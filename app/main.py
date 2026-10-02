@@ -59409,7 +59409,7 @@ def natural_analytics_search(request: NaturalSearchModel) -> dict:
 
 
 
-    for event_type in ["person", "vehicle", "plate", "line_crossing", "intrusion"]:
+    for event_type in ["person", "vehicle", "plate", "line_crossing", "intrusion", "loitering"]:
 
 
 
@@ -72909,7 +72909,7 @@ def customer_dashboard_intelligence_api(request: Request, start_ms: int, end_ms:
             "person": by_type.get("person", 0),
             "vehicle": sum(by_type.get(kind, 0) for kind in vehicle_types),
             "plate": by_type.get("plate", 0),
-            "intrusion": by_type.get("intrusion", 0) + by_type.get("line_crossing", 0),
+            "intrusion": by_type.get("intrusion", 0) + by_type.get("line_crossing", 0) + by_type.get("loitering", 0),
         },
         "analytics_mock": False,
         "unread_alert_count": len(unread),
@@ -78973,7 +78973,7 @@ def analytics(request: Request) -> str:
 
 
 
-            <select id="analytics-type"><option value="">All types</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="plate">Plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select>
+            <select id="analytics-type"><option value="">All types</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="plate">Plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option><option value="loitering">Loitering</option></select>
 
 
 
@@ -81870,7 +81870,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
       <aside class="investigation-filters">
         <h2>Search evidence</h2>
         <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
-        <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select></label>
+        <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option><option value="loitering">Loitering</option></select></label>
         <label>Camera<select id="investigation-camera"><option value="">All cameras</option>{camera_options}</select></label>
         <label>From<input id="investigation-from" type="datetime-local"></label>
         <label>To<input id="investigation-to" type="datetime-local"></label>
@@ -82509,7 +82509,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-        <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select></label>
+        <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option><option value="loitering">Loitering</option></select></label>
 
 
 
@@ -91167,7 +91167,7 @@ def enterprise_notifications_page(request: Request) -> str:
 
 
 
-        <label>Event types<select id="notification-event-types" multiple><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="plate">License plate</option><option value="intrusion">Intrusion</option><option value="line_crossing">Line crossing</option></select></label>
+        <label>Event types<select id="notification-event-types" multiple><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="plate">License plate</option><option value="intrusion">Intrusion</option><option value="line_crossing">Line crossing</option><option value="loitering">Loitering</option></select></label>
 
 
 
@@ -145049,7 +145049,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     if(['car','truck','bus','motorcycle','bicycle','vehicle'].includes(eventType))return 'vehicle';
     if(eventType==='plate'||eventType==='lpr')return 'lpr';
     if(eventType==='people_counting_in'||eventType==='people_counting_out'||eventType==='people_counting')return 'people_counting';
-    if(eventType==='intrusion')return 'intrusion';
+    if(eventType==='intrusion'||eventType==='loitering')return 'intrusion';
     // Customer-drawn Line Crossing rules (customer_analytics_rule_worker.py)
     // -- deliberately its own category/color, distinct from People
     // Counting's own line, even though both share the same underlying
@@ -155441,7 +155441,7 @@ def _aaco_event_category(raw_event_type: object) -> str | None:
         return "lpr"
     if value in {"people_counting_in", "people_counting_out", "people_counting"}:
         return "people_counting"
-    if value == "intrusion":
+    if value in {"intrusion", "loitering"}:
         return "intrusion"
     if value == "line_crossing":
         return "line_crossing"

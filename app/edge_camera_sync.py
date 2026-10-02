@@ -160,17 +160,27 @@ def _reconcile_analytics_rules(db, appliance_id: str, cloud_rules: list, now: st
             continue
         cloud_ids.add(rule_id)
         geometry = item.get("geometry")
+        # Loitering (2026-10-01): the rule's own dwell and notification
+        # setting. An older cloud sends neither -- dwell stays NULL (the
+        # rule type's default) and notifications stay on.
+        try:
+            dwell_seconds = int(item["dwell_seconds"]) if item.get("dwell_seconds") is not None else None
+        except (TypeError, ValueError):
+            dwell_seconds = None
+        notifications_enabled = 0 if item.get("notifications_enabled") is False else 1
         db.execute(
-            "INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at,created_by) "
-            "VALUES(?,?,?,?,?,?,?,?,?,1,?,?,NULL) "
+            "INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at,created_by,"
+            "dwell_seconds,notifications_enabled) "
+            "VALUES(?,?,?,?,?,?,?,?,?,1,?,?,NULL,?,?) "
             "ON CONFLICT(id) DO UPDATE SET customer_id=excluded.customer_id,site_id=excluded.site_id,appliance_id=excluded.appliance_id,"
             "camera_id=excluded.camera_id,rule_type=excluded.rule_type,name=excluded.name,direction=excluded.direction,"
-            "geometry_json=excluded.geometry_json,enabled=1,updated_at=excluded.updated_at",
+            "geometry_json=excluded.geometry_json,enabled=1,updated_at=excluded.updated_at,"
+            "dwell_seconds=excluded.dwell_seconds,notifications_enabled=excluded.notifications_enabled",
             (
                 rule_id, item.get("customer_id"), item.get("site_id"), appliance_id, camera_id,
                 rule_type, item.get("name") or "", item.get("direction"),
                 json.dumps(geometry if isinstance(geometry, list) else []),
-                now, item.get("updated_at") or now,
+                now, item.get("updated_at") or now, dwell_seconds, notifications_enabled,
             ),
         )
     existing_ids = {

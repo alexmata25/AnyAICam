@@ -43,17 +43,61 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from partner_db import audit, connection
 from partner_portal import partner_identity
 
-RULE_TYPES = ("intrusion", "line_crossing", "people_counting", "exclusion", "security_line")
+RULE_TYPES = ("intrusion", "line_crossing", "people_counting", "exclusion", "security_line", "loitering")
 # Two-point line rules; "people_counting" is People Counting's counting
 # line (at most one per camera), "line_crossing" an alert rule.
 LINE_RULE_TYPES = ("line_crossing", "people_counting", "security_line")
 # Polygon rules: "intrusion" detects activity inside the zone; "exclusion"
 # (2026-09-26) ignores it -- detections centred inside, and pixel motion
-# inside, never become events on that camera (detection_exclusion.py).
-ZONE_RULE_TYPES = ("intrusion", "exclusion")
+# inside, never become events on that camera (detection_exclusion.py);
+# "loitering" (2026-10-01) fires when a person stays inside it for the
+# rule's own dwell_seconds.
+ZONE_RULE_TYPES = ("intrusion", "exclusion", "loitering")
 LINE_CROSSING_DIRECTIONS = ("both", "inbound", "outbound")
 MIN_POLYGON_POINTS = 3
 MAX_POLYGON_POINTS = 20
+# Loitering dwell: long enough not to fire on someone walking through,
+# short enough to stay useful; the default suits a porch or a doorway.
+LOITERING_DEFAULT_DWELL_SECONDS = 30
+LOITERING_MIN_DWELL_SECONDS = 10
+LOITERING_MAX_DWELL_SECONDS = 1800
+# Rules whose events notify someone and can therefore be muted per rule.
+# The event and its clip are kept either way. A security line's INTRUSION
+# ALARM follows Security Settings instead; a zone to ignore and a counting
+# line never notify.
+NOTIFYING_RULE_TYPES = ("intrusion", "line_crossing", "loitering")
+
+
+def _validate_dwell(rule_type: str, value) -> int | None:
+    """Loitering needs a dwell; every other type keeps its built-in
+    behaviour (an intrusion zone's few seconds) and accepts none."""
+    if rule_type != 'loitering':
+        if value not in (None, ''):
+            raise HTTPException(status_code=400, detail='dwell_seconds applies only to a loitering zone.')
+        return None
+    if value in (None, ''):
+        return LOITERING_DEFAULT_DWELL_SECONDS
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail='dwell_seconds must be a whole number of seconds.')
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='dwell_seconds must be a whole number of seconds.')
+    if float(value) != seconds:
+        raise HTTPException(status_code=400, detail='dwell_seconds must be a whole number of seconds.')
+    if not LOITERING_MIN_DWELL_SECONDS <= seconds <= LOITERING_MAX_DWELL_SECONDS:
+        raise HTTPException(status_code=400, detail=f'Loitering time must be between {LOITERING_MIN_DWELL_SECONDS} seconds and {LOITERING_MAX_DWELL_SECONDS // 60} minutes.')
+    return seconds
+
+
+def _validate_notifications(rule_type: str, value) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail='notifications_enabled must be true or false.')
+    if not value and rule_type not in NOTIFYING_RULE_TYPES:
+        raise HTTPException(status_code=400, detail='Notifications cannot be turned off for this rule type.')
+    return value
 
 
 def _customer_identity(request: Request) -> dict:
@@ -177,6 +221,8 @@ def _serialize_rule(row: dict) -> dict:
         'direction': row['direction'],
         'geometry': json.loads(row['geometry_json']),
         'enabled': bool(row['enabled']),
+        'dwell_seconds': row.get('dwell_seconds'),
+        'notifications_enabled': bool(row.get('notifications_enabled', 1)),
         'created_at': row['created_at'],
         'updated_at': row['updated_at'],
     }
@@ -218,6 +264,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         if not name:
             raise HTTPException(status_code=400, detail='name is required.')
         geometry_points, direction = _validate_geometry(rule_type, geometry, direction)
+        dwell_seconds = _validate_dwell(rule_type, payload.get('dwell_seconds'))
+        notifications_enabled = _validate_notifications(rule_type, payload.get('notifications_enabled'))
         with connection() as db:
             camera, can_edit = _authorized_camera_for_rules(db, camera_id, identity)
             _require_edit(can_edit)
@@ -229,12 +277,14 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
             rule_id = uuid.uuid4().hex[:12]
             db.execute(
                 'INSERT INTO customer_analytics_rules'
-                '(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at,created_by) '
-                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                '(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at,created_by,'
+                'dwell_seconds,notifications_enabled) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (
                     rule_id, identity['customer_id'], camera['site_id'], camera['appliance_id'], camera_id,
                     rule_type, name, direction, json.dumps(geometry_points),
                     1 if payload.get('enabled', True) else 0, now, now, identity['email'],
+                    dwell_seconds, 1 if notifications_enabled else 0,
                 ),
             )
             row = _fetch_rule(db, camera_id=camera_id, rule_id=rule_id, customer_id=identity['customer_id'])
@@ -259,9 +309,14 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                 geometry = json.loads(existing['geometry_json'])
             geometry_points, direction = _validate_geometry(rule_type, geometry, direction)
             enabled = payload.get('enabled', bool(existing['enabled']))
+            dwell_seconds = _validate_dwell(rule_type, payload.get('dwell_seconds', existing.get('dwell_seconds')))
+            notifications_enabled = _validate_notifications(
+                rule_type, payload.get('notifications_enabled', bool(existing.get('notifications_enabled', 1))))
             db.execute(
-                'UPDATE customer_analytics_rules SET name=?,direction=?,geometry_json=?,enabled=?,updated_at=? WHERE id=?',
-                (name, direction, json.dumps(geometry_points), 1 if enabled else 0, now, rule_id),
+                'UPDATE customer_analytics_rules SET name=?,direction=?,geometry_json=?,enabled=?,dwell_seconds=?,'
+                'notifications_enabled=?,updated_at=? WHERE id=?',
+                (name, direction, json.dumps(geometry_points), 1 if enabled else 0, dwell_seconds,
+                 1 if notifications_enabled else 0, now, rule_id),
             )
             row = _fetch_rule(db, camera_id=camera_id, rule_id=rule_id, customer_id=identity['customer_id'])
         audit(identity, 'camera.analytics_rule_updated', 'camera', camera_id, {'rule_id': rule_id})
@@ -298,7 +353,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         <section class="panel">
           <div class="panel-head"><div><h2>Draw a rule</h2><div class="health-detail">
             Capture a frame from this camera, then draw a line to watch for crossings,
-            a zone to watch for activity inside it, or a zone to ignore. Points are saved
+            a zone to watch for activity inside it, a zone where someone lingering
+            should be flagged (loitering), or a zone to ignore. Points are saved
             relative to the frame, so a rule still lines up if the camera's resolution ever changes.
           </div></div></div>
           {"" if can_edit else '<div class="health-detail" style="color:#b45309;margin-bottom:12px">You have view-only access to this camera. Ask the account owner to grant Camera Settings access to draw or edit rules.</div>'}
@@ -314,7 +370,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                 <button class="compact-button" id="clear-drawing" type="button">Clear drawing</button>
               </div>
               <p class="health-detail" id="preview-status" role="status" style="margin-top:8px">Starting the live preview…</p>
-              <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then tap or click on the image to place points. Drag a point to move it. A line needs 2 points; a zone needs at least 3. Zones to ignore are drawn in red.</p>
+              <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then tap or click on the image to place points. Drag a point to move it. A line needs 2 points; a zone needs at least 3. Zones to ignore are drawn in red, loitering zones in amber.</p>
             </div>
             <div style="flex:1;min-width:260px;display:grid;gap:12px;align-content:start">
               <label style="display:grid;gap:6px">Rule type
@@ -324,7 +380,12 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                   <option value="exclusion">Ignore detections in zone</option>
                   <option value="people_counting">People counting line</option>
                   <option value="security_line">Security line (intrusion alarm when armed)</option>
+                  <option value="loitering">Loitering (a person stays in the zone)</option>
                 </select>
+              </label>
+              <label style="display:grid;gap:6px;display:none" id="dwell-field">Alert after a person stays this long (seconds)
+                <input id="rule-dwell" type="number" inputmode="numeric" min="{LOITERING_MIN_DWELL_SECONDS}" max="{LOITERING_MAX_DWELL_SECONDS}" step="1" value="{LOITERING_DEFAULT_DWELL_SECONDS}" {"disabled" if not can_edit else ""}>
+                <span class="health-detail">Between {LOITERING_MIN_DWELL_SECONDS} seconds and {LOITERING_MAX_DWELL_SECONDS // 60} minutes. Only people count &mdash; cars and animals never do. Someone walking straight through does not trigger it.</span>
               </label>
               <label style="display:grid;gap:6px" id="direction-field"><span id="direction-label">Direction</span>
                 <select id="rule-direction" {"disabled" if not can_edit else ""}>
@@ -339,6 +400,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                 <input id="rule-name" type="text" maxlength="60" placeholder="e.g. Driveway entrance" {"disabled" if not can_edit else ""}>
               </label>
               <label><span><input id="rule-enabled" type="checkbox" checked {"disabled" if not can_edit else ""}> Enabled</span></label>
+              <label id="notifications-field"><span><input id="rule-notifications" type="checkbox" checked {"disabled" if not can_edit else ""}> Send notifications</span>
+                <span class="health-detail" style="display:block">When off, this rule still records events and clips but sends no push, email, text or in-app alert.</span></label>
               <div style="display:flex;gap:8px">
                 <button class="action-button" id="save-rule" type="button" {"disabled" if not can_edit else ""}>Save rule</button>
                 <button class="ghost-button" id="cancel-edit" type="button" style="display:none">Cancel edit</button>
@@ -358,7 +421,9 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
             (and an alert, if you have alerts turned on) on cameras with Smart
             Motion. A people counting line counts people walking across it in
             each direction on cameras with People Counting; each camera has one
-            counting line. Anything centred inside a zone to ignore &mdash; people,
+            counting line. A loitering zone creates an event when a person stays
+            inside it for the time you set; it works whether or not the system
+            is armed. Anything centred inside a zone to ignore &mdash; people,
             vehicles, motion &mdash; never becomes an event, alert, count or clip on
             this camera, for every analytic; the rest of the picture is unaffected.
             Changes take effect within a few minutes.
@@ -377,8 +442,10 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   const ctx=canvas.getContext('2d');
   const ruleType=document.getElementById('rule-type');
   const isLine=t=>t==='line_crossing'||t==='people_counting'||t==='security_line';
-  const isZone=t=>t==='intrusion'||t==='exclusion';
-  const typeLabels={line_crossing:'Line crossing',intrusion:'Detect inside zone',exclusion:'Ignore detections in zone',people_counting:'People counting line',security_line:'Security line'};
+  const isZone=t=>t==='intrusion'||t==='exclusion'||t==='loitering';
+  const NOTIFYING=''' + json.dumps(list(NOTIFYING_RULE_TYPES)) + ''';
+  const DEFAULT_DWELL=''' + str(LOITERING_DEFAULT_DWELL_SECONDS) + ''';
+  const typeLabels={line_crossing:'Line crossing',intrusion:'Detect inside zone',exclusion:'Ignore detections in zone',people_counting:'People counting line',security_line:'Security line',loitering:'Loitering'};
   const directionField=document.getElementById('direction-field');
   const bgCanvas=document.createElement('canvas');
   let hasFrame=false, points=[], editingRuleId=null, sessionId=null, hls=null, pollTimer=null, stopped=false;
@@ -488,7 +555,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     drawBackground();
     if(!points.length)return;
     if(ruleType.value==='security_line'&&points.length===2)shadeProtectedSide();
-    const color=ruleType.value==='exclusion'||ruleType.value==='security_line'?'#ef4444':'#22c55e';
+    const color=ruleType.value==='exclusion'||ruleType.value==='security_line'?'#ef4444':ruleType.value==='loitering'?'#f59e0b':'#22c55e';
     // Drawn in camera-frame pixels: a 1280-wide frame on a 322 px phone
     // screen shrank a 2 px line to half a pixel. Size them for the screen.
     const px=screenScale();
@@ -515,6 +582,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     points=[];
     document.getElementById('rule-name').value='';
     document.getElementById('rule-enabled').checked=true;
+    document.getElementById('rule-notifications').checked=true;
+    document.getElementById('rule-dwell').value=DEFAULT_DWELL;
     document.getElementById('cancel-edit').style.display='none';
     redraw();
   }
@@ -534,6 +603,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     document.getElementById('security-line-hint').style.display=security?'':'none';
     [...directionSelect.options].forEach(o=>{o.textContent=text[o.value]||o.textContent;o.hidden=security&&o.value==='both';o.disabled=security&&o.value==='both';});
     if(security&&directionSelect.value==='both')directionSelect.value='inbound';
+    document.getElementById('dwell-field').style.display=ruleType.value==='loitering'?'grid':'none';
+    document.getElementById('notifications-field').style.display=NOTIFYING.includes(ruleType.value)?'':'none';
   }
   toggleDirectionField();
   ruleType.addEventListener('change',()=>{toggleDirectionField();points=[];redraw();});
@@ -604,7 +675,13 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
       direction:isLine(type)?document.getElementById('rule-direction').value:null,
       geometry:points,
       enabled:document.getElementById('rule-enabled').checked,
+      notifications_enabled:NOTIFYING.includes(type)?document.getElementById('rule-notifications').checked:true,
     };
+    if(type==='loitering'){
+      const dwell=Number(document.getElementById('rule-dwell').value);
+      if(!Number.isInteger(dwell)||dwell<''' + str(LOITERING_MIN_DWELL_SECONDS) + '''||dwell>''' + str(LOITERING_MAX_DWELL_SECONDS) + '''){alert('Enter a loitering time between ''' + str(LOITERING_MIN_DWELL_SECONDS) + ''' seconds and ''' + str(LOITERING_MAX_DWELL_SECONDS // 60) + ''' minutes.');return;}
+      payload.dwell_seconds=dwell;
+    }
     const url=editingRuleId
       ?`/api/customer/cameras/${cameraId}/analytics-rules/${editingRuleId}`
       :`/api/customer/cameras/${cameraId}/analytics-rules`;
@@ -616,6 +693,12 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
       loadRules();
     }catch(e){alert('Could not save this rule.');}
   });
+
+  function formatDwell(seconds){
+    if(seconds<60)return seconds+' s';
+    const m=Math.floor(seconds/60), s=seconds%60;
+    return s?m+' min '+s+' s':m+' min';
+  }
 
   function escapeHtml(text){
     const div=document.createElement('div');
@@ -635,6 +718,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     list.innerHTML=body.rules.map(rule=>{
       const typeLabel=typeLabels[rule.rule_type]||'Rule';
       const directionLabel=rule.direction?' &middot; '+escapeHtml(rule.direction):'';
+      const dwellLabel=rule.rule_type==='loitering'&&rule.dwell_seconds?' &middot; after '+formatDwell(rule.dwell_seconds):'';
+      const quietLabel=NOTIFYING.includes(rule.rule_type)&&!rule.notifications_enabled?' &middot; Notifications off':'';
       const stateLabel=rule.enabled?'Enabled':'Disabled';
       const actions=canEdit?(
         '<button class="compact-button" data-edit="'+rule.id+'" type="button">Edit</button>'+
@@ -643,7 +728,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
       ):'';
       return '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--border,#e5e7eb)">'+
         '<div><strong>'+escapeHtml(rule.name)+'</strong>'+
-        '<div style="color:var(--muted)">'+typeLabel+directionLabel+' &middot; '+stateLabel+'</div></div>'+
+        '<div style="color:var(--muted)">'+typeLabel+directionLabel+dwellLabel+' &middot; '+stateLabel+quietLabel+'</div></div>'+
         '<div style="display:flex;gap:8px;flex-shrink:0">'+actions+'</div></div>';
     }).join('');
     [...list.querySelectorAll('[data-edit]')].forEach(btn=>btn.addEventListener('click',()=>editRule(btn.dataset.edit,body.rules)));
@@ -660,6 +745,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     if(rule.direction)document.getElementById('rule-direction').value=rule.direction;
     document.getElementById('rule-name').value=rule.name;
     document.getElementById('rule-enabled').checked=rule.enabled;
+    document.getElementById('rule-notifications').checked=rule.notifications_enabled!==false;
+    document.getElementById('rule-dwell').value=rule.dwell_seconds||DEFAULT_DWELL;
     points=rule.geometry.slice();
     document.getElementById('cancel-edit').style.display='';
     redraw();

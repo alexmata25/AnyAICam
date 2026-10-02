@@ -168,6 +168,25 @@ def _fanout_payload(camera: dict, event_id: str, camera_id: str, event_type: str
     return payload
 
 
+# Customer rules whose notifications the customer can switch off per rule
+# (customer_analytics_rules.NOTIFYING_RULE_TYPES). The event and its clip
+# are always kept; only the push/in-app/email/SMS fan-out is skipped.
+MUTABLE_RULE_EVENT_TYPES=frozenset({'line_crossing','intrusion','loitering'})
+
+
+def rule_notifications_muted(event_type: str, rule_id, *, camera_id: str, customer_id: str) -> bool:
+    """True when the cloud-owned rule that produced this event has
+    "Send notifications" off. Looked up on the cloud's own copy of the
+    rule, scoped to the camera and its customer, so an appliance can
+    neither mute nor unmute another tenant's rule. Unknown rule (deleted
+    since, or an older appliance that sends no rule id): notify as before."""
+    if event_type not in MUTABLE_RULE_EVENT_TYPES or not rule_id:
+        return False
+    found=row('SELECT notifications_enabled FROM customer_analytics_rules WHERE id=? AND camera_id=? AND customer_id=?',
+              (str(rule_id)[:64],camera_id,customer_id))
+    return bool(found) and found.get('notifications_enabled') is not None and not found['notifications_enabled']
+
+
 def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
     if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
@@ -306,7 +325,7 @@ def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_loca
 # its own 'motion'-only rule in _resolve_parent_motion_event() above,
 # unchanged.
 AI_CLIP_PARENT_TYPES=frozenset({'person','car','truck','bus','motorcycle','bicycle','dog','cat','bird','backpack','suitcase'})
-RULE_EVENT_TYPES=frozenset({'line_crossing','intrusion','intrusion_alarm'})
+RULE_EVENT_TYPES=frozenset({'line_crossing','intrusion','intrusion_alarm','loitering'})
 # Continuous AI activity (2026-10-01, ai_activity.py): one activity owns
 # one clip, and every other object class seen during it (a truck beside
 # the car that opened it, a suitcase carried past) is its own card showing
@@ -321,7 +340,7 @@ ANALYTICS_MEDIA_PARENT_TYPES={
     # Line crossings, intrusion zones and Secure Edge INTRUSION ALARMs
     # (2026-10-01): the clip covering the crossing -- the person's own AI
     # activity, or another rule event that had to build one.
-    **{event_type:AI_CLIP_PARENT_TYPES|RULE_EVENT_TYPES for event_type in ('line_crossing','intrusion','intrusion_alarm')},
+    **{event_type:AI_CLIP_PARENT_TYPES|RULE_EVENT_TYPES for event_type in ('line_crossing','intrusion','intrusion_alarm','loitering')},
 }
 
 
@@ -563,7 +582,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # reconciliation never needs to know this column is JSON-
         # encoded in the cloud schema.
         analytics_rule_items=rows(
-            'SELECT r.id,r.customer_id,r.site_id,r.camera_id,r.rule_type,r.name,r.direction,r.geometry_json,r.updated_at '
+            'SELECT r.id,r.customer_id,r.site_id,r.camera_id,r.rule_type,r.name,r.direction,r.geometry_json,r.updated_at,'
+            'r.dwell_seconds,r.notifications_enabled '
             'FROM customer_analytics_rules r JOIN cameras c ON c.id=r.camera_id '
             'WHERE c.appliance_id=? AND r.enabled=1 ORDER BY r.camera_id,r.id',
             (appliance['id'],),
@@ -601,6 +621,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 rule_item['geometry']=json.loads(raw_geometry) if raw_geometry else []
             except (TypeError,ValueError):
                 rule_item['geometry']=[]
+            rule_item['notifications_enabled']=bool(rule_item.get('notifications_enabled',1))
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)
@@ -803,7 +824,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 if not event_id: continue
                 cursor=db.execute('INSERT OR IGNORE INTO appliance_events(appliance_id,event_id,event_type,camera_id,event_timestamp,payload_json,received_at) VALUES(?,?,?,?,?,?,?)',(appliance['id'],event_id,item.get('event_type'),item.get('camera_id'),item.get('timestamp'),json.dumps(item),now)); inserted+=cursor.rowcount; duplicates+=1-cursor.rowcount
                 if cursor.rowcount: accepted.append(item)
-        notifications=sum(fanout_appliance_event(appliance,item) for item in accepted)
+        notifications=sum(fanout_appliance_event(appliance,item) for item in accepted
+                          if not rule_notifications_muted(str(item.get('event_type') or ''),item.get('rule_id'),
+                                                          camera_id=str(item.get('camera_id') or ''),customer_id=appliance['customer_id']))
         return {'status':'accepted','inserted':inserted,'duplicates':duplicates,'notifications_created':notifications}
 
     @app.post('/api/appliance/live/{camera_id}/session')
@@ -1151,7 +1174,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 logger.exception('analytics_event.aac_voice_call_utterance_failed camera_id=%s',camera_id)
                 raise HTTPException(status_code=503,detail='Visitor answer could not be recorded yet; retry.') from error
             return {'status':'accepted','event_id':event_id,'voice_call':outcome.get('status'),'voice_call_event_id':outcome.get('event_id')}
-        if event_type!='aac_voice_call' and (event_type!='facial_recognition' or facial_notify_message):
+        # Customer rules (2026-10-01): a rule with "Send notifications" off
+        # keeps its event and clip above but fans out nothing.
+        fired_rule_id=detections[0].get('rule_id') if isinstance(detections,list) and detections and isinstance(detections[0],dict) else None
+        muted=rule_notifications_muted(event_type,fired_rule_id,camera_id=camera_id,customer_id=camera['customer_id'])
+        if muted:
+            logger.info('analytics_event.rule_notifications_off event_id=%s camera_id=%s rule_id=%s',event_id,camera_id,fired_rule_id)
+        if event_type!='aac_voice_call' and not muted and (event_type!='facial_recognition' or facial_notify_message):
             try:
                 fanout_appliance_event(
                     {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},

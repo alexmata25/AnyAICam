@@ -35,7 +35,7 @@ logger = logging.getLogger("anyaicam.notification_email")
 
 # Event types whose alert is about something a camera captured, so the
 # cloud receives a thumbnail/clip for it shortly after the event.
-MEDIA_EVENT_TYPES = frozenset({"person", "vehicle", "smart_motion", "motion", "ppe", "lpr", "facial_recognition", "people_counting"})
+MEDIA_EVENT_TYPES = frozenset({"person", "vehicle", "smart_motion", "motion", "ppe", "lpr", "facial_recognition", "people_counting", "loitering"})
 MEDIA_WAIT_SECONDS = max(0, int(os.environ.get("ANYAICAM_ALERT_EMAIL_MEDIA_WAIT_SECONDS", "180")))
 THUMBNAIL_CID = "event-thumbnail"
 DEFAULT_DISPLAY_TIMEZONE = "America/Chicago"  # main.APPLIANCE_TIMEZONE

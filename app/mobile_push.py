@@ -64,7 +64,7 @@ def eligible(db, notification, *, now):
 ACTIVITY_RANK = {
     'motion': 1, 'ppe': 1, 'people_counting': 1, 'occupancy': 1,
     'smart_motion': 2,
-    'person': 3, 'vehicle': 3, 'lpr': 3, 'line_crossing': 3, 'intrusion': 3, 'facial_recognition': 3,
+    'person': 3, 'vehicle': 3, 'lpr': 3, 'line_crossing': 3, 'intrusion': 3, 'loitering': 3, 'facial_recognition': 3,
 }
 VISIT_RANK = {**ACTIVITY_RANK, 'aac_voice_call': 4, 'intrusion_alarm': 5}
 ACTIVITY_HOLD_SECONDS = 5

@@ -1740,3 +1740,12 @@ def apply_migrations():
                    'camera_id TEXT,actor_email TEXT,issued_at REAL NOT NULL,expires_at REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL)')
         camera_columns=_columns('cameras')
         if 'door_feedback_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_feedback_enabled INTEGER NOT NULL DEFAULT 0')
+
+        # Loitering (2026-10-01, customer_analytics_rules.py): how long a
+        # person must stay inside a zone before it counts (NULL = the rule
+        # type's default), and whether the rule notifies anyone -- the event
+        # and its clip are kept either way. Additive, so older rules and an
+        # older build are unaffected.
+        rule_columns=_columns('customer_analytics_rules')
+        if 'dwell_seconds' not in rule_columns: db.execute('ALTER TABLE customer_analytics_rules ADD COLUMN dwell_seconds INTEGER')
+        if 'notifications_enabled' not in rule_columns: db.execute('ALTER TABLE customer_analytics_rules ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 1')

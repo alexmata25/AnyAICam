@@ -41,7 +41,7 @@ from customer_analytics_panel import event_type_label,event_type_message
 # silently create zero notifications (the same class of gap 'ppe'/
 # 'storage_problem'/'facial_recognition' above were each added to fix),
 # even though the in-app notification is the entire point of Phase 3.
-SUPPORTED={'system_health','motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm'}
+SUPPORTED={'system_health','motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm','loitering'}
 
 # Per-(user, camera, event_type) minimum spacing between EXTERNAL
 # (email/sms) delivery attempts -- "Prevent duplicate/spam notifications

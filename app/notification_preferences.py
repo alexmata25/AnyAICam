@@ -31,6 +31,7 @@ import re
 EVENT_TYPES: dict[str, str] = {
     "motion": "Motion", "line_crossing": "Line crossing",
     "intrusion": "Intrusion analytics", "occupancy": "Occupancy",
+    "loitering": "Loitering",
     "recording_stopped": "Recording stopped", "low_disk": "Low storage",
     "high_cpu": "High CPU usage", "software_update": "Software update",
     "smart_motion": "Smart Motion",

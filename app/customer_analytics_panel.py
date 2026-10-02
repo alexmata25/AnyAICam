@@ -49,7 +49,7 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     # (customer_analytics_rule_worker.camera_rules_entitled), so their
     # events belong to its summary.
     "smart_motion": ("Smart Motion", ("motion", "smart_motion", "person", "vehicle", "car", "truck", "bus", "motorcycle", "bicycle",
-                                      "intrusion", "line_crossing")),
+                                      "intrusion", "line_crossing", "loitering")),
     "people_counting": ("People Counting", ("people_counting", "people_counting_in", "people_counting_out")),
     "lpr": ("LPR", ("lpr", "plate")),
     "ppe": ("PPE", ("ppe",)),
@@ -332,7 +332,7 @@ EVENT_TYPE_LABELS = {
     "motion": "Motion", "smart_motion": "Smart Motion", "ppe": "PPE", "plate": "License plate", "lpr": "License plate",
     "people_counting": "People count", "people_counting_in": "Entry", "people_counting_out": "Exit",
     "facial_recognition": "Face", "aac_voice_call": "Voice call", "line_crossing": "Line crossing",
-    "intrusion_alarm": "INTRUSION ALARM",
+    "intrusion_alarm": "INTRUSION ALARM", "loitering": "Loitering",
     "camera_offline": "Camera offline", "appliance_offline": "AnyAiCam appliance offline",
     "recording_stopped": "Recording stopped", "low_disk": "Storage almost full", "storage_problem": "Storage problem",
     "high_cpu": "AnyAiCam appliance overloaded", "software_update": "Software update", "occupancy": "Occupancy",
@@ -343,6 +343,7 @@ EVENT_TYPE_MESSAGES = {
     "people_counting_in": "Person entered", "people_counting_out": "Person left",
     "plate": "License plate read", "lpr": "License plate read",
     "intrusion_alarm": "INTRUSION ALARM: a person crossed into a protected area",
+    "loitering": "Person loitering",
 }
 
 
