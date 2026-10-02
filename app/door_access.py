@@ -162,24 +162,32 @@ class DoorNotReachable(Exception):
     """The door's appliance could not be asked to open it; nothing moved."""
 
 
-def dispatch_manual_unlock(camera: dict, *, actor: str, pulse_ms: int | None) -> relay_control.RelayResult:
+def dispatch_manual_unlock(camera: dict, *, actor: str, pulse_ms: int | None, extra: dict | None = None) -> relay_control.RelayResult:
     """Where the door hardware is (2026-10-01). On the appliance itself this
     is trigger_door(). In the cloud portal the door's relay is plugged into
     the customer's appliance, so the already-authorized command goes there
     over its control channel and the appliance's own answer is returned.
     Fails closed: not connected or no answer means the door stays shut."""
     import os
+    # extra (2026-10-01, backup_access.py): Backup Mobile Access sends its
+    # single-use command id and issue time, which the appliance checks before
+    # it moves anything (talk_audio_relay_client._door_unlock_on_appliance).
+    extra = dict(extra or {})
+    trigger = extra.get("trigger") or "manual"
     if os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower() != "cloud":
-        return trigger_door(camera, reason=f"manual_unlock:{camera['id']}", actor=actor, trigger_type='manual', pulse_ms=pulse_ms)
+        return trigger_door(camera, reason=f"{trigger}_unlock:{camera['id']}", actor=actor, trigger_type=trigger, pulse_ms=pulse_ms)
     import appliance_control
     appliance_id = camera.get("appliance_id")
     if not appliance_id or not appliance_control.connected(appliance_id):
         raise DoorNotReachable("the appliance for this door is not connected right now")
-    answer = appliance_control.request(appliance_id, {"type": "door_unlock", "camera_id": camera["id"], "actor": actor, "pulse_ms": pulse_ms})
+    answer = appliance_control.request(appliance_id, {**extra, "type": "door_unlock", "camera_id": camera["id"], "actor": actor, "pulse_ms": pulse_ms})
     if not answer or answer.get("status") == "timeout":
         raise DoorNotReachable("the appliance did not answer in time")
     if answer.get("status") != "ok":
-        raise DoorNotReachable({"not_a_door_here": "the appliance does not have this door set up yet"}.get(answer.get("reason"), "the door could not be reached"))
+        raise DoorNotReachable({"not_a_door_here": "the appliance does not have this door set up yet",
+                                "replayed_command": "the appliance refused a repeated unlock command",
+                                "expired_command": "the appliance refused an expired unlock command",
+                                "bad_command": "the appliance refused a malformed unlock command"}.get(answer.get("reason"), "the door could not be reached"))
     return relay_control.RelayResult(channel=int(answer.get("channel") or 0), activated=bool(answer.get("activated")),
                                      dry_run=bool(answer.get("dry_run")), suppressed_reason=answer.get("suppressed_reason"),
                                      simulated=bool(answer.get("simulated")))
@@ -349,7 +357,7 @@ def register_door_access_routes(app: FastAPI) -> None:
         identity = _customer_identity(request)
         with connection() as db:
             camera = db.execute(
-                'SELECT id,name,door_access_enabled,door_relay_channel,door_relay_pulse_ms FROM cameras WHERE id=? AND customer_id=?',
+                'SELECT id,name,door_access_enabled,door_relay_channel,door_relay_pulse_ms,door_feedback_enabled FROM cameras WHERE id=? AND customer_id=?',
                 (camera_id, identity['customer_id']),
             ).fetchone()
         if not camera:
@@ -372,6 +380,9 @@ def register_door_access_routes(app: FastAPI) -> None:
         if identity.get('role') != 'customer_owner':
             raise HTTPException(status_code=403, detail='Only the account owner can configure door access.')
         enabled = bool(payload.get('door_access_enabled'))
+        # Audible feedback at the door (door_feedback.py): off by default; only
+        # meaningful on a door, so turning the door off turns it off too.
+        feedback = bool(payload.get('door_feedback_enabled')) and enabled
         relay_channel = payload.get('door_relay_channel')
         pulse_ms = payload.get('door_relay_pulse_ms')
         if enabled:
@@ -391,16 +402,18 @@ def register_door_access_routes(app: FastAPI) -> None:
             if not camera:
                 raise HTTPException(status_code=404, detail='Camera not found.')
             db.execute(
-                'UPDATE cameras SET door_access_enabled=?,door_relay_channel=?,door_relay_pulse_ms=? WHERE id=?',
-                (1 if enabled else 0, relay_channel, pulse_ms, camera_id),
+                'UPDATE cameras SET door_access_enabled=?,door_relay_channel=?,door_relay_pulse_ms=?,door_feedback_enabled=? WHERE id=?',
+                (1 if enabled else 0, relay_channel, pulse_ms, 1 if feedback else 0, camera_id),
             )
         audit(
             identity, 'camera.door_access_configured', 'camera', camera_id,
-            {'door_access_enabled': enabled, 'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms},
+            {'door_access_enabled': enabled, 'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms,
+             'door_feedback_enabled': feedback},
         )
         return {
             'message': f"Door access {'enabled' if enabled else 'disabled'} for {camera['name']}.",
             'door_access_enabled': enabled, 'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms,
+            'door_feedback_enabled': feedback,
         }
 
     @app.get('/api/customer/cameras/{camera_id}/door-config/unlock-access')

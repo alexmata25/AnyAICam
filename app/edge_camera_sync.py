@@ -468,6 +468,11 @@ def sync_provisioned_cameras() -> dict:
                     (1 if item.get("door_access_enabled") else 0, item.get("door_relay_channel"),
                      item.get("door_relay_pulse_ms"), camera_id),
                 )
+            # Audible door feedback (2026-10-01, door_feedback.py): off unless
+            # the owner turned it on for this door.
+            if "door_feedback_enabled" in item:
+                db.execute("UPDATE cameras SET door_feedback_enabled=? WHERE id=?",
+                           (1 if item.get("door_feedback_enabled") else 0, camera_id))
             synced += 1
 
             if not device_key:

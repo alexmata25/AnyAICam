@@ -48803,6 +48803,10 @@ register_appliance_claim_routes(app, page_shell)
 # their own sign-in, single-use invitation links and per-person permissions.
 from household_users import register_household_routes
 register_household_routes(app, page_shell)
+# Face Access Backup Mobile Access (2026-10-01): per-person PIN + session,
+# single-use replay-protected unlock command, honest no-hardware result.
+from backup_access import register_backup_access_routes
+register_backup_access_routes(app)
 # Registered before register_partner_workspace_routes() runs the
 # generic @app.get("/settings/{settings_slug}") catch-all it (or later
 # code in this file) may match against -- see that route's own handling

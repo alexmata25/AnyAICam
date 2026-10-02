@@ -850,6 +850,10 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         f'<label class="face-access-field">Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
         f'<label class="face-access-field">Unlock duration (seconds)<input id="door-relay-pulse-seconds" type="number" min="0.5" max="60" step="0.5" '
         f'inputmode="decimal" value="{pulse_seconds}"></label>'
+        f'<label style="display:flex;gap:8px;align-items:flex-start"><input id="door-feedback-enabled" type="checkbox" '
+        f'{"checked" if camera.get("door_feedback_enabled") else ""} style="margin-top:3px"><span>Audible feedback at the door'
+        f'<span class="health-detail" style="display:block">Through this camera’s speaker: one long tone when access is denied, two short beeps '
+        f'when the unlock command is accepted, three falling tones when access was granted but the door output didn’t run.</span></span></label>'
         f'</div>'
         f'<button class="action-button" id="save-door-access" type="button" style="margin-top:12px">Save Face Access settings</button>'
         f'{viewer_access_section}'
@@ -1285,6 +1289,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
         const seconds=secondsRaw?Number(secondsRaw):{relay_control.DEFAULT_PULSE_MS}/1000;
         if(!Number.isFinite(seconds)||seconds<=0||seconds>60){{showToast('Enter an unlock duration between 0.5 and 60 seconds.');return}}
         payload.door_relay_pulse_ms=Math.round(seconds*1000);
+        payload.door_feedback_enabled=!!document.getElementById('door-feedback-enabled')?.checked;
       }}
       saveDoorAccessButton.disabled=true;
       let response,data;
