@@ -1746,6 +1746,12 @@ def apply_migrations():
         # activation, which only the appliance sets. Additive.
         if 'completed_at' not in _columns('customer_setup_drafts'): db.execute('ALTER TABLE customer_setup_drafts ADD COLUMN completed_at TEXT')
 
+        # One notification fan-out per customer per appliance event (2026-10-02,
+        # notification_engine.claim_event_fanout): the analytics-event route
+        # and legacy forwarding both claim camera_id:local_event_id here.
+        db.execute('CREATE TABLE IF NOT EXISTS notification_event_keys(customer_id TEXT NOT NULL,dedupe_key TEXT NOT NULL,'
+                   'created_at TEXT NOT NULL,PRIMARY KEY(customer_id,dedupe_key))')
+
         # Loitering (2026-10-01, customer_analytics_rules.py): how long a
         # person must stay inside a zone before it counts (NULL = the rule
         # type's default), and whether the rule notifies anyone -- the event

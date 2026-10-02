@@ -323,11 +323,56 @@ def _enqueue_mobile_push(db, notification_id: str) -> None:
     db.execute('RELEASE SAVEPOINT mobile_push_enqueue')
 
 
+# Event types a person must explicitly choose in their notification
+# settings before they get ANY notification for them, in-app included
+# (2026-10-02): a busy street produces a plate read every few seconds.
+OPT_IN_EVENT_TYPES = frozenset({'lpr'})
+
+
+def opted_in(user_id: str, event_type: str) -> bool:
+    from notification_preferences import get_preferences
+    with connection() as db:
+        return event_type in (get_preferences(db, user_id=user_id).get('event_types') or [])
+
+
+def notification_event_type(event_type: str) -> str:
+    """Stored detection type -> the notification type customers choose
+    from: a license-plate read is stored as 'plate' and notified as 'lpr'."""
+    return 'lpr' if event_type == 'plate' else event_type
+
+
+def claim_event_fanout(customer_id: str, dedupe_key: str) -> bool:
+    """Durable, atomic "fan this event out once" (2026-10-02). The same
+    camera event can reach the cloud through the analytics-event route and
+    the legacy /api/appliance/events forwarding (and their retries); both
+    pass the event's own identity, and only the first claim notifies. The
+    primary key makes concurrent claims safe."""
+    with connection() as db:
+        cursor=db.execute('INSERT INTO notification_event_keys(customer_id,dedupe_key,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING',
+                          (customer_id,str(dedupe_key)[:300],datetime.now().isoformat()))
+        return bool(cursor.rowcount)
+
+
+def event_dedupe_key(camera_id, local_event_id) -> str | None:
+    """One identity for an appliance event however it arrives: its camera
+    and the appliance's own (local) event id."""
+    if not camera_id or not local_event_id:
+        return None
+    return f"{camera_id}:{local_event_id}"
+
+
 def fanout_appliance_event(appliance: dict,event: dict):
-    customer_id=appliance.get('customer_id'); site_id=appliance.get('site_id'); camera_id=str(event.get('camera_id') or '') or None; event_type=str(event.get('event_type') or '')
+    customer_id=appliance.get('customer_id'); site_id=appliance.get('site_id'); camera_id=str(event.get('camera_id') or '') or None; event_type=notification_event_type(str(event.get('event_type') or ''))
     if not customer_id or event_type not in SUPPORTED: return 0
+    if event_type in OPT_IN_EVENT_TYPES and not any(opted_in(user['id'],event_type) for user in rows(
+            "SELECT id FROM partner_users WHERE customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')",(customer_id,))):
+        return 0  # nobody on this account chose these alerts: nothing to claim or send
+    if event.get('dedupe_key') and not claim_event_fanout(customer_id,event['dedupe_key']):
+        return 0  # this event already notified this customer (another route, a retry or a replay)
     now=datetime.now(); current_time=_quiet_hours_clock(now); users=rows("SELECT id,email,role,camera_access_mode FROM partner_users WHERE customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')",(customer_id,)); created=0
     for user in users:
+        if event_type in OPT_IN_EVENT_TYPES and not opted_in(user['id'],event_type):
+            continue  # opt-in only, for every channel
         if user['role']=='customer_viewer' and camera_id:
             # Notifications Reliability Phase (2026-09-14): a customer_viewer
             # with NO customer_camera_permissions rows at all -- the real

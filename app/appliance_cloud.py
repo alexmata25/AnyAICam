@@ -150,12 +150,18 @@ def _security_config(appliance: dict) -> dict:
     return {'sites':[{key:state[key] for key in ('customer_id','site_id','mode','changed_at','settings')} for state in states]}
 
 
-def _fanout_payload(camera: dict, event_id: str, camera_id: str, event_type: str, event_timestamp: str, message: str | None) -> dict:
+def _fanout_payload(camera: dict, event_id: str, camera_id: str, event_type: str, event_timestamp: str, message: str | None,
+                    local_event_id: str | None = None) -> dict:
     """Notification payload for an ingested edge event. An armed-security
     INTRUSION ALARM carries a critical severity and a message that names
     the camera and links straight to its live view (which is what an SMS
     shows)."""
     payload = {'id': event_id, 'camera_id': camera_id, 'event_type': event_type, 'timestamp': event_timestamp, 'message': message}
+    if local_event_id:
+        import notification_engine
+        payload['dedupe_key'] = notification_engine.event_dedupe_key(camera_id, local_event_id)
+    if event_type == 'plate':
+        payload['event_type'] = 'lpr'  # notified as License plate recognition, opt-in (notification_engine.OPT_IN_EVENT_TYPES)
     if event_type == 'intrusion_alarm':
         try:
             from notification_email import public_base_url
@@ -891,6 +897,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 if not event_id: continue
                 cursor=db.execute('INSERT OR IGNORE INTO appliance_events(appliance_id,event_id,event_type,camera_id,event_timestamp,payload_json,received_at) VALUES(?,?,?,?,?,?,?)',(appliance['id'],event_id,item.get('event_type'),item.get('camera_id'),item.get('timestamp'),json.dumps(item),now)); inserted+=cursor.rowcount; duplicates+=1-cursor.rowcount
                 if cursor.rowcount: accepted.append(item)
+        import notification_engine
+        for item in accepted:
+            # The legacy route's id is the appliance's own event id: the same
+            # identity analytics_event_available() uses, so an event that
+            # arrives both ways notifies once.
+            item['dedupe_key']=notification_engine.event_dedupe_key(item.get('camera_id'),item.get('id'))
         notifications=sum(fanout_appliance_event(appliance,item) for item in accepted
                           if not rule_notifications_muted(str(item.get('event_type') or ''),item.get('rule_id'),
                                                           camera_id=str(item.get('camera_id') or ''),customer_id=appliance['customer_id']))
@@ -1261,7 +1273,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             try:
                 fanout_appliance_event(
                     {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
-                    _fanout_payload(camera, event_id, camera_id, event_type, event_timestamp, facial_notify_message),
+                    _fanout_payload(camera, event_id, camera_id, event_type, event_timestamp, facial_notify_message, local_event_id),
                 )
             except Exception:
                 logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
