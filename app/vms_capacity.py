@@ -9,12 +9,15 @@ sync, and it is kept here so it keeps applying offline (Local mode).
 The recording/live pipeline asks camera_licensed() through camera_url(), the
 one place every camera worker resolves its camera:
 
-- capacity known: only the first N provisioned camera numbers run;
-- never synced but activated (claimed before this existed, or claimed
-  moments ago): unchanged behaviour until the first sync arrives, so an
-  upgrade never interrupts working cameras;
-- never activated (a copied installer that was never claimed, even with
-  legacy CAMERA<n>_HOST settings): nothing runs.
+- capacity known: only the first N provisioned camera numbers run
+  (0 runs none);
+- no authoritative capacity yet -- never claimed, claimed moments ago, or
+  just upgraded from a build without this -- nothing runs (fail closed,
+  2026-10-02 Codex finding): legacy CAMERA<n>_* settings cannot operate a
+  camera before the cloud has said what this appliance may run. The first
+  configuration sync (seconds after activation) enables the licensed
+  cameras; the supervisor keeps polling refused slots, so no restart is
+  needed. Claiming and registering never depend on this.
 
 A cloud process runs no camera pipeline and is never restricted here.
 """
@@ -77,12 +80,12 @@ def _activated() -> bool:
 
 def licensed_camera_numbers(provisioned: list[int]) -> list[int] | None:
     """The provisioned camera numbers this appliance may run, or None for
-    "no limit applies" (cloud, or activated but never synced)."""
+    "no limit applies" (the cloud only, which runs no cameras)."""
     if _cloud_runtime():
         return None
     capacity = load_capacity()
     if capacity is None:
-        return None if _activated() else []
+        return []  # no authoritative capacity yet: fail closed
     return sorted(provisioned)[: int(capacity["camera_slot_quantity"])]
 
 

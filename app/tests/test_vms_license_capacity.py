@@ -156,10 +156,50 @@ def test_a_synced_capacity_limits_which_cameras_run(edge, monkeypatch):
     assert vms_capacity.licensed_camera_numbers([1, 2, 3]) == []
 
 
-def test_a_claimed_appliance_keeps_running_until_its_first_sync(edge):
+def test_an_activated_appliance_runs_nothing_before_its_first_authoritative_sync(edge, monkeypatch):
+    """Fail closed (2026-10-02, Codex): before the cloud has said what this
+    appliance may run, nothing runs -- legacy CAMERA<n>_* settings included."""
     vms_capacity, state = edge
     state["activated"] = True
-    assert vms_capacity.licensed_camera_numbers([1, 2, 3]) is None  # unchanged behaviour until the cloud says
+    assert vms_capacity.licensed_camera_numbers([1, 2, 3]) == []
+    import main
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2])
+    for n in (1, 2):
+        monkeypatch.setenv(f"CAMERA{n}_HOST", f"192.0.2.{n}")
+        monkeypatch.setenv(f"CAMERA{n}_USERNAME", "admin")
+        monkeypatch.setenv(f"CAMERA{n}_PASSWORD", "secret")
+        with pytest.raises(main.CameraNotLicensedError):
+            main.camera_url(n)
+
+
+@pytest.mark.parametrize("capacity,expected", [(0, []), (1, [1]), (2, [1, 2]), (8, [1, 2, 3])])
+def test_authoritative_capacity_allows_exactly_n(edge, capacity, expected):
+    vms_capacity, _ = edge
+    vms_capacity.persist_capacity({"camera_slot_quantity": capacity})
+    assert vms_capacity.licensed_camera_numbers([3, 1, 2]) == expected
+
+
+def test_a_later_valid_sync_enables_the_licensed_cameras(edge, monkeypatch):
+    vms_capacity, state = edge
+    state["activated"] = True
+    import main
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2])
+    monkeypatch.setenv("CAMERA1_HOST", "192.0.2.21")
+    monkeypatch.setenv("CAMERA2_HOST", "192.0.2.22")
+    with pytest.raises(main.CameraNotLicensedError):
+        main.camera_url(1)
+    assert vms_capacity.persist_capacity({"camera_slot_quantity": 1}) is True  # first configuration sync
+    assert "192.0.2.21" in main.camera_url(1)
+    with pytest.raises(main.CameraNotLicensedError):
+        main.camera_url(2)
+
+
+def test_claiming_never_depends_on_capacity(client, db_path):
+    """Registration/activation stays independent of the licence and of
+    capacity (the owner's decision): an unlicensed customer still activates."""
+    _seed_tenant(db_path)
+    _entitle(db_path)  # no plan, no licence
+    assert _activated(client, db_path)
 
 
 def test_an_older_cloud_without_capacity_changes_nothing(edge):
