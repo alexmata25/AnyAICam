@@ -26,6 +26,8 @@ def http_client(tmp_path, monkeypatch):
 
 def _admin_session():
     main.save_users([{"id": "admin-1", "email": "admin@example.test", "role": "administrator", "enabled": True, "camera_ids": []}])
+    from global_admin_helper import make_live_global_admin
+    make_live_global_admin("admin@example.test")  # identity grants require a live global administrator (2026-10-02)
     return main.create_session("admin-1")
 
 
@@ -196,9 +198,8 @@ def test_grant_list_shows_active_and_revoked_grants(http_client):
 
     response = client.get("/api/operations/identity-grants", cookies={main.SESSION_COOKIE_NAME: token})
     assert response.status_code == 200
-    grants = response.json()["grants"]
+    grants = [g for g in response.json()["grants"] if g["email"] == "amata@anyaicam.com"]  # the acting admin's own grant aside
     assert len(grants) == 1
-    assert grants[0]["email"] == "amata@anyaicam.com"
     assert grants[0]["revoked_at"] is None
 
 

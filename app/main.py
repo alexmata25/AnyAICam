@@ -52251,11 +52251,29 @@ _GRANT_ROLE_LABELS = {
 }
 
 
+def _is_live_global_administrator(user) -> bool:
+    """Identity grants decide who may administer every appliance, so only a
+    LIVE global administrator grant may see or change them (2026-10-02,
+    Codex launch blocker): manage_settings alone let a legacy support_admin
+    create a global administrator grant and escalate any portal account."""
+    if not user or not has_permission(user, "manage_settings") or not user.get("email"):
+        return False
+    from appliance_identity import has_global_administrator_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        return has_global_administrator_grant(db, email=str(user.get("email")))
+
+
+def _require_live_global_administrator(request: Request) -> dict:
+    user = current_user(request)
+    if not _is_live_global_administrator(user):
+        raise HTTPException(status_code=403, detail="Platform administrator access is required.")
+    return user
+
+
 @app.get("/api/operations/identity-grants")
 def list_identity_grants(request: Request) -> dict:
-    user = current_user(request)
-    if not has_permission(user, "manage_settings"):
-        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    user = _require_live_global_administrator(request)
     from partner_db import connection as partner_connection
     with partner_connection() as db:
         grants = db.execute(
@@ -52268,9 +52286,7 @@ def list_identity_grants(request: Request) -> dict:
 
 @app.post("/api/operations/identity-grants")
 def create_identity_grant(request: Request, payload: dict) -> dict:
-    user = current_user(request)
-    if not has_permission(user, "manage_settings"):
-        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    user = _require_live_global_administrator(request)
     email = str(payload.get("email", "")).strip().lower()
     role = str(payload.get("role", "")).strip()
     scope_type = str(payload.get("scope_type", "")).strip()
@@ -52297,9 +52313,7 @@ def create_identity_grant(request: Request, payload: dict) -> dict:
 
 @app.post("/api/operations/identity-grants/{grant_id}/revoke")
 def revoke_identity_grant(request: Request, grant_id: str) -> dict:
-    user = current_user(request)
-    if not has_permission(user, "manage_settings"):
-        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    user = _require_live_global_administrator(request)
     from appliance_identity import revoke_grant
     from partner_db import connection as partner_connection
     with partner_connection() as db:
@@ -52331,7 +52345,7 @@ def revoke_identity_grant(request: Request, grant_id: str) -> dict:
 @app.get("/operations/identity-grants", response_class=HTMLResponse)
 def identity_grants_page(request: Request) -> str:
     user = current_user(request)
-    if not has_permission(user, "manage_settings"):
+    if not _is_live_global_administrator(user):
         return permission_denied_page("Identity grants", "operations", "manage_settings")
     record_audit(request, "view", "operations:identity-grants", "Opened identity grant management.")
     from partner_db import connection as partner_connection

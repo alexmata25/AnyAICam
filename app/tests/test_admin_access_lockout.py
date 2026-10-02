@@ -187,7 +187,9 @@ def test_the_change_password_page_asks_for_the_current_password_only_when_not_fo
 
 
 def _local_admin_session(role="administrator"):
-    main.save_users([{"id": "admin-1", "email": "admin@example.test", "role": role, "enabled": True, "camera_ids": []}])
+    # The acting Admin Portal session is the platform owner itself (a live
+    # global administrator, 2026-10-02 -- identity grants require one).
+    main.save_users([{"id": "admin-1", "email": ADMIN_EMAIL, "role": role, "enabled": True, "camera_ids": []}])
     return main.create_session("admin-1")
 
 

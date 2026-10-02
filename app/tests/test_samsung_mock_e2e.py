@@ -76,7 +76,11 @@ def _legacy_admin_session():
     cloud/partner identity, exactly matching this session's own
     "admin@local is bootstrap/emergency only" design: an operator's own
     grants come from the cloud grant system, never from being admin@local."""
-    main.save_users([{"id": "bootstrap-admin", "email": "admin@local", "role": "administrator", "enabled": True, "camera_ids": []}])
+    # The acting Admin Portal session must be a live platform administrator
+    # (2026-10-02); a real platform account, never the local admin@local.
+    main.save_users([{"id": "bootstrap-admin", "email": "platform-admin@anyaicam.test", "role": "administrator", "enabled": True, "camera_ids": []}])
+    from global_admin_helper import make_live_global_admin
+    make_live_global_admin("platform-admin@anyaicam.test")
     return main.create_session("bootstrap-admin")
 
 

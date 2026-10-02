@@ -59,6 +59,8 @@ def http_client(tmp_path, monkeypatch):
 
 def _admin_session():
     main.save_users([{"id": "admin-1", "email": "admin@local", "role": "administrator", "enabled": True, "camera_ids": []}])
+    from global_admin_helper import make_live_global_admin
+    make_live_global_admin("admin@local")  # identity grants require a live global administrator (2026-10-02)
     return main.create_session("admin-1")
 
 
