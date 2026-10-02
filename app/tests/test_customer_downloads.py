@@ -187,3 +187,54 @@ def test_my_subscription_says_when_the_installer_is_not_released_yet(license_por
     _license(db_path)
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
     assert "will appear here when it is released" in html
+
+
+# ------------------------------------------------------------------ install + activate steps
+
+def test_steps_use_the_customer_claim_flow_with_this_portal_and_the_plan_mode(license_portal, db_path, storage, package, monkeypatch):
+    """The customer path is `anyaicam-setup --claim` with this portal's
+    address: plain `anyaicam-setup` is the administrator Cloud ID + token
+    flow, and its Portal URL default is the appliance's own local VMS."""
+    import main
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://portal.anyaicam.com")
+    client, _, _ = license_portal
+    _seed(db_path)
+    _license(db_path, product="camera_slots_local", quantity=8)
+    _license(db_path)
+    _publish(package)
+    html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
+    assert 'id="vms-installer-steps"' in html
+    assert "sudo ./install.sh --product-mode=local" in html and "sudo ./validate.sh" in html
+    assert "anyaicam-setup --claim --portal-url=https://portal.anyaicam.com" in html
+    assert 'href="/customer/claim-appliance"' in html
+    # The archive has no top-level folder: unpack it into one, by its real name.
+    assert f"tar -xzf {PACKAGE} -C anyaicam-installer" in html
+    assert "anyaicam-setup</code>" not in html  # the administrator flow is never offered
+
+
+def test_steps_follow_the_plan_and_never_offer_a_local_address():
+    import main
+    hybrid = main._installer_steps_html("hybrid")
+    assert "--product-mode=hybrid" in hybrid
+    none = main._installer_steps_html(None)
+    assert "--product-mode" not in none and "Choose <strong>local</strong> or <strong>hybrid</strong>" in none
+    for local in ("", "http://localhost:8000", "http://127.0.0.1:8000"):
+        original = main.PUBLIC_BASE_URL
+        try:
+            main.PUBLIC_BASE_URL = local
+            steps = main._installer_steps_html("local")
+        finally:
+            main.PUBLIC_BASE_URL = original
+        assert "--portal-url" not in steps and "enter the address of this portal" in steps
+        assert "anyaicam-setup --claim" in steps
+
+
+def test_steps_escape_the_portal_address():
+    import main
+    original = main.PUBLIC_BASE_URL
+    try:
+        main.PUBLIC_BASE_URL = 'https://p.example/"><script>x</script>'
+        steps = main._installer_steps_html("local")
+    finally:
+        main.PUBLIC_BASE_URL = original
+    assert "<script>" not in steps

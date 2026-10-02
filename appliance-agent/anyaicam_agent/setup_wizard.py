@@ -268,9 +268,40 @@ def _complete_claim_with_retry(client:PortalClient,config:AgentConfig,state:dict
     raise SystemExit(f'Claim completion failed after {attempts} attempts: {last_error}. Run anyaicam-setup --claim again to retry -- it is safe to retry the same claim.')
 
 
-def claim_main():
+def _option(args,name:str) -> str|None:
+    """--name=value or --name value; None when the option is absent."""
+    for index,arg in enumerate(args):
+        if arg.startswith(name+'='): return arg.split('=',1)[1]
+        if arg==name: return args[index+1] if index+1<len(args) else ''
+    return None
+
+
+def _apply_portal_options(config:AgentConfig,args) -> None:
+    """Customer install (2026-10-01): My subscription gives the owner one
+    exact command, `anyaicam-setup --claim --portal-url=<their portal>`. The
+    installer's bootstrap agent.env points at http://127.0.0.1:8000 -- on an
+    appliance that is the local VMS, not the AnyAiCam cloud -- so pressing
+    Enter at the old Portal URL prompt could never claim anything. With
+    --portal-url the cloud address and production mode are taken from the
+    command and nothing is asked; without it the prompts are unchanged."""
+    portal_url=_option(args,'--portal-url')
+    if portal_url is None:
+        config.portal_url=input(f'Portal URL [{config.portal_url}]: ').strip() or config.portal_url
+        config.mode=input(f'Mode (development/production) [{config.mode}]: ').strip() or config.mode
+        return
+    portal_url=portal_url.strip().rstrip('/')
+    if not portal_url.startswith(('https://','http://')) or not portal_url.split('://',1)[1] or ' ' in portal_url:
+        raise SystemExit(f'--portal-url must be the full web address of your AnyAiCam portal, for example https://portal.anyaicam.com (got {portal_url!r}).')
+    mode=_option(args,'--mode') or 'production'
+    if mode not in ('development','production'):
+        raise SystemExit("--mode must be 'production' or 'development'.")
+    config.portal_url=portal_url; config.mode=mode
+    print(f'Portal: {config.portal_url}')
+
+
+def claim_main(args=()):
     print('\nAnyAiCam appliance claim\n')
-    config=AgentConfig.load(); config.portal_url=input(f'Portal URL [{config.portal_url}]: ').strip() or config.portal_url; config.mode=input(f'Mode (development/production) [{config.mode}]: ').strip() or config.mode
+    config=AgentConfig.load(); _apply_portal_options(config,list(args))
     device_id=_installer_device_id(config)
     client=PortalClient(config.portal_url)
     try: info=client.test(); print('Portal connectivity: OK',info.get('mode'))
@@ -372,7 +403,7 @@ def wireguard_enroll_main():
 def main():
     args=sys.argv[1:]
     if '--wireguard-enroll' in args: wireguard_enroll_main()
-    elif '--claim' in args: claim_main()
+    elif '--claim' in args: claim_main(args)
     else: interactive_main()
 
 

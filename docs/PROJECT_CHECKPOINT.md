@@ -5391,3 +5391,96 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
 
 **Open, handle separately after this release is stable (not investigated or changed now)**
 - Some primary recordings on the Ryzen are older than the 7-day retention: the oldest `camera*/` file was 9.5 days old on 2026-10-01. The existing recording retention seems to skip some files.
+
+## 2026-10-01 evening: Ryzen release `b46cb43` INSTALLED and validated; checkpoint COMPLETE
+
+- **Installed** by the owner with `sudo ./install.sh --repair` from `~/anyaicam-release-b46cb43` (23:10–23:15 UTC). Repair of an existing install: appliance identity preserved (sha256 `1b418261…`), product mode left unset (legacy), MediaMTX unchanged, WebRTC firewall reinstalled.
+- **Root validation** (`~/validate-b46cb43-root.log`, 23:58 UTC): **PASSED, 0 failures** (26 checks). An earlier non-root run showed 11 failures; every one was a root-only read (`/etc/anyaicam` is 0750, quarantine dir, firewall/port owner), not a defect.
+- **Independently verified:**
+  - `/health`, `/version` and the container env report `b46cb43e2414…`.
+  - All 569 running source files hash-match the payload, and the running `app/main.py` equals the git blob.
+  - The VMS archive sha256 `715dc89f…` reproduces from git.
+  - Rollback image `anyaicam-vms:rollback-2e1086246293` contains 2e10862's exact `main.py`, and the pre-upgrade DB backup exists.
+  - SQLite integrity ok. No table lost rows; 5 additive tables (`access_door_*`, `sms_test_sends`). Customer, appliance and 9 camera rows unchanged.
+  - 0 restarts, 0 tracebacks.
+  - 4/5 cameras recording; Bedroom has been offline since 2026-09-29 (no ARP reply), so this is not a regression.
+- **Behaviour verified:**
+  - 98+ analytics events after the install.
+  - **Line-crossing events receive a playable clip** (H.264 720p and AAC; cloud `accepted`; plays in the browser from S3).
+  - The Talk greeting played (ISAPI 200s) and the Talk relay is connected. MediaMTX and the WebRTC publisher are up.
+  - The agent re-entitled (8 slots). The sync flags are still on.
+  - Face Access unlock is fail-closed and simulated, because `relay_control.get_provider()` is always simulated in this build. Front Door is door-enabled on channel 1, and no relay hardware is attached.
+- **Browser (staging `b46cb43`, signed in, 1366px and 390px):**
+  - All 24 customer pages load with no console or API errors, no raw ISO timestamps, and no page-level horizontal scroll.
+  - Live video plays and event clips play.
+  - Friends & Family is unchanged (approved state; 50/25/0 rule as on golden).
+- Samsung untouched.
+
+## Launch remediation list (confirmed 2026-10-01, all pre-existing, none caused by `b46cb43`)
+
+1. **Offline cameras must clearly show "Camera offline".** The Dashboard currently says "Configured", the camera page shows "Starting live view…" forever, and the Live tile is plain black (Bedroom).
+2. **Facial-recognition events need a correctly associated, playable cloud clip.** Each FR moment is 3–8 s after its parent `person` clip ended (for example FR 23:10:11 against a clip ending 23:10:08), so the cloud's `.../media/shared` rightly answers 403 ("moment is outside the claimed parent's clip"). The parent-clip association and timing need to be fixed on the edge.
+3. **Dashboard "Live view" button overlaps the status line.** `.action-button` is `display:inline` with vertical padding inside `.feature-card`.
+4. **The clip duration shown to the customer must be the real duration**, not a hardcoded "10s". For example, a clip labelled 10s is 7.5 s, and the Ryzen log says "created clip (10.0s)" for a 6.9 s file.
+5. **Redact RTSP credentials from customer and appliance logs.** FFmpeg error lines print `rtsp://user:password@…`, and the credentials are also on the ffmpeg command line in the process list.
+- Low priority: the Cloudflare beacon is blocked by CSP, and `/favicon.ico` returns 404.
+- **Launch blocker (next phase):** My subscription says "The installer download will appear here when it is released." The customer installer download and release wiring is not live. Covered by the installer + licensed download + activation E2E phase.
+- Roadmap (owner-requested 2026-10-01): Face Access **Backup Mobile Access**, being implemented software-only on `feature/face-access-backup-mobile-access`. Physical relay, strike and maglock validation is deferred until hardware is available.
+
+## Pre-launch checklist additions (owner, 2026-10-01)
+
+- **Face Access Backup Mobile Access** (software-only now): per-person backup PIN (hashed, set/change/reset, never shown), Unlock Door from People/Face Access, session + PIN, permission/schedule/date/revocation checks, rate limiting, short-lived replay-protected cloud→appliance command, honest "no door hardware configured" result, audit states, denial/success tones. Physical relay/strike/maglock validation is deferred. Branch `feature/face-access-backup-mobile-access`.
+- **Business Partner program**, after the installer phase:
+  - Referral Partner (existing 20% recurring commission and activation/hardware rules preserved).
+  - New Reseller Partner: wholesale floor, partner-set selling price, margin ledger with refund/cancel/dispute reversal, F&F never below the wholesale floor, partner-scoped pricing, global-admin control.
+  - Fix: 10% display default vs the 20% ledger; multi-line/add-on invoice commissions; the add-on-before-first-plan-invoice edge case.
+  - Uses the current pricing catalog. The Videoloft Partner Portal is unchanged.
+  - **Stop for owner approval of wholesale levels and limits before any customer-facing price.**
+
+## Installer + licensed download + activation E2E (in progress, branch `fix/launch-installer-e2e-20261001`)
+
+- **Why My subscription says "will appear here when it is released":** the download feature (`customer_downloads.py`, licensed-owner-only route, private `downloads` storage) is on golden, but no installer has ever been published (`latest_vms_installer()` is `None` on staging; staging storage is local, `/app/recordings/storage`). Publishing is the operator step `python -m customer_downloads publish <pkg> <commit> <version>`.
+- **Launch blocker fixed:** the page told customers to run `anyaicam-setup`, the administrator Cloud ID + activation-token flow a customer never receives. Its Portal URL default `http://127.0.0.1:8000` is the appliance's own VMS, not the cloud. The page now gives `install.sh --product-mode=<plan>`, `validate.sh`, `anyaicam-setup --claim --portal-url=<ANYAICAM_PUBLIC_URL>` and a link to Claim an appliance. The agent accepts `--portal-url` (production mode, no prompts) and keeps the old prompts without it.
+
+## Pre-launch: customer account users / household members (inspected 2026-10-01, NOT built)
+
+**Already exists (reuse, do not duplicate):**
+- `partner_users` with role `customer_viewer` under the owner's `customer_id`, plus an `identity_grants` row, so the appliance's cloud-delegated login recognises them.
+- Per-camera permissions in `customer_camera_permissions`: `can_live`, `can_playback`, `can_download`, `can_share`, `can_alerts`, `can_settings`, `can_talk`, `can_unlock`.
+- Camera access mode all/selected through owner-only `POST/DELETE /api/customer/users/{id}/camera-access`.
+- Per-door unlock access for viewers in Camera Settings (`/door-config/unlock-access`).
+- Viewers are already enforced in live view, playback, Talk, door unlock and notifications (`notification_engine` filters a viewer's alerts to their cameras).
+- Separate login with a temporary password and forced first-sign-in change (`must_change_password`).
+- Password reset, account unlock and change-email for customer users through the partner admin routes.
+
+**Missing:**
+1. **No customer-reachable way to add a user.** `POST /api/partner/users/invite` is gated by `require_partner_access` (partner roles only), so a `customer_owner` is refused even though its permission set includes `user.invite`. Today only a partner or admin can create a household member.
+2. **No customer UI:** no Account → Users / Household page (list, add, edit, remove or disable, resend).
+3. **Invitation is a temporary password by email** (`invitations.status='preview'`), not a single-use, expiring accept link. There is no SMS/phone invite.
+4. **No customer-facing permission editor.** The camera-access API exists but has no page. There are no permissions for People/Face Access management or Backup Mobile Access (the `customer_viewer` role has `facial.view` only).
+5. No owner-side remove or disable of a household user, and no audit view of it.
+- `/api/user-invites` (main.py) is the legacy local-VMS user system (`current_user()`), not cloud customer accounts. Do not extend it for this.
+
+## Pre-launch: Customer VMS Software Update (inspected 2026-10-01, NOT built)
+
+Goal: routine updates without AnyAiCam staff remoting in, via Settings → System → Software Update (current version, approved version, release notes, Update Now).
+
+**Reusable (already on golden):**
+- **Agent updater (RDM-1/2, `appliance-agent/anyaicam_agent/updater/`, about 2,300 lines):**
+  - RSA-signed manifest checked against a single pinned public key, plus the package SHA-256 (`verify.py`).
+  - Authenticated manifest fetch with a presigned package download (`s3_source.py`).
+  - Version directories with an atomic pointer switch (`installer.py`).
+  - Crash-safe state machine: a marker written before every switch, a health check after restart, automatic rollback (`state_machine.py`, `health.py`).
+  - An idempotent, durable history (`history.py`).
+  - Periodic source checks are wired in `service.py`. `install_update` is in the command allow-list.
+- **Cloud:** `GET /api/appliance/updates/latest` (signs the manifest, 300 s presigned URL), the `POST .../updates/{id}/result` ledger (`appliance_update_results`), and `updates_storage.publish_release()`.
+- **Root side:** the privileged watcher (`appliance-agent/system/privileged_watcher.py`), with a fixed DISPATCH table that never runs marker-supplied input.
+- **Release installer:** `install.sh --repair` creates a rollback point (image, code, DB) and preserves identity, configuration and DB. `validate.sh` is the post-update gate, and `rollback.sh` restores. All proven on the Ryzen (b46cb43).
+- **Manual/offline path for Local:** the licensed My subscription installer download (`customer_downloads.py`) plus `sudo ./install.sh --repair`.
+
+**Missing:**
+1. **Nothing applies a staged release to the running VMS.** The updater's activation only switches `updates/current_version.txt`; no code consumes it. A root-side apply step is needed: a new watcher action, such as `apply_vms_release`, that re-verifies the staged package's signature **as root**, runs `install.sh --repair`, then `validate.sh`, then `rollback.sh` on failure, and reports the result. **Security:** root must never execute from the agent-writable directory without that re-verification.
+2. **No device holds the pinned update public key.** No installer step writes `trusted_signing_key.pem`, so verification fails closed everywhere today. The cloud needs `ANYAICAM_UPDATE_SIGNING_KEY_FILE` (key custody is an owner decision).
+3. No release-publishing CLI or admin "approve release for channel" step (only `publish_release()`).
+4. No customer Software Update UI (cloud portal or local VMS), no "update available" email/in-app notice, and no per-appliance progress or result view.
+5. Local-mode UI should point to the manual path (download, then `install.sh --repair`). The installer is never emailed.

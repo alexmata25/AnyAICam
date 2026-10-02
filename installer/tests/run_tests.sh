@@ -1265,6 +1265,18 @@ VMS_PUBLISHES_8000=yes; PORT_8000_FREE=no
 assert_exit "the appliance's own VMS publish passes (repair/upgrade)" 0 vms_http_port_preflight
 unset -f docker vms_http_port_bindable
 source "$INSTALLER_DIR/01-preflight.sh"
+
+echo "== RAM floor (01-preflight.sh ram_floor_ok) =="
+# Real MemTotal readings: 8 GB machines report ~7.6-7.9 GiB after firmware/
+# kernel reservations; they must pass. 6 GB and smaller must not.
+assert_exit "8 GB PC reporting 7.85 GiB MemTotal -> passes" 0 ram_floor_ok 8231100
+assert_exit "8 GB PC reporting 7.60 GiB MemTotal -> passes" 0 ram_floor_ok 7969177
+assert_exit "8 GB VM (c5.xlarge-class) reporting 7.40 GiB -> passes" 0 ram_floor_ok 7759462
+assert_exit "16 GB PC -> passes" 0 ram_floor_ok 16300000
+assert_exit "6 GB PC reporting 5.8 GiB -> fails" 1 ram_floor_ok 6081740
+assert_exit "just under the 7.2 GiB allowance -> fails" 1 ram_floor_ok 7549746
+assert_exit "exactly the 7.2 GiB allowance -> passes" 0 ram_floor_ok 7549747
+assert_exit "non-numeric MemTotal -> refused" 2 ram_floor_ok "unknown"
 assert_exit "install.sh runs the TCP 8000 preflight right after the UDP one, before docker_setup" 0   bash -c "grep -A1 '^    webrtc_port_preflight\$' '$INSTALLER_DIR/install.sh' | grep -q '^    vms_http_port_preflight\$' && [ \$(grep -n '^    vms_http_port_preflight\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) -lt \$(grep -n '^    docker_setup\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) ]"
 assert_exit "install.sh runs the port preflight right after preflight_checks, before anything is changed" 0 \
   bash -c "grep -A1 '^    preflight_checks\$' '$INSTALLER_DIR/install.sh' | grep -q '^    webrtc_port_preflight\$' && [ \$(grep -n '^    webrtc_port_preflight\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) -lt \$(grep -n '^    docker_setup\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) ]"
