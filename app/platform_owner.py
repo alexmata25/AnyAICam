@@ -422,17 +422,42 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         return {"mfa_enabled": confirmed, "recovery_codes_remaining": int(remaining) if confirmed else 0}
 
     @app.post("/api/platform-owner/mfa/enroll")
-    def platform_owner_mfa_enroll(request: Request) -> dict:
+    def platform_owner_mfa_enroll(request: Request, payload: dict | None = None) -> dict:
+        """First enrollment, or replacing a confirmed factor (2026-10-02).
+        Re-enrolling used to overwrite the confirmed secret and clear
+        confirmed_at, so a session holder could switch MFA off by starting
+        an enrollment and abandoning it. Now a replacement needs a current
+        code from the confirmed factor, is stored as pending, and the
+        confirmed factor stays in force until the replacement is confirmed."""
         actor = _require_global_grant_session(request)
         secret = generate_totp_secret()
+        from partner_db import audit as partner_audit
         from partner_db import connection
 
+        now = datetime.now().isoformat()
         with connection() as db:
-            db.execute(
-                "INSERT INTO platform_owner_mfa(user_id,secret_base32,confirmed_at,created_at) VALUES(?,?,NULL,?) "
-                "ON CONFLICT(user_id) DO UPDATE SET secret_base32=excluded.secret_base32, confirmed_at=NULL, created_at=excluded.created_at",
-                (actor["user_id"], secret, datetime.now().isoformat()),
-            )
+            current = db.execute("SELECT secret_base32,confirmed_at FROM platform_owner_mfa WHERE user_id=?", (actor["user_id"],)).fetchone()
+            replacing = bool(current and current["confirmed_at"])
+            if replacing:
+                if not verify_totp_code(current["secret_base32"], str((payload or {}).get("current_code", ""))):
+                    reauth_failed = True
+                else:
+                    reauth_failed = False
+                    db.execute("UPDATE platform_owner_mfa SET pending_secret_base32=?,pending_created_at=? WHERE user_id=?",
+                               (secret, now, actor["user_id"]))
+            else:
+                reauth_failed = False
+                db.execute(
+                    "INSERT INTO platform_owner_mfa(user_id,secret_base32,confirmed_at,created_at) VALUES(?,?,NULL,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET secret_base32=excluded.secret_base32, confirmed_at=NULL, created_at=excluded.created_at,"
+                    " pending_secret_base32=NULL, pending_created_at=NULL",
+                    (actor["user_id"], secret, now),
+                )
+        if reauth_failed:
+            partner_audit({"email": actor["email"], "role": "administrator"}, "mfa_replace_denied", "platform_owner_mfa", actor["user_id"])
+            raise HTTPException(status_code=403, detail="Enter a current code from your existing authenticator to replace it.")
+        if replacing:
+            partner_audit({"email": actor["email"], "role": "administrator"}, "mfa_replace_started", "platform_owner_mfa", actor["user_id"])
         return {
             "status": "enrolled_pending_confirmation",
             "secret_base32": secret,
@@ -448,12 +473,16 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         from partner_db import connection
 
         with connection() as db:
-            row = db.execute("SELECT secret_base32 FROM platform_owner_mfa WHERE user_id=?", (actor["user_id"],)).fetchone()
-            if not row:
+            row = db.execute("SELECT secret_base32,confirmed_at,pending_secret_base32 FROM platform_owner_mfa WHERE user_id=?", (actor["user_id"],)).fetchone()
+            if not row or (row["confirmed_at"] and not row["pending_secret_base32"]):
                 raise HTTPException(status_code=400, detail="No pending MFA enrollment. Call enroll first.")
-            if not verify_totp_code(row["secret_base32"], code):
+            # A replacement is confirmed against the NEW secret; until then the
+            # confirmed factor is untouched.
+            candidate = row["pending_secret_base32"] or row["secret_base32"]
+            if not verify_totp_code(candidate, code):
                 raise HTTPException(status_code=400, detail="Incorrect code.")
-            db.execute("UPDATE platform_owner_mfa SET confirmed_at=? WHERE user_id=?", (datetime.now().isoformat(), actor["user_id"]))
+            db.execute("UPDATE platform_owner_mfa SET secret_base32=?,confirmed_at=?,pending_secret_base32=NULL,pending_created_at=NULL WHERE user_id=?",
+                       (candidate, datetime.now().isoformat(), actor["user_id"]))
             codes = generate_recovery_codes(db, user_id=actor["user_id"])
         partner_audit({"email": actor["email"], "role": "administrator"}, "mfa_confirm", "platform_owner_mfa", actor["user_id"])
         return {"status": "confirmed", "recovery_codes": codes, "message": "MFA is now required for this account's Admin Portal logins. Save these recovery codes -- they are shown only once."}
