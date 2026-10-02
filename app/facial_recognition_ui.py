@@ -292,6 +292,7 @@ async function loadPerson(){
   const list=$('e-image-list');
   list.innerHTML=(p.reference_images||[]).length?('<p class="health-detail">'+p.reference_images.length+' face photo(s) enrolled.</p>'):'<p class="health-detail">No face photo yet. Add one below.</p>';
   loadAccess();
+  loadBackup();
 }
 
 $('e-create')?.addEventListener('click',async()=>{
@@ -402,6 +403,33 @@ $('a-save')?.addEventListener('click',async()=>{
   const result=await r.json().catch(()=>({}));
   say('a-status',r.ok?'Face Access saved.':(result.detail||'Could not save Face Access.'));
   if(r.ok)loadAccess();
+});
+// ---------- Backup Mobile Access
+async function loadBackup(){
+  const r=await fetch(PERSON_URL(personId).replace(/(\?|$)/,'/backup-access$1'));
+  if(!r.ok){$('b-panel').hidden=true;return}
+  const b=await r.json();$('b-panel').hidden=false;
+  $('b-pin-state').textContent=b.locked?'Too many wrong PINs -- backup access is paused for a few minutes.':(b.pin_set?`A Backup Access PIN is set${b.pin_set_at?' (since '+new Date(b.pin_set_at).toLocaleDateString()+')':''}. It is never shown.`:'No Backup Access PIN is set yet.');
+  $('b-pin-manage').hidden=!b.can_manage_pin;$('b-pin-save').textContent=b.pin_set?'Change PIN':'Set PIN';$('b-pin-reset').hidden=!b.pin_set;
+  const usable=b.doors.filter(d=>d.open_now);
+  $('b-unlock').hidden=!(b.can_unlock&&b.pin_set&&usable.length);
+  $('b-door').innerHTML=usable.map(d=>`<option value="${esc(d.camera_id)}">${esc(d.name)}</option>`).join('');
+  if(b.can_unlock&&b.pin_set&&!usable.length)say('b-status',b.doors.length?'None of this person’s doors are open to them right now.':'This person has no doors yet.');
+}
+$('b-pin-save')?.addEventListener('click',async()=>{
+  const r=await fetch(PERSON_URL(personId).replace(/(\?|$)/,'/backup-pin$1'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:$('b-pin-new').value})});
+  const x=await r.json().catch(()=>({}));$('b-pin-new').value='';say('b-status',x.message||x.detail||'Could not save the PIN.');if(r.ok)loadBackup();
+});
+$('b-pin-reset')?.addEventListener('click',async()=>{
+  if(!confirm('Remove this person’s Backup Access PIN? They can’t use backup access until a new one is set.'))return;
+  const r=await fetch(PERSON_URL(personId).replace(/(\?|$)/,'/backup-pin$1'),{method:'DELETE'});
+  const x=await r.json().catch(()=>({}));say('b-status',x.message||x.detail||'');if(r.ok)loadBackup();
+});
+$('b-go')?.addEventListener('click',async()=>{
+  const btn=$('b-go');btn.disabled=true;say('b-status','Checking…');
+  const r=await fetch(PERSON_URL(personId).replace(/(\?|$)/,'/backup-unlock$1'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({camera_id:$('b-door').value,pin:$('b-pin').value})});
+  const x=await r.json().catch(()=>({}));$('b-pin').value='';btn.disabled=false;
+  say('b-status',x.message||x.detail||'The door was not unlocked.');loadBackup();
 });
 loadPerson();
 '''
@@ -870,6 +898,15 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
 <div class="time-row"><label>Start date<input type="date" id="a-starts"{ro}></label><label>Expiration date<input type="date" id="a-expires"{ro}></label><span class="health-detail">Leave empty for no limit. Turning Face Access off or an expired date stops every automatic unlock right away; history is kept.</span></div>
 <h3>Doors this person may open</h3><div id="a-doors"></div>
 ''' + ('<button class="action-button" id="a-save" type="button">Save Face Access</button>' if can_manage else "") + '''<p class="health-detail" id="a-status" role="status"></p></section>
+<section class="panel" id="b-panel" hidden><h2>Backup access</h2>
+<p class="health-detail">If face recognition doesn't let this person in, they can unlock a door they're allowed through from this page with their own PIN. Keys and normal exits always keep working without AnyAiCam.</p>
+<p id="b-pin-state" class="health-detail"></p>
+<div id="b-pin-manage" hidden><label>New Backup Access PIN (6&ndash;10 digits)<input id="b-pin-new" type="password" inputmode="numeric" autocomplete="new-password" maxlength="10"></label>
+<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="ghost-button" id="b-pin-save" type="button">Set PIN</button><button class="ghost-button" id="b-pin-reset" type="button" hidden>Remove PIN</button></div></div>
+<div id="b-unlock" hidden><label>Door<select id="b-door"></select></label>
+<label>PIN<input id="b-pin" type="password" inputmode="numeric" autocomplete="off" maxlength="10"></label>
+<button class="action-button" id="b-go" type="button">Unlock door</button></div>
+<p class="health-detail" id="b-status" role="status" aria-live="polite"></p></section>
 </div></div>''')
         scripts = ("<script>const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null")
                    + ";const CAN_MANAGE=" + json.dumps(bool(can_manage)) + ";\n" + PERSON_PAGE_JS + "</script>")

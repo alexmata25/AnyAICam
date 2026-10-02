@@ -1721,3 +1721,18 @@ def apply_migrations():
                    'can_people INTEGER NOT NULL DEFAULT 0,can_face_access INTEGER NOT NULL DEFAULT 0,can_backup_access INTEGER NOT NULL DEFAULT 0,'
                    'updated_at TEXT NOT NULL,updated_by TEXT)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_customer_user_permissions_customer ON customer_user_permissions(customer_id)')
+
+        # Face Access Backup Mobile Access (2026-10-01, backup_access.py):
+        # one hashed PIN per enrolled person (never a door or household PIN),
+        # with its wrong-PIN count and lockout; and the single-use unlock
+        # command ledger -- issued on the cloud, received on the appliance --
+        # whose primary key is what stops a command running twice. Audible
+        # door feedback (door_feedback.py) is off per door until the owner
+        # turns it on.
+        db.execute('CREATE TABLE IF NOT EXISTS facial_person_backup_pins(person_id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,'
+                   'pin_hash TEXT NOT NULL,set_at TEXT NOT NULL,set_by TEXT,failed_attempts INTEGER NOT NULL DEFAULT 0,'
+                   'locked_until TEXT,last_failed_at TEXT)')
+        db.execute('CREATE TABLE IF NOT EXISTS backup_unlock_commands(id TEXT PRIMARY KEY,customer_id TEXT,person_id TEXT,'
+                   'camera_id TEXT,actor_email TEXT,issued_at REAL NOT NULL,expires_at REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL)')
+        camera_columns=_columns('cameras')
+        if 'door_feedback_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_feedback_enabled INTEGER NOT NULL DEFAULT 0')

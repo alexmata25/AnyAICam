@@ -47,6 +47,7 @@ import time
 from pathlib import Path
 
 import door_access
+import door_feedback
 import facial_people
 import facial_recognition
 import relay_control
@@ -557,6 +558,9 @@ def record_facial_events(
                     facial_event_id=event["id"], authorization_result="authorized", relay_result="activated",
                     success=True, now=now,
                 )
+                # Audible feedback (door_feedback.py; off unless the owner
+                # turned it on for this door): two short beeps.
+                door_feedback.play_for_camera(context["id"], door_feedback.GRANTED)
             else:
                 # Mode 2: recognized, but not authorized for automatic
                 # entry at this door (no facial_rules row matched, or
@@ -578,6 +582,10 @@ def record_facial_events(
                     authorization_result="authorized" if outcomes else "not_authorized",
                     relay_result=relay_result, success=False, now=now,
                 )
+                # Denied -> one long tone; authorized but the relay didn't
+                # run (simulated, dry run, error) -> the distinct fault tone.
+                door_feedback.play_for_camera(context["id"], door_feedback.outcome_for(
+                    "authorized" if outcomes else "not_authorized", relay_result))
                 event["door_notify_message"] = f"{person_name or 'A recognized person'} is at {context['name']}."
         elif door_enabled and match_state == "unknown":
             # Mode 3: unknown person at a door camera. Never auto-
@@ -592,6 +600,7 @@ def record_facial_events(
                 matched_person_id=None, matched_person_name=None, facial_event_id=event["id"],
                 authorization_result="unknown_person", relay_result="skipped", success=False, now=now,
             )
+            door_feedback.play_for_camera(context["id"], door_feedback.DENIED)
             event["door_notify_message"] = f"Unknown person at {context['name']}."
     return created
 

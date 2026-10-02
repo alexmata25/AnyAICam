@@ -547,7 +547,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # recording strategy to run for a camera. Omitting it here would
         # be the exact same unreachable-in-practice gap this comment
         # already documents for people_counting_enabled.
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,door_access_enabled,door_relay_channel,door_relay_pulse_ms,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,door_access_enabled,door_relay_channel,door_relay_pulse_ms,door_feedback_enabled,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
         # analytics_rules (2026-09-21): the tenant-safe customer-drawn
         # Intrusion Zone / Line-Crossing rules (customer_analytics_
         # rules.py) for THIS appliance's own cameras only -- the same
