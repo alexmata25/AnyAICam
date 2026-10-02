@@ -28,6 +28,10 @@ EMAIL_TYPES={
     # Admin portal pass (2026-09-26): Customer accounts' payment reminder,
     # previously sent through a separate raw-SMTP path in main.py.
     'payment_reminder',
+    # Direct self-service signup (2026-10-02, direct_onboarding.py): the
+    # confirm-your-address link, and the note sent instead when the address
+    # already has an account. Additive only.
+    'email_verification',
 }
 
 

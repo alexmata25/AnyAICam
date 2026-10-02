@@ -31,6 +31,11 @@ def site(license_portal, db_path, monkeypatch, tmp_path):
 
     class _Mail:
         def send(self, message_type, to, subject, text, html=None, metadata=None, images=None):
+            # The real service refuses unknown types; so does this fake.
+            if message_type not in email_service.EMAIL_TYPES:
+                raise ValueError("Unsupported email type.")
+            if to.startswith("smtp-down"):
+                raise OSError("connection refused")
             mail.append({"to": to, "subject": subject, "text": text})
             return {"status": "sent"}
     monkeypatch.setattr(email_service, "get_email_service", lambda: _Mail())
@@ -287,3 +292,17 @@ def test_a_replayed_purchase_webhook_grants_the_entitlement_once_and_only_to_its
     import customer_entitlements as ce
     assert ce.total_camera_slots(a_id) == 8 and ce.total_camera_slots(b_id) == 0
     assert _count(db_path, "SELECT COUNT(*) FROM customer_entitlements WHERE customer_id=?", (a_id,)) == 1
+
+
+# ------------------------------------------------------------------ email delivery
+
+def test_the_real_email_service_accepts_the_signup_email_type():
+    import email_service
+    assert "email_verification" in email_service.EMAIL_TYPES
+
+
+def test_a_mail_outage_is_reported_plainly_and_creates_nothing(site, db_path):
+    client, _, mail = site
+    down = _signup(client, "smtp-down@example.test")
+    assert down.status_code == 503 and "couldn't send" in down.json()["detail"]
+    assert _count(db_path, "SELECT COUNT(*) FROM customers") == 0

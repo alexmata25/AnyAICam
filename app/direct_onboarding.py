@@ -28,6 +28,7 @@ unchanged.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta
@@ -39,6 +40,7 @@ from fastapi.responses import HTMLResponse
 from appliance_protocol import RateLimiter
 from partner_db import audit, connection, password_hash
 
+logger = logging.getLogger("anyaicam.direct_onboarding")
 HOUSE_PARTNER_ID = "anyaicam-primary"
 DIRECT_CHANNEL = "direct"
 VERIFY_TTL_HOURS = 24
@@ -147,14 +149,23 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
         from email_service import get_email_service
         if raw:
             link = f"{_base(request)}/customer/verify-email?token={raw}"
-            get_email_service().send("verification", email, "Confirm your AnyAiCam account",
-                                     f"Confirm your email address to finish creating your AnyAiCam account:\n{link}\n\n"
-                                     f"This link works once and expires in {VERIFY_TTL_HOURS} hours. If you didn't ask for this, ignore this email.")
-            audit({"email": email, "role": "anonymous"}, "direct_signup.started", "direct_signup", "")
+            subject = "Confirm your AnyAiCam account"
+            text = (f"Confirm your email address to finish creating your AnyAiCam account:\n{link}\n\n"
+                    f"This link works once and expires in {VERIFY_TTL_HOURS} hours. If you didn't ask for this, ignore this email.")
         else:
-            get_email_service().send("verification", email, "Your AnyAiCam account",
-                                     "Someone tried to create an AnyAiCam account with this email address, which already has one. "
-                                     "Sign in or reset your password instead. If this wasn't you, no action is needed.")
+            subject = "Your AnyAiCam account"
+            text = ("Someone tried to create an AnyAiCam account with this email address, which already has one. "
+                    f"Sign in or reset your password instead: {_base(request)}/customer-login.html\n\n"
+                    "If this wasn't you, no action is needed.")
+        try:
+            result = get_email_service().send("email_verification", email, subject, text)
+        except Exception as error:  # mail server down: say so plainly; a retry replaces the pending link
+            logger.warning("direct_signup.email_failed error=%s", type(error).__name__)
+            result = {"status": "failed"}
+        if isinstance(result, dict) and result.get("status") in ("failed", "error"):
+            raise HTTPException(status_code=503, detail="We couldn't send the confirmation email just now. Please try again in a few minutes.")
+        if raw:
+            audit({"email": email, "role": "anonymous"}, "direct_signup.started", "direct_signup", "")
         return {"message": GENERIC_SENT}
 
     @app.get("/customer/verify-email", response_class=HTMLResponse)
@@ -181,7 +192,12 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                 '<label>Email<input id="s-email" type="email" autocomplete="email" required></label>'
                 f'<label>Password<input id="s-password" type="password" minlength="{MIN_PASSWORD_LENGTH}" autocomplete="new-password" required></label>'
                 f'<label>Confirm password<input id="s-confirm" type="password" minlength="{MIN_PASSWORD_LENGTH}" autocomplete="new-password" required></label>'
-                '<div id="message" class="message" role="status"></div><button class="submit">Create account</button></form>'
+                f'<p style="margin:0;color:#4b5873;font-size:14px">At least {MIN_PASSWORD_LENGTH} characters.</p>'
+                '<div id="message" class="message" role="status"></div><button class="submit">Create account</button>'
+                '<p style="margin:0;color:#4b5873;font-size:13px">By creating an account you agree to the AnyAiCam '
+                '<a href="https://anyaicam.com/terms.html" target="_blank" rel="noopener">Terms of Service</a> and '
+                '<a href="https://anyaicam.com/privacy-policy.html" target="_blank" rel="noopener">Privacy Policy</a>.</p></form>'
+                '<p style="font-size:14px">Already have an account? <a href="/customer-login.html">Sign in</a></p>'
                 '<p style="font-size:14px">Working with an installer? <a href="/customer-register">Request an account through your installer</a>.</p>')
         script = ("const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';"
                   "let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='\"'&&v[v.length-1]==='\"'?v.slice(1,-1):v};"
@@ -189,7 +205,8 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                   "const r=await fetch('/api/customer/direct-signup',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({"
                   "name:document.getElementById('s-name').value,email:document.getElementById('s-email').value,password:document.getElementById('s-password').value,"
                   "confirm_password:document.getElementById('s-confirm').value})}),b=await r.json().catch(()=>({}));msg.style.display='block';"
-                  "msg.textContent=b.message||b.detail||'Something went wrong. Please try again.';if(!r.ok)btn.disabled=false});")
+                  "msg.textContent=b.message||b.detail||'Something went wrong. Please try again.';"
+                  "if(r.ok){msg.style.background='#e7f6ec';msg.style.color='#14532d';e.target.querySelectorAll('input').forEach(i=>i.disabled=true)}else btn.disabled=false});")
         return HTMLResponse(_page(None, None, body=form, script=script))
 
 
