@@ -104206,7 +104206,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-def _installer_steps_html(mode: str | None) -> str:
+def _installer_steps_html(mode: str | None, filename: str = "") -> str:
     """Install-and-activate steps under the installer download (2026-10-01).
 
     The customer path is the claim flow: `anyaicam-setup --claim` prints a
@@ -104221,9 +104221,15 @@ def _installer_steps_html(mode: str | None) -> str:
     portal_flag = f" --portal-url={portal}" if portal else ""
     mode_note = "" if product_flag else " Choose <strong>local</strong> or <strong>hybrid</strong> when asked, matching your plan."
     portal_note = "" if portal_flag else " When asked for the Portal URL, enter the address of this portal, and <strong>production</strong> for the mode."
+    # The archive has no top-level folder of its own, so unpack it into one.
+    unpack_step = (
+        '<li>Open a terminal where you saved the file and unpack it into its own folder: '
+        f'<code style="word-break:break-all">mkdir -p anyaicam-installer &amp;&amp; tar -xzf {escape(filename)} -C anyaicam-installer &amp;&amp; cd anyaicam-installer</code></li>'
+        if filename else '<li>Unpack the downloaded file into a new, empty folder and open a terminal in that folder.</li>'
+    )
     return (
         '<ol class="health-detail" id="vms-installer-steps" style="margin:10px 0 0;padding-left:20px;line-height:1.7">'
-        '<li>Extract the downloaded file and open a terminal in the extracted folder.</li>'
+        + unpack_step +
         f'<li>Install: <code>sudo ./install.sh{escape(product_flag)}</code>, then check it with <code>sudo ./validate.sh</code>.{mode_note}</li>'
         f'<li>Link it to this account: <code style="word-break:break-all">sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup --claim{escape(portal_flag)}</code>.{portal_note} It shows a claim code.</li>'
         '<li>Enter that code on <a href="/customer/claim-appliance">Claim an appliance</a> and choose the site. The appliance finishes activating by itself.</li>'
@@ -104334,7 +104340,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                 f'{customer_downloads.human_size(int(_installer["size_bytes"]))} &middot; build {escape(_installer["commit"][:7])}</span>'
                 f'<br><span class="health-detail">SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></span></span>'
                 f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
-                + _installer_steps_html(mode))
+                + _installer_steps_html(mode, str(_installer["filename"])))
         else:
             _download_html = '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
     _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'
