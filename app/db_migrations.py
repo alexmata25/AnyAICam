@@ -1766,6 +1766,12 @@ def apply_migrations():
         if 'product_mode_applied' not in appliance_mode_columns: db.execute('ALTER TABLE appliances ADD COLUMN product_mode_applied TEXT')
         if 'product_mode_applied_at' not in appliance_mode_columns: db.execute('ALTER TABLE appliances ADD COLUMN product_mode_applied_at TEXT')
 
+        # Stripe ordering guard (2026-10-02, customer_entitlements._is_stale):
+        # the Stripe event.created of the state an entitlement row holds;
+        # an older event never overwrites it. Additive.
+        if 'stripe_state_at' not in _columns('customer_entitlements'): db.execute('ALTER TABLE customer_entitlements ADD COLUMN stripe_state_at INTEGER')
+        if 'stripe_state_at' not in _columns('addon_subscriptions'): db.execute('ALTER TABLE addon_subscriptions ADD COLUMN stripe_state_at INTEGER')
+
         # Loitering (2026-10-01, customer_analytics_rules.py): how long a
         # person must stay inside a zone before it counts (NULL = the rule
         # type's default), and whether the rule notifies anyone -- the event

@@ -48776,6 +48776,8 @@ from mobile_push_routes import register_routes as register_mobile_push_routes
 register_mobile_push_routes(app)
 from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
+from customer_billing import register_customer_billing_routes
+register_customer_billing_routes(app)
 from customer_registration import register_customer_registration_routes
 
 
@@ -104501,10 +104503,18 @@ def _customer_subscription_portal_page(identity: dict) -> str:
             f'</div>'
         )
 
+    # Manage billing (2026-10-02): owner only, and only when this account has
+    # a Stripe customer of its own (customer_billing.py).
+    import customer_billing
+    _manage_billing_html = ""
+    if is_owner and customer_billing.stripe_customer_ids_for_customer(customer_id):
+        _manage_billing_html = ('<p><button class="ghost-button" id="manage-billing-button" type="button">Manage billing</button> '
+                                '<span id="manage-billing-message" class="health-detail"></span></p>')
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
     <p>{plan_summary}</p>
     <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
+    {_manage_billing_html}
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
     <div class="health-row"><span><strong>Local</strong> &middot; monthly subscription</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance or your own PC at home. Keeps working without an internet connection.</span></div>
@@ -104521,6 +104531,16 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     </section>
     {_friends_family_panel if is_owner else ""}'''
     scripts = '''<script>
+    const manageBillingButton=document.getElementById('manage-billing-button');
+    if(manageBillingButton)manageBillingButton.onclick=async()=>{
+      const messageEl=document.getElementById('manage-billing-message');messageEl.textContent='';
+      manageBillingButton.disabled=true;manageBillingButton.textContent='Opening…';
+      let response,r;
+      try{response=await fetch('/api/customer/billing-portal',{method:'POST'});r=await response.json()}
+      catch(error){manageBillingButton.disabled=false;manageBillingButton.textContent='Manage billing';messageEl.textContent='Could not reach the server. Try again.';return}
+      if(!response.ok){manageBillingButton.disabled=false;manageBillingButton.textContent='Manage billing';messageEl.textContent=r.detail||'Could not open billing management.';return}
+      location.href=r.url
+    };
     const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
     if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
       const tier_label=subscriptionUpgradeButton.dataset.tierLabel;
@@ -113745,6 +113765,16 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
     if not tier:
         raise HTTPException(status_code=400, detail="Unknown camera-slot tier.")
     _, _, _, _, camera_slot_maximum, _, env_var, billing_type = tier
+    if billing_type == "recurring":
+        # At most one active base subscription (2026-10-02): a second Hybrid
+        # checkout created a second subscription and summed capacity. A plan
+        # change on the existing subscription is a separate flow whose
+        # proration/timing terms need the owner's decision first.
+        from customer_entitlements import get_entitlements_for_customer
+        if any(e.get("product") == "camera_slots_hybrid" and e.get("status") == "active" and int(e.get("camera_slot_quantity") or 0) > 0
+               for e in get_entitlements_for_customer(identity["customer_id"])):
+            raise HTTPException(status_code=409, detail="This account already has an active Hybrid subscription. "
+                                                        "To change it, use Manage billing on My subscription.")
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:
         raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {plan_type} {tier_label}.")

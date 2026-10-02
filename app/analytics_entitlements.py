@@ -421,6 +421,31 @@ def _positive_int(value) -> Optional[int]:
     return number if number > 0 else None
 
 
+def _event_created(event: dict) -> int | None:
+    try:
+        created = int(event.get("created"))
+        return created if created > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _addon_state_is_newer(customer_id: str, addon_key: str, event: dict) -> bool:
+    """The package already holds a state from a NEWER Stripe event
+    (2026-10-02): webhooks arrive out of order, and an old checkout must not
+    re-activate a package cancelled after it."""
+    created = _event_created(event)
+    existing = row("SELECT stripe_state_at FROM addon_subscriptions WHERE customer_id=? AND addon_key=?", (customer_id, addon_key))
+    return bool(created and existing and existing.get("stripe_state_at") and created < int(existing["stripe_state_at"]))
+
+
+def _mark_addon_state_at(customer_id: str, addon_key: str, event: dict) -> None:
+    created = _event_created(event)
+    if created:
+        with connection() as db:
+            db.execute("UPDATE addon_subscriptions SET stripe_state_at=? WHERE customer_id=? AND addon_key=? AND COALESCE(stripe_state_at,0)<=?",
+                       (created, customer_id, addon_key, created))
+
+
 def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
     if awaiting_payment(session_obj):
@@ -461,11 +486,14 @@ def _sync_checkout_completed(event: dict) -> dict:
             link_ids.append(link["id"])
         return {"status": "pending_link_created", "pending_link_ids": link_ids, "addon_key": addon["addon_key"], "analytic_keys": list(addon["analytic_keys"])}
 
+    if _addon_state_is_newer(customer["id"], addon["addon_key"], event):
+        return {"status": "stale", "reason": "a newer subscription state is already applied", "addon_key": addon["addon_key"]}
     upsert_addon_subscription(
         customer_id=customer["id"], addon_key=addon["addon_key"], status="active",
         quantity=_positive_int((session_obj.get("metadata") or {}).get("anyaicam_quantity")),
         stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
     )
+    _mark_addon_state_at(customer["id"], addon["addon_key"], event)
     subscription_ids = []
     for analytic_key in addon["analytic_keys"]:
         subscription = upsert_analytics_subscription(
@@ -529,6 +557,8 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
             customer_id = metadata_customer_id
         if not customer_id:
             continue
+        if package_customer_id is None and _addon_state_is_newer(customer_id, addon["addon_key"], event):
+            return {"status": "stale", "reason": "a newer subscription state is already applied", "addon_key": addon["addon_key"]}
         if package_customer_id is None:
             package_customer_id = customer_id
             upsert_addon_subscription(
@@ -551,6 +581,7 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
 
     if not subscription_ids:
         return {"status": "ignored", "reason": "no existing analytics subscription for this stripe customer/addon"}
+    _mark_addon_state_at(package_customer_id, addon["addon_key"], event)
     return {
         "status": "analytics_subscription_updated",
         "subscription_ids": subscription_ids,

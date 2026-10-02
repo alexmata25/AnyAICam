@@ -239,8 +239,11 @@ def test_subscription_deleted_cancels_the_entitlement_and_zeroes_camera_slots(db
 def test_subscription_update_for_an_unknown_stripe_customer_is_ignored_not_fabricated(db_path):
     with override_target(sqlite_path=db_path):
         event = _subscription_event("evt_unknown_1", stripe_customer="cus_never_seen", price_id=TIER_1_16)
-        result = ce.sync_entitlement_from_stripe_event(event)
-    assert result["status"] == "ignored"
+        # 2026-10-02: retried by Stripe (503), never marked processed and lost.
+        with pytest.raises(ce.RetryableStripeEventError):
+            ce.sync_entitlement_from_stripe_event(event)
+        assert not ce.is_event_processed("evt_unknown_1")
+        assert ce.get_entitlements_for_customer("cust-1") == []
 
 
 # ------------------------------------- Phase 2 (still true under Phase 3): identity
@@ -313,9 +316,10 @@ def test_subscription_event_never_fabricates_an_entitlement_out_of_nothing(db_pa
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
         event = _subscription_event("evt_sub_first", stripe_customer="cus_never_seen_yet", price_id=TIER_1_16, customer_id="cust-1")
-        result = ce.sync_entitlement_from_stripe_event(event)
+        # 2026-10-02: still never a grant -- retried until its checkout lands.
+        with pytest.raises(ce.RetryableStripeEventError):
+            ce.sync_entitlement_from_stripe_event(event)
         entitlements = ce.get_entitlements_for_customer("cust-1")
-    assert result["status"] == "ignored"
     assert entitlements == []
 
 
