@@ -1810,6 +1810,10 @@ def apply_migrations():
         addon_columns=_columns('addon_subscriptions')
         for column in ('payment_failed_at', 'suspended_reason'):
             if column not in addon_columns: db.execute(f'ALTER TABLE addon_subscriptions ADD COLUMN {column} TEXT')
+        # An add-on set to end because its base plan was cancelled
+        # (plan_changes.align_addons_with_base); resuming the base plan
+        # resumes exactly these. Additive.
+        if 'ended_with_base' not in addon_columns: db.execute('ALTER TABLE addon_subscriptions ADD COLUMN ended_with_base INTEGER')
         # Visitor Call lifecycle (2026-10-02, aac_voice_call_events.reconcile):
         # last heartbeat from an open call page, why a call closed, and the
         # call that replaced an expired/abandoned one. Additive.

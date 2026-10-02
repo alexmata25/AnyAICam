@@ -62,8 +62,7 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         portal_config = {"id": "bpc_policy", "features": {
             "payment_method_update": {"enabled": True},
             "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
-            "subscription_update": {"enabled": True, "proration_behavior": "always_invoice",
-                                    "schedule_at_period_end": {"conditions": [{"type": "decreasing_item_amount"}]}}}}
+            "subscription_update": {"enabled": False}}}  # plan changes stay in AnyAiCam (owner, 2026-10-02)
         schedules: dict = {}
 
         def fake_get(path):
@@ -114,6 +113,12 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
                 schedule["phases"] = phases
                 schedule["fields"] = values
                 return schedule
+            if path.startswith("/v1/subscriptions/") and "cancel_at" in dict(fields):
+                sub = stripe[path.rsplit("/", 1)[1]]
+                values = dict(fields)
+                sub["cancel_at"] = int(values["cancel_at"]) if values["cancel_at"] else None
+                sub["proration_behavior_seen"] = values.get("proration_behavior")
+                return sub
             if path.startswith("/v1/subscriptions/") and "cancel_at_period_end" in dict(fields):
                 sub = stripe[path.rsplit("/", 1)[1]]
                 sub["cancel_at_period_end"] = dict(fields)["cancel_at_period_end"] == "true"

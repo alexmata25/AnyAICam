@@ -16,15 +16,14 @@ one is bound to the signed-in customer:
   logged -- only the portal URL Stripe issues.
 
 Owner policy (2026-10-02): the portal is on for account owners, for changing
-the card, upgrading and downgrading the plan, and cancelling/resuming renewal.
+the card and cancelling/resuming renewal. Plan changes (upgrade/downgrade)
+stay inside AnyAiCam (plan_changes.py), never in the portal.
 Before a session opens, the Stripe portal configuration is checked against
 the approved billing policies (configuration_problems()); a mismatch refuses
 the portal rather than letting Stripe apply a different policy:
 - payment method update enabled;
 - cancellation enabled, at the end of the paid period (never immediate);
-- plan changes enabled, upgrades prorated and invoiced immediately
-  (proration_behavior=always_invoice), downgrades scheduled for the end of the
-  period (schedule_at_period_end on decreasing_item_amount).
+- plan changes (subscription_update) DISABLED.
 ANYAICAM_STRIPE_PORTAL_CONFIGURATION_ID names the configuration (else Stripe's
 default is checked). ANYAICAM_STRIPE_BILLING_PORTAL_ENABLED=false turns the
 portal off.
@@ -60,15 +59,8 @@ def configuration_problems(configuration: dict) -> list[str]:
         problems.append("cancellation is not enabled")
     elif cancel.get("mode") != "at_period_end":
         problems.append("cancellation is not at the end of the period")
-    update = features.get("subscription_update") or {}
-    if not update.get("enabled"):
-        problems.append("plan changes are not enabled")
-    else:
-        if update.get("proration_behavior") != "always_invoice":
-            problems.append("upgrades are not prorated and invoiced immediately")
-        conditions = ((update.get("schedule_at_period_end") or {}).get("conditions")) or []
-        if not any(isinstance(c, dict) and c.get("type") == "decreasing_item_amount" for c in conditions):
-            problems.append("downgrades are not scheduled for the end of the period")
+    if (features.get("subscription_update") or {}).get("enabled"):
+        problems.append("plan changes are enabled in the portal (they belong in AnyAiCam)")
     return problems
 
 

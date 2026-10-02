@@ -279,6 +279,82 @@ def cancel_downgrade(identity: dict) -> dict:
     return {"status": "downgrade_cancelled", "message": "You're keeping Hybrid."}
 
 
+# Owner decisions 2026-10-02: when the base plan is cancelled, its add-ons end
+# with it -- never billing after the base plan ends -- with no credit for
+# unused add-on days. An add-on whose own paid period ends on or before the
+# base plan's end simply ends then (cancel_at_period_end: it never renews for
+# a final partial period); one paid beyond the base end stops on the base end
+# date (cancel_at, proration_behavior=none). Resuming the base plan resumes
+# exactly the add-ons its cancellation ended.
+
+def align_addons_with_base(customer_id: str, base: dict) -> list[str]:
+    import customer_entitlements as ce
+    import stripe_state
+    from partner_db import connection, rows
+    main = sys.modules.get("main")
+    base_end = ce._period_end(base)
+    base_customer = str(base.get("customer") or "")
+    if main is None or not base_end or not base_customer:
+        return []
+    changed = []
+    for addon in rows("SELECT * FROM addon_subscriptions WHERE customer_id=? AND stripe_customer_id=? AND status IN ('active','suspended') "
+                      "AND stripe_subscription_id IS NOT NULL", (customer_id, base_customer)):
+        current = stripe_state.current_subscription(addon["stripe_subscription_id"])
+        if not current or str(current.get("customer") or "") != base_customer \
+                or str((current.get("metadata") or {}).get("anyaicam_customer_id") or customer_id) != customer_id \
+                or current.get("status") in ce.SUBSCRIPTION_INACTIVE_STATUSES:
+            continue
+        addon_end = ce._period_end(current)
+        if addon_end and addon_end <= base_end:
+            if not current.get("cancel_at_period_end"):
+                main.stripe_api_post(f"/v1/subscriptions/{current['id']}", [("cancel_at_period_end", "true")],
+                                     idempotency_key=f"anyaicam-addon-end-{current['id']}-{base_end}")
+        elif int(current.get("cancel_at") or 0) != int(base_end):
+            main.stripe_api_post(f"/v1/subscriptions/{current['id']}", [("cancel_at", str(base_end)), ("proration_behavior", "none")],
+                                 idempotency_key=f"anyaicam-addon-cancel-at-{current['id']}-{base_end}")
+        with connection() as db:
+            db.execute("UPDATE addon_subscriptions SET ended_with_base=1 WHERE id=?", (addon["id"],))
+        changed.append(addon["id"])
+    return changed
+
+
+def resume_addons_with_base(customer_id: str, base: dict) -> list[str]:
+    import stripe_state
+    from partner_db import connection, rows
+    main = sys.modules.get("main")
+    base_customer = str(base.get("customer") or "")
+    if main is None or not base_customer:
+        return []
+    resumed = []
+    for addon in rows("SELECT * FROM addon_subscriptions WHERE customer_id=? AND stripe_customer_id=? AND ended_with_base=1",
+                      (customer_id, base_customer)):
+        current = stripe_state.current_subscription(addon["stripe_subscription_id"])
+        if current and str(current.get("customer") or "") == base_customer:
+            if current.get("cancel_at_period_end"):
+                main.stripe_api_post(f"/v1/subscriptions/{current['id']}", [("cancel_at_period_end", "false")],
+                                     idempotency_key=f"anyaicam-addon-resume-{current['id']}-{current.get('current_period_end') or ''}")
+            elif current.get("cancel_at"):
+                main.stripe_api_post(f"/v1/subscriptions/{current['id']}", [("cancel_at", "")],
+                                     idempotency_key=f"anyaicam-addon-resume-at-{current['id']}-{current.get('cancel_at')}")
+        with connection() as db:
+            db.execute("UPDATE addon_subscriptions SET ended_with_base=NULL WHERE id=?", (addon["id"],))
+        resumed.append(addon["id"])
+    return resumed
+
+
+def sync_addons_with_base(entitlement: dict, subscription: dict) -> None:
+    """The base plan's renewal state, wherever it was changed (AnyAiCam or
+    the Customer Portal): set to end -> its add-ons end with it; renewal
+    resumed -> the add-ons it ended resume."""
+    import customer_entitlements as ce
+    if entitlement.get("product") not in ce.BASE_PLAN_PRODUCTS or entitlement.get("status") not in ("active", "suspended"):
+        return
+    if subscription.get("cancel_at_period_end"):
+        align_addons_with_base(entitlement["customer_id"], subscription)
+    else:
+        resume_addons_with_base(entitlement["customer_id"], subscription)
+
+
 def _record_scheduled_change(entitlement_id: str, change: str | None, at: int | None, schedule_id: str | None) -> None:
     from partner_db import connection
     with connection() as db:

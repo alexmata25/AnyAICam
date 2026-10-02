@@ -206,9 +206,10 @@ def test_the_owner_portal_uses_the_policy_checked_configuration(env):
 
 @pytest.mark.parametrize("breaks", [
     {"subscription_cancel": {"enabled": True, "mode": "immediately"}},
-    {"subscription_update": {"enabled": True, "proration_behavior": "create_prorations",
+    {"subscription_cancel": {"enabled": False}},
+    {"subscription_update": {"enabled": True, "proration_behavior": "always_invoice"}},  # plan changes belong in AnyAiCam
+    {"subscription_update": {"enabled": True, "proration_behavior": "always_invoice",  # even "correctly" configured ones
                              "schedule_at_period_end": {"conditions": [{"type": "decreasing_item_amount"}]}}},
-    {"subscription_update": {"enabled": True, "proration_behavior": "always_invoice"}},  # downgrades would be immediate
     {"payment_method_update": {"enabled": False}},
 ])
 def test_a_portal_configured_against_policy_is_refused(env, breaks):
@@ -355,3 +356,93 @@ def test_cancelling_a_plan_with_a_scheduled_downgrade_drops_the_downgrade(env):
     env["client"].post("/api/customer/plan/cancel", cookies=_cookie(*OWNER_A))
     assert env["stripe"]["sub_A1"].get("schedule") is None and env["stripe"]["sub_A1"]["cancel_at_period_end"] is True
     assert _plan(env["path"], product="camera_slots_hybrid")["scheduled_change"] is None
+
+
+
+# ================================================================ owner decisions (finalized 2026-10-02)
+
+def _addon(env, monkeypatch, *, sub_id="sub_AD", period_end, customer_id="cust-A", stripe_customer="cus_A", price="price_adv"):
+    import analytics_entitlements as ae
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS", "price_adv")
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN", "price_talk")
+    monkeypatch.setattr(ae, "ANALYTICS_PRICE_MAP", ae._load_price_map())
+    env["stripe"][sub_id] = _subscription(sub_id, stripe_customer, "active", price=price, metadata_customer=customer_id,
+                                          period_end=period_end)
+    _deliver(env, _checkout(f"evt_{sub_id}", customer_id=customer_id, stripe_customer=stripe_customer, sub_id=sub_id, price=price))
+
+
+def test_cancelling_the_base_plan_ends_its_add_ons_with_it_and_resume_brings_them_back(env, monkeypatch):
+    _customer(env)
+    _addon(env, monkeypatch, sub_id="sub_LATE", period_end=PERIOD_END + 14 * 86400)   # paid past the base end
+    _addon(env, monkeypatch, sub_id="sub_EARLY", period_end=PERIOD_END - 5 * 86400, price="price_talk")   # its own period ends first
+    for _ in range(2):  # a repeated cancel changes nothing further
+        assert env["client"].post("/api/customer/plan/cancel", cookies=_cookie(*OWNER_A)).status_code == 200
+    late, early = env["stripe"]["sub_LATE"], env["stripe"]["sub_EARLY"]
+    assert late["cancel_at"] == PERIOD_END and late["proration_behavior_seen"] == "none"  # stops with the base, no credit
+    assert early.get("cancel_at_period_end") is True and not early.get("cancel_at")     # never renews for a partial period
+    assert len([p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_LATE"]) == 1
+    assert len([p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_EARLY"]) == 1
+    env["client"].post("/api/customer/plan/resume", cookies=_cookie(*OWNER_A))
+    assert not env["stripe"]["sub_LATE"].get("cancel_at") and env["stripe"]["sub_EARLY"]["cancel_at_period_end"] is False
+    conn = sqlite3.connect(env["path"])
+    assert conn.execute("SELECT COUNT(*) FROM addon_subscriptions WHERE ended_with_base=1").fetchone()[0] == 0
+    conn.close()
+
+
+def test_a_base_cancellation_made_in_the_portal_also_ends_the_add_ons(env, monkeypatch):
+    _customer(env)
+    _addon(env, monkeypatch, sub_id="sub_LATE", period_end=PERIOD_END + 14 * 86400)
+    env["stripe"]["sub_A1"]["cancel_at_period_end"] = True  # the customer cancelled in the Customer Portal
+    for _ in range(2):  # Stripe resends the webhook
+        _deliver(env, _sub_event("evt_portal_cancel", "updated", env["stripe"]["sub_A1"], 9_000))
+    _deliver(env, _sub_event("evt_portal_cancel_2", "updated", env["stripe"]["sub_A1"], 9_001))
+    assert env["stripe"]["sub_LATE"]["cancel_at"] == PERIOD_END
+    assert len([p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_LATE"]) == 1
+    env["stripe"]["sub_A1"]["cancel_at_period_end"] = False  # ...and renewed it again there
+    _deliver(env, _sub_event("evt_portal_resume", "updated", env["stripe"]["sub_A1"], 9_100))
+    assert not env["stripe"]["sub_LATE"].get("cancel_at")
+
+
+def test_cancelling_one_accounts_plan_never_touches_another_accounts_add_ons(env, monkeypatch):
+    _customer(env)
+    _customer(env, customer_id="cust-B", stripe_customer="cus_B", sub_id="sub_B1")
+    _addon(env, monkeypatch, sub_id="sub_ADB", period_end=PERIOD_END + 14 * 86400, customer_id="cust-B", stripe_customer="cus_B")
+    env["client"].post("/api/customer/plan/cancel", cookies=_cookie(*OWNER_A))
+    assert not env["stripe"]["sub_ADB"].get("cancel_at") and not env["stripe"]["sub_ADB"].get("cancel_at_period_end")
+    assert not [p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_ADB"]
+
+
+def test_partial_refunds_leave_add_ons_and_licenses_unchanged(env, monkeypatch):
+    import customer_entitlements as ce
+    _customer(env)
+    _addon(env, monkeypatch, sub_id="sub_AD", period_end=PERIOD_END)
+    _deliver(env, _invoice("evt_pad", sub_id="sub_AD", invoice_id="in_ad", price="price_adv"))
+    for _ in range(2):
+        _deliver(env, _refund("evt_rad", "in_ad", refunded=100))
+    conn = sqlite3.connect(env["path"])
+    assert conn.execute("SELECT status FROM addon_subscriptions WHERE stripe_subscription_id='sub_AD'").fetchone()[0] == "active"
+    conn.close()
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8", "price_vms_8")
+    monkeypatch.setattr(ce, "PRICE_ID_VMS_LICENSE_MAP", ce._load_vms_license_map())
+    _deliver(env, {"id": "evt_lic", "type": "checkout.session.completed", "data": {"object": {
+        "id": "cs_lic", "object": "checkout.session", "mode": "payment", "payment_status": "paid", "customer": "cus_A",
+        "payment_intent": "pi_license", "customer_details": {"email": "a@example.test"},
+        "metadata": {"anyaicam_customer_id": "cust-A", "anyaicam_stripe_price_id": "price_vms_8"}}}})
+    _deliver(env, {"id": "evt_lpr", "type": "charge.refunded", "data": {"object": {
+        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 4999, "amount_refunded": 1000, "refunded": False}}})
+    with override_target(sqlite_path=str(env["path"])):
+        assert ce.vms_license_capacity("cust-A") == 8
+
+
+def test_a_won_dispute_restores_once_even_when_replayed(env):
+    _customer(env)
+    _paid_period(env)
+    _deliver(env, _dispute("evt_d1", "in_p1"))
+    won = _dispute("evt_won", "in_p1", kind="charge.dispute.closed", status="won")
+    for _ in range(3):
+        _deliver(env, won)
+    _deliver(env, _dispute("evt_won_b", "in_p1", kind="charge.dispute.closed", status="won"))
+    assert _plan(env["path"])["status"] == "active" and _capacity(env) == (8, "local")
+    conn = sqlite3.connect(env["path"])
+    assert conn.execute("SELECT COUNT(*) FROM customer_entitlements WHERE customer_id='cust-A'").fetchone()[0] == 1
+    conn.close()

@@ -732,6 +732,7 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         supersede_other_base_plans(entitlement, current)
         import plan_changes
         plan_changes.sync_scheduled_change(entitlement, current)
+        plan_changes.sync_addons_with_base(entitlement, current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}
 
 
