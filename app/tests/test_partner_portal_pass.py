@@ -219,7 +219,11 @@ def test_partner_owner_invites_a_team_member_and_the_email_is_sent(client, sent_
     assert sent_mail and sent_mail[0][0] == "invitation" and sent_mail[0][1] == "new-tech@example.test"
     with connection() as db:
         created = db.execute("SELECT partner_id, role, must_change_password FROM partner_users WHERE email='new-tech@example.test'").fetchone()
-    assert (created["partner_id"], created["role"], created["must_change_password"]) == ("p-alpha", "technician", 1)
+    # 2026-10-02: no temporary password exists; the invitee sets their own
+    # through the emailed single-use link (account_invitations.py), so there
+    # is nothing to force-change, and nothing secret was returned.
+    assert (created["partner_id"], created["role"], created["must_change_password"]) == ("p-alpha", "technician", 0)
+    assert "temporary_password" not in response.json() and "invitation_link" not in response.json()
 
 
 def test_salesperson_cannot_invite_and_email_is_required(client, sent_mail):

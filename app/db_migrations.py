@@ -1755,6 +1755,9 @@ def apply_migrations():
         # fanout_appliance_event): one notification per person per appliance
         # event, however often or by whichever route it arrives.
         if 'dedupe_key' not in _columns('notifications'): db.execute('ALTER TABLE notifications ADD COLUMN dedupe_key TEXT')
+        # Account invitations (2026-10-02, account_invitations.py): the account a
+        # single-use link opens. Household invitations leave it NULL. Additive.
+        if 'invitee_user_id' not in _columns('invitations'): db.execute('ALTER TABLE invitations ADD COLUMN invitee_user_id TEXT')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_user_dedupe ON notifications(user_id,dedupe_key) WHERE dedupe_key IS NOT NULL')
 
         # Loitering (2026-10-01, customer_analytics_rules.py): how long a

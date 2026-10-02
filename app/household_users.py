@@ -389,7 +389,7 @@ def invitation_for_token(db, raw: str, now: datetime) -> dict | None:
         return None
     row = db.execute(
         "SELECT i.*,c.name AS customer_name,c.status AS customer_status FROM invitations i JOIN customers c ON c.id=i.customer_id "
-        "WHERE i.token_hash=? AND i.role='customer_viewer' AND i.status='pending' AND i.expires_at>=?",
+        "WHERE i.token_hash=? AND i.role='customer_viewer' AND i.status='pending' AND i.expires_at>=? AND i.invitee_user_id IS NULL",
         (token_hash(raw), now.isoformat()),
     ).fetchone()
     if not row or (row["customer_status"] or "active") not in ("active", "trial", "pending_installation"):

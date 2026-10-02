@@ -145,15 +145,21 @@ def register_website_partner_routes(app: FastAPI,shell) -> None:
             if status=='approved':
                 existing=db.execute('SELECT id FROM partner_users WHERE lower(email)=?',(application['email'].lower(),)).fetchone()
                 if existing: raise HTTPException(status_code=409,detail='A portal user already exists for this email.')
-                partner_id=secrets.token_hex(7); user_id=secrets.token_hex(7); invitation_id=secrets.token_hex(7); temporary=secrets.token_urlsafe(12)
+                partner_id=secrets.token_hex(7); user_id=secrets.token_hex(7); invitation_id=secrets.token_hex(7)
+                import account_invitations
                 db.execute('INSERT INTO partners(id,name,approval_status,territory,source,created_at) VALUES(?,?,?,?,?,?)',(partner_id,application['company_name'],'approved',application['service_area'],'real',now))
                 db.execute('''INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at,account_status,must_change_password)
-                    VALUES(?,?,?,?,?,?,1,?,'active',1)''',(user_id,partner_id,application['email'].lower(),application['contact_name'],'partner_owner',password_hash(temporary),now))
-                expiry=(datetime.now()+timedelta(days=7)).isoformat(); preview=f'Partner portal: {settings.invitation_url}\nTemporary password: {temporary}\nThis invitation expires {expiry}. You must create a permanent password and accept the Partner Terms.'
-                db.execute('INSERT INTO invitations(id,email,role,status,temporary_password_hash,email_preview,expires_at,created_at,created_by) VALUES(?,?,?,? ,?,?,?,?,?)',(invitation_id,application['email'].lower(),'partner_owner','pending',password_hash(temporary),preview,expiry,now,identity['email']))
-                result.update({'message':'Partner approved and invitation preview created.','invitation_id':invitation_id,'temporary_password':temporary,'email_preview':preview})
+                    VALUES(?,?,?,?,?,?,1,?,'active',0)''',(user_id,partner_id,application['email'].lower(),application['contact_name'],'partner_owner',account_invitations.unusable_password_hash(),now))
+                preview=(f'Partner portal: {settings.invitation_url}\nSet your password with the personal link in this email '
+                         f'(single use, valid {account_invitations.INVITE_TTL_DAYS} days), then accept the Partner Terms when you first sign in.')
+                raw_invite,expiry=account_invitations.issue(db,invitation_id=invitation_id,email=application['email'].lower(),role='partner_owner',customer_id=None,
+                                                            user_id=user_id,created_by=identity['email'],now=datetime.fromisoformat(now),preview=preview)
+                invite_link=account_invitations.link(account_invitations.public_base(request),raw_invite)
+                result.update({'message':'Partner approved and invitation created.','invitation_id':invitation_id,'email_preview':preview,'invitation_expires_at':expiry})
         audit(identity,'partner_application.'+status,'partner_application',application_id)
         if status=='approved':
-            get_email_service().send('invitation',application['email'],'Your AnyAiCam Partner Portal invitation',preview,metadata={'application_id':application_id,'invitation_id':invitation_id})
+            delivery=get_email_service().send('invitation',application['email'],'Your AnyAiCam Partner Portal invitation',preview+'\n\nSet your password: '+invite_link,metadata={'application_id':application_id,'invitation_id':invitation_id})
+            if str((delivery or {}).get('status') or '')!='sent':
+                result['invitation_link']=invite_link  # one-time manual handoff: the email did not go out
             audit(identity,'partner.approved','partner',partner_id,{'application_id':application_id}); audit(identity,'user.invited','partner_user',user_id,{'role':'partner_owner'})
         return result

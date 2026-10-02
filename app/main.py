@@ -42050,6 +42050,8 @@ PUBLIC_PATH_PREFIXES = (
     # single-use link token is the only authorization (household_users.py).
     "/customer/join",
     "/api/customer/household/join",
+    "/accept-invitation",
+    "/api/invitations/accept",
 
     "/forgot-password",
 
@@ -48776,6 +48778,8 @@ from mobile_push_routes import register_routes as register_mobile_push_routes
 register_mobile_push_routes(app)
 from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
+from account_invitations import register_account_invitation_routes
+register_account_invitation_routes(app)
 from customer_registration import register_customer_registration_routes
 
 
