@@ -439,3 +439,26 @@ def test_the_account_page_offers_users_and_household_to_the_owner_only(portal, d
     assert 'href="/customer/household"' in client.get("/customer-portal", cookies=_cookie(*OWNER)).text
     viewer = client.get("/customer-portal", cookies=_cookie("maria@example.test", "customer_viewer", "cust-1"))
     assert viewer.status_code == 200 and 'href="/customer/household"' not in viewer.text
+
+
+def test_the_face_access_grant_lets_a_member_manage_people_and_shows_edit_controls(portal, db_path, mail):
+    """The customer_viewer role never carries facial.manage; the owner's
+    Manage Face Access grant is what gives it to this one person."""
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client)
+    _join(client, _token(mail))
+    viewer = ("maria@example.test", "customer_viewer", "cust-1")
+    import facial_recognition_ui as fr
+    identity = {"email": "maria@example.test", "role": "customer_viewer", "customer_id": "cust-1"}
+    with override_target(sqlite_path=str(db_path)):
+        assert fr.facial_allowed(identity, "facial.manage") is False
+    member = _member_id(db_path)
+    client.put(f"/api/customer/household/users/{member}/permissions", json={"camera_ids": ["cam-1"], "face_access": True},
+               cookies=_cookie(*OWNER))
+    with override_target(sqlite_path=str(db_path)):
+        assert fr.facial_allowed(identity, "facial.manage") is True
+        assert fr.facial_allowed(identity, "facial.view") is True
+        assert fr.facial_allowed({"role": "salesperson"}, "facial.manage") is False
+    created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Cleaner"}, cookies=_cookie(*viewer))
+    assert created.status_code != 403, created.text

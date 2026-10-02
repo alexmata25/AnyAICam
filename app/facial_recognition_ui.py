@@ -108,19 +108,25 @@ def _resolve_customer_id(identity: dict, requested: str | None) -> str:
     return customer_id
 
 
+def facial_allowed(identity: dict, permission: str) -> bool:
+    """The one facial.* permission decision for routes and pages. A household
+    member (customer_viewer) gets People / Face Access exactly as the account
+    owner granted them (household_users.py) -- including facial.manage, which
+    the customer_viewer role itself never carries; every other role is the
+    role permission, unchanged."""
+    if identity.get("role") == "customer_viewer" and permission in ("facial.view", "facial.manage"):
+        import household_users
+        return household_users.facial_permission_allowed(identity, permission)
+    return allowed(identity, permission)
+
+
 def _require(request: Request, permission: str) -> dict:
     from partner_portal import partner_identity
 
     identity = partner_identity(request)
     if not identity:
         raise HTTPException(status_code=401, detail="Sign in is required.")
-    if not allowed(identity, permission):
-        raise HTTPException(status_code=403, detail="You do not have permission for this action.")
-    # Users & household (2026-10-01): a household member reaches People only
-    # with the People or Face Access grant, and manages Face Access only with
-    # the Face Access grant the account owner gave them.
-    import household_users
-    if not household_users.facial_permission_allowed(identity, permission):
+    if not facial_allowed(identity, permission):
         raise HTTPException(status_code=403, detail="You do not have permission for this action.")
     return identity
 
@@ -817,7 +823,7 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
         title = "Person"
         if facial_ctx and not facial_ctx["entitled"]:
             return shell(title, "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>' + _FACE_ACCESS_UPSELL)
-        can_manage = allowed(identity, "facial.manage")
+        can_manage = facial_allowed(identity, "facial.manage")
         customer_id_field = "" if facial_ctx else _customer_picker("e-customer-id")
         cameras = []
         if facial_ctx:
