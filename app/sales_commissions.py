@@ -135,6 +135,44 @@ def _invoice_price_id(invoice: dict) -> str:
     return str(_invoice_metadata(invoice).get("anyaicam_stripe_price_id") or "")
 
 
+def _line_price_id(line: dict) -> str:
+    price = line.get("price") or ((line.get("pricing") or {}).get("price_details") or {}).get("price")
+    if isinstance(price, dict):
+        return str(price.get("id") or "")
+    return price if isinstance(price, str) else ""
+
+
+def _classify_invoice(invoice: dict) -> tuple[Optional[str], Optional[dict], str, float]:
+    """(product_class, product, price_id, eligible_fraction) for a whole
+    invoice, independent of line order (2026-10-02, Codex finding: lines[0]
+    alone used to decide, so base+add-on and add-on+base invoices were
+    treated differently). The invoice is a base-plan invoice when ANY line
+    is a known base plan -- that line's tier drives activation; otherwise an
+    add-on invoice when any line is a known add-on. eligible_fraction is the
+    share of the invoice's line amounts on known AnyAiCam plan/add-on lines,
+    so an unknown price line never earns commission. Percentages, timing and
+    add-on rules are unchanged."""
+    lines = [line for line in ((invoice.get("lines") or {}).get("data") or []) if isinstance(line, dict)]
+    if not lines:
+        price_id = _invoice_price_id(invoice)
+        product_class, product = _classify(price_id)
+        return product_class, product, price_id, 1.0
+    classified = []
+    for line in lines:
+        price_id = _line_price_id(line)
+        product_class, product = _classify(price_id)
+        classified.append((product_class, product, price_id, max(0, int(line.get("amount") or 0))))
+    base = sorted((c for c in classified if c[0] == "base"), key=lambda c: (-int(c[1].get("camera_slot_maximum") or 0), c[2]))
+    addon = sorted((c for c in classified if c[0] == "addon"), key=lambda c: c[2])
+    chosen = base[0] if base else (addon[0] if addon else None)
+    if not chosen:
+        return None, None, classified[0][2], 0.0
+    total = sum(c[3] for c in classified)
+    eligible = sum(c[3] for c in classified if c[0] is not None)
+    fraction = (eligible / total) if total > 0 else 1.0
+    return chosen[0], chosen[1], chosen[2], fraction
+
+
 def _invoice_subscription_id(invoice: dict) -> str:
     sub = invoice.get("subscription") or ((invoice.get("parent") or {}).get("subscription_details") or {}).get("subscription")
     return str(sub.get("id") if isinstance(sub, dict) else sub or "")
@@ -220,15 +258,14 @@ def _invoice_paid(event: dict) -> dict:
     amount_paid = int(invoice.get("amount_paid") or 0)
     if not invoice_id or not subscription_id or amount_paid <= 0:
         return {"status": "ignored", "reason": "not a paid subscription invoice"}
-    price_id = _invoice_price_id(invoice)
-    product_class, product = _classify(price_id)
+    product_class, product, price_id, eligible_fraction = _classify_invoice(invoice)
     if product_class is None:
         return {"status": "ignored", "reason": "not an AnyAiCam plan or add-on price", "price_id": price_id}
     customer_id = _customer_for(_invoice_metadata(invoice), str(invoice.get("customer") or ""))
     if not customer_id:
         return {"status": "ignored", "reason": "customer not resolved"}
     tax = int(invoice.get("tax") or 0) + sum(int(t.get("amount") or 0) for t in (invoice.get("total_taxes") or []) if isinstance(t, dict))
-    basis = max(0, amount_paid - tax)
+    basis = int(round(max(0, amount_paid - tax) * eligible_fraction))  # unknown price lines earn nothing
     if not row("SELECT id FROM subscription_payments WHERE id=?", (invoice_id,)):
         with connection() as db:
             db.execute(
