@@ -5515,3 +5515,59 @@ Goal: routine updates without AnyAiCam staff remoting in, via Settings → Syste
 - Provision the pinned key at `/etc/anyaicam/trusted_signing_key.pem`.
 - Build a controlled, signed, approved release publisher.
 - Test authorization, manual-only behaviour, signature/platform rejection, real version change, failed-health rollback, crash recovery, migrations, data preservation and offline updates.
+
+
+## 2026-10-02 overnight launch run (integration branch `launch/overnight-20261002`)
+
+**State**
+- Golden `reconcile/golden-foundation-20260911` = `310dcc8` (fast-forwarded from `cd20e96` after the hardening gate). Not changed overnight.
+- Staging `310dcc8` (rollback `portal-cd20e96-pre-310dcc8-20261002T045609Z-rollback`); installer `1.1.0-vms-310dcc85dc4b` published (SHA-256 `38950c64...58c4`). Nothing deployed overnight.
+- Ryzen and Samsung: untouched. No Stripe/Twilio/Cloudflare changes. No pricing or policy changes.
+
+**Installer E2E (disposable Ubuntu 24.04 c5.xlarge, terminated; SG and key pair deleted)**
+- Passed: licensed download (owner), signed-out 401, unlicensed owner 403, SHA-256 check, package self-verification (664 files), preflight on 7.5 GiB RAM, clean install, `validate.sh` 0 failures, claim, phone-width portal claim, activation, agent entitlement sync (8 slots), product mode `local`.
+- Found and fixed (branch `fix/claim-code-on-resume`):
+  1. **Launch blocker:** a claimed appliance never synced its configuration -- the edge's local customers insert failed its FOREIGN KEY every iteration (no partner for a self-installed appliance).
+  2. A resumed claim could never show its code again (hash-only on the cloud; agent resumed locally) -- the customer was stuck until expiry.
+  3. Raw ISO expiry in the agent, raw device UUID in the portal look-up, EOFError traceback at the discovery prompt without a terminal.
+- Not yet re-run end to end with the fixes (no external deploy overnight). **Next:** deploy the integration build to staging, publish a new installer, repeat the E2E on a fresh disposable machine.
+- Test setup note: the clean install needs 100 GB free disk (my first 40 GB volume was refused correctly).
+
+**Integration branch contents (each committed separately, focused + neighbouring tests run)**
+1. VMS licence at provisioning/operation, never at claim (`fix/vms-license-at-provisioning`). **Owner decision needed before golden:** existing pre-launch accounts with a camera plan but no licence/appliance order would drop to zero usable cameras (staging: `4efaf5153f`). Grandfathering policy is yours.
+2. Unified logout + legacy /alerts fix + mobile identity/logout + private/no-store signed-in HTML (`fix/logout-alerts-session`). Real-browser Back/Forward check pending a staging deploy.
+3. Loitering rule end to end (`feature/analytics-loitering`), Smart Motion entitlement, independent of arming.
+4. Customer-journey security: stored HTML injection in setup (status + discovery) fixed with DOM/textContent and bounded at ingestion; owner-scoped pending-appliance activation-token recovery; wizard completion no longer marks devices activated (`fix/setup-xss-activation`).
+5. Shared analytics: rule state follows the tracker (missing detections never count as dwell, line side kept through retained misses, config change resets); LPR clip sharing; one notification per person per event across routes/retries; LPR alerts opt-in for every channel.
+6. Secure Edge: arm-state reset, one urgent alert per physical intrusion (edge merge + cloud backstop, evidence kept), durable clip state Pending/Available/Failed, no premature "clip saved".
+7. Updates: the periodic poll is check-only (RDM launch blocker step 1).
+
+**Regression (established 10-batch strategy, one process per batch)**
+- At `daca1d7`, recorded unmodified: 5,696 passed, 7 failed, 148 skipped. One flaky (`test_p05_mobile_poll_js`, passes in isolation) and **six real integration regressions**, fixed in `db10df0`:
+  - a `media_status` KeyError in the event serializers;
+  - three tests updated for deliberate changes (bounded-event shape, signed-in identity display, LPR opt-in).
+- At `db10df0`: **5,702 passed, 1 failed, 148 skipped, 0 errors.** The failure is `test_talk_audio_relay::test_no_appliance_channel_uses_local_isapi_fallback`:
+  - an intermittent timing race (it asserts server-side websocket cleanup before it completes);
+  - it failed 1 of 3 isolated runs right after the regression and passed 8 of 8 later;
+  - pristine b46cb43 passed 6 of 6;
+  - module and test are unchanged.
+- Appliance agent: 591 passed, 3 failed. The 3 failures are pre-existing and Windows-only (identical on pristine b46cb43). Installer: 40 tests OK, 2 skipped.
+
+**Review-list fixes on `fix/review-items-20261002` (from `daca1d7`, not yet merged into the integration branch)**
+- Platform owner MFA replacement keeps the confirmed factor until the new one is confirmed, and requires re-authentication (`3fb4cc6`).
+- Existing stale 300-second recording rows are repaired with bounded probing (`ccb49a1`).
+- Local/Hybrid transition acknowledgment and restart retry (`b7dd9dd`).
+- Stripe ordering guard, duplicate-Hybrid refusal and owner billing portal: **parked** on `wip/stripe-billing-parked` (`5d78548`) per the owner's "do not start Stripe yet".
+
+**Owner decisions needed**
+- Local billing cadence conflict: 2026-09-30 pricing and the My Subscription page say Local is **monthly**, but checkout (`PLAN_TIERS`) bills Local as a **one-time** payment.
+- Licence grandfathering for existing accounts (see item 1).
+- LPR alerts: implemented as opt-in for every channel, nobody opted in by default. Confirm.
+- Billing policy: grace period, dunning, cancellation timing, proration, refund/dispute access.
+
+**Remaining launch backlog (not started overnight)**
+- RDM updates steps 2-6: trusted signing key provisioning, release build/sign/approve/publish procedure, VMS-level apply/rollback through the privileged watcher with re-verification, real VMS /health,/ready,/version validation, signed platform/disk checks, owner/tenant-scoped check/status/apply endpoints and Settings > System UI, disposable E2E with fault injection.
+- Stripe/billing reconciliation package (current-subscription reconciliation, plan change on the existing subscription, duplicate-checkout guard, customer billing portal, payment failure/recovery status, readiness catalog). Grace period, restriction timing, cancellation timing, refund/dispute access and proration remain **owner decisions**.
+- Facial Recognition parent-clip timing issue (not addressed by the shared media work).
+- Physical camera checks on approved cameras (line direction, occlusion, exclusions, LPR, face, PPE) -- needs an approved device; Ryzen/Samsung untouched overnight.
+- Cloudflare purge of the old cached installer URL (owner action; it expires on its own within 4 h of 05:00 UTC).
