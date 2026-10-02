@@ -306,7 +306,7 @@ async function loadPerson(){
   const p=await r.json();
   $('e-heading').textContent=p.display_name;
   $('e-name').value=p.display_name||'';$('e-reference').value=p.external_reference||'';$('e-notes').value=p.notes||'';
-  $('e-create').textContent='Save details';
+  if($('e-create'))$('e-create').textContent='Save details';  // manager-only button (2026-10-02)
   $('e-after-create').hidden=false;
   const list=$('e-image-list');
   list.innerHTML=(p.reference_images||[]).length?('<p class="health-detail">'+p.reference_images.length+' face photo(s) enrolled.</p>'):'<p class="health-detail">No face photo yet. Add one below.</p>';
@@ -800,6 +800,10 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         # Face crops stay on the appliance that saw the face (owner policy,
         # 2026-10-02: no cloud face images at launch). Say plainly whether a
         # preview can be shown here, never a path or a broken image.
+        with connection() as db:
+            camera = db.execute("SELECT name,camera_number FROM cameras WHERE id=? AND customer_id=?",
+                                (event.get("camera_id"), resolved)).fetchone()
+        event["camera_name"] = (camera["name"] or f"Camera {camera['camera_number']}") if camera else None
         path = event.pop("face_thumbnail_path", None)
         event["face_preview_available"] = bool(path) and Path(path).is_file()
         if not event["face_preview_available"]:
@@ -847,8 +851,13 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         customer_id_field = "" if facial_ctx else _customer_picker("aac-customer-id")
         empty_message = "Loading your people…" if facial_ctx else "Choose a customer and refresh."
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
+        # Add/Remove only for someone who can manage people (2026-10-02):
+        # never a button whose action would be refused.
+        can_manage_people = facial_allowed(identity, "facial.manage")
+        fixed_customer_id_js += "const CAN_MANAGE=" + json.dumps(bool(can_manage_people)) + ";"
+        add_person = '<a class="action-button" href="/aac/people/enroll">Add person</a>' if can_manage_people else ""
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>People</h1></div>
-<a class="action-button" href="/aac/people/enroll">Add person</a></header>
+''' + add_person + '''</header>
 <section class="panel">''' + customer_id_field + '''<label>Search<input id="aac-search"></label><button class="ghost-button" id="aac-refresh">Refresh</button></section>
 <section class="panel" id="aac-people-list"><p class="health-detail">''' + empty_message + '''</p></section>''')
         scripts = '''<script>
@@ -872,9 +881,9 @@ async function aacLoadPeople(){
   // maliciously-crafted name can never execute as markup/script in
   // another user's (e.g. an administrator's) browser session.
   // Phone-first cards (2026-10-01): name, unit and Face Access at a glance.
-  box.innerHTML='<div class="people-cards">'+data.people.map(p=>{const access=p.status!=='active'?'Disabled':(p.access_enabled===0||p.access_enabled===false?'Face Access off':'Face Access on');
+  box.innerHTML='<div class="people-cards">'+data.people.map(p=>{const access=p.status!=='active'?'Disabled':(!('access_enabled' in p)?'':(p.access_enabled===0||p.access_enabled===false?'Face Access off':'Face Access on'));
     return `<div class="setting-link"><a href="/aac/people/enroll?person_id=${encodeURIComponent(p.id)}${FIXED_CUSTOMER_ID?'':'&customer_id='+encodeURIComponent(customerId)}"><strong>${aacEsc(p.display_name)}</strong><div class="health-detail">${p.unit?'Unit '+aacEsc(p.unit)+' · ':''}${aacEsc(access)}${p.external_reference?' · '+aacEsc(p.external_reference):''}</div></a>
-    <button class="ghost-button" type="button" onclick="aacDeletePerson('${p.id}','${customerId}')">Remove</button></div>`;}).join('')+'</div>';
+    ${CAN_MANAGE?`<button class="ghost-button" type="button" onclick="aacDeletePerson('${p.id}','${customerId}')">Remove</button>`:''}</div>`;}).join('')+'</div>';
 }
 async function aacDeletePerson(personId,customerId){
   if(!confirm('Remove this person? Their face templates and door access are deleted now; past recognition and door history is kept.'))return;
@@ -914,7 +923,7 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
         camera_options = "".join(f'<option value="{html.escape(c["id"], quote=True)}">{html.escape(c["name"] or "Camera")}</option>' for c in cameras)
         ro = "" if can_manage else " disabled"
         content = ('''<style>
-.person-page .panel{max-width:760px}.person-page label{display:grid;gap:6px;margin:10px 0}
+.person-page .panel{max-width:760px}.person-page label{display:grid;gap:6px;margin:10px 0}.person-page [hidden]{display:none!important}
 .person-page input,.person-page select,.person-page textarea{width:100%;box-sizing:border-box}
 .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 12px}.tabs button{flex:1 1 auto;min-height:44px}.tabs button.active{outline:2px solid var(--brand-soft,#42e4dc)}
 .face-pick{display:flex;gap:12px;align-items:center;margin:10px 0}.face-pick img{width:96px;height:96px;object-fit:cover;border-radius:10px}
@@ -927,8 +936,8 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
 <div class="person-page"><header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1 id="e-heading">Add person</h1></div><a class="ghost-button" href="/aac/people">People</a></header>
 <section class="panel"><h2>Details</h2>''' + customer_id_field + f'''
 <label>Name (person or tenant)<input id="e-name" required{ro}></label>
-<label>Reference (optional, e.g. lease or employee number)<input id="e-reference"{ro}></label>
-<label>Notes<textarea id="e-notes"{ro}></textarea></label>
+<label__DETAILS_HIDDEN__>Reference (optional, e.g. lease or employee number)<input id="e-reference"{ro}></label>
+<label__DETAILS_HIDDEN__>Notes<textarea id="e-notes"{ro}></textarea></label>
 ''' + ('<button class="action-button" id="e-create" type="button">Add person</button>' if can_manage else "") + '''<p role="status" id="e-status" class="health-detail"></p></section>
 <div id="e-after-create" hidden>
 <section class="panel" id="e-photo-panel"__DETAILS_HIDDEN__><h2>Face photo</h2><div id="e-image-list"></div>''' + ('''
@@ -1076,6 +1085,7 @@ document.getElementById('ev-refresh').addEventListener('click',async()=>{
         scripts = '''<script>
 ''' + fixed_customer_id_js + '''
 function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function aacWhen(value){if(!value)return '—';const d=new Date(/[zZ]|[+-][0-9]{2}:?[0-9]{2}$/.test(value)?value:value+'Z');return isNaN(d)?String(value):d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'});}
 (async()=>{
   const box=document.getElementById('d-detail');
   const eventId=box.dataset.eventId;
@@ -1092,13 +1102,12 @@ function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&am
     ?`<img src="/api/aac/events/${encodeURIComponent(eventId)}/thumbnail?customer_id=${encodeURIComponent(customerId)}" alt="Face preview" style="max-width:200px;border-radius:8px;display:block;margin-bottom:12px">`
     :`<p class="health-detail" id="d-preview-note">${aacEsc(e.face_preview_note||'Face preview is not available.')}</p>`;
   box.innerHTML=preview+`
-  <div class="health-row"><span>Time</span><strong>${aacEsc(e.event_timestamp)}</strong></div>
-  <div class="health-row"><span>Camera</span><strong>${aacEsc(e.camera_id)}</strong></div>
-  <div class="health-row"><span>State</span><strong>${aacEsc(e.match_state)}</strong></div>
+  <div class="health-row"><span>Time</span><strong>${aacEsc(aacWhen(e.event_timestamp))}</strong></div>
+  <div class="health-row"><span>Camera</span><strong>${aacEsc(e.camera_name||'Camera')}</strong></div>
+  <div class="health-row"><span>Match</span><strong>${aacEsc(({known:'Known person',watchlist:'Watchlist match',unknown:'Unknown person'})[e.match_state]||'Face seen')}</strong></div>
   <div class="health-row"><span>Matched person</span><strong>${aacEsc(e.matched_person_name||'—')}</strong></div>
   <div class="health-row"><span>Watchlist</span><strong>${aacEsc(e.matched_watchlist_name||'—')}</strong></div>
-  <div class="health-row"><span>Confidence</span><strong>${aacEsc(e.confidence)}</strong></div>
-  <div class="health-row"><span>Engine</span><strong>${aacEsc(e.engine)}</strong></div>`;
+  <div class="health-row"><span>Confidence</span><strong>${aacEsc(e.confidence==null?'—':Math.round(Number(e.confidence)*100)+'%')}</strong></div>`;
 })();
 </script>'''
         return shell("Facial Recognition · Match detail", "aac", content, scripts)

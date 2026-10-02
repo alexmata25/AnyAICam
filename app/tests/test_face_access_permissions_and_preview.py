@@ -206,3 +206,27 @@ def test_no_cloud_face_crop_upload_path_exists():
     route = source[source.index("/api/appliance/facial-events/{detection_event_id}/thumbnail"):]
     route = route[:route.index("@app.post", 10)]
     assert "status_code=410" in route and "get_storage" not in route and ".put(" not in route
+
+
+# ================================================================ customer-facing pages (browser-found, 2026-10-02)
+
+def test_backup_access_only_member_gets_working_pages_without_manage_controls(client, db_path):
+    _grant_face_access()
+    person, _ = _person(db_path)
+    _member(db_path, backup_access=1)
+    people_page = client.get("/aac/people", cookies=VIEWER).text
+    assert "const CAN_MANAGE=false" in people_page and 'href="/aac/people/enroll">Add person</a>' not in people_page
+    person_page = client.get(f"/aac/people/enroll?person_id={person}", cookies=VIEWER).text
+    # loadPerson() used to crash on the manager-only button before loadBackup()
+    assert "if($('e-create'))$('e-create').textContent" in person_page
+    assert "<label hidden>Reference" in person_page and "<label hidden>Notes" in person_page
+
+
+def test_match_detail_reads_like_a_customer_page(client, db_path):
+    _grant_face_access()
+    event_id = _event(db_path)
+    detail = client.get(f"/api/aac/events/{event_id}", cookies=OWNER).json()
+    assert detail["camera_name"] == "Door"
+    page = client.get(f"/aac/events/{event_id}", cookies=OWNER).text
+    assert "aacWhen(e.event_timestamp)" in page and "e.camera_name" in page and "Unknown person" in page
+    assert "${aacEsc(e.engine)}" not in page and "${aacEsc(e.camera_id)}" not in page
