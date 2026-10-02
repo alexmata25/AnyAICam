@@ -117,6 +117,11 @@ from partner_db import connection, row, rows
 from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment, awaiting_payment_result
 
 
+# Stripe's current state and Stripe-customer ownership (2026-10-02): see
+# stripe_state.py, shared with add-ons.
+from stripe_state import RetryableStripeEventError, bound_elsewhere as _bound_elsewhere, current_subscription, unresolved
+
+
 def normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
@@ -568,6 +573,32 @@ def _sync_checkout_completed(event: dict) -> dict:
     if not customer and fields["email"]:
         customer = find_customer_by_email(fields["email"])
 
+    if customer and _bound_elsewhere(fields["stripe_customer_id"], customer["id"]):
+        # The Stripe customer already pays for a DIFFERENT AnyAiCam account:
+        # never provision this one from it (2026-10-02, cross-tenant).
+        return {"status": "rejected", "reason": "stripe customer belongs to another account", "customer_id": customer["id"]}
+    subscription_id = str(session_obj.get("subscription") or "") or None
+    current = current_subscription(subscription_id) if session_obj.get("mode") == "subscription" else None
+    if current is not None:
+        current_customer = str(current.get("customer") or "")
+        current_meta = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
+        if (fields["stripe_customer_id"] and current_customer != fields["stripe_customer_id"]) or \
+                (customer and current_meta and current_meta != customer["id"]):
+            return {"status": "rejected", "reason": "checkout and its subscription disagree about the account"}
+        current_price = _current_subscription_price_id(current)
+        tier = resolve_tier(current_price) or tier
+        if current_price:
+            fields["price_id"] = current_price
+        if current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES:
+            # Already ended in Stripe (this checkout event arrived late):
+            # grant nothing; an existing row reflects the ended state.
+            if customer:
+                existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer["id"], tier["product"]))
+                if existing:
+                    upsert_entitlement(customer_id=customer["id"], product=tier["product"], camera_slot_quantity=0, status="cancelled",
+                                       stripe_customer_id=fields["stripe_customer_id"], stripe_subscription_id=subscription_id,
+                                       stripe_price_id=fields["price_id"])
+            return {"status": "not_granted", "reason": "subscription is no longer active in Stripe"}
     if not customer:
         if not fields["email"]:
             return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
@@ -580,6 +611,7 @@ def _sync_checkout_completed(event: dict) -> dict:
     entitlement = upsert_entitlement(
         customer_id=customer["id"], product=tier["product"], camera_slot_quantity=tier["camera_slot_maximum"],
         status="active", stripe_customer_id=fields["stripe_customer_id"],
+        stripe_subscription_id=subscription_id if current is not None else None,
         stripe_checkout_session_id=fields["stripe_checkout_session_id"], stripe_price_id=fields["price_id"],
     )
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"], "customer_id": customer["id"]}
@@ -605,6 +637,12 @@ def _current_subscription_price_id(subscription_obj: dict) -> str:
 
 def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     subscription_obj = (event.get("data") or {}).get("object") or {}
+    current = current_subscription(str(subscription_obj.get("id") or "") or None)
+    if current is not None:
+        # What Stripe says now wins over this event's snapshot; a deletion
+        # is only "cancelled" if the subscription really has ended.
+        subscription_obj = current
+        cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
     stripe_customer_id = str(subscription_obj.get("customer") or "")
     metadata = subscription_obj.get("metadata") or {}
     price_id = _current_subscription_price_id(subscription_obj)
@@ -618,6 +656,12 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         "SELECT * FROM customer_entitlements WHERE stripe_customer_id=? AND product=?",
         (stripe_customer_id, tier["product"]),
     )
+    if existing and metadata_customer_id and existing["customer_id"] != metadata_customer_id:
+        # The Stripe customer maps to one account and the subscription
+        # names another: apply it to neither (2026-10-02).
+        return {"status": "rejected", "reason": "stripe customer and subscription metadata name different accounts"}
+    if not existing and metadata_customer_id and _bound_elsewhere(stripe_customer_id, metadata_customer_id):
+        return {"status": "rejected", "reason": "stripe customer belongs to another account"}
     if not existing and metadata_customer_id:
         # Self-healing path: Stripe does not guarantee webhook delivery
         # order, so a subscription.updated event can in principle arrive
@@ -627,11 +671,16 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         # metadata), so look the entitlement up that way instead of
         # giving up.
         existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (metadata_customer_id, tier["product"]))
-    if not existing:
-        return {"status": "ignored", "reason": "no existing entitlement for this stripe customer/product"}
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
+    if not existing:
+        known = metadata_customer_id and row("SELECT id FROM customers WHERE id=?", (metadata_customer_id,))
+        if not known:
+            return unresolved("camera_plan", str(subscription_obj.get("id") or "") or None, stripe_customer_id)
+        if current is None and new_status == "active":
+            # Without Stripe's current state, only a checkout grants.
+            return {"status": "ignored", "reason": "no existing entitlement for this stripe customer/product"}
     entitlement = upsert_entitlement(
-        customer_id=existing["customer_id"],
+        customer_id=(existing or {}).get("customer_id") or metadata_customer_id,
         product=tier["product"],
         # An upgrade (a different Price ID's subscription.updated for the
         # SAME product) would arrive with a different tier -- always take

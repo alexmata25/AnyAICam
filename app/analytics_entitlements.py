@@ -441,6 +441,22 @@ def _sync_checkout_completed(event: dict) -> dict:
         customer = row("SELECT * FROM customers WHERE id=?", (fields["authoritative_customer_id"],))
     if not customer and fields["email"]:
         customer = _find_customer_by_email(fields["email"])
+    # Same ownership and current-state rules as camera plans (2026-10-02,
+    # customer_entitlements): a Stripe customer paying for another account
+    # never provisions this one, and a subscription that has already ended in
+    # Stripe is never granted by a late checkout event.
+    from stripe_state import bound_elsewhere as _bound_elsewhere, current_subscription
+    if customer and _bound_elsewhere(fields["stripe_customer_id"], customer["id"]):
+        return {"status": "rejected", "reason": "stripe customer belongs to another account", "customer_id": customer["id"]}
+    subscription_id = str(session_obj.get("subscription") or "") or None
+    current = current_subscription(subscription_id) if session_obj.get("mode") == "subscription" else None
+    if current is not None:
+        current_meta = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
+        if (fields["stripe_customer_id"] and str(current.get("customer") or "") != fields["stripe_customer_id"]) or \
+                (customer and current_meta and current_meta != customer["id"]):
+            return {"status": "rejected", "reason": "checkout and its subscription disagree about the account"}
+        if current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES:
+            return {"status": "not_granted", "reason": "subscription is no longer active in Stripe"}
 
     if not customer:
         if not fields["email"]:
@@ -465,6 +481,7 @@ def _sync_checkout_completed(event: dict) -> dict:
         customer_id=customer["id"], addon_key=addon["addon_key"], status="active",
         quantity=_positive_int((session_obj.get("metadata") or {}).get("anyaicam_quantity")),
         stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
+        stripe_subscription_id=subscription_id if current is not None else None,
     )
     subscription_ids = []
     for analytic_key in addon["analytic_keys"]:
@@ -492,6 +509,11 @@ def _current_subscription_price_id(subscription_obj: dict) -> str:
 
 def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     subscription_obj = (event.get("data") or {}).get("object") or {}
+    from stripe_state import current_subscription, stripe_customer_accounts, unresolved
+    current = current_subscription(str(subscription_obj.get("id") or "") or None)
+    if current is not None:  # Stripe's current state wins over this event's snapshot (2026-10-02)
+        subscription_obj = current
+        cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
     stripe_customer_id = str(subscription_obj.get("customer") or "")
     metadata = subscription_obj.get("metadata") or {}
     price_id = _current_subscription_price_id(subscription_obj)
@@ -503,6 +525,11 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     if not addon:
         return {"status": "ignored", "reason": "no verified analytics mapping for this stripe price id", "price_id": price_id}
 
+    owners = stripe_customer_accounts(stripe_customer_id)
+    if metadata_customer_id and owners and owners != {metadata_customer_id}:
+        return {"status": "rejected", "reason": "stripe customer and subscription metadata name different accounts"}
+    if not owners and (not metadata_customer_id or not row("SELECT id FROM customers WHERE id=?", (metadata_customer_id,))):
+        return unresolved("add_on", str(subscription_obj.get("id") or "") or None, stripe_customer_id)
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
     items = ((subscription_obj.get("items") or {}).get("data") or [])
     quantity = _positive_int(items[0].get("quantity")) if items and isinstance(items[0], dict) else None

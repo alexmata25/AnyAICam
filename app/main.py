@@ -48783,6 +48783,8 @@ from mobile_push_routes import register_routes as register_mobile_push_routes
 register_mobile_push_routes(app)
 from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
+from customer_billing import register_customer_billing_routes
+register_customer_billing_routes(app)
 from account_invitations import register_account_invitation_routes
 register_account_invitation_routes(app)
 from direct_onboarding import register_direct_onboarding_routes
@@ -113808,6 +113810,12 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
+    # One subscription per plan (2026-10-02): a second checkout for a plan
+    # this account already holds would start a second, parallel Stripe
+    # subscription (double billing) and overwrite the first one's record.
+    from customer_entitlements import get_entitlements_for_customer as _held
+    if any(e["product"] == f"camera_slots_{plan_type}" and e["status"] == "active" for e in _held(customer_id)):
+        raise HTTPException(status_code=409, detail=f"Your account already has an active {plan_type.title()} plan.")
     stripe_mode = "payment" if billing_type == "one_time" else "subscription"
     import pricing_catalog
     _catalog_plan = pricing_catalog.find_base_plan(plan_type, tier_label)
@@ -114211,68 +114219,18 @@ def create_stripe_customer_portal(
 
 
     user = current_user(request)
-
-
-
-
-
-
-
-
+    # Legacy appliance-admin tool only (2026-10-02): it maps a legacy login
+    # to a billing account and falls back to the shared 'primary' account,
+    # so a customer session here opened ANOTHER account's Stripe portal.
+    # Customers use POST /api/customer/billing-portal (customer_billing.py).
+    if not user.get("enabled", True) or not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Use Manage billing on My subscription.")
     if not PUBLIC_BASE_URL:
-
-
-
-
-
-
-
-
         raise HTTPException(
-
-
-
-
-
-
-
-
             status_code=503,
-
-
-
-
-
-
-
-
             detail="ANYAICAM_PUBLIC_URL is required.",
-
-
-
-
-
-
-
-
         )
-
-
-
-
-
-
-
-
     account = billing_account_for_user(user)
-
-
-
-
-
-
-
-
     customer_id = stripe_customer_id_for_account(account)
 
 
