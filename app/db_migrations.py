@@ -1243,6 +1243,12 @@ CREATE INDEX IF NOT EXISTS idx_checkout_pending_session ON checkout_pending(sess
 CREATE TABLE IF NOT EXISTS stripe_customer_bindings(customer_id TEXT PRIMARY KEY, stripe_customer_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS billing_invoice_states(invoice_id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT NOT NULL, updated_at TEXT NOT NULL);
 '''),
+    # Local -> Hybrid upgrade attempts (Codex verification of 9a388c6): one
+    # open attempt per subscription and price, its Idempotency-Key derived
+    # from it; a declined attempt is closed so a retry is a new attempt.
+    ('20261002_plan_upgrade_attempts','''
+CREATE TABLE IF NOT EXISTS plan_upgrade_attempts(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, stripe_subscription_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL, open_slot TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(stripe_subscription_id, stripe_price_id, open_slot));
+'''),
 ]
 
 

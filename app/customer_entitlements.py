@@ -175,6 +175,22 @@ def upsert_entitlement(
     (e.g. a subscription-cancelled event has no checkout_session_id)."""
     existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, product))
     now = _now()
+    if not existing:
+        # Two simultaneous requests (e.g. duplicate upgrade clicks, or one
+        # with its webhook) may both find no row: one inserts, the other
+        # updates that row instead of failing on UNIQUE(customer_id, product).
+        entitlement_id = uuid.uuid4().hex
+        with connection() as db:
+            inserted = db.execute(
+                "INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,"
+                "stripe_customer_id,stripe_subscription_id,stripe_checkout_session_id,stripe_price_id,created_at,updated_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(customer_id,product) DO NOTHING",
+                (entitlement_id, customer_id, product, camera_slot_quantity, status,
+                 stripe_customer_id, stripe_subscription_id, stripe_checkout_session_id, stripe_price_id, now, now, expires_at),
+            ).rowcount
+        if inserted:
+            return row("SELECT * FROM customer_entitlements WHERE id=?", (entitlement_id,))
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, product))
     with connection() as db:
         if existing:
             db.execute(

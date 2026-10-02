@@ -11,6 +11,7 @@ customer/subscription, unresolvable events (retried, not lost), replayed
 webhooks, duplicate checkout, Billing Portal authorization, and
 direct-vs-partner attribution.
 """
+import copy
 import hashlib
 import hmac
 import json
@@ -100,9 +101,19 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
                 return found
             raise AssertionError(f"unexpected Stripe GET {path}")
 
+        replies: dict = {}  # Idempotency-Key -> Stripe's first answer, replayed for the same key (as Stripe does)
+
         def fake_post(path, fields, idempotency_key=None):
             posts.append((path, dict(fields)))
             keys.append(idempotency_key)
+            if idempotency_key and idempotency_key in replies:
+                return copy.deepcopy(replies[idempotency_key])
+            answer = stripe_write(path, fields, idempotency_key)
+            if idempotency_key:
+                replies[idempotency_key] = copy.deepcopy(answer)
+            return answer
+
+        def stripe_write(path, fields, idempotency_key):
             if path == "/v1/billing_portal/sessions":
                 return {"id": "bps_1", "url": "https://billing.stripe.test/session"}
             if path == "/v1/customers":  # one customer per Idempotency-Key, as Stripe does
@@ -448,7 +459,8 @@ def test_local_to_hybrid_upgrades_the_same_subscription_to_one_base_plan(env):
     assert changes[0][1]["proration_behavior"] == "always_invoice"
     assert changes[0][1]["billing_cycle_anchor"] == "unchanged"
     assert changes[0][1]["payment_behavior"] == "pending_if_incomplete"
-    assert env["keys"][env["posts"].index(changes[0])] == f"anyaicam-upgrade-sub_A1-si_sub_A1-{HYBRID_8}"
+    # Keyed per upgrade attempt (plan_upgrade_attempts): same attempt, same key.
+    assert env["keys"][env["posts"].index(changes[0])].startswith(f"anyaicam-upgrade-sub_A1-si_sub_A1-{HYBRID_8}-")
     assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]  # no second subscription
     assert _plan(env["path"], product="camera_slots_hybrid")["status"] == "active"
     assert _plan(env["path"], product="camera_slots_local")["status"] == "superseded"
@@ -470,16 +482,19 @@ def test_a_declined_upgrade_payment_leaves_the_customer_on_local(env):
     assert _capacity(env) == (8, "local")
 
 
-def test_repeated_upgrade_requests_reach_stripe_as_one_operation(env):
-    """Two requests that both find the subscription still on Local (a double
-    click, a retry after a lost response, two workers) send the same
-    Idempotency-Key, so Stripe performs and charges the change once."""
+def test_a_try_after_a_confirmed_decline_is_a_new_upgrade_attempt(env):
+    """Codex verification of 9a388c6, finding 2: once Stripe confirmed an
+    attempt was not applied, the customer's next try is a new attempt with a
+    new Idempotency-Key (the same key would only replay the cached decline).
+    Simultaneous requests for one attempt share one key:
+    test_stripe_billing_verification.py."""
     _local_customer(env)
-    env["declines"].add("sub_A1")  # the first attempt is not applied...
-    env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
-    env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    env["declines"].add("sub_A1")  # the card keeps failing
+    for _ in range(2):
+        assert env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A)).status_code == 402
     upgrade_keys = [k for (path, _), k in zip(env["posts"], env["keys"]) if path == "/v1/subscriptions/sub_A1"]
-    assert len(upgrade_keys) == 2 and len(set(upgrade_keys)) == 1  # ...and a repeat is the same Stripe operation
+    assert len(upgrade_keys) == 2 and len(set(upgrade_keys)) == 2
+    assert _capacity(env) == (8, "local") and not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]
 
 
 def test_the_upgrade_button_uses_the_in_place_upgrade(env):

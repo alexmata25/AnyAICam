@@ -15,8 +15,11 @@
    quantity, discount); anything different -- another plan, a Friends &
    Family decision made since -- first expires the open session in Stripe
    (which Stripe refuses once it has been paid), so only one can ever be
-   paid. A completed or expired session frees the claim (webhook step); a
-   session whose payment is still pending (bank debit) keeps it.
+   paid. An expired session frees the claim (webhook step); a session whose
+   payment is still pending (bank debit) keeps it. A PAID session holds the
+   claim -- with no expiry -- until the webhook's entitlement provisioning
+   for it has completed (Codex verification of 9a388c6, finding 1): while
+   provisioning waits for a webhook retry, no second checkout can start.
 2. One canonical Stripe customer per AnyAiCam account (stripe_customer_bindings,
    both columns unique). Every plan, add-on and VMS-license checkout passes
    `customer=<that id>` -- never only customer_email, which made Stripe
@@ -45,6 +48,8 @@ CLOCK_SKEW_SECONDS = 60
 MIN_REUSE_SECONDS = 5 * 60  # a session about to expire is replaced, not reused
 AWAITING_PAYMENT_SECONDS = 14 * 24 * 3600  # bank debits can take days
 FREE_STATES = ("completed", "expired", "abandoned")
+# Webhook steps that provision what a Checkout Session bought (main._stripe_webhook_steps).
+PROVISIONING_STEPS = ("camera_slot_entitlements", "analytics_entitlements")
 
 IN_PROGRESS = "A checkout for this purchase is already in progress. Finish it in the other window, or try again in a few minutes."
 NEEDS_ATTENTION = "This account's billing records need attention. Please contact AnyAiCam support."
@@ -119,7 +124,8 @@ def _claim(customer_id: str, purchase: str, price_id: str, quantity: int, finger
             "ON CONFLICT(customer_id,purchase) DO UPDATE SET token=excluded.token,price_id=excluded.price_id,"
             "quantity=excluded.quantity,fingerprint=excluded.fingerprint,session_id=NULL,checkout_url=NULL,status='creating',"
             "expires_at=excluded.expires_at,created_at=excluded.created_at,updated_at=excluded.updated_at "
-            "WHERE checkout_pending.status IN ('completed','expired','abandoned') OR checkout_pending.expires_at<?",
+            "WHERE checkout_pending.status IN ('completed','expired','abandoned') "
+            "OR (checkout_pending.expires_at<? AND checkout_pending.status<>'paid')",
             (customer_id, purchase, token, price_id, quantity, fingerprint, now + CHECKOUT_SESSION_SECONDS, _now_iso(), _now_iso(),
              now - CLOCK_SKEW_SECONDS)).rowcount
     current = _pending(customer_id, purchase)
@@ -189,9 +195,22 @@ def create_session(customer_id: str, purchase: str, *, price_id: str, quantity: 
     return session
 
 
+class ProvisioningPending(Exception):
+    """The paid session's entitlement provisioning has not completed yet:
+    this step fails, so Stripe redelivers the event, and the claim stays."""
+
+
+def _provisioned(event_id: str) -> bool:
+    with connection() as db:
+        done = {r["step"] for r in db.execute(
+            "SELECT step FROM stripe_webhook_steps WHERE event_id=? AND status='completed'", (event_id,)).fetchall()}
+    return all(step in done for step in PROVISIONING_STEPS)
+
+
 def sync_from_stripe_event(event: dict) -> dict:
-    """Webhook step: a finished session frees its claim; one still awaiting
-    a bank payment keeps it while the payment can still arrive."""
+    """Webhook step: a paid session keeps blocking until it is provisioned,
+    then frees its claim; one still awaiting a bank payment keeps it while
+    the payment can still arrive; an expired one frees it."""
     event_type = str(event.get("type") or "")
     session = (event.get("data") or {}).get("object") or {}
     session_id = str(session.get("id") or "")
@@ -200,6 +219,11 @@ def sync_from_stripe_event(event: dict) -> dict:
     if event_type == "checkout.session.completed" and session.get("payment_status") not in ("paid", "no_payment_required"):
         state, expires = "awaiting_payment", int(time.time()) + AWAITING_PAYMENT_SECONDS
     elif event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        with connection() as db:  # paid: blocking, whatever happens to provisioning
+            db.execute("UPDATE checkout_pending SET status='paid',updated_at=? WHERE session_id=? AND status<>'completed'",
+                       (_now_iso(), session_id))
+        if not _provisioned(str(event.get("id") or "")):
+            raise ProvisioningPending("the purchase is paid but not provisioned yet")
         state, expires = "completed", None
     elif event_type in ("checkout.session.expired", "checkout.session.async_payment_failed"):
         state, expires = "expired", None

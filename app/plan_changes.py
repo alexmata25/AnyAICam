@@ -26,14 +26,23 @@ that immediate proration payment succeeds. If it does not, nothing changes --
 the customer stays on Local and is told the payment did not go through. (Not
 a grace policy: Hybrid is simply never granted on an unpaid upgrade.)
 
-Repeated or concurrent requests reach Stripe with the same Idempotency-Key
-(per subscription and price change), and a request that finds the
-subscription already on Hybrid sends nothing: one change, one charge.
+Upgrade attempts (Codex verification of 9a388c6, finding 2): each attempt
+is a durable row in plan_upgrade_attempts, and its Idempotency-Key is
+derived from it. Concurrent requests and retries after a lost response use
+the attempt still open -- the same key, so Stripe makes one change and one
+charge. Once Stripe confirms the attempt was NOT applied (the proration
+payment failed; the subscription is still on Local), the attempt is closed;
+the customer's next explicit try, after fixing the card, is a new attempt
+with a new key -- Stripe would otherwise replay the cached decline. Always
+the same subscription; a request that finds it already on Hybrid sends
+nothing.
 """
 from __future__ import annotations
 
 import os
 import sys
+import uuid
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -42,6 +51,31 @@ from partner_db import audit
 UPGRADE_PRORATION_BEHAVIOR = "always_invoice"  # owner, 2026-10-02: prorate and invoice now
 UPGRADE_BILLING_CYCLE_ANCHOR = "unchanged"     # owner, 2026-10-02: renewal date unchanged
 UPGRADE_PAYMENT_BEHAVIOR = "pending_if_incomplete"
+
+
+def _open_upgrade_attempt(customer_id: str, subscription_id: str, price_id: str) -> dict:
+    """The unresolved attempt for this change, created if there is none;
+    concurrent requests get the same one (unique open slot)."""
+    from partner_db import connection, row
+    now = datetime.now().isoformat()
+    with connection() as db:
+        db.execute("INSERT INTO plan_upgrade_attempts(id,customer_id,stripe_subscription_id,stripe_price_id,open_slot,status,"
+                   "created_at,updated_at) VALUES(?,?,?,?,'open','open',?,?) ON CONFLICT DO NOTHING",
+                   (uuid.uuid4().hex, customer_id, subscription_id, price_id, now, now))
+    return row("SELECT * FROM plan_upgrade_attempts WHERE stripe_subscription_id=? AND stripe_price_id=? AND open_slot='open'",
+               (subscription_id, price_id))
+
+
+def _close_upgrade_attempt(attempt_id: str, status: str) -> None:
+    from partner_db import connection
+    with connection() as db:
+        db.execute("UPDATE plan_upgrade_attempts SET status=?,open_slot=NULL,updated_at=? WHERE id=? AND open_slot='open'",
+                   (status, datetime.now().isoformat(), attempt_id))
+
+
+def _on_price(subscription: dict, price_id: str) -> bool:
+    return any(isinstance(i, dict) and str((i.get("price") or {}).get("id") or "") == price_id
+               for i in ((subscription.get("items") or {}).get("data") or []))
 
 
 def upgrade_available() -> bool:
@@ -97,6 +131,7 @@ def upgrade_to_hybrid(identity: dict) -> dict:
     if item is None or not item.get("id"):
         raise HTTPException(status_code=409, detail="This plan's billing record needs attention. Please contact AnyAiCam support.")
     if str((item.get("price") or {}).get("id") or "") != hybrid_price:  # a repeated request finds it already moved
+        attempt = _open_upgrade_attempt(customer_id, subscription_id, hybrid_price)
         current = main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [
             ("items[0][id]", str(item["id"])),
             ("items[0][price]", hybrid_price),
@@ -107,12 +142,22 @@ def upgrade_to_hybrid(identity: dict) -> dict:
             ("metadata[anyaicam_stripe_price_id]", hybrid_price),
             ("metadata[anyaicam_camera_slot_plan_type]", "hybrid"),
             ("metadata[anyaicam_camera_slot_maximum]", str(camera_slot_maximum)),
-        ], idempotency_key=f"anyaicam-upgrade-{subscription_id}-{item['id']}-{hybrid_price}")
-        moved = [i for i in ((current.get("items") or {}).get("data") or [])
-                 if isinstance(i, dict) and str((i.get("price") or {}).get("id") or "") == hybrid_price]
-        if not moved or current.get("pending_update"):
+        ], idempotency_key=f"anyaicam-upgrade-{subscription_id}-{item['id']}-{hybrid_price}-{attempt['id']}")
+        if not _on_price(current, hybrid_price) or current.get("pending_update"):
             # pending_if_incomplete: the proration payment did not go
-            # through, so Stripe kept the subscription on Local.
+            # through. Confirm with Stripe's current state before closing
+            # this attempt (the next try is then a new attempt, new key).
+            try:
+                confirmed = stripe_state.current_subscription(subscription_id)
+            except stripe_state.RetryableStripeEventError as error:
+                raise HTTPException(status_code=502, detail="Could not reach Stripe. Please try again shortly.") from error
+            applied = _on_price(confirmed, hybrid_price) and not confirmed.get("pending_update")
+        else:
+            applied = True
+        _close_upgrade_attempt(attempt["id"], "applied" if applied else "declined")
+        if applied and not _on_price(current, hybrid_price):
+            current = confirmed
+        if not applied:
             audit(identity, "customer.plan_upgrade_payment_incomplete", "customer", customer_id, {"to": "hybrid"})
             raise HTTPException(status_code=402, detail="The payment for the upgrade didn't go through, so your plan is still Local. "
                                                         "Please check your payment method and try again.")

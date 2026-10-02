@@ -98,7 +98,8 @@ def test_after_7_days_unpaid_the_plan_is_suspended_not_duplicated(env):
 def test_payment_within_grace_restores_normal_state(env):
     _customer(env)
     _deliver(env, _invoice("evt_f1", kind="invoice.payment_failed", created=int(NOW.timestamp())))
-    _deliver(env, _invoice("evt_p2"))  # the retry succeeded on day 3
+    env["invoices"]["in_evt_f1"] = {"id": "in_evt_f1", "status": "paid", "amount_paid": 1499}
+    _deliver(env, _invoice("evt_p2", invoice_id="in_evt_f1"))  # Stripe's retry of that invoice succeeded on day 3
     _sweep(env, NOW + timedelta(days=30))
     assert _plan(env["path"])["status"] == "active" and _plan(env["path"])["payment_failed_at"] is None
 
@@ -107,7 +108,8 @@ def test_payment_after_suspension_restores_exactly_once(env):
     _customer(env)
     _deliver(env, _invoice("evt_f1", kind="invoice.payment_failed", created=int(NOW.timestamp())))
     _sweep(env, NOW + timedelta(days=8))
-    paid = _invoice("evt_p2")
+    env["invoices"]["in_evt_f1"] = {"id": "in_evt_f1", "status": "paid", "amount_paid": 1499}
+    paid = _invoice("evt_p2", invoice_id="in_evt_f1")  # the failed invoice, paid late
     for _ in range(2):
         _deliver(env, paid)  # replay
     assert _plan(env["path"])["status"] == "active" and _capacity(env) == (8, "local")
@@ -153,7 +155,8 @@ def test_an_add_on_follows_the_same_grace(env, monkeypatch):
     _sweep(env, NOW + timedelta(days=7))
     with override_target(sqlite_path=str(env["path"])):
         assert ae.get_active_analytics_for_customer("cust-A") == []
-    _deliver(env, _invoice("evt_ap", sub_id="sub_AD", price="price_adv"))
+    env["invoices"]["in_evt_af"] = {"id": "in_evt_af", "status": "paid", "amount_paid": 1499}
+    _deliver(env, _invoice("evt_ap", sub_id="sub_AD", price="price_adv", invoice_id="in_evt_af"))
     with override_target(sqlite_path=str(env["path"])):
         assert ae.get_active_analytics_for_customer("cust-A")
     assert _plan(env["path"])["status"] == "active"  # the camera plan was never touched

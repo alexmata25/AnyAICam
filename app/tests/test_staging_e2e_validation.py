@@ -49,6 +49,12 @@ RYZEN_STARTER_STAGING = "price_staging_ryzen_starter"
 TEST_WEBHOOK_SECRET = "whsec_staging_validation_secret"
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_staging_e2e_validation.db"
@@ -119,6 +125,7 @@ def _checkout_event(event_id, price_id, *, email="staging-buyer@example.test", s
         "id": event_id, "type": "checkout.session.completed",
         "data": {"object": {
             "id": f"cs_{event_id}", "mode": mode, "customer": stripe_customer, "customer_details": {"email": email},
+            **({"subscription": f"sub_{event_id}"} if mode == "subscription" else {}),
             "payment_status": "paid", "client_reference_id": "primary", "metadata": metadata,
         }},
     }

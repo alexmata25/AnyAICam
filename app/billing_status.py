@@ -27,7 +27,12 @@ it never starts grace again (finding 6); the invoice's state in Stripe is
 read before grace starts. A refund or dispute recorded before the purchase
 was granted is consulted when it is granted (stripe_state.payment_reversal,
 finding 4). A failed renewal is also emailed to the customer, once per
-invoice (purchase_notifications.notify_payment_failed, finding 8). Camera plans keep their camera
+invoice (purchase_notifications.notify_payment_failed, finding 8).
+A paid invoice clears grace only when it resolves the outstanding failure:
+no other renewal invoice of the subscription is still unpaid in Stripe and
+Stripe no longer reports the subscription past_due/unpaid -- a delayed
+invoice.paid for an older period never ends grace started by a newer failed
+renewal (Codex verification of 9a388c6, finding 3). Camera plans keep their camera
 count while suspended (counted only when active), so restoring is exact.
 
 Not decided here (owner): partial refunds -- a partially refunded payment
@@ -176,6 +181,28 @@ def grace_ends_at(payment_failed_at: str | None) -> datetime | None:
         return None
 
 
+def _outstanding_failure(subscription_id: str, *, paid_invoice_id: str = "", subscription: dict | None = None) -> bool:
+    """True while a failed renewal of this subscription is still unpaid:
+    another invoice recorded as failed that Stripe has not settled, or Stripe
+    still reporting the subscription past_due/unpaid. Read from Stripe;
+    unreadable -> RetryableStripeEventError (the event is retried)."""
+    import stripe_state
+    from urllib.parse import quote
+    with connection() as db:
+        db.execute(INVOICE_STATES_DDL)
+        failed = [r["invoice_id"] for r in db.execute(
+            "SELECT invoice_id FROM billing_invoice_states WHERE subscription_id=? AND state='failed' AND invoice_id<>?",
+            (subscription_id, paid_invoice_id)).fetchall()]
+    for invoice_id in failed:
+        current = stripe_state.stripe_get(f"/v1/invoices/{quote(invoice_id, safe='')}", "a failed renewal's payment state")
+        status = str(current.get("status") or "")
+        if status not in SETTLED_INVOICE_STATES:
+            return True
+        _set_invoice_state(invoice_id, subscription_id, status)
+    subscription = subscription or stripe_state.current_subscription(subscription_id)
+    return str((subscription or {}).get("status") or "") in GRACE_STRIPE_STATUSES
+
+
 def apply_subscription_status(subscription: dict) -> None:
     """Stripe's current status for a subscription (reconciliation)."""
     subscription_id = str(subscription.get("id") or "")
@@ -185,7 +212,7 @@ def apply_subscription_status(subscription: dict) -> None:
     if status in GRACE_STRIPE_STATUSES:
         mark_payment_failed(subscription_id)
         sweep_grace()
-    elif status in HEALTHY_STRIPE_STATUSES:
+    elif status in HEALTHY_STRIPE_STATUSES and not _outstanding_failure(subscription_id, subscription=subscription):
         payment_recovered(subscription_id)
 
 
@@ -384,6 +411,8 @@ def sync_from_stripe_event(event: dict) -> dict:
             _set_invoice_state(str(obj["id"]), subscription_id, "paid")
         if _is_reversed(str(obj.get("charge") or ""), intent, str(obj.get("id") or "")):
             return {"status": "ignored", "reason": "this payment was refunded or disputed"}
+        if _outstanding_failure(subscription_id, paid_invoice_id=str(obj.get("id") or "")):
+            return {"status": "ignored", "reason": "a later renewal is still unpaid: grace continues"}
         return {"status": "recovered", "rows": payment_recovered(subscription_id)}
     if event_type in ("customer.subscription.updated", "customer.subscription.created"):
         from stripe_state import current_subscription
