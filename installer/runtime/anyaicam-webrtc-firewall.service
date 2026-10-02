@@ -1,0 +1,14 @@
+[Unit]
+Description=AnyAiCam WebRTC media port restriction (private/Tailscale sources only)
+DefaultDependencies=no
+After=network-pre.target
+Before=docker.service anyaicam-vms.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/anyaicam-webrtc-firewall apply
+
+[Install]
+WantedBy=multi-user.target docker.service

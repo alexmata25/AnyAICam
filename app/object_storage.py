@@ -6,7 +6,8 @@ from pathlib import Path,PurePosixPath
 
 from cloud_config import settings
 
-ALLOWED_CATEGORIES={'snapshots','thumbnails','clips','documents','partner-materials'}
+# 'downloads' (2026-10-01): customer installers, served only by customer_downloads' licensed route.
+ALLOWED_CATEGORIES={'snapshots','thumbnails','clips','documents','partner-materials','updates','downloads'}
 
 
 def safe_key(category: str,key: str) -> str:

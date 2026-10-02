@@ -25,6 +25,7 @@ customer can watch without talking, and -- once transport exists --
 briefly talk while a separate live-view session is also open).
 """
 
+import os
 import secrets
 from datetime import datetime, timedelta
 
@@ -101,6 +102,27 @@ def _sweep_expired_sessions(db, now: datetime) -> None:
     )
 
 
+TALK_CHANNEL_OFFLINE_DETAIL = (
+    "Camera talk channel offline: this camera's appliance is not connected for two-way audio right now, "
+    "so your voice cannot reach the camera speaker."
+)
+
+
+def _require_appliance_talk_channel(camera: dict) -> None:
+    """On the cloud, homeowner Talk reaches a camera only through its
+    appliance's talk channel (talk_audio_relay's /api/appliance/talk/channel
+    WebSocket); the cloud cannot reach a camera on the customer's LAN
+    itself. Refuse to start a session that could never deliver audio,
+    with a clear reason, instead of reporting a successful Talk (found in
+    the 2026-09-28 Front Door test). Edge/combined runtimes keep their
+    local camera relay and are not affected."""
+    if os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower() != "cloud":
+        return
+    import talk_audio_relay
+    if not talk_audio_relay.appliance_talk_channel_connected(camera.get("appliance_id")):
+        raise HTTPException(status_code=503, detail=TALK_CHANNEL_OFFLINE_DETAIL)
+
+
 def register_talk_session_routes(app: FastAPI) -> None:
     @app.post('/api/customer/cameras/{camera_id}/talk/start')
     def start_talk_session(request: Request, camera_id: str) -> dict:
@@ -109,6 +131,7 @@ def register_talk_session_routes(app: FastAPI) -> None:
         with connection() as db:
             _sweep_expired_sessions(db, now)
             camera = _authorized_talk_camera(db, camera_id, identity)
+            _require_appliance_talk_channel(camera)
 
             session_id = secrets.token_hex(12)
             expires = now + timedelta(seconds=TALK_SESSION_DURATION_SECONDS)
@@ -125,7 +148,7 @@ def register_talk_session_routes(app: FastAPI) -> None:
         return {'session_id': session_id, 'status': 'requested', 'expires_at': expires.isoformat()}
 
     @app.post('/api/customer/talk/sessions/{session_id}/stop')
-    def stop_talk_session(request: Request, session_id: str) -> dict:
+    async def stop_talk_session(request: Request, session_id: str) -> dict:
         identity = _customer_identity(request)
         now = datetime.now()
         with connection() as db:
@@ -149,4 +172,17 @@ def register_talk_session_routes(app: FastAPI) -> None:
             )
 
         audit(identity, 'customer.talk_session_stopped', 'customer_talk_session', session_id, {'camera_id': session['camera_id']})
+
+        # 2026-09-23 fix: an explicit stop while a WebSocket was still
+        # actively relaying audio used to leave that relay running --
+        # audio kept reaching the camera speaker until it separately
+        # expired on its own timeout, up to MAX_RELAY_SECONDS later. A
+        # customer/AACO/AAC Voice Call "hang up" action must actually
+        # hang up. Local import: talk_audio_relay imports
+        # _authorized_talk_camera from this module, so a module-level
+        # import here would be circular. A no-op when no WebSocket for
+        # this session is currently open (the common case).
+        import talk_audio_relay
+        await talk_audio_relay.stop_active_relay_if_any(session_id)
+
         return {'session_id': session_id, 'status': 'stopped'}

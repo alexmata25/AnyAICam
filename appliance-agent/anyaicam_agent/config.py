@@ -18,26 +18,226 @@ class AgentConfig:
     camera_capacity: int=16
     software_version: str='0.1.0'
     recording_path: str='/var/lib/anyaicam/recordings'
+    vms_hls_path: str='/var/lib/anyaicam/vms/hls'
+    vms_recordings_path: str='/var/lib/anyaicam/vms/recordings'
+    vms_status_freshness_seconds: int=20
+    vms_recording_freshness_seconds: int=360
     config_dir: str=str(DEFAULT_CONFIG_DIR)
     state_dir: str=str(DEFAULT_STATE_DIR)
     log_dir: str=str(DEFAULT_LOG_DIR)
+
+    # RDM-2 (device-side integration, Group 2A): the manifest
+    # target/channel values this device presents to UpdateStateMachine.
+    # Not per-camera/per-customer -- these describe the appliance
+    # software itself. Defaults are not invented: 'anyaicam-appliance'
+    # matches every RDM-1 test manifest's target value, and 'stable'
+    # matches UpdateStateMachine's own constructor default (Group 6).
+    update_target: str='anyaicam-appliance'
+    update_channel: str='stable'
+
+    # RDM-2 (device-side integration, Group 2G): how often service.py's
+    # periodic pull path (check_for_source_update()) calls the already-
+    # existing UpdateStateMachine.check_and_install(). Deliberately a
+    # SEPARATE, much slower cadence than checkin_seconds (the normal
+    # heartbeat/camera/command poll interval) -- checking for a new
+    # software update does not need, and must not run at, the same
+    # frequency as routine operational polling.
+    update_check_interval_seconds: int=900
+
+    # RDM4 (remote device management -- diagnostics): the VMS app's own
+    # local health endpoint. Deliberately a plain loopback URL, not
+    # portal_url (that's the CLOUD-facing address) -- diagnostics reads
+    # the VMS's own signal directly, the same "trust the service's own
+    # output, not an external inference" philosophy camera_binding.py's
+    # LocalVmsStatusReader already uses for per-camera status. Verified
+    # reachable from this agent's actual systemd sandbox (NoNewPrivileges,
+    # ProtectSystem=strict, CapabilityBoundingSet=CAP_NET_RAW) before this
+    # was wired in -- see the diagnostics tests.
+    vms_local_health_url: str='http://127.0.0.1:8000/health'
+
+    # Provisioning Phase 7 (device-side entitlement refresh): how often
+    # service.py's periodic pull path (poll_entitlement()) calls the
+    # already-existing, already-tested cloud endpoint POST /api/
+    # provisioning/refresh (provisioning_api.py) to learn this
+    # customer's current Local/Hybrid camera-slot entitlement. The cloud
+    # endpoint existed and was tested long before anything on the device
+    # side ever called it -- this is that missing caller. Deliberately a
+    # separate, slower cadence than checkin_seconds (the normal
+    # heartbeat/camera/command poll interval), matching update_check_
+    # interval_seconds' own established precedent for "this doesn't need
+    # to run at operational-polling frequency."
+    entitlement_refresh_interval_seconds: int=1800
 
     def __post_init__(self): self.discovery_networks=self.discovery_networks or []
 
     @property
     def credential_file(self): return Path(self.state_dir)/'credential.json'
+    # Phase 2A (non-interactive claim flow, appliance side): where an
+    # in-progress claim's own state is durably recorded -- claim_session_id
+    # and, once known, claim_proof are both bearer-equivalent secrets
+    # (see app/appliance_claims.py's own docstring), so this file gets
+    # the exact same 0600-permission, atomic-write treatment as
+    # credential_file above (see save_claim_state()/load_claim_state()).
+    # Persisting claim_proof here the moment it's learned -- not just
+    # claim_session_id -- is what lets a restart between confirmation
+    # and completion retry claim/complete with the identical value
+    # afterward, matching the cloud side's own retry-safety guarantee
+    # (Phase 1 security-hardening checkpoint, hardening item 3) instead
+    # of stranding enrollment if the completion response is lost.
+    @property
+    def claim_state_file(self): return Path(self.state_dir)/'claim_state.json'
+    # The appliance's own UUIDv4 identity, generated once by
+    # installer/09-identity.sh (`cat /proc/sys/kernel/random/uuid`) and
+    # preserved across reinstalls -- a config_dir path (provisioned,
+    # read-only-in-practice trust material), not state_dir, matching
+    # trusted_public_key_file's own placement rationale below. This is
+    # the one real identifier this repository's own installer produces,
+    # and the exact value claim/begin's device_id now requires (see
+    # appliance_claims.py's DEVICE_ID_PATTERN comment).
+    @property
+    def installer_identity_file(self): return Path(self.config_dir)/'appliance_identity.json'
+    # WireGuard direct remote connectivity (docs/wireguard-remote-
+    # connectivity-plan.md Sec 6): private key + assigned tunnel address
+    # + gateway public key/endpoint -- provisioned trust material, same
+    # config_dir placement rationale as installer_identity_file/
+    # credential_file above (NOT state_dir: this is not routine runtime
+    # state, it's the device's own identity). See wireguard.py for the
+    # enrollment logic that reads/writes this file, and
+    # privileged_watcher.py's DISPATCH for the fixed, hardcoded path the
+    # rendered wg0.conf (a SEPARATE file, wireguard_conf_file below) is
+    # read from by the actual interface bring-up action.
+    @property
+    def wireguard_identity_file(self): return Path(self.config_dir)/'wireguard_identity.json'
+    # The rendered wg-quick config -- deliberately a real file path
+    # (config_dir/wireguard/wg0.conf), not the OS-default /etc/wireguard/
+    # wg0.conf, specifically so this unprivileged process (which already
+    # owns config_dir, same as every other file here) can write it
+    # without needing write access to /etc/wireguard/ at all -- wg-quick
+    # accepts a full config-file path as well as a bare interface name,
+    # so privileged_watcher.py's DISPATCH can point at this exact path
+    # as a fixed literal (see that module's own comment on this).
+    @property
+    def wireguard_conf_file(self): return Path(self.config_dir)/'wireguard'/'wg0.conf'
+    # Authenticated WireGuard event-media direct fetch (2026-09-19): a
+    # symmetric HMAC key this device shares with the cloud only -- see
+    # app/appliance_media_fetch.py's own module docstring for why this
+    # one secret genuinely must be a raw shared value (never a one-way
+    # hash like credential_hash): the cloud actively signs outgoing
+    # requests with it. Same config_dir placement as wireguard_identity_
+    # file (provisioned trust material, not routine runtime state) --
+    # deliberately a SEPARATE file, not folded into wireguard_identity.json,
+    # so rotating this one secret (see wireguard.py's rotate_media_fetch_
+    # secret()) never touches the WireGuard keypair/tunnel identity at all,
+    # and vice versa.
+    @property
+    def media_fetch_secret_file(self): return Path(self.config_dir)/'media_fetch_secret.json'
     @property
     def queue_file(self): return Path(self.state_dir)/'offline_queue.db'
     @property
     def cameras_file(self): return Path(self.state_dir)/'cameras.json'
+    @property
+    def discovered_cameras_file(self): return Path(self.state_dir)/'discovered_cameras.json'
+    @property
+    def camera_bindings_file(self): return Path(self.state_dir)/'camera_bindings.json'
+    @property
+    def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
+    @property
+    def entitlement_state_file(self): return Path(self.state_dir)/'entitlement_state.json'
+    # Local recording storage management (2026-09-17): the cross-process
+    # handoff FROM the VMS app's local_storage_manager.py worker TO this
+    # agent's own heartbeat is now an HTTP call (metrics.py's own
+    # VMS_LOCAL_URL, polling GET /api/appliance/local-storage-state) --
+    # NOT a shared state file. STATE_DIR is mounted read-only inside the
+    # VMS container by design, confirmed live on Ryzen, so a file this
+    # agent could read but the VMS app could never write into it was a
+    # structural dead end, not a transient bug.
+
+    # RDM4 (remote device management -- privileged actions): the ONLY
+    # channel by which this unprivileged agent process can ever request
+    # a reboot or a VMS-container restart. It writes an atomic marker
+    # file here (a known type + a correlation id, never a command or
+    # path) and a separate, root-owned watcher -- outside this process,
+    # outside this Python package, not installed by this commit -- acts
+    # on it via a fixed, hardcoded dispatch table. This agent never
+    # gains, and never attempts to gain, the privilege to reboot or
+    # touch Docker itself; NoNewPrivileges=true on its own systemd unit
+    # makes that structurally impossible regardless of what this code
+    # does, by design.
+    @property
+    def pending_actions_dir(self): return Path(self.state_dir)/'pending_actions'
+
+    # RDM-1 (Remote Device Management): additive-only properties, same style
+    # as the ones above. Update state lives under state_dir (mutable
+    # runtime state, like credential_file/queue_file); the trusted public
+    # key lives under config_dir (provisioned, read-only trust material,
+    # like agent.json).
+    @property
+    def updates_dir(self): return Path(self.state_dir)/'updates'
+    @property
+    def update_versions_dir(self): return self.updates_dir/'versions'
+    @property
+    def update_staging_dir(self): return self.updates_dir/'staging'
+    @property
+    def update_history_file(self): return self.updates_dir/'update_history.db'
+    @property
+    def pending_validation_file(self): return self.updates_dir/'pending_validation.json'
+    @property
+    def current_version_pointer_file(self): return self.updates_dir/'current_version.txt'
+    @property
+    def trusted_public_key_file(self): return Path(self.config_dir)/'trusted_signing_key.pem'
+
+    # The three fields first_enroll()/coordinated_reenroll() write into
+    # agent.json as part of a completed activation -- not general runtime
+    # tuning knobs like checkin_seconds/camera_capacity/etc. below. See
+    # load()'s own comment on why these three specifically need
+    # protection from environment-variable override once activated.
+    ACTIVATION_SCOPED_FIELDS={'cloud_id','portal_url','mode'}
 
     @classmethod
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
         if path.exists(): data=json.loads(path.read_text(encoding='utf-8'))
-        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH'}
+        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','vms_hls_path':'ANYAICAM_VMS_HLS_PATH','vms_recordings_path':'ANYAICAM_VMS_RECORDINGS_PATH','vms_status_freshness_seconds':'ANYAICAM_VMS_STATUS_FRESHNESS_SECONDS','vms_recording_freshness_seconds':'ANYAICAM_VMS_RECORDING_FRESHNESS_SECONDS','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS','vms_local_health_url':'ANYAICAM_VMS_LOCAL_HEALTH_URL','entitlement_refresh_interval_seconds':'ANYAICAM_ENTITLEMENT_REFRESH_INTERVAL_SECONDS'}
+        # field_defaults doubles as "the installer's own bootstrap
+        # placeholder" for portal_url/mode: appliance-agent/scripts/
+        # install.sh writes /etc/anyaicam/agent.env (sourced by
+        # anyaicam-agent.service on every start/restart/reboot) with
+        # ANYAICAM_PORTAL_URL=http://127.0.0.1:8000 and
+        # ANYAICAM_AGENT_MODE=development -- the exact same literals as
+        # these fields' own dataclass defaults below, so no separate
+        # constant is needed to recognize an untouched placeholder.
+        field_defaults={name:field.default for name,field in cls.__dataclass_fields__.items()}
         for key,environment in aliases.items():
-            if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity'} else os.environ[environment]
+            if os.getenv(environment) is None: continue
+            value=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','vms_status_freshness_seconds','vms_recording_freshness_seconds','update_check_interval_seconds','entitlement_refresh_interval_seconds'} else os.environ[environment]
+            # Once agent.json exists (activation has completed at least
+            # once -- it is written nowhere else, see setup_wizard.py's
+            # own already_enrolled check using this same file for the
+            # same signal) and its persisted value for this field is a
+            # real, non-default value, no environment variable may
+            # override it here -- not even one that looks like a
+            # deliberate admin override (i.e. differs from the field's
+            # own default). Ryzen's 2026-09-11 real-hardware failure was
+            # exactly that: agent.env/vms.env can carry a real,
+            # non-default value left over from a PRIOR activation (not
+            # the installer's untouched placeholder, which the check
+            # above this comment used to treat as the only unsafe case),
+            # and that stale-but-real value is indistinguishable from a
+            # genuine admin override once you only look at "does it equal
+            # the default?" -- so the previous version of this guard let
+            # it silently win and clobber the value a *new* activation
+            # had just persisted. There is already a correct, explicit
+            # channel for an administrator to change cloud_id/portal_url/
+            # mode on an activated appliance: re-run the interactive or
+            # --claim setup flow, which calls first_enroll()/
+            # coordinated_reenroll() and writes the new value directly
+            # into agent.json (see reenrollment.py) -- never through this
+            # environment-variable merge. So once a real value is
+            # persisted here, this loop must never let any environment
+            # variable -- placeholder or not -- override it; only a fresh
+            # activation (or a manual reset of agent.json) can change it.
+            if key in cls.ACTIVATION_SCOPED_FIELDS and path.exists() and data.get(key) not in (None,field_defaults.get(key)): continue
+            data[key]=value
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})
 
     def save(self,path: str|Path|None=None):
@@ -51,3 +251,50 @@ def load_credential(config: AgentConfig) -> dict|None:
 
 def save_credential(config: AgentConfig,value: dict):
     config.credential_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.credential_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.credential_file); os.chmod(config.credential_file,0o600)
+
+
+# Phase 2A claim-flow state -- same read/write/delete shape as
+# load_credential()/save_credential() above, for the same reason
+# (claim_state_file holds a bearer-equivalent secret once claim_proof
+# is known).
+def load_claim_state(config: AgentConfig) -> dict|None:
+    try: return json.loads(config.claim_state_file.read_text(encoding='utf-8'))
+    except (OSError,json.JSONDecodeError): return None
+
+
+def save_claim_state(config: AgentConfig,value: dict):
+    config.claim_state_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.claim_state_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.claim_state_file); os.chmod(config.claim_state_file,0o600)
+
+
+def clear_claim_state(config: AgentConfig):
+    try: config.claim_state_file.unlink()
+    except FileNotFoundError: pass
+
+
+# WireGuard identity -- same read/write shape as load_credential()/
+# save_credential() above (atomic write-then-rename, 0600), for the
+# same reason: wireguard_identity_file holds this device's own private
+# key, a bearer-equivalent secret for the tunnel exactly like
+# credential_file is for the control-plane API.
+def load_wireguard_identity(config: AgentConfig) -> dict|None:
+    try: return json.loads(config.wireguard_identity_file.read_text(encoding='utf-8'))
+    except (OSError,json.JSONDecodeError): return None
+
+
+def save_wireguard_identity(config: AgentConfig,value: dict):
+    config.wireguard_identity_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.wireguard_identity_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.wireguard_identity_file); os.chmod(config.wireguard_identity_file,0o600)
+
+
+# Media-fetch secret (2026-09-19) -- same read/write shape as every other
+# credential file above, deliberately its own separate file (see
+# AgentConfig.media_fetch_secret_file's own comment for why): a bearer-
+# equivalent shared secret, never logged, never returned by any API this
+# device calls, in either direction.
+def load_media_fetch_secret(config: AgentConfig) -> str|None:
+    try: value=json.loads(config.media_fetch_secret_file.read_text(encoding='utf-8')).get('secret')
+    except (OSError,json.JSONDecodeError,AttributeError): return None
+    return value if isinstance(value,str) and value else None
+
+
+def save_media_fetch_secret(config: AgentConfig,secret: str):
+    config.media_fetch_secret_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.media_fetch_secret_file.with_suffix('.tmp'); temporary.write_text(json.dumps({'secret':secret}),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.media_fetch_secret_file); os.chmod(config.media_fetch_secret_file,0o600)

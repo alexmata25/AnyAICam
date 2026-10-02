@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://anyaicam.com/customer-checkout.html">
+<title>Secure Customer Checkout | ANY AI CAM</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+body{background:#f3f6fb;color:#0b2b4f}.wrap{max-width:850px;margin:2rem auto;padding:0 1rem}.card{background:#fff;border:1px solid #dce6f5;border-radius:18px;box-shadow:0 18px 45px rgba(23,38,70,.12);overflow:hidden}.head{padding:2rem;color:#fff;background:linear-gradient(145deg,#080d2b,#17113f 62%,#31194a)}.head p{color:#d9e8ff}.content{padding:1.5rem}.notice{padding:1rem;border-left:5px solid #5fc4d1;background:#eefaff;border-radius:8px;margin-bottom:1.25rem}.summary{background:#f8fafc;border:1px solid #dce6f5;border-radius:12px;padding:1.25rem;margin:1rem 0}.row{display:flex;justify-content:space-between;gap:1rem;padding:.7rem 0;border-bottom:1px solid #e3eaf3}.row:last-child{border-bottom:0}.total{font-size:1.4rem;font-weight:900}.button{display:block;width:100%;box-sizing:border-box;padding:1rem;border:0;border-radius:10px;background:linear-gradient(90deg,#cc3b96,#5fc4d1);color:#fff;font-weight:900;font-size:1.05rem;cursor:pointer}.button:disabled{opacity:.6;cursor:wait}.error{padding:1rem;background:#fff0f0;border:1px solid #efb4b4;border-radius:10px;color:#8a2020}.hidden{display:none}
+</style>
+<link rel="stylesheet" href="header-standard.css">
+</head>
+<body>
+<header class="site-header">
+        <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+            <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+        </a>
+
+        <div class="header-controls">
+            <button class="mobile-menu-toggle" type="button" aria-expanded="false" aria-controls="primaryNav">Menu</button>
+            <div class="header-badges">
+                <a class="live-support-badge" href="support.html">&#9742; Connect with Live Support</a>
+            </div>
+        </div>
+                <nav class="site-nav" id="primaryNav" aria-label="Primary navigation">
+            <a href="index.html">Home</a>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="cloud-storage-pricing.html">Pricing</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="adapters.html">Adapters</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="support.html">Support</a>
+            <a href="contact.html">Contact</a>
+            <a href="cloud-setup-wizard.html">Get Started</a>
+            <div class="dropdown">
+              <a href="#" class="dropbtn">More</a>
+              <div class="dropdown-content">
+                <a href="nvr.html">NVR Setup</a>
+                <a href="software.html">Software</a>
+                <a href="partner.html">Partner Login</a>
+              </div>
+            </div>
+        </nav>
+    </header>
+<main class="wrap">
+<section class="card">
+<div class="head">
+<p style="font-weight:900;text-transform:uppercase;letter-spacing:.08em;color:#9be4ed;">Private Stripe Payment</p>
+<h1>Review and securely pay for your adapter.</h1>
+<p>Your salesperson prepared and locked this order. They cannot view or handle your card information.</p>
+</div>
+<div class="content">
+<div id="loading" class="notice">Loading your secure order…</div>
+<div id="error" class="error hidden"></div>
+<div id="checkoutContent" class="hidden">
+<div class="notice" id="partnerNotice"></div>
+<div class="summary" id="orderSummary"></div>
+<div class="summary">
+<h3>Customer</h3>
+<div class="row"><span>Name</span><strong id="customerName"></strong></div>
+<div class="row"><span>Email</span><strong id="customerEmail"></strong></div>
+<div class="row"><span>Order ID</span><strong id="orderId"></strong></div>
+</div>
+<div class="notice">
+<strong>What you pay today:</strong> adapter hardware only.<br>
+Cloud storage and analytics are billed separately by Videoloft after activation and the free trial.
+</div>
+<button class="button" id="payButton">Pay Securely with Stripe</button>
+<p style="text-align:center;color:#63708a;font-size:.9rem;">Card details are entered directly on Stripe’s secure checkout page.</p>
+</div>
+</div>
+</section>
+</main>
+<script>
+const params=new URLSearchParams(location.search);
+const orderCode=params.get('order')||'';
+const quoteCode=params.get('q')||'';
+const token=params.get('token')||'';
+let lockedOrder=null;
+
+const money=v=>Number(v||0).toLocaleString('en-US',{style:'currency',currency:'USD'});
+
+function adapterInfo(quote){
+ const map={
+   webhookTest:{label:'Webhook Test',price:.50,type:'webhook_test'},
+   adapter8:{label:'8-Channel Videoloft Adapter',price:349,type:'8channel'},
+   adapter16:{label:'16-Channel Videoloft Adapter',price:399,type:'16channel'},
+   adapter32:{label:'32-Channel Enterprise Adapter',price:2149,type:'32channel'},
+   adapter64:{label:'64-Channel Enterprise Adapter',price:2689,type:'64channel'}
+ };
+ return map[quote.adapter]||null;
+}
+
+
+function cameraInfo(quote){
+ const qty=Math.max(0,Number(quote.cameraHardwareQty||quote.cameraQty||quote.hardwareCameraQty||0));
+ return {qty,unitPrice:349.99,label:'ANY AI CAM 5MP Outdoor Fixed Dome AI Camera',sku:'AIC-CAM-5MP-DOME-001',warranty:'1 year'};
+}
+
+function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function analyticsRows(quote){
+ const selected=Array.isArray(quote.analytics)?quote.analytics:[];
+ if(!selected.length)return '<div class="row"><span>AI add-ons</span><strong>None selected</strong></div>';
+ return selected.map(item=>{
+   const qty=Math.max(1,Number(item.quantity)||1);
+   const unit=Number(item.unitPrice)||0;
+   const period=quote.billing==='annual'?'year':'month';
+   return `<div class="row"><span>${escapeHtml(item.name||item.key||'AI add-on')}</span><strong>${qty} camera${qty===1?'':'s'} × ${money(unit)} / ${period} = ${money(qty*unit)}</strong></div>`;
+ }).join('');
+}
+
+async function loadOrder(){
+ try{
+   if(!orderCode||!quoteCode||!token) throw new Error('This checkout link is incomplete.');
+   const response=await fetch(`api.php?action=get_checkout_order&order=${encodeURIComponent(orderCode)}&q=${encodeURIComponent(quoteCode)}&token=${encodeURIComponent(token)}`,{credentials:'same-origin',cache:'no-store'});
+   const result=await response.json();
+   if(!response.ok||!result.ok) throw new Error(result.error||'This checkout link is unavailable.');
+   lockedOrder=result.order;
+   const quote=lockedOrder.quote||{};
+   const adapter=adapterInfo(quote);
+   if(!adapter) throw new Error('This order does not include adapter hardware requiring payment.');
+
+   const qty=Math.max(1,Number(quote.adapterQty)||1);
+    const camera=cameraInfo(quote);
+    const adapterDue=adapter.price*qty;
+    const cameraDue=camera.qty*camera.unitPrice;
+    const due=adapterDue+cameraDue;
+   document.getElementById('partnerNotice').innerHTML=`Prepared by <strong>${lockedOrder.partner?.name||'ANY AI CAM'}</strong>. The products and prices are locked.`;
+   document.getElementById('orderSummary').innerHTML=`
+     <h3>Locked order summary</h3>
+     <div class="row"><span>Adapter</span><strong>${adapter.label}</strong></div>
+     <div class="row"><span>Adapter quantity</span><strong>${qty}</strong></div>
+      <div class="row"><span>Adapter subtotal</span><strong>${money(adapterDue)}</strong></div>
+      <div class="row"><span>Camera hardware</span><strong>${camera.qty?`${camera.qty} × ${money(camera.unitPrice)} = ${money(cameraDue)}`:'None selected'}</strong></div><div class="row"><span>Camera SKU / warranty</span><strong>${camera.qty?`${camera.sku} · ${camera.warranty}`:'—'}</strong></div><div class="row"><span>Brief specs</span><strong>${camera.qty?'5MP · AI person/vehicle detection · PoE · IP67 · IK10 · WDR Pro · Smart IR · ONVIF · H.265':'—'}</strong></div>
+     <div class="row"><span>Cloud cameras</span><strong>${Number(quote.cameraCount)||0}</strong></div>
+     <div class="row"><span>Cloud plan</span><strong>${String(quote.resolution||'').toUpperCase()}, ${quote.duration}-day ${quote.mode==='continuous'?'continuous':'motion'}</strong></div>
+     <div class="row"><span>Cloud billing after trial</span><strong>${quote.billing==='annual'?'Annual':'Monthly'}</strong></div>
+     ${analyticsRows(quote)}
+     <div class="row total"><span>Due today</span><strong>${money(due)}</strong></div>`;
+   document.getElementById('customerName').textContent=lockedOrder.customer?.name||'';
+   document.getElementById('customerEmail').textContent=lockedOrder.customer?.email||'';
+   document.getElementById('orderId').textContent=lockedOrder.orderId;
+   document.getElementById('loading').classList.add('hidden');
+   document.getElementById('checkoutContent').classList.remove('hidden');
+ }catch(error){
+   document.getElementById('loading').classList.add('hidden');
+   const errorBox=document.getElementById('error');
+   errorBox.textContent=error.message;
+   errorBox.classList.remove('hidden');
+ }
+}
+
+document.getElementById('payButton').addEventListener('click',async()=>{
+ const button=document.getElementById('payButton');
+ if(!lockedOrder)return;
+ button.disabled=true;
+ button.textContent='Creating Secure Stripe Checkout…';
+ try{
+   const quote=lockedOrder.quote||{};
+   const adapter=adapterInfo(quote);
+   if(!adapter) throw new Error('This order does not include payable adapter hardware.');
+
+   const response=await fetch('stripe-checkout.php?v=customer-order-fix',{
+     method:'POST',
+     headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({
+       adapter_type:adapter.type,
+       quantity:Math.max(1,Number(quote.adapterQty)||1),
+        camera_quantity:cameraInfo(quote).qty,
+       order_id:lockedOrder.orderId,
+       quote_id:lockedOrder.quoteId,
+       partner_id:lockedOrder.partner?.id||'',
+       customer_email:lockedOrder.customer?.email||''
+     })
+   });
+   const responseText=await response.text();
+   let result={};
+   try{
+     result=JSON.parse(responseText);
+   }catch(parseError){
+     throw new Error('Stripe server returned an invalid response.');
+   }
+   if(!response.ok||!result.url){
+     throw new Error(result.error||'Stripe checkout could not be created.');
+   }
+   window.location.assign(result.url);
+ }catch(error){
+   alert(error.message);
+   button.disabled=false;
+   button.textContent='Pay Securely with Stripe';
+ }
+});
+loadOrder();
+</script>
+
+<!-- Start of LiveChat (www.livechat.com) code -->
+<script>
+    window.__lc = window.__lc || {};
+    window.__lc.license = 19835797;
+    window.__lc.integration_name = "manual_channels";
+    window.__lc.product_name = "livechat";
+    ;(function(n,t,c){function i(n){return e._h?e._h.apply(null,n):e._q.push(n)}var e={_q:[],_h:null,_v:"2.0",on:function(){i(["on",c.call(arguments)])},once:function(){i(["once",c.call(arguments)])},off:function(){i(["off",c.call(arguments)])},get:function(){if(!e._h)throw new Error("[LiveChatWidget] You can't use getters before load.");return i(["get",c.call(arguments)])},call:function(){i(["call",c.call(arguments)])},init:function(){var n=t.createElement("script");n.async=!0,n.type="text/javascript",n.src="https://cdn.livechatinc.com/tracking.js",t.head.appendChild(n)}};!n.__lc.asyncInit&&e.init(),n.LiveChatWidget=n.LiveChatWidget||e}(window,document,[].slice))
+</script>
+<noscript><a href="https://www.livechat.com/chat-with/19835797/" rel="nofollow">Chat with us</a>, powered by <a href="https://www.livechat.com/?welcome" rel="noopener nofollow" target="_blank">LiveChat</a></noscript>
+<!-- End of LiveChat code -->
+
+<footer class="site-footer" id="about">
+        <div>
+            <a class="brand footer-brand" href="index.html#home" aria-label="ANY AI CAM home">
+                <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+            </a>
+            <p>Cloud camera activation and onboarding support for compatible existing camera systems.</p>
+            <p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">&copy; 2026 ANY AI CAM. All rights reserved.</p>
+        </div>
+        <div>
+            <h3>Service</h3>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="index.html#services">Cloud Account Setup</a>
+            <a href="index.html#pricing">Pricing Calculator</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="/camera-compatibility-check.html">Camera Check</a>
+            <a href="adapters.html">Adapter Options</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+            
+            <a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+            <a href="partner.html">Partner Login</a>
+            <a href="support.html">Live Tech Support</a>
+        </div>
+        <div>
+            <h3>Contact &amp; Policies</h3>
+            <a href="contact.html">Contact Us</a>
+            <a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a>
+            <a href="tel:+18325108240">(832) 510-8240</a>
+            <a href="privacy-policy.html">Privacy Policy</a>
+            <a href="terms.html">Terms of Service</a>
+            <a href="shipping-returns.html">Shipping &amp; Returns</a>
+            <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        </div>
+    </footer>
+
+<script id="aic-master-menu-script">
+document.addEventListener('DOMContentLoaded', function () {
+  var toggle = document.querySelector('.mobile-menu-toggle');
+  var nav = document.getElementById('primaryNav');
+  var header = document.querySelector('.site-header');
+  if (!toggle || !nav) return;
+  toggle.addEventListener('click', function () {
+    var open = toggle.getAttribute('aria-expanded') !== 'true';
+    toggle.setAttribute('aria-expanded', String(open));
+    nav.classList.toggle('active', open);
+    nav.classList.toggle('open', open);
+    if (header) header.classList.toggle('menu-open', open);
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">ANYAICAM VMS software activation path</title>
+  <desc id="desc">A VMS software visual showing Windows beta software review, Mac cloud adapter path, camera discovery, and ANYAICAM cloud recording.</desc>
+  <defs>
+    <linearGradient id="page" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#eef4ff"/>
+    </linearGradient>
+    <linearGradient id="dark" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#07102f"/>
+      <stop offset="0.62" stop-color="#0c1644"/>
+      <stop offset="1" stop-color="#281052"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1">
+      <stop offset="0" stop-color="#e42b93"/>
+      <stop offset="1" stop-color="#28c9d9"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="22" stdDeviation="28" flood-color="#07102f" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="760" rx="36" fill="url(#page)"/>
+  <rect x="52" y="52" width="1096" height="656" rx="30" fill="#fff" filter="url(#shadow)"/>
+
+  <g transform="translate(88 84)">
+    <text x="0" y="42" fill="#090f2f" font-family="Arial, sans-serif" font-size="34" font-weight="900">ANYAICAM VMS Software</text>
+    <text x="0" y="76" fill="#65718c" font-family="Arial, sans-serif" font-size="19">The software and adapter review that helps connect existing cameras to cloud recording.</text>
+
+    <g transform="translate(0 118)">
+      <rect width="496" height="402" rx="26" fill="url(#dark)"/>
+      <rect x="28" y="28" width="440" height="70" rx="18" fill="#111c51"/>
+      <circle cx="62" cy="63" r="10" fill="#e42b93"/>
+      <circle cx="94" cy="63" r="10" fill="#8e62ff"/>
+      <circle cx="126" cy="63" r="10" fill="#28c9d9"/>
+      <text x="160" y="71" fill="#fff" font-family="Arial, sans-serif" font-size="23" font-weight="800">VMS Control Panel</text>
+
+      <g transform="translate(34 128)">
+        <rect width="198" height="106" rx="18" fill="#15215d" stroke="#344985"/>
+        <text x="24" y="36" fill="#aef7ff" font-family="Arial, sans-serif" font-size="15" font-weight="800">Camera Discovery</text>
+        <circle cx="72" cy="70" r="20" fill="none" stroke="#28c9d9" stroke-width="7"/>
+        <rect x="115" y="52" width="46" height="34" rx="7" fill="#e42b93" opacity="0.88"/>
+      </g>
+
+      <g transform="translate(264 128)">
+        <rect width="198" height="106" rx="18" fill="#15215d" stroke="#344985"/>
+        <text x="24" y="36" fill="#aef7ff" font-family="Arial, sans-serif" font-size="15" font-weight="800">Cloud ID</text>
+        <rect x="28" y="56" width="142" height="26" rx="13" fill="url(#accent)"/>
+        <text x="48" y="75" fill="#fff" font-family="Arial, sans-serif" font-size="13" font-weight="800">Connected</text>
+      </g>
+
+      <g transform="translate(34 266)">
+        <rect width="428" height="92" rx="18" fill="#0d1745" stroke="#344985"/>
+        <text x="24" y="34" fill="#fff" font-family="Arial, sans-serif" font-size="18" font-weight="800">Beta software is provided directly by ANYAICAM</text>
+        <text x="24" y="62" fill="#c9d6ff" font-family="Arial, sans-serif" font-size="15">Not online. Not publicly downloadable. Review required.</text>
+      </g>
+    </g>
+
+    <g transform="translate(548 118)">
+      <rect width="476" height="402" rx="26" fill="#f8fbff" stroke="#dce5f5" stroke-width="2"/>
+      <text x="34" y="52" fill="#090f2f" font-family="Arial, sans-serif" font-size="26" font-weight="900">Choose the right path</text>
+
+      <g transform="translate(34 90)">
+        <rect width="408" height="118" rx="18" fill="#fff" stroke="#dbe6f7" stroke-width="2"/>
+        <rect x="20" y="22" width="70" height="70" rx="16" fill="#eaf5ff"/>
+        <text x="38" y="66" fill="#1674d1" font-family="Arial, sans-serif" font-size="24" font-weight="900">Win</text>
+        <text x="112" y="42" fill="#090f2f" font-family="Arial, sans-serif" font-size="20" font-weight="900">Windows customer</text>
+        <text x="112" y="72" fill="#65718c" font-family="Arial, sans-serif" font-size="16">May qualify for VMS beta software review.</text>
+        <text x="112" y="96" fill="#65718c" font-family="Arial, sans-serif" font-size="16">ANYAICAM confirms after request.</text>
+      </g>
+
+      <g transform="translate(34 232)">
+        <rect width="408" height="118" rx="18" fill="#fff" stroke="#dbe6f7" stroke-width="2"/>
+        <rect x="20" y="22" width="70" height="70" rx="16" fill="#fff0f8"/>
+        <text x="36" y="66" fill="#d22b8d" font-family="Arial, sans-serif" font-size="24" font-weight="900">Mac</text>
+        <text x="112" y="42" fill="#090f2f" font-family="Arial, sans-serif" font-size="20" font-weight="900">Mac customer</text>
+        <text x="112" y="72" fill="#65718c" font-family="Arial, sans-serif" font-size="16">Needs the cloud adapter path.</text>
+        <text x="112" y="96" fill="#65718c" font-family="Arial, sans-serif" font-size="16">Adapter size depends on camera count.</text>
+      </g>
+    </g>
+
+    <g transform="translate(0 568)">
+      <rect width="1024" height="78" rx="22" fill="url(#accent)"/>
+      <text x="34" y="48" fill="#fff" font-family="Arial, sans-serif" font-size="23" font-weight="900">Request details first. ANYAICAM reviews the system, then confirms software or adapter requirements.</text>
+    </g>
+  </g>
+</svg>

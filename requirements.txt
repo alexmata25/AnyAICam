@@ -1,13 +1,22 @@
-fastapi
-uvicorn
-websockets
-psycopg[binary]
-boto3
-cryptography
+fastapi==0.115.6
+uvicorn==0.34.0
+websockets==14.1
+psycopg[binary]==3.2.3
+boto3==1.35.81
+cryptography==44.0.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
-python-multipart
-itsdangerous
-ultralytics
+python-multipart==0.0.20
+itsdangerous==2.2.0
+ultralytics==8.3.40
 opencv-python==4.10.0.84
-pywebpush
+# Face Access production engine (facial_engine_onnx.py); imported only when
+# ANYAICAM_FACE_ENGINE selects an ONNX engine. Verified with numpy 1.26.4.
+onnxruntime==1.19.2
+numpy==1.26.4
+pywebpush==2.0.3
+pytesseract==0.3.13
+vosk==0.3.45
+# Access control: dry-contact USB relay modules (access_adapters.NumatoUsbRelayDriver);
+# imported only when a relay door is configured.
+pyserial==3.5

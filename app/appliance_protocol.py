@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay'}
+ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay','reboot_appliance','restart_vms'}
 FORBIDDEN_KEYS = {'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
 DISCOVERY_FORBIDDEN_KEYS = FORBIDDEN_KEYS | {'rtsp_urls','stream_url','stream_urls','ip','ip_address','host','mac','mac_address','onvif_xaddrs'}
 LIVE_RELAY_SESSION_DURATION_SECONDS = 900
@@ -43,6 +43,65 @@ def sanitize_discovery_results(value) -> list[dict]:
             continue
         results.append({**item, 'id': f'candidate-{index}', 'name': f'Discovered camera {index}'})
     return results
+
+
+def camera_credential_key() -> bytes | None:
+    """Shared by partner_workspace.py (customer-side: encrypts on submit)
+    and appliance_cloud.py (appliance-side: decrypts on poll). A single
+    source of truth for the env var so both sides fail closed the same
+    way when it's unset -- see ANYAICAM_CAMERA_CREDENTIAL_KEY."""
+    raw = os.environ.get('ANYAICAM_CAMERA_CREDENTIAL_KEY', '').strip()
+    return raw.encode() if raw else None
+
+
+def encrypt_camera_credentials(username: str, password: str):
+    key = camera_credential_key()
+    if not key: return None
+    from cryptography.fernet import Fernet
+    return Fernet(key).encrypt(json.dumps({'username': username, 'password': password}).encode())
+
+
+def decrypt_camera_credentials(token):
+    key = camera_credential_key()
+    if not key or not token: return None
+    from cryptography.fernet import Fernet
+    try: return json.loads(Fernet(key).decrypt(bytes(token)))
+    except Exception: return None
+
+
+def claim_flow_secret_key() -> bytes | None:
+    """Same shared-secret-key shape as camera_credential_key() above,
+    for a different trust domain: ephemeral secrets the non-interactive
+    claim flow (appliance_claims.py) needs to recover in plaintext for
+    a short, bounded window (claim_proof between confirm and complete;
+    the one-time credential between complete and a retried complete) --
+    see appliance_claims.py's own module docstring for why storing
+    those raw was the Phase 1 security-hardening checkpoint's finding.
+    Deliberately a separate env var/key from ANYAICAM_CAMERA_CREDENTIAL_KEY
+    rather than reusing it: these are different secrets with different
+    lifetimes and blast radii, and tying them to one key would mean a
+    leak of either purpose's key exposes the other's data too."""
+    raw = os.environ.get('ANYAICAM_CLAIM_FLOW_SECRET_KEY', '').strip()
+    return raw.encode() if raw else None
+
+
+def encrypt_claim_flow_secret(value: str) -> str | None:
+    """Fails closed (returns None) exactly like encrypt_camera_
+    credentials() does when the key is unset -- callers must treat
+    None as "encryption unavailable" and refuse to fall back to
+    storing the raw value, not silently proceed without it."""
+    key = claim_flow_secret_key()
+    if not key: return None
+    from cryptography.fernet import Fernet
+    return Fernet(key).encrypt(value.encode()).decode()
+
+
+def decrypt_claim_flow_secret(token) -> str | None:
+    key = claim_flow_secret_key()
+    if not key or not token: return None
+    from cryptography.fernet import Fernet
+    try: return Fernet(key).decrypt(token.encode() if isinstance(token, str) else bytes(token)).decode()
+    except Exception: return None
 
 
 def health_state(payload: dict) -> tuple[str,list[str]]:

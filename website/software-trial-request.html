@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<title>Request Free Software Trial | ANY AI CAM</title>
+<meta name="description" content="Request the ANY AI CAM free software trial and receive setup instructions by email.">
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.png" type="image/png">
+<link rel="stylesheet" href="styles.css">
+<style>
+  body{background:#f4f8fc;color:#0b1332}
+  .flow-shell{max-width:760px;margin:0 auto;padding:2rem 1rem 4rem}
+  .flow-card{background:#fff;border:1px solid #d9e6f4;border-radius:18px;padding:clamp(1.25rem,4vw,2.25rem);box-shadow:0 18px 48px rgba(13,39,75,.09)}
+  .field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+  label{display:grid;gap:.4rem;font-weight:800;color:#0b1332}
+  input,textarea{width:100%;min-height:48px;border:1px solid #cfd9ea;border-radius:10px;padding:.75rem;font:inherit;background:#fff;color:#071032;box-sizing:border-box}
+  textarea{min-height:100px;resize:vertical}
+  .choice{display:flex;gap:.7rem;align-items:flex-start;border:1px solid #d9e6f4;border-radius:12px;padding:1rem;background:#f8fbff;font-weight:700}
+  .choice input{width:1.25rem;min-height:auto;height:1.25rem;margin-top:.15rem}
+  .actions{display:flex;justify-content:space-between;gap:.75rem;flex-wrap:wrap;margin-top:1.5rem}
+  .note{padding:1rem;border-left:5px solid #23c7d5;background:#f0fbfd;border-radius:10px;color:#39516a;line-height:1.6}
+  @media(max-width:700px){.field-grid{grid-template-columns:1fr}.actions .button{width:100%;justify-content:center}}
+</style>
+<link rel="stylesheet" href="header-standard.css">
+</head><body>
+
+
+<header class="site-header">
+  <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+    <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection">
+  </a>
+  <nav class="site-nav" aria-label="Primary navigation">
+    <a href="index.html">Home</a>
+    <a href="software.html">Software</a>
+    <a href="camera-compatibility-check.html">Camera Readiness</a>
+    <a href="contact.html">Contact</a>
+  </nav>
+</header>
+
+<main class="flow-shell">
+  <section class="flow-card">
+    <p class="eyebrow">Free Software Trial</p>
+    <h1>Request your software trial.</h1>
+    <p>Send us your information and ANY AI CAM will email the software instructions and next steps.</p>
+
+    <div class="note">
+      The software is free to use during the trial. Continued cloud service requires an active Videoloft subscription after the trial.
+    </div>
+
+    <form action="submit-software-trial-request.php" method="post" style="margin-top:1.25rem">
+      <div class="field-grid">
+        <label>Full name
+          <input name="name" required autocomplete="name">
+        </label>
+        <label>Email address
+          <input name="email" type="email" required autocomplete="email">
+        </label>
+        <label>Phone number
+          <input name="phone" type="tel" autocomplete="tel">
+        </label>
+        <label>Business or site name
+          <input name="site_name" autocomplete="organization">
+        </label>
+      </div>
+
+      <label style="margin-top:1rem">Anything we should know?
+        <textarea name="notes" placeholder="Optional: camera brand, number of cameras, or setup questions"></textarea>
+      </label>
+
+      <label class="choice" style="margin-top:1rem">
+        <input type="checkbox" name="subscription_ack" value="yes" required>
+        <span>I understand continued cloud service requires a Videoloft subscription after the free trial.</span>
+      </label>
+
+      <div class="actions">
+        <a class="button secondary" href="software.html#free-software-request">Back</a>
+        <button class="button primary" type="submit">Send My Trial Request</button>
+      </div>
+    </form>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div><strong>ANY AI CAM</strong><p>Cloud camera activation and onboarding support for compatible camera systems.</p></div>
+  <div><a href="privacy-policy.html">Privacy Policy</a><a href="terms.html">Terms of Service</a></div>
+  <div><a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a><a href="tel:+18325108240">(832) 510-8240</a></div>
+</footer>
+
+</body></html>

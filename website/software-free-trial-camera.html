@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<title>Camera Readiness | Free Software Trial | ANY AI CAM</title>
+<meta name="description" content="Check camera login and Windows computer readiness for the ANY AI CAM free software trial.">
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.png" type="image/png">
+<link rel="stylesheet" href="styles.css">
+<style>
+  body{background:#f4f8fc;color:#0b1332}
+  .flow-shell{max-width:900px;margin:0 auto;padding:2rem 1rem 4rem}
+  .flow-card{background:#fff;border:1px solid #d9e6f4;border-radius:18px;padding:clamp(1.25rem,4vw,2.4rem);box-shadow:0 18px 48px rgba(13,39,75,.09)}
+  .progress{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin:0 0 1.5rem}
+  .progress span{padding:.65rem .5rem;text-align:center;border-radius:999px;background:#e9eef7;color:#66738a;font-weight:800;font-size:.86rem}
+  .progress .active{background:#071032;color:#fff}
+  .field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+  label{display:grid;gap:.4rem;font-weight:800;color:#0b1332}
+  input,select,textarea{width:100%;min-height:48px;border:1px solid #cfd9ea;border-radius:10px;padding:.75rem;font:inherit;background:#fff;color:#071032;box-sizing:border-box}
+  textarea{min-height:110px;resize:vertical}
+  .choice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.85rem}
+  .choice{display:flex;gap:.7rem;align-items:flex-start;border:1px solid #d9e6f4;border-radius:12px;padding:1rem;background:#f8fbff;font-weight:700}
+  .choice input{width:1.25rem;min-height:auto;height:1.25rem;margin-top:.15rem}
+  .actions{display:flex;justify-content:space-between;gap:.75rem;flex-wrap:wrap;margin-top:1.5rem}
+  .note{padding:1rem;border-left:5px solid #23c7d5;background:#f0fbfd;border-radius:10px;color:#39516a;line-height:1.6}
+  .error{display:none;margin-top:1rem;padding:.85rem;border-radius:10px;background:#fff0f0;color:#8b1e1e;font-weight:700}
+  @media(max-width:700px){.field-grid,.choice-grid{grid-template-columns:1fr}.actions .button{width:100%;justify-content:center}}
+</style>
+<link rel="stylesheet" href="header-standard.css">
+</head><body>
+
+
+<header class="site-header">
+  <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+    <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection">
+  </a>
+  <nav class="site-nav" aria-label="Primary navigation">
+    <a href="index.html">Home</a>
+    <a href="software.html">Software</a>
+    <a href="camera-compatibility-check.html">Camera Readiness</a>
+    <a href="contact.html">Contact</a>
+  </nav>
+</header>
+
+<main class="flow-shell">
+  <section class="flow-card">
+    <div class="progress"><span>1. Contact</span><span class="active">2. Camera readiness</span><span>3. Review</span></div>
+    <p class="eyebrow">Camera & Computer Readiness</p>
+    <h1>Can your system connect to the software?</h1>
+    <div class="note">You will need the administrator username and password for at least one compatible camera or recorder. Do not enter the password on this website.</div>
+    <form id="step2Form" style="margin-top:1.25rem">
+      <div class="field-grid">
+        <label>Camera or recorder brand<input id="brand" required placeholder="Example: Hikvision, Dahua, VIVOTEK"></label>
+        <label>Model number<input id="model" placeholder="Enter it if known"></label>
+        <label>How many cameras?<input id="cameraCount" type="number" min="1" max="128" value="1" required></label>
+        <label>Windows computer available?
+          <select id="windowsComputer" required>
+            <option value="">Choose one</option>
+            <option value="Yes">Yes</option>
+            <option value="No">No</option>
+            <option value="Not sure">Not sure</option>
+          </select>
+        </label>
+      </div>
+      <p style="font-weight:900;margin:1.4rem 0 .7rem">Do you know the administrator login for at least one camera or recorder?</p>
+      <div class="choice-grid">
+        <label class="choice"><input type="radio" name="hasLogin" value="Yes" required><span><strong>Yes</strong><br>I can enter the camera or recorder login during installation.</span></label>
+        <label class="choice"><input type="radio" name="hasLogin" value="No"><span><strong>No</strong><br>I may need the starter-camera path or help resetting my system.</span></label>
+      </div>
+      <label style="margin-top:1rem">Anything else we should know?<textarea id="notes" placeholder="Network details, camera type, questions, or setup concerns"></textarea></label>
+      <div class="actions">
+        <a class="button secondary" href="software-free-trial-request.html">Back</a>
+        <button class="button primary" type="submit">Review Request</button>
+      </div>
+    </form>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div><strong>ANY AI CAM</strong><p>Cloud camera activation and onboarding support for compatible camera systems.</p></div>
+  <div><a href="privacy-policy.html">Privacy Policy</a><a href="terms.html">Terms of Service</a></div>
+  <div><a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a><a href="tel:+18325108240">(832) 510-8240</a></div>
+</footer>
+
+<script>
+const key='anyaicamSoftwareTrial';
+const saved=JSON.parse(localStorage.getItem(key)||'{}');
+['brand','model','cameraCount','windowsComputer','notes'].forEach(id=>{if(saved[id])document.getElementById(id).value=saved[id]});
+if(saved.hasLogin){const r=document.querySelector('input[name=hasLogin][value="'+saved.hasLogin+'"]');if(r)r.checked=true;}
+document.getElementById('step2Form').addEventListener('submit',e=>{
+ e.preventDefault();
+ const data={...saved};
+ ['brand','model','cameraCount','windowsComputer','notes'].forEach(id=>data[id]=document.getElementById(id).value.trim());
+ data.hasLogin=document.querySelector('input[name=hasLogin]:checked').value;
+ localStorage.setItem(key,JSON.stringify(data));
+ location.href='software-free-trial-review.html';
+});
+</script></body></html>

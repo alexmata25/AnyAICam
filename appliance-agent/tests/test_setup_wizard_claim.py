@@ -1,0 +1,490 @@
+"""Phase 2A: the appliance-side claim workflow (anyaicam-setup --claim)
+added to setup_wizard.py. Unit-level coverage for the new orchestration
+helpers using a fake PortalClient -- no real HTTP, no real cloud; the
+genuine cross-process integration (real HTTP, real cloud routes, real
+enrollment) is covered separately by
+app/tests/test_claim_flow_end_to_end.py. This file's job is narrower
+and cheaper: prove the appliance-side state machine (resume-after-
+restart, proof persistence, retry-on-transient-failure) behaves
+correctly in isolation, the same way test_reenrollment.py already
+isolates first_enroll()/coordinated_reenroll() from any real network
+call.
+
+_finish_enrollment() itself is not re-tested here -- that machinery
+(first_enroll()/coordinated_reenroll()) is exactly what
+test_reenrollment.py already covers, unmodified by Phase 2A; this file
+patches it out to isolate the claim-flow orchestration being added.
+"""
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from anyaicam_agent.config import AgentConfig, load_claim_state
+from anyaicam_agent.portal import PortalError
+from anyaicam_agent import setup_wizard
+
+SECRET = 'device-secret-0123456789abcdef0123456789abcdef'
+
+
+class FakePortalClient:
+    """Queues one canned response (or exception instance, raised
+    instead of returned) per call, in call order -- popping past the
+    end of a queue is a test bug (an unexpected extra call), and
+    surfaces as a plain IndexError rather than silently returning
+    something misleading."""
+
+    def __init__(self, begin=(), status=(), complete=()):
+        self.secrets_seen = []
+        self.begin_calls = []
+        self.status_calls = []
+        self.complete_calls = []
+        self._begin = list(begin)
+        self._status = list(status)
+        self._complete = list(complete)
+
+    def test(self):
+        return {'mode': 'development'}
+
+    def claim_begin(self, device_id, device_secret):
+        self.begin_calls.append(device_id)
+        self.secrets_seen.append(device_secret)
+        result = self._begin.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def claim_status(self, claim_session_id, device_secret):
+        self.status_calls.append(claim_session_id)
+        self.secrets_seen.append(device_secret)
+        result = self._status.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def claim_complete(self, claim_session_id, claim_proof, device_secret):
+        self.complete_calls.append((claim_session_id, claim_proof))
+        self.secrets_seen.append(device_secret)
+        result = self._complete.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _no_sleep(_seconds):
+    pass
+
+
+class InstallerDeviceIdTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_file_exits(self):
+        with self.assertRaises(SystemExit):
+            setup_wizard._installer_device_id(self.config)
+
+    def test_malformed_json_exits(self):
+        self.config.installer_identity_file.write_text('not json', encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            setup_wizard._installer_device_id(self.config)
+
+    def test_missing_appliance_id_key_exits(self):
+        self.config.installer_identity_file.write_text(json.dumps({'installer_version': '1'}), encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            setup_wizard._installer_device_id(self.config)
+
+    def test_valid_file_returns_the_uuid(self):
+        self.config.installer_identity_file.write_text(json.dumps({'appliance_id': '11111111-1111-4111-8111-111111111111'}), encoding='utf-8')
+        self.assertEqual(setup_wizard._installer_device_id(self.config), '11111111-1111-4111-8111-111111111111')
+
+
+class OpenOrResumeClaimTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name)
+        self.device_id = '11111111-1111-4111-8111-111111111111'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_opens_a_fresh_claim_and_persists_state(self):
+        client = FakePortalClient(begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}])
+
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+
+        self.assertEqual(state['claim_session_id'], 'sess-1')
+        self.assertEqual(client.begin_calls, [self.device_id])
+        persisted = load_claim_state(self.config)
+        self.assertEqual(persisted['claim_session_id'], 'sess-1')
+        self.assertEqual(persisted['device_id'], self.device_id)
+
+    def test_resumes_from_existing_state_without_calling_begin_again(self):
+        # Simulates "appliance restart while waiting": a prior process
+        # already ran _open_or_resume_claim and persisted state; this
+        # is a fresh process (fresh FakePortalClient with an EMPTY
+        # begin queue -- popping it would raise IndexError, proving
+        # claim_begin is never called on this path).
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'sess-1', 'opened_at': '2026-01-01T00:00:00', 'device_secret': SECRET, 'portal_origin': setup_wizard.portal_origin(self.config.portal_url)})
+        client = FakePortalClient()
+
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+
+        self.assertEqual(state['claim_session_id'], 'sess-1')
+        self.assertEqual(client.begin_calls, [])
+
+    def test_different_device_id_in_stale_state_opens_a_new_claim(self):
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(self.config, {'device_id': 'some-other-device', 'claim_session_id': 'stale-sess', 'opened_at': '2026-01-01T00:00:00', 'device_secret': SECRET, 'portal_origin': setup_wizard.portal_origin(self.config.portal_url)})
+        client = FakePortalClient(begin=[{'claim_session_id': 'sess-new', 'claim_code': 'WXYZ9999', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}])
+
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+
+        self.assertEqual(state['claim_session_id'], 'sess-new')
+        self.assertEqual(client.begin_calls, [self.device_id])
+
+    def test_begin_failure_exits_without_persisting_state(self):
+        client = FakePortalClient(begin=[PortalError('rate limited', status_code=429)])
+
+        with self.assertRaises(SystemExit):
+            setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+        self.assertIsNone(load_claim_state(self.config))
+
+
+class WaitForClaimProofTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name)
+        self.state = {'device_id': 'd', 'claim_session_id': 'sess-1', 'opened_at': '2026-01-01T00:00:00', 'device_secret': SECRET}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_returns_immediately_if_proof_already_known(self):
+        self.state['claim_proof'] = 'already-known-proof'
+        client = FakePortalClient()
+
+        proof = setup_wizard._wait_for_claim_proof(client, self.config, self.state, sleep_fn=_no_sleep)
+
+        self.assertEqual(proof, 'already-known-proof')
+        self.assertEqual(client.status_calls, [])
+
+    def test_polls_through_pending_to_claimed_and_persists_proof(self):
+        client = FakePortalClient(status=[{'status': 'pending'}, {'status': 'pending'}, {'status': 'claimed', 'claim_proof': 'the-proof'}])
+
+        proof = setup_wizard._wait_for_claim_proof(client, self.config, self.state, sleep_fn=_no_sleep)
+
+        self.assertEqual(proof, 'the-proof')
+        self.assertEqual(len(client.status_calls), 3)
+        # Nothing was persisted by this test's own setUp -- confirm the
+        # function itself durably wrote the proof to a state file (the
+        # property a restart between confirmation and completion
+        # actually depends on).
+        persisted = load_claim_state(self.config)
+        self.assertEqual(persisted['claim_proof'], 'the-proof')
+
+    def test_abandoned_claim_reports_expired_and_clears_state(self):
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(self.config, self.state)
+        client = FakePortalClient(status=[{'status': 'pending'}, {'status': 'expired'}])
+
+        with self.assertRaises(SystemExit):
+            setup_wizard._wait_for_claim_proof(client, self.config, self.state, sleep_fn=_no_sleep)
+        self.assertIsNone(load_claim_state(self.config))
+
+    def test_transient_polling_error_retries_rather_than_giving_up(self):
+        client = FakePortalClient(status=[PortalError('network blip'), {'status': 'claimed', 'claim_proof': 'the-proof'}])
+
+        proof = setup_wizard._wait_for_claim_proof(client, self.config, self.state, sleep_fn=_no_sleep)
+
+        self.assertEqual(proof, 'the-proof')
+        self.assertEqual(len(client.status_calls), 2)
+
+
+class CompleteClaimWithRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name)
+        self.state = {'device_id': 'd', 'claim_session_id': 'sess-1', 'claim_proof': 'the-proof', 'device_secret': SECRET}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_succeeds_on_first_attempt(self):
+        client = FakePortalClient(complete=[{'appliance_id': 'a1', 'cloud_id': 'D', 'credential': 'cred', 'credential_id': 'cid'}])
+
+        result = setup_wizard._complete_claim_with_retry(client, self.config, self.state, sleep_fn=_no_sleep)
+
+        self.assertEqual(result['appliance_id'], 'a1')
+        self.assertEqual(len(client.complete_calls), 1)
+
+    def test_lost_response_then_successful_retry_recovers_the_result(self):
+        # Simulates the exact scenario hardening item 3 made safe
+        # cloud-side: the first HTTP round trip is lost (PortalError),
+        # the second attempt uses the SAME claim_session_id+claim_proof
+        # and succeeds.
+        client = FakePortalClient(complete=[PortalError('timed out'), {'appliance_id': 'a1', 'cloud_id': 'D', 'credential': 'cred', 'credential_id': 'cid'}])
+
+        result = setup_wizard._complete_claim_with_retry(client, self.config, self.state, sleep_fn=_no_sleep)
+
+        self.assertEqual(result['appliance_id'], 'a1')
+        self.assertEqual(len(client.complete_calls), 2)
+        self.assertEqual(client.complete_calls[0], client.complete_calls[1], 'both attempts must present the identical session_id+proof pair')
+
+    def test_exhausting_all_attempts_exits_without_losing_state(self):
+        client = FakePortalClient(complete=[PortalError('down')] * 3)
+
+        with self.assertRaises(SystemExit):
+            setup_wizard._complete_claim_with_retry(client, self.config, self.state, attempts=3, sleep_fn=_no_sleep)
+        self.assertEqual(len(client.complete_calls), 3)
+
+
+class ClaimMainOrchestrationTests(unittest.TestCase):
+    """Exercises claim_main() end to end at the orchestration level --
+    PortalClient itself replaced with a fake, _finish_enrollment()
+    patched out (its own machinery is test_reenrollment.py's job, not
+    this file's)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name, portal_url='http://portal.example.test')
+        self.config.installer_identity_file.write_text(json.dumps({'appliance_id': '11111111-1111-4111-8111-111111111111'}), encoding='utf-8')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_full_claim_flow_reaches_finish_enrollment_and_clears_state(self):
+        client = FakePortalClient(
+            begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}],
+            status=[{'status': 'pending'}, {'status': 'claimed', 'claim_proof': 'the-proof'}],
+            complete=[{'appliance_id': 'a1', 'cloud_id': '11111111-1111-4111-8111-111111111111'.upper(), 'credential': 'cred', 'credential_id': 'cid', 'customer_id': 'cust-1', 'site_id': 'site-1', 'partner_id': None}],
+        )
+        finished_with = []
+        with patch.object(setup_wizard, 'AgentConfig') as agent_config_cls, \
+             patch.object(setup_wizard, 'PortalClient', return_value=client), \
+             patch.object(setup_wizard, '_finish_enrollment', side_effect=lambda cfg, activated: finished_with.append(activated)), \
+             patch('builtins.input', return_value=''):
+            agent_config_cls.load.return_value = self.config
+            setup_wizard.claim_main()
+
+        self.assertEqual(len(finished_with), 1)
+        self.assertEqual(finished_with[0]['appliance_id'], 'a1')
+        self.assertIsNone(load_claim_state(self.config), 'claim state must be cleared once enrollment is handed off')
+
+    def test_claim_state_survives_a_failed_finish_enrollment_for_retry(self):
+        """The core claim-state lifecycle fix: if server-side completion
+        succeeds but local enrollment fails, claim_state.json (the only
+        local copy of the plaintext claim_proof) must survive so a
+        retry can resume and recover the SAME already-issued credential
+        via claim_complete()'s own server-side retry-safety path --
+        never call claim_begin again. Confirmed live on Ryzen
+        (2026-09-12): clear_claim_state() ran immediately after
+        claim_complete() succeeded, before _finish_enrollment() was even
+        attempted -- when that step then failed, the already-issued
+        credential became permanently unrecoverable even though the
+        server's own recovery window was still open."""
+        client = FakePortalClient(
+            begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}],
+            status=[{'status': 'claimed', 'claim_proof': 'the-proof'}],
+            complete=[{'appliance_id': 'a1', 'cloud_id': '11111111-1111-4111-8111-111111111111'.upper(), 'credential': 'cred', 'credential_id': 'cid', 'customer_id': 'cust-1', 'site_id': 'site-1', 'partner_id': None}],
+        )
+        with patch.object(setup_wizard, 'AgentConfig') as agent_config_cls, \
+             patch.object(setup_wizard, 'PortalClient', return_value=client), \
+             patch.object(setup_wizard, '_finish_enrollment', side_effect=SystemExit('First-time appliance enrollment failed; the appliance remains unactivated.')), \
+             patch('builtins.input', return_value=''):
+            agent_config_cls.load.return_value = self.config
+            with self.assertRaises(SystemExit):
+                setup_wizard.claim_main()
+
+        persisted = load_claim_state(self.config)
+        self.assertIsNotNone(persisted, 'claim_state.json must survive a local enrollment failure so the credential can still be recovered')
+        self.assertEqual(persisted['claim_session_id'], 'sess-1')
+        self.assertEqual(persisted['claim_proof'], 'the-proof')
+
+        # A fresh anyaicam-setup --claim now correctly RESUMES this exact
+        # session (never opens a new one -- client.begin_calls stays at
+        # its one original entry, proving claim_begin was never called
+        # again) and reuses the already-known proof without re-polling
+        # (client.status_calls stays empty) -- the two properties that
+        # together let the already-issued credential still be recovered
+        # through claim_complete()'s own status=='completed' retry path.
+        resumed = setup_wizard._open_or_resume_claim(client, self.config, '11111111-1111-4111-8111-111111111111')
+        self.assertEqual(resumed['claim_session_id'], 'sess-1')
+        self.assertEqual(client.begin_calls, ['11111111-1111-4111-8111-111111111111'])
+        proof = setup_wizard._wait_for_claim_proof(client, self.config, resumed, sleep_fn=_no_sleep)
+        self.assertEqual(proof, 'the-proof')
+        self.assertEqual(len(client.status_calls), 1, 'must not re-poll during resume -- the one entry here is from the original attempt before it failed; the proof was already known from the surviving claim_state.json')
+
+    def test_customer_double_confirm_is_transparent_to_the_appliance(self):
+        # The customer double-clicking "Confirm" in the portal produces
+        # no appliance-visible difference at all -- claim/status simply
+        # keeps returning the same claim_proof it already returned
+        # (cloud-side idempotency, Phase 1), so the appliance side needs
+        # no special handling and this reduces to the ordinary
+        # happy-path polling behavior.
+        client = FakePortalClient(
+            begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}],
+            status=[{'status': 'claimed', 'claim_proof': 'the-proof'}, {'status': 'claimed', 'claim_proof': 'the-proof'}],
+            complete=[{'appliance_id': 'a1', 'cloud_id': 'D', 'credential': 'cred', 'credential_id': 'cid', 'customer_id': 'cust-1', 'site_id': 'site-1', 'partner_id': None}],
+        )
+        state = setup_wizard._open_or_resume_claim(client, self.config, '11111111-1111-4111-8111-111111111111')
+        first_proof = setup_wizard._wait_for_claim_proof(client, self.config, dict(state), sleep_fn=_no_sleep)
+        second_proof = setup_wizard._wait_for_claim_proof(client, self.config, dict(state), sleep_fn=_no_sleep)
+        self.assertEqual(first_proof, second_proof)
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class ClaimPortalOptionTests(unittest.TestCase):
+    """Customer install (2026-10-01): My subscription prints
+    `anyaicam-setup --claim --portal-url=<portal>`. The installer leaves the
+    agent pointed at http://127.0.0.1:8000 (the appliance's own VMS), so the
+    command -- not a prompt default -- must decide which cloud is claimed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name)
+        self.assertEqual(self.config.portal_url, 'http://127.0.0.1:8000')
+        self.assertEqual(self.config.mode, 'development')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_portal_url_option_sets_cloud_and_production_without_prompting(self):
+        with patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            setup_wizard._apply_portal_options(self.config, ['--claim', '--portal-url=https://portal.anyaicam.com/'])
+        self.assertEqual(self.config.portal_url, 'https://portal.anyaicam.com')
+        self.assertEqual(self.config.mode, 'production')
+
+    def test_space_separated_form_and_explicit_mode(self):
+        with patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            setup_wizard._apply_portal_options(self.config, ['--claim', '--portal-url', 'https://portal-staging.anyaicam.com', '--mode=development'])
+        self.assertEqual(self.config.portal_url, 'https://portal-staging.anyaicam.com')
+        self.assertEqual(self.config.mode, 'development')
+
+    def test_rejects_a_portal_url_that_is_not_a_web_address(self):
+        for bad in ('', 'portal.anyaicam.com', 'https://', 'ftp://x', 'https://a b'):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                setup_wizard._apply_portal_options(self.config, ['--claim', f'--portal-url={bad}'])
+        self.assertEqual(self.config.portal_url, 'http://127.0.0.1:8000')
+
+    def test_rejects_an_unknown_mode(self):
+        with self.assertRaises(SystemExit):
+            setup_wizard._apply_portal_options(self.config, ['--portal-url=https://p.example', '--mode=staging'])
+
+    def test_without_the_option_the_existing_prompts_are_unchanged(self):
+        answers = iter(['https://typed.example', 'production'])
+        with patch('builtins.input', side_effect=lambda _prompt: next(answers)):
+            setup_wizard._apply_portal_options(self.config, ['--claim'])
+        self.assertEqual((self.config.portal_url, self.config.mode), ('https://typed.example', 'production'))
+
+    def test_main_passes_the_command_line_to_claim(self):
+        seen = []
+        with patch.object(setup_wizard, 'claim_main', side_effect=lambda args: seen.append(list(args))), \
+             patch.object(setup_wizard.sys, 'argv', ['anyaicam-setup', '--claim', '--portal-url=https://p.example']):
+            setup_wizard.main()
+        self.assertEqual(seen, [['--claim', '--portal-url=https://p.example']])
+
+    def test_claim_uses_the_commanded_portal_for_every_cloud_call(self):
+        tmp_identity = self.config.installer_identity_file
+        tmp_identity.write_text(json.dumps({'appliance_id': '11111111-1111-4111-8111-111111111111'}), encoding='utf-8')
+        client = FakePortalClient(
+            begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}],
+            status=[{'status': 'claimed', 'claim_proof': 'p'}],
+            complete=[{'appliance_id': 'a1', 'cloud_id': 'C1', 'credential': 'cred', 'credential_id': 'cid', 'customer_id': 'cust-1', 'site_id': 'site-1', 'partner_id': None}],
+        )
+        finished = []
+        with patch.object(setup_wizard, 'AgentConfig') as agent_config_cls, \
+             patch.object(setup_wizard, 'PortalClient', return_value=client) as portal_cls, \
+             patch.object(setup_wizard, '_finish_enrollment', side_effect=lambda cfg, activated: finished.append(cfg.portal_url)), \
+             patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            agent_config_cls.load.return_value = self.config
+            setup_wizard.claim_main(['--claim', '--portal-url=https://portal.anyaicam.com'])
+        portal_cls.assert_called_with('https://portal.anyaicam.com')
+        self.assertEqual(finished, ['https://portal.anyaicam.com'])
+        self.assertEqual(self.config.mode, 'production')
+
+
+class ClaimOriginBindingAndSecretTests(unittest.TestCase):
+    """2026-10-01 security fix: a saved claim (session id, device secret,
+    proof) is only ever sent to the portal origin it was opened with, a
+    production appliance only talks https, and every claim carries a fresh
+    device secret."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name, portal_url='https://portal-a.example.test')
+        self.device_id = '11111111-1111-4111-8111-111111111111'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _begin_result(self):
+        return {'claim_session_id': 'new-sess', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}
+
+    def test_a_new_claim_gets_a_strong_secret_saved_with_its_origin(self):
+        client = FakePortalClient(begin=[self._begin_result()])
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+        self.assertGreaterEqual(len(state['device_secret']), 32)
+        self.assertEqual(client.secrets_seen, [state['device_secret']])
+        saved = load_claim_state(self.config)
+        self.assertEqual((saved['device_secret'], saved['portal_origin']), (state['device_secret'], 'https://portal-a.example.test'))
+        other = setup_wizard._open_or_resume_claim(FakePortalClient(begin=[self._begin_result()]), AgentConfig(
+            config_dir=tempfile.mkdtemp(), state_dir=tempfile.mkdtemp(), portal_url='https://portal-a.example.test'), self.device_id)
+        self.assertNotEqual(other['device_secret'], state['device_secret'])
+
+    def test_portal_a_state_is_never_sent_to_portal_b(self):
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'portal-a-sess', 'device_secret': SECRET,
+                                       'claim_proof': 'portal-a-proof', 'portal_origin': 'https://portal-a.example.test'})
+        self.config.portal_url = 'https://portal-b.example.test/'
+        client_b = FakePortalClient(begin=[self._begin_result()])
+        state = setup_wizard._open_or_resume_claim(client_b, self.config, self.device_id)
+        self.assertEqual(state['claim_session_id'], 'new-sess')
+        self.assertNotIn(SECRET, client_b.secrets_seen)
+        self.assertNotIn('claim_proof', state)
+        self.assertEqual(load_claim_state(self.config)['portal_origin'], 'https://portal-b.example.test')
+
+    def test_same_origin_resumes_even_with_different_spelling(self):
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'sess-a', 'device_secret': SECRET,
+                                       'portal_origin': 'https://portal-a.example.test'})
+        self.config.portal_url = 'HTTPS://Portal-A.example.test/'
+        state = setup_wizard._open_or_resume_claim(FakePortalClient(), self.config, self.device_id)
+        self.assertEqual(state['claim_session_id'], 'sess-a')
+
+    def test_interactive_portal_b_also_discards_portal_a_state(self):
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'portal-a-sess', 'device_secret': SECRET,
+                                       'portal_origin': 'https://portal-a.example.test'})
+        answers = iter(['https://portal-b.example.test', 'production'])
+        with patch('builtins.input', side_effect=lambda _p: next(answers)):
+            setup_wizard._apply_portal_options(self.config, ['--claim'])
+        client_b = FakePortalClient(begin=[self._begin_result()])
+        setup_wizard._open_or_resume_claim(client_b, self.config, self.device_id)
+        self.assertEqual(client_b.begin_calls, [self.device_id])
+        self.assertNotIn(SECRET, client_b.secrets_seen)
+
+    def test_production_requires_https_on_both_paths(self):
+        with self.assertRaises(SystemExit):
+            setup_wizard._apply_portal_options(self.config, ['--portal-url=http://portal.example.test'])
+        answers = iter(['http://portal.example.test', 'production'])
+        with patch('builtins.input', side_effect=lambda _p: next(answers)), self.assertRaises(SystemExit):
+            setup_wizard._apply_portal_options(self.config, ['--claim'])
+        # Development keeps working against a local http portal.
+        setup_wizard._apply_portal_options(self.config, ['--portal-url=http://127.0.0.1:8000', '--mode=development'])
+        self.assertEqual(self.config.portal_url, 'http://127.0.0.1:8000')
+
+    def test_a_cloud_side_claim_from_a_lost_state_explains_instead_of_resuming(self):
+        busy = PortalError('A claim is already in progress for this device.', status_code=409)
+        with self.assertRaises(SystemExit) as raised:
+            setup_wizard._open_or_resume_claim(FakePortalClient(begin=[busy]), self.config, self.device_id)
+        self.assertIn('already waiting', str(raised.exception))
+        self.assertIsNone(load_claim_state(self.config))

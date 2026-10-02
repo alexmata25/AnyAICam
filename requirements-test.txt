@@ -1,0 +1,19 @@
+# Test-only dependencies for app/tests/. Not required at runtime -- never
+# install this in a production/edge/appliance image, only in a CI or local
+# dev environment that runs `pytest app/tests`.
+#
+# This file did not exist before the live-view JS-syntax incident
+# (docs/... see the commit this file was added in): the test suite's own
+# runtime dependencies (pytest, httpx for FastAPI's TestClient) had never
+# been pinned down anywhere, so a fresh environment (this project's own
+# staging host, confirmed live) had no way to run `app/tests` at all
+# without someone ad hoc `pip install`-ing them first and hoping the
+# versions happened to work.
+pytest==8.3.4
+httpx==0.28.1
+
+# Real JS-engine parser used by test_generated_customer_pages_js_syntax.py
+# to catch malformed JavaScript template literals/strings in generated
+# customer-facing pages before they ever reach a browser -- see that
+# file's own docstring for the exact incident this closes.
+esprima==4.0.1

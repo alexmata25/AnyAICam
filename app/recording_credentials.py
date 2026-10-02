@@ -25,13 +25,26 @@ precedent Phase 2 established for live relay ("behind a feature flag,
 no media bytes touch this code path even in testing"). No media ever
 touches this code path; only STS credentials are issued.
 
-The actual AWS IAM role this credential-issuance call assumes does not
-exist yet -- see docs/r1-recording-iam.md for the role design and the
-illustrative (not executed) AWS CLI commands to create it. Creating
-real IAM resources requires elevated AWS credentials this application
-deliberately does not have (its own EC2 instance role is scoped to
-assume only specific, already-approved role ARNs -- by design, the
-same restriction that already applies to live relay).
+The AWS IAM role/bucket this credential-issuance call assumes are real
+and already applied (confirmed live 2026-09-13: role
+anyaicam-recording-upload-role, bucket anyaicam-recordings-prod-20260820)
+-- docs/r1-recording-iam.md's own "designed, not yet applied" framing
+predates that and is stale; do not treat it as current.
+
+2026-09-13: event_media_uploader.py's motion-event thumbnail/clip
+upload reuses this exact credential-issuance route and role rather
+than getting its own -- the underlying mechanism (issue a short-lived,
+prefix-scoped STS session) is identical in shape, and stands up a
+second real AWS role for what's still a low-volume, small-object
+feature was judged unnecessary complexity. What must NOT be reused is
+the *scope*: recording_session_policy() grants a whole camera's
+recording prefix, appropriate for bulk/continuous upload but far wider
+than event-media ever needs. event_media_session_policy() below grants
+only the .../events/* sub-prefix event-media objects actually live
+under. The route in appliance_cloud.py picks between the two based on
+*which* flag actually authorized the request (RECORDING_UPLOAD_ENABLED
+vs ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED) -- when bulk recording is the
+authorizer, behavior is completely unchanged from before this addition.
 """
 
 import re
@@ -59,6 +72,31 @@ def recording_session_policy(bucket: str, customer_id: str, site_id: str, applia
         'Version': '2012-10-17',
         'Statement': [
             {'Effect': 'Allow', 'Action': 's3:PutObject', 'Resource': f'arn:aws:s3:::{bucket}/{prefix}*'}
+        ],
+    }
+
+
+def event_media_session_policy(bucket: str, customer_id: str, site_id: str, appliance_id: str, camera_id: str) -> dict:
+    """2026-09-13: event-media (motion-event thumbnail/clip) upload
+    reuses this same credential-issuance mechanism and the same
+    underlying IAM role as bulk/continuous recording upload, but must
+    never be granted that feature's full per-camera write scope --
+    event-media objects only ever live at
+    {recording_s3_prefix}{date}/events/motion_{event_id}.{mp4,jpg}
+    (see appliance_cloud.py's analytics_event_media_available(), which
+    already validates every uploaded key against this exact deterministic
+    shape). This policy is scoped one level narrower than
+    recording_session_policy() -- .../*/events/* rather than .../*  --
+    so an event-media credential can never write to what would become a
+    bulk-recording object under the same camera prefix, even though both
+    currently share one role. s3:PutObject only, no ListBucket, no
+    GetObject, no DeleteObject -- same restriction shape as
+    recording_session_policy()."""
+    prefix = recording_s3_prefix(customer_id, site_id, appliance_id, camera_id)
+    return {
+        'Version': '2012-10-17',
+        'Statement': [
+            {'Effect': 'Allow', 'Action': 's3:PutObject', 'Resource': f'arn:aws:s3:::{bucket}/{prefix}*/events/*'}
         ],
     }
 

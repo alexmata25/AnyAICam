@@ -1,0 +1,2 @@
+# Optional cloud runtime only; credentials are provided outside the repository.
+firebase-admin==7.7.0

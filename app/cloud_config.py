@@ -16,9 +16,65 @@ def _int(name, default):
         return default
 
 
+# The exact untouched default allowed_origins resolves to below -- see
+# Settings.effective_allowed_origins.
+_DEFAULT_ALLOWED_ORIGINS = ["http://localhost:8000"]
+
+
+# The exact untouched default trusted_hosts resolves to below. Compared
+# by value (never by re-reading os.environ) so Settings.effective_
+# trusted_hosts stays fully driven by constructor arguments in tests,
+# matching every other property on this class -- an operator who
+# explicitly configures ANYAICAM_TRUSTED_HOSTS to this same literal list
+# is indistinguishable from -- and treated identically to -- never having
+# set it at all, which is fine: both mean "no real restriction was ever
+# configured."
+_DEFAULT_TRUSTED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+
+
+# The one staging EC2 instance (portal-staging.anyaicam.com) also serves
+# app.anyaicam.com -- a real, second live domain, not a typo or a leftover
+# from testing -- following the account's single-EC2 consolidation.
+# Confirmed live (2026-09-20): a fresh container deploy that faithfully
+# reused the host's own persisted /etc/anyaicam-staging/vms-staging.env
+# still 500'd every app.anyaicam.com request with "Invalid host header",
+# because a *previous* incident response had added app.anyaicam.com to a
+# *running* container's ANYAICAM_TRUSTED_HOSTS/ANYAICAM_ALLOWED_ORIGINS
+# by hand (an extra -e flag, or a since-lost env file edit) without ever
+# writing it back into that persisted env file -- so the very next clean
+# rebuild-from-source-of-truth silently reverted it. Env files are host-
+# level operational config, not something a Docker image build touches,
+# so fixing the file this one time would still leave the guarantee
+# resting entirely on that file never drifting from the container again.
+# Unioned into staging's effective_trusted_hosts/effective_allowed_origins
+# below unconditionally -- regardless of what ANYAICAM_TRUSTED_HOSTS/
+# ANYAICAM_ALLOWED_ORIGINS are actually configured to on any given
+# deploy -- so this specific domain can never again be silently dropped
+# by an env file that falls out of sync with a container's live history.
+STAGING_SECONDARY_PUBLIC_HOST = "app.anyaicam.com"
+
+
+def default_email_from() -> str:
+    """ANYAICAM_EMAIL_FROM, else the older ANYAICAM_SMTP_FROM (the variable
+    main.py's legacy SMTP notifier and older env files use), else the
+    development placeholder -- read when Settings() is created."""
+    return (
+        os.getenv("ANYAICAM_EMAIL_FROM", "").strip()
+        or os.getenv("ANYAICAM_SMTP_FROM", "").strip()
+        or "no-reply@localhost"
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ANYAICAM_ENV", "development").lower()
+    # Same env var and default ("edge") app/main.py's own RUNTIME_ROLE
+    # constant already uses. The real AWS/cloud deployment explicitly
+    # sets ANYAICAM_RUNTIME_ROLE=cloud (aws.env, ecs-task-definition.json)
+    # -- this default only ever applies to appliances that never set it,
+    # i.e. edge appliances, so it cannot silently relax the real
+    # internet-facing cloud deployment's production requirements.
+    runtime_role: str = os.getenv("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
     app_secrets: list[str] = field(
         default_factory=lambda: [
             item
@@ -128,7 +184,25 @@ class Settings:
     smtp_port: int = _int("ANYAICAM_SMTP_PORT", 587)
     smtp_username: str = os.getenv("ANYAICAM_SMTP_USERNAME", "")
     smtp_password: str = os.getenv("ANYAICAM_SMTP_PASSWORD", "")
-    email_from: str = os.getenv("ANYAICAM_EMAIL_FROM", "no-reply@localhost")
+    # ANYAICAM_SMTP_FROM is the older sender variable main.py's own legacy
+    # SMTP notifier reads (and the one aws.env/older env files set); honor
+    # it here too so a deployment that only sets it doesn't send password-
+    # reset mail as no-reply@localhost, which SES and most relays reject.
+    email_from: str = field(default_factory=lambda: default_email_from())
+    # Notifications settings page (Email + SMS channels) -- sms_backend
+    # mirrors email_backend's own "preview" default exactly (never a
+    # live send until explicitly configured). Every credential here is
+    # read from the environment at call time by sms_service.py, never a
+    # literal in source; twilio_auth_token is intentionally not logged
+    # or echoed anywhere this dataclass's other fields might be.
+    sms_backend: str = os.getenv("ANYAICAM_SMS_BACKEND", "preview").lower()
+    sms_preview_dir: str = os.getenv(
+        "ANYAICAM_SMS_PREVIEW_DIR",
+        "/app/recordings/sms-preview",
+    )
+    twilio_account_sid: str = os.getenv("ANYAICAM_TWILIO_ACCOUNT_SID", "")
+    twilio_auth_token: str = os.getenv("ANYAICAM_TWILIO_AUTH_TOKEN", "")
+    twilio_from_number: str = os.getenv("ANYAICAM_TWILIO_FROM_NUMBER", "")
     log_level: str = os.getenv("ANYAICAM_LOG_LEVEL", "INFO").upper()
     log_format: str = os.getenv("ANYAICAM_LOG_FORMAT", "text").lower()
     https_only: bool = _bool("ANYAICAM_HTTPS_ONLY", False)
@@ -151,6 +225,87 @@ class Settings:
     @property
     def deployed(self):
         return self.environment in {"staging", "production"}
+
+    @property
+    def edge_production(self):
+        """A RUNTIME_ROLE=edge appliance in ANYAICAM_ENV=production is a
+        distinct security PROFILE, not a weaker version of cloud
+        production: it is reached over a private LAN/Tailscale network,
+        never the public internet, so it has no in-scope HTTPS
+        termination boundary to require -- unlike an internet-facing
+        cloud/combined production deployment, where all of that remains
+        mandatory and unchanged (see validate() below: every check this
+        property exempts is skipped ONLY when this is True, and strong/
+        non-default application secrets are never exempted for either
+        profile). Staging is deliberately unaffected by runtime_role --
+        this scopes strictly to production, matching the actual ask."""
+        return self.production and self.runtime_role == "edge"
+
+    @property
+    def effective_trusted_hosts(self):
+        """The value actually passed to TrustedHostMiddleware (main.py).
+
+        Cloud/combined production has a single, fixed public domain it is
+        meant to serve exclusively -- Host-header validation there is a
+        real, load-bearing security check and stays completely unchanged,
+        whether trusted_hosts is left at its default or explicitly
+        configured.
+
+        An edge appliance has no such fixed address: it's reached over
+        whatever LAN IP or Tailscale address DHCP/Tailscale happens to
+        assign it, which can't be enumerated at install time the way a
+        cloud domain can. Confirmed live on Samsung: the installer's own
+        ANYAICAM_ENV=production stamp (this session's earlier fix) made
+        TrustedHostMiddleware start rejecting the appliance's real
+        Tailscale address with "Invalid host header", because
+        ANYAICAM_TRUSTED_HOSTS was never set and the default
+        (localhost/127.0.0.1/testserver) matches nothing an operator
+        actually connects through. For edge_production specifically, with
+        trusted_hosts still at that exact untouched default, this returns
+        Starlette's own "*" sentinel, which disables host-header matching
+        entirely -- the same private-LAN/Tailscale trust boundary
+        edge_production already relies on for its other exemptions (see
+        its own docstring above). The moment an operator sets
+        ANYAICAM_TRUSTED_HOSTS to anything else -- on an edge appliance or
+        otherwise -- that explicit value is honored exactly as configured,
+        never silently widened."""
+        if self.edge_production and self.trusted_hosts == _DEFAULT_TRUSTED_HOSTS:
+            return ["*"]
+        if self.staging and STAGING_SECONDARY_PUBLIC_HOST not in self.trusted_hosts:
+            return [*self.trusted_hosts, STAGING_SECONDARY_PUBLIC_HOST]
+        return self.trusted_hosts
+
+    @property
+    def effective_allowed_origins(self):
+        """The value cloud_security.ProductionSecurityMiddleware actually
+        checks a browser request's Origin header against, and CORS
+        preflight/state-changing requests are rejected with "Origin is
+        not allowed" for any Origin not in this list.
+
+        Confirmed live on Samsung: the Admin login POST from
+        http://192.168.0.165:8000/partner.html was rejected because
+        ANYAICAM_ALLOWED_ORIGINS was never set and the untouched default
+        (http://localhost:8000) matches no origin a browser actually
+        loads the appliance's own pages from -- the exact same shape of
+        bug as effective_trusted_hosts above, for the same underlying
+        reason: an edge appliance has no fixed address to enumerate in
+        advance, unlike a cloud deployment's single fixed public domain.
+
+        For edge_production specifically, with allowed_origins still at
+        its exact untouched default, this returns ["*"], which
+        cloud_security.py's dispatch() treats as "any origin accepted" --
+        the same private-LAN/Tailscale trust boundary edge_production
+        already relies on for every other exemption on this class (see
+        its own docstring). Cloud/combined production, staging, and any
+        profile where an operator has explicitly configured
+        ANYAICAM_ALLOWED_ORIGINS are all completely unaffected and keep
+        exact current behavior."""
+        if self.edge_production and self.allowed_origins == _DEFAULT_ALLOWED_ORIGINS:
+            return ["*"]
+        staging_origin = f"https://{STAGING_SECONDARY_PUBLIC_HOST}"
+        if self.staging and staging_origin not in self.allowed_origins:
+            return [*self.allowed_origins, staging_origin]
+        return self.allowed_origins
 
     @property
     def partner_login_url(self):
@@ -214,7 +369,13 @@ class Settings:
             "customer login": self.customer_login_url,
         }
 
-        if self.deployed:
+        # Internet-facing hardening -- unchanged from before for staging
+        # and for cloud/combined production. edge_production is the only
+        # exemption, and it is scoped exactly to this block: an edge
+        # appliance's LAN/Tailscale reachability has no HTTPS-terminating
+        # boundary in front of it to require secure cookies, CSRF
+        # tokens, or HTTPS-scheme URLs against.
+        if self.deployed and not self.edge_production:
             if not self.secure_cookies or not self.csrf_enabled:
                 errors.append(
                     "Staging and production require secure cookies and CSRF protection."
@@ -234,17 +395,10 @@ class Settings:
                 )
 
         if self.production:
-            if not self.https_only:
-                errors.append("Production requires HTTPS-only mode.")
-
-            if (
-                urlparse(self.partner_login_url).scheme != "https"
-                or urlparse(self.customer_login_url).scheme != "https"
-            ):
-                errors.append(
-                    "Production partner and customer login URLs must use HTTPS."
-                )
-
+            # Strong, non-default application secrets are required in
+            # EVERY production deployment -- deliberately outside the
+            # `not self.edge_production` branch below, so edge can never
+            # exempt itself from this one.
             if any(
                 secret in {
                     "local-development-secret-change-me",
@@ -257,6 +411,18 @@ class Settings:
                 errors.append(
                     "Replace default or short application secrets in production."
                 )
+
+            if not self.edge_production:
+                if not self.https_only:
+                    errors.append("Production requires HTTPS-only mode.")
+
+                if (
+                    urlparse(self.partner_login_url).scheme != "https"
+                    or urlparse(self.customer_login_url).scheme != "https"
+                ):
+                    errors.append(
+                        "Production partner and customer login URLs must use HTTPS."
+                    )
 
         if errors:
             raise RuntimeError("Configuration error: " + " ".join(errors))

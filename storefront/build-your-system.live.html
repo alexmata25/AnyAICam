@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Build Your AnyAiCam VMS | Edge Appliance & Storage Wizard</title>
+<meta name="description" content="Configure camera capacity, per-camera feature quantities, an AnyAiCam Edge appliance, storage and access-control options in a guided public system-planning flow.">
+<link rel="icon" href="favicon.png"><link rel="stylesheet" href="vms-product.css">
+<style>
+.builder{padding:3rem 1rem 4rem}.builder-head{max-width:850px;margin:0 auto 1.6rem;text-align:center}.builder-head h1{font-size:clamp(2.2rem,5vw,4rem);line-height:1.03;margin:.35rem 0 .8rem}.builder-shell{width:min(1180px,100%);margin:auto;display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:1.2rem;align-items:start}.wizard-card,.summary{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 16px 38px rgba(7,16,50,.08)}.wizard-card{overflow:hidden}.progress{display:grid;grid-template-columns:repeat(5,1fr);background:#f0f5fa;border-bottom:1px solid var(--line)}.progress button{border:0;background:transparent;padding:.85rem .35rem;font:inherit;font-size:.73rem;font-weight:900;color:#6b7890;cursor:pointer}.progress button.active{background:#fff;color:var(--navy);box-shadow:inset 0 -3px 0 var(--cyan)}.step-pane{display:none;padding:1.4rem}.step-pane.active{display:block}.step-pane h2{margin:.1rem 0 .35rem}.step-pane>p{margin:.2rem 0 1.2rem;color:var(--muted)}.choice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem}.choice{position:relative;display:flex;gap:.75rem;align-items:flex-start;border:2px solid var(--line);border-radius:14px;padding:1rem;cursor:pointer;background:#fff}.choice:has(input:checked){border-color:var(--cyan);background:#f0fdff;box-shadow:0 0 0 2px rgba(35,199,213,.08)}.choice:has(input:disabled){opacity:.55;cursor:not-allowed}.choice input{width:auto;min-height:0;margin-top:.25rem}.choice strong{display:block}.choice small{display:block;color:var(--muted);margin-top:.25rem;font-weight:500;line-height:1.4}.field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}.field-grid label{display:block;font-weight:850}.field-grid span{display:block;margin-bottom:.35rem}.field-grid input,.field-grid select{width:100%;min-height:47px;padding:.72rem;border:1px solid #aebed0;border-radius:10px;background:#fff}.feature-list{display:grid;gap:.75rem}.feature-row{display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:1rem;align-items:center;border:1px solid var(--line);border-radius:14px;padding:1rem;background:#fff}.feature-row label{font-weight:900}.feature-row small{display:block;color:var(--muted);font-weight:500;margin-top:.2rem}.feature-row input{width:100%;min-height:44px;border:1px solid #aebed0;border-radius:10px;padding:.65rem}.constraint{margin-top:.8rem;padding:.85rem;border-radius:10px;background:#eaf8ff;color:#134861;font-weight:750}.constraint[hidden]{display:none}.step-actions{display:flex;justify-content:space-between;gap:.7rem;padding:1rem 1.4rem;border-top:1px solid var(--line);background:#fafcff}.step-actions button{border-radius:999px;min-height:46px;padding:.7rem 1.15rem;font-weight:900;cursor:pointer}.back{background:#fff;border:1px solid var(--navy);color:var(--navy)}.next,.checkout{border:0;background:linear-gradient(90deg,var(--pink),var(--cyan));color:#fff}.summary{padding:1.25rem;position:sticky;top:1rem}.summary h2{margin:.25rem 0 1rem}.summary dl{display:grid;grid-template-columns:1fr auto;gap:.6rem .8rem;margin:0}.summary dt{color:var(--muted)}.summary dd{margin:0;text-align:right;font-weight:850;max-width:210px}.test-price{margin:1rem 0 .4rem;padding:1rem;border-radius:13px;background:#071032;color:#fff;text-align:center;font-size:1.7rem;font-weight:950}.test-note{margin-top:1rem;padding:.9rem;border-left:5px solid #e5b900;background:#fff5cb;border-radius:8px;color:#5d4800}.feedback{min-height:1.4rem;margin-top:.7rem;color:#a12020;font-weight:800}.review-box{background:#f7fbff;border:1px solid var(--line);border-radius:14px;padding:1rem;margin-top:1rem}.review-box ol{margin:.5rem 0 0;padding-left:1.25rem}.storage-card{border:1px solid var(--line);border-radius:14px;padding:1rem;margin-top:1rem;background:#f8fbff}.inline-note{font-size:.9rem;color:var(--muted)}@media(max-width:900px){.builder-shell{grid-template-columns:1fr}.summary{position:static}.progress{grid-template-columns:1fr 1fr 1fr}.progress button:nth-child(n+4){border-top:1px solid var(--line)}}@media(max-width:620px){.choice-grid,.field-grid{grid-template-columns:1fr}.feature-row{grid-template-columns:1fr}.progress{grid-template-columns:1fr 1fr}.builder{padding:2rem .8rem}.step-pane{padding:1rem}.step-actions{padding:1rem}.summary{padding:1rem}}
+</style>
+<style id="aic-unified-sticky-footer-v1">
+/* AnyAiCam unified navigation/footer enhancement - public VMS pages */
+.stage-header{
+  position:sticky;
+  top:0;
+  z-index:1000;
+  box-shadow:0 12px 28px rgba(2,8,29,.20);
+}
+.site-header{
+  z-index:1000 !important;
+}
+.aic-footer-actions{
+  padding:2rem 1rem;
+  background:#f4f8fc;
+  border-top:1px solid #d9e4f2;
+}
+.aic-footer-actions-inner{
+  width:min(1120px,100%);
+  margin:0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:1.25rem;
+  flex-wrap:wrap;
+}
+.aic-footer-actions-copy h2{
+  margin:0 0 .35rem;
+  color:#071032;
+  font-size:clamp(1.35rem,3vw,1.9rem);
+}
+.aic-footer-actions-copy p{
+  margin:0;
+  color:#52627a;
+  line-height:1.6;
+}
+.aic-footer-actions-buttons{
+  display:flex;
+  gap:.65rem;
+  flex-wrap:wrap;
+}
+.aic-quick-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:44px;
+  padding:.72rem 1rem;
+  border-radius:999px;
+  text-decoration:none !important;
+  font-weight:850;
+  border:1px solid #0b2b4f;
+  background:#fff;
+  color:#0b2b4f !important;
+}
+.aic-quick-btn.primary{
+  border:0;
+  color:#fff !important;
+  background:linear-gradient(90deg,#cc3b96,#23c7d5);
+}
+.aic-unified-footer{
+  background:#071032;
+  color:#dce6ff;
+  padding:3rem 1rem 1.4rem;
+}
+.aic-unified-footer a{
+  color:#dce6ff;
+  text-decoration:none;
+}
+.aic-unified-footer a:hover,
+.aic-unified-footer a:focus-visible{
+  color:#68d7df;
+  text-decoration:underline;
+}
+.aic-footer-grid{
+  width:min(1180px,100%);
+  margin:0 auto;
+  display:grid;
+  grid-template-columns:1.35fr 1fr 1fr 1fr;
+  gap:2rem;
+}
+.aic-footer-brand img{
+  display:block;
+  width:min(210px,100%);
+  height:auto;
+  margin-bottom:1rem;
+}
+.aic-footer-brand p{
+  margin:.45rem 0;
+  color:#c8d5ee;
+  line-height:1.6;
+}
+.aic-unified-footer h3{
+  margin:.15rem 0 .8rem;
+  color:#fff;
+  font-size:1rem;
+}
+.aic-footer-links{
+  display:grid;
+  gap:.5rem;
+}
+.aic-footer-contact{
+  margin-top:1rem;
+  display:grid;
+  gap:.35rem;
+  font-size:.92rem;
+}
+.aic-footer-bottom{
+  width:min(1180px,100%);
+  margin:2rem auto 0;
+  padding-top:1rem;
+  border-top:1px solid rgba(255,255,255,.13);
+  display:flex;
+  justify-content:space-between;
+  gap:1rem;
+  flex-wrap:wrap;
+  color:#9fb0cf;
+  font-size:.86rem;
+}
+.aic-footer-policies{
+  display:flex;
+  gap:1rem;
+  flex-wrap:wrap;
+}
+@media(max-width:900px){
+  .aic-footer-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media(max-width:620px){
+  .aic-footer-grid{grid-template-columns:1fr;}
+  .aic-footer-actions-buttons{width:100%;display:grid;grid-template-columns:1fr;}
+  .aic-quick-btn{width:100%;}
+}
+</style>
+
+<link rel="stylesheet" href="header-standard.css">
+
+<style id="aic-stage-nav-no-underline-final">
+header.stage-header nav.stage-nav a,
+header.stage-header nav.stage-nav a:link,
+header.stage-header nav.stage-nav a:visited,
+header.stage-header nav.stage-nav a:hover,
+header.stage-header nav.stage-nav a:active,
+header.stage-header nav.stage-nav a:focus {
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: 0 !important;
+}
+</style>
+
+</head><body>
+
+<header class="stage-header"><div class="stage-header-inner"><a href="index.html"><img src="full-logo-transparent.png" alt="ANY AI CAM"></a><nav class="stage-nav" aria-label="Primary"><a href="index.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Home</a><a href="vms.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">VMS</a><a href="vms-features.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Features</a><a href="edge-appliance.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Edge Appliance</a><a href="face-access.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">AAC Face Access</a><a href="customer-setup.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Setup</a><a href="hardware.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Hardware</a><a href="build-your-system.html" aria-current="page" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Build System</a><a href="sales-partner-login.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Sales Partners</a><a href="vms-support.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Support</a><a href="vms-contact.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Contact</a></nav></div></header>
+<main class="builder"><div class="builder-head"><div class="eyebrow" style="color:#16778b">AnyAiCam VMS System Wizard</div><h1>Build the system before the box arrives.</h1><p class="lead" style="margin:auto">Choose camera capacity, Edge hardware, storage, per-camera features and access-control options. A future verified paid order will become the source for the provisioning manifest. This public planner does not create that order.</p></div>
+<div class="builder-shell"><form id="systemForm" class="wizard-card" novalidate>
+<div class="progress" aria-label="Wizard progress"><button type="button" data-goto="0" class="active" aria-current="step">1 Cameras</button><button type="button" data-goto="1">2 Edge</button><button type="button" data-goto="2">3 Storage</button><button type="button" data-goto="3">4 Features</button><button type="button" data-goto="4">5 Review</button></div>
+<section class="step-pane active" data-step="0"><h2 tabindex="-1">How many cameras will this site use?</h2><p>This becomes the purchased camera-slot capacity. Invalid counts are rejected; they are never silently changed.</p><div class="field-grid"><label><span>Camera count</span><input name="camera_count" type="number" min="1" max="128" step="1" value="8" required></label><label><span>Typical resolution</span><select name="resolution"><option value="2mp">2MP / 1080p</option><option value="4mp" selected>4MP</option><option value="5mp">5MP</option><option value="8mp">8MP / 4K</option><option value="mixed">Mixed resolutions</option></select></label><label><span>Recording mode</span><select name="recording_mode"><option value="continuous">Continuous</option><option value="motion">Motion / events</option><option value="mixed" selected>Mixed</option></select></label></div><div class="notice" style="margin-top:1rem"><strong>Camera slots, not IP addresses:</strong> a replacement camera can inherit the purchased logical slot after authorization.</div></section>
+<section class="step-pane" data-step="1"><h2 tabindex="-1">Choose the Edge appliance</h2><p>For VMS-only systems choose the MINISFORUM AI X1-255 — Ryzen 7 255 or the MINISFORUM AI X1 — Ryzen AI 9 HX 470. The separate AI Access Edge is reserved for AAC Face Access.</p><div class="choice-grid"><label class="choice"><input type="radio" name="appliance_tier" value="current_fit" checked><span><img src="aac-vms-edge-x1-255-ryzen7.jpg" alt="MINISFORUM AI X1-255 — Ryzen 7 255 VMS Edge" loading="lazy" style="display:block;width:100%;height:125px;object-fit:contain;margin-bottom:.55rem"><strong>MINISFORUM AI X1-255 — Ryzen 7 255</strong><small>Standard AnyAiCam VMS appliance. 32 GB DDR5 / 1 TB system SSD configuration shown; recording storage is sized separately.</small></span></label><label class="choice"><input type="radio" name="appliance_tier" value="growth_ready"><span><img src="aac-vms-edge-x1-ryzen9.jpg" alt="MINISFORUM AI X1 — Ryzen AI 9 HX 470 VMS Edge" loading="lazy" style="display:block;width:100%;height:125px;object-fit:contain;margin-bottom:.55rem"><strong>MINISFORUM AI X1 — Ryzen AI 9 HX 470</strong><small>Higher-performance VMS appliance for heavier analytics, concurrent workload or planned expansion.</small></span></label><label class="choice"><input type="radio" name="appliance_tier" value="ai_access_ready"><span><img src="aac-ai-access-edge.webp" alt="MINISFORUM candidate for AI Access Edge" loading="lazy" style="display:block;width:100%;height:125px;object-fit:contain;margin-bottom:.55rem"><strong>AI Access Edge — Integrated Face Access</strong><small>Premium MINISFORUM candidate tier for local facial recognition plus a supported provider API. Final capacity must be benchmarked before launch.</small></span></label></div><div class="constraint" id="faceTierMessage" hidden>AI Access Edge is required while AAC Face Access licenses are greater than zero. The two VMS appliance choices are disabled until Face Access is set back to 0.</div><div class="storage-card"><strong>Important hardware boundary</strong><p class="inline-note">The Numato three-channel relay is a separate standalone access-control option. It is not the VMS Edge appliance and it is not required by the AI Access Edge. Exact production Edge models and capacities will be published only after AnyAiCam validation.</p></div></section>
+<section class="step-pane" data-step="2"><h2 tabindex="-1">Choose local / hybrid storage behavior</h2><p>The Edge appliance remains the local operating center. Cloud retention is an optional extension.</p><div class="choice-grid"><label class="choice"><input type="radio" name="deployment_type" value="local"><span><strong>Local First</strong><small>Operate from the Edge appliance without optional cloud-overflow positioning in this draft.</small></span></label><label class="choice"><input type="radio" name="deployment_type" value="hybrid" checked><span><strong>Hybrid</strong><small>Local VMS plus selected cloud services/off-site retention according to entitlement.</small></span></label><label class="choice"><input type="radio" name="deployment_type" value="cloud_overflow"><span><strong>Cloud Overflow</strong><small>Draft option for cloud-expanded retention where supported.</small></span></label></div><div class="field-grid" style="margin-top:1rem"><label><span>Video retention target</span><select name="retention_days"><option value="7">7 days</option><option value="14" selected>14 days</option><option value="30">30 days</option></select></label></div><div class="notice" style="margin-top:1rem"><strong>V1 storage baseline:</strong> for 4MP / 15 FPS / H.265 motion recording at about 25% activity, plan roughly 1 / 2 / 4 TB for 8 cameras at 7 / 14 / 30 days, and 2 / 4 / 8 TB for 16 cameras. Actual retention varies; continuous recording and 8MP/4K require substantially more capacity.</div><div class="notice" style="margin-top:1rem"><strong>Production pricing:</strong> final Edge, storage and feature prices will map to approved products later. This public planner does not create a charge.</div></section>
+<section class="step-pane" data-step="3"><h2 tabindex="-1">Choose how many cameras get each feature</h2><p>Feature quantities are purchased independently. For example, a 10-camera site can buy Smart Motion for 5 cameras and basic VMS for the other 5.</p><div class="feature-list">
+<div class="feature-row"><label for="fq-smart_motion">Smart Motion<small>People/vehicle-oriented event classification where supported.</small></label><input id="fq-smart_motion" data-feature="smart_motion" type="number" min="0" step="1" value="0" aria-label="Smart Motion camera quantity"></div>
+<div class="feature-row"><label for="fq-people_counting">People Counting<small>Occupancy and traffic insights for appropriate viewpoints.</small></label><input id="fq-people_counting" data-feature="people_counting" type="number" min="0" step="1" value="0" aria-label="People Counting camera quantity"></div>
+<div class="feature-row"><label for="fq-license_plate">License Plate Recognition<small>Licensed plate analytics for suitable cameras.</small></label><input id="fq-license_plate" data-feature="license_plate" type="number" min="0" step="1" value="0" aria-label="License Plate Recognition camera quantity"></div>
+<div class="feature-row"><label for="fq-ppe">PPE Detection<small>Draft safety analytics module.</small></label><input id="fq-ppe" data-feature="ppe" type="number" min="0" step="1" value="0" aria-label="PPE Detection camera quantity"></div>
+<div class="feature-row"><label for="fq-face_access">AAC Facial Recognition / Face Access<small>Integrated local face matching + access policy for entrance cameras. Requires AI Access Edge and a supported access-control provider API.</small></label><input id="fq-face_access" data-feature="face_access" type="number" min="0" step="1" value="0" aria-label="Face Access camera quantity"></div>
+</div>
+<div class="storage-card"><strong>Integrated Face Access connection</strong><div class="choice-grid" style="margin-top:.8rem"><label class="choice"><input type="radio" name="access_control_mode" value="none" checked><span><strong>No integrated door control</strong><small>VMS/analytics only. Leave Face Access quantity at 0.</small></span></label><label class="choice"><input type="radio" name="access_control_mode" value="provider_api"><span><strong>Supported provider API</strong><small>For AAC Face Access, connect a validated access-control platform through protected API credentials after activation.</small></span></label></div><p class="inline-note"><strong>Examples are not compatibility claims:</strong> enterprise platforms such as Brivo, Avigilon or other access-control systems are supported only after AnyAiCam validates the specific integration.</p></div>
+<div class="storage-card"><strong>Separate standalone access-control option</strong><div style="display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:1rem;align-items:center;margin-top:.8rem"><div><img src="aac-standalone-relay.png" alt="Numato three-channel relay for standalone access control" loading="lazy" style="width:100%;max-width:270px;height:120px;object-fit:contain;display:block;margin-bottom:.5rem"><strong>Numato 3-channel relay candidate</strong><p class="inline-note">Use for standalone local door/gate trigger designs. This is not the VMS/AI Edge appliance and does not satisfy the integrated AAC Face Access provider-API requirement.</p></div><label><span>Standalone relay modules</span><input name="standalone_relay_modules" type="number" min="0" max="16" step="1" value="0"></label></div><p class="inline-note">One candidate module provides three Ethernet-controlled SPDT relay outputs. Final installations must use appropriate listed access-control/lock hardware and preserve required egress/life-safety behavior.</p></div>
+<div class="constraint" id="faceAccessRequirement" hidden>Integrated AAC Face Access requires AI Access Edge and a supported provider API before the plan is complete.</div></section>
+<section class="step-pane" data-step="4"><h2 tabindex="-1">Customer, site and system-plan review</h2><p>These details identify the customer and site the future paid-order provisioning manifest would belong to. This public planner does not charge a card.</p><div class="field-grid"><label><span>Customer name</span><input name="customer_name" autocomplete="name" required maxlength="120"></label><label><span>Email</span><input name="customer_email" type="email" autocomplete="email" required maxlength="190"></label><label><span>Site name</span><input name="site_name" required maxlength="160" placeholder="Main office"></label></div><div class="review-box"><strong>What happens after verified payment in the production design</strong><ol><li>Stripe verifies payment server-to-server.</li><li>The backend creates a canonical provisioning request with camera slots and purchased feature quantities.</li><li>AnyAiCam creates/links the customer, site, appliance reservation and entitlements.</li><li>The appliance is fulfilled and associated with that provisioning record.</li><li>After delivery, the customer connects it, signs in/activates, discovers cameras, enters camera credentials locally and assigns purchased feature slots.</li></ol></div><div class="test-note"><strong>Planning only:</strong> no physical Edge appliance, AWS resources, access-control integration or production subscription is created from this page.</div></section>
+<div class="step-actions"><button type="button" class="back" id="backButton" hidden>Back</button><span></span><button type="button" class="next" id="nextButton">Continue</button><button type="submit" class="checkout" id="checkoutButton" hidden>Finish System Plan</button></div></form>
+<aside class="summary" aria-live="polite"><div class="eyebrow" style="color:#16778b">System summary</div><h2>AnyAiCam Edge + VMS</h2><dl><dt>Cameras</dt><dd id="sumCameras">8</dd><dt>Resolution</dt><dd id="sumResolution">4MP</dd><dt>Recording</dt><dd id="sumRecording">Mixed</dd><dt>Edge</dt><dd id="sumAppliance">MINISFORUM AI X1-255 — Ryzen 7 255</dd><dt>Storage mode</dt><dd id="sumDeployment">Hybrid</dd><dt>Retention</dt><dd id="sumRetention">14 days</dd><dt>Features</dt><dd id="sumAnalytics">None</dd><dt>Access control</dt><dd id="sumAccess">None</dd></dl><div class="test-price">Planning Only</div><p class="inline-note">Production appliance/storage/feature pricing is intentionally not invented here.</p><div class="feedback" id="feedback" role="alert"></div><div id="planResult" class="notice" hidden style="margin:0 1.4rem 1.2rem"><strong>Your AnyAiCam system plan is ready.</strong><br>No order or charge was created. <a href="vms-contact.html" style="font-weight:900;color:#0b2b4f">Contact ANY AI CAM</a> to review hardware sizing, availability and production pricing.</div><p style="margin-top:1rem"><a href="vms.html" style="font-weight:900;color:#16778b">Learn what the VMS does →</a></p><p><a href="face-access.html" style="font-weight:900;color:#16778b">Learn about AAC Face Access →</a></p></aside></div></main>
+
+<section class="aic-footer-actions" aria-label="Quick actions">
+  <div class="aic-footer-actions-inner">
+    <div class="aic-footer-actions-copy">
+      <h2>Ready for the next step?</h2>
+      <p>Go straight to system planning, VMS features, Face Access, or support without scrolling back to the top.</p>
+    </div>
+    <div class="aic-footer-actions-buttons">
+      <a class="aic-quick-btn primary" href="build-your-system.html">Start Setup Wizard</a>
+      <a class="aic-quick-btn" href="vms-features.html">Explore VMS Features</a>
+      <a class="aic-quick-btn" href="face-access.html">AAC Face Access</a>
+      <a class="aic-quick-btn" href="vms-support.html">Contact Support</a>
+    </div>
+  </div>
+</section>
+
+
+<footer class="aic-unified-footer" id="about">
+  <div class="aic-footer-grid">
+    <div class="aic-footer-brand">
+      <a href="index.html" aria-label="ANY AI CAM home"><img src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection"></a>
+      <p>Local-first video, optional hybrid cloud services, modular AI analytics, and AAC Face Access for compatible security systems.</p>
+      <div class="aic-footer-contact">
+        <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        <a href="tel:+13465544699">(346) 554-4699</a>
+        <a href="/cdn-cgi/l/email-protection#395854584d587958574058505a5854175a5654"><span class="__cf_email__" data-cfemail="e6878b879287a687889f878f85878bc885898b">[email&#160;protected]</span></a>
+      </div>
+    </div>
+    <div>
+      <h3>AnyAiCam VMS</h3>
+      <div class="aic-footer-links">
+        <a href="vms.html">VMS Overview</a>
+        <a href="vms-features.html">VMS Features</a>
+        <a href="edge-appliance.html">Edge Appliance</a>
+        <a href="build-your-system.html">Build Your System</a>
+        <a href="customer-setup.html">Customer Setup</a>
+      </div>
+    </div>
+    <div>
+      <h3>AI Access & Hardware</h3>
+      <div class="aic-footer-links">
+        <a href="face-access.html">AAC Face Access</a>
+        <a href="edge-appliance.html">AI Edge Appliance</a>
+        <a href="hardware.html">Hardware Selector</a>
+        <a href="analytics.html">Analytics Catalog</a>
+        <a href="/camera-compatibility-check.html">Camera Readiness</a>
+      </div>
+    </div>
+    <div>
+      <h3>Cloud, Account & Support</h3>
+      <div class="aic-footer-links">
+        <a href="/cloud-setup-wizard.html">Videoloft Cloud Setup</a>
+        <a href="signin.html">Account Dashboard</a>
+        <a href="sales-partner-login.html">Sales Partner Login</a>
+        <a href="vms-partner-apply.html">Become a VMS / AAC Sales Partner</a>
+        <a href="vms-support.html">Live Tech Support</a>
+        <a href="vms-contact.html">Contact Us</a>
+        <a href="plans.html">Plan Explainer</a>
+      </div>
+    </div>
+  </div>
+  <div class="aic-footer-bottom">
+    <span>© 2026 ANY AI CAM. All rights reserved.</span>
+    <div class="aic-footer-policies">
+      <a href="/privacy-policy.html">Privacy Policy</a>
+      <a href="/terms.html">Terms of Service</a>
+      <a href="/shipping-returns.html">Shipping &amp; Returns</a>
+    </div>
+  </div>
+</footer>
+
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+(()=>{
+const form=document.getElementById('systemForm'),panes=[...document.querySelectorAll('.step-pane')],progress=[...document.querySelectorAll('.progress button')],back=document.getElementById('backButton'),next=document.getElementById('nextButton'),checkout=document.getElementById('checkoutButton'),feedback=document.getElementById('feedback'),faceTierMessage=document.getElementById('faceTierMessage'),faceAccessRequirement=document.getElementById('faceAccessRequirement'),planResult=document.getElementById('planResult');let step=0;
+const labels={local:'Local First',hybrid:'Hybrid',cloud_overflow:'Cloud Overflow',current_fit:'MINISFORUM AI X1-255 — Ryzen 7 255',growth_ready:'MINISFORUM AI X1 — Ryzen AI 9 HX 470',ai_access_ready:'AI Access Edge — AAC Face Access',continuous:'Continuous',motion:'Motion / events',mixed:'Mixed',smart_motion:'Smart Motion',people_counting:'People Counting',license_plate:'License Plate Recognition',ppe:'PPE Detection',face_access:'AAC Face Access',provider_api:'Provider API','2mp':'2MP / 1080p','4mp':'4MP','5mp':'5MP','8mp':'8MP / 4K'};
+function val(name){const el=form.elements[name];if(!el)return'';if(el instanceof RadioNodeList)return el.value;return el.value}
+function cameraCount(){return Number(val('camera_count'))}
+function featureQuantities(){const result={};form.querySelectorAll('[data-feature]').forEach(el=>result[el.dataset.feature]=Number(el.value||0));return result}
+function updateFeatureMaximums(){const count=cameraCount();form.querySelectorAll('[data-feature]').forEach(el=>{el.max=Number.isInteger(count)&&count>=1&&count<=128?String(count):'128'})}
+function faceQty(){return featureQuantities().face_access||0}
+function applyConstraints(){updateFeatureMaximums();const face=faceQty()>0;const radios=[...form.querySelectorAll('input[name="appliance_tier"]')];radios.forEach(r=>{if(r.value!=='ai_access_ready')r.disabled=face});if(face){const ai=radios.find(r=>r.value==='ai_access_ready');if(ai&&!ai.checked)ai.checked=true;faceTierMessage.hidden=false}else{radios.forEach(r=>r.disabled=false);faceTierMessage.hidden=true}const mode=val('access_control_mode');faceAccessRequirement.hidden=!(face&&mode!=='provider_api');renderSummary()}
+function renderSummary(){document.getElementById('sumCameras').textContent=val('camera_count')||'—';document.getElementById('sumResolution').textContent=labels[val('resolution')]||val('resolution');document.getElementById('sumRecording').textContent=labels[val('recording_mode')]||val('recording_mode');document.getElementById('sumAppliance').textContent=labels[val('appliance_tier')]||val('appliance_tier');document.getElementById('sumDeployment').textContent=labels[val('deployment_type')]||val('deployment_type');document.getElementById('sumRetention').textContent=(val('retention_days')||'—')+' days';const q=featureQuantities(),parts=Object.entries(q).filter(([,n])=>n>0).map(([k,n])=>(labels[k]||k)+' × '+n);document.getElementById('sumAnalytics').textContent=parts.length?parts.join(', '):'None';const access=val('access_control_mode'),relayCount=Number(val('standalone_relay_modules')||0);const accessParts=[];if(access!=='none')accessParts.push('Integrated Face Access: '+(labels[access]||access));if(relayCount>0)accessParts.push('Standalone access: '+relayCount+' Numato relay module(s)');document.getElementById('sumAccess').textContent=accessParts.length?accessParts.join(' + '):'None'}
+function show(i,moveFocus=true,clearFeedback=true){step=Math.max(0,Math.min(panes.length-1,i));panes.forEach((p,n)=>{const active=n===step;p.classList.toggle('active',active);p.setAttribute('aria-hidden',active?'false':'true')});progress.forEach((p,n)=>{const active=n===step;p.classList.toggle('active',active);if(active)p.setAttribute('aria-current','step');else p.removeAttribute('aria-current')});back.hidden=step===0;next.hidden=step===panes.length-1;checkout.hidden=step!==panes.length-1;if(clearFeedback)feedback.textContent='';window.scrollTo({top:0,behavior:'smooth'});if(moveFocus){const heading=panes[step].querySelector('h2');if(heading)requestAnimationFrame(()=>heading.focus({preventScroll:true}))}}
+function currentValid(){if(step===0){const c=cameraCount();if(!Number.isInteger(c)||c<1||c>128){feedback.textContent='Camera count must be a whole number from 1 to 128.';form.elements.camera_count.focus();return false}}if(step===3){const c=cameraCount();for(const el of form.querySelectorAll('[data-feature]')){const n=Number(el.value);if(!Number.isInteger(n)||n<0||n>c){feedback.textContent='Each feature quantity must be a whole number from 0 to the purchased camera count.';el.focus();return false}}if(faceQty()>0&&val('access_control_mode')!=='provider_api'){feedback.textContent='Integrated AAC Face Access requires the Supported Provider API option.';faceAccessRequirement.hidden=false;return false}const relays=Number(val('standalone_relay_modules'));if(!Number.isInteger(relays)||relays<0||relays>16){feedback.textContent='Standalone relay modules must be a whole number from 0 to 16.';form.elements.standalone_relay_modules.focus();return false}}const required=[...panes[step].querySelectorAll('input[required],select[required]')];for(const el of required){if(!el.checkValidity()){el.reportValidity();return false}}return true}
+next.addEventListener('click',()=>{if(currentValid())show(step+1)});back.addEventListener('click',()=>show(step-1));progress.forEach((b,i)=>b.addEventListener('click',()=>{if(i<=step||currentValid())show(i)}));
+form.addEventListener('input',applyConstraints);form.addEventListener('change',applyConstraints);window.addEventListener('pageshow',()=>{checkout.disabled=false;checkout.textContent='Finish System Plan';feedback.textContent='';if(planResult)planResult.hidden=true;applyConstraints()});
+form.addEventListener('submit',e=>{
+  e.preventDefault();
+  for(let i=0;i<panes.length;i++){
+    if(i!==step) show(i,false,false);
+    if(!currentValid()) return;
+  }
+  show(panes.length-1,false,false);
+  if(!form.reportValidity()||!currentValid()) return;
+  const payload={
+    customer_name:val('customer_name'),
+    customer_email:val('customer_email'),
+    site_name:val('site_name'),
+    camera_count:Number(val('camera_count')),
+    resolution:val('resolution'),
+    recording_mode:val('recording_mode'),
+    retention_days:Number(val('retention_days')),
+    deployment_type:val('deployment_type'),
+    appliance_tier:val('appliance_tier'),
+    feature_quantities:featureQuantities(),
+    access_control_mode:val('access_control_mode'),
+    standalone_relay_modules:Number(val('standalone_relay_modules'))
+  };
+  try{sessionStorage.setItem('anyaicamVmsSystemPlan',JSON.stringify(payload))}catch(_err){}
+  feedback.textContent='';
+  checkout.disabled=false;
+  checkout.textContent='Finish System Plan';
+  if(planResult){
+    planResult.hidden=false;
+    planResult.scrollIntoView({behavior:'smooth',block:'center'});
+  }
+});
+applyConstraints();show(0,false)
+})();
+</script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body></html>

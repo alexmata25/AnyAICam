@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Restricts the Docker-published WebRTC media port (UDP 8189, MediaMTX) to
+# private-network and Tailscale sources only.
+#
+# Why here and not UFW: Docker-published ports are DNAT'ed and FORWARDed
+# before UFW's INPUT rules ever see them, so a UFW rule cannot restrict
+# them (and UFW is not even enabled on every appliance). DOCKER-USER is the
+# chain Docker itself reserves for exactly this; Docker never flushes it,
+# and if it already exists when dockerd starts, Docker keeps it and jumps
+# to it -- so applying this Before=docker.service leaves no boot-time
+# window where the port is reachable more broadly.
+#
+# Allowed: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918 LAN) and
+# 100.64.0.0/10 (Tailscale). Dropped: everything else, and anything
+# arriving through a wg* tunnel (the cloud WireGuard gateway) even from a
+# private source. Idempotent: `apply` can be re-run safely.
+set -euo pipefail
+PORT="${ANYAICAM_WEBRTC_UDP_PORT:-8189}"
+IPT="${ANYAICAM_IPTABLES:-iptables}"
+CHAIN="ANYAICAM-WEBRTC"
+ALLOWED_SOURCES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10)
+JUMP=(-p udp -m conntrack --ctorigdstport "$PORT" --ctdir ORIGINAL -j "$CHAIN")
+
+apply() {
+    "$IPT" -w -N DOCKER-USER 2>/dev/null || true
+    "$IPT" -w -N "$CHAIN" 2>/dev/null || true
+    "$IPT" -w -F "$CHAIN"
+    "$IPT" -w -A "$CHAIN" -i wg+ -j DROP
+    local net
+    for net in "${ALLOWED_SOURCES[@]}"; do
+        "$IPT" -w -A "$CHAIN" -s "$net" -j RETURN
+    done
+    "$IPT" -w -A "$CHAIN" -j DROP
+    "$IPT" -w -C DOCKER-USER "${JUMP[@]}" 2>/dev/null || "$IPT" -w -I DOCKER-USER 1 "${JUMP[@]}"
+}
+
+check() {
+    "$IPT" -w -C DOCKER-USER "${JUMP[@]}" 2>/dev/null || { echo "missing DOCKER-USER jump for udp/$PORT" >&2; return 1; }
+    "$IPT" -w -C "$CHAIN" -i wg+ -j DROP 2>/dev/null || { echo "missing wg+ drop" >&2; return 1; }
+    local net
+    for net in "${ALLOWED_SOURCES[@]}"; do
+        "$IPT" -w -C "$CHAIN" -s "$net" -j RETURN 2>/dev/null || { echo "missing allow $net" >&2; return 1; }
+    done
+    "$IPT" -w -C "$CHAIN" -j DROP 2>/dev/null || { echo "missing final drop" >&2; return 1; }
+}
+
+case "${1:-apply}" in
+    apply) apply ;;
+    check) check ;;
+    *) echo "usage: $0 apply|check" >&2; exit 2 ;;
+esac

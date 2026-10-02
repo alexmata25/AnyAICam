@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AnyAiCam VMS Support | Edge Appliance, Cameras, Recording & AAC</title>
+<meta name="description" content="Support for AnyAiCam VMS, Edge appliances, camera discovery, recording and storage, customer accounts, analytics, and AAC Face Access.">
+<link rel="icon" href="favicon.png">
+<style>
+:root{
+  --navy:#071032;--navy2:#0b1b48;--ink:#15233d;--muted:#5c6b82;
+  --line:#d9e4f2;--panel:#f4f8fc;--white:#fff;--teal:#23c7d5;--pink:#cc3b96;
+  --green:#177a5d;--amber:#9a6515;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);background:#fff}
+a{color:#0f6981}
+img{max-width:100%}
+.test-banner{background:#0d244e;color:#e9f3ff;text-align:center;padding:.55rem 1rem;font-size:.83rem;font-weight:750}
+.stage-header{position:sticky;top:0;z-index:1000;background:rgba(7,16,50,.98);box-shadow:0 12px 28px rgba(2,8,29,.2)}
+.stage-header-inner{width:min(1240px,100%);margin:auto;padding:.8rem 1rem;display:flex;align-items:center;gap:1.2rem}
+.stage-header img{width:185px;height:auto;display:block}
+.stage-nav{margin-left:auto;display:flex;align-items:center;gap:.2rem;flex-wrap:wrap;justify-content:flex-end}
+.stage-nav a{color:#edf4ff;text-decoration:none;padding:.6rem .7rem;border-radius:8px;font-size:.88rem;font-weight:760}
+.stage-nav a:hover,.stage-nav a:focus-visible,.stage-nav a[aria-current="page"]{background:rgba(255,255,255,.12)}
+.wrap{width:min(1120px,calc(100% - 2rem));margin:0 auto}
+.hero{background:linear-gradient(135deg,#071032,#132a5b 60%,#164b65);color:#fff;padding:5rem 0 4.5rem}
+.hero-grid{display:grid;grid-template-columns:1.35fr .85fr;gap:2.2rem;align-items:center}
+.eyebrow{font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;font-weight:900;color:#6fe4e9}
+.hero h1{font-size:clamp(2.35rem,5vw,4.6rem);line-height:1.02;margin:.55rem 0 1rem}
+.hero p{color:#d7e4fb;font-size:1.08rem;line-height:1.75;max-width:760px}
+.hero-card{background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.18);border-radius:18px;padding:1.4rem}
+.hero-card h2{margin:.1rem 0 .8rem;font-size:1.2rem}
+.hero-card a{display:block;color:#fff;text-decoration:none;padding:.7rem .8rem;border:1px solid rgba(255,255,255,.18);border-radius:10px;margin:.5rem 0;background:rgba(255,255,255,.06);font-weight:780}
+.button-row{display:flex;gap:.7rem;flex-wrap:wrap;margin-top:1.5rem}
+.button{display:inline-flex;align-items:center;justify-content:center;min-height:46px;padding:.78rem 1.05rem;border-radius:999px;text-decoration:none;font-weight:850}
+.button.primary{color:#fff;background:linear-gradient(90deg,var(--pink),var(--teal))}
+.button.light{color:#071032;background:#fff}
+.section{padding:4rem 0}
+.section.alt{background:var(--panel)}
+.section h2{font-size:clamp(1.8rem,3.5vw,2.65rem);margin:.35rem 0 1rem;color:#071032}
+.lead{font-size:1.06rem;line-height:1.75;color:var(--muted);max-width:850px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem;margin-top:1.5rem}
+.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:1.3rem;box-shadow:0 12px 32px rgba(18,45,87,.06)}
+.card h3{margin:.2rem 0 .6rem;color:#071032}
+.card p{color:var(--muted);line-height:1.65;margin:.4rem 0}
+.card a{font-weight:800}
+.icon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;background:#e9f9fb;color:#087787;font-weight:900;margin-bottom:.8rem}
+.notice{border-left:4px solid var(--teal);background:#eefbfd;border-radius:12px;padding:1rem 1.1rem;line-height:1.65}
+.warn{border-left-color:#d19a3a;background:#fff8e9}
+.support-panel{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1.5rem}
+.support-box{border:1px solid var(--line);border-radius:16px;padding:1.35rem;background:#fff}
+.support-box h3{margin:.1rem 0 .7rem;color:#071032}
+.support-box p,.support-box li{color:var(--muted);line-height:1.65}
+.support-box ul{padding-left:1.2rem}
+.contact-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:1.2rem}
+.contact-card{background:#071032;color:#fff;border-radius:18px;padding:1.5rem}
+.contact-card h3{margin-top:0}
+.contact-card a{color:#8be7eb;font-weight:850}
+.contact-card p{color:#d9e5fb;line-height:1.7}
+.aic-unified-footer{background:#071032;color:#dce6ff;padding:3rem 1rem 1.4rem}
+.aic-unified-footer a{color:#dce6ff;text-decoration:none}
+.aic-unified-footer a:hover{text-decoration:underline;color:#68d7df}
+.aic-footer-grid{width:min(1180px,100%);margin:0 auto;display:grid;grid-template-columns:1.35fr 1fr 1fr 1fr;gap:2rem}
+.aic-footer-brand img{display:block;width:min(210px,100%);height:auto;margin-bottom:1rem}
+.aic-footer-brand p{color:#c8d5ee;line-height:1.6}
+.aic-unified-footer h3{color:#fff;font-size:1rem}
+.aic-footer-links{display:grid;gap:.5rem}
+.aic-footer-contact{display:grid;gap:.35rem;font-size:.92rem}
+.aic-footer-bottom{width:min(1180px,100%);margin:2rem auto 0;padding-top:1rem;border-top:1px solid rgba(255,255,255,.13);display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;color:#9fb0cf;font-size:.86rem}
+@media(max-width:900px){
+  .hero-grid,.contact-grid{grid-template-columns:1fr}
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .aic-footer-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:660px){
+  .stage-header-inner{align-items:flex-start;flex-direction:column}
+  .stage-nav{margin-left:0;justify-content:flex-start}
+  .grid,.support-panel,.aic-footer-grid{grid-template-columns:1fr}
+  .hero{padding-top:3.3rem}
+}
+</style>
+<link rel="stylesheet" href="header-standard.css">
+
+<style id="aic-stage-nav-no-underline-final">
+header.stage-header nav.stage-nav a,
+header.stage-header nav.stage-nav a:link,
+header.stage-header nav.stage-nav a:visited,
+header.stage-header nav.stage-nav a:hover,
+header.stage-header nav.stage-nav a:active,
+header.stage-header nav.stage-nav a:focus {
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: 0 !important;
+}
+</style>
+
+</head>
+<body>
+
+
+<header class="stage-header">
+  <div class="stage-header-inner">
+    <a href="index.html" aria-label="ANY AI CAM home"><img src="full-logo-transparent.png" alt="ANY AI CAM"></a>
+    <nav class="stage-nav" aria-label="Primary"><a href="index.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Home</a><a href="vms.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">VMS</a><a href="vms-features.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Features</a><a href="edge-appliance.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Edge Appliance</a><a href="face-access.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">AAC Face Access</a><a href="aac-features.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">AAC Features</a><a href="customer-setup.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Setup</a><a href="hardware.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Hardware</a><a href="build-your-system.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Build System</a><a href="sales-partner-login.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Sales Partners</a><a href="vms-support.html" aria-current="page" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Support</a><a href="vms-contact.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Contact</a></nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="eyebrow">AnyAiCam VMS & AAC Support</div>
+      <h1>Support for your cameras, Edge appliance, recording, AI and access system.</h1>
+      <p>Use this support center for AnyAiCam VMS, the VMS Edge appliance, camera discovery, recording and storage, customer accounts, licensed analytics, and AAC Face Access. Videoloft cloud customers have a separate support path so the two products stay clear.</p>
+      <div class="button-row">
+        <a class="button primary" href="mailto:amata@anyaicam.com?subject=AnyAiCam%20VMS%20Support%20Request">Email VMS Support</a>
+        <a class="button light" href="tel:+13465544699">Call (346) 554-4699</a>
+      </div>
+    </div>
+    <aside class="hero-card">
+      <h2>Quick support links</h2>
+      <a href="customer-setup.html">Edge appliance setup guide</a>
+      <a href="hardware.html#storage-sizing">Recording storage guide</a>
+      <a href="https://app.anyaicam.com/customer-login.html">Customer login</a>
+      <a href="https://app.anyaicam.com/partner.html">Partner login</a>
+      <a href="support.html">Videoloft support</a>
+    </aside>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <div class="eyebrow" style="color:#16778b">Choose the issue</div>
+    <h2>What do you need help with?</h2>
+    <p class="lead">Start with the area that matches the problem. This keeps VMS, hardware, account, analytics and AAC support separate from Videoloft cloud onboarding.</p>
+    <div class="grid">
+      <article class="card"><div class="icon">01</div><h3>Edge appliance setup</h3><p>Activation, network connection, appliance readiness, first-time setup and site commissioning.</p><a href="customer-setup.html">Open setup guide →</a></article>
+      <article class="card"><div class="icon">02</div><h3>Camera discovery & connection</h3><p>Camera discovery, compatible IP cameras, ONVIF/vendor connection, authorized credentials and camera naming.</p><a href="/camera-compatibility-check.html">Check camera readiness →</a></article>
+      <article class="card"><div class="icon">03</div><h3>Recording & storage</h3><p>Retention, storage sizing, recording volume capacity, playback issues and disk-space planning.</p><a href="hardware.html#storage-sizing">See storage guide →</a></article>
+      <article class="card"><div class="icon">04</div><h3>Customer account & remote access</h3><p>Customer login, site access, camera authorization, password setup and portal-access problems.</p><a href="https://app.anyaicam.com/customer-login.html">Customer login →</a></article>
+      <article class="card"><div class="icon">05</div><h3>Analytics & alerts</h3><p>Licensed analytics, camera-specific feature assignment, events, notifications and supported AI workflows.</p><a href="analytics.html">Analytics catalog →</a></article>
+      <article class="card"><div class="icon">06</div><h3>AAC Face Access</h3><p>AI Access Edge, facial recognition workflow, supported access-control integrations and standalone relay mode.</p><a href="face-access.html">AAC Face Access support →</a></article>
+      <article class="card"><div class="icon">07</div><h3>Plans, billing & subscriptions</h3><p>VMS plan questions, analytics subscriptions, camera slots, account billing and order questions.</p><a href="plans.html">Review plans →</a></article>
+      <article class="card"><div class="icon">08</div><h3>Partner support</h3><p>Approved sales partners and integrators can use the partner portal for their VMS/AAC account.</p><a href="https://app.anyaicam.com/partner.html">Partner login →</a></article>
+      <article class="card"><div class="icon">VL</div><h3>Videoloft cloud support</h3><p>Need help with Videoloft activation, adapters or the Videoloft cloud service? Use the separate Videoloft support page.</p><a href="support.html">Go to Videoloft support →</a></article>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <div class="eyebrow" style="color:#16778b">Before contacting support</div>
+    <h2>A few details help us solve the issue faster.</h2>
+    <div class="support-panel">
+      <div class="support-box">
+        <h3>For VMS / camera issues</h3>
+        <ul>
+          <li>Customer or site name.</li>
+          <li>Which camera or cameras are affected.</li>
+          <li>Whether live view, recording, playback or events are affected.</li>
+          <li>Approximate time the problem started.</li>
+          <li>Any error message shown on screen.</li>
+          <li>Whether the Edge appliance is powered and connected to the network.</li>
+        </ul>
+      </div>
+      <div class="support-box">
+        <h3>For AAC Face Access issues</h3>
+        <ul>
+          <li>Site and door/access-point name.</li>
+          <li>Whether the issue is recognition, access decision, provider API or relay operation.</li>
+          <li>Approximate time of the failed event.</li>
+          <li>Whether the AI Access Edge is online.</li>
+          <li>Do not email passwords, API secrets or private access codes.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="notice warn" style="margin-top:1rem">
+      <strong>Camera credentials:</strong> AnyAiCam support does not bypass manufacturer security. If a camera or recorder password is unknown, use the approved manufacturer recovery/reset process. Physical reset, cabling or onsite work may require the customer or a local technician.
+    </div>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <div class="eyebrow" style="color:#16778b">Portal sign-in</div>
+    <h2>Use the correct login page.</h2>
+    <div class="support-panel">
+      <div class="support-box">
+        <h3>Customers</h3>
+        <p>Use the customer portal for normal VMS account access, authorized cameras, recordings, events and subscription features.</p>
+        <p><a href="https://app.anyaicam.com/customer-login.html">app.anyaicam.com/customer-login.html →</a></p>
+      </div>
+      <div class="support-box">
+        <h3>Partners</h3>
+        <p>Approved VMS/AAC sales partners and partner administrators should use the secure partner portal.</p>
+        <p><a href="https://app.anyaicam.com/partner.html">app.anyaicam.com/partner.html →</a></p>
+      </div>
+    </div>
+    <div class="notice" style="margin-top:1rem"><strong>Important:</strong> the local emergency recovery sign-in is not the normal customer or partner portal. Use the links above for day-to-day access.</div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap contact-grid">
+    <div>
+      <div class="eyebrow" style="color:#16778b">Contact AnyAiCam</div>
+      <h2>Need direct VMS support?</h2>
+      <p class="lead">Send a short description of the problem, the site name, affected camera or access point, and any visible error message. Do not send camera passwords, API credentials, payment-card information or private access codes by email.</p>
+      <div class="button-row">
+        <a class="button primary" href="mailto:amata@anyaicam.com?subject=AnyAiCam%20VMS%20Support%20Request">Email VMS Support</a>
+        <a class="button light" style="border:1px solid #b8c7da" href="tel:+13465544699">Call Support</a>
+      </div>
+    </div>
+    <aside class="contact-card">
+      <h3>AnyAiCam VMS Support</h3>
+      <p><strong>Phone</strong><br><a href="tel:+13465544699">(346) 554-4699</a></p>
+      <p><strong>Email</strong><br><a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a></p>
+      <p><strong>Videoloft customer?</strong><br><a href="support.html">Open Videoloft Support</a></p>
+    </aside>
+  </div>
+</section>
+</main>
+
+<footer class="aic-unified-footer">
+  <div class="aic-footer-grid">
+    <div class="aic-footer-brand">
+      <a href="index.html" aria-label="ANY AI CAM home"><img src="full-logo-transparent.png" alt="ANY AI CAM"></a>
+      <p>Local-first video, optional hybrid cloud services, modular AI analytics, and AAC Face Access for compatible security systems.</p>
+      <div class="aic-footer-contact">
+        <a href="tel:+13465544699">(346) 554-4699</a>
+        <a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a>
+      </div>
+    </div>
+    <div>
+      <h3>AnyAiCam VMS</h3>
+      <div class="aic-footer-links">
+        <a href="vms.html">VMS Overview</a>
+        <a href="vms-features.html">VMS Features</a>
+        <a href="edge-appliance.html">Edge Appliance</a>
+        <a href="build-your-system.html">Build Your System</a>
+        <a href="customer-setup.html">Customer Setup</a>
+      </div>
+    </div>
+    <div>
+      <h3>AI Access & Hardware</h3>
+      <div class="aic-footer-links">
+        <a href="face-access.html">AAC Face Access</a>
+        <a href="aaco.html">AACO — AnyAiCam Operator</a>
+        <a href="visitor-call.html">AAC VC — Visitor Call</a>
+        <a href="secure-edge.html">AAC Secure Edge</a>
+        <a href="hardware.html">Hardware Selector</a>
+        <a href="analytics.html">Analytics Catalog</a>
+        <a href="/camera-compatibility-check.html">Camera Readiness</a>
+      </div>
+    </div>
+    <div>
+      <h3>Account & Support</h3>
+      <div class="aic-footer-links">
+        <a href="https://app.anyaicam.com/customer-login.html">Customer Login</a>
+        <a href="https://app.anyaicam.com/partner.html">Partner Login</a>
+        <a href="vms-support.html">AnyAiCam VMS Support</a>
+        <a href="support.html">Videoloft Support</a>
+        <a href="plans.html">Plan Explainer</a>
+      </div>
+    </div>
+  </div>
+  <div class="aic-footer-bottom">
+    <span>© 2026 ANY AI CAM. All rights reserved.</span>
+    <span>VMS support and Videoloft support are separate product support paths.</span>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,187 @@
+/*
+ * ANY AI CAM unified public-page header styling
+ * Reference: current index.html header.
+ *
+ * This file is intentionally NOT linked by index.html.
+ * It standardizes the other public navigation headers without changing
+ * their page-specific navigation links or page content.
+ */
+
+:root {
+  --aic-header-navy: rgba(3, 8, 31, 0.94);
+  --aic-header-cyan: #23c7d5;
+  --aic-header-white: #ffffff;
+  --aic-header-font: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Common visual treatment */
+.site-header,
+.stage-header,
+.top {
+  background: var(--aic-header-navy) !important;
+  color: var(--aic-header-white) !important;
+  border-bottom: 1px solid rgba(255,255,255,.08) !important;
+  box-shadow: 0 12px 28px rgba(2,8,29,.20) !important;
+  font-family: var(--aic-header-font) !important;
+  backdrop-filter: blur(14px);
+}
+
+/* The existing site-header already uses the homepage layout.
+   These rules make alternate VMS/partner header shells use the same scale. */
+.stage-header-inner,
+.topin {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: .85rem max(1rem, calc((100vw - 1120px) / 2)) !important;
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  gap: .75rem !important;
+}
+
+/* Match homepage logo scale on alternate header shells. */
+.stage-header img,
+.top img {
+  display: block !important;
+  width: clamp(14rem, 22vw, 20rem) !important;
+  height: 5.4rem !important;
+  max-height: none !important;
+  object-fit: contain !important;
+}
+
+/* Match homepage navigation typography and color. */
+.site-header .site-nav,
+.stage-header .stage-nav,
+.top .nav {
+  font-family: var(--aic-header-font) !important;
+  font-size: .8rem !important;
+  font-weight: 800 !important;
+}
+
+.stage-header .stage-nav,
+.top .nav {
+  margin-left: auto !important;
+  display: flex !important;
+  flex: 1 1 auto !important;
+  justify-content: center !important;
+  align-items: center !important;
+  gap: clamp(.4rem, 1vw, .75rem) !important;
+  flex-wrap: wrap !important;
+}
+
+.site-header .site-nav a,
+.site-header .site-nav .dropbtn,
+.stage-header .stage-nav a,
+.top .nav a {
+  color: var(--aic-header-white) !important;
+  font-family: var(--aic-header-font) !important;
+  font-size: .8rem !important;
+  font-weight: 800 !important;
+  line-height: 1.25 !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+
+.stage-header .stage-nav a,
+.top .nav a {
+  padding: .4rem .5rem !important;
+  border-radius: 6px !important;
+}
+
+.site-header .site-nav a:hover,
+.site-header .site-nav a:focus-visible,
+.stage-header .stage-nav a:hover,
+.stage-header .stage-nav a:focus-visible,
+.top .nav a:hover,
+.top .nav a:focus-visible {
+  color: var(--aic-header-cyan) !important;
+}
+
+/* Keep active VMS page links readable but do not change typography. */
+.stage-header .stage-nav a[aria-current="page"] {
+  color: var(--aic-header-white) !important;
+  background: rgba(255,255,255,.13) !important;
+}
+
+/* Preserve dropdown contrast on site-header pages. */
+.site-header .dropdown-content a {
+  font-family: var(--aic-header-font) !important;
+  font-size: .8rem !important;
+  font-weight: 800 !important;
+}
+
+/* Mobile scale copied from the homepage header. */
+@media (max-width: 640px) {
+  .stage-header-inner,
+  .topin {
+    padding: .9rem 1rem !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+  }
+
+  .stage-header img,
+  .top img {
+    width: 10.5rem !important;
+    height: 3.25rem !important;
+  }
+
+  .stage-header .stage-nav,
+  .top .nav {
+    flex-basis: 100% !important;
+    width: 100% !important;
+    justify-content: flex-start !important;
+    gap: .2rem !important;
+  }
+
+  .stage-header .stage-nav a,
+  .top .nav a {
+    font-size: .8rem !important;
+    font-weight: 800 !important;
+    padding: .75rem .85rem !important;
+  }
+}
+
+
+.stage-header .stage-nav a,
+.stage-header .stage-nav a:visited,
+.stage-header .stage-nav a:hover,
+.stage-header .stage-nav a:focus {
+  text-decoration: none !important;
+}
+
+
+/* Force VMS/AAC header navigation links to display without underlines. */
+header.stage-header nav.stage-nav a,
+header.stage-header nav.stage-nav a:link,
+header.stage-header nav.stage-nav a:visited,
+header.stage-header nav.stage-nav a:hover,
+header.stage-header nav.stage-nav a:active,
+header.stage-header nav.stage-nav a:focus {
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: 0 !important;
+}
+
+
+/* Videoloft/site-header More dropdown: white menu with readable dark links. */
+.site-header .site-nav .dropdown-content {
+  background: #ffffff !important;
+  border: 1px solid #d9e6f4 !important;
+  box-shadow: 0 10px 28px rgba(7,16,50,.18) !important;
+}
+
+.site-header .site-nav .dropdown-content a,
+.site-header .site-nav .dropdown-content a:link,
+.site-header .site-nav .dropdown-content a:visited {
+  color: #0b2b4f !important;
+  background: #ffffff !important;
+  text-decoration: none !important;
+}
+
+.site-header .site-nav .dropdown-content a:hover,
+.site-header .site-nav .dropdown-content a:focus-visible {
+  color: #071032 !important;
+  background: #eef7fb !important;
+  text-decoration: none !important;
+}
