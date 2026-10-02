@@ -8,6 +8,22 @@ MIN_VCPU=4
 # customer appliances are sized at 16 GiB or more. Keep this floor explicit
 # and independently report/validate the target appliance class before release.
 MIN_RAM_GIB=8
+# /proc/meminfo's MemTotal is always below the installed RAM: firmware,
+# the kernel image and (on some PCs) integrated graphics reserve part of it
+# before Linux counts anything. A PC sold as "8 GB" reports about
+# 7.6-7.9 GiB, so comparing MemTotal to exactly 8 GiB refused every 8 GB
+# machine the customer page says is supported (2026-10-01). The floor stays
+# 8 GB installed; up to 10% may be reserved (MemTotal >= ~7.2 GiB).
+RAM_RESERVED_ALLOWANCE_PERCENT=10
+MEMINFO_PATH="${MEMINFO_PATH:-/proc/meminfo}"
+
+# ram_floor_ok MEMTOTAL_KIB -> exit 0 when the machine meets the floor.
+ram_floor_ok() {
+    local mem_kib="$1"
+    [[ "$mem_kib" =~ ^[0-9]+$ ]] || return 2
+    local min_kib=$(( MIN_RAM_GIB * 1024 * 1024 * (100 - RAM_RESERVED_ALLOWANCE_PERCENT) / 100 ))
+    (( mem_kib >= min_kib ))
+}
 
 preflight_checks() {
     log "Running preflight checks..."
@@ -43,14 +59,13 @@ preflight_checks() {
         echo "[ERROR] Only $vcpu vCPU detected; at least $MIN_VCPU are required." >&2
         exit 1
     fi
-    mem_kib="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)"
-    min_mem_kib=$(( MIN_RAM_GIB * 1024 * 1024 ))
+    mem_kib="$(awk '/^MemTotal:/ { print $2; exit }' "$MEMINFO_PATH")"
     if [[ -z "$mem_kib" || ! "$mem_kib" =~ ^[0-9]+$ ]]; then
-        echo "[ERROR] Could not determine physical RAM from /proc/meminfo." >&2
+        echo "[ERROR] Could not determine physical RAM from $MEMINFO_PATH." >&2
         exit 1
     fi
-    if (( mem_kib < min_mem_kib )); then
-        echo "[ERROR] Less than ${MIN_RAM_GIB} GiB RAM detected; at least ${MIN_RAM_GIB} GiB are required by the installer floor." >&2
+    if ! ram_floor_ok "$mem_kib"; then
+        echo "[ERROR] Only $(( mem_kib / 1024 )) MiB of memory is usable; AnyAiCam needs a PC with at least ${MIN_RAM_GIB} GB of RAM installed (16 GB recommended)." >&2
         exit 1
     fi
 
