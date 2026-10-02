@@ -197,6 +197,15 @@ def _normalize_device_id(device_id: str) -> str:
     return device_id.lower()
 
 
+def _seconds_until(moment: str) -> int:
+    """Seconds left before `moment` on THIS server's clock, so the appliance
+    can say "expires in N minutes" whatever its own clock or time zone."""
+    try:
+        return max(0, int((datetime.fromisoformat(str(moment)) - _now()).total_seconds()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _generate_claim_code() -> str:
     # 8 uppercase hex characters (32 bits) -- short enough to type from
     # a small display, long enough combined with claim_begin_limiter's
@@ -392,6 +401,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 'claim_session_id': resumable['claim_session_id'],
                 'claim_code': claim_code,
                 'expires_at': resumable['expires_at'],
+                'expires_in_seconds': _seconds_until(resumable['expires_at']),
                 'poll_interval_seconds': 5,
                 'resumed': True,
             }
@@ -411,6 +421,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             'claim_session_id': claim_session_id,
             'claim_code': claim_code,
             'expires_at': expires_at,
+            'expires_in_seconds': CLAIM_SESSION_TTL_MINUTES * 60,
             'poll_interval_seconds': 5,
             'resumed': False,
         }
@@ -703,7 +714,8 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           message.textContent='';
           const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim_code:code})}),body=await response.json();
           if(!response.ok){message.textContent=body.detail||'Claim code not found or expired.';return}
-          document.getElementById('claim-device-id').textContent=body.device_id;
+          // A readable name, not the raw device UUID (2026-10-02).
+          document.getElementById('claim-device-id').textContent='AnyAiCam appliance (ID ending '+String(body.device_id||'').replace(/-/g,'').slice(-6).toUpperCase()+')';
           document.getElementById('claim-step-code').hidden=true;
           document.getElementById('claim-step-confirm').hidden=false;
         };

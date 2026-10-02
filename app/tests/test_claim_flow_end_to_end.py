@@ -416,6 +416,15 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         self.assertEqual(self._confirm(code_1)[0], 404)
         self.assertEqual(self._confirm(code_2)[0], 200)
 
+    def test_the_code_comes_with_how_long_it_lasts(self):
+        session = self._begin()
+        self.assertTrue(0 < session['expires_in_seconds'] <= 15 * 60)
+
+    def test_the_claim_page_names_the_appliance_without_its_raw_id(self):
+        source = open(Path(__file__).resolve().parents[1] / 'appliance_claims.py', encoding='utf-8').read()
+        self.assertIn("'AnyAiCam appliance (ID ending '", source)
+        self.assertNotIn("textContent=body.device_id;", source)
+
     def test_only_the_appliance_holding_the_secret_gets_a_new_code(self):
         session = self._begin()
         status, body = _http_post('/api/appliance/claim/begin', {'device_id': self.device_id, 'device_secret': 'x' * 40})

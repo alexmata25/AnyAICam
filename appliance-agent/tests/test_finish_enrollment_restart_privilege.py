@@ -118,3 +118,34 @@ class FinishEnrollmentRestartServiceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FinishEnrollmentWithoutTerminalTests(unittest.TestCase):
+    """Found in the installer E2E (2026-10-02): run without a terminal, the
+    claim completed and then crashed with EOFError at the discovery
+    prompt. It now skips discovery and finishes normally."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = _config(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_terminal_skips_discovery_instead_of_crashing(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with patch.object(setup_wizard, '_queue_privileged_action', return_value=('completed', {}, '')),              patch.object(setup_wizard, 'PortalClient') as portal_client_cls,              patch.object(setup_wizard, 'scan', side_effect=AssertionError('discovery must not run')),              patch('builtins.input', side_effect=EOFError), contextlib.redirect_stdout(out):
+            portal_client_cls.return_value.request.return_value = {}
+            setup_wizard._finish_enrollment(self.config, dict(_ACTIVATION))
+        self.assertIn('Skipping camera discovery', out.getvalue())
+        self.assertIn('Configuration saved securely.', out.getvalue())
+
+
+class ClaimCodeWordingTests(unittest.TestCase):
+    def test_expiry_is_said_in_minutes_never_as_a_raw_timestamp(self):
+        self.assertEqual(setup_wizard._expiry_text({'expires_in_seconds': 900, 'expires_at': '2026-10-02T05:38:58.927850'}),
+                         'This code expires in 15 minutes.')
+        self.assertEqual(setup_wizard._expiry_text({'expires_in_seconds': 50}), 'This code expires in 1 minute.')
+        self.assertEqual(setup_wizard._expiry_text({'expires_at': '2026-10-02T05:38:58.927850'}), 'This code expires in a few minutes.')

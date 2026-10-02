@@ -147,7 +147,12 @@ def _finish_enrollment(config:AgentConfig,activated:dict) -> None:
         if status!='completed': print(f'WARNING: could not queue a VMS restart automatically ({error}); restart the anyaicam-vms container manually to apply the new cloud URL.')
     except OSError as error:
         print(f'WARNING: could not update the VMS environment file ({error}); set ANYAICAM_CLOUD_URL={config.portal_url} in it manually and restart anyaicam-vms.')
-    if input('Run camera discovery now? [Y/n]: ').strip().lower()!='n':
+    try:
+        answer=input('Run camera discovery now? [Y/n]: ')
+    except EOFError:  # no terminal (a script or service): never a traceback after a successful claim
+        answer='n'
+        print('\nSkipping camera discovery here; cameras can be added from the AnyAiCam portal.')
+    if answer.strip().lower()!='n':
         cameras=scan(config.discovery_networks); config.cameras_file.parent.mkdir(parents=True,exist_ok=True); config.cameras_file.write_text(json.dumps(cameras,indent=2),encoding='utf-8'); print(f'Discovered {len(cameras)} compatible endpoints.')
     print('Configuration saved securely.')
     print('AnyAiCam service restarted and authenticated during identity commit.')
@@ -269,11 +274,19 @@ def _open_or_resume_claim(client:PortalClient,config:AgentConfig,device_id:str) 
     return state
 
 
+def _expiry_text(session:dict) -> str:
+    seconds=session.get('expires_in_seconds')
+    if isinstance(seconds,(int,float)) and seconds>0:
+        minutes=max(1,round(seconds/60))
+        return f"This code expires in {minutes} minute{'s' if minutes!=1 else ''}."
+    return 'This code expires in a few minutes.'  # older cloud: never a raw timestamp
+
+
 def _show_claim_code(session:dict) -> None:
     if not session.get('claim_code'):
         return
     print(f"\n  Claim code:  {session['claim_code']}\n", flush=True)
-    print(f"This code expires at {session['expires_at']}.")
+    print(_expiry_text(session))
     print("On another device, sign in to the AnyAiCam customer portal, open 'Claim an appliance', enter this code, choose the site, and confirm.\n", flush=True)
 
 

@@ -657,7 +657,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # partners table definitions) -- nothing more.
             customer_row=row('SELECT id,partner_id,name,company,email,phone,status,trial_status,billing_status FROM customers WHERE id=?',(appliance['customer_id'],))
             site_row=row('SELECT id,customer_id,name,address,site_type FROM sites WHERE id=?',(appliance['site_id'],))
-            partner_row=row('SELECT id,name,approval_status FROM partners WHERE id=?',(appliance['partner_id'],)) if appliance.get('partner_id') else None
+            # The partner the local customers row will reference: the
+            # appliance's own, else the customer's. A claimed (self-
+            # installed) appliance has no partner_id of its own, and its
+            # customer row's partner then had no local parent -- every
+            # edge sync iteration failed on that FOREIGN KEY, so no camera,
+            # rule or security setting ever reached it (installer E2E,
+            # 2026-10-02).
+            identity_partner_id=appliance.get('partner_id') or (customer_row['partner_id'] if customer_row else None)
+            partner_row=row('SELECT id,name,approval_status FROM partners WHERE id=?',(identity_partner_id,)) if identity_partner_id else None
             identity={
                 'customer':dict(customer_row) if customer_row else None,
                 'site':dict(site_row) if site_row else None,
