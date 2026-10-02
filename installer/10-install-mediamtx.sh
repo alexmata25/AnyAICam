@@ -35,6 +35,13 @@ install_mediamtx() {
     # fails loudly below -- those are different failure classes and must
     # not be conflated.
     if [[ ! -f "$MEDIAMTX_PAYLOAD_DIR/mediamtx" ]]; then
+        # 2026-10-01: a release that declares MediaMTX included must carry
+        # it -- a missing payload is a broken artifact, not an optional
+        # skip (Hybrid turns P2P live view on by default).
+        if [[ "${MEDIAMTX_INCLUDED:-}" == "true" ]]; then
+            echo "[ERROR] This release declares MediaMTX included, but its payload is missing -- the installer package is incomplete." >&2
+            return 1
+        fi
         log "MediaMTX not included in this release build -- skipping (P2P live view stays unavailable on this appliance until a release that includes it is installed)."
         return 0
     fi

@@ -116,8 +116,31 @@ ready_endpoint_self_test_ok() {
 # own recorded hash (when the release build actually embedded one) give
 # the same assurance install_mediamtx() itself already relies on, with
 # zero execution risk.
+# The P2P flag the VMS will actually run with (2026-10-01): an explicit
+# ANYAICAM_LIVE_P2P_ENABLED line wins; otherwise Hybrid turns it on by
+# default (app/product_mode.py FLAG_REGISTRY) -- mode resolved the same way
+# current_mode() does: administrative override, then the mode the cloud
+# last sent (product_mode.json), then the installer's bootstrap.
+PRODUCT_MODE_STATE_FILE="${PRODUCT_MODE_STATE_FILE:-/var/lib/anyaicam/vms/data-config/product_mode.json}"
+effective_product_mode() {
+    local mode
+    mode="$(sed -n 's/^ANYAICAM_PRODUCT_MODE=//p' "$VMS_ENV_FILE" 2>/dev/null | head -1)"
+    [[ "$mode" == local || "$mode" == hybrid ]] && { echo "$mode"; return; }
+    mode="$(grep -o '"mode": *"[a-z]*"' "$PRODUCT_MODE_STATE_FILE" 2>/dev/null | grep -o '"[a-z]*"$' | tr -d '"')"
+    [[ "$mode" == local || "$mode" == hybrid ]] && { echo "$mode"; return; }
+    mode="$(sed -n 's/^ANYAICAM_PRODUCT_MODE_BOOTSTRAP=//p' "$VMS_ENV_FILE" 2>/dev/null | head -1)"
+    [[ "$mode" == local || "$mode" == hybrid ]] && { echo "$mode"; return; }
+    echo ""
+}
+p2p_effectively_enabled() {
+    local explicit
+    explicit="$(sed -n 's/^ANYAICAM_LIVE_P2P_ENABLED=//p' "$VMS_ENV_FILE" 2>/dev/null | head -1)"
+    if [[ -n "$explicit" ]]; then [[ "$explicit" == true ]]; return; fi
+    [[ "$(effective_product_mode)" == hybrid ]]
+}
+
 mediamtx_required_and_usable() {
-    grep -q '^ANYAICAM_LIVE_P2P_ENABLED=true$' "$VMS_ENV_FILE" 2>/dev/null || return 0
+    p2p_effectively_enabled || return 0
 
     if [[ ! -f "$MEDIAMTX_BINARY_PATH" ]]; then
         echo "MediaMTX binary missing at $MEDIAMTX_BINARY_PATH while ANYAICAM_LIVE_P2P_ENABLED=true -- P2P live view is broken." >&2

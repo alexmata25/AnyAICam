@@ -645,6 +645,11 @@ echo "== install_mediamtx() =="
 reset_fixture
 assert_exit "no MediaMTX payload in this release -- silent no-op, not a failure" 0 install_mediamtx clean
 assert_exit "nothing gets installed when there is no payload" 1 test -f "$MEDIAMTX_BINARY_PATH"
+# 2026-10-01: a release that DECLARES MediaMTX included must carry it.
+reset_fixture
+MEDIAMTX_INCLUDED=true
+assert_exit "release declares MediaMTX but the payload is missing -> FAIL (incomplete package)" 1 install_mediamtx clean
+MEDIAMTX_INCLUDED=false
 
 # A present-but-corrupt payload (checksum mismatch) is a real build/
 # transfer problem, and MUST fail loudly -- never install a binary that
@@ -759,6 +764,26 @@ cat > "$VMS_RELEASE_MARKER" <<'EOF'
 }
 EOF
 assert_exit "P2P enabled + MediaMTX present but checksum mismatches this release's recorded hash -> FAIL" 1 mediamtx_required_and_usable
+# 17d (2026-10-01): Hybrid turns P2P on by default with NO explicit flag line,
+#      so the binary is required by the EFFECTIVE flag, not just a literal line.
+reset_fixture; mkdir -p "$CONFIG_DIR"; PRODUCT_MODE_STATE_FILE="$CONFIG_DIR/product_mode.json"
+echo "ANYAICAM_PRODUCT_MODE_BOOTSTRAP=hybrid" > "$VMS_ENV_FILE"
+assert_exit "Hybrid bootstrap, no P2P override, MediaMTX missing -> FAIL" 1 mediamtx_required_and_usable
+reset_fixture; mkdir -p "$CONFIG_DIR"; PRODUCT_MODE_STATE_FILE="$CONFIG_DIR/product_mode.json"
+printf "%s
+" ANYAICAM_PRODUCT_MODE_BOOTSTRAP=hybrid ANYAICAM_LIVE_P2P_ENABLED=false > "$VMS_ENV_FILE"
+assert_exit "Hybrid with P2P explicitly off -> pass without MediaMTX" 0 mediamtx_required_and_usable
+reset_fixture; mkdir -p "$CONFIG_DIR"; PRODUCT_MODE_STATE_FILE="$CONFIG_DIR/product_mode.json"
+echo "ANYAICAM_PRODUCT_MODE_BOOTSTRAP=local" > "$VMS_ENV_FILE"
+assert_exit "Local bootstrap, no override -> pass without MediaMTX" 0 mediamtx_required_and_usable
+reset_fixture; mkdir -p "$CONFIG_DIR"; PRODUCT_MODE_STATE_FILE="$CONFIG_DIR/product_mode.json"
+echo "ANYAICAM_PRODUCT_MODE_BOOTSTRAP=local" > "$VMS_ENV_FILE"; echo '{"mode": "hybrid"}' > "$PRODUCT_MODE_STATE_FILE"
+assert_exit "Local bootstrap upgraded to Hybrid by the cloud, MediaMTX missing -> FAIL" 1 mediamtx_required_and_usable
+reset_fixture; mkdir -p "$CONFIG_DIR" "$MEDIAMTX_INSTALL_DIR"; PRODUCT_MODE_STATE_FILE="$CONFIG_DIR/product_mode.json"
+echo "ANYAICAM_PRODUCT_MODE=hybrid" > "$VMS_ENV_FILE"; printf "not the real binary" > "$MEDIAMTX_BINARY_PATH"
+printf '{"vms_release_commit": "x", "mediamtx_included": "true", "mediamtx_sha256": "%s"}
+' 0000000000000000000000000000000000000000000000000000000000000000 > "$VMS_RELEASE_MARKER"
+assert_exit "Hybrid override, no P2P line, binary checksum mismatch -> FAIL" 1 mediamtx_required_and_usable
 
 # 17d. P2P enabled, binary present, checksum matches this release's own
 #      recorded hash exactly -- the genuine, correct, working case.
