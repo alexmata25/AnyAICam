@@ -166,3 +166,53 @@ def test_vms_page_shows_live_and_playback_screenshots():
         assert re.search(r'alt="[^"]{20,}"', tag.group(0)) and 'width="1600"' in tag.group(0), name
         assert (SITE / "app-screens" / name).stat().st_size < 400_000, name
     assert ".app-shot-pair" in text
+
+
+# ---------------------------------------------------------------- VMS screenshot gallery (2026-10-02)
+
+SCREENSHOT_PAGES = {
+    "vms.html": ["vms-smart-alerts-actions", "vms-events-list", "vms-notification-settings"],
+    "analytics.html": ["analytics-smart-motion", "analytics-people-counting", "analytics-detection-rules"],
+    "vms-features.html": ["vms-camera-analytics-settings"],
+}
+
+
+def _webp_size(path):
+    from PIL import Image
+    with Image.open(path) as image:
+        return image.size
+
+
+@pytest.mark.parametrize("page", sorted(SCREENSHOT_PAGES))
+def test_vms_screenshots_are_responsive_described_and_true_to_size(page):
+    """Each screenshot ships a full-size and an 800px file, declares its real
+    dimensions (no stretching, no layout shift), has a descriptive alt, opens
+    full size when clicked, and stays small enough for the web."""
+    text = (SITE / page).read_text(encoding="utf-8", errors="replace")
+    assert 'src="app-screens/app-shot-lightbox.js"' in text and ".app-shot-dialog" in text
+    for name in SCREENSHOT_PAGES[page]:
+        full, small = SITE / "app-screens" / f"{name}.webp", SITE / "app-screens" / f"{name}-800.webp"
+        tag = re.search(r'<img src="app-screens/' + re.escape(name) + r'\.webp"[^>]*>', text)
+        assert tag, name
+        tag = tag.group(0)
+        assert f'srcset="app-screens/{name}-800.webp 800w, app-screens/{name}.webp ' in tag and "sizes=" in tag, name
+        width, height = _webp_size(full)
+        assert f'width="{width}" height="{height}"' in tag, name
+        assert _webp_size(small)[0] == 800, name
+        assert re.search(r'alt="AnyAiCam [^"]{40,}"', tag), name
+        assert f'<a class="app-shot-zoom" href="app-screens/{name}.webp"' in text, name
+        assert full.stat().st_size < 400_000 and small.stat().st_size < 150_000, name
+
+
+def test_screenshot_lightbox_script_is_valid_javascript():
+    if NODE is None:
+        pytest.skip("node not installed")
+    done = _node_check(_text(SITE / "app-screens" / "app-shot-lightbox.js"))
+    assert done.returncode == 0, done.stderr.strip()[:300]
+
+
+def test_raw_screenshot_files_are_never_published():
+    """Only the reviewed, cropped WebP exports belong on the site; the raw
+    captures include browser address bars, account details and other tabs."""
+    raw = [p.name for p in SITE.rglob("*") if re.match(r"(?i)screenshot[ _-]", p.name)]
+    assert not raw, raw
