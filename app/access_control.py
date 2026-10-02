@@ -386,12 +386,38 @@ class AccessControlService:
 
     # -- commands
     def unlock(self, door_id: str, *, duration_seconds: float | None = None, reason: str = "", actor: str = "",
-               trigger: str = "manual", person_id: str | None = None, facial_event_id: str | None = None) -> Outcome:
+               trigger: str = "manual", person_id: str | None = None, facial_event_id: str | None = None,
+               facial_access: dict | None = None) -> Outcome:
         context = {"trigger_type": trigger, "actor": actor, "reason": reason, "person_id": person_id,
                    "facial_event_id": facial_event_id}
         door = self.store.door(door_id)
         if door is None or not door.enabled:
             return self._record(door, door_id, "unlock", Outcome(False, "denied", door_id, "door is not configured or disabled"), **context)
+        is_automatic_face = trigger == "automatic" and actor == "facial_recognition"
+        if is_automatic_face:
+            # This guard is at the shared physical adapter boundary, not in
+            # the mock provider or UI. Other manual/AAC/O workflows keep
+            # their existing authorization paths.
+            import face_access_safety
+            from facial_recognition import FACIAL_DEBOUNCE_SECONDS
+
+            face = facial_access if isinstance(facial_access, dict) else {}
+            evidence_ok = face_access_safety.observation_is_access_approved(face)
+            same_target = (
+                face.get("customer_id") == door.customer_id
+                and face.get("camera_id") == door.camera_id
+                and face.get("person_id") == person_id
+                and face.get("facial_event_id") == facial_event_id
+                and bool(face.get("rule_id"))
+            )
+            if not face_access_safety.physical_face_access_gate_open():
+                return self._record(door, door_id, "unlock", Outcome(False, "denied", door_id, "physical Face Access gate is closed"), **context)
+            if not same_target:
+                return self._record(door, door_id, "unlock", Outcome(False, "denied", door_id, "Face Access authorization context is incomplete or mismatched"), **context)
+            if not evidence_ok:
+                return self._record(door, door_id, "unlock", Outcome(False, "denied", door_id, "recognition engine provenance or quality is not approved"), **context)
+            if face.get("cloud_origin") and face.get("cloud_grant_fresh") is not True:
+                return self._record(door, door_id, "unlock", Outcome(False, "denied", door_id, "cloud Face Access grant is stale"), **context)
         seconds = int(round(duration_seconds)) if duration_seconds else door.unlock_seconds
         seconds = max(1, min(MAX_UNLOCK_SECONDS, seconds))
         context["duration_seconds"] = seconds
@@ -417,6 +443,18 @@ class AccessControlService:
                         False, "uncertain_state", door.id, f"lock state is {state}; automatic unlock refused", state=state), **context)
             if door.dry_run:
                 return self._record(door, door.id, "unlock", Outcome(False, "dry_run", door.id, "dry run: no hardware command sent"), **context)
+            if is_automatic_face:
+                try:
+                    allowed, refusal = face_access_safety.reserve_physical_dispatch(
+                        facial_access,
+                        cooldown_seconds=float(facial_access.get("cooldown_seconds", 0) or 0),
+                        rearm_seconds=max(float(facial_access.get("cooldown_seconds", 0) or 0), FACIAL_DEBOUNCE_SECONDS),
+                        now_epoch=float(self.clock()),
+                    )
+                except Exception:
+                    allowed, refusal = False, "dispatch_state_unavailable"
+                if not allowed:
+                    return self._record(door, door.id, "unlock", Outcome(False, "duplicate" if refusal in {"duplicate_facial_event", "cooldown", "person_still_present", "concurrent_dispatch"} else "denied", door.id, refusal), **context)
             adapter = self.adapters.adapter(door)
             try:
                 self._call(adapter.unlock, seconds)

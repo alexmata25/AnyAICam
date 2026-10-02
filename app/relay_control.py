@@ -71,6 +71,10 @@ class RelayRequest:
     reason: str = ""
     dry_run: bool = True
     requested_by: str = ""
+    # Private in-process evidence for the automatic Face Access dispatch.
+    # Other consumers (manual Unlock/AAC VC/AACO) leave these unset and do
+    # not use the Face Access physical-unlock interlock.
+    facial_access: dict | None = None
 
     def __post_init__(self) -> None:
         if self.channel not in VALID_CHANNELS:
@@ -302,7 +306,8 @@ def reset_provider() -> None:
         _provider = None
 
 
-def build_request(rule: RelayRule, *, reason: str, requested_by: str = "aac_facial_recognition") -> RelayRequest:
+def build_request(rule: RelayRule, *, reason: str, requested_by: str = "aac_facial_recognition",
+                  facial_access: dict | None = None) -> RelayRequest:
     """Turns a matched rule into the RelayRequest a provider is asked to
     fulfil. rule.dry_run flows straight through -- this function never
     upgrades a dry-run rule into a real trigger; only editing the rule
@@ -314,4 +319,5 @@ def build_request(rule: RelayRule, *, reason: str, requested_by: str = "aac_faci
         reason=reason,
         dry_run=rule.dry_run,
         requested_by=requested_by,
+        facial_access=dict(facial_access) if facial_access is not None else None,
     )

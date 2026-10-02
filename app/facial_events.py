@@ -320,6 +320,8 @@ def evaluate_access_rules(
     current_time: str | None = None,
     current_weekday: str | None = None,
     today: str | None = None,
+    access_evidence: dict | None = None,
+    presence_gap_seconds: float | None = None,
 ) -> list[dict]:
     """Loads this customer's enabled facial_rules (scoped to this
     camera or camera-agnostic, i.e. camera_id IS NULL), evaluates each
@@ -367,7 +369,26 @@ def evaluate_access_rules(
             current_weekday=current_weekday,
         ):
             continue
-        request = relay_control.build_request(rule, reason=f"facial_event:{detection_event_id}")
+        origin = row["origin"] if "origin" in row.keys() else "local"
+        cloud_grant_fresh = True
+        if origin == "cloud":
+            import facial_embedding_sync
+            cloud_grant_fresh = facial_embedding_sync.cloud_access_grant_is_fresh(db, customer_id=customer_id)
+        face_context = {
+            **(access_evidence or {}),
+            "customer_id": customer_id,
+            "camera_id": camera_id,
+            "rule_id": rule.id,
+            "person_id": matched_person_id,
+            "facial_event_id": detection_event_id,
+            "cooldown_seconds": float(rule.cooldown_seconds),
+            "presence_gap_seconds": presence_gap_seconds,
+            "cloud_origin": origin == "cloud",
+            "cloud_grant_fresh": cloud_grant_fresh,
+        }
+        request = relay_control.build_request(
+            rule, reason=f"facial_event:{detection_event_id}", facial_access=face_context
+        )
         result = relay_provider.trigger(request)
         outcomes.append(
             {
@@ -380,6 +401,24 @@ def evaluate_access_rules(
             }
         )
     return outcomes
+
+
+def _epoch_seconds(value) -> float:
+    """Normalize event time to UTC epoch seconds for durable presence state."""
+    from datetime import datetime, timezone
+    import time
+
+    if isinstance(value, (int, float)):
+        return float(value)
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return time.time()
 
 
 def record_facial_events(
@@ -416,7 +455,8 @@ def record_facial_events(
     if not _is_entitled(db, camera_id=context["id"]):
         return []
     settings = facial_people.get_settings(db, customer_id=context["customer_id"])
-    observations = facial_recognition.detect_and_embed(person_crop_bgr, engine=engine)
+    active_engine = engine or facial_recognition.get_engine()
+    observations = facial_recognition.detect_and_embed(person_crop_bgr, engine=active_engine)
     if not observations:
         return []
     engine = observations[0].engine
@@ -434,7 +474,17 @@ def record_facial_events(
         )
         if match_state == "unknown" and not settings["unknown_person_events_enabled"]:
             continue
+        presence_gap_seconds = None
         if accepted is not None:
+            # Observe every matched detector frame, including frames whose
+            # event is suppressed by the UI/event debounce. This lets the
+            # physical path distinguish a continuing presence from a new
+            # re-entry, and survives process restarts in the database.
+            import face_access_safety
+            presence_gap_seconds = face_access_safety.note_person_presence(
+                customer_id=context["customer_id"], camera_id=context["id"], person_id=accepted.person_id,
+                now_epoch=_epoch_seconds(now),
+            )
             # A known/watchlist match is debounced by WHO it is -- the
             # correct behavior is suppressing the same enrolled person
             # being re-reported every frame while they linger in view.
@@ -527,10 +577,12 @@ def record_facial_events(
                     # the provider it was given.
                     relay_provider=door_access.CameraDoorProvider(
                         context, relay_provider, person_id=accepted.person_id if accepted else None),
-                    detection_event_id=event["detection_event_id"],
+                    detection_event_id=event["id"],
                     current_time=_hhmm(now),
                     current_weekday=_weekday_and_date(now)[0],
                     today=_weekday_and_date(now)[1],
+                    access_evidence=facial_recognition.access_observation_evidence(observation, active_engine),
+                    presence_gap_seconds=presence_gap_seconds,
                 )
                 event["relay_outcomes"] = outcomes
                 # Persisted separately from the INSERT above (the

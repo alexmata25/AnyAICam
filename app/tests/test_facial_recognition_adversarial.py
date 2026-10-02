@@ -210,6 +210,78 @@ def test_reflected_event_id_in_match_detail_page_is_escaped(client, monkeypatch)
     assert "&lt;img" in response.text
 
 
+@pytest.mark.parametrize("path,method,payload", [
+    ("/api/aac/people", "post", {"customer_id": "cust-1", "display_name": "No license"}),
+    ("/api/aac/people/person-1/images", "post", {"customer_id": "cust-1", "image_base64": "not-decoded"}),
+    ("/api/aac/watchlists", "post", {"customer_id": "cust-1", "name": "No license"}),
+    ("/api/aac/settings?customer_id=cust-1", "get", None),
+    ("/api/aac/events?customer_id=cust-1", "get", None),
+])
+def test_unentitled_customer_cannot_read_or_mutate_face_access_apis(client, db_path, monkeypatch, path, method, payload):
+    monkeypatch.setattr("analytics_entitlements.get_active_analytics_for_customer", lambda customer_id: [])
+    if method == "get":
+        response = client.get(path, cookies=_cookies(_customer_owner_cookie()))
+    else:
+        response = client.post(path, json=payload, cookies=_cookies(_customer_owner_cookie()))
+    assert response.status_code == 403
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            assert db.execute("SELECT COUNT(*) AS n FROM facial_people").fetchone()["n"] == 0
+            assert db.execute("SELECT COUNT(*) AS n FROM facial_embeddings").fetchone()["n"] == 0
+            assert db.execute("SELECT COUNT(*) AS n FROM facial_watchlists").fetchone()["n"] == 0
+
+
+@pytest.mark.parametrize("path", [
+    "/api/aac/watchlists?customer_id=cust-1",
+    "/api/aac/events?customer_id=cust-1",
+])
+def test_backup_only_household_user_cannot_read_general_facial_data(client, db_path, path):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,account_status) VALUES('backup-only','p1','backup@example.test','Backup','customer_viewer','x',1,'cust-1',?,'active')", (NOW,))
+            db.execute("INSERT INTO customer_user_permissions(user_id,customer_id,can_people,can_face_access,can_backup_access,updated_at,updated_by) VALUES('backup-only','cust-1',0,0,1,?,'owner')", (NOW,))
+    token = partner_portal._token("backup@example.test", "customer_viewer", None, "cust-1")
+    response = client.get(path, cookies=_cookies(token))
+    assert response.status_code == 403
+
+
+def test_backup_only_household_user_gets_redacted_person_profile_and_backup_page(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,account_status) VALUES('backup-only','p1','backup@example.test','Backup','customer_viewer','x',1,'cust-1',?,'active')", (NOW,))
+            db.execute("INSERT INTO customer_user_permissions(user_id,customer_id,can_people,can_face_access,can_backup_access,updated_at,updated_by) VALUES('backup-only','cust-1',0,0,1,?,'owner')", (NOW,))
+            from facial_people import enroll_person
+            person_id = enroll_person(db, customer_id="cust-1", display_name="Tenant One", site_id=None,
+                                      external_reference="PRIVATE-REF", notes="PRIVATE-NOTE", created_by="owner", now=NOW)
+    token = partner_portal._token("backup@example.test", "customer_viewer", None, "cust-1")
+    cookies = _cookies(token)
+    response = client.get("/api/aac/people?customer_id=cust-1", cookies=cookies)
+    assert response.status_code == 200
+    profile = response.json()["people"][0]
+    assert set(profile) == {"id", "display_name", "unit", "status"}
+    assert profile["display_name"] == "Tenant One"
+    assert "PRIVATE-REF" not in response.text and "PRIVATE-NOTE" not in response.text
+    detail = client.get(f"/api/aac/people/{person_id}?customer_id=cust-1", cookies=cookies)
+    assert detail.status_code == 200
+    assert set(detail.json()) == {"id", "display_name", "unit", "status"}
+    page = client.get(f"/aac/people/enroll?person_id={person_id}", cookies=cookies)
+    assert page.status_code == 200
+    assert "Backup Access" in page.text
+    assert 'id="b-go"' in page.text
+    assert 'id="a-enabled"' not in page.text and "<h2>Face Access</h2>" not in page.text
+    assert "PRIVATE-REF" not in page.text and "PRIVATE-NOTE" not in page.text
+    assert client.get("/aac/people/enroll", cookies=cookies).status_code == 403
+
+
+def test_cloud_match_detail_explains_local_only_face_preview(client, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
+    response = client.get("/aac/events/event-1", cookies=_cookies(_admin_cookie()))
+    assert response.status_code == 200
+    assert "Face preview is available only on the local appliance." in response.text
+    assert "const CLOUD_RUNTIME=true;" in response.text
+    assert "const preview=e.face_thumbnail_path" in response.text
+
+
 # --------------------------------------------------------------- thumbnail access
 
 

@@ -388,6 +388,36 @@ def detect_and_embed(image_bgr, *, engine: FaceEngine | None = None) -> list[Fac
     return observations
 
 
+def access_observation_evidence(observation: FaceObservation, active_engine: FaceEngine) -> dict:
+    """Return explicit provenance for the physical Face Access boundary.
+
+    Event recognition can use any available engine. Automatic physical
+    authorization is limited to the approved ArcFace model/version and only
+    when the active engine itself reports that same available capability.
+    Quality is validated as finite and positive; no similarity/confidence
+    threshold is introduced here.
+    """
+    from face_access_safety import APPROVED_ACCESS_ENGINE, APPROVED_ACCESS_ENGINE_VERSION
+
+    try:
+        capability = active_engine.capability()
+    except Exception:
+        capability = {}
+    return {
+        "engine": str(getattr(observation, "engine", "") or ""),
+        "engine_version": str(getattr(observation, "engine_version", "") or ""),
+        "active_engine": str(getattr(active_engine, "name", "") or ""),
+        "active_engine_version": str(getattr(active_engine, "version", "") or ""),
+        "engine_available": (
+            isinstance(capability, dict)
+            and capability.get("available") is True
+            and capability.get("engine") == APPROVED_ACCESS_ENGINE
+            and str(capability.get("version") or "") == APPROVED_ACCESS_ENGINE_VERSION
+        ),
+        "quality": getattr(observation, "quality", None),
+    }
+
+
 # --------------------------------------------------------------------------
 # Matching
 # --------------------------------------------------------------------------

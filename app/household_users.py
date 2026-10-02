@@ -207,17 +207,26 @@ def account_permission(identity: dict | None, key: str) -> bool:
 
 def facial_permission_allowed(identity: dict | None, permission: str) -> bool:
     """The household layer on top of the role permission for facial.* routes:
-    a household member sees People only with the People or Face Access grant,
-    and manages Face Access only with the Face Access grant."""
+    a household member sees facial data only with the People or Face Access
+    grant, and manages Face Access only with the Face Access grant. Backup
+    Access has its own narrowly-scoped APIs; it must not grant access to the
+    broader facial events, watchlists, match details, or thumbnails."""
     if not identity or identity.get("role") != "customer_viewer":
         return True
     if permission == "facial.manage":
         return account_permission(identity, "face_access")
     if permission == "facial.view":
-        # Backup Mobile Access lives on the person's People profile, so it
-        # needs to reach People too (backup_access.py).
-        return any(account_permission(identity, key) for key in ("people", "face_access", "backup_access"))
+        return any(account_permission(identity, key) for key in ("people", "face_access"))
     return True
+
+
+def facial_profile_allowed(identity: dict | None) -> bool:
+    """A Backup-Access-only member may open the redacted person profile
+    needed to use the separate Backup Access endpoints. This is not a
+    grant to facial.view routes such as match events or watchlists."""
+    if not identity or identity.get("role") != "customer_viewer":
+        return True
+    return any(account_permission(identity, key) for key in ("people", "face_access", "backup_access"))
 
 
 def unlockable_door_ids(identity: dict) -> set[str] | None:

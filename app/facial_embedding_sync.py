@@ -52,7 +52,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from database_backend import connect
@@ -144,7 +144,45 @@ def _control_plane_get(path: str) -> dict | None:
         return None
 
 
-def _replace_local_directory(customer_id: str, directory: dict) -> dict:
+FACE_ACCESS_GRANT_MAX_AGE_SECONDS = 15 * 60
+
+
+def _record_authoritative_sync(db, customer_id: str, directory_version: str | None, now_epoch: float | None = None) -> None:
+    """Persist the successful, authenticated directory refresh used to
+    validate cloud-origin physical Face Access grants. This is separate from
+    the in-memory conditional-sync cache so a restart cannot revive an old
+    authorization snapshot."""
+    synced_at = float(time.time() if now_epoch is None else now_epoch)
+    db.execute(
+        "INSERT INTO facial_access_sync_state(customer_id,last_success_at,directory_version,updated_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(customer_id) DO UPDATE SET last_success_at=excluded.last_success_at, "
+        "directory_version=excluded.directory_version,updated_at=excluded.updated_at",
+        (customer_id, synced_at, directory_version, datetime.now(timezone.utc).isoformat()),
+    )
+
+
+def cloud_access_grant_is_fresh(db, *, customer_id: str, now_epoch: float | None = None) -> bool:
+    """Fail closed unless this tenant's authoritative cloud grant snapshot
+    succeeded within the approved 15-minute maximum. Local-origin grants do
+    not call this helper and remain independent of cloud availability."""
+    try:
+        row = db.execute(
+            "SELECT last_success_at FROM facial_access_sync_state WHERE customer_id=?",
+            (customer_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        synced_at = float(row["last_success_at"])
+        now = float(time.time() if now_epoch is None else now_epoch)
+        age = now - synced_at
+        return 0.0 <= age <= FACE_ACCESS_GRANT_MAX_AGE_SECONDS
+    except Exception:
+        # Missing schema/state, corrupt timestamps, or database errors are
+        # authorization failures, never permission to use stale grants.
+        return False
+
+
+def _replace_local_directory(customer_id: str, directory: dict, *, now_epoch: float | None = None) -> dict:
     """The one write path: replaces this customer_id's local
     facial_people/facial_embeddings/facial_watchlists/
     facial_watchlist_members rows with the given snapshot, inside one
@@ -155,7 +193,9 @@ def _replace_local_directory(customer_id: str, directory: dict) -> dict:
     watchlists = [item for item in directory.get("watchlists", []) if isinstance(item, dict)]
     memberships = [item for item in directory.get("watchlist_members", []) if isinstance(item, dict)]
     door_grants = [item for item in directory.get("door_grants", []) if isinstance(item, dict)]
-    now = datetime.now().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    synced_at = float(time.time() if now_epoch is None else now_epoch)
+    version = str(directory.get("directory_version") or "").strip() or None
     with connect() as db:
         # Children before parents, matching the schema's own FK
         # dependency order -- see db_migrations.py's facial_* block.
@@ -221,6 +261,7 @@ def _replace_local_directory(customer_id: str, directory: dict) -> dict:
                     grant.get("created_at", now), grant.get("updated_at", now),
                 ),
             )
+        _record_authoritative_sync(db, customer_id, version, synced_at)
     return {"people": len(people), "embeddings": len(embeddings), "watchlists": len(watchlists),
             "watchlist_members": len(memberships), "door_grants": len(door_grants)}
 
@@ -255,14 +296,18 @@ def sync_facial_directory() -> dict:
         if conditional and customer_id == applied["customer_id"] and response.get("directory_version") == applied["version"]:
             # Local tables already hold exactly this snapshot -- no data
             # transferred, nothing rewritten, recognition keeps running.
+            # It is still a successful authenticated authoritative check and
+            # refreshes the durable grant-validity window.
+            with connect() as db:
+                _record_authoritative_sync(db, customer_id, applied["version"])
             return {"status": "unchanged"}
         # An "unchanged" reply that doesn't match what this process applied
         # (e.g. the appliance was re-assigned to a different customer)
         # can't be trusted -- drop the version so the next sync is full.
         reset_sync_state()
         return {"status": "fetch_failed"}
-    summary = _replace_local_directory(customer_id, response)
     version = str(response.get("directory_version") or "").strip() or None
+    summary = _replace_local_directory(customer_id, response)
     with _state_lock:
         # An older cloud sends no directory_version: stay unconditional.
         _applied_directory.update(customer_id=customer_id, version=version, applied_at=time.monotonic() if version else None)

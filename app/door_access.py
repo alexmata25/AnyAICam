@@ -95,7 +95,7 @@ def record_door_access_event(
 
 def trigger_door(camera: dict, *, reason: str, actor: str, trigger_type: str, pulse_ms: int | None = None,
                  dry_run: bool = False, facial_event_id: str | None = None,
-                 person_id: str | None = None) -> relay_control.RelayResult:
+                 person_id: str | None = None, facial_access: dict | None = None) -> relay_control.RelayResult:
     """The one physical dispatch for every door consumer (the Unlock
     button, AACO, AAC Voice Call, facial access rules), 2026-09-25.
 
@@ -113,17 +113,45 @@ def trigger_door(camera: dict, *, reason: str, actor: str, trigger_type: str, pu
     service = access_control.get_service()
     door = service.door_for_camera(camera["id"]) if service is not None else None
     if door is None:
+        provider = relay_control.get_provider()
+        is_automatic_face = trigger_type == "automatic" and actor == "facial_recognition"
+        if is_automatic_face and not dry_run and provider.capability().get("hardware_connected"):
+            import face_access_safety
+            from facial_recognition import FACIAL_DEBOUNCE_SECONDS
+            face = facial_access if isinstance(facial_access, dict) else {}
+            if not face_access_safety.physical_face_access_gate_open() or not face_access_safety.observation_is_access_approved(face):
+                return relay_control.RelayResult(channel=camera.get("door_relay_channel") or 0, activated=False,
+                                                 dry_run=False, suppressed_reason="physical_face_access_denied")
+            if (face.get("customer_id") != camera.get("customer_id") or face.get("camera_id") != camera.get("id")
+                    or face.get("person_id") != person_id or face.get("facial_event_id") != facial_event_id
+                    or not face.get("rule_id")):
+                return relay_control.RelayResult(channel=camera.get("door_relay_channel") or 0, activated=False,
+                                                 dry_run=False, suppressed_reason="face_access_context_mismatch")
+            if face.get("cloud_origin") and face.get("cloud_grant_fresh") is not True:
+                return relay_control.RelayResult(channel=camera.get("door_relay_channel") or 0, activated=False,
+                                                 dry_run=False, suppressed_reason="cloud_grant_stale")
+            try:
+                allowed, refusal = face_access_safety.reserve_physical_dispatch(
+                    face, cooldown_seconds=float(face.get("cooldown_seconds", 0) or 0),
+                    rearm_seconds=max(float(face.get("cooldown_seconds", 0) or 0), FACIAL_DEBOUNCE_SECONDS),
+                )
+            except Exception:
+                allowed, refusal = False, "dispatch_state_unavailable"
+            if not allowed:
+                return relay_control.RelayResult(channel=camera.get("door_relay_channel") or 0, activated=False,
+                                                 dry_run=False, suppressed_reason=refusal)
         request_obj = relay_control.RelayRequest(
             channel=camera["door_relay_channel"],
             pulse_ms=pulse_ms or camera.get("door_relay_pulse_ms") or relay_control.DEFAULT_PULSE_MS,
-            reason=reason, dry_run=dry_run, requested_by=actor,
+            reason=reason, dry_run=dry_run, requested_by=actor, facial_access=facial_access,
         )
-        return relay_control.get_provider().trigger(request_obj)
+        return provider.trigger(request_obj)
     channel = camera.get("door_relay_channel") or 0
     if dry_run:
         return relay_control.RelayResult(channel=channel, activated=False, dry_run=True)
     outcome = service.unlock(door.id, duration_seconds=(pulse_ms / 1000.0) if pulse_ms else None, reason=reason,
-                             actor=actor, trigger=trigger_type, person_id=person_id, facial_event_id=facial_event_id)
+                             actor=actor, trigger=trigger_type, person_id=person_id, facial_event_id=facial_event_id,
+                             facial_access=facial_access)
     if outcome.ok:
         return relay_control.RelayResult(channel=channel, activated=True, dry_run=False)
     # "duplicate" keeps the existing "just unlocked, wait a moment" message.
@@ -150,12 +178,16 @@ class CameraDoorProvider(relay_control.RelayProvider):
         import access_control
         service = access_control.get_service()
         if service is None or service.door_for_camera(self.camera["id"]) is None:
-            return self.base.trigger(request)
+            # The in-process mock remains available for development/event
+            # simulation. Any future hardware-backed base provider must go
+            # through trigger_door's production Face Access interlock.
+            if not self.base.capability().get("hardware_connected"):
+                return self.base.trigger(request)
         reason = request.reason or ""
         facial_event_id = reason.split(":", 1)[1] if reason.startswith("facial_event:") else None
         return trigger_door(self.camera, reason=reason, actor="facial_recognition", trigger_type="automatic",
                             pulse_ms=request.pulse_ms, dry_run=request.dry_run, facial_event_id=facial_event_id,
-                            person_id=self.person_id)
+                            person_id=self.person_id, facial_access=request.facial_access)
 
 
 class DoorNotReachable(Exception):

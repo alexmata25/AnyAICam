@@ -1233,6 +1233,45 @@ CREATE INDEX IF NOT EXISTS idx_subscription_payments_subscription ON subscriptio
 CREATE TABLE IF NOT EXISTS commission_ledger(id TEXT PRIMARY KEY, kind TEXT NOT NULL, source_ref TEXT NOT NULL, salesperson_user_id TEXT NOT NULL, partner_id TEXT, customer_id TEXT NOT NULL, stripe_subscription_id TEXT, stripe_invoice_id TEXT, hardware_order_id TEXT, plan_type TEXT, camera_slot_tier INTEGER, paid_month_index INTEGER, basis_cents INTEGER NOT NULL DEFAULT 0, original_amount_cents INTEGER NOT NULL, amount_cents INTEGER NOT NULL, status TEXT NOT NULL, friends_family INTEGER NOT NULL DEFAULT 0, earned_at TEXT NOT NULL, reversed_at TEXT, reversal_reason TEXT, UNIQUE(kind, source_ref));
 CREATE INDEX IF NOT EXISTS idx_commission_ledger_salesperson ON commission_ledger(salesperson_user_id, earned_at);
 '''),
+    # Face Access physical-dispatch safety (2026-10-02): a cloud directory
+    # snapshot is authoritative only for 15 minutes, and physical dispatch
+    # replay/cooldown state must survive appliance and process restarts.
+    # All state is additive and tenant-keyed; timestamps are UTC epoch
+    # seconds so freshness/cooldown comparisons are unambiguous.
+    ('20261002_facial_access_physical_safety','''
+CREATE TABLE IF NOT EXISTS facial_access_sync_state(
+    customer_id TEXT PRIMARY KEY,
+    last_success_at REAL NOT NULL,
+    directory_version TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS facial_access_presence(
+    customer_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    last_seen_at REAL NOT NULL,
+    PRIMARY KEY(customer_id,camera_id,person_id)
+);
+CREATE TABLE IF NOT EXISTS facial_access_dispatches(
+    customer_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    facial_event_id TEXT NOT NULL UNIQUE,
+    reserved_at REAL NOT NULL,
+    PRIMARY KEY(customer_id,camera_id,rule_id,person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_facial_access_dispatches_event ON facial_access_dispatches(facial_event_id);
+CREATE TABLE IF NOT EXISTS facial_access_dispatch_events(
+    facial_event_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    attempted_at REAL NOT NULL,
+    result TEXT NOT NULL
+);
+'''),
 ]
 
 
