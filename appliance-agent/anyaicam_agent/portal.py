@@ -64,9 +64,11 @@ class PortalClient:
     # interactive wizard (the only current call site pattern to follow)
     # to actually use this flow is explicitly deferred to a later phase,
     # so there is no logging call site to get wrong in this one.
-    def claim_begin(self,device_id): return self.request('POST','/api/appliance/claim/begin',{'device_id':device_id},authenticated=False)
-    def claim_status(self,claim_session_id): return self.request('POST','/api/appliance/claim/status',{'claim_session_id':claim_session_id},authenticated=False)
-    def claim_complete(self,claim_session_id,claim_proof): return self.request('POST','/api/appliance/claim/complete',{'claim_session_id':claim_session_id,'claim_proof':claim_proof},authenticated=False)
+    # device_secret (2026-10-01 security fix): proves this is the appliance
+    # that opened the claim; the cloud refuses resume/status/complete without it.
+    def claim_begin(self,device_id,device_secret): return self.request('POST','/api/appliance/claim/begin',{'device_id':device_id,'device_secret':device_secret},authenticated=False)
+    def claim_status(self,claim_session_id,device_secret): return self.request('POST','/api/appliance/claim/status',{'claim_session_id':claim_session_id,'device_secret':device_secret},authenticated=False)
+    def claim_complete(self,claim_session_id,claim_proof,device_secret): return self.request('POST','/api/appliance/claim/complete',{'claim_session_id':claim_session_id,'claim_proof':claim_proof,'device_secret':device_secret},authenticated=False)
     # WireGuard direct remote connectivity (docs/wireguard-remote-
     # connectivity-plan.md Sec 5): authenticated -- reuses the same
     # bearer+nonce channel every other appliance route already uses,

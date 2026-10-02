@@ -26,6 +26,8 @@ def test_appliance_claims_table_and_indexes_are_created(tmp_path):
         # claim_proof_plaintext (above) is kept in the schema, never
         # dropped, but new code never writes to it again.
         "claim_proof_encrypted", "completed_credential_encrypted", "credential_recovery_expires_at",
+        # Device possession (2026-10-01 security fix).
+        "device_secret_hash",
     }
     assert "idx_appliance_claims_device_id" in indexes
     assert "idx_appliance_claims_status" in indexes

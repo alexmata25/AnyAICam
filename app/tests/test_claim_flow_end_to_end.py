@@ -94,6 +94,10 @@ from anyaicam_agent.portal import PortalClient  # noqa: E402
 appliance_activation.ACTIVATION_IDENTITY_FILE = Path(tempfile.gettempdir()) / 'anyaicam-claim-e2e-identity-unused.json'
 
 
+
+# Possession secret of the claiming appliance (2026-10-01 security fix).
+DEVICE_SECRET = "test-device-secret-0123456789abcdef0123456789"
+
 def _shell_stub(title, icon, content, scripts=''):
     return f'<html><head><title>{title}</title></head><body>{content}{scripts}</body></html>'
 
@@ -229,9 +233,18 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         # exactly as a technician reading it off the appliance's
         # terminal would, and used for the "customer" side of every
         # scenario below.
-        status, body = _http_post('/api/appliance/claim/begin', {'device_id': device_id or self.device_id})
+        status, body = _http_post('/api/appliance/claim/begin', {'device_secret': DEVICE_SECRET, 'device_id': device_id or self.device_id})
         self.assertEqual(status, 200, body)
         return body
+
+    def _same_device_state(self, config, session):
+        """What THIS appliance saved when it opened the claim (2026-10-01
+        security fix): only the device holding the claim's secret, for this
+        portal, may resume it -- a UUID alone no longer returns the session."""
+        from anyaicam_agent.config import save_claim_state
+        save_claim_state(config, {'device_id': self.device_id, 'claim_session_id': session['claim_session_id'],
+                                  'device_secret': DEVICE_SECRET, 'portal_origin': setup_wizard.portal_origin(config.portal_url),
+                                  'opened_at': '2026-10-01T00:00:00'})
 
     def _confirm(self, claim_code, site_id=None, cookie=None):
         return _http_post('/api/portal/claims/confirm', {'claim_code': claim_code, 'site_id': site_id or self.site_id}, cookie=cookie or self.cookie)
@@ -240,6 +253,7 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
     def test_full_workflow_reaches_authenticate_appliance_success(self):
         session = self._begin()
         config = self._agent_config()
+        self._same_device_state(config, session)
         client = PortalClient(config.portal_url)
         info = client.test()
         self.assertIn('mode', info)
@@ -336,7 +350,7 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         with connection() as db:
             db.execute("UPDATE appliance_claims SET proof_expires_at=? WHERE claim_session_id=?", ('2020-01-01T00:00:00', session['claim_session_id']))
 
-        status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+        status, status_body = _http_post('/api/appliance/claim/status', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id']})
 
         self.assertEqual(status_body, {'status': 'expired'})
         with connection() as db:
@@ -350,6 +364,7 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         # state, then is discarded (standing in for a crash/reboot
         # before completion).
         config_a = self._agent_config()
+        self._same_device_state(config_a, session)
         client_a = PortalClient(config_a.portal_url)
         state_a = setup_wizard._open_or_resume_claim(client_a, config_a, self.device_id)
 
@@ -377,7 +392,7 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         self.assertEqual(status, 200)
         config = self._agent_config()
         client = PortalClient(config.portal_url)
-        state = {'device_id': self.device_id, 'claim_session_id': session['claim_session_id']}
+        state = {'device_id': self.device_id, 'claim_session_id': session['claim_session_id'], 'device_secret': DEVICE_SECRET}
         setup_wizard._wait_for_claim_proof(client, config, state, sleep_fn=lambda _: None)
 
         first = setup_wizard._complete_claim_with_retry(client, config, state, sleep_fn=lambda _: None)
@@ -406,14 +421,14 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         session = self._begin()
         status, _ = self._confirm(session['claim_code'])
         self.assertEqual(status, 200)
-        status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+        status, status_body = _http_post('/api/appliance/claim/status', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id']})
         claim_proof = status_body['claim_proof']
 
         results = []
         lock = threading.Lock()
 
         def worker():
-            r = _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': claim_proof})
+            r = _http_post('/api/appliance/claim/complete', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id'], 'claim_proof': claim_proof})
             with lock:
                 results.append(r)
 
@@ -477,11 +492,11 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         session = self._begin()
         status, _ = self._confirm(session['claim_code'])
         self.assertEqual(status, 200)
-        status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+        status, status_body = _http_post('/api/appliance/claim/status', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id']})
         claim_proof = status_body['claim_proof']
 
         with patch.dict(os.environ, {'ANYAICAM_RUNTIME_ROLE': 'cloud'}):
-            status, body = _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': claim_proof})
+            status, body = _http_post('/api/appliance/claim/complete', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id'], 'claim_proof': claim_proof})
 
         self.assertEqual(status, 200, body)
         self.assertEqual(body['cloud_id'], self.device_id.upper())
@@ -501,9 +516,9 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
             session = self._begin(device_id)
             status, _ = self._confirm(session['claim_code'], site_id=site_id)
             self.assertEqual(status, 200)
-            status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+            status, status_body = _http_post('/api/appliance/claim/status', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id']})
             with patch.dict(os.environ, {'ANYAICAM_RUNTIME_ROLE': 'cloud'}):
-                status, body = _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': status_body['claim_proof']})
+                status, body = _http_post('/api/appliance/claim/complete', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id'], 'claim_proof': status_body['claim_proof']})
             self.assertEqual(status, 200, body)
             return body
 
@@ -535,9 +550,9 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         def _claim(device_id, site_id):
             session = self._begin(device_id)
             self._confirm(session['claim_code'], site_id=site_id)
-            status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+            status, status_body = _http_post('/api/appliance/claim/status', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id']})
             with patch.dict(os.environ, {'ANYAICAM_RUNTIME_ROLE': 'edge'}):
-                return _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': status_body['claim_proof']})
+                return _http_post('/api/appliance/claim/complete', {'device_secret': DEVICE_SECRET, 'claim_session_id': session['claim_session_id'], 'claim_proof': status_body['claim_proof']})
 
         status_a, body_a = _claim(device_a, self.site_id)
         self.assertEqual(status_a, 200, body_a)

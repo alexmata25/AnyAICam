@@ -1573,6 +1573,10 @@ def apply_migrations():
             ('claim_proof_encrypted','TEXT'),
             ('completed_credential_encrypted','TEXT'),
             ('credential_recovery_expires_at','TEXT'),
+            # Device possession (2026-10-01 security fix): hash of a random
+            # secret only the claiming appliance holds; resume, status and
+            # complete all require it (appliance_claims.py).
+            ('device_secret_hash','TEXT'),
         ):
             if name not in claim_columns: db.execute(f'ALTER TABLE appliance_claims ADD COLUMN {name} {definition}')
 

@@ -206,6 +206,29 @@ def _generate_claim_code() -> str:
     return secrets.token_hex(4).upper()
 
 
+DEVICE_SECRET_MIN_LENGTH = 32
+
+
+def _device_secret(payload: dict) -> str:
+    """The claiming appliance's possession secret (2026-10-01 security fix).
+
+    claim_begin() used to hand an existing pending claim's claim_session_id
+    to anyone presenting the device's UUID, and claim_status()/
+    claim_complete() trusted that session id alone -- so whoever learned a
+    device UUID could poll the owner-confirmed proof and take the permanent
+    appliance credential. The appliance now generates a random secret per
+    claim and keeps it in its own 0600 claim-state file; the cloud stores
+    only its hash, and resume, status and complete all require it."""
+    secret = str(payload.get('device_secret', '') or '')
+    if len(secret) < DEVICE_SECRET_MIN_LENGTH or len(secret) > 256:
+        raise HTTPException(status_code=400, detail='device_secret is required (update the AnyAiCam agent).')
+    return secret
+
+
+def _possesses(claim: dict, secret: str) -> bool:
+    return bool(claim.get('device_secret_hash')) and verify_password(secret, claim['device_secret_hash'])
+
+
 def _find_pending_claim_for_device(device_id: str) -> dict | None:
     now_text = _now().isoformat()
     candidates = rows(
@@ -345,11 +368,16 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         if not _valid_device_id(device_id):
             raise HTTPException(status_code=400, detail='device_id must be a valid UUIDv4.')
         device_id = _normalize_device_id(device_id)
+        device_secret = _device_secret(payload)
         existing_appliance = row('SELECT id FROM appliances WHERE cloud_id=?', (device_id.upper(),))
         if existing_appliance:
             raise HTTPException(status_code=409, detail='This device is already provisioned. Use the existing activation flow.')
         resumable = _find_pending_claim_for_device(device_id)
         if resumable:
+            # Only the appliance that opened this claim may resume it: a
+            # UUID alone never returns the session.
+            if not _possesses(resumable, device_secret):
+                raise HTTPException(status_code=409, detail='A claim is already in progress for this device.')
             return {
                 'claim_session_id': resumable['claim_session_id'],
                 'claim_code': None,
@@ -364,10 +392,11 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         expires_at = (now + timedelta(minutes=CLAIM_SESSION_TTL_MINUTES)).isoformat()
         with connection() as db:
             db.execute(
-                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at) VALUES(?,?,?,?,?,?,?)',
-                (claim_id, device_id, claim_session_id, password_hash(claim_code), 'pending', expires_at, now.isoformat()),
+                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash) VALUES(?,?,?,?,?,?,?,?)',
+                (claim_id, device_id, claim_session_id, password_hash(claim_code), 'pending', expires_at, now.isoformat(), password_hash(device_secret)),
             )
-        logger.info('Claim session opened device_id=%s claim_session_id=%s', device_id, claim_session_id)
+        # Never log the session id: it is a bearer value for this claim.
+        logger.info('Claim session opened claim_id=%s', claim_id)
         return {
             'claim_session_id': claim_session_id,
             'claim_code': claim_code,
@@ -384,8 +413,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         claim_session_id = str(payload.get('claim_session_id', '')).strip()
         if not claim_session_id:
             raise HTTPException(status_code=400, detail='claim_session_id is required.')
+        device_secret = _device_secret(payload)
         claim = row('SELECT * FROM appliance_claims WHERE claim_session_id=?', (claim_session_id,))
-        if not claim:
+        if not claim or not _possesses(claim, device_secret):  # same answer as an unknown session
             # Same generic response as an expired/unknown session --
             # never lets a caller distinguish "wrong id" from "expired"
             # (avoids a session-id enumeration oracle).
@@ -491,7 +521,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         # every other single-use hashed secret in this codebase is
         # bounded.
         audit(identity, 'appliance_claim.confirmed', 'appliance_claim', claim['id'])
-        logger.info('Claim confirmed claim_session_id=%s customer_id=%s site_id=%s', claim['claim_session_id'], identity['customer_id'], site_id)
+        logger.info('Claim confirmed claim_id=%s customer_id=%s site_id=%s', claim['id'], identity['customer_id'], site_id)
         return {'status': 'claimed', 'device_id': claim['device_id']}
 
     @app.post('/api/appliance/claim/complete')
@@ -503,8 +533,10 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         claim_proof = str(payload.get('claim_proof', '')).strip()
         if not claim_session_id or not claim_proof:
             raise HTTPException(status_code=400, detail='claim_session_id and claim_proof are required.')
+        device_secret = _device_secret(payload)
         claim = row('SELECT * FROM appliance_claims WHERE claim_session_id=?', (claim_session_id,))
-        if not claim or not claim.get('claim_proof_hash') or not verify_password(claim_proof, claim['claim_proof_hash']):
+        if (not claim or not _possesses(claim, device_secret) or not claim.get('claim_proof_hash')
+                or not verify_password(claim_proof, claim['claim_proof_hash'])):
             raise HTTPException(status_code=403, detail='Claim is not ready to be completed.')
         if claim['status'] == 'completed':
             # Retry-safety path (hardening item 3): the proof already

@@ -48,14 +48,14 @@ def _mock_response(payload: dict):
 def test_claim_begin_posts_device_id_unauthenticated():
     client = _client()
     with patch("urllib.request.urlopen", return_value=_mock_response({"claim_session_id": "sess-1", "claim_code": "ABCD1234"})) as urlopen:
-        result = client.claim_begin("AIC-DEVICE-0001")
+        result = client.claim_begin("AIC-DEVICE-0001", "secret-0123456789abcdef0123456789abcdef")
 
     assert result == {"claim_session_id": "sess-1", "claim_code": "ABCD1234"}
     request = urlopen.call_args[0][0]
     assert request.full_url == "https://portal.example.test/api/appliance/claim/begin"
     assert request.get_header("Authorization") is None
     body = json.loads(request.data.decode())
-    assert body == {"device_id": "AIC-DEVICE-0001"}
+    assert body == {"device_id": "AIC-DEVICE-0001", "device_secret": "secret-0123456789abcdef0123456789abcdef"}
 
 
 def test_claim_begin_raises_portal_error_with_status_code_on_http_error():
@@ -65,7 +65,7 @@ def test_claim_begin_raises_portal_error_with_status_code_on_http_error():
     http_error.read = lambda: error_body
     with patch("urllib.request.urlopen", side_effect=http_error):
         try:
-            client.claim_begin("AIC-DEVICE-0001")
+            client.claim_begin("AIC-DEVICE-0001", "secret-0123456789abcdef0123456789abcdef")
             assert False, "expected PortalError"
         except PortalError as error:
             assert error.status_code == 429
@@ -78,7 +78,7 @@ def test_claim_begin_raises_portal_error_with_status_code_on_http_error():
 def test_claim_status_posts_claim_session_id_not_as_a_url_param():
     client = _client()
     with patch("urllib.request.urlopen", return_value=_mock_response({"status": "pending"})) as urlopen:
-        result = client.claim_status("sess-1")
+        result = client.claim_status("sess-1", "secret-0123456789abcdef0123456789abcdef")
 
     assert result == {"status": "pending"}
     request = urlopen.call_args[0][0]
@@ -86,13 +86,13 @@ def test_claim_status_posts_claim_session_id_not_as_a_url_param():
     # param, is that claim_session_id never appears in a URL (see
     # appliance_claims.py's own comment on why) -- assert that directly.
     assert "sess-1" not in request.full_url
-    assert json.loads(request.data.decode()) == {"claim_session_id": "sess-1"}
+    assert json.loads(request.data.decode()) == {"claim_session_id": "sess-1", "device_secret": "secret-0123456789abcdef0123456789abcdef"}
 
 
 def test_claim_status_returns_proof_when_present():
     client = _client()
     with patch("urllib.request.urlopen", return_value=_mock_response({"status": "claimed", "claim_proof": "proof-value"})):
-        result = client.claim_status("sess-1")
+        result = client.claim_status("sess-1", "secret-0123456789abcdef0123456789abcdef")
 
     assert result["claim_proof"] == "proof-value"
 
@@ -103,13 +103,13 @@ def test_claim_status_returns_proof_when_present():
 def test_claim_complete_posts_session_and_proof_not_in_url():
     client = _client()
     with patch("urllib.request.urlopen", return_value=_mock_response({"appliance_id": "appl-1", "cloud_id": "AIC-DEVICE-0001", "credential": "cred-value"})) as urlopen:
-        result = client.claim_complete("sess-1", "proof-value")
+        result = client.claim_complete("sess-1", "proof-value", "secret-0123456789abcdef0123456789abcdef")
 
     assert result["credential"] == "cred-value"
     request = urlopen.call_args[0][0]
     assert "sess-1" not in request.full_url and "proof-value" not in request.full_url
     body = json.loads(request.data.decode())
-    assert body == {"claim_session_id": "sess-1", "claim_proof": "proof-value"}
+    assert body == {"claim_session_id": "sess-1", "claim_proof": "proof-value", "device_secret": "secret-0123456789abcdef0123456789abcdef"}
 
 
 def test_claim_complete_replay_surfaces_conflict_status_code():
@@ -119,7 +119,7 @@ def test_claim_complete_replay_surfaces_conflict_status_code():
     http_error.read = lambda: error_body
     with patch("urllib.request.urlopen", side_effect=http_error):
         try:
-            client.claim_complete("sess-1", "already-used-proof")
+            client.claim_complete("sess-1", "already-used-proof", "secret-0123456789abcdef0123456789abcdef")
             assert False, "expected PortalError"
         except PortalError as error:
             assert error.status_code == 409

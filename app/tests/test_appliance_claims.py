@@ -69,6 +69,10 @@ with override_target(sqlite_path="/tmp/test_appliance_claims_import.db"):
 VALID_DEVICE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+
+# Possession secret of the claiming appliance (2026-10-01 security fix).
+DEVICE_SECRET = "test-device-secret-0123456789abcdef0123456789"
+
 def _seed_customer(db, customer_id="cust-1", site_id="site-1", partner_id="partner-1", email="owner@example.test"):
     now = "2026-09-10T00:00:00"
     db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", (partner_id, "Test Partner", "approved", "real", now))
@@ -167,11 +171,11 @@ def _seeded_customer(db_path, **kwargs):
 
 
 def _begin(client, device_id=VALID_DEVICE_ID):
-    return client.post("/api/appliance/claim/begin", json={"device_id": device_id})
+    return client.post("/api/appliance/claim/begin", json={"device_secret": DEVICE_SECRET, "device_id": device_id})
 
 
 def _status(client, claim_session_id):
-    return client.post("/api/appliance/claim/status", json={"claim_session_id": claim_session_id})
+    return client.post("/api/appliance/claim/status", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id})
 
 
 def _lookup(client, claim_code, cookie=None):
@@ -419,7 +423,7 @@ def test_expired_claimed_row_can_no_longer_be_completed(client, db_path):
 
     response = client.post(
         "/api/appliance/claim/complete",
-        json={"claim_session_id": session["claim_session_id"], "claim_proof": proof},
+        json={"device_secret": DEVICE_SECRET, "claim_session_id": session["claim_session_id"], "claim_proof": proof},
     )
 
     assert response.status_code == 403
@@ -531,7 +535,7 @@ def _claim_through_to_proof(client, db_path, device_id=VALID_DEVICE_ID):
 def test_complete_produces_activate_shaped_response_and_working_credential(client, db_path):
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
 
-    response = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    response = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
 
     assert response.status_code == 200
     body = response.json()
@@ -564,10 +568,10 @@ def test_complete_retry_recovers_the_same_result_not_a_second_credential(client,
     # response) must recover the identical activation result -- never
     # a 403/409 that strands the device, and never a second credential.
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
-    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    first = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
     assert first.status_code == 200
 
-    second = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    second = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
 
     assert second.status_code == 200
     assert second.json() == first.json(), "a retry must recover the exact same result, not a different (e.g. rotated) credential"
@@ -583,17 +587,17 @@ def test_complete_retry_recovers_the_same_result_not_a_second_credential(client,
 
 def test_complete_retry_fails_closed_with_wrong_proof_even_after_completion(client, db_path):
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
-    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    first = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
     assert first.status_code == 200
 
-    wrong = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": "not-the-real-proof"})
+    wrong = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": "not-the-real-proof"})
 
     assert wrong.status_code == 403
 
 
 def test_complete_retry_after_recovery_window_expires_is_a_clean_conflict(client, db_path):
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
-    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    first = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
     assert first.status_code == 200
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -602,7 +606,7 @@ def test_complete_retry_after_recovery_window_expires_is_a_clean_conflict(client
                 ("2020-01-01T00:00:00", claim_session_id),
             )
 
-    retry = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    retry = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
 
     assert retry.status_code == 409
     with override_target(sqlite_path=str(db_path)):
@@ -622,7 +626,7 @@ def test_complete_retry_survives_a_simulated_process_restart(client, db_path, id
     # cloud worker process, or this same process after a restart,
     # handles the retry".
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
-    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    first = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
     assert first.status_code == 200
 
     with override_target(sqlite_path=str(db_path)):
@@ -630,7 +634,7 @@ def test_complete_retry_survives_a_simulated_process_restart(client, db_path, id
         appliance_cloud.register_appliance_cloud_routes(fresh_app, shell=lambda *a, **k: "")
         appliance_claims.register_appliance_claim_routes(fresh_app)
         with TestClient(fresh_app) as fresh_client:
-            retry = fresh_client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+            retry = fresh_client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
 
     assert retry.status_code == 200
     assert retry.json() == first.json()
@@ -653,7 +657,7 @@ def test_complete_is_multi_worker_safe_under_concurrent_retries(client, db_path,
     # native context, rather than trying to share one contextvars.Context
     # across concurrent threads (which raises "context already entered").
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
-    original = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    original = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
     assert original.status_code == 200
     # This test isolates multi-worker retry-safety specifically, not
     # activation_limiter's own (separately tested) rate-limit capacity
@@ -674,7 +678,7 @@ def test_complete_is_multi_worker_safe_under_concurrent_retries(client, db_path,
             with TestClient(worker_app) as worker_client:
                 response = worker_client.post(
                     "/api/appliance/claim/complete",
-                    json={"claim_session_id": claim_session_id, "claim_proof": claim_proof},
+                    json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof},
                 )
         with lock:
             results.append((response.status_code, response.json()))
@@ -704,7 +708,7 @@ def test_complete_rejects_expired_proof(client, db_path):
         with connection() as db:
             db.execute("UPDATE appliance_claims SET proof_expires_at=? WHERE claim_session_id=?", ("2020-01-01T00:00:00", claim_session_id))
 
-    response = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    response = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": claim_proof})
 
     assert response.status_code == 403
     with override_target(sqlite_path=str(db_path)):
@@ -716,7 +720,7 @@ def test_complete_rejects_expired_proof(client, db_path):
 def test_complete_rejects_wrong_proof(client, db_path):
     claim_session_id, _ = _claim_through_to_proof(client, db_path)
 
-    response = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": "not-the-real-proof"})
+    response = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": claim_session_id, "claim_proof": "not-the-real-proof"})
 
     assert response.status_code == 403
 
@@ -731,7 +735,7 @@ def test_full_happy_path_never_logs_secrets(client, db_path, caplog):
     confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
     assert confirm.status_code == 200
     status = _status(client, session["claim_session_id"]).json()
-    complete = client.post("/api/appliance/claim/complete", json={"claim_session_id": session["claim_session_id"], "claim_proof": status["claim_proof"]})
+    complete = client.post("/api/appliance/claim/complete", json={"device_secret": DEVICE_SECRET, "claim_session_id": session["claim_session_id"], "claim_proof": status["claim_proof"]})
     assert complete.status_code == 200
     credential = complete.json()["credential"]
 

@@ -1,12 +1,14 @@
 import getpass
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .commands import _queue_privileged_action
 from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential,load_wireguard_identity,save_claim_state
@@ -195,6 +197,12 @@ def _installer_device_id(config:AgentConfig) -> str:
     return device_id
 
 
+def portal_origin(url:str) -> str:
+    """scheme://host[:port], lowercase -- what a saved claim is bound to."""
+    parts=urlsplit(str(url or '').strip())
+    return f'{parts.scheme.lower()}://{(parts.netloc or "").lower()}'
+
+
 def _open_or_resume_claim(client:PortalClient,config:AgentConfig,device_id:str) -> dict:
     """Never calls claim/begin while a locally-recorded claim session
     for this exact device_id might still be live on the cloud side --
@@ -203,13 +211,27 @@ def _open_or_resume_claim(client:PortalClient,config:AgentConfig,device_id:str) 
     non-expired claim-state file exists on disk"). Covers this
     process being interrupted (killed, rebooted, crashed) at any point
     between opening a claim and completing it."""
+    origin=portal_origin(config.portal_url)
     state=load_claim_state(config)
+    # A saved claim is resumed only with the same portal it was opened with
+    # (2026-10-01 security fix): its session id, device secret and proof are
+    # never sent to a different origin. One for another portal -- or from an
+    # older agent without a device secret -- is discarded, not reused.
+    if state and (state.get('portal_origin')!=origin or not state.get('device_secret')):
+        print('Discarding a saved claim that was opened with a different portal; starting a new claim here.')
+        clear_claim_state(config); state=None
     if state and state.get('device_id')==device_id and state.get('claim_session_id'):
         print('Resuming a previously-opened claim session for this appliance.')
         return state
-    try: session=client.claim_begin(device_id)
-    except PortalError as error: raise SystemExit(f'Could not start the claim: {error}') from error
-    state={'device_id':device_id,'claim_session_id':session['claim_session_id'],'opened_at':datetime.now().isoformat()}
+    device_secret=secrets.token_urlsafe(32)
+    try: session=client.claim_begin(device_id,device_secret)
+    except PortalError as error:
+        if getattr(error,'status_code',None)==409 and 'in progress' in str(error):
+            raise SystemExit('A claim for this appliance is already waiting on the AnyAiCam cloud from an earlier setup run. '
+                             'It expires within an hour; run anyaicam-setup --claim again after that.') from error
+        raise SystemExit(f'Could not start the claim: {error}') from error
+    state={'device_id':device_id,'claim_session_id':session['claim_session_id'],'device_secret':device_secret,
+           'portal_origin':origin,'opened_at':datetime.now().isoformat()}
     save_claim_state(config,state)
     if session.get('resumed'):
         print('A claim session was already pending for this appliance on the cloud side; resuming it.')
@@ -234,7 +256,7 @@ def _wait_for_claim_proof(client:PortalClient,config:AgentConfig,state:dict,slee
         return state['claim_proof']
     print('Waiting for a customer to confirm this claim in the portal...')
     while True:
-        try: status=client.claim_status(state['claim_session_id'])
+        try: status=client.claim_status(state['claim_session_id'],state['device_secret'])
         except PortalError as error:
             print(f'WARNING: could not poll claim status ({error}); retrying...')
             sleep_fn(5); continue
@@ -259,7 +281,7 @@ def _complete_claim_with_retry(client:PortalClient,config:AgentConfig,state:dict
     mint a second credential."""
     last_error=None
     for attempt in range(1,attempts+1):
-        try: return client.claim_complete(state['claim_session_id'],state['claim_proof'])
+        try: return client.claim_complete(state['claim_session_id'],state['claim_proof'],state['device_secret'])
         except PortalError as error:
             last_error=error
             if attempt<attempts:
@@ -276,6 +298,16 @@ def _option(args,name:str) -> str|None:
     return None
 
 
+def _require_secure_portal(url:str,mode:str) -> None:
+    """A production appliance only ever talks to an https:// portal: the
+    claim carries a device secret and returns a permanent credential."""
+    parts=urlsplit(str(url or '').strip())
+    if not parts.netloc:
+        raise SystemExit(f'The portal address {url!r} is not a full web address (for example https://portal.anyaicam.com).')
+    if mode=='production' and parts.scheme.lower()!='https':
+        raise SystemExit(f'A production appliance must use an https:// portal address (got {url!r}).')
+
+
 def _apply_portal_options(config:AgentConfig,args) -> None:
     """Customer install (2026-10-01): My subscription gives the owner one
     exact command, `anyaicam-setup --claim --portal-url=<their portal>`. The
@@ -288,6 +320,7 @@ def _apply_portal_options(config:AgentConfig,args) -> None:
     if portal_url is None:
         config.portal_url=input(f'Portal URL [{config.portal_url}]: ').strip() or config.portal_url
         config.mode=input(f'Mode (development/production) [{config.mode}]: ').strip() or config.mode
+        _require_secure_portal(config.portal_url,config.mode)
         return
     portal_url=portal_url.strip().rstrip('/')
     if not portal_url.startswith(('https://','http://')) or not portal_url.split('://',1)[1] or ' ' in portal_url:
@@ -295,6 +328,7 @@ def _apply_portal_options(config:AgentConfig,args) -> None:
     mode=_option(args,'--mode') or 'production'
     if mode not in ('development','production'):
         raise SystemExit("--mode must be 'production' or 'development'.")
+    _require_secure_portal(portal_url,mode)
     config.portal_url=portal_url; config.mode=mode
     print(f'Portal: {config.portal_url}')
 
