@@ -86,7 +86,8 @@ def test_customer_playback_page_sets_no_store_cache_control(http_client, db_path
     response = http_client.get("/playback", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
 
     assert response.status_code == 200
-    assert response.headers.get("cache-control") == "no-store"
+    # 2026-10-01: every signed-in page is now "private, no-store" (still never stored).
+    assert "no-store" in response.headers.get("cache-control", "").split(", ")
 
 
 def test_customer_playback_data_fetches_all_opt_out_of_the_http_cache(http_client, db_path):
