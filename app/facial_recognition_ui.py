@@ -108,16 +108,35 @@ def _resolve_customer_id(identity: dict, requested: str | None) -> str:
     return customer_id
 
 
+FACE_PREVIEW_LOCAL_ONLY = "Face preview is available only on the local appliance."
+
+
+def _runtime_role() -> str:
+    from cloud_config import settings as _settings
+    return _settings.runtime_role
+
+
 def facial_allowed(identity: dict, permission: str) -> bool:
     """The one facial.* permission decision for routes and pages. A household
     member (customer_viewer) gets People / Face Access exactly as the account
     owner granted them (household_users.py) -- including facial.manage, which
     the customer_viewer role itself never carries; every other role is the
     role permission, unchanged."""
-    if identity.get("role") == "customer_viewer" and permission in ("facial.view", "facial.manage"):
+    if identity.get("role") == "customer_viewer" and permission in ("facial.view", "facial.manage", "facial.profile"):
         import household_users
         return household_users.facial_permission_allowed(identity, permission)
+    if permission == "facial.profile":  # every other role: exactly facial.view, unchanged
+        return allowed(identity, "facial.view")
     return allowed(identity, permission)
+
+
+# What a person with only facial.profile (Backup Access alone) may see of a
+# person: enough to find themselves and use Backup Access, nothing more.
+PROFILE_ONLY_FIELDS = ("id", "display_name", "status")
+
+
+def _profile_only(person: dict) -> dict:
+    return {key: person.get(key) for key in PROFILE_ONLY_FIELDS}
 
 
 def _require(request: Request, permission: str) -> dict:
@@ -291,7 +310,7 @@ async function loadPerson(){
   $('e-after-create').hidden=false;
   const list=$('e-image-list');
   list.innerHTML=(p.reference_images||[]).length?('<p class="health-detail">'+p.reference_images.length+' face photo(s) enrolled.</p>'):'<p class="health-detail">No face photo yet. Add one below.</p>';
-  loadAccess();
+  if(typeof CAN_VIEW_DETAILS==='undefined'||CAN_VIEW_DETAILS)loadAccess();
   loadBackup();
 }
 
@@ -460,15 +479,19 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get("/api/aac/people")
     def aac_list_people(request: Request, customer_id: str | None = None, site_id: str | None = None, status: str | None = None, search: str | None = None) -> dict:
-        identity = _require(request, "facial.view")
+        identity = _require(request, "facial.profile")
+        _require_face_access(identity)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             people = facial_people.list_people(db, customer_id=resolved, site_id=site_id, status=status, search=search)
+        if not facial_allowed(identity, "facial.view"):
+            people = [_profile_only(person) for person in people]
         return {"people": people}
 
     @app.post("/api/aac/people")
     def aac_enroll_person(request: Request, payload: dict) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, payload.get("customer_id"))
         try:
             with connection() as db:
@@ -489,12 +512,15 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get("/api/aac/people/{person_id}")
     def aac_get_person(request: Request, person_id: str, customer_id: str | None = None) -> dict:
-        identity = _require(request, "facial.view")
+        identity = _require(request, "facial.profile")
+        _require_face_access(identity)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             person = facial_people.get_person(db, customer_id=resolved, person_id=person_id)
             if person is None:
                 raise HTTPException(status_code=404, detail="Person not found.")
+            if not facial_allowed(identity, "facial.view"):
+                return _profile_only(person)
             person["reference_images"] = facial_people.list_reference_images(db, customer_id=resolved, person_id=person_id)
             person["watchlists"] = facial_people.person_watchlist_memberships(db, customer_id=resolved, person_id=person_id)
         return person
@@ -502,6 +528,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.patch("/api/aac/people/{person_id}")
     def aac_update_person(request: Request, person_id: str, payload: dict) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, payload.get("customer_id"))
         try:
             with connection() as db:
@@ -544,6 +571,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/aac/people/{person_id}/access")
     def aac_person_access(request: Request, person_id: str, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         import face_access_people
         with connection() as db:
@@ -597,6 +625,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.post("/api/aac/people/{person_id}/images")
     def aac_add_reference_image(request: Request, person_id: str, payload: dict) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, payload.get("customer_id"))
         image = _decode_image(str(payload.get("image_base64", "")))
         observations = facial_recognition.detect_and_embed(image)
@@ -634,6 +663,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.delete("/api/aac/people/{person_id}/images/{embedding_id}")
     def aac_delete_reference_image(request: Request, person_id: str, embedding_id: str, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             deleted = facial_people.delete_reference_image(db, customer_id=resolved, person_id=person_id, embedding_id=embedding_id)
@@ -645,6 +675,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/aac/watchlists")
     def aac_list_watchlists(request: Request, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             watchlists = facial_people.list_watchlists(db, customer_id=resolved)
@@ -653,6 +684,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.post("/api/aac/watchlists")
     def aac_create_watchlist(request: Request, payload: dict) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, payload.get("customer_id"))
         try:
             with connection() as db:
@@ -674,6 +706,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.delete("/api/aac/watchlists/{watchlist_id}")
     def aac_delete_watchlist(request: Request, watchlist_id: str, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             deleted = facial_people.delete_watchlist(db, customer_id=resolved, watchlist_id=watchlist_id)
@@ -685,6 +718,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/aac/watchlists/{watchlist_id}/members")
     def aac_list_watchlist_members(request: Request, watchlist_id: str, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             members = facial_people.list_watchlist_members(db, customer_id=resolved, watchlist_id=watchlist_id)
@@ -693,6 +727,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.post("/api/aac/watchlists/{watchlist_id}/members")
     def aac_add_watchlist_member(request: Request, watchlist_id: str, payload: dict) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, payload.get("customer_id"))
         with connection() as db:
             added = facial_people.add_watchlist_member(
@@ -711,6 +746,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.delete("/api/aac/watchlists/{watchlist_id}/members/{person_id}")
     def aac_remove_watchlist_member(request: Request, watchlist_id: str, person_id: str, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             removed = facial_people.remove_watchlist_member(db, customer_id=resolved, watchlist_id=watchlist_id, person_id=person_id)
@@ -734,6 +770,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         offset: int = 0,
     ) -> dict:
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             events = facial_events.list_events(
@@ -754,16 +791,26 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/aac/events/{event_id}")
     def aac_event_detail(request: Request, event_id: str, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             event = facial_events.get_event_detail(db, customer_id=resolved, event_id=event_id)
         if event is None:
             raise HTTPException(status_code=404, detail="Event not found.")
+        # Face crops stay on the appliance that saw the face (owner policy,
+        # 2026-10-02: no cloud face images at launch). Say plainly whether a
+        # preview can be shown here, never a path or a broken image.
+        path = event.pop("face_thumbnail_path", None)
+        event["face_preview_available"] = bool(path) and Path(path).is_file()
+        if not event["face_preview_available"]:
+            event["face_preview_note"] = (FACE_PREVIEW_LOCAL_ONLY if _runtime_role() == "cloud"
+                                          else "No face preview was saved for this match.")
         return event
 
     @app.get("/api/aac/settings")
     def aac_get_settings(request: Request, customer_id: str | None = None) -> dict:
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             return facial_people.get_settings(db, customer_id=resolved)
@@ -771,6 +818,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     @app.put("/api/aac/settings")
     def aac_update_settings(request: Request, payload: dict) -> dict:
         identity = _require(request, "facial.manage")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, payload.get("customer_id"))
         min_confidence = payload.get("min_confidence")
         if min_confidence is not None and not (0.0 <= float(min_confidence) <= 1.0):
@@ -792,7 +840,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get("/aac/people", response_class=HTMLResponse)
     def aac_people_page(request: Request):
-        identity = _require(request, "facial.view")
+        identity = _require(request, "facial.profile")
         facial_ctx = _customer_facial_context(identity)
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Facial Recognition · People", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>People</h1></div></header>' + _FACE_ACCESS_UPSELL)
@@ -846,12 +894,16 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
         will be enrolled before anything is saved); and Face Access -- on/off,
         unit/apartment, site/building, start and expiry dates, and the doors
         they may open on which days and hours. Phone-first layout."""
-        identity = _require(request, "facial.view")
+        identity = _require(request, "facial.profile")
         facial_ctx = _customer_facial_context(identity)
         title = "Person"
         if facial_ctx and not facial_ctx["entitled"]:
             return shell(title, "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>' + _FACE_ACCESS_UPSELL)
         can_manage = facial_allowed(identity, "facial.manage")
+        # Backup Access alone (2026-10-02): the face photo and Face Access
+        # panels are not theirs to see; their data is not sent either.
+        can_view_details = facial_allowed(identity, "facial.view")
+        details_hidden = "" if can_view_details else " hidden"
         customer_id_field = "" if facial_ctx else _customer_picker("e-customer-id")
         cameras = []
         if facial_ctx:
@@ -879,7 +931,7 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
 <label>Notes<textarea id="e-notes"{ro}></textarea></label>
 ''' + ('<button class="action-button" id="e-create" type="button">Add person</button>' if can_manage else "") + '''<p role="status" id="e-status" class="health-detail"></p></section>
 <div id="e-after-create" hidden>
-<section class="panel"><h2>Face photo</h2><div id="e-image-list"></div>''' + ('''
+<section class="panel" id="e-photo-panel"__DETAILS_HIDDEN__><h2>Face photo</h2><div id="e-image-list"></div>''' + ('''
 <div class="tabs" role="tablist"><button class="ghost-button active" data-tab="take" type="button">Take Photo</button><button class="ghost-button" data-tab="upload" type="button">Upload Photo</button><button class="ghost-button" data-tab="camera" type="button">Enroll from Camera</button></div>
 <div data-pane="take"><p class="health-detail">Use this phone, tablet or computer camera. Face the camera in good light.</p>
 <button class="ghost-button" id="take-start" type="button">Open camera</button><video id="take-video" autoplay playsinline muted hidden></video>
@@ -891,7 +943,7 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
 <label>Camera<select id="cam-select">''' + camera_options + '''</select></label><button class="ghost-button" id="cam-start" type="button">Capture from this camera</button>
 <p class="health-detail" id="cam-status" role="status"></p><div id="cam-candidates"></div></div>
 <p class="health-detail">Only the face area is stored as the template&#39;s reference -- the full photo is never saved.</p>''' if can_manage else "") + f'''</section>
-<section class="panel"><h2>Face Access</h2>
+<section class="panel" id="a-panel"__DETAILS_HIDDEN__><h2>Face Access</h2>
 <label class="toggle"><input type="checkbox" id="a-enabled"{ro}> Face Access enabled for this person</label>
 <label>Unit / apartment (optional)<input id="a-unit" maxlength="40"{ro}></label>
 <label>Site / building<select id="a-site"{ro}></select></label>
@@ -908,8 +960,10 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
 <button class="action-button" id="b-go" type="button">Unlock door</button></div>
 <p class="health-detail" id="b-status" role="status" aria-live="polite"></p></section>
 </div></div>''')
+        content = content.replace("__DETAILS_HIDDEN__", details_hidden)
         scripts = ("<script>const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null")
-                   + ";const CAN_MANAGE=" + json.dumps(bool(can_manage)) + ";\n" + PERSON_PAGE_JS + "</script>")
+                   + ";const CAN_MANAGE=" + json.dumps(bool(can_manage)) + ";const CAN_VIEW_DETAILS=" + json.dumps(bool(can_view_details))
+                   + ";\n" + PERSON_PAGE_JS + "</script>")
         return shell(title, "aac", content, scripts)
 
     @app.get("/aac/watchlists", response_class=HTMLResponse)
@@ -992,6 +1046,7 @@ document.getElementById('ev-refresh').addEventListener('click',async()=>{
     @app.get("/api/aac/events/{event_id}/thumbnail")
     def aac_event_thumbnail(request: Request, event_id: str, customer_id: str | None = None):
         identity = _require(request, "facial.view")
+        _require_face_access(identity)  # licensed Face Access feature (2026-10-02)
         resolved = _resolve_customer_id(identity, customer_id)
         with connection() as db:
             event = facial_events.get_event_detail(db, customer_id=resolved, event_id=event_id)
@@ -1030,10 +1085,13 @@ function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&am
   const e=await response.json();
   // matched_person_name/matched_watchlist_name are denormalized snapshots
   // of free text a 'facial.manage' user chose -- escaped before reaching
-  // innerHTML (see aac_people_page's own comment on this). The thumbnail
-  // <img> below is intentionally allowed to fail silently (onerror hides
-  // it) -- not every event has one yet (e.g. no face crop could be saved).
-  box.innerHTML=`<img src="/api/aac/events/${encodeURIComponent(eventId)}/thumbnail?customer_id=${encodeURIComponent(customerId)}" alt="Face thumbnail" style="max-width:200px;border-radius:8px;display:block;margin-bottom:12px" onerror="this.style.display='none'">
+  // innerHTML (see aac_people_page's own comment on this). The face
+  // preview is shown only when the server says this appliance holds the
+  // crop; otherwise its note says why (local-only, or none saved).
+  const preview=e.face_preview_available
+    ?`<img src="/api/aac/events/${encodeURIComponent(eventId)}/thumbnail?customer_id=${encodeURIComponent(customerId)}" alt="Face preview" style="max-width:200px;border-radius:8px;display:block;margin-bottom:12px">`
+    :`<p class="health-detail" id="d-preview-note">${aacEsc(e.face_preview_note||'Face preview is not available.')}</p>`;
+  box.innerHTML=preview+`
   <div class="health-row"><span>Time</span><strong>${aacEsc(e.event_timestamp)}</strong></div>
   <div class="health-row"><span>Camera</span><strong>${aacEsc(e.camera_id)}</strong></div>
   <div class="health-row"><span>State</span><strong>${aacEsc(e.match_state)}</strong></div>

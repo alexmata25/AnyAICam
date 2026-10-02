@@ -214,8 +214,14 @@ def facial_permission_allowed(identity: dict | None, permission: str) -> bool:
     if permission == "facial.manage":
         return account_permission(identity, "face_access")
     if permission == "facial.view":
-        # Backup Mobile Access lives on the person's People profile, so it
-        # needs to reach People too (backup_access.py).
+        # Events, match detail, face thumbnails, watchlists, settings and
+        # Face Access details: People or Face Access only (2026-10-02,
+        # Codex review -- Backup Access alone no longer reaches them).
+        return any(account_permission(identity, key) for key in ("people", "face_access"))
+    if permission == "facial.profile":
+        # Backup Mobile Access lives on the person's People profile, so a
+        # Backup-Access-only member reaches the people list and a person's
+        # profile -- reduced to name and status (facial_recognition_ui).
         return any(account_permission(identity, key) for key in ("people", "face_access", "backup_access"))
     return True
 

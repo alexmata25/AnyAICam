@@ -212,12 +212,16 @@ def test_facial_directory_never_returns_another_customers_data(client, db_path):
     assert "Mallory" not in names
 
 
-def test_facial_event_thumbnail_upload_and_tenant_isolation(client, db_path, tmp_path, monkeypatch):
+def test_facial_event_thumbnail_upload_is_refused_and_nothing_is_stored(client, db_path, tmp_path, monkeypatch):
+    """Owner policy 2026-10-02: no Hybrid cloud face-crop storage at launch.
+    The route still authenticates the appliance, then refuses every upload
+    (own tenant or not) and writes nothing to storage or to the event."""
     import base64
 
     import object_storage
 
-    monkeypatch.setattr(object_storage, "get_storage", lambda: object_storage.LocalStorage(root=tmp_path / "storage"))
+    storage_root = tmp_path / "storage"
+    monkeypatch.setattr(object_storage, "get_storage", lambda: object_storage.LocalStorage(root=storage_root))
     payload = {
         "local_event_id": "levt-1", "event_type": "facial_recognition", "confidence": 0.9,
         "detections": [{"match_state": "known"}], "event_timestamp": NOW,
@@ -231,11 +235,12 @@ def test_facial_event_thumbnail_upload_and_tenant_isolation(client, db_path, tmp
         json={"image_base64": image_b64},
         headers=_appliance_auth_headers("appl-1", "test-credential"),
     )
-    assert response.status_code == 200
+    assert response.status_code == 410 and "local appliance" in response.json()["detail"]
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             row = db.execute("SELECT face_thumbnail_path FROM facial_events WHERE detection_event_id=?", (detection_event_id,)).fetchone()
-    assert row["face_thumbnail_path"] is not None
+    assert row["face_thumbnail_path"] is None
+    assert not storage_root.exists() or not any(storage_root.rglob("*.jpg"))
 
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -245,7 +250,7 @@ def test_facial_event_thumbnail_upload_and_tenant_isolation(client, db_path, tmp
         json={"image_base64": image_b64},
         headers=_appliance_auth_headers("appl-2", "other-credential"),
     )
-    assert cross_tenant.status_code == 403
+    assert cross_tenant.status_code == 410
 
 
 def test_facial_event_thumbnail_requires_authentication(client):
@@ -253,7 +258,7 @@ def test_facial_event_thumbnail_requires_authentication(client):
     assert response.status_code == 401
 
 
-def test_facial_event_thumbnail_rejects_invalid_base64(client):
+def test_facial_event_thumbnail_upload_is_refused_whatever_the_payload(client):
     payload = {"local_event_id": "levt-1", "event_type": "facial_recognition", "confidence": 0.9, "detections": [{"match_state": "known"}], "event_timestamp": NOW}
     created = client.post("/api/appliance/analytics/cam-1/events", json=payload, headers=_appliance_auth_headers("appl-1", "test-credential"))
     detection_event_id = created.json()["event_id"]
@@ -262,7 +267,7 @@ def test_facial_event_thumbnail_rejects_invalid_base64(client):
         json={"image_base64": "not valid base64!!"},
         headers=_appliance_auth_headers("appl-1", "test-credential"),
     )
-    assert response.status_code == 400
+    assert response.status_code == 410
 
 
 def test_facial_directory_excludes_disabled_people(client, db_path):

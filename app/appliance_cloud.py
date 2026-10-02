@@ -1409,50 +1409,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.post('/api/appliance/facial-events/{detection_event_id}/thumbnail')
     def facial_event_thumbnail_available(request: Request,detection_event_id: str,payload: dict) -> dict:
-        # AAC (facial recognition), Phase 2: the third and last of the
-        # split-topology gaps from the Phase 1 Codex review -- face-crop
-        # thumbnails were local-appliance-disk-only, so a separate cloud
-        # customer-portal process could never display one. Reuses the
-        # existing object_storage.py abstraction (the SAME 'thumbnails'
-        # category/backend other event media already goes through, S3
-        # or local per settings.storage_backend) rather than inventing a
-        # second storage path.
-        #
-        # The facial_events row (looked up by detection_event_id, which
-        # is globally unique -- facial_events.detection_event_id has its
-        # own UNIQUE constraint) must already exist AND belong to a
-        # camera assigned to THIS authenticated appliance -- both
-        # checked below -- before any bytes are accepted or stored,
-        # closing the same tenant-isolation gap every other appliance-
-        # scoped route here already closes.
-        #
-        # Edge-side automatic upload (reading the local face-crop file
-        # save_yolo_events()'s AAC hook already writes and POSTing it
-        # here through analytics_sync.py) is not yet wired -- this route
-        # is the tested, ready cloud half; see the Phase 2 report's own
-        # note on this being the one still-manual step.
-        appliance=authenticate_appliance(request)
-        if not FACIAL_EMBEDDING_SYNC_ENABLED: raise HTTPException(status_code=404,detail='Facial embedding sync is not enabled.')
-        image_base64=str(payload.get('image_base64') or '').strip()
-        if not image_base64: raise HTTPException(status_code=400,detail='image_base64 is required.')
-        try:
-            import base64
-            image_bytes=base64.b64decode(image_base64,validate=True)
-        except Exception as error:
-            raise HTTPException(status_code=400,detail='image_base64 is not valid base64.') from error
-        with connection() as db:
-            event=db.execute(
-                'SELECT fe.id,fe.customer_id,fe.camera_id FROM facial_events fe WHERE fe.detection_event_id=?',
-                (detection_event_id,),
-            ).fetchone()
-            if not event: raise HTTPException(status_code=404,detail='Facial event not found.')
-            camera=db.execute('SELECT id FROM cameras WHERE id=? AND appliance_id=?',(event['camera_id'],appliance['id'])).fetchone()
-            if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
-            from object_storage import get_storage
-            storage_key=f"facial/{event['customer_id']}/{detection_event_id}.jpg"
-            stored=get_storage().put('thumbnails',storage_key,image_bytes,content_type='image/jpeg')
-            db.execute('UPDATE facial_events SET face_thumbnail_path=? WHERE detection_event_id=?',(stored['key'],detection_event_id))
-        return {'status':'accepted','thumbnail_key':stored['key']}
+        # Face crops stay on the local appliance (owner policy, 2026-10-02:
+        # no Hybrid cloud face-crop storage at launch). This route used to
+        # accept and store an appliance's face crop in cloud object storage;
+        # it now refuses every upload, after authenticating the appliance,
+        # and stores nothing. The cloud match detail says the preview is
+        # available only on the local appliance.
+        authenticate_appliance(request)
+        raise HTTPException(status_code=410,detail='Face previews are kept on the local appliance and are not stored in the cloud.')
+
 
     @app.post('/api/appliance/analytics/{camera_id}/events/{local_event_id}/media')
     def analytics_event_media_available(request: Request,camera_id: str,local_event_id: str,payload: dict) -> dict:

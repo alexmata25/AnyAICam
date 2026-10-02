@@ -44,6 +44,14 @@ def _shell(title, active, content, scripts=""):
     return f"<html><title>{title}</title>{content}{scripts}</html>"
 
 
+
+@pytest.fixture(autouse=True)
+def _face_access_active(monkeypatch):
+    """Every customer here holds the Face Access add-on: these tests are
+    about tenant isolation and input handling, not licensing (2026-10-02:
+    the add-on gate now covers every customer Face Access API)."""
+    monkeypatch.setattr("analytics_entitlements.get_active_analytics_for_customer", lambda customer_id: ["facial_recognition"])
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_facial_recognition_adversarial.db"

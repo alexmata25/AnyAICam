@@ -441,9 +441,10 @@ def test_the_account_page_offers_users_and_household_to_the_owner_only(portal, d
     assert viewer.status_code == 200 and 'href="/customer/household"' not in viewer.text
 
 
-def test_the_face_access_grant_lets_a_member_manage_people_and_shows_edit_controls(portal, db_path, mail):
+def test_the_face_access_grant_lets_a_member_manage_people_and_shows_edit_controls(portal, db_path, mail, monkeypatch):
     """The customer_viewer role never carries facial.manage; the owner's
     Manage Face Access grant is what gives it to this one person."""
+    monkeypatch.setattr("analytics_entitlements.get_active_analytics_for_customer", lambda customer_id: ["facial_recognition"])
     client, _, _ = portal
     _home(db_path)
     _invite(client)

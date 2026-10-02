@@ -114,11 +114,13 @@ def test_customer_viewer_cannot_enroll(client):
 
 
 def test_customer_viewer_can_view_people(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     response = client.get("/api/aac/people", params={"customer_id": "cust-1"}, cookies=_cookies(_customer_viewer_cookie()))
     assert response.status_code == 200
 
 
 def test_customer_owner_can_enroll(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     response = client.post(
         "/api/aac/people",
         json={"customer_id": "cust-1", "display_name": "Alice"},
@@ -181,6 +183,7 @@ def test_administrator_cannot_read_person_under_wrong_customer_id(client):
 
 
 def test_add_reference_image_stores_only_the_crop_not_the_upload(client, db_path, monkeypatch):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     # The real default Haar cascade correctly finds no face in a plain
     # synthetic image (see test_facial_recognition.py's own coverage of
     # that real, unmocked path) -- an injected fake engine is used here
@@ -226,6 +229,7 @@ def test_add_reference_image_stores_only_the_crop_not_the_upload(client, db_path
 
 
 def test_add_reference_image_rejects_image_with_no_detectable_face(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     blank = np.zeros((10, 10, 3), dtype=np.uint8)
@@ -239,6 +243,7 @@ def test_add_reference_image_rejects_image_with_no_detectable_face(client):
 
 
 def test_add_reference_image_rejects_malformed_base64(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     response = client.post(
@@ -253,6 +258,7 @@ def test_add_reference_image_rejects_malformed_base64(client):
 
 
 def test_authenticated_deletion_removes_person(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     response = client.delete(f"/api/aac/people/{person_id}", params={"customer_id": "cust-1"}, cookies=_cookies(_customer_owner_cookie()))
@@ -262,6 +268,7 @@ def test_authenticated_deletion_removes_person(client):
 
 
 def test_unauthenticated_deletion_is_rejected(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     response = client.delete(f"/api/aac/people/{person_id}", params={"customer_id": "cust-1"})
@@ -269,6 +276,7 @@ def test_unauthenticated_deletion_is_rejected(client):
 
 
 def test_viewer_cannot_delete(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     response = client.delete(f"/api/aac/people/{person_id}", params={"customer_id": "cust-1"}, cookies=_cookies(_customer_viewer_cookie()))
@@ -279,6 +287,7 @@ def test_viewer_cannot_delete(client):
 
 
 def test_enrollment_and_deletion_are_audited(client, db_path):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     client.delete(f"/api/aac/people/{person_id}", params={"customer_id": "cust-1"}, cookies=_cookies(_customer_owner_cookie()))
@@ -290,6 +299,7 @@ def test_enrollment_and_deletion_are_audited(client, db_path):
 
 
 def test_audit_log_never_contains_the_raw_uploaded_image_or_embedding(client, db_path):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
     person_id = created.json()["person_id"]
     image_base64 = _sample_image_base64()
@@ -310,6 +320,7 @@ def test_audit_log_never_contains_the_raw_uploaded_image_or_embedding(client, db
 
 
 def test_watchlist_lifecycle_through_routes(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     created = client.post(
         "/api/aac/watchlists",
         json={"customer_id": "cust-1", "name": "Banned"},
@@ -331,6 +342,7 @@ def test_watchlist_lifecycle_through_routes(client):
 
 
 def test_settings_round_trip_through_routes(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     update = client.put(
         "/api/aac/settings",
         json={"customer_id": "cust-1", "min_confidence": 0.75},
@@ -342,6 +354,7 @@ def test_settings_round_trip_through_routes(client):
 
 
 def test_settings_rejects_out_of_range_confidence(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     response = client.put(
         "/api/aac/settings",
         json={"customer_id": "cust-1", "min_confidence": 1.5},
@@ -351,6 +364,7 @@ def test_settings_rejects_out_of_range_confidence(client):
 
 
 def test_events_endpoint_scopes_to_customer(client):
+    _grant_face_access()  # Face Access is a licensed add-on (2026-10-02 entitlement gate)
     response = client.get("/api/aac/events", params={"customer_id": "cust-1"}, cookies=_cookies(_customer_viewer_cookie()))
     assert response.status_code == 200
     assert response.json() == {"events": []}
