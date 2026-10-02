@@ -142523,6 +142523,11 @@ def _probe_recording_duration_seconds(path: Path) -> float | None:
         return None
 
 
+STALE_RECORDING_DURATION_SECONDS = 300
+RECORDING_DURATION_REPAIRS_PER_CALL = 20
+_recording_durations_verified: set = set()
+
+
 def _catalog_local_recordings_for_camera(camera_id: str) -> int:
     """Backfills the recordings table from local .mkv files still on
     disk for this camera -- reconciled verbatim from the accepted,
@@ -142587,6 +142592,7 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
 
         cutoff = time.time() - CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS
         added = 0
+        repairs = 0
 
         for path in sorted(camera_folder.glob("*.mkv")):
             try:
@@ -142604,11 +142610,30 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
             s3_key = cloud_recording_s3_key(path, camera_number)
 
             existing = db.execute(
-                "SELECT id FROM recordings WHERE camera_id=? AND s3_key=?",
+                "SELECT id, started_at, duration_seconds FROM recordings WHERE camera_id=? AND s3_key=?",
                 (camera_id, s3_key),
             ).fetchone()
 
             if existing:
+                # Repair (2026-10-02): rows cataloged while ffprobe failed (or
+                # before the duration probe existed) carry the old fixed 300 s
+                # -- wrong for every Event-mode clip. Re-probe them, bounded
+                # per call and once per process per row; a failed probe never
+                # changes a row.
+                if (repairs < RECORDING_DURATION_REPAIRS_PER_CALL
+                        and int(existing["duration_seconds"] or 0) == STALE_RECORDING_DURATION_SECONDS
+                        and (camera_id, s3_key) not in _recording_durations_verified):
+                    repairs += 1
+                    _recording_durations_verified.add((camera_id, s3_key))
+                    probed = _probe_recording_duration_seconds(path)
+                    if probed is not None and abs(probed - STALE_RECORDING_DURATION_SECONDS) >= 1:
+                        try:
+                            repaired_end = datetime.fromisoformat(str(existing["started_at"])) + timedelta(seconds=probed)
+                            db.execute("UPDATE recordings SET duration_seconds=?, ended_at=? WHERE id=?",
+                                       (int(round(probed)), repaired_end.isoformat(), existing["id"]))
+                            db.commit()
+                        except (ValueError, sqlite3.OperationalError) as error:
+                            logger.warning("recordings_catalog.duration_repair_failed camera_id=%s error=%s", camera_id, type(error).__name__)
                 continue
 
             # Real ffprobe duration, not an assumed 5 minutes -- only for
