@@ -42013,6 +42013,10 @@ PUBLIC_PATH_PREFIXES = (
     "/customer-forgot-password",
 
     "/customer-reset-password",
+    # Users & household (2026-10-01): the invitee has no session yet; the
+    # single-use link token is the only authorization (household_users.py).
+    "/customer/join",
+    "/api/customer/household/join",
 
     "/forgot-password",
 
@@ -47544,6 +47548,8 @@ NAV_ITEMS = [
 
 
     ("customer-app-settings", "/customer-app-settings", "✦", "Settings"),
+    # Users & household (2026-10-01): account owners only -- see page_shell().
+    ("household", "/customer/household", "◍", "Users & household"),
 
 
 
@@ -47793,7 +47799,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "customer-app-settings", "mobile-app",
+            "customer-app-settings", "household", "mobile-app",
 
 
 
@@ -48052,6 +48058,9 @@ def _facial_view_permitted(shell_user: dict | None, shell_role: str) -> bool:
     at all (e.g. a legacy-only role name) simply isn't granted, same as
     an anonymous visitor."""
     try:
+        import household_users
+        if not household_users.facial_permission_allowed(shell_user, "facial.view"):
+            return False
         from partner_db import allowed as partner_db_allowed
     except Exception:
         return False
@@ -48146,6 +48155,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
         if (allowed_keys is None or item[0] in allowed_keys)
         and (item[0] != "customer-app-settings" or shell_role in CUSTOMER_PORTAL_ROLES)
+        and (item[0] != "household" or (shell_has_partner_identity and shell_role == "customer_owner"))
         # AAC (facial recognition), Phase 2: being in allowed_keys above
         # (added for administrator/customer_owner/customer_viewer) only
         # makes "aac" ELIGIBLE -- this is the actual permission gate,
@@ -48789,6 +48799,10 @@ register_appliance_cloud_routes(app, page_shell, current_user)
 # before or after this line (no /customer/{...} wildcard exists
 # anywhere in this codebase).
 register_appliance_claim_routes(app, page_shell)
+# Users & household (2026-10-01): owner-managed household members with
+# their own sign-in, single-use invitation links and per-person permissions.
+from household_users import register_household_routes
+register_household_routes(app, page_shell)
 # Registered before register_partner_workspace_routes() runs the
 # generic @app.get("/settings/{settings_slug}") catch-all it (or later
 # code in this file) may match against -- see that route's own handling
