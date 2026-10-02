@@ -1752,6 +1752,13 @@ def apply_migrations():
         db.execute('CREATE TABLE IF NOT EXISTS notification_event_keys(customer_id TEXT NOT NULL,dedupe_key TEXT NOT NULL,'
                    'created_at TEXT NOT NULL,PRIMARY KEY(customer_id,dedupe_key))')
 
+        # Platform-owner MFA replacement (2026-10-02, platform_owner.py): a new
+        # authenticator is held here until confirmed; the confirmed factor
+        # stays in force meanwhile. Additive.
+        mfa_columns=_columns('platform_owner_mfa')
+        if 'pending_secret_base32' not in mfa_columns: db.execute('ALTER TABLE platform_owner_mfa ADD COLUMN pending_secret_base32 TEXT')
+        if 'pending_created_at' not in mfa_columns: db.execute('ALTER TABLE platform_owner_mfa ADD COLUMN pending_created_at TEXT')
+
         # Loitering (2026-10-01, customer_analytics_rules.py): how long a
         # person must stay inside a zone before it counts (NULL = the rule
         # type's default), and whether the rule notifies anyone -- the event
