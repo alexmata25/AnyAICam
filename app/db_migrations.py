@@ -1749,3 +1749,13 @@ def apply_migrations():
         rule_columns=_columns('customer_analytics_rules')
         if 'dwell_seconds' not in rule_columns: db.execute('ALTER TABLE customer_analytics_rules ADD COLUMN dwell_seconds INTEGER')
         if 'notifications_enabled' not in rule_columns: db.execute('ALTER TABLE customer_analytics_rules ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 1')
+
+        # Event clip state (2026-10-01, appliance_cloud.set_media_status):
+        # 'pending' -- the appliance is building/uploading a clip (retries
+        # continue); 'available' -- a clip is registered; 'failed' -- no
+        # clip will ever exist. NULL for events that never promised one and
+        # for every older row, which keep their previous behaviour.
+        detection_event_columns_media=_columns('detection_events')
+        if 'media_status' not in detection_event_columns_media: db.execute('ALTER TABLE detection_events ADD COLUMN media_status TEXT')
+        if 'media_status_at' not in detection_event_columns_media: db.execute('ALTER TABLE detection_events ADD COLUMN media_status_at TEXT')
+        if 'media_status_reason' not in detection_event_columns_media: db.execute('ALTER TABLE detection_events ADD COLUMN media_status_reason TEXT')

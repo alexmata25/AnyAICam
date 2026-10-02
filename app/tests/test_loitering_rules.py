@@ -92,10 +92,23 @@ def test_intrusion_keeps_its_built_in_dwell_and_any_class():
     assert _run([_intrusion()], readings) == [(1, "intrusion")]  # 5 s, unchanged
 
 
+HALF = [{"x": 0.0, "y": 0.0}, {"x": 0.5, "y": 0.0}, {"x": 0.5, "y": 1.0}, {"x": 0.0, "y": 1.0}]  # left half of a 200 px frame
+
+
+def _walk(xs, dwell, step=5.0):
+    """A person 40 px wide walking in small steps (the tracker keeps one
+    track); None is a missed cycle. Returns the cycle indexes that fired."""
+    rule = _loitering(dwell=dwell, geometry=HALF)
+    fired = []
+    for index, x in enumerate(xs):
+        if _cycle([rule], [_person(x=x)] if x is not None else [], index * step):
+            fired.append(index)
+    return fired
+
+
 def test_someone_walking_through_never_loiters():
-    readings = [[_person()], [_person()], [_person(x=500, y=500)], [], [], [_person()], [_person()]]
-    # 200x200 frame: x=500 is outside the zone -- the stay resets
-    assert _run([_loitering(dwell=10)], readings) == []
+    # walks in and straight out (20 s), unseen twice, briefly back in: never 30 s inside in one stay
+    assert _walk([50, 60, 70, 80, 90, None, None, 70, 70], dwell=30) == []
 
 
 @pytest.mark.parametrize("dwell,expected", [(None, 30.0), ("abc", 30.0), (2, 10.0), (99999, 1800.0), (45, 45.0)])
@@ -123,9 +136,8 @@ def test_an_occlusion_past_the_grace_starts_over():
 
 
 def test_leaving_and_coming_back_needs_a_full_new_dwell_and_fires_again():
-    outside = _person(x=500, y=500)
-    readings = [[_person()]] * 4 + [[outside]] + [[_person()]] * 4
-    assert _run([_loitering(dwell=15)], readings) == [(3, "loitering"), (8, "loitering")]
+    # fires once at 15 s; walks out (x=90 is outside); comes back at 40 s; a new full 15 s stay fires again at 55 s
+    assert _walk([50, 50, 50, 50, 60, 70, 80, 90, 70, 70, 70, 70], dwell=15) == [3, 11]
 
 
 def test_a_detection_outage_resets_the_camera():
@@ -339,6 +351,12 @@ def test_the_edge_mirrors_dwell_and_notifications(tmp_path):
     with override_target(sqlite_path=str(path)):
         initialize_database()
         with connection() as db:
+            db.execute("INSERT INTO partners(id,name,created_at) VALUES('partner-1','P','now')")
+            db.execute("INSERT INTO customers(id,partner_id,name,email,status,created_at) VALUES('cust-1','partner-1','C','c@example.test','active','now')")
+            db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-1','cust-1','Home','now')")
+            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-1','cust-1','site-1','AIC-1','now')")
+            db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) "
+                       "VALUES('cam-1','cust-1','site-1','appl-1','Front Door',1,'configured','now')")
             base = {"customer_id": "cust-1", "site_id": "site-1", "camera_id": "cam-1", "name": "Porch", "geometry": ZONE, "updated_at": "x"}
             edge_camera_sync._reconcile_analytics_rules(db, "appl-1", [
                 {**base, "id": "new", "rule_type": "loitering", "dwell_seconds": 120, "notifications_enabled": False},

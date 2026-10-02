@@ -1,8 +1,10 @@
 /* Shared event readiness and cancellable playback. No media bytes are proxied. */
 (function(root){
   const escape=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  function state(hasClip,timestamp,now=Date.now()){
+  function state(hasClip,timestamp,now=Date.now(),status=null){
     if(hasClip)return 'ready';
+    if(status==='pending')return 'processing';  // durable: the appliance is still delivering it
+    if(status==='failed'||status==='available')return 'unavailable';
     const text=String(timestamp||'');
     const age=now-new Date(/Z$|[+-]\d\d:?\d\d$/.test(text)?text:text+'Z').getTime();
     return age>=0&&age<120000?'processing':'unavailable';

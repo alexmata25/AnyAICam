@@ -37149,6 +37149,14 @@ async def _build_and_upload_owned_analytics_clip(
         print(f"Analytics event {event_id} camera {camera_number}: clip build/upload failed: {type(error).__name__}: {error}")
     finally:
         await asyncio.to_thread(event_media_sharing.owner_finished, event_id, camera_number, registered)
+        if not registered:
+            # No clip and none queued for retry: the portal must say "no clip",
+            # not "being saved" (report_media_failed leaves outbox jobs alone).
+            try:
+                from event_media_uploader import report_media_failed
+                await asyncio.to_thread(report_media_failed, event_id=event_id, camera_number=camera_number, reason="clip_unavailable")
+            except Exception as report_error:
+                print(f"Analytics event {event_id}: could not report the missing clip: {type(report_error).__name__}")
 
 
 def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None,
@@ -54887,7 +54895,7 @@ def _customer_detection_events(request: Request, *, limit: int | None = None) ->
     select = (
         'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
         'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
-        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, de.media_status AS media_status, '
         'dem.thumbnail_s3_key AS thumbnail_s3_key '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
@@ -54929,8 +54937,8 @@ def _customer_detection_events(request: Request, *, limit: int | None = None) ->
                 if row["thumbnail_s3_key"] else None
             ),
             "linked_recording": None,
-            "has_event_clip": bool(row["has_event_clip"]),
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
@@ -55006,7 +55014,7 @@ def _customer_investigate_events(request: Request) -> list[dict] | None:
     select = (
         'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
         'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
-        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, de.media_status AS media_status, '
         'dem.thumbnail_s3_key AS thumbnail_s3_key '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
@@ -55066,8 +55074,8 @@ def _customer_investigate_events(request: Request) -> list[dict] | None:
                 if row["thumbnail_s3_key"] else None
             ),
             "linked_recording": None,
-            "has_event_clip": bool(row["has_event_clip"]),
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
@@ -55196,7 +55204,7 @@ def _customer_investigate_search(
         rows = db.execute(
             'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
             'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
-            'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+            'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, de.media_status AS media_status, '
             'dem.thumbnail_s3_key AS thumbnail_s3_key '
             f'{from_clause} ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ? OFFSET ?',
             params + [limit, offset],
@@ -55217,7 +55225,7 @@ def _customer_investigate_search(
                 f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
                 if row["thumbnail_s3_key"] else None
             ),
-            "has_event_clip": bool(row["has_event_clip"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
             "plate_number": None,
             "vehicle_color": None,
         }
@@ -121571,7 +121579,7 @@ def _naive_utc_timestamp_to_epoch_ms(raw_timestamp) -> int | None:
 
 
 def _is_customer_event_pending(event: dict) -> bool:
-    return customer_event_media_state(event.get('has_event_clip'),event.get('timestamp')) == 'processing'
+    return customer_event_media_state(event.get('has_event_clip'),event.get('timestamp'),status=event.get('media_status')) == 'processing'
 
 
 def _customer_event_playback_href(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
@@ -122015,8 +122023,8 @@ def _render_customer_events(request: Request) -> str:
   // false for all of them regardless of whether a real response was
   // ever received, and "is anything still pending" looked false even
   // while every row was still visibly showing "Processing…".
-  function mediaStateFor(hasClip,timestamp){
-    return AnyAiCamEventMedia.state(hasClip,timestamp);
+  function mediaStateFor(hasClip,timestamp,status){
+    return AnyAiCamEventMedia.state(hasClip,timestamp,Date.now(),status);
   }
 
   // JS mirror of _customer_event_playback_href() (main.py) -- same
@@ -122086,7 +122094,7 @@ def _render_customer_events(request: Request) -> str:
     if(!event||!event.id)return null;
     const tbody=document.querySelector('#events-table tbody');
     if(!tbody)return null;
-    const mediaState=mediaStateFor(event.has_event_clip,event.timestamp);
+    const mediaState=mediaStateFor(event.has_event_clip,event.timestamp,event.media_status);
     const thumbHtml=eventThumbnailCellHtml(event,mediaState);
     const actionHtml=eventActionCellHtml(event.camera_id,event.timestamp,event.id,event.has_event_clip,mediaState);
     const existing=tbody.querySelector(`tr[data-event-id="${CSS.escape(String(event.id))}"]`);
@@ -143943,7 +143951,7 @@ def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
     with connection() as db:
         rows = db.execute(
             "SELECT de.id, de.event_type, de.event_timestamp, "
-            "CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip "
+            "CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip , de.media_status AS media_status "
             "FROM detection_events de "
             "LEFT JOIN detection_event_media dem ON dem.detection_event_id=de.id "
             "WHERE de.camera_id=? AND de.event_timestamp>=? AND de.event_timestamp<? "
@@ -143955,8 +143963,8 @@ def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
             "id": row["id"],
             "event_type": row["event_type"],
             "timestamp": row["event_timestamp"],
-            "has_event_clip": bool(row["has_event_clip"]),
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
         }
         for row in rows
     ]
@@ -144007,7 +144015,7 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
     select = (
         'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
         'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
-        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, de.media_status AS media_status, '
         'dem.thumbnail_s3_key AS thumbnail_s3_key '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
@@ -144052,8 +144060,8 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
                 if row["thumbnail_s3_key"] else None
             ),
             "linked_recording": None,
-            "has_event_clip": bool(row["has_event_clip"]),
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
             # Additive, customer-ready fields (2026-09-25) for the Dashboard:
             # friendly type, epoch-ms time (the stored value is naive UTC,
             # which browsers parse as local time), a real confidence only,

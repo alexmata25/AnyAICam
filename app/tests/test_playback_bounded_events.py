@@ -58,6 +58,7 @@ def test_only_the_requested_date_is_returned(db_path):
         "event_type": "person",
         "timestamp": "2026-08-20T10:00:00",
         "has_event_clip": False,
+        "media_status": None,
         "media_state": "unavailable",
     }]
 
@@ -84,7 +85,7 @@ def test_returns_only_bounded_timeline_and_media_readiness_fields(db_path):
         _seed_event(conn, "ev-1", "cam-1", "truck", "2026-08-20T10:00:00")
         result = main._customer_camera_events("cam-1", "2026-08-20")
     assert set(result[0].keys()) == {
-        "id", "event_type", "timestamp", "has_event_clip", "media_state"
+        "id", "event_type", "timestamp", "has_event_clip", "media_status", "media_state"
     }
 
 

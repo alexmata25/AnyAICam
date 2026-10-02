@@ -145,6 +145,11 @@ def deliver_after_failure(child_id: str, camera_number: int, owner_id: str) -> N
     leave it without media rather than invent any."""
     if not any(job.get("event_id") == owner_id and job.get("kind") != "shared" for job in event_media_outbox.load()):
         logger.info("event_media_sharing.owner_without_media child=%s owner=%s", child_id, owner_id)
+        try:
+            from event_media_uploader import report_media_failed
+            report_media_failed(event_id=child_id, camera_number=camera_number, reason="owner_without_media")
+        except Exception as error:
+            logger.warning("event_media_sharing.failure_report_failed child=%s error=%s", child_id, type(error).__name__)
         return
     from event_media_uploader import RETRY_SECONDS
     event_media_outbox.put({

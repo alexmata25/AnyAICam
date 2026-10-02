@@ -622,6 +622,32 @@ def register_shared_event_media(
     return False
 
 
+def report_media_failed(*, event_id: str, camera_number: int, reason: str) -> bool:
+    """No clip will ever exist for this event (none could be built, or the
+    clip it was to share was never kept): tell the cloud, so the portal
+    shows "no clip" instead of "being saved" forever. Only for a clip that
+    is truly gone -- a clip still in the outbox is pending, not failed, and
+    keeps being retried. Best effort: if this cannot be delivered the
+    event simply stays 'pending'."""
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        return False
+    if any(str(job.get("event_id")) == str(event_id) for job in event_media_outbox.load()):
+        return False  # still queued for retry
+    recording_upload._refresh_camera_map()
+    identity = recording_upload._camera_identity(camera_number)
+    if not identity:
+        return False
+    camera_id = identity["camera_id"]
+    if not _ensure_detection_event_synced(event_id, camera_id):
+        return False
+    response = recording_upload._control_plane_post(
+        f"/api/appliance/analytics/{camera_id}/events/{event_id}/media/failed", {"reason": reason})
+    delivered = isinstance(response, dict) and response.get("status") in {"accepted", "ignored"}
+    logger.info("event_media.failure_reported event_id=%s camera=%s reason=%s delivered=%s",
+                event_id, camera_number, reason, delivered)
+    return delivered
+
+
 def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     """Retry durable jobs on the next local worker tick; never contacts a
     service unless the normal event-media feature gate is enabled."""

@@ -289,7 +289,8 @@ def test_oldest_events_are_synced_first(tmp_path, monkeypatch):
 
 def test_payload_contains_only_the_seven_allowlisted_fields(tmp_path):
     payload = asy._build_payload(_event("evt-1"))
-    assert set(payload.keys()) == {"local_event_id", "event_type", "confidence", "object_count", "detections", "event_timestamp", "parent_local_event_id"}
+    assert set(payload.keys()) == {"local_event_id", "event_type", "confidence", "object_count", "detections", "event_timestamp", "parent_local_event_id",
+                                  "media_expected"}  # 2026-10-01: whether a clip is coming (durable clip state)
 
 
 def test_payload_forwards_parent_local_event_id_only_when_the_local_event_has_one(tmp_path):

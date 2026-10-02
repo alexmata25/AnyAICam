@@ -311,3 +311,162 @@ def test_security_settings_list_only_installed_cameras_not_slot_placeholders(clo
         placeholder = db.execute("SELECT status, device_key FROM cameras WHERE id='slot-6'").fetchone()
     assert [c["id"] for c in overview["cameras"]] == ["yard"]
     assert tuple(placeholder) == ("pending_installation", None)  # the placeholder row itself is untouched
+
+
+
+# ---------------------------------------------------------------- arming lifecycle through the worker (2026-10-01)
+
+def test_a_person_who_entered_while_disarmed_does_not_alarm_when_the_site_is_armed(edge_db):
+    security_modes.store_synced_state(edge_db, "cust-1", "site-1", "away", {}, None)
+    for i, x in enumerate([700, 650], 1):          # armed: seen outside
+        assert worker.evaluate_security_lines(1, "yard", [SEC_RULE], [person(x)], 1000, 1000, now=float(i * 2)) == []
+    security_modes.store_synced_state(edge_db, "cust-1", "site-1", "disarmed", {}, None)
+    for i, x in enumerate([520, 400, 380], 3):     # walks in while disarmed
+        assert worker.evaluate_security_lines(1, "yard", [SEC_RULE], [person(x)], 1000, 1000, now=float(i * 2)) == []
+    security_modes.store_synced_state(edge_db, "cust-1", "site-1", "away", {}, None)
+    for i, x in enumerate([370, 360, 350], 6):     # re-armed while still inside
+        assert worker.evaluate_security_lines(1, "yard", [SEC_RULE], [person(x)], 1000, 1000, now=float(i * 2)) == []
+    fired = []
+    for i, x in enumerate([700, 650, 520, 400, 380], 20):  # a new armed crossing
+        fired += worker.evaluate_security_lines(1, "yard", [SEC_RULE], [person(x)], 1000, 1000, now=float(i * 2))
+    assert len(fired) == 1
+
+
+def test_deleting_every_security_line_clears_crossing_state(edge_db):
+    security_modes.store_synced_state(edge_db, "cust-1", "site-1", "away", {}, None)
+    worker.evaluate_security_lines(1, "yard", [SEC_RULE], [person(700)], 1000, 1000, now=1.0)
+    assert security_rules._state
+    worker.evaluate_security_lines(1, "yard", [], [person(700)], 1000, 1000, now=2.0)
+    assert security_rules._state == {}
+
+
+SEC_RULE_2 = dict(SEC_RULE, id="sec-2", name="Side gate", geometry=[{"x": 0.55, "y": 0.0}, {"x": 0.55, "y": 1.0}])
+
+
+def test_overlapping_lines_give_one_alarm_event_that_records_both_lines(edge_db, monkeypatch):
+    import main
+    from datetime import datetime
+    security_modes.store_synced_state(edge_db, "cust-1", "site-1", "away", {}, None)
+    fired = []
+    for i, x in enumerate([800, 750, 650, 520, 400, 380, 360], 1):
+        fired += worker.evaluate_security_lines(1, "yard", [SEC_RULE, SEC_RULE_2], [person(x)], 1000, 1000, now=float(i * 2))
+    assert len(fired) == 1
+    saved = []
+    monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
+    monkeypatch.setattr(main, "append_analytics_event", saved.append)
+    monkeypatch.setattr(main, "_analytics_media_owner", lambda *a, **k: None)
+    record = worker.persist_rule_event(1, fired[0], datetime(2026, 10, 1, 3, 0), None)
+    assert record["event_type"] == "intrusion_alarm"
+    assert set(record["matched_rule_ids"]) == {"sec-1", "sec-2"}
+    assert set(record["matched_rule_names"]) == {"Back fence", "Side gate"}
+    import analytics_sync
+    detail = analytics_sync._build_payload(dict(record, timestamp="2026-10-01T03:00:00"))["detections"][0]
+    assert detail["track_id"] == "t1" and set(detail["matched_rule_ids"]) == {"sec-1", "sec-2"}
+
+
+# ---------------------------------------------------------------- cloud: one urgent fan-out per intrusion
+
+def _cloud_alarm(client, local_id, track, timestamp):
+    import secrets as _secrets
+    import time as _time
+    headers = {"X-Appliance-Id": "appl-1", "X-Request-Timestamp": str(int(_time.time())),
+               "X-Request-Nonce": _secrets.token_hex(16), "Authorization": "Bearer cred-1"}
+    body = {"local_event_id": local_id, "event_type": "intrusion_alarm", "confidence": 0.9, "object_count": 1,
+            "detections": [{"rule_id": "sec-1", "rule_name": "INTRUSION ALARM (Back fence)", "track_id": track}],
+            "event_timestamp": timestamp}
+    return client.post("/api/appliance/analytics/yard/events", headers=headers, json=body)
+
+
+@pytest.fixture()
+def alarm_cloud(tmp_path, monkeypatch):
+    import appliance_cloud
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from partner_db import password_hash
+    monkeypatch.setattr(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True)
+    appliance_cloud.request_limiter.events.clear()
+    with override_target(sqlite_path=tmp_path / "alarm-cloud.db"):
+        initialize_database()
+        _seed_customer()
+        with connection() as db:
+            db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES('c1','appl-1',?,'now')",
+                       (password_hash("cred-1"),))
+        sent = []
+        monkeypatch.setattr(appliance_cloud, "fanout_appliance_event", lambda *a, **k: sent.append(a[1]) or 1)
+        app = FastAPI()
+        appliance_cloud.register_appliance_cloud_routes(app, shell=lambda *a, **k: "")
+        with TestClient(app) as client:
+            yield client, sent
+    appliance_cloud.request_limiter.events.clear()
+
+
+def test_the_cloud_sends_one_urgent_alert_per_physical_intrusion(alarm_cloud):
+    client, sent = alarm_cloud
+    assert _cloud_alarm(client, "a1", "t1", "2026-10-01T03:00:00").json()["status"] == "accepted"
+    assert _cloud_alarm(client, "a2", "t1", "2026-10-01T03:00:20").json()["status"] == "accepted"  # same person, overlapping line
+    assert len(sent) == 1 and sent[0]["severity"] == "critical"
+    with connection() as db:  # both events are kept, for audit
+        assert db.execute("SELECT COUNT(*) FROM detection_events WHERE event_type='intrusion_alarm'").fetchone()[0] == 2
+    assert _cloud_alarm(client, "a3", "t9", "2026-10-01T03:00:30").json()["status"] == "accepted"  # a different person
+    assert _cloud_alarm(client, "a4", "t1", "2026-10-01T03:10:00").json()["status"] == "accepted"  # same track, long after
+    assert len(sent) == 3
+
+
+def test_an_alarm_without_a_track_is_never_suppressed(alarm_cloud):
+    client, sent = alarm_cloud
+    _cloud_alarm(client, "a1", None, "2026-10-01T03:00:00")
+    _cloud_alarm(client, "a2", None, "2026-10-01T03:00:05")
+    assert len(sent) == 2
+
+
+# ---------------------------------------------------------------- the clip is never claimed before it exists
+
+def _alarm_event(media_status=None, clip=False):
+    with connection() as db:
+        db.execute("INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at,media_status) "
+                   "VALUES('alarm-1','cust-1','site-1','appl-1','yard','alarm-1','intrusion_alarm','2026-09-28T03:00:00','2026-09-28T03:00:01',?)",
+                   (media_status,))
+        if clip:
+            db.execute("INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,created_at) "
+                       "VALUES('m1','alarm-1','cust-1','yard','recordings/x.mp4','a','b','now')")
+
+
+@pytest.mark.parametrize("status,clip,line,link", [
+    ("pending", False, "still being saved", "Open Events"),
+    ("failed", False, "No clip could be saved", None),
+    ("available", True, "The clip is saved in Events.", "View event clip"),
+    (None, False, "Check Events for a clip", "Open Events"),
+])
+def test_the_alarm_banner_says_what_is_true_about_the_clip(cloud_db, status, clip, line, link):
+    import live_view_page
+    _seed_customer()
+    _alarm_event(status, clip)
+    banner = live_view_page._intrusion_alarm_banner(_Req("alarm-1"), "yard", {"customer_id": "cust-1"})
+    assert line in banner and 'href="tel:911"' in banner
+    if link:
+        assert link in banner
+    else:
+        assert "View event clip" not in banner and "Open Events" not in banner
+    if not clip:
+        assert "The clip is saved" not in banner
+    assert 'datetime="2026-09-28T03:00:00Z"' in banner  # shown in the viewer's own time zone
+
+
+def test_a_pending_clip_email_does_not_promise_a_video(cloud_db):
+    _seed_customer()
+    _alarm_event("pending")
+    with connection() as db:
+        db.execute("INSERT INTO notifications(id,user_id,customer_id,camera_id,event_id,event_type,severity,title,message,timestamp,created_at) "
+                   "VALUES('n1','owner-1','cust-1','yard','alarm-1','intrusion_alarm','critical','INTRUSION ALARM','x','2026-09-28T03:00:00','now')")
+        context = notification_email.alert_context(db, "n1")
+    assert context["media_status"] == "pending" and context["has_clip"] is False
+    email = notification_email.build_alert_email(context, base_url="https://portal.example.test")
+    assert "still being saved" in email["text"] and "Open live camera" in email["text"]  # the urgent alert still goes out now
+    person_email = notification_email.build_alert_email(dict(context, event_type="person"), base_url="https://portal.example.test")
+    assert "View event video" not in person_email["text"]
+    failed = notification_email.build_alert_email(dict(context, event_type="person", media_status="failed"),
+                                                  base_url="https://portal.example.test")
+    assert "No video clip could be saved" in failed["text"]
+    ready = notification_email.build_alert_email(dict(context, event_type="person", media_status="available", has_clip=True),
+                                                 base_url="https://portal.example.test")
+    assert "still being saved" not in ready["text"]

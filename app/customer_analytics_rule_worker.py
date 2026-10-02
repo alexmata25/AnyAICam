@@ -129,13 +129,17 @@ def evaluate_security_lines(camera_number, camera_id, rules, tracked, frame_widt
     is armed in the site's current mode (security_modes; the local copy
     the cloud synced, so an outage never silently disarms). Disarmed or
     not participating: evaluated not at all."""
+    import security_rules
     security = [r for r in rules if r["analytic_type"] == "security_line"]
     if not security:
+        security_rules.note_arm_state(camera_number, None)  # no lines left: nothing may carry over
         return []
     import security_modes
-    import security_rules
     with connection() as db:
         armed, state = security_modes.camera_armed_now(db, camera_id)
+    # Disarmed, or a different armed mode than last time: crossing state is
+    # reset, so only a NEW armed outside-to-inside crossing can alarm.
+    security_rules.note_arm_state(camera_number, state["mode"] if armed and state else None)
     if not armed:
         return []
     cooldown = (state or {}).get("settings", {}).get("alarm_cooldown_seconds")
@@ -268,6 +272,10 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
     if analytic_type == "intrusion_alarm":
         record["severity"] = "critical"
         record["security_mode"] = fired.get("security_mode")
+        # One alarm per physical intrusion: every security line this person
+        # confirmed in the same pass, for audit.
+        record["matched_rule_ids"] = list(fired.get("matched_rule_ids") or [fired["rule_id"]])
+        record["matched_rule_names"] = list(fired.get("matched_rule_names") or [fired.get("zone_name")])
     if analytic_type == "loitering":
         # How long the person had stayed when it fired, and the rule's own
         # threshold -- shown on the event and sent to the cloud with it.
@@ -284,6 +292,10 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
     from main import _analytics_media_owner, _schedule_owned_analytics_clip
     media_owner = _analytics_media_owner(camera_number, record["id"], now)
     event_media_sharing.link(record, media_owner)
+    # Tells the cloud a clip is on its way (its own, or a shared one), so
+    # the portal shows "being saved" -- never "saved" -- until it is
+    # registered, or "no clip" if it is reported lost.
+    record["media_expected"] = bool(media_owner)
     append_analytics_event(record)
     if media_owner == record["id"]:
         _schedule_owned_analytics_clip(record["id"], camera_number, now, thumbnail_url)

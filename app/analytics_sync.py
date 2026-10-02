@@ -528,6 +528,12 @@ def _build_payload(event: dict) -> dict:
             "rule_id": event.get("rule_id"),
             "direction": event.get("direction"),
         }]
+        if str(event.get("event_type") or "").strip() == "intrusion_alarm":
+            # The person (edge track) and every line they crossed: the cloud
+            # sends one urgent alert per physical intrusion.
+            payload_detections[0]["track_id"] = event.get("track_id")
+            payload_detections[0]["matched_rule_ids"] = event.get("matched_rule_ids")
+            payload_detections[0]["matched_rule_names"] = event.get("matched_rule_names")
     # Loitering (2026-10-01): the rule (the cloud looks up its notification
     # setting by rule_id), the zone, and how long the person stayed.
     if str(event.get("event_type") or "").strip() == "loitering" and payload_detections is None:
@@ -563,6 +569,7 @@ def _build_payload(event: dict) -> dict:
         "detections": payload_detections,
         "event_timestamp": str(event.get("timestamp") or "").strip(),
         "parent_local_event_id": _parent_local_event_id(event),
+        "media_expected": bool(event.get("media_expected")),
     }
 
 

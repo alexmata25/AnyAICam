@@ -911,23 +911,48 @@ def _intrusion_alarm_banner(request: Request, camera_id: str, identity: dict) ->
         return ''
     with connection() as db:
         event = db.execute(
-            "SELECT id,event_timestamp FROM detection_events WHERE id=? AND camera_id=? AND customer_id=? AND event_type='intrusion_alarm'",
+            "SELECT de.id,de.event_timestamp,de.media_status,"
+            "(SELECT 1 FROM detection_event_media m WHERE m.detection_event_id=de.id AND length(coalesce(m.s3_key,''))>0) AS has_clip "
+            "FROM detection_events de WHERE de.id=? AND de.camera_id=? AND de.customer_id=? AND de.event_type='intrusion_alarm'",
             (alarm_id, camera_id, identity.get('customer_id')),
         ).fetchone()
     if not event:
         return ''
-    when = escape(str(event['event_timestamp'] or '')[:19].replace('T', ' '))
+    # Shown in the viewer's own time zone (the script below); the server's
+    # rendering is only the no-script fallback.
+    raw = str(event['event_timestamp'] or '')
+    iso = raw if raw.endswith('Z') or '+' in raw[10:] else raw + 'Z'
+    try:
+        from notification_email import local_time_label
+        fallback = local_time_label(raw)
+    except Exception:
+        fallback = raw[:16].replace('T', ' ')
+    when = f'<time class="alarm-time" datetime="{escape(iso, quote=True)}">{escape(fallback)}</time>'
+    # The alarm itself is sent at once; its clip arrives later. Say what is
+    # actually true about the clip right now (2026-10-01).
+    events_href = f'/events?camera={quote(camera_id, safe="")}'
+    if event['has_clip']:
+        clip_line, clip_link = 'The clip is saved in Events.', f'<a class="ghost-button" href="{events_href}">View event clip</a>'
+    elif event['media_status'] == 'failed':
+        clip_line, clip_link = 'No clip could be saved for this alarm.', ''
+    elif event['media_status'] == 'pending':
+        clip_line, clip_link = 'Its clip is still being saved and will appear in Events.', f'<a class="ghost-button" href="{events_href}">Open Events</a>'
+    else:
+        clip_line, clip_link = 'Check Events for a clip of it.', f'<a class="ghost-button" href="{events_href}">Open Events</a>'
     return (
         '<section class="panel" role="alert" id="intrusion-alarm-banner" '
         'style="border:2px solid #b42318;background:rgba(180,35,24,.14)">'
         '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between">'
         f'<div><h2 style="margin:0;color:#f97066">INTRUSION ALARM</h2>'
-        f'<div class="health-detail">A person crossed into a protected area at {when}. The clip is saved in Events.</div></div>'
+        f'<div class="health-detail">A person crossed into a protected area at {when}. {clip_line}</div></div>'
         '<div style="display:flex;gap:8px;flex-wrap:wrap">'
         '<button type="button" class="ghost-button" onclick="var m=document.querySelector(&#39;.talk-mic&#39;);if(m){m.scrollIntoView({block:&#39;center&#39;});m.focus();}">Talk (hold the mic button)</button>'
-        f'<a class="ghost-button" href="/events?camera={quote(camera_id, safe="")}">View event clip</a>'
+        f'{clip_link}'
         '<a href="tel:911" style="background:#b42318;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none;font-weight:700">Call 911</a>'
         '</div></div></section>'
+        '<script>(function(){var t=document.querySelector("#intrusion-alarm-banner .alarm-time");if(!t)return;'
+        'var d=new Date(t.getAttribute("datetime"));if(isNaN(d))return;'
+        't.textContent=d.toLocaleString([],{weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});})();</script>'
     )
 
 
