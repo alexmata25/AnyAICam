@@ -197,12 +197,26 @@ class RestrictedBoundary:
         return result
 
     def unlock_door(self, identity, door_id):
-        # Only doors on allowed cameras (matched by exact name, like the boundary's own door lookup).
-        if str(door_id).startswith("camera-name:"):
-            requested = " ".join(str(door_id).removeprefix("camera-name:").lower().split())
-            if requested not in self._allowed_labels:
-                from aaco import Clarification
-                return Clarification(CAMERA_NOT_ALLOWED_MESSAGE)
+        """Only doors on allowed cameras (2026-10-02, Codex launch blocker).
+
+        The VMS boundary resolves every token form (camera-name:, camera-N,
+        ...) to the door's camera id and checks it against allowed_ids
+        there, before any authorization or relay call -- a name check here
+        alone let "camera-2" through to an excluded camera. An inner
+        boundary that cannot take allowed_ids fails closed: only an exact,
+        allowed camera name passes."""
+        import inspect
+        from aaco import Clarification
+        try:
+            scoped = "allowed_ids" in inspect.signature(self._inner.unlock_door).parameters
+        except (TypeError, ValueError):
+            scoped = False
+        if scoped:
+            return self._inner.unlock_door(identity, door_id, allowed_ids=set(self._allowed_ids))
+        token = str(door_id)
+        requested = " ".join(token.removeprefix("camera-name:").lower().split())
+        if not token.startswith("camera-name:") or requested not in self._allowed_labels:
+            return Clarification(CAMERA_NOT_ALLOWED_MESSAGE)
         return self._inner.unlock_door(identity, door_id)
 
 

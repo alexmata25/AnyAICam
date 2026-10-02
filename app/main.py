@@ -155918,7 +155918,7 @@ class _ClassicAacoBoundary:
             return [door for door in doors if door.get("camera_number") == number]
         return []
 
-    def unlock_door(self, identity: dict, door_id: str) -> dict:
+    def unlock_door(self, identity: dict, door_id: str, *, allowed_ids: set[str] | None = None) -> dict:
         """AACO's own path to the exact same authorization/execution/
         audit code the manual "Unlock Door" button uses
         (door_access.py) -- never a second, parallel relay-control
@@ -155954,6 +155954,24 @@ class _ClassicAacoBoundary:
         door = matches[0]
 
         now = datetime.now()
+        # AACO camera scope (2026-10-02, Codex launch blocker): enforced on
+        # the door's RESOLVED camera id, whatever token form named it
+        # (camera-name:, camera-N, padded/signed numbers...). Only a
+        # camera-name: token used to be checked, so "camera-2" reached the
+        # relay for a camera AACO was told not to use. An excluded camera
+        # never reaches _authorized_door_camera() or the relay; the refusal
+        # is audited like every other denied unlock.
+        if allowed_ids is not None and door["id"] not in allowed_ids:
+            import aaco_settings
+            with connection() as audit_db:
+                door_access.record_door_access_event(
+                    audit_db, customer_id=identity["customer_id"], camera_id=door["id"],
+                    door_name="", relay_channel=None, trigger_type="aaco",
+                    actor_user_id=None, actor_email=identity["email"],
+                    authorization_result="denied", relay_result="skipped", success=False,
+                    error="aaco_camera_scope", now=now,
+                )
+            return Clarification(aaco_settings.CAMERA_NOT_ALLOWED_MESSAGE)
         try:
             with connection() as db:
                 camera, user_id = door_access._authorized_door_camera(db, door["id"], identity)
