@@ -5441,3 +5441,22 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
 
 - **Why My subscription says "will appear here when it is released":** the download feature (`customer_downloads.py`, licensed-owner-only route, private `downloads` storage) is on golden, but no installer has ever been published (`latest_vms_installer()` is `None` on staging; staging storage is local, `/app/recordings/storage`). Publishing is the operator step `python -m customer_downloads publish <pkg> <commit> <version>`.
 - **Launch blocker fixed:** the page told customers to run `anyaicam-setup`, the administrator Cloud ID + activation-token flow a customer never receives. Its Portal URL default `http://127.0.0.1:8000` is the appliance's own VMS, not the cloud. The page now gives `install.sh --product-mode=<plan>`, `validate.sh`, `anyaicam-setup --claim --portal-url=<ANYAICAM_PUBLIC_URL>` and a link to Claim an appliance. The agent accepts `--portal-url` (production mode, no prompts) and keeps the old prompts without it.
+
+## Pre-launch: customer account users / household members (inspected 2026-10-01, NOT built)
+
+**Already exists (reuse, do not duplicate):**
+- `partner_users` with role `customer_viewer` under the owner's `customer_id`, plus an `identity_grants` row, so the appliance's cloud-delegated login recognises them.
+- Per-camera permissions in `customer_camera_permissions`: `can_live`, `can_playback`, `can_download`, `can_share`, `can_alerts`, `can_settings`, `can_talk`, `can_unlock`.
+- Camera access mode all/selected through owner-only `POST/DELETE /api/customer/users/{id}/camera-access`.
+- Per-door unlock access for viewers in Camera Settings (`/door-config/unlock-access`).
+- Viewers are already enforced in live view, playback, Talk, door unlock and notifications (`notification_engine` filters a viewer's alerts to their cameras).
+- Separate login with a temporary password and forced first-sign-in change (`must_change_password`).
+- Password reset, account unlock and change-email for customer users through the partner admin routes.
+
+**Missing:**
+1. **No customer-reachable way to add a user.** `POST /api/partner/users/invite` is gated by `require_partner_access` (partner roles only), so a `customer_owner` is refused even though its permission set includes `user.invite`. Today only a partner or admin can create a household member.
+2. **No customer UI:** no Account → Users / Household page (list, add, edit, remove or disable, resend).
+3. **Invitation is a temporary password by email** (`invitations.status='preview'`), not a single-use, expiring accept link. There is no SMS/phone invite.
+4. **No customer-facing permission editor.** The camera-access API exists but has no page. There are no permissions for People/Face Access management or Backup Mobile Access (the `customer_viewer` role has `facial.view` only).
+5. No owner-side remove or disable of a household user, and no audit view of it.
+- `/api/user-invites` (main.py) is the legacy local-VMS user system (`current_user()`), not cloud customer accounts. Do not extend it for this.
