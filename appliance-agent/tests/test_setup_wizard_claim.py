@@ -334,3 +334,73 @@ class ClaimMainOrchestrationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ClaimPortalOptionTests(unittest.TestCase):
+    """Customer install (2026-10-01): My subscription prints
+    `anyaicam-setup --claim --portal-url=<portal>`. The installer leaves the
+    agent pointed at http://127.0.0.1:8000 (the appliance's own VMS), so the
+    command -- not a prompt default -- must decide which cloud is claimed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = AgentConfig(config_dir=self.tmp.name, state_dir=self.tmp.name)
+        self.assertEqual(self.config.portal_url, 'http://127.0.0.1:8000')
+        self.assertEqual(self.config.mode, 'development')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_portal_url_option_sets_cloud_and_production_without_prompting(self):
+        with patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            setup_wizard._apply_portal_options(self.config, ['--claim', '--portal-url=https://portal.anyaicam.com/'])
+        self.assertEqual(self.config.portal_url, 'https://portal.anyaicam.com')
+        self.assertEqual(self.config.mode, 'production')
+
+    def test_space_separated_form_and_explicit_mode(self):
+        with patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            setup_wizard._apply_portal_options(self.config, ['--claim', '--portal-url', 'https://portal-staging.anyaicam.com', '--mode=development'])
+        self.assertEqual(self.config.portal_url, 'https://portal-staging.anyaicam.com')
+        self.assertEqual(self.config.mode, 'development')
+
+    def test_rejects_a_portal_url_that_is_not_a_web_address(self):
+        for bad in ('', 'portal.anyaicam.com', 'https://', 'ftp://x', 'https://a b'):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                setup_wizard._apply_portal_options(self.config, ['--claim', f'--portal-url={bad}'])
+        self.assertEqual(self.config.portal_url, 'http://127.0.0.1:8000')
+
+    def test_rejects_an_unknown_mode(self):
+        with self.assertRaises(SystemExit):
+            setup_wizard._apply_portal_options(self.config, ['--portal-url=https://p.example', '--mode=staging'])
+
+    def test_without_the_option_the_existing_prompts_are_unchanged(self):
+        answers = iter(['https://typed.example', 'production'])
+        with patch('builtins.input', side_effect=lambda _prompt: next(answers)):
+            setup_wizard._apply_portal_options(self.config, ['--claim'])
+        self.assertEqual((self.config.portal_url, self.config.mode), ('https://typed.example', 'production'))
+
+    def test_main_passes_the_command_line_to_claim(self):
+        seen = []
+        with patch.object(setup_wizard, 'claim_main', side_effect=lambda args: seen.append(list(args))), \
+             patch.object(setup_wizard.sys, 'argv', ['anyaicam-setup', '--claim', '--portal-url=https://p.example']):
+            setup_wizard.main()
+        self.assertEqual(seen, [['--claim', '--portal-url=https://p.example']])
+
+    def test_claim_uses_the_commanded_portal_for_every_cloud_call(self):
+        tmp_identity = self.config.installer_identity_file
+        tmp_identity.write_text(json.dumps({'appliance_id': '11111111-1111-4111-8111-111111111111'}), encoding='utf-8')
+        client = FakePortalClient(
+            begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}],
+            status=[{'status': 'claimed', 'claim_proof': 'p'}],
+            complete=[{'appliance_id': 'a1', 'cloud_id': 'C1', 'credential': 'cred', 'credential_id': 'cid', 'customer_id': 'cust-1', 'site_id': 'site-1', 'partner_id': None}],
+        )
+        finished = []
+        with patch.object(setup_wizard, 'AgentConfig') as agent_config_cls, \
+             patch.object(setup_wizard, 'PortalClient', return_value=client) as portal_cls, \
+             patch.object(setup_wizard, '_finish_enrollment', side_effect=lambda cfg, activated: finished.append(cfg.portal_url)), \
+             patch('builtins.input', side_effect=AssertionError('must not prompt')):
+            agent_config_cls.load.return_value = self.config
+            setup_wizard.claim_main(['--claim', '--portal-url=https://portal.anyaicam.com'])
+        portal_cls.assert_called_with('https://portal.anyaicam.com')
+        self.assertEqual(finished, ['https://portal.anyaicam.com'])
+        self.assertEqual(self.config.mode, 'production')
