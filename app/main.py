@@ -155611,6 +155611,20 @@ def _aaco_fuzzy_camera_matches(cameras: list[dict], requested: str) -> list[dict
     return [camera for score, camera in scored if score == best]
 
 
+def _aaco_exact_name_matches(cameras: list[dict], camera_token: str) -> list[dict]:
+    requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
+    return [camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested]
+
+
+def _aaco_numbered_labels(cameras: list[dict]) -> str:
+    """'Front Door (Camera 1) or Front Door (Camera 4)' -- the number is
+    what tells same-named cameras apart, and "camera 4" is a phrase AACO
+    understands as the customer's answer."""
+    labels = [f'{_camera_display_label(camera)} (Camera {camera["camera_number"]})' if camera.get("camera_number") is not None
+              else _camera_display_label(camera) for camera in cameras]
+    return ", ".join(labels[:-1]) + " or " + labels[-1] if len(labels) > 1 else "".join(labels)
+
+
 class _ClassicAacoBoundary:
     """Adapter from AACO's strict command schema to existing Classic VMS.
 
@@ -155646,9 +155660,16 @@ class _ClassicAacoBoundary:
         # of this, and _camera_ambiguity() for why this method (not the
         # fuzzy layer) is what decides whether an exact match already
         # exists before any fuzzy matching is even attempted.
+        #
+        # Two cameras with the same display name (2026-10-02, Codex
+        # review): no longer "the first one wins" -- an identical-name
+        # match is ambiguous, resolves to nothing here, and
+        # _camera_ambiguity() turns it into a question naming each camera
+        # by number. Live, Playback, event search and (via _door_matches)
+        # door unlock all ask instead of silently picking one.
         if camera_token.startswith("camera-name:"):
-            requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
-            return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
+            exact = _aaco_exact_name_matches(cameras, camera_token)
+            return exact[0] if len(exact) == 1 else None
         if camera_token.startswith("camera-"):
             try:
                 number = int(camera_token.removeprefix("camera-"))
@@ -155687,13 +155708,15 @@ class _ClassicAacoBoundary:
         unambiguous answer (or never run at all, because this already
         returned a Clarification)."""
         from aaco import Clarification
-
         if not camera_token.startswith("camera-name:") or cls._find_camera(cameras, camera_token):
             return None
+        exact = _aaco_exact_name_matches(cameras, camera_token)
+        if len(exact) > 1:
+            return Clarification(f"More than one camera is called {_camera_display_label(exact[0])}. "
+                                 f"Which one: {_aaco_numbered_labels(exact)}?")
         matches = _aaco_fuzzy_camera_matches(cameras, camera_token.removeprefix("camera-name:"))
         if len(matches) > 1:
-            names = ", ".join(_camera_display_label(camera) for camera in matches)
-            return Clarification(f"More than one camera matches that. Did you mean {names}?")
+            return Clarification(f"More than one camera matches that. Did you mean {_aaco_numbered_labels(matches)}?")
         return None
 
     def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
@@ -155948,7 +155971,7 @@ class _ClassicAacoBoundary:
             doors = door_access.customer_door_cameras(db, identity["customer_id"])
         matches = self._door_matches(doors, door_id)
         if len(matches) > 1:
-            return Clarification("More than one door matches that name. Try the camera name or number instead.")
+            return Clarification(f"More than one door is called that. Which one: {_aaco_numbered_labels(matches)}?")
         if not matches:
             raise PermissionError("Door is unavailable.")
         door = matches[0]
