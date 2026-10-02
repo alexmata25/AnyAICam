@@ -35,7 +35,7 @@ logger = logging.getLogger("anyaicam.notification_email")
 
 # Event types whose alert is about something a camera captured, so the
 # cloud receives a thumbnail/clip for it shortly after the event.
-MEDIA_EVENT_TYPES = frozenset({"person", "vehicle", "smart_motion", "motion", "ppe", "lpr", "facial_recognition", "people_counting"})
+MEDIA_EVENT_TYPES = frozenset({"person", "vehicle", "smart_motion", "motion", "ppe", "lpr", "facial_recognition", "people_counting", "loitering"})
 MEDIA_WAIT_SECONDS = max(0, int(os.environ.get("ANYAICAM_ALERT_EMAIL_MEDIA_WAIT_SECONDS", "180")))
 THUMBNAIL_CID = "event-thumbnail"
 DEFAULT_DISPLAY_TIMEZONE = "America/Chicago"  # main.APPLIANCE_TIMEZONE
@@ -103,6 +103,7 @@ def alert_context(db, notification_id: str) -> dict | None:
     context = {key: row[key] for key in row.keys()}
     context["thumbnail_s3_key"] = None
     context["has_clip"] = False
+    context["media_status"] = None
     if context["event_type"] == "aac_voice_call" and context["event_id"]:
         try:
             call = db.execute("SELECT thumbnail_s3_key FROM aac_voice_call_events WHERE id = ?", (context["event_id"],)).fetchone()
@@ -118,7 +119,27 @@ def alert_context(db, notification_id: str) -> dict | None:
         if media:
             context["thumbnail_s3_key"] = media["thumbnail_s3_key"] or None
             context["has_clip"] = bool(media["s3_key"])
+        try:
+            status = db.execute("SELECT media_status FROM detection_events WHERE id = ?", (context["event_id"],)).fetchone()
+            context["media_status"] = status["media_status"] if status else None
+        except Exception:
+            pass  # a database without the column: no status, as before
     return context
+
+
+def clip_note(context: dict) -> str:
+    """What is true about the event's clip when the email is sent
+    (detection_events.media_status). Never says a clip is saved before it
+    is registered; urgent alarms are sent at once, so theirs is often
+    still on its way."""
+    if context.get("has_clip"):
+        return ""
+    status = context.get("media_status")
+    if status == "pending":
+        return "The video clip is still being saved. Open the event in a few minutes to watch it."
+    if status == "failed":
+        return "No video clip could be saved for this event."
+    return ""
 
 
 def media_ready(context: dict) -> bool:
@@ -222,7 +243,7 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     elif category == "alarm":
         button = "Open live camera"
     elif path.startswith(("/playback", "/events")):
-        button = "View event video"
+        button = "View event video" if context.get("has_clip") else "View event"
     elif path.endswith("/live"):
         button = "View camera"
     else:
@@ -255,6 +276,9 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     if message and message not in (headline, context.get("title")):
         lines.append("")
         lines.append(message)
+    note = clip_note(context)
+    if note:
+        lines += ["", note]
     lines += ["", f"{button}: {link}"]
     if category == "alarm":
         # One tap to the phone dialer; AnyAiCam never calls 911 itself.
@@ -283,6 +307,8 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
                   f'style="display:block;width:100%;max-width:560px;height:auto;border-radius:8px;margin:12px 0">') if image else ""
     message_html = (f'<p style="color:#344054;margin:12px 0">{esc(message)}</p>'
                     if message and message not in (headline, context.get("title")) else "")
+    if note:
+        message_html += f'<p style="color:#667085;margin:12px 0">{esc(note)}</p>'
     button_html = (
         f'<a href="{esc(link, quote=True)}" style="background:{accent};color:#ffffff;padding:12px 18px;border-radius:6px;'
         f'text-decoration:none;display:inline-block;font-weight:bold;margin:0 8px 8px 0">{esc(button)}</a>'

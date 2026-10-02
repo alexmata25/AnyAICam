@@ -72,7 +72,7 @@ CUSTOMER_ANALYTICS_RULE_INTERVAL_SECONDS = max(0.5, float(os.environ.get("CUSTOM
 # The rule types this worker evaluates. The same table also stores People
 # Counting's own counting line ("people_counting"), which only
 # people_counting_worker() (main.py) reads.
-EVALUATED_RULE_TYPES = frozenset({"intrusion", "line_crossing", "security_line"})
+EVALUATED_RULE_TYPES = frozenset({"intrusion", "line_crossing", "security_line", "loitering"})
 
 
 def camera_rules_entitled(identity: dict | None) -> bool:
@@ -98,7 +98,8 @@ def load_rules_for_camera(camera_id: str) -> list[dict]:
     not the only one."""
     with connection() as db:
         raw_rules = db.execute(
-            "SELECT id,rule_type,name,direction,geometry_json,enabled FROM customer_analytics_rules WHERE camera_id=?",
+            "SELECT id,rule_type,name,direction,geometry_json,enabled,dwell_seconds,notifications_enabled "
+            "FROM customer_analytics_rules WHERE camera_id=?",
             (camera_id,),
         ).fetchall()
     rules = []
@@ -117,6 +118,8 @@ def load_rules_for_camera(camera_id: str) -> list[dict]:
             "confidence_threshold": 0.0,
             "enabled": True,
             "geometry": geometry,
+            "dwell_seconds": row["dwell_seconds"],
+            "notifications_enabled": bool(row["notifications_enabled"]) if row["notifications_enabled"] is not None else True,
         })
     return rules
 
@@ -126,13 +129,17 @@ def evaluate_security_lines(camera_number, camera_id, rules, tracked, frame_widt
     is armed in the site's current mode (security_modes; the local copy
     the cloud synced, so an outage never silently disarms). Disarmed or
     not participating: evaluated not at all."""
+    import security_rules
     security = [r for r in rules if r["analytic_type"] == "security_line"]
     if not security:
+        security_rules.note_arm_state(camera_number, None)  # no lines left: nothing may carry over
         return []
     import security_modes
-    import security_rules
     with connection() as db:
         armed, state = security_modes.camera_armed_now(db, camera_id)
+    # Disarmed, or a different armed mode than last time: crossing state is
+    # reset, so only a NEW armed outside-to-inside crossing can alarm.
+    security_rules.note_arm_state(camera_number, state["mode"] if armed and state else None)
     if not armed:
         return []
     cooldown = (state or {}).get("settings", {}).get("alarm_cooldown_seconds")
@@ -208,6 +215,8 @@ def event_type_for(analytic_type: str) -> str:
     option exactly."""
     if analytic_type == "intrusion_alarm":
         return "intrusion_alarm"  # security_line, armed: never a plain line_crossing/intrusion
+    if analytic_type == "loitering":
+        return "loitering"  # its own event type: own label, filter, preference and notification text
     return "line_crossing" if analytic_type == "line_crossing" else "intrusion"
 
 
@@ -246,7 +255,7 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
 
     analytic_type = fired["analytic_type"]
     direction = fired.get("direction")
-    label = {"line_crossing": "Line Crossing", "intrusion_alarm": "INTRUSION ALARM"}.get(analytic_type, "Intrusion Zone")
+    label = {"line_crossing": "Line Crossing", "intrusion_alarm": "INTRUSION ALARM", "loitering": "Loitering"}.get(analytic_type, "Intrusion Zone")
     record = AnalyticsEventModel(
         camera=camera_number,
         site="home",
@@ -263,6 +272,16 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
     if analytic_type == "intrusion_alarm":
         record["severity"] = "critical"
         record["security_mode"] = fired.get("security_mode")
+        # One alarm per physical intrusion: every security line this person
+        # confirmed in the same pass, for audit.
+        record["matched_rule_ids"] = list(fired.get("matched_rule_ids") or [fired["rule_id"]])
+        record["matched_rule_names"] = list(fired.get("matched_rule_names") or [fired.get("zone_name")])
+    if analytic_type == "loitering":
+        # How long the person had stayed when it fired, and the rule's own
+        # threshold -- shown on the event and sent to the cloud with it.
+        record["dwell_seconds"] = fired.get("dwell_seconds")
+        record["dwell_threshold_seconds"] = fired.get("dwell_threshold_seconds")
+        record["zone_name"] = fired.get("zone_name")
     # Event clip (2026-10-01): line crossings and Secure Edge alarms reached
     # the cloud with a thumbnail and never a clip (staging: 100 line
     # crossings in a day, none with video). Same rule as People Counting:
@@ -273,6 +292,10 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
     from main import _analytics_media_owner, _schedule_owned_analytics_clip
     media_owner = _analytics_media_owner(camera_number, record["id"], now)
     event_media_sharing.link(record, media_owner)
+    # Tells the cloud a clip is on its way (its own, or a shared one), so
+    # the portal shows "being saved" -- never "saved" -- until it is
+    # registered, or "no clip" if it is reported lost.
+    record["media_expected"] = bool(media_owner)
     append_analytics_event(record)
     if media_owner == record["id"]:
         _schedule_owned_analytics_clip(record["id"], camera_number, now, thumbnail_url)
@@ -297,12 +320,21 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
             identity = recording_uploader._camera_identity(camera_number)
             camera_id = identity.get("camera_id") if identity else None
             rules = load_rules_for_camera(camera_id) if camera_id and camera_rules_entitled(identity) else []
-            if rules:
+            if not rules:
+                # Every rule deleted or disabled, or the camera lost Smart
+                # Motion: nothing may carry over to a rule enabled later.
+                analytics_rules_engine.reset_camera(camera_number)
+            else:
+                analytics_rules_engine.forget_rules_except(camera_number, [rule["id"] for rule in rules])
                 async with ai_inference_semaphore:
                     result = await asyncio.to_thread(detect_objects_frame, camera_number)
                 if result.get("ok"):
                     frame = result.get("frame")
                     raw_detections = result.get("detections", [])
+                    # A failed detection never reaches here, so nothing ages
+                    # during an outage; start_cycle() resets the camera when
+                    # the gap since the last good cycle is too long.
+                    analytics_rules_engine.start_cycle(camera_number, time.monotonic())
                     tracked = analytics_rules_engine.update_tracker(camera_number, raw_detections)
                     if frame is not None:
                         frame_height, frame_width = frame.shape[0], frame.shape[1]

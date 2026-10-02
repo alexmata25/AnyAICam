@@ -102,3 +102,96 @@ def test_two_people_are_tracked_independently():
         alarms = sr.evaluate(1, dict(RULE, alarm_cooldown_seconds=0), [person(xa, track="A"), person(xb, track="B")], W, H, float(i * 2))
         fired += [(i, a["track_id"]) for a in alarms]
     assert fired == [(5, "A")]  # B was inside all along and never alarms
+
+
+# ---------------------------------------------------------------- arming lifecycle (2026-10-01)
+
+def _feed(xs, start=0, rule=RULE, track="t1"):
+    fired = []
+    for i, x in enumerate(xs, start + 1):
+        if sr.evaluate(1, rule, [person(x, track=track)] if x is not None else [], W, H, now=float(i * 2)):
+            fired.append(i)
+    return fired
+
+
+def test_a_crossing_made_while_disarmed_cannot_alarm_after_rearming():
+    """Armed, the person is seen outside; the site is Disarmed and they walk
+    in; it is re-armed while they are still inside. Without the reset the
+    old 'was outside' history plus two inside readings raised an alarm."""
+    sr.note_arm_state(1, "away")
+    assert _feed([700, 650]) == []                # armed: seen outside
+    sr.note_arm_state(1, None)                    # disarmed: not evaluated while they walk in
+    sr.note_arm_state(1, "away")                  # re-armed with the person still inside
+    assert _feed([400, 380, 360, 350], start=10) == []
+    # only a NEW armed outside-to-inside crossing alarms
+    assert _feed([700, 650, 520, 400, 380], start=20) == [25]
+
+
+def test_switching_between_stay_and_away_also_starts_over():
+    sr.note_arm_state(1, "stay")
+    _feed([700, 650])
+    assert sr.note_arm_state(1, "away") is True
+    assert _feed([400, 380, 360], start=10) == []
+    assert sr.note_arm_state(1, "away") is False  # unchanged mode keeps the state
+
+
+def test_a_lost_and_reacquired_track_needs_a_fresh_crossing():
+    """After track loss (or an appliance restart) the person comes back under
+    a new track with no 'outside' history: standing inside never alarms."""
+    sr.note_arm_state(1, "away")
+    assert _feed([700, 650, 520]) == []           # was crossing as t1 ...
+    assert _feed([400, 380, 360], start=10, track="t2") == []  # ... re-acquired inside as t2
+
+
+def test_a_restart_starts_with_no_crossing_history():
+    sr.note_arm_state(1, "away")
+    _feed([700, 650])
+    sr.reset_state()                              # process restart
+    sr.note_arm_state(1, "away")
+    assert _feed([400, 380, 360], start=10) == []
+
+
+# ---------------------------------------------------------------- one alarm per physical intrusion
+
+FENCE_A = dict(RULE, id="fence-a", name="Fence A", alarm_cooldown_seconds=0)
+FENCE_B = dict(RULE, id="fence-b", name="Fence B", geometry=[{"x": 0.55, "y": 0.0}, {"x": 0.55, "y": 1.0}], alarm_cooldown_seconds=0)
+
+
+def _walk_both(xs, track="t1", start=0):
+    alarms = []
+    for i, x in enumerate(xs, start + 1):
+        for rule in (FENCE_A, FENCE_B):
+            alarms += sr.evaluate(1, rule, [person(x, track=track)], W, H, now=float(i * 2))
+    return alarms
+
+
+def test_overlapping_security_lines_raise_one_alarm_for_one_intrusion():
+    alarms = _walk_both([800, 750, 650, 520, 400, 380, 360])
+    assert len(alarms) == 1
+    # every line the person crossed is kept on the alarm, for audit
+    assert set(alarms[0]["matched_rule_ids"]) == {"fence-a", "fence-b"}
+    assert set(alarms[0]["matched_rule_names"]) == {"Fence A", "Fence B"}
+
+
+def test_two_different_people_are_two_intrusions():
+    a = _walk_both([800, 750, 650, 520, 400, 380, 360], track="p1")
+    b = _walk_both([800, 750, 650, 520, 400, 380, 360], track="p2", start=20)
+    assert len(a) == 1 and len(b) == 1
+
+
+def test_leaving_and_coming_back_is_a_new_intrusion():
+    first = _walk_both([800, 750, 650, 520, 400, 380, 360])
+    out_again = _walk_both([800, 800], start=10)
+    second = _walk_both([650, 520, 400, 380, 360], start=20)
+    assert len(first) == 1 and out_again == [] and len(second) == 1
+
+
+def test_the_dedup_window_is_bounded(monkeypatch):
+    monkeypatch.setattr(sr, "ALARM_DEDUP_SECONDS", 5.0)
+    alarms = []
+    for i, x in enumerate([800, 750, 520, 400, 380], 1):
+        alarms += sr.evaluate(1, FENCE_A, [person(x)], W, H, now=float(i * 2))
+    # much later the same track confirms the second line: past the window, it alarms
+    for i, x in enumerate([800, 750, 650, 400, 380], 50):
+        alarms += sr.evaluate(1, dict(FENCE_B, geometry=[{"x": 0.7, "y": 0.0}, {"x": 0.7, "y": 1.0}]), [person(x)], W, H, now=float(i * 2))
+    assert len(alarms) == 2

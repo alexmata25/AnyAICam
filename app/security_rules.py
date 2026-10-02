@@ -23,9 +23,28 @@ must never become an intrusion alarm. This evaluator is for the
 
 Pure logic: no I/O. The caller (customer_analytics_rule_worker) gates it
 on the camera actually being armed (security_modes.camera_is_armed).
+
+Arming lifecycle (2026-10-01): crossings are only watched while armed, so
+someone who walked in while the site was Disarmed must not alarm the
+moment it is armed again. note_arm_state() resets a camera's crossing
+state whenever it is Disarmed or changes mode (Stay <-> Away): after
+arming, an alarm needs a NEW crossing -- seen outside, then confirmed on
+the protected side. A track the tracker loses and re-acquires (or any
+track after a restart) starts with no "outside" history, so it too needs
+a fresh outside-to-inside crossing.
+
+One alarm per physical intrusion (2026-10-01, owner decision): when the
+same person (camera + track) crosses several overlapping security lines,
+the first confirmed line raises the INTRUSION ALARM; any other line the
+same track confirms within ALARM_DEDUP_SECONDS raises none, until the
+person leaves the protected side of the line that raised it (that
+intrusion is then over, and a new one alarms again). The extra
+lines are kept on the alarm (matched_rule_ids / matched_rule_names) when
+they confirm in the same pass, and logged either way, for audit.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 
@@ -36,16 +55,54 @@ MIN_CONFIDENCE = max(0.0, float(os.environ.get("ANYAICAM_SECURITY_MIN_CONFIDENCE
 MIN_BOX_HEIGHT_FRACTION = max(0.0, float(os.environ.get("ANYAICAM_SECURITY_MIN_BOX_HEIGHT", "0.06")))
 DEFAULT_COOLDOWN_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_SECURITY_ALARM_COOLDOWN_SECONDS", "60")))
 TRACK_TTL_SECONDS = 30.0
+ALARM_DEDUP_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_SECURITY_ALARM_DEDUP_SECONDS", "120")))
+
+logger = logging.getLogger("anyaicam.security_rules")
 
 _lock = threading.Lock()
 _state: dict = {}          # (camera, rule_id, track_id) -> {"outside": bool, "inside_run": int, "alarmed": bool, "seen": float}
 _last_alarm_at: dict = {}  # (camera, rule_id) -> time
+_arm_mode: dict = {}       # camera -> the armed mode its crossing state belongs to
+_track_alarm: dict = {}    # (camera, track_id) -> {"at": time, "alarm": the alarm dict raised for it}
 
 
 def reset_state() -> None:
     with _lock:
         _state.clear()
         _last_alarm_at.clear()
+        _arm_mode.clear()
+        _track_alarm.clear()
+
+
+def reset_camera(camera_number) -> None:
+    """Forget every crossing, cooldown and raised alarm for one camera."""
+    with _lock:
+        _reset_camera_locked(camera_number)
+
+
+def _reset_camera_locked(camera_number) -> None:
+    for store in (_state, _last_alarm_at, _track_alarm):
+        for key in [key for key in store if key[0] == camera_number]:
+            del store[key]
+
+
+def note_arm_state(camera_number, mode: str | None) -> bool:
+    """Tell this module whether the camera is armed right now (the armed
+    mode, or None while Disarmed / not part of the mode). Any change --
+    disarming, arming, Stay <-> Away -- and every Disarmed reading clears
+    the camera's crossing state. Returns True when it was reset."""
+    with _lock:
+        previous = _arm_mode.get(camera_number)
+        if mode is None:
+            _arm_mode.pop(camera_number, None)
+            had_state = any(key[0] == camera_number for store in (_state, _last_alarm_at, _track_alarm) for key in store)
+            _reset_camera_locked(camera_number)
+            return previous is not None or had_state
+        if previous == mode:
+            return False
+        _reset_camera_locked(camera_number)
+        _arm_mode[camera_number] = mode
+        return True
 
 
 def _signed_distance(point, a, b) -> float:
@@ -117,6 +174,9 @@ def evaluate(camera_number, rule: dict, tracked_detections: list, frame_width: i
                 track["outside"] = True
                 track["inside_run"] = 0
                 track["alarmed"] = False  # left the protected side: a later entry may alarm again
+                raised = _track_alarm.get((camera_number, track_id))
+                if raised and raised["alarm"]["rule_id"] == rule_id:
+                    del _track_alarm[(camera_number, track_id)]  # left the area it intruded into: that intrusion is over
                 continue
             if not inside:
                 continue  # straddling / within the margin: no evidence either way this reading
@@ -126,8 +186,20 @@ def evaluate(camera_number, rule: dict, tracked_detections: list, frame_width: i
             track["alarmed"] = True
             if now - _last_alarm_at.get((camera_number, rule_id), float("-inf")) < cooldown:
                 continue  # confirmed, but this rule alarmed moments ago
+            raised = _track_alarm.get((camera_number, track_id))
+            if raised and now - raised["at"] <= ALARM_DEDUP_SECONDS:
+                # The same person already raised this intrusion on another
+                # (overlapping) line: one urgent alarm, the extra line kept
+                # for audit.
+                primary = raised["alarm"]
+                if rule_id not in primary["matched_rule_ids"]:
+                    primary["matched_rule_ids"].append(rule_id)
+                    primary["matched_rule_names"].append(rule.get("name"))
+                logger.info("security_alarm.duplicate_suppressed camera=%s track=%s rule_id=%s primary_rule_id=%s",
+                            camera_number, track_id, rule_id, primary["rule_id"])
+                continue
             _last_alarm_at[(camera_number, rule_id)] = now
-            alarms.append({
+            alarm = {
                 "rule_id": rule_id,
                 "analytic_type": "intrusion_alarm",
                 "zone_name": rule.get("name"),
@@ -136,5 +208,11 @@ def evaluate(camera_number, rule: dict, tracked_detections: list, frame_width: i
                 "confidence": detection.get("confidence"),
                 "direction": rule.get("direction") or "inbound",
                 "box": {k: detection[k] for k in ("x", "y", "width", "height")},
-            })
+                "matched_rule_ids": [rule_id],
+                "matched_rule_names": [rule.get("name")],
+            }
+            _track_alarm[(camera_number, track_id)] = {"at": now, "alarm": alarm}
+            alarms.append(alarm)
+        for key in [k for k, v in _track_alarm.items() if k[0] == camera_number and now - v["at"] > ALARM_DEDUP_SECONDS]:
+            del _track_alarm[key]
     return alarms

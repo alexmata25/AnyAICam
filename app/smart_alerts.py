@@ -36,7 +36,7 @@ _CATEGORY_BY_TYPE = {
     "vehicle": "vehicles", "car": "vehicles", "truck": "vehicles", "bus": "vehicles", "motorcycle": "vehicles",
     "bicycle": "vehicles", "lpr": "vehicles", "plate": "vehicles",
     "intrusion_alarm": "security", "aac_voice_call": "security", "facial_recognition": "security",
-    "line_crossing": "security", "intrusion": "security", "door_access": "security",
+    "line_crossing": "security", "intrusion": "security", "loitering": "security", "door_access": "security",
     "storage_problem": "system", "camera_offline": "system", "appliance_offline": "system", "low_disk": "system",
     "high_cpu": "system", "software_update": "system", "recording_problem": "system",
 }

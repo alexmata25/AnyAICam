@@ -169,7 +169,7 @@ def test_sync_payload_forwards_the_media_parent_under_the_existing_field():
     assert analytics_sync._build_payload({"id": "ppe-1", "event_type": "ppe", "timestamp": "t", "media_parent_event_id": "owner"})["parent_local_event_id"] == "owner"
     assert analytics_sync._build_payload({"id": "sm", "event_type": "smart_motion", "timestamp": "t", "motion_event_id": "m"})["parent_local_event_id"] == "m"
     assert analytics_sync._build_payload({"id": "x", "event_type": "person", "timestamp": "t"})["parent_local_event_id"] is None
-    assert len(analytics_sync._build_payload({"id": "x", "event_type": "ppe", "timestamp": "t", "media_parent_event_id": "o"})) == 7
+    assert len(analytics_sync._build_payload({"id": "x", "event_type": "ppe", "timestamp": "t", "media_parent_event_id": "o"})) == 8  # + media_expected (2026-10-01)
 
 
 def test_link_never_points_an_event_at_itself():

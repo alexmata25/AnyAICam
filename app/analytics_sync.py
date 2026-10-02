@@ -528,6 +528,22 @@ def _build_payload(event: dict) -> dict:
             "rule_id": event.get("rule_id"),
             "direction": event.get("direction"),
         }]
+        if str(event.get("event_type") or "").strip() == "intrusion_alarm":
+            # The person (edge track) and every line they crossed: the cloud
+            # sends one urgent alert per physical intrusion.
+            payload_detections[0]["track_id"] = event.get("track_id")
+            payload_detections[0]["matched_rule_ids"] = event.get("matched_rule_ids")
+            payload_detections[0]["matched_rule_names"] = event.get("matched_rule_names")
+    # Loitering (2026-10-01): the rule (the cloud looks up its notification
+    # setting by rule_id), the zone, and how long the person stayed.
+    if str(event.get("event_type") or "").strip() == "loitering" and payload_detections is None:
+        payload_detections = [{
+            "rule_name": event.get("rule_name"),
+            "rule_id": event.get("rule_id"),
+            "zone_name": event.get("zone_name"),
+            "dwell_seconds": event.get("dwell_seconds"),
+            "dwell_threshold_seconds": event.get("dwell_threshold_seconds"),
+        }]
     # LPR (2026-09-30): the plate read and the vehicle it was read on, for
     # the customer's License Plates table. Without this the cloud had no
     # plate text at all. Vehicle colour/make/model are None unless the edge
@@ -553,6 +569,7 @@ def _build_payload(event: dict) -> dict:
         "detections": payload_detections,
         "event_timestamp": str(event.get("timestamp") or "").strip(),
         "parent_local_event_id": _parent_local_event_id(event),
+        "media_expected": bool(event.get("media_expected")),
     }
 
 
@@ -683,6 +700,10 @@ def _build_notification_payload(event: dict, camera_id: str) -> dict:
     triggered_by = str(event.get("triggered_by") or "").strip()
     if payload["event_type"] == "smart_motion" and triggered_by:
         payload["message"] = f"Smart Motion: {triggered_by} detected"
+    # Customer rules (2026-10-01): the cloud honours the rule's own
+    # "Send notifications" setting, so it needs to know which rule fired.
+    if event.get("rule_id") and payload["event_type"] in ("line_crossing", "intrusion", "loitering"):
+        payload["rule_id"] = str(event.get("rule_id"))
     return payload
 
 

@@ -69,6 +69,9 @@ WORKSPACES: dict[str, dict] = {
     "intrusion": {"slug": "intrusion", "label": "Intrusion", "entitlement": "smart_motion",
                   "types": ("intrusion",), "rule": True,
                   "description": "Activity inside the zones you drew."},
+    "loitering": {"slug": "loitering", "label": "Loitering", "entitlement": "smart_motion",
+                  "types": ("loitering",), "rule": True,
+                  "description": "People who stayed in a loitering zone longer than you allowed."},
 }
 BY_SLUG = {spec["slug"]: key for key, spec in WORKSPACES.items()}
 TABS = tuple(WORKSPACES)  # kept for callers/tests that list the analytic keys
@@ -81,6 +84,7 @@ RESULT_FILTERS: dict[str, dict[str, tuple[str, ...]]] = {
     "facial_recognition": {"known": (), "unknown": ()},
     "line_crossing": {},
     "intrusion": {},
+    "loitering": {},
 }
 SEARCHABLE = {"lpr", "facial_recognition"}  # free-text search over the stored plate / name
 PAGE_SIZE = 48
@@ -108,13 +112,17 @@ def _row_details(key: str, row: dict) -> dict:
     if key == "people_counting":
         event_type = row.get("event_type")
         return {"direction": "in" if event_type == "people_counting_in" else "out" if event_type == "people_counting_out" else None}
-    if key in ("line_crossing", "intrusion"):
+    if key in ("line_crossing", "intrusion", "loitering"):
         # The appliance names these "Line Crossing (<name>)" / "Intrusion
-        # Zone (<name>)"; the page already says which kind it is.
+        # Zone (<name>)" / "Loitering (<name>)"; the page already says which
+        # kind it is.
         rule = str(detections.get("rule_name") or "").strip()
-        match = re.match(r"^(?:Line Crossing|Intrusion Zone) \((.*)\)$", rule)
+        match = re.match(r"^(?:Line Crossing|Intrusion Zone|Loitering) \((.*)\)$", rule)
         rule = match.group(1) if match else rule
-        return {"rule": None if rule in ("", "unnamed rule") else rule, "direction": detections.get("direction")}
+        details = {"rule": None if rule in ("", "unnamed rule") else rule, "direction": detections.get("direction")}
+        if key == "loitering":
+            details["dwell_seconds"] = detections.get("dwell_seconds")
+        return details
     return {"object_count": row.get("object_count")}
 
 
@@ -249,7 +257,7 @@ def _summary(db, key: str, where: str, args: list, plate_query: str = "") -> dic
             "SUM(CASE WHEN de.event_type='people_counting_in' THEN 1 ELSE 0 END) AS n_in, "
             "SUM(CASE WHEN de.event_type='people_counting_out' THEN 1 ELSE 0 END) AS n_out "
             f"FROM detection_events de WHERE {where} GROUP BY substr(de.event_timestamp,1,13) ORDER BY hour", args)]
-    if key in ("ppe", "facial_recognition", "line_crossing", "intrusion"):
+    if key in ("ppe", "facial_recognition", "line_crossing", "intrusion", "loitering"):
         counts: dict[str, int] = {}
         for r in db.execute(f"SELECT de.event_type, de.detections_json FROM detection_events de WHERE {where}", args):
             details = _row_details(key, dict(r))
@@ -295,7 +303,7 @@ def available_workspaces(customer_id: str | None, camera_ids: list[str]) -> list
                 (customer_id, *camera_ids))}
             rule_kinds |= {r["event_type"] for r in db.execute(
                 f"SELECT DISTINCT event_type FROM detection_events WHERE customer_id=? AND camera_id IN ({marks}) "
-                "AND event_type IN ('line_crossing','intrusion')", (customer_id, *camera_ids))}
+                "AND event_type IN ('line_crossing','intrusion','loitering')", (customer_id, *camera_ids))}
     out = []
     for key, spec in WORKSPACES.items():
         if spec["entitlement"] not in entitled:
@@ -481,9 +489,10 @@ def render_landing(request: Request, cameras: list[dict], page_shell: Callable) 
 SMART_RULES_SLUG = "smart-rules"
 SMART_RULES_HREF = f"/analytics/{SMART_RULES_SLUG}"
 SMART_RULES_LABEL = "Smart Rules"
-SMART_RULES_DESCRIPTION = "Draw detection zones, line crossings, zones to ignore and counting lines on each camera."
+SMART_RULES_DESCRIPTION = "Draw detection zones, loitering zones, line crossings, zones to ignore and counting lines on each camera."
 RULE_KIND_LABELS = (("intrusion", "detection zone", "detection zones"), ("line_crossing", "line crossing", "line crossings"),
-                    ("exclusion", "zone to ignore", "zones to ignore"), ("people_counting", "counting line", "counting lines"))
+                    ("exclusion", "zone to ignore", "zones to ignore"), ("people_counting", "counting line", "counting lines"),
+                    ("loitering", "loitering zone", "loitering zones"))
 
 
 def _rules_editor_href(camera_id: str) -> str:

@@ -64,6 +64,10 @@
       return [known?'Recognized':'Unknown',known?'good':'',d.person||(known?'Recognized person':'Unknown face'),
         [d.watchlist?`Watchlist: ${d.watchlist}`:null,known&&e.confidence!=null?`${pct(e.confidence)}% match`:null]];
     }
+    if(key==='loitering'){
+      const stayed=d.dwell_seconds>=60?`${Math.floor(d.dwell_seconds/60)} min ${d.dwell_seconds%60?d.dwell_seconds%60+' s':''}`.trim():d.dwell_seconds!=null?`${d.dwell_seconds} s`:null;
+      return ['Loitering','',d.rule?`Loitering: ${d.rule}`:'Person loitering',[stayed?`Stayed ${stayed}`:null,e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
+    }
     const kind=key==='line_crossing'?'Line crossed':'Zone intrusion';
     return [key==='line_crossing'?'Line':'Zone','',d.rule?`${kind}: ${d.rule}`:kind,[d.direction?`Direction: ${pretty(d.direction)}`:null,e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
   }
@@ -156,10 +160,10 @@
     else if(key==='ppe')html=stat('Checks',t)+stat('Violations',res.violation||0)+stat('Missing hard hat',res.missing_hard_hat||0)+stat('Missing vest',res.missing_vest||0);
     else if(key==='facial_recognition')html=stat('Faces',t)+stat('Recognized',res.known||0)+stat('Unknown',res.unknown||0);
     else if(key==='lpr')html=stat('Plates read',t);
-    else{html=stat(key==='line_crossing'?'Crossings':'Intrusions',t)+Object.entries(res).slice(0,3).map(([rule,n])=>stat(rule,n)).join('')}
+    else{html=stat(key==='line_crossing'?'Crossings':key==='loitering'?'Loitering':'Intrusions',t)+Object.entries(res).slice(0,3).map(([rule,n])=>stat(rule,n)).join('')}
     stats.innerHTML=html;
   }
-  const EMPTY={smart_motion:'No people, vehicle or motion detections',people_counting:'No entries or exits',lpr:'No license plate reads',ppe:'No PPE checks',facial_recognition:'No faces',line_crossing:'No line crossings',intrusion:'No zone intrusions'};
+  const EMPTY={smart_motion:'No people, vehicle or motion detections',people_counting:'No entries or exits',lpr:'No license plate reads',ppe:'No PPE checks',facial_recognition:'No faces',line_crossing:'No line crossings',intrusion:'No zone intrusions',loitering:'No loitering'};
   async function load(append){
     if(state.loading)return;state.loading=true;
     if(!append){state.before=null;state.items.clear();inline.close();results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">Loading…</div>'}
