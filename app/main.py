@@ -41867,7 +41867,10 @@ app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 
 
 
-app.mount("/recordings", StaticFiles(directory="/app/recordings"), name="recordings")
+# Only recorded media, never the app data that shares /app/recordings
+# (recordings_guard.py, 2026-10-01 security fix).
+from recordings_guard import RecordingsStaticFiles
+app.mount("/recordings", RecordingsStaticFiles(directory="/app/recordings"), name="recordings")
 
 
 
