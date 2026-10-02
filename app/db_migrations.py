@@ -1740,3 +1740,8 @@ def apply_migrations():
                    'camera_id TEXT,actor_email TEXT,issued_at REAL NOT NULL,expires_at REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL)')
         camera_columns=_columns('cameras')
         if 'door_feedback_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_feedback_enabled INTEGER NOT NULL DEFAULT 0')
+
+        # Customer setup wizard completion (2026-10-02, partner_workspace.
+        # confirm_customer_setup): recorded on its own, separate from device
+        # activation, which only the appliance sets. Additive.
+        if 'completed_at' not in _columns('customer_setup_drafts'): db.execute('ALTER TABLE customer_setup_drafts ADD COLUMN completed_at TEXT')

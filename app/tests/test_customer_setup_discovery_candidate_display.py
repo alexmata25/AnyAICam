@@ -86,8 +86,8 @@ def test_setup_page_renders_device_key_for_every_candidate(http_client, db_path)
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     body = response.text
-    assert "Device key:" in body
-    assert "escapeHtml(x.device_key||'none')" in body
+    assert "'Device key: '" in body
+    assert "el('code',{textContent:String(x.device_key||'none')})" in body
 
 
 def test_setup_page_falls_back_through_name_then_manufacturer_model(http_client, db_path):
@@ -115,15 +115,20 @@ def test_setup_page_escapes_appliance_reported_candidate_fields(http_client, db_
     (name, device_key) directly into innerHTML than before -- every one
     of them must go through escapeHtml so a malformed/hostile discovery
     result can never inject markup into the customer's own browser."""
+    # 2026-10-02: no string-built markup at all -- every appliance-reported
+    # value is a text node or a dataset value (the attribute values used to
+    # be interpolated unescaped). test_setup_hostile_appliance_values_
+    # browser.py proves it in a real browser.
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     body = response.text
-    assert "function escapeHtml(v)" in body
+    assert "document.getElementById('scan-results').innerHTML" not in body
+    assert "document.getElementById('appliance-status').innerHTML" not in body
     for expected in (
-        "escapeHtml(label)",
-        "escapeHtml(x.manufacturer||'Unknown manufacturer')",
-        "escapeHtml(x.model||'')",
-        "escapeHtml(address||'no address reported')",
-        "escapeHtml(x.device_key||'none')",
+        "el('strong',{textContent:String(label)})",
+        "String(x.manufacturer||'Unknown manufacturer')",
+        "String(address||'no address reported')",
+        "el('code',{textContent:String(x.device_key||'none')})",
+        "['Software',a.software_version||'Not installed']",
     ):
         assert expected in body, f"missing {expected!r}"
 
@@ -135,7 +140,7 @@ def test_provisioning_click_handler_still_reads_device_key_from_the_data_attribu
     displayed."""
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     body = response.text
-    assert "data-device-key=\"${x.device_key||''}\"" in body
+    assert "Object.assign(row.dataset,{deviceKey:String(x.device_key||'')" in body
     assert "button.closest('[data-device-key]')" in body
 
 

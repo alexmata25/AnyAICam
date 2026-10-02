@@ -129,16 +129,18 @@ def test_provision_success_handler_reloads_after_a_fresh_provision(http_client, 
     assert confirm_call.index("))location.reload()") < confirm_call.index("document.getElementById('link-customer-appliance')")
 
 
-def test_provision_success_handler_reloads_immediately_when_already_provisioned(http_client, db_path):
-    """The idempotent short-circuit response never carries a fresh
-    activation_token (nothing new was minted), so there is no one-time
-    secret to protect -- this branch must reload right away, matching
-    "Link appliance"'s own existing unconditional reload-on-success."""
+def test_already_provisioned_offers_an_auditable_token_recovery_not_a_tokenless_reload(http_client, db_path):
+    """2026-10-02: a lost first response (with its one-time token) used to
+    leave the customer reloading forever with nothing to activate with. A
+    still-pending appliance now offers the owner-only recovery action
+    (test_activation_token_recovery.py); an activated one simply reloads."""
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn)
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     body = response.text
-    assert "if(r.status==='already_provisioned'){messageEl.textContent='An appliance was already provisioned for this account.';location.reload();return}" in body
+    assert "if(r.status==='already_provisioned'){if(!r.activation_pending){" in body
+    assert "/activation-token/recover" in body
+    assert "messageEl.textContent='An appliance was already provisioned for this account.';location.reload();return}" not in body
 
 
 # --------------------------------------------------- fix 2: link must not regress an already-activated appliance
