@@ -51,7 +51,12 @@ def _sales_user(identifier: str) -> Optional[dict]:
     return user if user and user.get("role") in SALES_ROLES else None
 
 
-def set_attribution(*, customer_id: str, salesperson: str, source: str, created_by: str, replace: bool = False) -> dict:
+def set_attribution(*, customer_id: str, salesperson: str, source: str, created_by: str, replace: bool = False,
+                    actor_role: str = "administrator") -> dict:
+    """Assign (or, with replace=True, re-assign) a customer's salesperson.
+    Every change is written to the central audit log (2026-10-02, Codex
+    finding): who, which customer, previous and new salesperson, and whether
+    it replaced an existing attribution -- future commissions follow it."""
     user = _sales_user(salesperson)
     if not user:
         raise ValueError("That user is not a salesperson or partner owner.")
@@ -60,13 +65,19 @@ def set_attribution(*, customer_id: str, salesperson: str, source: str, created_
     existing = row("SELECT * FROM sales_attributions WHERE customer_id=?", (customer_id,))
     with connection() as db:
         if existing and not replace:
-            return existing
+            return existing  # unchanged: nothing to audit
         if existing:
             db.execute("UPDATE sales_attributions SET salesperson_user_id=?,partner_id=?,source=?,created_at=?,created_by=? WHERE customer_id=?",
                        (user["id"], user.get("partner_id"), source, _now(), created_by, customer_id))
         else:
             db.execute("INSERT INTO sales_attributions(customer_id,salesperson_user_id,partner_id,source,created_at,created_by) VALUES(?,?,?,?,?,?)",
                        (customer_id, user["id"], user.get("partner_id"), source, _now(), created_by))
+    from partner_db import audit
+    audit({"email": created_by, "role": actor_role},
+          "sales_attribution.replaced" if existing else "sales_attribution.assigned", "customer", customer_id,
+          {"customer_id": customer_id, "previous_salesperson_user_id": (existing or {}).get("salesperson_user_id"),
+           "previous_partner_id": (existing or {}).get("partner_id"), "new_salesperson_user_id": user["id"],
+           "new_partner_id": user.get("partner_id"), "replacement": bool(existing), "source": source})
     return row("SELECT * FROM sales_attributions WHERE customer_id=?", (customer_id,))
 
 
