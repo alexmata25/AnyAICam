@@ -13,7 +13,7 @@ from typing import Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, decrypt_camera_credentials, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
+from appliance_protocol import sanitize_software_version, ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, decrypt_camera_credentials, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
 from live_manifest import LiveManifestStore
 from object_storage import get_storage
 from partner_db import audit, authorize_appliance_tenant, connection, password_hash, row, rows, verify_password
@@ -474,7 +474,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             wireguard_status=str(wireguard_status)[:20] if wireguard_status in ('disabled','enrolling','enrolled','active','degraded','failed') else None
             wireguard_last_handshake_at=safe.get('wireguard_last_handshake_at')
             wireguard_last_handshake_at=str(wireguard_last_handshake_at)[:40] if isinstance(wireguard_last_handshake_at,str) else None
-            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at),wireguard_status=COALESCE(?,wireguard_status),wireguard_last_handshake_at=COALESCE(?,wireguard_last_handshake_at) WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,wireguard_status,wireguard_last_handshake_at,appliance['id']))
+            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at),wireguard_status=COALESCE(?,wireguard_status),wireguard_last_handshake_at=COALESCE(?,wireguard_last_handshake_at) WHERE id=?',(state,state,now,sanitize_software_version(safe.get('software_version')),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,wireguard_status,wireguard_last_handshake_at,appliance['id']))
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
         return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}
 
@@ -498,7 +498,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.post('/api/appliance/version')
     def version(request: Request,payload: dict) -> dict:
-        appliance=authenticate_appliance(request); version_value=str(payload.get('software_version','Unknown'))[:80]
+        appliance=authenticate_appliance(request); version_value=sanitize_software_version(payload.get('software_version'))
         with connection() as db: db.execute('UPDATE appliances SET software_version=?,last_check_in=? WHERE id=?',(version_value,datetime.now().isoformat(),appliance['id']))
         return {'status':'accepted'}
 

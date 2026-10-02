@@ -25,20 +25,51 @@ def sanitize_appliance_payload(value):
     return value
 
 
+DISCOVERY_MAX_RESULTS = 256
+DISCOVERY_MAX_TEXT = 256
+DISCOVERY_MAX_DEPTH = 4
+DISCOVERY_MAX_KEYS = 64
+_CONTROL_CHARS = re.compile(r'[\x00-\x1f\x7f]')
+_SOFTWARE_VERSION = re.compile(r'[^A-Za-z0-9 ._+:/()\-]')
+
+
+def bounded_text(value, limit: int = DISCOVERY_MAX_TEXT) -> str:
+    """Appliance-supplied text (2026-10-02): control characters removed and
+    length capped. Pages still escape it; this only bounds what is stored."""
+    return _CONTROL_CHARS.sub('', str(value))[:limit]
+
+
+def sanitize_software_version(value) -> str:
+    """A version label is shown on several pages: letters, digits and
+    . _ + : / ( ) - and spaces only, at most 80 characters."""
+    cleaned = _SOFTWARE_VERSION.sub('', str(value if value is not None else '')).strip()[:80]
+    return cleaned or 'Unknown'
+
+
 def sanitize_discovery_results(value) -> list[dict]:
-    """Strip edge addressing and replace address-derived identity fields."""
-    def scrub(item):
+    """Strip edge addressing and replace address-derived identity fields;
+    bound what an appliance can store (2026-10-02): at most
+    DISCOVERY_MAX_RESULTS results, DISCOVERY_MAX_KEYS keys per object,
+    DISCOVERY_MAX_DEPTH levels, text capped and without control characters."""
+    def scrub(item, depth=0):
+        if depth > DISCOVERY_MAX_DEPTH:
+            return None
         if isinstance(item, dict):
-            return {key: scrub(child) for key, child in item.items() if key.lower() not in DISCOVERY_FORBIDDEN_KEYS}
+            kept = [(str(key)[:64], child) for key, child in item.items() if str(key).lower() not in DISCOVERY_FORBIDDEN_KEYS]
+            return {key: scrub(child, depth + 1) for key, child in kept[:DISCOVERY_MAX_KEYS]}
         if isinstance(item, list):
-            return [scrub(child) for child in item]
-        return item
+            return [scrub(child, depth + 1) for child in item[:DISCOVERY_MAX_RESULTS]]
+        if isinstance(item, str):
+            return bounded_text(item)
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return bounded_text(item)
 
     safe = scrub(value)
     if not isinstance(safe, list):
         return []
     results = []
-    for index, item in enumerate(safe, 1):
+    for index, item in enumerate(safe[:DISCOVERY_MAX_RESULTS], 1):
         if not isinstance(item, dict):
             continue
         results.append({**item, 'id': f'candidate-{index}', 'name': f'Discovered camera {index}'})
