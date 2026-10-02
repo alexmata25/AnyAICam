@@ -16,6 +16,12 @@ import hardware_orders as ho
 from database_backend import override_target
 from partner_db import initialize_database
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 SLOT_PRICE = "price_test_camera_slots_local_8"
 ANALYTICS_PRICE = "price_test_advanced_analytics"
 HARDWARE_PRICE = "price_test_ryzen_starter"
@@ -49,7 +55,9 @@ def _session_event(event_id, event_type, price_id, *, payment_status, customer_i
     if customer_id:
         metadata["anyaicam_customer_id"] = customer_id
     return {"id": event_id, "type": event_type, "data": {"object": {
-        "id": session_id, "mode": "payment", "customer": "cus_1", "payment_status": payment_status,
+        # Plans and add-ons are subscriptions; hardware is a one-time payment.
+        "id": session_id, "mode": "payment" if price_id == HARDWARE_PRICE else "subscription", "customer": "cus_1",
+        **({} if price_id == HARDWARE_PRICE else {"subscription": f"sub_{session_id}"}), "payment_status": payment_status,
         "customer_details": {"email": email}, "metadata": metadata}}}
 
 

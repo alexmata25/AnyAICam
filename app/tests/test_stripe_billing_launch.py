@@ -64,6 +64,12 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
             "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
             "subscription_update": {"enabled": False}}}  # plan changes stay in AnyAiCam (owner, 2026-10-02)
         schedules: dict = {}
+        invoices: dict = {}  # invoice id -> what Stripe says now (default: a subscription's first invoice is paid)
+        intents: dict = {}  # payment intent id -> what Stripe says now (default: succeeded, not refunded)
+        sessions: dict = {}  # Checkout Sessions by id; created once per Idempotency-Key
+        sessions_by_key: dict = {}
+        customers_by_key: dict = {}
+        paid_sessions: set = set()  # sessions Stripe will not expire (already paid)
 
         def fake_get(path):
             if path.startswith("/v1/prices/"):
@@ -72,8 +78,20 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
                 return {"data": [portal_config]} if "?" in path else portal_config
             if path.startswith("/v1/subscription_schedules/"):
                 return schedules[path.rsplit("/", 1)[1]]
-            if path.startswith("/v1/invoice_payments") or path.startswith("/v1/invoices/"):
+            if path.startswith("/v1/invoice_payments"):
                 return {"data": []}
+            if path.startswith("/v1/invoices/"):
+                invoice_id = path.rsplit("/", 1)[1]
+                if invoice_id in invoices:
+                    return invoices[invoice_id]
+                first = invoice_id.startswith("in_first_")
+                return {"id": invoice_id, "object": "invoice", "status": "paid" if first else "open",
+                        "amount_paid": 1499 if first else 0, "payment_intent": f"pi_{invoice_id}", "charge": f"ch_{invoice_id}"}
+            if path.startswith("/v1/payment_intents/"):
+                intent_id = path.rsplit("/", 1)[1].split("?", 1)[0]
+                return intents.get(intent_id) or {"id": intent_id, "object": "payment_intent", "status": "succeeded",
+                                                  "latest_charge": {"id": f"ch_for_{intent_id}", "amount": 1499,
+                                                                    "amount_refunded": 0, "refunded": False}}
             if path.startswith("/v1/subscriptions/"):
                 found = stripe.get(path.rsplit("/", 1)[1])
                 if found is None:
@@ -87,6 +105,25 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
             keys.append(idempotency_key)
             if path == "/v1/billing_portal/sessions":
                 return {"id": "bps_1", "url": "https://billing.stripe.test/session"}
+            if path == "/v1/customers":  # one customer per Idempotency-Key, as Stripe does
+                return customers_by_key.setdefault(idempotency_key or f"none-{len(posts)}",
+                                                   {"id": f"cus_new_{len(customers_by_key) + 1}", "object": "customer"})
+            if path == "/v1/checkout/sessions":
+                if idempotency_key in sessions_by_key:  # Stripe replays the original answer
+                    return sessions_by_key[idempotency_key]
+                session_id = f"cs_{len(sessions) + 1}"
+                created = {"id": session_id, "url": f"https://checkout.stripe.test/{session_id}", "status": "open", "fields": dict(fields)}
+                sessions[session_id] = created
+                if idempotency_key:
+                    sessions_by_key[idempotency_key] = created
+                return created
+            if path.startswith("/v1/checkout/sessions/") and path.endswith("/expire"):
+                session_id = path.split("/")[4]
+                if session_id in paid_sessions or session_id not in sessions:
+                    from fastapi import HTTPException
+                    raise HTTPException(status_code=502, detail="Stripe refused: session is complete")
+                sessions[session_id]["status"] = "expired"
+                return sessions[session_id]
             if path == "/v1/subscription_schedules":  # a schedule taken over from a subscription
                 sub = stripe[dict(fields)["from_subscription"]]
                 schedule_id = f"sub_sched_{sub['id']}"
@@ -137,7 +174,9 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         monkeypatch.setattr(main, "stripe_api_post", fake_post)
         with TestClient(main.app, follow_redirects=False) as client:
             yield {"client": client, "stripe": stripe, "posts": posts, "path": path, "tmp": tmp_path, "main": main,
-                   "keys": keys, "declines": declines, "portal_config": portal_config, "schedules": schedules}
+                   "keys": keys, "declines": declines, "portal_config": portal_config, "schedules": schedules,
+                   "invoices": invoices, "intents": intents, "sessions": sessions, "paid_sessions": paid_sessions,
+                   "customers_by_key": customers_by_key}
 
 
 def _deliver(env, event):
@@ -150,7 +189,7 @@ def _deliver(env, event):
 
 def _subscription(sub_id, customer, status, price=LOCAL_8, metadata_customer="cust-A", period_end=1_893_456_000, cancel_at_end=False):
     return {"id": sub_id, "object": "subscription", "customer": customer, "status": status,
-            "current_period_end": period_end, "cancel_at_period_end": cancel_at_end,
+            "current_period_end": period_end, "cancel_at_period_end": cancel_at_end, "latest_invoice": f"in_first_{sub_id}",
             "items": {"data": [{"id": f"si_{sub_id}", "price": {"id": price}, "quantity": 1}]},
             "metadata": {"anyaicam_customer_id": metadata_customer, "anyaicam_stripe_price_id": price}}
 

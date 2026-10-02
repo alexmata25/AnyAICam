@@ -22,6 +22,12 @@ import hardware_returns as hr
 import purchase_notifications as pn
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 RYZEN_STARTER_PRICE = "price_fulfillment_ryzen_starter"
 LOCAL_1_8 = "price_fulfillment_local_1_8"
 
@@ -365,7 +371,7 @@ def test_subscription_cancellation_does_not_invoke_hardware_return_logic(db_path
     _seed_customer(db_path)
     checkout_event = {
         "id": "evt_sub_checkout", "type": "checkout.session.completed",
-        "data": {"object": {"id": "cs_sub", "mode": "subscription", "customer": "cus_sub", "customer_details": {"email": "jane@example.test"}, "payment_status": "paid", "metadata": {"anyaicam_stripe_price_id": LOCAL_1_8, "anyaicam_customer_id": "cust-1"}}},
+        "data": {"object": {"id": "cs_sub", "mode": "subscription", "subscription": "sub_1", "customer": "cus_sub", "customer_details": {"email": "jane@example.test"}, "payment_status": "paid", "metadata": {"anyaicam_stripe_price_id": LOCAL_1_8, "anyaicam_customer_id": "cust-1"}}},
     }
     cancel_event = {
         "id": "evt_sub_cancel", "type": "customer.subscription.deleted",

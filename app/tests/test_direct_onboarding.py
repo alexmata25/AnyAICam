@@ -17,6 +17,12 @@ from database_backend import override_target
 from test_customer_downloads import _publish, package, storage  # noqa: F401 -- fixtures
 from test_pricing_ff_commission import _stripe_maps, db_path, license_portal, portal  # noqa: F401 -- fixtures
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 LINK = re.compile(r"/customer/verify-email\?token=([A-Za-z0-9_\-]+)")
 PASSWORD = "direct-owner-pass-1"
 
@@ -107,7 +113,8 @@ def _webhook(client, event):
 
 def _completed(event_id, price_id, customer_id, email, mode="subscription"):
     return {"id": event_id, "type": "checkout.session.completed", "data": {"object": {
-        "id": f"cs_{event_id}", "customer": f"cus_{customer_id[:6]}", "mode": mode, "payment_status": "paid",
+        "id": f"cs_{event_id}", "customer": f"cus_test_{customer_id}", "mode": mode, "payment_status": "paid",
+        **({"subscription": f"sub_{event_id}"} if mode == "subscription" else {}),
         "customer_details": {"email": email}, "client_reference_id": customer_id,
         "metadata": {"anyaicam_stripe_price_id": price_id, "anyaicam_customer_id": customer_id}}}}
 
@@ -188,7 +195,7 @@ def test_direct_owner_buys_local_gets_entitlement_and_downloads_the_installer(si
     assert client.get("/api/customer/downloads/vms-installer").status_code == 403
     plan = client.post("/api/customer/camera-slots/checkout", json={"plan_type": "local", "tier_label": "1-8"})
     assert plan.status_code == 200, plan.text
-    assert captured[-1]["metadata[anyaicam_customer_id]"] == customer_id and captured[-1]["customer_email"] == email
+    assert captured[-1]["metadata[anyaicam_customer_id]"] == customer_id and captured[-1]["customer"] == f"cus_test_{customer_id}"
     licence = client.post("/api/customer/vms-license/checkout", json={"capacity": 8})
     assert licence.status_code == 200, licence.text
     assert captured[-1]["metadata[anyaicam_customer_id]"] == customer_id

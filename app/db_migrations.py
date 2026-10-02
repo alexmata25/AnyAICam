@@ -1233,6 +1233,16 @@ CREATE INDEX IF NOT EXISTS idx_subscription_payments_subscription ON subscriptio
 CREATE TABLE IF NOT EXISTS commission_ledger(id TEXT PRIMARY KEY, kind TEXT NOT NULL, source_ref TEXT NOT NULL, salesperson_user_id TEXT NOT NULL, partner_id TEXT, customer_id TEXT NOT NULL, stripe_subscription_id TEXT, stripe_invoice_id TEXT, hardware_order_id TEXT, plan_type TEXT, camera_slot_tier INTEGER, paid_month_index INTEGER, basis_cents INTEGER NOT NULL DEFAULT 0, original_amount_cents INTEGER NOT NULL, amount_cents INTEGER NOT NULL, status TEXT NOT NULL, friends_family INTEGER NOT NULL DEFAULT 0, earned_at TEXT NOT NULL, reversed_at TEXT, reversal_reason TEXT, UNIQUE(kind, source_ref));
 CREATE INDEX IF NOT EXISTS idx_commission_ledger_salesperson ON commission_ledger(salesperson_user_id, earned_at);
 '''),
+    # Billing launch guards (Codex audit of 3f5b9c4, 2026-10-02): one payable
+    # Checkout Session per purchase, one canonical Stripe customer per
+    # account (checkout_guard.py), monotonic per-invoice payment state
+    # (billing_status.py). Additive only.
+    ('20261002_billing_launch_guards','''
+CREATE TABLE IF NOT EXISTS checkout_pending(customer_id TEXT NOT NULL, purchase TEXT NOT NULL, token TEXT NOT NULL, price_id TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, fingerprint TEXT NOT NULL, session_id TEXT, checkout_url TEXT, status TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(customer_id, purchase));
+CREATE INDEX IF NOT EXISTS idx_checkout_pending_session ON checkout_pending(session_id);
+CREATE TABLE IF NOT EXISTS stripe_customer_bindings(customer_id TEXT PRIMARY KEY, stripe_customer_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS billing_invoice_states(invoice_id TEXT PRIMARY KEY, subscription_id TEXT, state TEXT NOT NULL, updated_at TEXT NOT NULL);
+'''),
 ]
 
 

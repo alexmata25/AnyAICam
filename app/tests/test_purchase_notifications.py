@@ -24,6 +24,12 @@ LOCAL_1_8 = "price_test_local_1_8"
 LOCAL_9_16 = "price_test_local_9_16"
 HYBRID_1_8 = "price_test_hybrid_1_8"
 HYBRID_17_32 = "price_test_hybrid_17_32"
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 DOLLAR_TEST_PRICE = "price_1UDegIGllhK80H2nHCfGvcz8"  # deliberately unmapped, see customer_entitlements
 RYZEN_STARTER_PRICE = "price_test_ryzen_starter"
 
@@ -98,6 +104,7 @@ def _checkout_event(event_id, price_id, *, email="jane@example.test", stripe_cus
         "id": event_id, "type": "checkout.session.completed",
         "data": {"object": {
             "id": f"cs_{event_id}", "mode": mode, "customer": stripe_customer,
+            **({"subscription": f"sub_{stripe_customer}"} if mode == "subscription" else {}),
             "customer_details": {"email": email}, "payment_status": "paid", "metadata": metadata,
         }},
     }
@@ -107,7 +114,7 @@ def _subscription_event(event_id, price_id, *, stripe_customer, event_type="cust
     return {
         "id": event_id, "type": event_type,
         "data": {"object": {
-            "id": f"sub_{event_id}", "customer": stripe_customer, "status": status,
+            "id": f"sub_{stripe_customer}", "customer": stripe_customer, "status": status,  # the subscription its checkout started
             "items": {"data": [{"price": {"id": price_id}}]}, "metadata": {},
         }},
     }

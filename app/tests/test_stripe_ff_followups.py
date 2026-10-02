@@ -19,6 +19,12 @@ from test_pricing_ff_commission import (  # noqa: F401
     OWNER, _checkout_event, _cookie, _doors, _make_global_admin, _seed, _stripe_maps, db_path, face_portal, portal,
 )
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 SESSION = "cs_test_a1b2c3d4e5f6"
 
 

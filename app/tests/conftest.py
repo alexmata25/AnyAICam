@@ -125,3 +125,70 @@ def fake_stripe_prices(monkeypatch):
     monkeypatch.setattr(main, "stripe_api_get", _get)
     monkeypatch.setattr(main, "_VERIFIED_STRIPE_PRICES", {})
     return overrides
+
+
+@pytest.fixture()
+def stripe_follows_events(monkeypatch):
+    """Stripe test double for tests written before billing read Stripe's
+    current state. Since the Codex audit of 3f5b9c4 (finding 9) nothing is
+    applied without that state, so these tests need a Stripe to ask. Here
+    Stripe "now" is what the test's own events say, in the order sent: a
+    subscription is as its latest subscription event describes it (or as its
+    checkout created it), a subscription's first invoice is paid, and a
+    payment is not refunded unless the test says so. Out-of-order, stale,
+    refunded and cross-tenant cases are tested against an explicit Stripe
+    in test_stripe_billing_launch.py / test_stripe_billing_policies.py.
+    Tests may adjust the returned state ("subscriptions", "invoices",
+    "intents") directly."""
+    import analytics_entitlements
+    import billing_status
+    import customer_entitlements
+    import sales_commissions
+    import stripe_state
+
+    now = {"subscriptions": {}, "invoices": {}, "intents": {}}
+
+    def reader(path):
+        kind, _, ident = path.split("?", 1)[0].rpartition("/")
+        if kind == "/v1/subscriptions":
+            if ident not in now["subscriptions"]:
+                raise LookupError(f"Stripe has no subscription {ident}")
+            return now["subscriptions"][ident]
+        if kind == "/v1/invoices":
+            first = ident.startswith("in_first_")
+            return now["invoices"].get(ident) or {"id": ident, "object": "invoice", "status": "paid" if first else "open",
+                                                  "amount_paid": 1 if first else 0, "payment_intent": f"pi_{ident}"}
+        if kind == "/v1/payment_intents":
+            return now["intents"].get(ident) or {"id": ident, "status": "succeeded",
+                                                 "latest_charge": {"id": f"ch_{ident}", "amount": 1, "amount_refunded": 0}}
+        raise AssertionError(f"unexpected Stripe read {path}")
+
+    def observe(event):
+        obj = (event.get("data") or {}).get("object") or {}
+        event_type = str(event.get("type") or "")
+        if event_type.startswith("customer.subscription.") and obj.get("id"):
+            now["subscriptions"][obj["id"]] = dict(obj, latest_invoice=obj.get("latest_invoice") or f"in_first_{obj['id']}")
+        elif event_type.startswith("checkout.session.") and obj.get("subscription"):
+            metadata = dict(obj.get("metadata") or {})
+            price = metadata.get("anyaicam_stripe_price_id")
+            now["subscriptions"].setdefault(obj["subscription"], {
+                "id": obj["subscription"], "object": "subscription", "customer": obj.get("customer"), "status": "active",
+                "metadata": metadata, "latest_invoice": f"in_first_{obj['subscription']}",
+                "items": {"data": [{"price": {"id": price}, "quantity": int(metadata.get("anyaicam_quantity") or 1)}]}})
+        elif event_type.startswith("invoice.") and obj.get("subscription"):
+            subscription_id = obj["subscription"]["id"] if isinstance(obj["subscription"], dict) else obj["subscription"]
+            details = obj.get("subscription_details") or ((obj.get("parent") or {}).get("subscription_details")) or {}
+            now["subscriptions"].setdefault(subscription_id, {
+                "id": subscription_id, "object": "subscription", "customer": obj.get("customer"), "status": "active",
+                "metadata": dict(details.get("metadata") or {}), "latest_invoice": obj.get("id")})
+
+    monkeypatch.setattr(stripe_state, "_stripe_reader", lambda: reader)
+    for module, name in ((customer_entitlements, "sync_entitlement_from_stripe_event"),
+                         (analytics_entitlements, "sync_analytics_from_stripe_event"),
+                         (billing_status, "sync_from_stripe_event"),
+                         (sales_commissions, "sync_commissions_from_stripe_event")):
+        def follow(event, _original=getattr(module, name)):
+            observe(event)
+            return _original(event)
+        monkeypatch.setattr(module, name, follow)
+    return now

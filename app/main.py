@@ -113898,9 +113898,11 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         fields.append(("subscription_data[metadata][anyaicam_product_class]", "base"))
         fields.append(("subscription_data[metadata][anyaicam_camera_slot_plan_type]", plan_type))
         fields.append(("subscription_data[metadata][anyaicam_camera_slot_maximum]", str(camera_slot_maximum)))
-    if identity.get("email"):
-        fields.append(("customer_email", str(identity["email"])))
-    session = stripe_api_post("/v1/checkout/sessions", fields)
+    # The account's one Stripe customer, and one payable checkout per base
+    # plan at a time (Codex audit of 3f5b9c4, findings 1-2; checkout_guard.py).
+    import checkout_guard
+    fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
+    session = checkout_guard.create_session(customer_id, "base", price_id=price_id, quantity=1, fields=fields)
     session_id = str(session.get("id") or "")
     checkout_url = str(session.get("url") or "")
     if not session_id or not checkout_url:
@@ -113985,6 +113987,12 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
+    # One subscription per add-on: a second one would bill twice for the
+    # same package (more sites or doors is a change to the existing one).
+    from partner_db import row as _held_row
+    if _held_row("SELECT id FROM addon_subscriptions WHERE customer_id=? AND addon_key=? AND status IN ('active','suspended')",
+                 (customer_id, addon_key)):
+        raise HTTPException(status_code=409, detail=f"Your account already has {label}.")
     import pricing_catalog
     _catalog_addon = pricing_catalog.find_addon(addon_key)
     _catalog_face = next((t for t in pricing_catalog.face_access_tiers() if f"face_access_{t['size']}" == addon_key), None)
@@ -114016,9 +114024,9 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         ("subscription_data[metadata][anyaicam_addon_key]", addon_key),
     ]
     friends_family.apply_to_checkout_fields(fields, customer_id, item["discount_class"])
-    if identity.get("email"):
-        fields.append(("customer_email", str(identity["email"])))
-    session = stripe_api_post("/v1/checkout/sessions", fields)
+    import checkout_guard
+    fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
+    session = checkout_guard.create_session(customer_id, f"addon:{addon_key}", price_id=price_id, quantity=quantity, fields=fields)
     session_id = str(session.get("id") or "")
     checkout_url = str(session.get("url") or "")
     if not session_id or not checkout_url:
@@ -114120,9 +114128,9 @@ def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Reque
         ("metadata[anyaicam_vms_license_capacity]", str(license_["capacity"])),
     ]
     friends_family.apply_to_checkout_fields(fields, customer_id, "vms_license")
-    if identity.get("email"):
-        fields.append(("customer_email", str(identity["email"])))
-    session = stripe_api_post("/v1/checkout/sessions", fields)
+    import checkout_guard
+    fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
+    session = checkout_guard.create_session(customer_id, "vms_license", price_id=price_id, quantity=1, fields=fields)
     session_id = str(session.get("id") or "")
     checkout_url = str(session.get("url") or "")
     if not session_id or not checkout_url:
@@ -114917,6 +114925,9 @@ async def _billing_grace_worker() -> None:
         try:
             import billing_status
             await asyncio.to_thread(billing_status.sweep_grace)
+            # Failed-renewal emails that could not be sent yet (outbox retry).
+            from purchase_notifications import retry_payment_failed_notifications
+            await asyncio.to_thread(retry_payment_failed_notifications)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -114947,6 +114958,10 @@ def _stripe_webhook_steps() -> list:
         # Grace after failed payments, refunds and disputes (2026-10-02).
         from billing_status import sync_from_stripe_event
         sync_from_stripe_event(event)
+    def checkout_sessions(event):
+        # A finished Checkout Session frees its purchase claim (checkout_guard.py).
+        from checkout_guard import sync_from_stripe_event
+        sync_from_stripe_event(event)
 
     return [
         ("legacy_billing", process_stripe_webhook_event),
@@ -114955,6 +114970,7 @@ def _stripe_webhook_steps() -> list:
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),
         ("billing_status", billing),
+        ("checkout_sessions", checkout_sessions),
     ]
 
 

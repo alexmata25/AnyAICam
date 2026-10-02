@@ -23,6 +23,12 @@ import customer_entitlements as ce
 import hardware_orders as ho
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 ADVANCED_ANALYTICS_TEST_PRICE = "price_test_advanced_analytics"
 FACIAL_RECOGNITION_TEST_PRICE = "price_test_analytics_facial_recognition"
 TALK_DOWN_TEST_PRICE = "price_test_analytics_talk_down"
@@ -81,11 +87,15 @@ def _checkout_event(event_id, price_id, *, email="real-customer@example.test", s
         metadata["anyaicam_customer_id"] = customer_id
     return {
         "id": event_id, "type": "checkout.session.completed",
-        "data": {"object": {"id": f"cs_{event_id}", "customer": stripe_customer, "customer_details": {"email": email}, "metadata": metadata}},
+        "data": {"object": {"id": f"cs_{event_id}", "mode": "subscription", "subscription": f"sub_{price_id}",
+                            "customer": stripe_customer, "customer_details": {"email": email}, "metadata": metadata}},
     }
 
 
-def _subscription_event(event_id, event_type, price_id, *, stripe_customer="cus_1", status="active", subscription_id="sub_1", customer_id=None):
+def _subscription_event(event_id, event_type, price_id, *, stripe_customer="cus_1", status="active", subscription_id=None, customer_id=None):
+    subscription_id = subscription_id or f"sub_{price_id}"  # one subscription per add-on, as checkout created it
+    if event_type.endswith("deleted") and status == "active":
+        status = "canceled"  # what Stripe says about a deleted subscription
     metadata = {"anyaicam_stripe_price_id": price_id}
     if customer_id:
         metadata["anyaicam_customer_id"] = customer_id

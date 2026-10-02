@@ -26,6 +26,12 @@ import customer_entitlements as ce
 
 
 # Approved working pricing, 2026-09-30 (pricing_catalog.BASE_PLANS).
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 EXPECTED = {
     ("local", "1-8"): (8, 14.99),
     ("local", "9-16"): (16, 24.99),

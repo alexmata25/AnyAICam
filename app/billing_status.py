@@ -19,7 +19,15 @@
    stands) restores disputed service. Commission reversal is unchanged
    (sales_commissions.py).
 Every transition is a state set keyed by Stripe ids, so replayed or
-duplicated events change nothing further. Camera plans keep their camera
+duplicated events change nothing further.
+
+Ordering (Codex audit of 3f5b9c4): each invoice's payment state is monotonic
+(billing_invoice_states) -- once paid, a delayed invoice.payment_failed for
+it never starts grace again (finding 6); the invoice's state in Stripe is
+read before grace starts. A refund or dispute recorded before the purchase
+was granted is consulted when it is granted (stripe_state.payment_reversal,
+finding 4). A failed renewal is also emailed to the customer, once per
+invoice (purchase_notifications.notify_payment_failed, finding 8). Camera plans keep their camera
 count while suspended (counted only when active), so restoring is exact.
 
 Not decided here (owner): partial refunds -- a partially refunded payment
@@ -40,6 +48,10 @@ HEALTHY_STRIPE_STATUSES = {"active", "trialing"}
 RESTORED_BY_PAYMENT = ("payment_failed", "refunded")
 REVERSALS_DDL = ("CREATE TABLE IF NOT EXISTS billing_reversals(id INTEGER PRIMARY KEY AUTOINCREMENT,charge_id TEXT,payment_intent TEXT,"
                  "invoice_id TEXT,reason TEXT NOT NULL,created_at TEXT NOT NULL)")
+INVOICE_STATES_DDL = ("CREATE TABLE IF NOT EXISTS billing_invoice_states(invoice_id TEXT PRIMARY KEY,subscription_id TEXT,"
+                      "state TEXT NOT NULL,updated_at TEXT NOT NULL)")
+# 'paid' (or 'void': nothing is owed) is final for an invoice.
+SETTLED_INVOICE_STATES = ("paid", "void")
 
 
 def _now() -> datetime:
@@ -219,14 +231,65 @@ def _record_reversal(charge_id: str, intent: str, invoice_id: str, reason: str) 
                        (charge_id or None, intent or None, invoice_id or None, reason, _now().isoformat()))
 
 
-def _is_reversed(charge_id: str, intent: str, invoice_id: str) -> bool:
+def reversal_reason(charge_id: str, intent: str, invoice_id: str) -> str | None:
+    """'refunded' / 'disputed' if this payment was reversed (a won dispute no
+    longer counts), else None."""
     with connection() as db:
         db.execute(REVERSALS_DDL)
         for column, value in (("charge_id", charge_id), ("payment_intent", intent), ("invoice_id", invoice_id)):
-            if value and db.execute(f"SELECT 1 FROM billing_reversals WHERE {column}=? AND reason IN ('refunded','disputed')",
-                                    (value,)).fetchone():
-                return True
-    return False
+            if value:
+                found = db.execute(f"SELECT reason FROM billing_reversals WHERE {column}=? AND reason IN ('refunded','disputed') "
+                                   "ORDER BY CASE reason WHEN 'refunded' THEN 0 ELSE 1 END LIMIT 1", (value,)).fetchone()
+                if found:
+                    return found["reason"]
+    return None
+
+
+def _is_reversed(charge_id: str, intent: str, invoice_id: str) -> bool:
+    return reversal_reason(charge_id, intent, invoice_id) is not None
+
+
+def record_reversal(charge_id: str, intent: str, invoice_id: str, reason: str) -> None:
+    _record_reversal(charge_id, intent, invoice_id, reason)
+
+
+# ------------------------------------------------------------------ per-invoice payment state (finding 6)
+
+def invoice_state(invoice_id: str) -> str | None:
+    with connection() as db:
+        db.execute(INVOICE_STATES_DDL)
+        found = db.execute("SELECT state FROM billing_invoice_states WHERE invoice_id=?", (invoice_id,)).fetchone()
+    return found["state"] if found else None
+
+
+def _set_invoice_state(invoice_id: str, subscription_id: str, state: str) -> bool:
+    """Monotonic: a settled invoice never goes back to failed. True if the
+    state was written."""
+    with connection() as db:
+        db.execute(INVOICE_STATES_DDL)
+        return bool(db.execute(
+            "INSERT INTO billing_invoice_states(invoice_id,subscription_id,state,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(invoice_id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at "
+            "WHERE billing_invoice_states.state NOT IN ('paid','void')",
+            (invoice_id, subscription_id, state, _now().isoformat())).rowcount)
+
+
+def _invoice_payment_failed(invoice: dict, subscription_id: str, at) -> dict:
+    invoice_id = str(invoice.get("id") or "")
+    if not invoice_id:
+        return {"status": "ignored", "reason": "invoice has no id"}
+    if invoice_state(invoice_id) in SETTLED_INVOICE_STATES:
+        return {"status": "ignored", "reason": "this invoice has already been paid"}
+    import stripe_state
+    from urllib.parse import quote
+    current = stripe_state.stripe_get(f"/v1/invoices/{quote(invoice_id, safe='')}", "the invoice's payment state")
+    if str(current.get("status") or "") in SETTLED_INVOICE_STATES:
+        _set_invoice_state(invoice_id, subscription_id, str(current["status"]))
+        return {"status": "ignored", "reason": "this invoice has already been paid"}
+    if not _set_invoice_state(invoice_id, subscription_id, "failed"):
+        return {"status": "ignored", "reason": "this invoice has already been paid"}
+    mark_payment_failed(subscription_id, at=at)
+    return {"status": "grace_started", "subscription": subscription_id, "invoice": invoice_id}
 
 
 def _stripe_invoice_subscription(intent: str) -> tuple[str, str] | None:
@@ -277,6 +340,11 @@ def _dispute_closed(event: dict) -> dict:
         return {"status": "ignored", "reason": "dispute not won: service stays suspended"}
     charge_id, intent = str(obj.get("charge") or ""), str(obj.get("payment_intent") or "")
     payment = _payment_for_charge(charge_id, intent, "")
+    with connection() as db:  # the payment stands: no longer a reversal
+        db.execute(REVERSALS_DDL)
+        for column, value in (("charge_id", charge_id), ("payment_intent", intent)):
+            if value:
+                db.execute(f"UPDATE billing_reversals SET reason='dispute_won' WHERE {column}=? AND reason='disputed'", (value,))
     restored = 0
     if payment and payment.get("stripe_subscription_id"):
         restored = _restore(payment["stripe_subscription_id"], ("disputed",))
@@ -304,8 +372,7 @@ def sync_from_stripe_event(event: dict) -> dict:
     if event_type == "invoice.payment_failed":
         subscription_id = _invoice_subscription(obj)
         if subscription_id:
-            mark_payment_failed(subscription_id, at=event.get("created"))
-            return {"status": "grace_started", "subscription": subscription_id}
+            return _invoice_payment_failed(obj, subscription_id, event.get("created"))
         return {"status": "ignored"}
     if event_type in ("invoice.paid", "invoice.payment_succeeded"):
         subscription_id = _invoice_subscription(obj)
@@ -313,6 +380,8 @@ def sync_from_stripe_event(event: dict) -> dict:
             return {"status": "ignored"}
         import sales_commissions
         intent = sales_commissions._invoice_payment_intent(obj) or ""
+        if obj.get("id"):
+            _set_invoice_state(str(obj["id"]), subscription_id, "paid")
         if _is_reversed(str(obj.get("charge") or ""), intent, str(obj.get("id") or "")):
             return {"status": "ignored", "reason": "this payment was refunded or disputed"}
         return {"status": "recovered", "rows": payment_recovered(subscription_id)}

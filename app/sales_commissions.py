@@ -27,12 +27,15 @@ the salesperson who created the customer in the Partner Portal
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Optional
 
 import pricing_catalog
 from partner_db import connection, row, rows
+
+logger = logging.getLogger("anyaicam.sales_commissions")
 
 SALES_ROLES = {"salesperson", "partner_owner"}
 EARNED, REVERSED, NOT_ELIGIBLE_FF = "earned", "reversed", "not_eligible_friends_family"
@@ -255,6 +258,34 @@ def _customer_for(metadata: dict, stripe_customer_id: str) -> Optional[str]:
     return None
 
 
+def _verified_invoice_owner(invoice: dict, subscription_id: str) -> tuple[Optional[str], str]:
+    """(customer_id, "") when the invoice's Stripe customer, its subscription
+    and its metadata all belong to one AnyAiCam account; (None, why)
+    otherwise -- then neither account's payments or commissions change
+    (Codex audit of 3f5b9c4, finding 7). Stripe unreadable -> retried."""
+    import stripe_state
+    stripe_customer_id = str(invoice.get("customer") or "")
+    if not stripe_customer_id:
+        return None, "invoice has no Stripe customer"
+    metadata_customer_id = str(_invoice_metadata(invoice).get("anyaicam_customer_id") or "") or None
+    owners = stripe_state.stripe_customer_accounts(stripe_customer_id)
+    if metadata_customer_id and owners and owners != {metadata_customer_id}:
+        return None, "the invoice names a different account than its Stripe customer"
+    if len(owners) > 1:
+        return None, "the Stripe customer is linked to more than one account"
+    subscription = stripe_state.current_subscription(subscription_id)
+    if str(subscription.get("customer") or "") != stripe_customer_id:
+        return None, "the invoice and its subscription belong to different Stripe customers"
+    subscription_customer_id = str((subscription.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
+    candidates = {c for c in (metadata_customer_id, subscription_customer_id, *owners) if c}
+    if len(candidates) > 1:
+        return None, "the invoice, its subscription and its Stripe customer name different accounts"
+    customer_id = next(iter(candidates), None) or _customer_for({}, stripe_customer_id)
+    if not customer_id or not row("SELECT id FROM customers WHERE id=?", (customer_id,)):
+        return None, "customer not resolved"
+    return customer_id, ""
+
+
 def _base_paid_months(customer_id: str) -> int:
     found = row("SELECT COUNT(*) AS n FROM subscription_payments WHERE customer_id=? AND product_class='base'", (customer_id,))
     return int((found or {}).get("n") or 0)
@@ -272,9 +303,10 @@ def _invoice_paid(event: dict) -> dict:
     product_class, product, price_id, eligible_fraction = _classify_invoice(invoice)
     if product_class is None:
         return {"status": "ignored", "reason": "not an AnyAiCam plan or add-on price", "price_id": price_id}
-    customer_id = _customer_for(_invoice_metadata(invoice), str(invoice.get("customer") or ""))
+    customer_id, why = _verified_invoice_owner(invoice, subscription_id)
     if not customer_id:
-        return {"status": "ignored", "reason": "customer not resolved"}
+        logger.warning("commission.invoice_rejected invoice=%s reason=%s", invoice_id, why)
+        return {"status": "rejected" if why != "customer not resolved" else "ignored", "reason": why}
     tax = int(invoice.get("tax") or 0) + sum(int(t.get("amount") or 0) for t in (invoice.get("total_taxes") or []) if isinstance(t, dict))
     basis = int(round(max(0, amount_paid - tax) * eligible_fraction))  # unknown price lines earn nothing
     if not row("SELECT id FROM subscription_payments WHERE id=?", (invoice_id,)):

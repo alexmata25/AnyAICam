@@ -337,6 +337,27 @@ def _format_date(iso_timestamp: str) -> str:
         return iso_timestamp or ""
 
 
+def _payment_failed_email(first_name: str, plan_label: str, grace_end: str) -> tuple[str, str, str]:
+    link = _portal_url("/subscription-portal")
+    keep = f"Your service continues until {grace_end}. " if grace_end else ""
+    subject = "Your AnyAiCam payment didn't go through"
+    text = (
+        f"Hi {first_name},\n\n"
+        f"We couldn't collect the latest payment for your AnyAiCam {plan_label}.\n\n"
+        f"{keep}To keep it running, update your payment method on My subscription: {link}\n\n"
+        f"If you've already updated it, you can ignore this email.\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>We couldn't collect the latest payment for your AnyAiCam {plan_label}.</p>"
+        f"<p>{keep}To keep it running, update your payment method on <a href=\"{link}\">My subscription</a>.</p>"
+        f"<p>If you've already updated it, you can ignore this email.</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
 def _hardware_order_email(first_name: str, order: dict) -> tuple[str, str, str]:
     """Order-confirmation email -- sent immediately after a successful
     hardware payment/order record, per this phase's explicit content
@@ -645,6 +666,9 @@ def _notify_from_stripe_event(event: dict) -> dict:
     if entitlement_outcome and entitlement_outcome.get("status") == "pending_link_created":
         return _notify_setup_required(event_id, session_or_sub)
 
+    if event_type == "invoice.payment_failed":
+        return notify_payment_failed(str(session_or_sub.get("id") or ""))
+
     # Not a camera-slot outcome -- check whether this event produced a
     # hardware order instead (mutually exclusive by construction, see
     # module docstring).
@@ -725,6 +749,71 @@ def _notify_hardware_order(event_id: str, order: dict) -> dict:
         customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"order_id": order["id"], "sku": order["sku"]},
     )
+
+
+# ------------------------------------------------- failed renewal (outbox)
+#
+# Codex audit of 3f5b9c4, finding 8: a failed renewal is emailed to the
+# account owner through provisioning_notifications -- once per invoice
+# (key "payment-failed:<invoice id>"), whatever number of failure events
+# Stripe sends, and never after the invoice was paid. A send that fails is
+# retried by the billing worker (retry_payment_failed_notifications), not
+# only if Stripe happens to redeliver. Stripe's own customer emails are not
+# relied on.
+
+PAYMENT_FAILED_TYPE = "payment_failed"
+
+
+def notify_payment_failed(invoice_id: str) -> dict:
+    import billing_status
+    from partner_db import rows
+    if not invoice_id:
+        return {"status": "ignored", "reason": "no invoice"}
+    state = row("SELECT * FROM billing_invoice_states WHERE invoice_id=?", (invoice_id,))
+    if not state or state["state"] != "failed":
+        return {"status": "ignored", "reason": "this invoice is not unpaid"}
+    subscription_id = state["subscription_id"]
+    held = rows("SELECT customer_id,product AS label_key,payment_failed_at FROM customer_entitlements WHERE stripe_subscription_id=? "
+                "AND status IN ('active','suspended')", (subscription_id,))
+    label = _plan_label(held[0]["label_key"]) + " plan" if held else ""
+    if not held:
+        held = rows("SELECT customer_id,addon_key AS label_key,payment_failed_at FROM addon_subscriptions WHERE stripe_subscription_id=? "
+                    "AND status IN ('active','suspended')", (subscription_id,))
+        if held:
+            try:
+                from analytics_entitlements import ANALYTICS_CATALOG
+                label = next((item[1] for item in ANALYTICS_CATALOG if item[0] == held[0]["label_key"]), "add-on")
+            except Exception:
+                label = "add-on"
+    if not held:
+        return {"status": "ignored", "reason": "no AnyAiCam service for this subscription"}
+    customer = _customer_row(held[0]["customer_id"])
+    if not customer:
+        return {"status": "ignored", "reason": "customer row no longer exists"}
+    grace_end = billing_status.grace_ends_at(held[0]["payment_failed_at"])
+    subject, text, html = _payment_failed_email(_first_name(customer.get("name")), label or "subscription",
+                                                _format_date(grace_end.isoformat()) if grace_end else "")
+    return _send_once(
+        event_id=f"payment-failed:{invoice_id}", notification_type=PAYMENT_FAILED_TYPE, customer_id=customer["id"],
+        recipient_email=customer.get("email") or "", subject=subject, text=text, html=html,
+        metadata={"stripe_invoice_id": invoice_id, "stripe_subscription_id": subscription_id},
+    )
+
+
+def retry_payment_failed_notifications(limit: int = 50) -> int:
+    """Resend failed-renewal emails that were not delivered yet."""
+    from partner_db import rows
+    sent = 0
+    for pending in rows("SELECT stripe_event_id FROM provisioning_notifications WHERE notification_type=? "
+                        "AND status IN ('pending','failed') ORDER BY updated_at LIMIT ?", (PAYMENT_FAILED_TYPE, limit)):
+        key = str(pending["stripe_event_id"] or "")
+        if key.startswith("payment-failed:"):
+            try:
+                if notify_payment_failed(key.split(":", 1)[1]).get("status") == "sent":
+                    sent += 1
+            except Exception:
+                continue
+    return sent
 
 
 # ------------------------------------------------- fulfillment/return triggers

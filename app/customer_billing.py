@@ -75,7 +75,12 @@ def _portal_configuration(main) -> dict:
 
 def stripe_customer_ids_for_customer(customer_id: str) -> set[str]:
     from partner_db import rows
-    ids = {r["stripe_customer_id"] for r in rows(
+    try:  # the canonical Stripe customer (checkout_guard.py)
+        ids = {r["stripe_customer_id"] for r in rows(
+            "SELECT stripe_customer_id FROM stripe_customer_bindings WHERE customer_id=?", (customer_id,))}
+    except Exception:
+        ids = set()
+    ids |= {r["stripe_customer_id"] for r in rows(
         "SELECT stripe_customer_id FROM customer_entitlements WHERE customer_id=? AND stripe_customer_id IS NOT NULL AND stripe_customer_id<>''",
         (customer_id,))}
     try:

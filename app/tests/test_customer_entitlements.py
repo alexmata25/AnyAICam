@@ -17,6 +17,12 @@ from partner_db import initialize_database
 import customer_entitlements as ce
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_customer_entitlements.db"
@@ -306,17 +312,21 @@ def test_subscription_change_self_heals_via_metadata_customer_id_when_stripe_cus
     assert entitlement["camera_slot_quantity"] == 16
 
 
-def test_subscription_event_never_fabricates_an_entitlement_out_of_nothing(db_path):
-    """The self-heal fallback only ever repairs the LOOKUP for an
-    entitlement that already exists -- it must never create one from a
-    bare subscription event with no prior checkout at all."""
+@pytest.mark.parametrize("stripe_says", ["canceled", "incomplete_expired", "incomplete"])
+def test_subscription_event_never_fabricates_an_entitlement_out_of_nothing(db_path, stripe_says):
+    """A bare subscription event never creates service Stripe does not
+    confirm: one that has ended, or whose first payment never completed
+    (Codex audit of 3f5b9c4, finding 5). Only a subscription Stripe says is
+    active, for a known account, is granted -- that is how a purchase whose
+    first payment completed late gets its service (test_stripe_billing_remediation.py)."""
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        event = _subscription_event("evt_sub_first", stripe_customer="cus_never_seen_yet", price_id=TIER_1_16, customer_id="cust-1")
+        event = _subscription_event("evt_sub_first", stripe_customer="cus_never_seen_yet", price_id=TIER_1_16, customer_id="cust-1",
+                                    status=stripe_says)
         result = ce.sync_entitlement_from_stripe_event(event)
         entitlements = ce.get_entitlements_for_customer("cust-1")
-    assert result["status"] == "ignored"
-    assert entitlements == []
+    assert result["status"] in ("not_granted", "entitlement_updated")
+    assert not [e for e in entitlements if e["status"] == "active" or e["camera_slot_quantity"]]
 
 
 # ------------------------------------------------------- Phase 3: fixed tiers

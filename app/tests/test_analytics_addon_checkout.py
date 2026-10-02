@@ -28,6 +28,12 @@ from fastapi.testclient import TestClient
 from database_backend import override_target
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_analytics_addon_checkout.db"
@@ -49,7 +55,9 @@ def client(db_path, tmp_path, monkeypatch, fake_stripe_prices):
 
         captured = {}
 
-        def _fake_stripe_api_post(path, fields):
+        def _fake_stripe_api_post(path, fields, idempotency_key=None):
+            if path == "/v1/customers":  # the account's canonical Stripe customer, one per account (checkout_guard.py)
+                return {"id": "cus_test_" + str(idempotency_key).replace("anyaicam-customer-", "")}
             captured["path"] = path
             captured["fields"] = fields
             return {"id": "cs_test_analytics_1", "url": "https://checkout.stripe.test/cs_test_analytics_1"}
@@ -113,7 +121,8 @@ def test_advanced_analytics_creates_one_recurring_session_for_the_bundle(client,
     assert fields["subscription_data[metadata][anyaicam_stripe_price_id]"] == "price_test_advanced_analytics"
     assert fields["subscription_data[metadata][anyaicam_customer_id]"] == "cust-1"
     assert fields["client_reference_id"] == "cust-1"
-    assert fields["customer_email"] == "owner@example.test"
+    # The account's one canonical Stripe customer, never only an email (Codex audit of 3f5b9c4, finding 2).
+    assert fields["customer"] == "cus_test_cust-1" and "customer_email" not in fields
 
 
 def test_old_single_price_face_access_sku_is_no_longer_sold(client, db_path):
@@ -241,7 +250,7 @@ def test_webhook_grants_every_advanced_analytics_key_from_one_purchase(client, d
             "id": "evt_test_1",
             "type": "checkout.session.completed",
             "data": {"object": {
-                "id": "cs_test_analytics_1",
+                "id": "cs_test_analytics_1", "mode": "subscription", "subscription": "sub_1",
                 "customer": "cus_test_1",
                 "customer_details": {"email": "owner@example.test"},
                 "metadata": {
@@ -273,7 +282,8 @@ def test_cancelling_advanced_analytics_cancels_all_its_keys_together(client, db_
         checkout_event = {
             "id": "evt_checkout", "type": "checkout.session.completed",
             "data": {"object": {
-                "id": "cs_1", "customer": "cus_test_1", "customer_details": {"email": "owner@example.test"},
+                "id": "cs_1", "mode": "subscription", "subscription": "sub_1", "customer": "cus_test_1",
+                "customer_details": {"email": "owner@example.test"},
                 "metadata": {
                     "anyaicam_stripe_price_id": fields["metadata[anyaicam_stripe_price_id]"],
                     "anyaicam_customer_id": fields["metadata[anyaicam_customer_id]"],
@@ -311,7 +321,8 @@ def test_face_access_purchase_does_not_touch_advanced_analytics_keys(client, db_
         event = {
             "id": "evt_face", "type": "checkout.session.completed",
             "data": {"object": {
-                "id": "cs_face", "customer": "cus_face", "customer_details": {"email": "owner@example.test"},
+                "id": "cs_face", "mode": "subscription", "subscription": "sub_face", "customer": "cus_face",
+                "customer_details": {"email": "owner@example.test"},
                 "metadata": {
                     "anyaicam_stripe_price_id": fields["metadata[anyaicam_stripe_price_id]"],
                     "anyaicam_customer_id": fields["metadata[anyaicam_customer_id]"],

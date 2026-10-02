@@ -34,6 +34,12 @@ TIER_1_16 = "price_test_1_16"
 TIER_17_32 = "price_test_17_32"
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_installation_lifecycle.db"

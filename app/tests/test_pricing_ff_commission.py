@@ -11,6 +11,12 @@ import pricing_catalog as pc
 from database_backend import override_target
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 # ================================================================ catalog
 
 @pytest.mark.parametrize("plan_type,tier,dollars", [
@@ -193,6 +199,7 @@ def _checkout_event(event_id, price_id, customer_id="cust-1", stripe_customer="c
         metadata["anyaicam_quantity"] = str(quantity)
     return {"id": event_id, "type": "checkout.session.completed", "data": {"object": {
         "id": f"cs_{event_id}", "customer": stripe_customer, "mode": "subscription", "payment_status": "paid",
+        "subscription": f"sub_{price_id}",  # the subscription this checkout started (as _cancel_event names it)
         "customer_details": {"email": "owner@example.test"}, "metadata": metadata}}}
 
 
@@ -273,7 +280,11 @@ def portal(db_path, tmp_path, monkeypatch, fake_stripe_prices):
     monkeypatch.setattr(purchase_notifications, "get_email_service", lambda: _Mail())
     captured = []
 
-    def _fake_stripe(path, fields):
+    def _fake_stripe(path, fields, idempotency_key=None):
+        if path == "/v1/customers":  # the account's canonical Stripe customer, one per account (checkout_guard.py)
+            return {"id": "cus_test_" + str(idempotency_key).replace("anyaicam-customer-", "")}
+        if path.endswith("/expire"):  # a different checkout replaces the open one
+            return {"id": path.split("/")[4], "status": "expired"}
         captured.append(dict(fields))
         return {"id": f"cs_{len(captured)}", "url": f"https://checkout.stripe.test/{len(captured)}"}
 

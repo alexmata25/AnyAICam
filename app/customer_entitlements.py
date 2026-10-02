@@ -120,6 +120,18 @@ from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment
 # Stripe's current state and Stripe-customer ownership (2026-10-02): see
 # stripe_state.py, shared with add-ons.
 from stripe_state import RetryableStripeEventError, bound_elsewhere as _bound_elsewhere, current_subscription, unresolved
+from stripe_state import conflicting_subscription, payment_reversal, subscription_payment_reversal
+
+# Stripe's status for a subscription whose FIRST payment has not completed:
+# never active service (Codex audit of 3f5b9c4, finding 5). The 7-day grace
+# is for a renewal of service already paid for, not an unpaid purchase.
+INITIAL_PAYMENT_INCOMPLETE = "incomplete"
+PAYMENT_INCOMPLETE_REASON = "payment_incomplete"
+
+
+def _set_suspended_reason(entitlement_id: str, reason) -> None:
+    with connection() as db:
+        db.execute("UPDATE customer_entitlements SET suspended_reason=? WHERE id=?", (reason, entitlement_id))
 
 
 def normalize_email(email: str) -> str:
@@ -602,6 +614,8 @@ def _sync_checkout_completed(event: dict) -> dict:
         return {"status": "rejected", "reason": "stripe customer belongs to another account", "customer_id": customer["id"]}
     subscription_id = str(session_obj.get("subscription") or "") or None
     current = current_subscription(subscription_id) if session_obj.get("mode") == "subscription" else None
+    if session_obj.get("mode") == "subscription" and current is None:
+        return {"status": "ignored", "reason": "subscription checkout without a subscription"}
     if current is not None:
         current_customer = str(current.get("customer") or "")
         current_meta = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
@@ -617,26 +631,57 @@ def _sync_checkout_completed(event: dict) -> dict:
             # grant nothing; an existing row reflects the ended state.
             if customer:
                 existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer["id"], tier["product"]))
-                if existing:
+                # Only a row bound to THIS subscription reflects its end: a
+                # newer subscription's row is never touched (finding 3).
+                if existing and str(existing.get("stripe_subscription_id") or subscription_id) == subscription_id:
                     upsert_entitlement(customer_id=customer["id"], product=tier["product"], camera_slot_quantity=0, status="cancelled",
                                        stripe_customer_id=fields["stripe_customer_id"], stripe_subscription_id=subscription_id,
                                        stripe_price_id=fields["price_id"])
             return {"status": "not_granted", "reason": "subscription is no longer active in Stripe"}
+        if current.get("status") == INITIAL_PAYMENT_INCOMPLETE:
+            return {"status": "not_granted", "reason": "the first payment has not completed"}
+    existing = None
+    if customer:
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer["id"], tier["product"]))
+        if existing and current is not None:
+            conflict = conflicting_subscription(existing.get("stripe_subscription_id"), current)
+            if conflict:
+                return {"status": "ignored", "reason": conflict}
+    # Never grant service for a payment already fully refunded or disputed,
+    # whichever event arrived first (finding 4).
+    if current is not None:
+        reversal = subscription_payment_reversal(current)
+    else:
+        if not fields["stripe_payment_intent_id"] and int(session_obj.get("amount_total") or 0) > 0:
+            raise RetryableStripeEventError("the checkout's payment could not be identified")
+        reversal = payment_reversal(payment_intent=fields["stripe_payment_intent_id"])
     if not customer:
         if not fields["email"]:
             return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
+        if reversal:
+            return {"status": "not_granted", "reason": f"the payment was {reversal}"}
         link = create_pending_link(
             email=fields["email"], product=tier["product"], camera_slot_quantity=tier["camera_slot_maximum"],
             stripe_customer_id=fields["stripe_customer_id"], stripe_checkout_session_id=fields["stripe_checkout_session_id"],
             stripe_price_id=fields["price_id"], raw_event=event,
         )
         return {"status": "pending_link_created", "pending_link_id": link["id"]}
+    # Only billing_status lifts a suspension of this same subscription (a
+    # payment, a won dispute) -- never a late or repeated checkout event.
+    keep_suspended = bool(existing and existing.get("status") == "suspended" and subscription_id
+                          and existing.get("stripe_subscription_id") == subscription_id
+                          and existing.get("suspended_reason") != PAYMENT_INCOMPLETE_REASON)
+    status = "suspended" if (reversal or keep_suspended) else "active"
     entitlement = upsert_entitlement(
         customer_id=customer["id"], product=tier["product"], camera_slot_quantity=tier["camera_slot_maximum"],
-        status="active", stripe_customer_id=fields["stripe_customer_id"],
+        status=status, stripe_customer_id=fields["stripe_customer_id"],
         stripe_subscription_id=subscription_id if current is not None else None,
         stripe_checkout_session_id=fields["stripe_checkout_session_id"], stripe_price_id=fields["price_id"],
     )
+    if reversal:
+        _set_suspended_reason(entitlement["id"], reversal)
+    elif status == "active":
+        _set_suspended_reason(entitlement["id"], None)
     if current is not None:
         record_billing_state(entitlement["id"], current)
         supersede_other_base_plans(entitlement, current)
@@ -644,7 +689,11 @@ def _sync_checkout_completed(event: dict) -> dict:
         with connection() as db:
             db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=? WHERE id=?",
                        (fields["stripe_payment_intent_id"], entitlement["id"]))
-    return {"status": "entitlement_updated", "entitlement_id": entitlement["id"], "customer_id": customer["id"]}
+    if fields["stripe_customer_id"]:
+        import checkout_guard
+        checkout_guard.bind_stripe_customer(customer["id"], fields["stripe_customer_id"])
+    return {"status": "entitlement_updated", "entitlement_id": entitlement["id"], "customer_id": customer["id"],
+            **({"suspended_reason": reversal} if reversal else {})}
 
 
 def _current_subscription_price_id(subscription_obj: dict) -> str:
@@ -668,11 +717,13 @@ def _current_subscription_price_id(subscription_obj: dict) -> str:
 def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     subscription_obj = (event.get("data") or {}).get("object") or {}
     current = current_subscription(str(subscription_obj.get("id") or "") or None)
-    if current is not None:
-        # What Stripe says now wins over this event's snapshot; a deletion
-        # is only "cancelled" if the subscription really has ended.
-        subscription_obj = current
-        cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
+    if current is None:
+        return {"status": "ignored", "reason": "subscription event without a subscription id"}
+    # What Stripe says now wins over this event's snapshot (never applied
+    # without it, finding 9); a deletion is only "cancelled" if the
+    # subscription really has ended.
+    subscription_obj = current
+    cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
     stripe_customer_id = str(subscription_obj.get("customer") or "")
     metadata = subscription_obj.get("metadata") or {}
     price_id = _current_subscription_price_id(subscription_obj)
@@ -701,19 +752,35 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         # metadata), so look the entitlement up that way instead of
         # giving up.
         existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (metadata_customer_id, tier["product"]))
+    if existing:
+        # A delayed event for an older subscription never alters the
+        # account's newer one (finding 3).
+        conflict = conflicting_subscription(existing.get("stripe_subscription_id"), subscription_obj)
+        if conflict:
+            return {"status": "ignored", "reason": conflict}
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
-    if existing and existing.get("status") == "suspended" and new_status == "active":
+    new_reason = None
+    if new_status == "active" and subscription_obj.get("status") == INITIAL_PAYMENT_INCOMPLETE:
+        # First payment not completed: no service (finding 5).
+        if not existing or existing.get("status") != "active":
+            return {"status": "not_granted", "reason": "the first payment has not completed"}
+        new_status, new_reason = "suspended", PAYMENT_INCOMPLETE_REASON
+    if existing and existing.get("status") == "suspended" and new_status == "active" \
+            and existing.get("suspended_reason") != PAYMENT_INCOMPLETE_REASON:
         # Suspended for an unpaid period, a refund or a dispute: only
         # billing_status lifts that (a payment, a won dispute), never a
         # subscription update that merely says the subscription exists.
         new_status = "suspended"
+    if new_status == "active" and (not existing or existing.get("status") != "active"):
+        # Becoming active here (first grant, or after the first payment
+        # completed): never for a refunded/disputed payment (finding 4).
+        reversal = subscription_payment_reversal(subscription_obj)
+        if reversal:
+            new_status, new_reason = "suspended", reversal
     if not existing:
         known = metadata_customer_id and row("SELECT id FROM customers WHERE id=?", (metadata_customer_id,))
         if not known:
             return unresolved("camera_plan", str(subscription_obj.get("id") or "") or None, stripe_customer_id)
-        if current is None and new_status == "active":
-            # Without Stripe's current state, only a checkout grants.
-            return {"status": "ignored", "reason": "no existing entitlement for this stripe customer/product"}
     entitlement = upsert_entitlement(
         customer_id=(existing or {}).get("customer_id") or metadata_customer_id,
         product=tier["product"],
@@ -727,12 +794,15 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
         stripe_price_id=price_id,
     )
-    if current is not None:
-        record_billing_state(entitlement["id"], current)
-        supersede_other_base_plans(entitlement, current)
-        import plan_changes
-        plan_changes.sync_scheduled_change(entitlement, current)
-        plan_changes.sync_addons_with_base(entitlement, current)
+    if new_reason:
+        _set_suspended_reason(entitlement["id"], new_reason)
+    elif new_status == "active":
+        _set_suspended_reason(entitlement["id"], None)
+    record_billing_state(entitlement["id"], current)
+    supersede_other_base_plans(entitlement, current)
+    import plan_changes
+    plan_changes.sync_scheduled_change(entitlement, current)
+    plan_changes.sync_addons_with_base(entitlement, current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}
 
 

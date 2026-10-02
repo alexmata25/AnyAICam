@@ -26,6 +26,12 @@ from fastapi.testclient import TestClient
 from database_backend import override_target
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_camera_slot_checkout.db"
@@ -47,7 +53,9 @@ def client(db_path, tmp_path, monkeypatch, fake_stripe_prices):
 
         captured = {}
 
-        def _fake_stripe_api_post(path, fields):
+        def _fake_stripe_api_post(path, fields, idempotency_key=None):
+            if path == "/v1/customers":  # the account's canonical Stripe customer, one per account (checkout_guard.py)
+                return {"id": "cus_test_" + str(idempotency_key).replace("anyaicam-customer-", "")}
             captured["path"] = path
             captured["fields"] = fields
             return {"id": "cs_test_camera_1", "url": "https://checkout.stripe.test/cs_test_camera_1"}
@@ -112,7 +120,8 @@ def test_local_checkout_is_a_monthly_subscription_session_with_full_metadata(cli
     assert fields["allow_promotion_codes"] == "true"
     assert "discounts[0][coupon]" not in fields
     assert fields["client_reference_id"] == "cust-1"
-    assert fields["customer_email"] == "owner@example.test"
+    # The account's one canonical Stripe customer, never only an email (Codex audit of 3f5b9c4, finding 2).
+    assert fields["customer"] == "cus_test_cust-1" and "customer_email" not in fields
     assert "customer/setup" in fields["success_url"]
     assert "customer/setup" in fields["cancel_url"]
 

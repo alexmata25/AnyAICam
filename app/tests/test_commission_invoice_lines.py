@@ -15,6 +15,12 @@ import pytest
 from test_pricing_ff_commission import _entries, _stripe_maps, _seed, db_path, ledger  # noqa: F401 -- fixtures and helpers
 
 
+# Billing reads Stripe's current state and applies nothing without it (Codex
+# audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
+# own events (conftest.stripe_follows_events).
+pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+
+
 def _invoice(event_id, invoice_id, lines, *, amount=None, sub="sub_base"):
     return {"id": event_id, "type": "invoice.paid", "data": {"object": {
         "id": invoice_id, "object": "invoice", "customer": "cus_1", "subscription": sub,

@@ -470,22 +470,37 @@ def _sync_checkout_completed(event: dict) -> dict:
     # customer_entitlements): a Stripe customer paying for another account
     # never provisions this one, and a subscription that has already ended in
     # Stripe is never granted by a late checkout event.
-    from stripe_state import bound_elsewhere as _bound_elsewhere, current_subscription
+    from stripe_state import (RetryableStripeEventError, bound_elsewhere as _bound_elsewhere, conflicting_subscription,
+                              current_subscription, subscription_payment_reversal)
     if customer and _bound_elsewhere(fields["stripe_customer_id"], customer["id"]):
         return {"status": "rejected", "reason": "stripe customer belongs to another account", "customer_id": customer["id"]}
     subscription_id = str(session_obj.get("subscription") or "") or None
     current = current_subscription(subscription_id) if session_obj.get("mode") == "subscription" else None
-    if current is not None:
-        current_meta = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
-        if (fields["stripe_customer_id"] and str(current.get("customer") or "") != fields["stripe_customer_id"]) or \
-                (customer and current_meta and current_meta != customer["id"]):
-            return {"status": "rejected", "reason": "checkout and its subscription disagree about the account"}
-        if current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES:
-            return {"status": "not_granted", "reason": "subscription is no longer active in Stripe"}
+    if current is None:
+        # Every add-on is a subscription; without Stripe's current state of
+        # it nothing is granted (Codex audit of 3f5b9c4, finding 9).
+        return {"status": "ignored", "reason": "add-on checkout without a subscription"}
+    current_meta = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
+    if (fields["stripe_customer_id"] and str(current.get("customer") or "") != fields["stripe_customer_id"]) or \
+            (customer and current_meta and current_meta != customer["id"]):
+        return {"status": "rejected", "reason": "checkout and its subscription disagree about the account"}
+    if current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES:
+        return {"status": "not_granted", "reason": "subscription is no longer active in Stripe"}
+    if current.get("status") == "incomplete":  # first payment not completed: no service (finding 5)
+        return {"status": "not_granted", "reason": "the first payment has not completed"}
+    held_addon = row("SELECT * FROM addon_subscriptions WHERE customer_id=? AND addon_key=?",
+                     (customer["id"], addon["addon_key"])) if customer else None
+    if held_addon:
+        conflict = conflicting_subscription(held_addon.get("stripe_subscription_id"), current)  # finding 3
+        if conflict:
+            return {"status": "ignored", "reason": conflict}
+    reversal = subscription_payment_reversal(current)  # finding 4
 
     if not customer:
         if not fields["email"]:
             return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
+        if reversal:
+            return {"status": "not_granted", "reason": f"the payment was {reversal}"}
         # One purchase can grant more than one analytic_key ("advanced_
         # analytics" grants four) -- pending_analytics_links is keyed
         # one row per analytic_key, so a multi-key addon creates one
@@ -502,11 +517,14 @@ def _sync_checkout_completed(event: dict) -> dict:
             link_ids.append(link["id"])
         return {"status": "pending_link_created", "pending_link_ids": link_ids, "addon_key": addon["addon_key"], "analytic_keys": list(addon["analytic_keys"])}
 
-    upsert_addon_subscription(
+    keep_reason = (held_addon or {}).get("suspended_reason") if (
+        held_addon and held_addon.get("status") == "suspended" and held_addon.get("stripe_subscription_id") == subscription_id
+        and held_addon.get("suspended_reason") != "payment_incomplete") else None
+    package = upsert_addon_subscription(
         customer_id=customer["id"], addon_key=addon["addon_key"], status="active",
         quantity=_positive_int((session_obj.get("metadata") or {}).get("anyaicam_quantity")),
         stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
-        stripe_subscription_id=subscription_id if current is not None else None,
+        stripe_subscription_id=subscription_id,
     )
     subscription_ids = []
     for analytic_key in addon["analytic_keys"]:
@@ -515,6 +533,15 @@ def _sync_checkout_completed(event: dict) -> dict:
             stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
         )
         subscription_ids.append(subscription["id"])
+    if reversal or keep_reason:
+        # A refunded/disputed payment, or a suspension only billing_status
+        # lifts: the package and its features stay off.
+        apply_addon_state(package, status="suspended", suspended_reason=reversal or keep_reason)
+    else:
+        apply_addon_state(package, status="active", suspended_reason=None)
+    if fields["stripe_customer_id"]:
+        import checkout_guard
+        checkout_guard.bind_stripe_customer(customer["id"], fields["stripe_customer_id"])
     return {
         "status": "analytics_subscription_updated",
         "subscription_ids": subscription_ids,
@@ -534,11 +561,15 @@ def _current_subscription_price_id(subscription_obj: dict) -> str:
 
 def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     subscription_obj = (event.get("data") or {}).get("object") or {}
-    from stripe_state import current_subscription, stripe_customer_accounts, unresolved
+    from stripe_state import (conflicting_subscription, current_subscription, stripe_customer_accounts,
+                              subscription_payment_reversal, unresolved)
     current = current_subscription(str(subscription_obj.get("id") or "") or None)
-    if current is not None:  # Stripe's current state wins over this event's snapshot (2026-10-02)
-        subscription_obj = current
-        cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
+    if current is None:
+        return {"status": "ignored", "reason": "subscription event without a subscription id"}
+    # Stripe's current state wins over this event's snapshot, and nothing is
+    # applied without it (2026-10-02; Codex finding 9).
+    subscription_obj = current
+    cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
     stripe_customer_id = str(subscription_obj.get("customer") or "")
     metadata = subscription_obj.get("metadata") or {}
     price_id = _current_subscription_price_id(subscription_obj)
@@ -555,11 +586,29 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         return {"status": "rejected", "reason": "stripe customer and subscription metadata name different accounts"}
     if not owners and (not metadata_customer_id or not row("SELECT id FROM customers WHERE id=?", (metadata_customer_id,))):
         return unresolved("add_on", str(subscription_obj.get("id") or "") or None, stripe_customer_id)
+    owner = metadata_customer_id or (next(iter(owners)) if len(owners) == 1 else None)
+    package_row = row("SELECT * FROM addon_subscriptions WHERE customer_id=? AND addon_key=?", (owner, addon["addon_key"])) if owner else None
+    if package_row:
+        # A delayed event for an older subscription never alters the
+        # account's newer one (finding 3).
+        conflict = conflicting_subscription(package_row.get("stripe_subscription_id"), subscription_obj)
+        if conflict:
+            return {"status": "ignored", "reason": conflict}
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
-    held = row("SELECT status FROM addon_subscriptions WHERE stripe_subscription_id=? AND addon_key=?",
+    new_reason = None
+    held = row("SELECT status,suspended_reason FROM addon_subscriptions WHERE stripe_subscription_id=? AND addon_key=?",
                (str(subscription_obj.get("id") or ""), addon["addon_key"]))
-    if held and held["status"] == "suspended" and new_status == "active":
+    if new_status == "active" and subscription_obj.get("status") == "incomplete":
+        # First payment not completed: no service (finding 5).
+        if not held or held["status"] != "active":
+            return {"status": "not_granted", "reason": "the first payment has not completed"}
+        new_status, new_reason = "suspended", "payment_incomplete"
+    if held and held["status"] == "suspended" and new_status == "active" and held.get("suspended_reason") != "payment_incomplete":
         new_status = "suspended"  # only billing_status lifts a suspension
+    if new_status == "active" and (not held or held["status"] != "active"):
+        reversal = subscription_payment_reversal(subscription_obj)  # finding 4
+        if reversal:
+            new_status, new_reason = "suspended", reversal
     items = ((subscription_obj.get("items") or {}).get("data") or [])
     quantity = _positive_int(items[0].get("quantity")) if items and isinstance(items[0], dict) else None
     subscription_ids = []
@@ -609,6 +658,10 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
 
     if not subscription_ids:
         return {"status": "ignored", "reason": "no existing analytics subscription for this stripe customer/addon"}
+    if package_customer_id is not None:
+        package = row("SELECT * FROM addon_subscriptions WHERE customer_id=? AND addon_key=?", (package_customer_id, addon["addon_key"]))
+        if package and (new_reason or (new_status == "active" and package.get("suspended_reason"))):
+            apply_addon_state(package, status=new_status, suspended_reason=new_reason)
     return {
         "status": "analytics_subscription_updated",
         "subscription_ids": subscription_ids,
