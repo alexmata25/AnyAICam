@@ -163,6 +163,17 @@ def read_permissions(db, *, customer_id: str, user_id: str) -> dict:
     return permissions
 
 
+def _lookup():
+    """Read-only lookups made while rendering ordinary pages (navigation,
+    People gates). Uses the plain connection -- never partner_db.connection(),
+    which initializes and caches the current database target -- so merely
+    showing a page can never be the first thing to initialize a database.
+    The app initializes its database at startup; a caller that finds no
+    household schema falls back to the unchanged role behaviour."""
+    from database_backend import connect
+    return connect()
+
+
 def account_permission(identity: dict | None, key: str) -> bool:
     """People / Face Access / Backup Mobile Access for this signed-in person.
 
@@ -181,11 +192,14 @@ def account_permission(identity: dict | None, key: str) -> bool:
         # Not a signed-in household member (no account to look up): the
         # unchanged customer_viewer role behaviour, People view only.
         return key == "people"
-    with connection() as db:
-        user = db.execute("SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
-                          (identity.get("email", ""), identity.get("customer_id"))).fetchone()
-        grant = (db.execute("SELECT * FROM customer_user_permissions WHERE user_id=?", (user["id"],)).fetchone()
-                 if user else None)
+    try:
+        with _lookup() as db:
+            user = db.execute("SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
+                              (identity.get("email", ""), identity.get("customer_id"))).fetchone()
+            grant = (db.execute("SELECT * FROM customer_user_permissions WHERE user_id=?", (user["id"],)).fetchone()
+                     if user else None)
+    except Exception:  # no household schema here: unchanged role behaviour
+        return key == "people"
     if grant is None:
         return key == "people"
     return bool(grant[f"can_{key}"])
@@ -210,12 +224,15 @@ def unlockable_door_ids(identity: dict) -> set[str] | None:
     """None = every door (owner). Otherwise the doors this person may unlock."""
     if identity.get("role") == "customer_owner":
         return None
-    with connection() as db:
-        return {row["camera_id"] for row in db.execute(
-            "SELECT p.camera_id FROM customer_camera_permissions p JOIN partner_users u ON u.id=p.user_id "
-            "JOIN cameras c ON c.id=p.camera_id WHERE lower(u.email)=lower(?) AND u.customer_id=? AND c.customer_id=? "
-            "AND p.can_unlock=1", (identity.get("email", ""), identity.get("customer_id"), identity.get("customer_id")),
-        ).fetchall()}
+    try:
+        with _lookup() as db:
+            return {row["camera_id"] for row in db.execute(
+                "SELECT p.camera_id FROM customer_camera_permissions p JOIN partner_users u ON u.id=p.user_id "
+                "JOIN cameras c ON c.id=p.camera_id WHERE lower(u.email)=lower(?) AND u.customer_id=? AND c.customer_id=? "
+                "AND p.can_unlock=1", (identity.get("email", ""), identity.get("customer_id"), identity.get("customer_id")),
+            ).fetchall()}
+    except Exception:  # no schema to check: no doors (fail closed)
+        return set()
 
 
 def restrict_face_access_payload(before: dict, payload: dict, manageable: set[str] | None) -> dict:
