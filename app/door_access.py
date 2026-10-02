@@ -138,10 +138,28 @@ class CameraDoorProvider(relay_control.RelayProvider):
     trigger_door() (automatic trigger: the service additionally refuses
     an unknown/jammed lock state or an offline controller)."""
 
-    def __init__(self, camera: dict, base: relay_control.RelayProvider, *, person_id: str | None = None):
+    def __init__(self, camera: dict, base: relay_control.RelayProvider, *, person_id: str | None = None,
+                 db=None, observation=None, engine=None, now=None):
         self.camera = camera
         self.base = base
         self.person_id = person_id
+        # Evidence for automatic physical Face Access (face_access_guard.py):
+        # the caller's database handle, the observation that matched, the
+        # engine instance that produced it, and the detection time.
+        self.db = db
+        self.observation = observation
+        self.engine = engine
+        self.now = now
+        self.rule = None
+        self.rule_origin = None
+
+    def for_rule(self, rule, origin: str | None = None) -> "CameraDoorProvider":
+        """The same provider, carrying the Face Access rule being applied
+        (its cooldown, and whether it is a cloud-origin grant)."""
+        import copy
+        scoped = copy.copy(self)
+        scoped.rule, scoped.rule_origin = rule, origin
+        return scoped
 
     def capability(self) -> dict:
         return self.base.capability()
@@ -151,11 +169,56 @@ class CameraDoorProvider(relay_control.RelayProvider):
         service = access_control.get_service()
         if service is None or service.door_for_camera(self.camera["id"]) is None:
             return self.base.trigger(request)
+        return self._physical_trigger(request)
+
+    def _physical_trigger(self, request: relay_control.RelayRequest) -> relay_control.RelayResult:
+        """A real access-control door (Z-Wave / relay adapter). Automatic
+        facial unlock reaches trigger_door() only when every condition in
+        face_access_guard.py holds; otherwise nothing physical is asked and
+        the refusal is recorded. Manual, Backup Access, AAC Voice Call and
+        AACO doors never come through here."""
+        import face_access_guard as guard
         reason = request.reason or ""
         facial_event_id = reason.split(":", 1)[1] if reason.startswith("facial_event:") else None
-        return trigger_door(self.camera, reason=reason, actor="facial_recognition", trigger_type="automatic",
-                            pulse_ms=request.pulse_ms, dry_run=request.dry_run, facial_event_id=facial_event_id,
-                            person_id=self.person_id)
+        now = guard.as_datetime(self.now)
+        customer_id = self.camera.get("customer_id")
+        rule_id = getattr(self.rule, "id", None)
+
+        def refuse(why: str) -> relay_control.RelayResult:
+            if self.db is not None:
+                guard.record_attempt(self.db, facial_event_id=facial_event_id, customer_id=customer_id, camera_id=self.camera["id"],
+                                     person_id=self.person_id, rule_id=rule_id, result="refused", reason=why, now=now)
+            return relay_control.RelayResult(channel=request.channel, activated=False, dry_run=False, suppressed_reason=why)
+
+        if not guard.physical_unlock_enabled():
+            return refuse("face_access_physical_disabled")
+        if self.db is None or not facial_event_id or not self.person_id:
+            return refuse("face_access_context_missing")
+        if guard.already_dispatched(self.db, facial_event_id=facial_event_id):
+            return refuse("duplicate_facial_event")  # a replay: never a second physical attempt
+        denial = (guard.engine_denial(self.observation, self.engine)
+                  or guard.quality_denial(self.observation)
+                  or guard.cloud_grant_denial(self.db, customer_id=customer_id, origin=self.rule_origin, now=now)
+                  or guard.rearm_denial(self.db, camera_id=self.camera["id"], person_id=self.person_id,
+                                        cooldown_seconds=getattr(self.rule, "cooldown_seconds", 0), now=now))
+        if denial:
+            return refuse(denial)
+        if not guard.claim_dispatch(self.db, facial_event_id=facial_event_id, customer_id=customer_id, camera_id=self.camera["id"],
+                                    person_id=self.person_id, rule_id=rule_id, now=now):
+            return refuse("duplicate_facial_event")
+        # The FR event and this claim are durable before anything physical
+        # happens (a crash after this point can never replay the event).
+        self.db.commit()
+        result = trigger_door(self.camera, reason=reason, actor="facial_recognition", trigger_type="automatic",
+                              pulse_ms=request.pulse_ms, dry_run=request.dry_run, facial_event_id=facial_event_id,
+                              person_id=self.person_id)
+        unlocked = bool(result.activated and not result.simulated)
+        guard.finish_dispatch(self.db, facial_event_id=facial_event_id, camera_id=self.camera["id"], person_id=self.person_id,
+                              result="unlocked" if unlocked else "not_unlocked", reason=result.suppressed_reason, now=now)
+        guard.record_attempt(self.db, facial_event_id=facial_event_id, customer_id=customer_id, camera_id=self.camera["id"],
+                             person_id=self.person_id, rule_id=rule_id, result="accepted" if unlocked else "refused",
+                             reason=result.suppressed_reason, now=now)
+        return result
 
 
 class DoorNotReachable(Exception):

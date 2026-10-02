@@ -550,24 +550,36 @@ def _rule(conn, **overrides):
     conn.execute(f"INSERT INTO facial_rules({cols}) VALUES({','.join('?' * len(row))})", list(row.values()))
 
 
-def _face(service, *, person_id="person-anna", confidence=0.93, now="12:00", match_state="known"):
+def _face(service, *, person_id="person-anna", confidence=0.93, now="12:00", match_state="known", detection_event_id="det-1"):
+    """A fully evidenced automatic Face Access attempt (2026-10-02): the
+    access-approved engine, a valid observation and the caller's database
+    -- so what these tests exercise is the access-control service itself.
+    The production gate is turned on by face_env; refusals for missing
+    evidence are covered in test_face_access_physical_interlock.py."""
     import door_access
     import facial_events
     import relay_control
+    from face_access_helpers import ApprovedEngine, observation
     ac.set_service(service)
     base = relay_control.MockRelayProvider()
-    camera = {"id": "cam-front", "name": "Front Door", "door_relay_channel": None, "door_relay_pulse_ms": None, "door_access_enabled": 1}
+    camera = {"id": "cam-front", "customer_id": "cust-1", "name": "Front Door", "door_relay_channel": None,
+              "door_relay_pulse_ms": None, "door_access_enabled": 1}
+    engine = ApprovedEngine()
     with connection() as conn:
         outcomes = facial_events.evaluate_access_rules(
             conn, customer_id="cust-1", camera_id="cam-front", match_state=match_state, confidence=confidence,
             matched_person_id=person_id, matched_watchlist_id=None,
-            relay_provider=door_access.CameraDoorProvider(camera, base, person_id=person_id),
-            detection_event_id="det-1", current_time=now)
+            relay_provider=door_access.CameraDoorProvider(camera, base, person_id=person_id, db=conn,
+                                                          observation=observation(engine), engine=engine,
+                                                          now="2026-10-02T12:00:00"),
+            detection_event_id=detection_event_id, current_time=now)
     return outcomes, base
 
 
 @pytest.fixture()
-def face_env(db):
+def face_env(db, monkeypatch):
+    from face_access_helpers import enable_physical_face_access
+    enable_physical_face_access(monkeypatch)
     adapter = aa.MockDoorAdapter()
     service = make_service(mock_adapters={"door-front": adapter})
     mock_door(service)

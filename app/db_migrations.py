@@ -1794,6 +1794,12 @@ def apply_migrations():
         # Visitor Call lifecycle (2026-10-02, aac_voice_call_events.reconcile):
         # last heartbeat from an open call page, why a call closed, and the
         # call that replaced an expired/abandoned one. Additive.
+        # Automatic Face Access conditions (2026-10-02, face_access_guard.py):
+        # durable cloud-grant sync time, one physical attempt per facial
+        # event, presence/re-arm per door and person, and an attempt log.
+        import face_access_guard
+        for statement in face_access_guard.DDL:
+            db.execute(statement)
         call_columns=_columns('aac_voice_call_events')
         if 'last_heartbeat_at' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN last_heartbeat_at TEXT')
         if 'end_reason' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN end_reason TEXT')

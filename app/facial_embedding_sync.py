@@ -163,6 +163,12 @@ def _replace_local_directory(customer_id: str, directory: dict) -> dict:
         # of the people they belong to and are replaced with them; grants
         # made on this appliance (origin 'local') are never touched.
         db.execute("DELETE FROM facial_rules WHERE customer_id=? AND origin='cloud'", (customer_id,))
+        # The authoritative grant snapshot's time, durably, in the same
+        # transaction as the snapshot itself: cloud-origin grants
+        # authorize a physical door only while this is at most 15 minutes
+        # old (face_access_guard.cloud_grant_denial), across restarts.
+        import face_access_guard
+        face_access_guard.mark_grants_synced(db, customer_id=customer_id)
         db.execute("DELETE FROM facial_watchlist_members WHERE watchlist_id IN (SELECT id FROM facial_watchlists WHERE customer_id=?)", (customer_id,))
         db.execute("DELETE FROM facial_embeddings WHERE customer_id=?", (customer_id,))
         db.execute("DELETE FROM facial_watchlists WHERE customer_id=?", (customer_id,))
@@ -255,6 +261,11 @@ def sync_facial_directory() -> dict:
         if conditional and customer_id == applied["customer_id"] and response.get("directory_version") == applied["version"]:
             # Local tables already hold exactly this snapshot -- no data
             # transferred, nothing rewritten, recognition keeps running.
+            # The cloud just confirmed it is still authoritative: the
+            # grants it holds are fresh again.
+            import face_access_guard
+            with connect() as db:
+                face_access_guard.mark_grants_synced(db, customer_id=customer_id)
             return {"status": "unchanged"}
         # An "unchanged" reply that doesn't match what this process applied
         # (e.g. the appliance was re-assigned to a different customer)

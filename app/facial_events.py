@@ -368,7 +368,12 @@ def evaluate_access_rules(
         ):
             continue
         request = relay_control.build_request(rule, reason=f"facial_event:{detection_event_id}")
-        result = relay_provider.trigger(request)
+        # A door provider that applies Face Access conditions per rule
+        # (door_access.CameraDoorProvider) learns the rule's cooldown and
+        # whether it is a cloud-origin grant (2026-10-02).
+        provider = relay_provider.for_rule(rule, origin=row["origin"] if "origin" in row.keys() else None) \
+            if hasattr(relay_provider, "for_rule") else relay_provider
+        result = provider.trigger(request)
         outcomes.append(
             {
                 "rule_id": rule.id,
@@ -416,7 +421,11 @@ def record_facial_events(
     if not _is_entitled(db, camera_id=context["id"]):
         return []
     settings = facial_people.get_settings(db, customer_id=context["customer_id"])
-    observations = facial_recognition.detect_and_embed(person_crop_bgr, engine=engine)
+    # The engine instance itself travels with each match to the door
+    # boundary: only the access-approved engine can open a door
+    # (face_access_guard.engine_denial).
+    active_engine = engine or facial_recognition.get_engine()
+    observations = facial_recognition.detect_and_embed(person_crop_bgr, engine=active_engine)
     if not observations:
         return []
     engine = observations[0].engine
@@ -457,6 +466,12 @@ def record_facial_events(
             # suppressed; that trade-off is intentional for Phase 1.
             grid = _UNKNOWN_POSITION_GRID_PX
             debounce_key = (context["id"], "unknown", observation.bbox.x // grid, observation.bbox.y // grid)
+        if accepted is not None and context.get("door_access_enabled"):
+            # Every sighting at a door, before debouncing, so a person still
+            # standing there after the door relocks is never "new" again.
+            import face_access_guard
+            face_access_guard.note_presence(db, customer_id=context["customer_id"], camera_id=context["id"],
+                                            person_id=accepted.person_id, now=now)
         if not _debounce.check_and_record(debounce_key):
             continue
         matched_person = None
@@ -526,7 +541,8 @@ def record_facial_events(
                     # command at a time, timed relock); any other door keeps
                     # the provider it was given.
                     relay_provider=door_access.CameraDoorProvider(
-                        context, relay_provider, person_id=accepted.person_id if accepted else None),
+                        context, relay_provider, person_id=accepted.person_id if accepted else None,
+                        db=db, observation=observation, engine=active_engine, now=now),
                     detection_event_id=event["detection_event_id"],
                     current_time=_hhmm(now),
                     current_weekday=_weekday_and_date(now)[0],
@@ -580,7 +596,7 @@ def record_facial_events(
                     matched_person_id=accepted.person_id if accepted else None, matched_person_name=person_name,
                     facial_event_id=event["id"],
                     authorization_result="authorized" if outcomes else "not_authorized",
-                    relay_result=relay_result, success=False, now=now,
+                    relay_result=relay_result, success=False, error=suppressed, now=now,
                 )
                 # Denied -> one long tone; authorized but the relay didn't
                 # run (simulated, dry run, error) -> the distinct fault tone.
