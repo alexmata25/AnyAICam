@@ -177,3 +177,17 @@ def test_appliance_serves_media_but_never_escapes_the_media_folders(tenants, mon
     for url in TRAVERSALS:
         response = client.get(url, cookies=_cookie(*CUSTOMER_A))
         _never_leaks(response)
+
+
+def test_signed_in_files_are_never_kept_by_a_shared_cache(tenants, monkeypatch):
+    """Cloudflare cached a signed-in .tar.gz and served it to anyone (staging,
+    2026-10-01): every /recordings answer -- served or refused -- and the
+    licensed download route say private, no-store to every cache."""
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
+    client = tenants
+    for url in (RAW_MEDIA[0], "/recordings/guard-secret.json", "/recordings/camera1/%2e%2e/guard-secret.json"):
+        response = client.get(url, cookies=_cookie(*CUSTOMER_A))
+        assert "no-store" in response.headers.get("cache-control", ""), url
+        assert response.headers.get("cdn-cache-control") == "no-store", url
+    download = client.get("/api/customer/downloads/vms-installer", cookies=_cookie(*CUSTOMER_A))
+    assert "no-store" in download.headers.get("cache-control", "") and download.headers.get("cdn-cache-control") == "no-store"

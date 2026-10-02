@@ -41731,6 +41731,11 @@ async def forwarded_https_middleware(request: Request, call_next):
         response.headers["CDN-Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+    # Signed-in files a shared cache must never keep (recordings_guard.py):
+    # Cloudflare caches by extension and would serve them to anyone.
+    if request.url.path.startswith(("/recordings/", "/storage/", "/api/customer/downloads/")):
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["CDN-Cache-Control"] = "no-store"
 
     if forwarded_proto == "https":
 

@@ -54,8 +54,17 @@ def recordings_path_allowed(path: str) -> bool:
     return dot > 0 and name[dot:] in MEDIA_EXTENSIONS
 
 
+# Signed-in responses must never be kept by a shared cache: Cloudflare caches
+# by file extension (.mp4, .jpg, .tar.gz ...) and would otherwise serve one
+# person's signed-in response to anyone who asks for the same URL -- seen
+# live on staging (cf-cache-status: HIT, signed out) on 2026-10-01.
+PRIVATE_NO_STORE = {"Cache-Control": "private, no-store", "CDN-Cache-Control": "no-store"}
+
+
 class RecordingsStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
         if not recordings_path_allowed(path):
-            raise HTTPException(status_code=404)
-        return await super().get_response(path, scope)
+            raise HTTPException(status_code=404, headers=dict(PRIVATE_NO_STORE))
+        response = await super().get_response(path, scope)
+        response.headers.update(PRIVATE_NO_STORE)
+        return response
