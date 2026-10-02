@@ -234,9 +234,14 @@ def test_a_fanout_exception_still_leaves_the_event_accepted_and_stored(client, d
         json=_valid_payload(),
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "accepted"
+    # 2026-10-02 (Codex): the event is stored either way, but a failed fan-out
+    # is answered 503 so the appliance retries -- and the retry, a replay,
+    # completes delivery (per-recipient idempotent; test_notification_partial_failure.py).
+    assert response.status_code == 503
     assert _detection_event_row(db_path, "cam-1", "local-evt-abc123") is not None
+    monkeypatch.setattr(appliance_cloud, "fanout_appliance_event", lambda *a, **k: 1)
+    retry = client.post("/api/appliance/analytics/cam-1/events", headers=_auth_headers("appl-1", "test-credential"), json=_valid_payload())
+    assert retry.status_code == 200 and retry.json()["status"] == "duplicate"
 
 
 def test_inbox_says_when_it_shows_only_the_latest_alerts():

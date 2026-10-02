@@ -341,18 +341,6 @@ def notification_event_type(event_type: str) -> str:
     return 'lpr' if event_type == 'plate' else event_type
 
 
-def claim_event_fanout(customer_id: str, dedupe_key: str) -> bool:
-    """Durable, atomic "fan this event out once" (2026-10-02). The same
-    camera event can reach the cloud through the analytics-event route and
-    the legacy /api/appliance/events forwarding (and their retries); both
-    pass the event's own identity, and only the first claim notifies. The
-    primary key makes concurrent claims safe."""
-    with connection() as db:
-        cursor=db.execute('INSERT INTO notification_event_keys(customer_id,dedupe_key,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING',
-                          (customer_id,str(dedupe_key)[:300],datetime.now().isoformat()))
-        return bool(cursor.rowcount)
-
-
 def event_dedupe_key(camera_id, local_event_id) -> str | None:
     """One identity for an appliance event however it arrives: its camera
     and the appliance's own (local) event id."""
@@ -367,8 +355,14 @@ def fanout_appliance_event(appliance: dict,event: dict):
     if event_type in OPT_IN_EVENT_TYPES and not any(opted_in(user['id'],event_type) for user in rows(
             "SELECT id FROM partner_users WHERE customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')",(customer_id,))):
         return 0  # nobody on this account chose these alerts: nothing to claim or send
-    if event.get('dedupe_key') and not claim_event_fanout(customer_id,event['dedupe_key']):
-        return 0  # this event already notified this customer (another route, a retry or a replay)
+    # Idempotent PER RECIPIENT (2026-10-02, Codex): each person's notification
+    # row carries the event's dedupe_key under UNIQUE(user_id,dedupe_key), and
+    # is created in the same transaction as that person's push/channel
+    # bookkeeping. Re-running fan-out for the same event (a retry, a replay,
+    # the other ingestion route) creates exactly the rows that are missing --
+    # a failure after the first recipient is filled in next time, and nobody
+    # is ever notified twice.
+    dedupe_key=str(event.get('dedupe_key') or '')[:300] or None
     now=datetime.now(); current_time=_quiet_hours_clock(now); users=rows("SELECT id,email,role,camera_access_mode FROM partner_users WHERE customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')",(customer_id,)); created=0
     for user in users:
         if event_type in OPT_IN_EVENT_TYPES and not opted_in(user['id'],event_type):
@@ -400,7 +394,9 @@ def fanout_appliance_event(appliance: dict,event: dict):
         notification_id=secrets.token_hex(16); timestamp=str(event.get('timestamp') or now.isoformat()); title=event_type_label(event_type); message=str(event.get('message') or event_type_message(event_type))[:1000]
         notification={'id':notification_id,'title':title,'message':message}
         with connection() as db:
-            db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity') or ('critical' if event_type in EMERGENCY_EVENT_TYPES else 'info'),title,message,timestamp,event.get('thumbnail'),now.isoformat()))
+            inserted=db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at,dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity') or ('critical' if event_type in EMERGENCY_EVENT_TYPES else 'info'),title,message,timestamp,event.get('thumbnail'),now.isoformat(),dedupe_key)).rowcount
+            if not inserted:
+                continue  # this person already has this event's notification
             _enqueue_mobile_push(db, notification_id)
             external=_external_channels(db,user=user,customer_id=customer_id,camera_id=camera_id,event_type=event_type,current_time=current_time,now=now,notification_id=notification_id)
         recipients={'in_app':'local','email':external['email_address'],'sms':external['phone_number']}

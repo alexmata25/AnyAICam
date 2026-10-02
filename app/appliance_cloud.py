@@ -242,6 +242,36 @@ def set_media_status(db, detection_event_id: str, status: str, reason: str | Non
     )
 
 
+def _fanout_detection_event(camera: dict,camera_id: str,event_id: str,local_event_id: str,event_type: str,event_timestamp: str,
+                            detections,facial_notify_message) -> bool:
+    """Notification fan-out for one stored detection event; safe to repeat
+    (per-recipient idempotency in notification_engine). Returns False only
+    when fan-out itself failed, so the caller can ask for a retry."""
+    # Customer rules (2026-10-01): a rule with "Send notifications" off
+    # keeps its event and clip but fans out nothing.
+    fired_rule_id=detections[0].get('rule_id') if isinstance(detections,list) and detections and isinstance(detections[0],dict) else None
+    muted=rule_notifications_muted(event_type,fired_rule_id,camera_id=camera_id,customer_id=camera['customer_id'])
+    if muted:
+        logger.info('analytics_event.rule_notifications_off event_id=%s camera_id=%s rule_id=%s',event_id,camera_id,fired_rule_id)
+    if event_type=='intrusion_alarm' and not muted:
+        first_detection=detections[0] if isinstance(detections,list) and detections and isinstance(detections[0],dict) else {}
+        earlier=duplicate_intrusion_alarm(camera_id,event_id,event_timestamp,first_detection.get('track_id'))
+        if earlier:
+            muted=True
+            logger.info('analytics_event.intrusion_alarm_duplicate event_id=%s camera_id=%s same_intrusion_as=%s',event_id,camera_id,earlier)
+    if event_type=='aac_voice_call' or muted or (event_type=='facial_recognition' and not facial_notify_message):
+        return True
+    try:
+        fanout_appliance_event(
+            {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
+            _fanout_payload(camera, event_id, camera_id, event_type, event_timestamp, facial_notify_message, local_event_id),
+        )
+    except Exception:
+        logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
+        return False
+    return True
+
+
 def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
     if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
@@ -898,14 +928,23 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 cursor=db.execute('INSERT OR IGNORE INTO appliance_events(appliance_id,event_id,event_type,camera_id,event_timestamp,payload_json,received_at) VALUES(?,?,?,?,?,?,?)',(appliance['id'],event_id,item.get('event_type'),item.get('camera_id'),item.get('timestamp'),json.dumps(item),now)); inserted+=cursor.rowcount; duplicates+=1-cursor.rowcount
                 if cursor.rowcount: accepted.append(item)
         import notification_engine
-        for item in accepted:
-            # The legacy route's id is the appliance's own event id: the same
-            # identity analytics_event_available() uses, so an event that
-            # arrives both ways notifies once.
-            item['dedupe_key']=notification_engine.event_dedupe_key(item.get('camera_id'),item.get('id'))
-        notifications=sum(fanout_appliance_event(appliance,item) for item in accepted
-                          if not rule_notifications_muted(str(item.get('event_type') or ''),item.get('rule_id'),
-                                                          camera_id=str(item.get('camera_id') or ''),customer_id=appliance['customer_id']))
+        notifications=0; fanout_failed=False
+        # Every valid item, replays included: fan-out is idempotent per
+        # recipient, so a replay fills in whoever an earlier failure missed.
+        # The id is the appliance's own event id -- the same identity
+        # analytics_event_available() uses -- so both routes converge.
+        for item in [i for i in safe.get('events',[]) if str(i.get('id',''))[:120]]:
+            item['dedupe_key']=notification_engine.event_dedupe_key(item.get('camera_id'),str(item.get('id'))[:120])
+            if rule_notifications_muted(str(item.get('event_type') or ''),item.get('rule_id'),
+                                        camera_id=str(item.get('camera_id') or ''),customer_id=appliance['customer_id']):
+                continue
+            try:
+                notifications+=fanout_appliance_event(appliance,item)
+            except Exception:
+                fanout_failed=True
+                logger.exception('appliance_events.fanout_failed event_id=%s',item.get('id'))
+        if fanout_failed:
+            raise HTTPException(status_code=503,detail='Notifications not fully delivered yet; retry this request.')
         return {'status':'accepted','inserted':inserted,'duplicates':duplicates,'notifications_created':notifications}
 
     @app.post('/api/appliance/live/{camera_id}/session')
@@ -1113,6 +1152,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # ingestion step after this block for why a replay still gets one
         # more (idempotent) ingestion attempt instead of returning early.
         aac_voice_call_duplicate_of=None
+        replayed_event_id=None
         with connection() as db:
             parent_detection_event_id=(
                 _resolve_parent_event(db,camera_id,appliance['id'],parent_local_event_id,event_type)
@@ -1151,9 +1191,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     elif existing['parent_detection_event_id']!=parent_detection_event_id:
                         raise HTTPException(status_code=409,detail='This event is already correlated with a different Motion event.')
                 if event_type!='aac_voice_call':
-                    return {'status':'duplicate','event_id':existing['id']}
-                aac_voice_call_duplicate_of=existing['id']
-            if aac_voice_call_duplicate_of is None and safe.get('media_expected') is True:
+                    replayed_event_id=existing['id']
+                else:
+                    aac_voice_call_duplicate_of=existing['id']
+            if replayed_event_id is None and aac_voice_call_duplicate_of is None and safe.get('media_expected') is True:
                 # The appliance is building (or sharing) a clip for this
                 # event: say so until it is registered or reported lost.
                 set_media_status(db,event_id,'pending')
@@ -1175,7 +1216,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # report's own note on face-crop thumbnail cloud sync being a
             # separate, not-yet-implemented piece.
             facial_notify_message=None
-            if event_type=='facial_recognition' and isinstance(detections,list) and detections and isinstance(detections[0],dict):
+            if replayed_event_id is None and event_type=='facial_recognition' and isinstance(detections,list) and detections and isinstance(detections[0],dict):
                 facial_fields=detections[0]
                 db.execute(
                     'INSERT INTO facial_events(id,detection_event_id,customer_id,site_id,camera_id,match_state,matched_person_id,matched_person_name,matched_watchlist_id,matched_watchlist_name,confidence,engine,engine_version,created_at) '
@@ -1236,7 +1277,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # aac_voice_call is excluded here too: its homeowner notification
         # is sent by the Voice Call ingestion below, through the session
         # it belongs to -- a generic fan-out here would be a duplicate.
-        if event_type=='aac_voice_call_utterance':
+        if event_type=='aac_voice_call_utterance' and replayed_event_id is None:
             # The visitor's answer, transcribed on the edge: attached to the
             # session its trigger created (never a notification of its own;
             # record_visitor_utterance() escalates when it should).
@@ -1257,26 +1298,20 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 logger.exception('analytics_event.aac_voice_call_utterance_failed camera_id=%s',camera_id)
                 raise HTTPException(status_code=503,detail='Visitor answer could not be recorded yet; retry.') from error
             return {'status':'accepted','event_id':event_id,'voice_call':outcome.get('status'),'voice_call_event_id':outcome.get('event_id')}
-        # Customer rules (2026-10-01): a rule with "Send notifications" off
-        # keeps its event and clip above but fans out nothing.
-        fired_rule_id=detections[0].get('rule_id') if isinstance(detections,list) and detections and isinstance(detections[0],dict) else None
-        muted=rule_notifications_muted(event_type,fired_rule_id,camera_id=camera_id,customer_id=camera['customer_id'])
-        if muted:
-            logger.info('analytics_event.rule_notifications_off event_id=%s camera_id=%s rule_id=%s',event_id,camera_id,fired_rule_id)
-        if event_type=='intrusion_alarm' and not muted:
-            first_detection=detections[0] if isinstance(detections,list) and detections and isinstance(detections[0],dict) else {}
-            earlier=duplicate_intrusion_alarm(camera_id,event_id,event_timestamp,first_detection.get('track_id'))
-            if earlier:
-                muted=True
-                logger.info('analytics_event.intrusion_alarm_duplicate event_id=%s camera_id=%s same_intrusion_as=%s',event_id,camera_id,earlier)
-        if event_type!='aac_voice_call' and not muted and (event_type!='facial_recognition' or facial_notify_message):
-            try:
-                fanout_appliance_event(
-                    {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
-                    _fanout_payload(camera, event_id, camera_id, event_type, event_timestamp, facial_notify_message, local_event_id),
-                )
-            except Exception:
-                logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
+        if replayed_event_id is not None:
+            # A replay of an already-stored event (the appliance retrying):
+            # fan-out is idempotent per recipient, so this fills in anyone an
+            # earlier failure missed and notifies nobody twice.
+            first=detections[0] if isinstance(detections,list) and detections and isinstance(detections[0],dict) else {}
+            replay_message=(str(first.get('door_notify_message') or '').strip() or None) if event_type=='facial_recognition' else None
+            if not _fanout_detection_event(camera,camera_id,replayed_event_id,local_event_id,event_type,event_timestamp,detections,replay_message):
+                raise HTTPException(status_code=503,detail='Notifications not fully delivered yet; retry this event.')
+            return {'status':'duplicate','event_id':replayed_event_id}
+        if event_type!='aac_voice_call':
+            if not _fanout_detection_event(camera,camera_id,event_id,local_event_id,event_type,event_timestamp,detections,facial_notify_message):
+                # Stored, but not everyone was notified: answer 503 so the
+                # appliance retries; the retry is a replay (above).
+                raise HTTPException(status_code=503,detail='Notifications not fully delivered yet; retry this event.')
         # AAC Voice Call cloud/edge split (2026-09-24): the edge greeted the
         # visitor locally and sent this trigger; the cloud now creates the
         # ONE authoritative Voice Call session for it (aac_voice_call.

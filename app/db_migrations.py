@@ -1747,10 +1747,15 @@ def apply_migrations():
         if 'completed_at' not in _columns('customer_setup_drafts'): db.execute('ALTER TABLE customer_setup_drafts ADD COLUMN completed_at TEXT')
 
         # One notification fan-out per customer per appliance event (2026-10-02,
-        # notification_engine.claim_event_fanout): the analytics-event route
+        # superseded the same day by notifications.dedupe_key): the analytics-event route
         # and legacy forwarding both claim camera_id:local_event_id here.
         db.execute('CREATE TABLE IF NOT EXISTS notification_event_keys(customer_id TEXT NOT NULL,dedupe_key TEXT NOT NULL,'
-                   'created_at TEXT NOT NULL,PRIMARY KEY(customer_id,dedupe_key))')
+                   'created_at TEXT NOT NULL,PRIMARY KEY(customer_id,dedupe_key))')  # superseded by notifications.dedupe_key (kept: additive)
+        # Per-recipient idempotency (2026-10-02, notification_engine.
+        # fanout_appliance_event): one notification per person per appliance
+        # event, however often or by whichever route it arrives.
+        if 'dedupe_key' not in _columns('notifications'): db.execute('ALTER TABLE notifications ADD COLUMN dedupe_key TEXT')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_user_dedupe ON notifications(user_id,dedupe_key) WHERE dedupe_key IS NOT NULL')
 
         # Loitering (2026-10-01, customer_analytics_rules.py): how long a
         # person must stay inside a zone before it counts (NULL = the rule

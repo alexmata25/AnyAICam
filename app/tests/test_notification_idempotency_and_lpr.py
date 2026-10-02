@@ -103,10 +103,17 @@ def test_different_events_still_notify_separately(cloud):
     assert len(_notifications("owner-1")) == 2
 
 
-def test_the_claim_is_atomic_per_customer(cloud):
-    assert notification_engine.claim_event_fanout("cust-1", "cam-1:x") is True
-    assert notification_engine.claim_event_fanout("cust-1", "cam-1:x") is False
-    assert notification_engine.claim_event_fanout("cust-2", "cam-1:x") is True  # another customer is independent
+def test_one_row_per_person_is_enforced_by_the_database(cloud):
+    """Per-recipient idempotency (test_notification_partial_failure.py):
+    every person's row carries the event identity under UNIQUE(user_id,dedupe_key)."""
+    _analytics(cloud, "evt-9")
+    with connection() as db:
+        keys = sorted(r[0] for r in db.execute("SELECT dedupe_key FROM notifications"))
+        assert keys == ["cam-1:evt-9", "cam-1:evt-9"]
+        import sqlite3 as _sqlite3
+        with pytest.raises(_sqlite3.IntegrityError):
+            db.execute("INSERT INTO notifications(id,user_id,customer_id,event_type,severity,title,message,timestamp,created_at,dedupe_key) "
+                       "VALUES('dup','owner-1','cust-1','person','info','t','m','t','t','cam-1:evt-9')")
     assert notification_engine.event_dedupe_key(None, "x") is None
 
 
