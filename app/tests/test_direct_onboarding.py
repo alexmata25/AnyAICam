@@ -306,3 +306,27 @@ def test_a_mail_outage_is_reported_plainly_and_creates_nothing(site, db_path):
     down = _signup(client, "smtp-down@example.test")
     assert down.status_code == 503 and "couldn't send" in down.json()["detail"]
     assert _count(db_path, "SELECT COUNT(*) FROM customers") == 0
+
+
+# ------------------------------------------------------------------ choose a plan on My subscription
+
+def test_my_subscription_lets_a_new_direct_owner_choose_a_plan_through_the_existing_checkout(site, db_path):
+    client, captured, mail = site
+    _direct_owner(client, mail, "chooser@example.test")
+    page = client.get("/subscription-portal").text
+    assert 'id="choose-plan-button"' in page and 'value="local|1-8"' in page
+    assert "/api/customer/camera-slots/checkout" in page  # the one existing checkout, not a copy
+    customer_id = _one(db_path, "SELECT id FROM customers WHERE email='chooser@example.test'")["id"]
+    assert client.post("/api/customer/camera-slots/checkout", json={"plan_type": "local", "tier_label": "1-8"}).status_code == 200
+    _webhook(client, _completed("evt_choose", "price_local_8", customer_id, "chooser@example.test"))
+    after = client.get("/subscription-portal").text
+    assert 'id="choose-plan-button"' not in after  # offered only while there is no plan
+
+
+def test_the_plan_chooser_is_not_offered_without_configured_prices(site, db_path, monkeypatch):
+    client, _, mail = site
+    _direct_owner(client, mail, "noprices@example.test")
+    from customer_entitlements import PLAN_TIERS
+    for tier in PLAN_TIERS:
+        monkeypatch.delenv(tier[6], raising=False)
+    assert 'id="choose-plan-button"' not in client.get("/subscription-portal").text

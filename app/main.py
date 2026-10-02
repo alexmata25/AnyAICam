@@ -104515,6 +104515,26 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     if not addon_rows:
         addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
 
+    # Direct self-service onboarding (2026-10-02): a customer with no plan
+    # yet chooses Local or Hybrid here, on My subscription -- previously
+    # only reachable inside step 6 of /customer/setup. Same route and
+    # server-side tier resolution as "Buy camera capacity" there and
+    # "Upgrade to Hybrid" below (create_camera_slot_checkout); only tiers
+    # with a configured Stripe Price ID are offered, owners only.
+    choose_plan_panel = ""
+    if is_owner and not camera_entitlement:
+        _plan_options = [t for t in PLAN_TIERS if os.environ.get(t[6], "").strip()]
+        if _plan_options:
+            _options_html = "".join(
+                f'<option value="{escape(t[0] + "|" + t[1], quote=True)}">{escape(t[0].title())} &middot; {escape(t[1])} cameras &middot; ${t[5]}/mo</option>'
+                for t in _plan_options)
+            choose_plan_panel = (
+                '<section id="choose-plan" class="panel" style="margin-top:14px"><h3 style="margin-top:0">Choose your plan</h3>'
+                '<p class="health-detail">Pick Local or Hybrid and how many cameras. You pay securely on Stripe and your plan is active as soon as the payment is confirmed.</p>'
+                f'<label class="health-detail" for="choose-plan-select">Plan</label> <select id="choose-plan-select">{_options_html}</select> '
+                '<button class="action-button" id="choose-plan-button">Continue to payment</button>'
+                '<p id="choose-plan-message" class="health-detail"></p></section>')
+
     upgrade_panel = ""
     if upgrade_tier:
         upgrade_panel = (
@@ -104538,6 +104558,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Included with every plan</h3>
     <div class="health-row"><span>{escape(", ".join(label for _, label in pricing_catalog.INCLUDED_FEATURES))}</span><span class="pill">Included</span></div>
     </section>
+    {choose_plan_panel}
     {_license_panel}
     {upgrade_panel}
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
@@ -104546,6 +104567,17 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     </section>
     {_friends_family_panel if is_owner else ""}'''
     scripts = '''<script>
+    const choosePlanButton=document.getElementById('choose-plan-button');
+    if(choosePlanButton)choosePlanButton.onclick=async()=>{
+      const [plan_type,tier_label]=document.getElementById('choose-plan-select').value.split('|');
+      const messageEl=document.getElementById('choose-plan-message');messageEl.textContent='';
+      choosePlanButton.disabled=true;choosePlanButton.textContent='Redirecting to Stripe…';
+      let response,r;
+      try{response=await fetch('/api/customer/camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type,tier_label})});r=await response.json()}
+      catch(error){choosePlanButton.disabled=false;choosePlanButton.textContent='Continue to payment';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+      if(!response.ok){choosePlanButton.disabled=false;choosePlanButton.textContent='Continue to payment';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
+      location.href=r.checkout_url
+    };
     const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
     if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
       const tier_label=subscriptionUpgradeButton.dataset.tierLabel;
