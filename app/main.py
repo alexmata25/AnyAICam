@@ -1972,6 +1972,10 @@ class CameraNotConfiguredError(Exception):
     and recording never started and nothing in the logs said why."""
 
 
+class CameraNotLicensedError(CameraNotConfiguredError):
+    """A configured camera beyond this appliance's licensed capacity (vms_capacity.py)."""
+
+
 def legacy_camera_numbers_in_use() -> list[int]:
     """Which of the 1..LEGACY_DEFAULT_CAMERA_COUNT legacy slots actually
     have at least one CAMERA{n}_HOST/USERNAME/PASSWORD env var set --
@@ -15816,6 +15820,12 @@ def camera_url(camera_number: int) -> str:
     neither source has anything for this camera_number -- see that
     exception's docstring for why process_supervisor() depends on this
     distinction."""
+    # Licensed capacity (2026-10-01, vms_capacity.py): beyond the camera plan
+    # AND VMS license this appliance holds -- or on a never-claimed install --
+    # a camera does not run, however it was configured.
+    import vms_capacity
+    if not vms_capacity.camera_licensed(camera_number, get_camera_numbers()):
+        raise CameraNotLicensedError(f"Camera {camera_number} is beyond this appliance's licensed camera capacity.")
     provisioned = _provisioned_camera_stream(camera_number)
     if provisioned:
         return credentialed_rtsp_url(provisioned["rtsp_url"], provisioned["username"], provisioned["password"])

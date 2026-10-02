@@ -314,3 +314,15 @@ def test_windows_linux_and_appliance_installs_all_use_the_identical_claim_and_re
     refresh = appliance_client.post("/api/provisioning/refresh", headers=_appliance_headers(f"appl-{appliance_type}", credential))
     assert refresh.status_code == 200
     assert refresh.json()["camera_slot_quantity"] == 16
+
+
+# VMS license at provisioning (2026-10-01): usable capacity is the smaller
+# of the camera plan and the VMS software license. These tests are about
+# provisioning and plan limits, so their customers hold a license that
+# covers the plan -- as every appliance customer does
+# (test_vms_license_capacity.py covers the license itself).
+@pytest.fixture(autouse=True)
+def _vms_license_covers_the_plan(monkeypatch):
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "vms_license_capacity", lambda customer_id: 64)
+

@@ -1199,14 +1199,17 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # requests count too, so a burst of simultaneous "Add this
         # camera" clicks can't race past the limit before any of them
         # reach appliance_submit_provisioning()'s own second gate.
-        from customer_entitlements import total_camera_slots
+        # Usable capacity (2026-10-01): the camera plan AND the VMS software
+        # license must both cover a new camera -- see customer_entitlements.
+        # usable_camera_capacity(). Claiming an appliance is not gated; this is.
+        from customer_entitlements import capacity_refusal, usable_camera_capacity
         already_known_device = row('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(identity['customer_id'],device_key))
         if not already_known_device:
-            slot_limit=total_camera_slots(identity['customer_id'])
+            slot_limit=usable_camera_capacity(identity['customer_id'])
             configured=row('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',(identity['customer_id'],))['n']
             pending=row("SELECT COUNT(*) AS n FROM camera_provisioning_requests WHERE customer_id=? AND status='queued'",(identity['customer_id'],))['n']
             if configured+pending>=slot_limit:
-                raise HTTPException(status_code=403,detail=f'Camera limit reached: this account is licensed for {slot_limit} camera(s). Upgrade your plan or remove a camera before adding another.')
+                raise HTTPException(status_code=403,detail=capacity_refusal(identity['customer_id']))
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
             db.execute(

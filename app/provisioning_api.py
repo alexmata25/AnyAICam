@@ -141,7 +141,9 @@ def register_provisioning_api_routes(app: FastAPI) -> None:
         return {
             "cloud_id": appliance["cloud_id"],
             "activation_status": appliance.get("activation_status"),
-            "camera_slot_quantity": total_camera_slots(customer_id),
+            # The capacity the appliance may actually run: camera plan AND VMS
+            # license (2026-10-01). The parts are reported for diagnostics.
+            **__import__("customer_entitlements").capacity_breakdown(customer_id),
             "entitlements": [
                 {
                     "product": item["product"],

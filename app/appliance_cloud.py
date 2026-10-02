@@ -697,7 +697,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # docstring for the "database is locked" this avoids).
         if product_mode_audit:
             audit(product_mode_audit['actor'],product_mode_audit['action'],product_mode_audit['entity_type'],product_mode_audit['entity_id'],product_mode_audit['details'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -1708,12 +1708,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if success:
                 already_known=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
                 if not already_known:
-                    from customer_entitlements import total_camera_slots
-                    slot_limit=total_camera_slots(job['customer_id'])
+                    from customer_entitlements import capacity_refusal, usable_camera_capacity
+                    slot_limit=usable_camera_capacity(job['customer_id'])
                     configured=db.execute('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',(job['customer_id'],)).fetchone()['n']
                     if configured>=slot_limit:
                         success=False
-                        message=f'Camera limit reached: this account is licensed for {slot_limit} camera(s). Upgrade the plan or remove a camera before adding another.'
+                        message=capacity_refusal(job['customer_id'])
             if success:
                 # device_key identifies the physical camera itself (its
                 # ONVIF endpoint reference UUID), not an appliance-camera

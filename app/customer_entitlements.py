@@ -266,6 +266,35 @@ def vms_license_capacity(customer_id: str) -> int:
     return max(purchased, included)
 
 
+
+def usable_camera_capacity(customer_id: str) -> int:
+    """How many cameras this customer's VMS may actually provision and run
+    (2026-10-01): the camera plan (subscription slots) AND the VMS software
+    license must both cover a camera, so capacity is the smaller of the two.
+    An appliance purchase includes a license matching the plan, so for an
+    appliance customer this equals the plan; a customer with a copied
+    installer and no license gets 0. Claiming an appliance is deliberately
+    NOT gated by this -- only provisioning and operating cameras are."""
+    return max(0, min(total_camera_slots(customer_id), vms_license_capacity(customer_id)))
+
+
+def capacity_breakdown(customer_id: str) -> dict:
+    plan = total_camera_slots(customer_id)
+    license_capacity = vms_license_capacity(customer_id)
+    return {"camera_slot_quantity": max(0, min(plan, license_capacity)), "plan_camera_slots": plan,
+            "vms_license_capacity": license_capacity, "vms_license_required": license_capacity <= 0}
+
+
+def capacity_refusal(customer_id: str) -> str:
+    """The customer-facing reason a new camera cannot be added."""
+    breakdown = capacity_breakdown(customer_id)
+    if breakdown["vms_license_required"]:
+        return ("A VMS software license is required to add cameras. It is included with every AnyAiCam appliance, "
+                "or can be purchased for your own PC from My subscription.")
+    usable = breakdown["camera_slot_quantity"]
+    return (f"Camera limit reached: this account is licensed for {usable} camera(s). "
+            "Upgrade your plan or license, or remove a camera before adding another.")
+
 # ----------------------------------------------------------- pending links
 
 
