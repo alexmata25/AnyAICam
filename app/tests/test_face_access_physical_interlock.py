@@ -360,3 +360,75 @@ def test_a_stale_snapshot_on_disk_cannot_authorize_after_a_restart(site, monkeyp
     facial_embedding_sync.reset_sync_state()  # process memory gone
     events = _see(T0)
     assert events and _unlocks(site) == [] and _attempts()[-1] == ("refused", "cloud_grant_stale")
+
+
+# ================================================================ deployment gate (2026-10-02, Codex follow-up)
+# The dedicated physical flag alone is not enough: automatic facial unlock
+# also needs the general Face Access flags, ANYAICAM_ENV=production and an
+# EXPLICIT appliance runtime role (edge or combined). Everything else fails
+# closed before the access-control service is called.
+
+@pytest.mark.parametrize("environment", ["development", "staging", "local", None])
+def test_a_non_production_environment_never_reaches_the_adapter_even_with_the_flag_on(site, monkeypatch, environment):
+    enable_physical_face_access(monkeypatch, environment=environment)
+    events = _see(T0)  # the real chain: record_facial_events -> ... -> AccessControlService
+    assert events and events[0]["match_state"] == "known"
+    assert _unlocks(site) == [] and _attempts()[-1] == ("refused", "face_access_not_production")
+
+
+def test_a_cloud_runtime_never_reaches_the_adapter_even_with_the_flag_on(site, monkeypatch):
+    enable_physical_face_access(monkeypatch, role="cloud")
+    _see(T0)
+    assert _unlocks(site) == [] and _attempts()[-1] == ("refused", "face_access_runtime_role_not_approved")
+
+
+@pytest.mark.parametrize("role", [None, "", "appliance", "EDGE-x", "worker"])
+def test_a_missing_or_unknown_runtime_role_never_reaches_the_adapter(site, monkeypatch, role):
+    enable_physical_face_access(monkeypatch, role=role)
+    _see(T0)
+    assert _unlocks(site) == [] and _attempts()[-1] == ("refused", "face_access_runtime_role_not_approved")
+
+
+def test_the_general_face_access_flag_is_still_required(site, monkeypatch):
+    enable_physical_face_access(monkeypatch)
+    monkeypatch.setattr(relay_control, "FACIAL_ACCESS_CONTROL_ENABLED", False)
+    with connection() as db:  # called directly: main.py would not even pass a relay provider
+        engine = ApprovedEngine()
+        provider = door_access.CameraDoorProvider({"id": "cam-1", "customer_id": "cust-1", "name": "Front Door"},
+                                                  relay_control.MockRelayProvider(), person_id=site["person"], db=db,
+                                                  engine=engine, observation=observation(engine), now=T0)
+        result = provider.trigger(relay_control.RelayRequest(channel=1, reason="facial_event:flag-1", dry_run=False))
+    assert result.suppressed_reason == "face_access_not_enabled" and _unlocks(site) == []
+
+
+@pytest.mark.parametrize("role", ["edge", "combined", " Edge "])
+def test_an_approved_production_appliance_with_arcface_reaches_the_adapter(site, monkeypatch, role):
+    enable_physical_face_access(monkeypatch, role=role)
+    _see(T0)
+    assert len(_unlocks(site)) == 1 and _attempts() == [("accepted", None)]
+
+
+def test_full_pipeline_arcface_fallback_to_haar_records_the_event_but_never_unlocks(site, monkeypatch):
+    """Production appliance, flag on -- but ArcFace failed to initialize and
+    get_engine() fell back to Haar. The FR event is recorded; the door is not."""
+    enable_physical_face_access(monkeypatch)
+    with connection() as db:
+        facial_people.add_reference_image(db, customer_id="cust-1", person_id=site["person"], embedding=(1.0, 0.0),
+                                          engine=fr.HaarEmbeddingFaceEngine.name, engine_version=fr.HaarEmbeddingFaceEngine.version,
+                                          now="2026-01-01")
+    monkeypatch.setattr(fr, "FACE_ENGINE_SELECTION", "arcface")
+    monkeypatch.setattr(fr, "_build_named_onnx_engine", lambda name: None)  # model missing / init failed
+    monkeypatch.setattr(fr.HaarEmbeddingFaceEngine, "detect_faces", lambda self, image: [fr.FaceDetection(0, 0, 10, 10)])
+    monkeypatch.setattr(fr.HaarEmbeddingFaceEngine, "embed", lambda self, crop: (1.0, 0.0))
+    fr.reset_engine()
+    try:
+        facial_events.reset_state()
+        with connection() as db:  # engine=None: production resolves get_engine() itself
+            events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1",
+                                                        person_crop_bgr=np.zeros((50, 50, 3), dtype=np.uint8), now=T0,
+                                                        relay_provider=relay_control.MockRelayProvider(simulated=True))
+        assert isinstance(fr.get_engine(), fr.HaarEmbeddingFaceEngine)
+    finally:
+        fr.reset_engine()
+    assert events and events[0]["match_state"] == "known" and events[0]["engine"] == "haar_intensity"
+    assert _unlocks(site) == [] and _attempts()[-1] == ("refused", "engine_not_access_approved")

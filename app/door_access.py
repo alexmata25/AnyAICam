@@ -190,8 +190,9 @@ class CameraDoorProvider(relay_control.RelayProvider):
                                      person_id=self.person_id, rule_id=rule_id, result="refused", reason=why, now=now)
             return relay_control.RelayResult(channel=request.channel, activated=False, dry_run=False, suppressed_reason=why)
 
-        if not guard.physical_unlock_enabled():
-            return refuse("face_access_physical_disabled")
+        gate = guard.physical_unlock_denial()
+        if gate:
+            return refuse(gate)
         if self.db is None or not facial_event_id or not self.person_id:
             return refuse("face_access_context_missing")
         if guard.already_dispatched(self.db, facial_event_id=facial_event_id):

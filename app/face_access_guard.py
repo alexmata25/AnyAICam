@@ -8,11 +8,12 @@ EVERY check below passes, at the boundary to the physical access-control
 service (door_access.CameraDoorProvider). Each refusal is audited and never
 stops event generation.
 
-1. Production gate (Codex blocker 1). Automatic facial unlock of a real
-   access-control door needs ANYAICAM_FACE_ACCESS_PHYSICAL_UNLOCK_ENABLED=
-   true -- separate from, and in addition to, the general FR / Face Access
-   flags. Default off: development and mock evaluation can never reach a
-   physical adapter.
+1. Production gate (Codex blocker 1 and follow-up). Automatic facial unlock
+   of a real access-control door needs ANYAICAM_FACE_ACCESS_PHYSICAL_UNLOCK_
+   ENABLED=true AND the general FR / Face Access flags AND ANYAICAM_ENV=
+   production AND an explicitly set appliance ANYAICAM_RUNTIME_ROLE (edge or
+   combined) -- see physical_unlock_denial(). Default off: development, test,
+   staging, cloud and mock evaluation can never reach a physical adapter.
 2. Access-approved engine (blocker 2, owner policy "no Haar physical
    unlocking"). The match must come from the approved production engine
    (ArcFace via ONNX: ACCESS_APPROVED_ENGINES), proven by the observation's
@@ -79,9 +80,37 @@ def as_datetime(value) -> datetime:
 
 # ------------------------------------------------------------------ 1. gate
 
+# Runtime roles that ARE the appliance next to the door (the repository's
+# ANYAICAM_RUNTIME_ROLE convention, as in appliance_activation.py).
+APPROVED_RUNTIME_ROLES = frozenset({"edge", "combined"})
+
+
+def physical_unlock_denial() -> str | None:
+    """None only when this process may physically unlock a door
+    automatically (2026-10-02, Codex follow-up). ALL of:
+    - the dedicated ANYAICAM_FACE_ACCESS_PHYSICAL_UNLOCK_ENABLED=true;
+    - the general Face Access enablement (FR on and
+      ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED on);
+    - ANYAICAM_ENV=production;
+    - ANYAICAM_RUNTIME_ROLE explicitly set to an approved appliance role
+      (edge/combined). The setting's own default ('edge' when unset) is NOT
+      accepted here: a missing or unknown role fails closed, as does cloud.
+    Read live on every attempt; never cached."""
+    if os.environ.get(PHYSICAL_UNLOCK_ENV, "").strip().lower() != "true":
+        return "face_access_physical_disabled"
+    import facial_recognition
+    import relay_control
+    if not facial_recognition.FACIAL_RECOGNITION_ENABLED or not relay_control.FACIAL_ACCESS_CONTROL_ENABLED:
+        return "face_access_not_enabled"
+    if os.environ.get("ANYAICAM_ENV", "").strip().lower() != "production":
+        return "face_access_not_production"
+    if os.environ.get("ANYAICAM_RUNTIME_ROLE", "").strip().lower() not in APPROVED_RUNTIME_ROLES:
+        return "face_access_runtime_role_not_approved"
+    return None
+
+
 def physical_unlock_enabled() -> bool:
-    """Read on every attempt (no cached import-time value)."""
-    return os.environ.get(PHYSICAL_UNLOCK_ENV, "").strip().lower() == "true"
+    return physical_unlock_denial() is None
 
 
 # ------------------------------------------------------------------ 2-3. engine and observation

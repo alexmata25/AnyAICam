@@ -49,5 +49,19 @@ def observation(engine=None, *, quality=0.5, vector=(1.0, 0.0), width=10, height
                               engine=engine.name, engine_version=engine.version, quality=quality)
 
 
-def enable_physical_face_access(monkeypatch):
+def enable_physical_face_access(monkeypatch, *, environment="production", role="edge"):
+    """Everything automatic physical Face Access needs from configuration:
+    the dedicated flag, the general Face Access flags, a production
+    environment and an explicitly approved appliance runtime role."""
+    import relay_control
     monkeypatch.setenv(face_access_guard.PHYSICAL_UNLOCK_ENV, "true")
+    monkeypatch.setattr(fr, "FACIAL_RECOGNITION_ENABLED", True)
+    monkeypatch.setattr(relay_control, "FACIAL_ACCESS_CONTROL_ENABLED", True)
+    if environment is None:
+        monkeypatch.delenv("ANYAICAM_ENV", raising=False)
+    else:
+        monkeypatch.setenv("ANYAICAM_ENV", environment)
+    if role is None:
+        monkeypatch.delenv("ANYAICAM_RUNTIME_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", role)
