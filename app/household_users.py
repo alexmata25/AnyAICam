@@ -196,7 +196,9 @@ def facial_permission_allowed(identity: dict | None, permission: str) -> bool:
     if permission == "facial.manage":
         return account_permission(identity, "face_access")
     if permission == "facial.view":
-        return account_permission(identity, "people") or account_permission(identity, "face_access")
+        # Backup Mobile Access lives on the person's People profile, so it
+        # needs to reach People too (backup_access.py).
+        return any(account_permission(identity, key) for key in ("people", "face_access", "backup_access"))
     return True
 
 

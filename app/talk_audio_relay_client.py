@@ -407,12 +407,29 @@ def _door_unlock_on_appliance(message: dict) -> dict:
             camera = db.execute("SELECT * FROM cameras WHERE id=? AND door_access_enabled=1", (camera_id,)).fetchone()
         if not camera:
             return {"status": "error", "reason": "not_a_door_here"}
+        trigger = "manual"
+        if message.get("trigger") == "backup_mobile":
+            # Backup Mobile Access (2026-10-01): a single-use command, refused
+            # if this appliance has seen its id before or it was issued
+            # outside the clock window -- before anything can move.
+            import backup_access
+            with connection() as db:
+                refused = backup_access.accept_command_on_appliance(db, message)
+            if refused:
+                logger.warning("talk_audio_relay_client.backup_unlock_refused camera_id=%s reason=%s", camera_id, refused)
+                return {"status": "error", "reason": refused}
+            trigger = "backup_mobile"
         pulse = message.get("pulse_ms") if isinstance(message.get("pulse_ms"), int) else None
         result = door_access.trigger_door(dict(camera), reason=f"remote_unlock:{camera_id}", actor=str(message.get("actor") or "portal"),
-                                          trigger_type="manual", pulse_ms=pulse)
+                                          trigger_type=trigger, pulse_ms=pulse)
+        simulated = bool(getattr(result, "simulated", False))
+        import door_feedback
+        relay_result = ("activated" if result.activated and not simulated
+                        else "cooldown" if result.suppressed_reason in ("cooldown", "duplicate") else "failed")
+        door_feedback.play(dict(camera), door_feedback.outcome_for("authorized", relay_result))
         return {"status": "ok", "channel": result.channel, "activated": bool(result.activated),
                 "dry_run": bool(result.dry_run), "suppressed_reason": result.suppressed_reason,
-                "simulated": bool(getattr(result, "simulated", False))}
+                "simulated": simulated}
     except Exception as error:
         logger.warning("talk_audio_relay_client.door_unlock_failed camera_id=%s error=%s", camera_id, type(error).__name__)
         return {"status": "error", "reason": "door_unreachable"}
