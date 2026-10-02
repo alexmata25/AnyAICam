@@ -5460,3 +5460,27 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
 4. **No customer-facing permission editor.** The camera-access API exists but has no page. There are no permissions for People/Face Access management or Backup Mobile Access (the `customer_viewer` role has `facial.view` only).
 5. No owner-side remove or disable of a household user, and no audit view of it.
 - `/api/user-invites` (main.py) is the legacy local-VMS user system (`current_user()`), not cloud customer accounts. Do not extend it for this.
+
+## Pre-launch: Customer VMS Software Update (inspected 2026-10-01, NOT built)
+
+Goal: routine updates without AnyAiCam staff remoting in, via Settings → System → Software Update (current version, approved version, release notes, Update Now).
+
+**Reusable (already on golden):**
+- **Agent updater (RDM-1/2, `appliance-agent/anyaicam_agent/updater/`, about 2,300 lines):**
+  - RSA-signed manifest checked against a single pinned public key, plus the package SHA-256 (`verify.py`).
+  - Authenticated manifest fetch with a presigned package download (`s3_source.py`).
+  - Version directories with an atomic pointer switch (`installer.py`).
+  - Crash-safe state machine: a marker written before every switch, a health check after restart, automatic rollback (`state_machine.py`, `health.py`).
+  - An idempotent, durable history (`history.py`).
+  - Periodic source checks are wired in `service.py`. `install_update` is in the command allow-list.
+- **Cloud:** `GET /api/appliance/updates/latest` (signs the manifest, 300 s presigned URL), the `POST .../updates/{id}/result` ledger (`appliance_update_results`), and `updates_storage.publish_release()`.
+- **Root side:** the privileged watcher (`appliance-agent/system/privileged_watcher.py`), with a fixed DISPATCH table that never runs marker-supplied input.
+- **Release installer:** `install.sh --repair` creates a rollback point (image, code, DB) and preserves identity, configuration and DB. `validate.sh` is the post-update gate, and `rollback.sh` restores. All proven on the Ryzen (b46cb43).
+- **Manual/offline path for Local:** the licensed My subscription installer download (`customer_downloads.py`) plus `sudo ./install.sh --repair`.
+
+**Missing:**
+1. **Nothing applies a staged release to the running VMS.** The updater's activation only switches `updates/current_version.txt`; no code consumes it. A root-side apply step is needed: a new watcher action, such as `apply_vms_release`, that re-verifies the staged package's signature **as root**, runs `install.sh --repair`, then `validate.sh`, then `rollback.sh` on failure, and reports the result. **Security:** root must never execute from the agent-writable directory without that re-verification.
+2. **No device holds the pinned update public key.** No installer step writes `trusted_signing_key.pem`, so verification fails closed everywhere today. The cloud needs `ANYAICAM_UPDATE_SIGNING_KEY_FILE` (key custody is an owner decision).
+3. No release-publishing CLI or admin "approve release for channel" step (only `publish_release()`).
+4. No customer Software Update UI (cloud portal or local VMS), no "update available" email/in-app notice, and no per-appliance progress or result view.
+5. Local-mode UI should point to the manual path (download, then `install.sh --repair`). The installer is never emailed.
