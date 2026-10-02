@@ -132,6 +132,8 @@ run_install() {
 
     load_release_metadata
     log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode, VMS=$VMS_RELEASE_COMMIT)"
+    log "Verifying this installer package against its own file list..."
+    verify_installer_payload || return 1
     preflight_checks
     webrtc_port_preflight
     vms_http_port_preflight

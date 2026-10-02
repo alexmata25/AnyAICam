@@ -1291,6 +1291,29 @@ assert_exit "the appliance's own VMS publish passes (repair/upgrade)" 0 vms_http
 unset -f docker vms_http_port_bindable
 source "$INSTALLER_DIR/01-preflight.sh"
 
+echo "== verify_installer_payload (01-preflight.sh) =="
+# Windows dev hosts: python3 may be the Store stub; Ubuntu has python3.
+if ! python3 -c "" >/dev/null 2>&1 && command -v python >/dev/null 2>&1; then python3() { python "$@"; }; fi
+PAYLOAD_FIXTURE="$(mktemp -d)"
+mkdir -p "$PAYLOAD_FIXTURE/payload"
+printf "install" > "$PAYLOAD_FIXTURE/install.sh"; printf "vms" > "$PAYLOAD_FIXTURE/payload/app.py"
+python3 - "$PAYLOAD_FIXTURE" <<'PYEOF'
+import hashlib, json, os, sys
+root = sys.argv[1]
+entries = [{"path": p, "sha256": hashlib.sha256(open(os.path.join(root, p), "rb").read()).hexdigest()} for p in ("install.sh", "payload/app.py")]
+json.dump(entries, open(os.path.join(root, "artifact-files.json"), "w"))
+PYEOF
+assert_exit "an intact package verifies" 0 verify_installer_payload "$PAYLOAD_FIXTURE/artifact-files.json"
+printf "vms-edited" > "$PAYLOAD_FIXTURE/payload/app.py"
+assert_exit "a file changed after the build is refused" 1 verify_installer_payload "$PAYLOAD_FIXTURE/artifact-files.json"
+printf "vms" > "$PAYLOAD_FIXTURE/payload/app.py"; rm "$PAYLOAD_FIXTURE/install.sh"
+assert_exit "a missing file is refused" 1 verify_installer_payload "$PAYLOAD_FIXTURE/artifact-files.json"
+printf "install" > "$PAYLOAD_FIXTURE/install.sh"
+echo '[{"path": "../etc/passwd", "sha256": "x"}]' > "$PAYLOAD_FIXTURE/evil.json"
+assert_exit "a manifest naming a path outside the package is refused" 1 verify_installer_payload "$PAYLOAD_FIXTURE/evil.json"
+assert_exit "a package without its manifest is refused" 1 verify_installer_payload "$PAYLOAD_FIXTURE/none.json"
+rm -rf "$PAYLOAD_FIXTURE"
+
 echo "== RAM floor (01-preflight.sh ram_floor_ok) =="
 # Real MemTotal readings: 8 GB machines report ~7.6-7.9 GiB after firmware/
 # kernel reservations; they must pass. 6 GB and smaller must not.

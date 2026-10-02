@@ -208,7 +208,12 @@ def test_steps_use_the_customer_claim_flow_with_this_portal_and_the_plan_mode(li
     assert "anyaicam-setup --claim --portal-url=https://portal.anyaicam.com" in html
     assert 'href="/customer/claim-appliance"' in html
     # The archive has no top-level folder: unpack it into one, by its real name.
-    assert f"tar -xzf {PACKAGE} -C anyaicam-installer" in html
+    # Verify the published SHA-256 first, then unpack into a new folder for this build.
+    record_sha = __import__("hashlib").sha256(package.read_bytes()).hexdigest()
+    assert f'echo "{record_sha}  {PACKAGE}" | sha256sum -c' in html
+    assert html.index("sha256sum -c") < html.index("tar -xzf")
+    assert f"mkdir anyaicam-installer-{COMMIT[:12]} &amp;&amp; tar -xzf {PACKAGE} -C anyaicam-installer-{COMMIT[:12]}" in html
+    assert "mkdir -p" not in html
     assert "anyaicam-setup</code>" not in html  # the administrator flow is never offered
 
 

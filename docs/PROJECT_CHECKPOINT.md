@@ -5484,3 +5484,34 @@ Goal: routine updates without AnyAiCam staff remoting in, via Settings → Syste
 3. No release-publishing CLI or admin "approve release for channel" step (only `publish_release()`).
 4. No customer Software Update UI (cloud portal or local VMS), no "update available" email/in-app notice, and no per-appliance progress or result view.
 5. Local-mode UI should point to the manual path (download, then `install.sh --repair`). The installer is never emailed.
+
+## 2026-10-02 launch security fixes (golden `cd20e96` hotfixes + branch `fix/launch-installer-hardening`)
+
+- **/recordings exposure (found in the staging installer E2E, fixed and deployed):** the static mount served all of `/app/recordings` to any signed-in customer: audit log, other customers' billing invoices, license state, the email-preview mailbox, face crops, DB backups and object storage including the licensed installer. Cloud: the mount serves nothing. Appliance: only `camera<N>/`, `media/` and `clips/` media types. Tenant-isolation and traversal matrix tested. Golden `47899c0`.
+- **Cloudflare cached a signed-in `.tar.gz`** and served it signed out (`cf-cache-status: HIT`). Every `/recordings`, `/storage/` and licensed-download response is now `private, no-store` plus `CDN-Cache-Control: no-store`. Golden `cd20e96`. **Owner action: purge the cached installer URL in Cloudflare.**
+- **Claim credential exposure (launch blocker, Codex):** fixed by device-possession secrets, log redaction and agent portal-origin binding with HTTPS. `cad4316`.
+- **Codex before-launch items fixed:**
+  - product mode is now a bootstrap the cloud can supersede (`05e0e71`)
+  - MediaMTX declared-payload and effective-P2P validation (`13baf55`)
+  - installer self-verification against `artifact-files.json` before any change
+  - install steps verify the published SHA-256 before extraction, into a new per-build folder
+- **Needs owner decision (Codex licensing):** claim/provisioning is deliberately not entitlement-gated today (documented design; real enforcement is at camera provisioning). Codex recommends requiring a VMS license at claim/provisioning and defining combined capacity (camera-plan slots vs VMS license capacity).
+
+## Pre-launch: billing / Stripe (Codex read-only review of 567b7f2, for the pricing phase)
+
+1. Unlinked subscription update/deletion is marked processed and lost; a cancellation arriving before checkout completion can leave access active. Reconcile orphan events / fetch current subscription after linkage; test both orders and stale/newer updates.
+2. Local→Hybrid creates a second subscription and leaves Local active; slots sum both. Replace the subscription (one billable base plan); explicit grandfathering rule if intended.
+3. No payment-failure lifecycle: `past_due` maps to active, no app notice. Define grace/retry, customer billing state, notice and payment-update action, and access transitions; verify Stripe dunning settings.
+4. Real customer billing controls: owner-scoped Stripe portal for the stored Stripe customer (status, renewal, scheduled cancellation, update/cancel); the existing portal is legacy-keyed.
+5. Dispute won/closed never restores reversed commission; add reconciliation before partner payouts rely on the ledger.
+6. Launch verification: live Price IDs and monthly interval, webhook secret and retries, F&F coupon values and duration, checkout links on the camera-slot path.
+
+## Pre-launch: Software Update (Codex audit, confirms the earlier entry), launch blockers for that phase
+
+- RDM flips `updates/current_version.txt` and restarts the agent, but nothing consumes it; the VMS runs from `/opt/anyaicam` and its health is not checked. **Real VMS activation, VMS health check and rollback are launch blockers.**
+- Make periodic checks report-only (no automatic install).
+- Add an owner-scoped manual Update (deny viewers and other customers) with signed release notes and the `appliance_update_results` history.
+- Add an offline source through the same verifier.
+- Provision the pinned key at `/etc/anyaicam/trusted_signing_key.pem`.
+- Build a controlled, signed, approved release publisher.
+- Test authorization, manual-only behaviour, signature/platform rejection, real version change, failed-health rollback, crash recovery, migrations, data preservation and offline updates.

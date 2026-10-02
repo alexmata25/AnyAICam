@@ -8,6 +8,44 @@ MIN_VCPU=4
 # customer appliances are sized at 16 GiB or more. Keep this floor explicit
 # and independently report/validate the target appliance class before release.
 MIN_RAM_GIB=8
+
+# verify_installer_payload (2026-10-01): before anything on this machine is
+# changed, every file this package's build recorded in artifact-files.json
+# must be present and match its SHA-256 -- a truncated download, a file
+# edited after extraction or a mixed folder never reaches an existing
+# installation. Read-only; python3 ships with Ubuntu 24.04.
+verify_installer_payload() {
+    local manifest="${1:-$INSTALLER_DIR/artifact-files.json}"
+    if [[ ! -f "$manifest" ]]; then
+        echo "[ERROR] This installer package is missing its file manifest (artifact-files.json); download it again." >&2
+        return 1
+    fi
+    python3 - "$manifest" "$(dirname "$manifest")" <<'PYEOF' || {
+import hashlib, json, os, sys
+manifest, root = sys.argv[1], sys.argv[2]
+entries = json.load(open(manifest, encoding="utf-8"))
+bad = []
+for entry in entries:
+    rel = entry.get("path", "")
+    path = os.path.normpath(os.path.join(root, rel))
+    if rel.startswith("/") or ".." in rel.split("/") or not path.startswith(os.path.normpath(root)):
+        bad.append(f"unsafe path {rel!r}"); continue
+    try:
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        bad.append(f"missing {rel}"); continue
+    if digest != entry.get("sha256"):
+        bad.append(f"changed {rel}")
+if bad or not entries:
+    print("; ".join(bad[:10]) or "empty manifest", file=sys.stderr)
+    sys.exit(1)
+print(f"{len(entries)} files verified")
+PYEOF
+        echo "[ERROR] This installer package does not match its own file list -- it is incomplete or was modified. Download it again and verify its SHA-256 before running it." >&2
+        return 1
+    }
+}
 # /proc/meminfo's MemTotal is always below the installed RAM: firmware,
 # the kernel image and (on some PCs) integrated graphics reserve part of it
 # before Linux counts anything. A PC sold as "8 GB" reports about
