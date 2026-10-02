@@ -12,10 +12,12 @@ here. Hybrid should enable cloud identity/services, remote access,
 notifications, event-media upload, analytics sync, and relay/P2P.
 
 Resolution order for the mode itself (current_mode()):
-1. ANYAICAM_PRODUCT_MODE env var -- an explicit installer/manual
-   selection. This is also the only mechanism for a genuinely
-   air-gapped Local install that never reaches the cloud at all to
-   learn a mode any other way.
+1. ANYAICAM_PRODUCT_MODE env var -- an explicit ADMINISTRATIVE
+   override, set by hand (2026-10-01: the installer no longer writes
+   it; an older install that has it keeps it as an override).
+   (After 2. comes the installer's own first-run choice,
+   ANYAICAM_PRODUCT_MODE_BOOTSTRAP: used only until the cloud says
+   otherwise, and the mode an air-gapped Local install keeps.)
 2. The persisted state file -- the mode this appliance last learned
    from the cloud's own GET /api/appliance/configuration response
    (see appliance_cloud.appliance_configuration()'s `product_mode`
@@ -63,6 +65,11 @@ from pathlib import Path
 logger = logging.getLogger("anyaicam.product_mode")
 
 PRODUCT_MODE_ENV = "ANYAICAM_PRODUCT_MODE"
+# The installer's first-run choice (2026-10-01): used only until the cloud
+# tells this appliance its mode, so a later Local->Hybrid upgrade or
+# Hybrid->Local change from the cloud actually takes effect. An air-gapped
+# Local appliance never hears from the cloud and keeps its bootstrap mode.
+BOOTSTRAP_MODE_ENV = "ANYAICAM_PRODUCT_MODE_BOOTSTRAP"
 VALID_MODES = ("local", "hybrid")
 
 STATE_FILE = Path(os.environ.get(
@@ -83,9 +90,13 @@ def _read_persisted_mode() -> str:
 def current_mode() -> str:
     """See module docstring for the full 3-step resolution order."""
     env_mode = os.environ.get(PRODUCT_MODE_ENV, "").strip().lower()
-    if env_mode in VALID_MODES:
+    if env_mode in VALID_MODES:  # explicit administrative override
         return env_mode
-    return _read_persisted_mode()
+    persisted = _read_persisted_mode()
+    if persisted in VALID_MODES:  # what the cloud last said
+        return persisted
+    bootstrap = os.environ.get(BOOTSTRAP_MODE_ENV, "").strip().lower()
+    return bootstrap if bootstrap in VALID_MODES else persisted
 
 
 def is_local() -> bool:

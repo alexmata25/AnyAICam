@@ -175,3 +175,38 @@ def test_flag_registry_documents_every_governed_flag_used_in_this_codebase():
         "ANYAICAM_LIVE_P2P_ENABLED",
     }
     assert expected == set(pm.FLAG_REGISTRY.keys())
+
+
+# --------------------------------------------- installer bootstrap (2026-10-01)
+
+def test_the_installer_bootstrap_applies_until_the_cloud_says_otherwise(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_PRODUCT_MODE", raising=False)
+    monkeypatch.setenv("ANYAICAM_PRODUCT_MODE_BOOTSTRAP", "local")
+    assert pm.current_mode() == "local"  # air-gapped / never heard from the cloud
+
+
+def test_a_cloud_upgrade_from_a_local_install_takes_effect(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_PRODUCT_MODE", raising=False)
+    monkeypatch.setenv("ANYAICAM_PRODUCT_MODE_BOOTSTRAP", "local")
+    pm.persist_mode("hybrid")  # what edge_camera_sync stores after an upgrade purchase
+    assert pm.current_mode() == "hybrid"
+
+
+def test_a_cloud_downgrade_from_a_hybrid_install_takes_effect(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_PRODUCT_MODE", raising=False)
+    monkeypatch.setenv("ANYAICAM_PRODUCT_MODE_BOOTSTRAP", "hybrid")
+    pm.persist_mode("local")
+    assert pm.current_mode() == "local"
+
+
+def test_an_explicit_administrative_override_still_wins(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_PRODUCT_MODE", "local")
+    monkeypatch.setenv("ANYAICAM_PRODUCT_MODE_BOOTSTRAP", "hybrid")
+    pm.persist_mode("hybrid")
+    assert pm.current_mode() == "local"
+
+
+def test_an_invalid_bootstrap_is_ignored(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_PRODUCT_MODE", raising=False)
+    monkeypatch.setenv("ANYAICAM_PRODUCT_MODE_BOOTSTRAP", "cloudy")
+    assert pm.current_mode() == ""

@@ -50,17 +50,28 @@ validate_product_mode() {
 select_product_mode() {
     local file="$VMS_ENV_FILE" saved="" count=0
     PRODUCT_MODE_LEGACY=false
+    PRODUCT_MODE_OVERRIDE_SAVED=false
     [[ -f "$file" ]] || file="$VMS_INSTALL_ROOT/.env"
     if [[ -f "$file" ]]; then
-        count=$(grep -c '^ANYAICAM_PRODUCT_MODE=' "$file" || true)
-        if (( count > 1 )); then
-            echo '[ERROR] Duplicate ANYAICAM_PRODUCT_MODE entries; resolve before installing.' >&2
-            return 2
-        fi
-        if (( count == 1 )); then
-            saved=$(sed -n 's/^ANYAICAM_PRODUCT_MODE=//p' "$file")
-            validate_product_mode "$saved" || return 2
-        fi
+        # 2026-10-01: the installer's choice is a BOOTSTRAP value
+        # (ANYAICAM_PRODUCT_MODE_BOOTSTRAP) that a later cloud-learned mode
+        # (Local->Hybrid upgrade, Hybrid->Local change) supersedes -- see
+        # app/product_mode.py current_mode(). ANYAICAM_PRODUCT_MODE stays
+        # the explicit administrative override; an existing one (older
+        # installer or set by hand) is honoured as saved and left as is.
+        local key
+        for key in ANYAICAM_PRODUCT_MODE ANYAICAM_PRODUCT_MODE_BOOTSTRAP; do
+            count=$(grep -c "^${key}=" "$file" || true)
+            if (( count > 1 )); then
+                echo "[ERROR] Duplicate ${key} entries; resolve before installing." >&2
+                return 2
+            fi
+            if (( count == 1 )) && [[ -z "$saved" ]]; then
+                saved=$(sed -n "s/^${key}=//p" "$file")
+                validate_product_mode "$saved" || return 2
+                [[ "$key" == ANYAICAM_PRODUCT_MODE ]] && PRODUCT_MODE_OVERRIDE_SAVED=true
+            fi
+        done
     fi
     if [[ ${ANYAICAM_PRODUCT_MODE+x} ]]; then
         validate_product_mode "$ANYAICAM_PRODUCT_MODE" || return 2
@@ -97,5 +108,7 @@ persist_product_mode() {
     # individual _ENABLED flag under any circumstance.
     [[ -z "${ANYAICAM_PRODUCT_MODE:-}" ]] && return 0
     validate_product_mode "$ANYAICAM_PRODUCT_MODE" || return 2
-    upsert_env_key "$VMS_ENV_FILE" ANYAICAM_PRODUCT_MODE "$ANYAICAM_PRODUCT_MODE"
+    # An existing administrative override is left exactly as it is.
+    [[ "${PRODUCT_MODE_OVERRIDE_SAVED:-false}" == true ]] && return 0
+    upsert_env_key "$VMS_ENV_FILE" ANYAICAM_PRODUCT_MODE_BOOTSTRAP "$ANYAICAM_PRODUCT_MODE"
 }

@@ -53,7 +53,8 @@ log() { :; }
 ANYAICAM_PRODUCT_MODE={mode}
 select_product_mode
 ensure_vms_env
-grep -qx 'ANYAICAM_PRODUCT_MODE={mode}' "$VMS_ENV_FILE"
+grep -qx 'ANYAICAM_PRODUCT_MODE_BOOTSTRAP={mode}' "$VMS_ENV_FILE"
+! grep -q '^ANYAICAM_PRODUCT_MODE=' "$VMS_ENV_FILE"
 cp "$VMS_ENV_FILE" "$tmp/before"
 INSTALL_STATE=existing
 select_product_mode
@@ -166,6 +167,38 @@ test "$ANYAICAM_PRODUCT_MODE" = local
                 self.run_policy(f'''
 printf '{contents}\\n' > "$VMS_ENV_FILE"
 ANYAICAM_PRODUCT_MODE=hybrid
+select_product_mode
+''', False)
+
+    def test_a_saved_bootstrap_mode_is_reused_and_never_becomes_an_override(self):
+        """2026-10-01: the installer's choice is a bootstrap value the cloud
+        can supersede (app/product_mode.py); repair keeps it as bootstrap."""
+        self.run_policy('''
+printf '%s\n' ANYAICAM_PRODUCT_MODE_BOOTSTRAP=hybrid > "$VMS_ENV_FILE"
+INSTALL_STATE=existing
+select_product_mode
+test "$ANYAICAM_PRODUCT_MODE" = hybrid
+persist_product_mode
+grep -qx ANYAICAM_PRODUCT_MODE_BOOTSTRAP=hybrid "$VMS_ENV_FILE"
+! grep -q '^ANYAICAM_PRODUCT_MODE=' "$VMS_ENV_FILE"
+''')
+
+    def test_an_existing_administrative_override_is_left_exactly_as_it_is(self):
+        self.run_policy('''
+printf '%s\n' ANYAICAM_PRODUCT_MODE=local > "$VMS_ENV_FILE"
+INSTALL_STATE=existing
+select_product_mode
+persist_product_mode
+grep -qx ANYAICAM_PRODUCT_MODE=local "$VMS_ENV_FILE"
+! grep -q '^ANYAICAM_PRODUCT_MODE_BOOTSTRAP=' "$VMS_ENV_FILE"
+''')
+
+    def test_corrupt_or_duplicate_bootstrap_modes_are_rejected(self):
+        for contents in ("ANYAICAM_PRODUCT_MODE_BOOTSTRAP=", "ANYAICAM_PRODUCT_MODE_BOOTSTRAP=bad",
+                         "ANYAICAM_PRODUCT_MODE_BOOTSTRAP=local\nANYAICAM_PRODUCT_MODE_BOOTSTRAP=local"):
+            with self.subTest(contents=contents):
+                self.run_policy(f'''
+printf '{contents}\n' > "$VMS_ENV_FILE"
 select_product_mode
 ''', False)
 
