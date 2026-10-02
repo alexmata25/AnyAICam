@@ -281,6 +281,19 @@ class HappyPathTests(StateMachineTestCase):
         self.assertEqual(result.state, UpdateState.RESTARTING)
         self.assertEqual(source.check_calls, [("", DEVICE_TARGET, "stable")])
 
+    def test_check_available_never_downloads_installs_activates_or_restarts(self):
+        """Launch blocker (2026-10-02): the periodic poll only checks."""
+        manifest_dict, signature, package_bytes = self.make_update()
+        source = FakeUpdateSourceProvider(manifest=manifest_dict, signature=signature, package_bytes=package_bytes)
+        machine = self.make_machine(source=source)
+        found = machine.check_available()
+        self.assertEqual(found["version"], manifest_dict.get("version"))
+        self.assertEqual(self.restart.calls, 0)
+        self.assertFalse(self.pointer_file.exists() and self.pointer_file.read_text().strip() == manifest_dict.get("version"))
+        self.assertFalse(self.versions_dir.exists() and any(self.versions_dir.iterdir()))
+        self.assertEqual(machine.history.in_progress_update_ids(), [])
+        self.assertIsNone(self.make_machine(source=FakeUpdateSourceProvider()).check_available())
+
     def test_check_and_install_returns_none_when_nothing_available(self):
         machine = self.make_machine(source=FakeUpdateSourceProvider())
         self.assertIsNone(machine.check_and_install())

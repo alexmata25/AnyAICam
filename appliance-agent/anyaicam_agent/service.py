@@ -62,6 +62,7 @@ class ApplianceAgent:
         self.vms_status=LocalVmsStatusReader(config.vms_hls_path,config.vms_recordings_path,config.vms_status_freshness_seconds,config.vms_recording_freshness_seconds)
         self.update_resume_failed=False
         self._next_source_check_at=0.0
+        self.available_update=None  # what the periodic check found; applied only by an owner-confirmed action
         self._next_entitlement_check_at=0.0
     def resolve_update_state(self):
         # RDM-2 Groups 2A/2E: runs once at startup, before any command
@@ -130,12 +131,10 @@ class ApplianceAgent:
             self.queue.put(key,'POST',path,sanitize(payload))
             self.log.warning('Queued offline update result report update_id=%s state=%s error=%s',result.update_id,result.state.value,error)
     def check_for_source_update(self):
-        # RDM-2 Group 2G: the periodic PULL path -- calls the ALREADY-
-        # EXISTING UpdateStateMachine.check_and_install() (built in
-        # RDM-1, never previously called by anything in the real
-        # runtime) on its own slow cadence (config.update_check_interval_
-        # seconds, default 900s), deliberately separate from
-        # checkin_seconds' much more frequent normal poll interval.
+        # RDM-2 Group 2G: the periodic PULL path, on its own slow cadence
+        # (config.update_check_interval_seconds, default 900s). Since
+        # 2026-10-02 it only CHECKS (UpdateStateMachine.check_available());
+        # it never downloads, activates or restarts -- see below.
         #
         # Isolated in its own try/except, matching resolve_update_state()'s
         # established discipline (Groups 2E/2F): a failure here is
@@ -172,17 +171,15 @@ class ApplianceAgent:
             if self.state_machine.has_unresolved_activation():
                 self.log.debug('Skipping periodic update check: a previous update is still awaiting restart/health confirmation.')
                 return
-            result=self.state_machine.check_and_install()
-            if result is not None:
-                # A pre-restart outcome (REJECTED/DOWNLOAD_FAILED/etc.)
-                # from THIS self-initiated pull is recorded durably in
-                # the local update history (RDM-1) but not separately
-                # reported to the cloud here -- Group 2D's endpoint is
-                # scoped to POST-RESTART conclusions only (Group 2E). If
-                # this pull DOES trigger an actual restart, the real
-                # conclusion is reported the normal way, via
-                # resolve_update_state() on this device's next startup.
-                self.log.info('Periodic update check concluded: %s',result.as_dict())
+            # LAUNCH BLOCKER FIX (2026-10-02): the periodic poll used to call
+            # check_and_install(), so a published release downloaded,
+            # activated and restarted on customer appliances with no customer
+            # action. It now only CHECKS and remembers what is available;
+            # applying an update is a separate, owner-confirmed action.
+            available=self.state_machine.check_available()
+            self.available_update=available
+            if available is not None:
+                self.log.info('Update available (not installed; waiting for the owner): %s',available)
         except Exception:
             self.log.exception('Periodic update source check failed; will retry next cycle')
     def current_camera_slot_quantity(self) -> int:

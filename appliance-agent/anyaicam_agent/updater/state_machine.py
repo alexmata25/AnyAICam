@@ -176,6 +176,21 @@ class UpdateStateMachine:
 
     # -- public entry points ----------------------------------------------
 
+    def check_available(self, current_version: Optional[str] = None) -> Optional[dict]:
+        """Check only (2026-10-02 launch blocker): what the source offers for
+        this device, WITHOUT authenticating, downloading, installing,
+        activating or restarting anything. Returns a small summary dict, or
+        None when nothing is available. The periodic poll uses this; an
+        update is applied only by an explicit, owner-confirmed action."""
+        version_to_check = current_version if current_version is not None else self._current_version()
+        available = self.source.check_for_manifest(version_to_check, self.device_target, self.channel)
+        if available is None:
+            return None
+        manifest_dict, _signature = available
+        manifest_dict = manifest_dict if isinstance(manifest_dict, dict) else {}
+        return {"version": manifest_dict.get("version"), "update_id": manifest_dict.get("update_id"),
+                "current_version": version_to_check}
+
     def check_and_install(self, current_version: Optional[str] = None):
         """Queries self.source for the latest available manifest for this
         device's target/channel, and if one is available, feeds it
