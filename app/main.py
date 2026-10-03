@@ -104456,13 +104456,20 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         import customer_downloads
         _installer = customer_downloads.latest_vms_installer()
         if _installer:
+            # Customer-facing summary first; the build id, checksum and terminal
+            # commands stay available, tucked into a collapsed details section.
             _download_html = (
                 f'<div class="health-row" id="vms-installer-download"><span>AnyAiCam VMS installer {escape(str(_installer["version"]))}'
                 f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk) &middot; '
-                f'{customer_downloads.human_size(int(_installer["size_bytes"]))} &middot; build {escape(_installer["commit"][:7])}</span>'
-                f'<br><span class="health-detail">SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></span></span>'
+                f'{customer_downloads.human_size(int(_installer["size_bytes"]))}</span></span>'
                 f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
-                + _installer_steps_html(mode, str(_installer["filename"]), str(_installer["sha256"])))
+                '<p class="health-detail" style="margin:8px 0 0">Install it on your PC, then link the PC to this account on '
+                '<a href="/customer/claim-appliance">Claim an appliance</a>. The step-by-step commands are in the technical details below.</p>'
+                '<details id="vms-installer-technical" style="margin-top:10px"><summary>Technical details and install commands</summary>'
+                f'<p class="health-detail" style="margin:8px 0 0">Build {escape(_installer["commit"][:7])}'
+                f'<br>SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></p>'
+                + _installer_steps_html(mode, str(_installer["filename"]), str(_installer["sha256"]))
+                + '</details>')
         else:
             _download_html = '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
     _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'

@@ -171,6 +171,26 @@ def test_my_subscription_shows_the_download_to_a_licensed_owner(license_portal, 
     assert record["sha256"] in html and "Ubuntu 24.04" in html and "sudo ./install.sh" in html
 
 
+def test_the_license_card_tucks_build_checksum_and_commands_into_technical_details(license_portal, db_path, storage, package):
+    """The card shows customer-friendly facts; the build id, SHA-256 and
+    terminal commands are kept, inside a collapsed details section."""
+    client, _, _ = license_portal
+    _seed(db_path)
+    _license(db_path, product="camera_slots_local", quantity=8)
+    _license(db_path)
+    record = _publish(package)
+    html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
+    start = html.index('id="vms-installer-download"')
+    details = html.index('<details id="vms-installer-technical"', start)
+    end = html.index("</details>", details)
+    visible, technical = html[start:details], html[details:end]
+    assert "Download installer" in visible and "Ubuntu 24.04" in visible and 'href="/customer/claim-appliance"' in visible
+    for hidden in (record["sha256"], f"Build {COMMIT[:7]}", "sudo ./install.sh", "sha256sum -c", "anyaicam-setup --claim"):
+        assert hidden not in visible and hidden in technical
+    assert "<details id=\"vms-installer-technical\" open" not in html  # collapsed by default
+    assert technical.index("<summary>Technical details and install commands</summary>") < technical.index("vms-installer-steps")
+
+
 def test_my_subscription_hides_the_download_without_a_license(license_portal, db_path, storage, package):
     client, _, _ = license_portal
     _seed(db_path)
