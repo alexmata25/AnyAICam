@@ -41,6 +41,8 @@ class _Outbox:
         if self.mode == "raise":
             raise RuntimeError("connection refused")
         self.messages.append({"type": message_type, "to": to, "subject": subject, "text": text, "html": html})
+        if self.mode == "sent_preview":
+            return {"type": message_type, "to": to, "status": "preview"}
         if self.mode == "provider_failed":
             return {"type": message_type, "to": to, "status": "failed",
                     "error": "(535, b'5.7.8 Username and Password not accepted')"}
@@ -187,7 +189,8 @@ def test_a_failed_resend_says_so(portal, db_path, outbox):
     response = _resend(client, invitation_id)
     assert response.status_code == 200
     assert response.json()["email_sent"] is False and "could not be sent" in response.json()["message"]
-    assert _invitation(db_path)["email_status"] == "failed"
+    # The delivered earlier link still stands, so the invitation keeps saying it was emailed.
+    assert _invitation(db_path)["email_status"] == "sent" and "earlier invitation link still works" in response.json()["message"]
 
 
 def test_resend_is_still_rate_limited_and_capped(portal, db_path, outbox):
@@ -220,25 +223,6 @@ def test_another_household_can_not_resend_this_invitation(portal, db_path, outbo
 
 
 # ------------------------------------------------------------------ expiration, replay, acceptance
-
-def test_an_expired_invitation_can_be_resent_and_the_old_link_stays_dead(portal, db_path, outbox):
-    client, _, _ = portal
-    _home(db_path)
-    _invite(client)
-    invitation_id = _invitation(db_path)["id"]
-    expired_link = _token(outbox.messages)
-    conn = sqlite3.connect(db_path)
-    conn.execute("UPDATE invitations SET expires_at=?,last_sent_at=? WHERE id=?",
-                 ((datetime.now() - timedelta(minutes=1)).isoformat(), (datetime.now() - timedelta(days=8)).isoformat(), invitation_id))
-    conn.commit()
-    conn.close()
-    assert _overview(client)["invitations"][0]["status"] == "expired"
-    assert _join(client, expired_link).status_code == 400
-    assert _resend(client, invitation_id).json()["email_sent"] is True
-    assert datetime.fromisoformat(_invitation(db_path)["expires_at"]) > datetime.now() + timedelta(days=6)
-    assert _join(client, expired_link).status_code == 400
-    assert _join(client, _token(outbox.messages)).status_code == 200
-
 
 def test_the_emailed_link_is_accepted_once_and_cannot_be_replayed(portal, db_path, outbox):
     client, _, _ = portal
@@ -274,6 +258,8 @@ def test_the_page_shows_delivery_state_and_failures_as_warnings(portal, db_path,
     html = client.get("/customer/household", cookies=_cookie(*OWNER)).text
     assert "'Email not sent'" in html and "'Email sent'" in html and "Try again" in html
     assert "say(r.message,r.email_sent!==false)" in html
+    # An expired invitation offers Invite again (the server refuses Resend), pre-filled with its choices.
+    assert "data-again=" in html and "Invite again" in html and "again.permissions" in html
     # The status line sits above the lists, where the owner is looking.
     assert html.index('id="hh-message"') < html.index('id="hh-users"')
 
@@ -291,3 +277,182 @@ def test_the_household_page_script_is_valid_javascript(tmp_path):
     script.write_text(re.search(r"<script>(.*)</script>", household_users._HOUSEHOLD_SCRIPT, re.S).group(1), encoding="utf-8")
     done = subprocess.run([node, "--check", str(script)], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr[:300]
+
+
+# ------------------------------------------------------------------ resend never strands the recipient (2026-10-02 review)
+
+def _expire(db_path, invitation_id):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE invitations SET expires_at=?,last_sent_at=? WHERE id=?",
+                 ((datetime.now() - timedelta(minutes=1)).isoformat(), (datetime.now() - timedelta(days=8)).isoformat(), invitation_id))
+    conn.commit()
+    conn.close()
+
+
+def test_resend_chain_old_link_dies_new_link_works_once(portal, db_path, outbox):
+    """invitation -> successful Resend -> old link rejected -> new link
+    accepted once -> replay rejected."""
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client)
+    invitation_id = _invitation(db_path)["id"]
+    original = _token(outbox.messages)
+    _allow_resend(db_path, invitation_id)
+    assert _resend(client, invitation_id).json()["email_sent"] is True
+    fresh = _token(outbox.messages)
+    assert fresh != original
+    assert _join(client, original).status_code == 400
+    assert _join(client, fresh).status_code == 200
+    replay = _join(client, fresh, password="a different long password")
+    assert replay.status_code == 400 and "invalid, expired, or already used" in replay.json()["detail"]
+
+
+@pytest.mark.parametrize("mode", ["provider_failed", "raise", "preview"])
+def test_a_resend_that_was_not_delivered_keeps_the_working_link(portal, db_path, outbox, mode):
+    """invitation -> failed/preview Resend -> the original link still works
+    and keeps its expiry: never replace a link with one nobody received."""
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client)
+    before = _invitation(db_path)
+    original = _token(outbox.messages)
+    outbox.mode = "sent_preview" if mode == "preview" else mode
+    _allow_resend(db_path, before["id"])
+    response = _resend(client, before["id"])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["email_sent"] is False and body["email_status"] == ("preview" if mode == "preview" else "failed")
+    assert "earlier invitation link still works" in body["message"]
+    if mode == "preview":
+        assert "not delivered" in body["message"]
+    after = _invitation(db_path)
+    assert after["token_hash"] == before["token_hash"] and after["expires_at"] == before["expires_at"]
+    assert after["send_count"] == before["send_count"]
+    # The current link was delivered, so the list still says so.
+    assert after["email_status"] == "sent"
+    record = _email_records(db_path)[-1]
+    assert record["status"] == body["email_status"] and json.loads(record["metadata_json"])["resend"] is True
+    assert _join(client, original).status_code == 200
+
+
+def test_a_failed_resend_is_still_spaced_a_minute_apart(portal, db_path, outbox):
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client)
+    invitation_id = _invitation(db_path)["id"]
+    outbox.mode = "raise"
+    _allow_resend(db_path, invitation_id)
+    assert _resend(client, invitation_id).json()["email_sent"] is False
+    too_soon = _resend(client, invitation_id)
+    assert too_soon.status_code == 400 and "wait a minute" in too_soon.json()["detail"]
+
+
+@pytest.mark.parametrize("state", ["accepted", "cancelled", "expired"])
+def test_resend_is_refused_server_side_unless_the_invitation_is_waiting(portal, db_path, outbox, state):
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client)
+    invitation_id = _invitation(db_path)["id"]
+    original = _token(outbox.messages)
+    if state == "accepted":
+        assert _join(client, original).status_code == 200
+    elif state == "cancelled":
+        assert client.post(f"/api/customer/household/invitations/{invitation_id}/cancel", cookies=_cookie(*OWNER)).status_code == 200
+    else:
+        _expire(db_path, invitation_id)
+    before = _invitation(db_path)
+    _allow_resend(db_path, invitation_id)
+    response = _resend(client, invitation_id)
+    assert response.status_code == 400, response.text
+    after = _invitation(db_path)
+    assert after["token_hash"] == before["token_hash"] and after["expires_at"] == before["expires_at"]
+    assert after["status"] == before["status"] and len(outbox.messages) == 1
+    if state == "expired":
+        assert "Invite again" in response.json()["detail"]
+        assert _join(client, original).status_code == 400
+
+
+def test_an_expired_invitation_is_replaced_by_inviting_again(portal, db_path, outbox):
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client, permissions={"camera_ids": ["cam-1"], "talk": True})
+    old_id = _invitation(db_path)["id"]
+    old_link = _token(outbox.messages)
+    _expire(db_path, old_id)
+    listed = _overview(client)["invitations"][0]
+    assert listed["status"] == "expired" and listed["permissions"]["camera_ids"] == ["cam-1"] and listed["permissions"]["talk"]
+    assert _invite(client, permissions=listed["permissions"]).json()["email_sent"] is True
+    assert _q(db_path, "SELECT status FROM invitations WHERE id=?", (old_id,))[0]["status"] == "cancelled"
+    assert _join(client, old_link).status_code == 400
+    assert _join(client, _token(outbox.messages)).status_code == 200
+
+
+def test_a_resend_racing_a_cancel_never_revives_the_invitation(portal, db_path, outbox, monkeypatch):
+    """The invitation is cancelled while its new email is being sent: the
+    new link is never stored and the invitation stays cancelled."""
+    client, _, _ = portal
+    _home(db_path)
+    _invite(client)
+    invitation_id = _invitation(db_path)["id"]
+    _allow_resend(db_path, invitation_id)
+    real_send = outbox.send
+
+    def cancel_then_send(*args, **kwargs):
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE invitations SET status='cancelled' WHERE id=?", (invitation_id,))
+        conn.commit()
+        conn.close()
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(outbox, "send", cancel_then_send)
+    before = _invitation(db_path)
+    response = _resend(client, invitation_id)
+    assert response.json()["email_sent"] is False
+    after = _invitation(db_path)
+    assert after["status"] == "cancelled" and after["token_hash"] == before["token_hash"]
+    assert _join(client, _token(outbox.messages)).status_code == 400
+
+
+def test_no_response_ever_carries_an_invitation_token(portal, db_path, outbox):
+    client, _, _ = portal
+    _home(db_path)
+    created = _invite(client)
+    invitation = _invitation(db_path)
+    first = _token(outbox.messages)
+    _allow_resend(db_path, invitation["id"])
+    resent = _resend(client, invitation["id"])
+    second = _token(outbox.messages)
+    listed = client.get("/api/customer/household", cookies=_cookie(*OWNER))
+    cancelled = client.post(f"/api/customer/household/invitations/{invitation['id']}/cancel", cookies=_cookie(*OWNER))
+    secrets_seen = {first, second, invitation["token_hash"], _invitation(db_path)["token_hash"]}
+    for response in (created, resent, listed, cancelled):
+        assert not any(secret in response.text for secret in secrets_seen), response.text[:200]
+        assert "token" not in response.text.lower()
+    assert all("token_hash" not in item for item in listed.json()["invitations"])
+
+
+def test_missing_smtp_configuration_is_a_failed_send_not_a_sent_one(portal, db_path, monkeypatch):
+    """The canonical email service, configured for SMTP with no host."""
+    from types import SimpleNamespace
+
+    import email_service
+    import household_users
+    monkeypatch.setattr(email_service, "settings", SimpleNamespace(email_backend="smtp", smtp_host="", smtp_port=587,
+                                                                  smtp_username="", smtp_password="", email_from="no-reply@example.test"))
+    monkeypatch.setattr(email_service, "get_email_service", lambda: email_service.SMTPEmail())
+    household_users._invite_limiter.events.clear()
+    client, _, _ = portal
+    _home(db_path)
+    body = _invite(client).json()
+    assert body["email_status"] == "failed" and body["email_sent"] is False
+    assert "SMTP email is disabled or incomplete" in _invitation(db_path)["email_error"]
+    assert "SMTP" not in body["message"]
+
+
+def test_preview_mode_says_the_invitation_was_not_delivered(portal, db_path, outbox):
+    client, _, _ = portal
+    _home(db_path)
+    outbox.mode = "sent_preview"
+    body = _invite(client).json()
+    assert body["email_status"] == "preview" and body["email_sent"] is False
+    assert "not delivered" in body["message"]
