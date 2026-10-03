@@ -196,6 +196,10 @@ _INSTALL_UPDATE_STATUS_BY_STATE={
     'healthy':'completed',      # only reachable via idempotent replay
     'rolled_back':'failed',     # requested version did not end up running
     'rollback_failed':'failed',
+    # Software Update (2026-10-03): the release is verified and staged and
+    # the root applier was asked to activate it. Not the final outcome --
+    # that arrives later through the update ledger (apply_results.py).
+    'activation_requested':'completed',
 }
 
 
@@ -206,6 +210,8 @@ def _install_update_result(result):
     state_value=result.state.value
     status=_INSTALL_UPDATE_STATUS_BY_STATE[state_value]
     payload=result.as_dict()
+    if state_value=='activation_requested':
+        payload['health_confirmed']=False
     if state_value=='restarting':
         # RESTARTING means activation succeeded and a restart was just
         # signaled -- NOT a final outcome. The real healthy/rolled_back/
@@ -219,7 +225,7 @@ def _install_update_result(result):
     return status,payload,result.error
 
 
-def execute(command,payload,config,stop_event=None,*,state_machine=None,update_resume_failed=False):
+def execute(command,payload,config,stop_event=None,*,state_machine=None,update_resume_failed=False,owner_update=None):
     if command not in ALLOWED: return 'failed',{},'Unsupported command; arbitrary shell execution is disabled.'
     if command=='refresh_cameras': return 'completed',{'cameras':scan(config.discovery_networks)},''
     if command=='run_diagnostics': return 'completed',diagnostics(config),''
@@ -247,9 +253,14 @@ def execute(command,payload,config,stop_event=None,*,state_machine=None,update_r
             return 'failed',{},f'Could not determine update state due to a local storage error: {error}; new updates are blocked until this is resolved.'
         if unresolved:
             return 'failed',{},'A previous update is still awaiting restart/health confirmation; new updates are blocked until it resolves.'
-        manifest_dict,signature,parse_error=_parse_install_update_payload(payload)
-        if parse_error:
-            return 'failed',{},parse_error
-        result=state_machine.process_install_update(manifest_dict,signature)
+        # Software Update (2026-10-03): an install is always one exact,
+        # owner-confirmed release (update_id/version/sha256). The agent
+        # verifies and stages it; the root applier re-verifies and
+        # activates it under /opt/anyaicam. The legacy pointer-flip
+        # pipeline (process_install_update) is no longer reachable from any
+        # command: it never changed the running VMS.
+        if owner_update is None:
+            return 'failed',{},'Secure updater is not configured for this agent version.'
+        result=owner_update.stage(payload)
         return _install_update_result(result)
     return 'failed',{},'Secure updater is not configured for this agent version.'

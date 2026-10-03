@@ -6,12 +6,13 @@ raised SourceUnavailable in a loop. See updates_storage.py's own module
 docstring for the full contract this file proves end to end:
 
   * an empty catalog answers no_update_available, never a 404
-  * a published release is served as a manifest signed with the
-    server's own private key, verifiable with updater/verify.py's own
-    public-key verification -- proving the two independently-built
-    halves actually agree on wire format
-  * signing is fail-closed (503, never an unsigned manifest) if no
-    signing key is configured
+  * a published release is served with the signature it was signed
+    with OFFLINE (Software Update, 2026-10-03: the server holds no
+    private key and never signs; these tests replace the earlier
+    server-signing ones), verifiable with updater/verify.py's scheme
+  * publishing refuses a bad signature, a package that does not match
+    the manifest, or a missing public key; a catalog record without a
+    signature is never served (503)
   * update-result reporting accepts the first report and 409s a
     duplicate for the same update_id, matching service.py's own
     documented "never retry a 409" expectation
@@ -94,15 +95,23 @@ def local_storage(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def signing_key_pair(tmp_path, monkeypatch):
+    """The test plays the OFFLINE signer: it keeps the private key. The
+    server is configured with the public key only."""
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    key_path = tmp_path / "signing_key.pem"
-    key_path.write_bytes(private_key.private_bytes(
+    public_path = tmp_path / "update_signing_public.pem"
+    public_path.write_bytes(private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ))
-    monkeypatch.setenv("ANYAICAM_UPDATE_SIGNING_KEY_FILE", str(key_path))
+    monkeypatch.setenv("ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE", str(public_path))
+    monkeypatch.delenv("ANYAICAM_UPDATE_SIGNING_KEY_FILE", raising=False)
     return private_key
+
+
+def _offline_sign(private_key, manifest: dict) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    return private_key.sign(updates_storage.canonical_manifest_bytes(manifest), padding.PKCS1v15(), hashes.SHA256())
 
 
 # --------------------------------------------------------- no update published
@@ -142,23 +151,31 @@ def test_invalid_target_segment_is_rejected(client, db_path, local_storage):
 # --------------------------------------------------------- published release
 
 
-def _manifest(version="1.2.3"):
+PACKAGE = b"package-bytes"
+
+
+def _manifest(version="1.2.3", package=PACKAGE):
+    import hashlib
     return {
         "update_id": "upd-1",
         "version": version,
-        "sha256": "a" * 64,
+        "sha256": hashlib.sha256(package).hexdigest(),
         "target": "anyaicam-appliance",
-        "platform": "linux",
+        "platform": "ubuntu",
         "architecture": "x86_64",
         "channel": "stable",
         "issued_at": "2026-09-10T00:00:00Z",
-        "package_size_bytes": 1024,
+        "package_size_bytes": len(package),
+        "build_id": "b" * 40,
+        "migration_safety": "additive",
     }
 
 
-def test_published_release_is_served_signed_and_verifiable(client, db_path, local_storage, signing_key_pair):
+def test_published_release_is_served_with_its_offline_signature(client, db_path, local_storage, signing_key_pair):
     _seeded(db_path)
-    updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=b"package-bytes")
+    signature = _offline_sign(signing_key_pair, _manifest())
+    updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=PACKAGE,
+                                    signature=signature)
 
     response = client.get(
         "/api/appliance/updates/latest?target=anyaicam-appliance&channel=stable",
@@ -169,23 +186,25 @@ def test_published_release_is_served_signed_and_verifiable(client, db_path, loca
     body = response.json()
     assert body["manifest"] == _manifest()
     assert body["package_url"]
-
-    # Proves the server's signature actually verifies under the SAME
-    # scheme the device-side updater/verify.py checks -- not just that
-    # a signature-shaped string was returned.
-    from cryptography.exceptions import InvalidSignature
+    assert base64.b64decode(body["signature"]) == signature  # the stored offline signature, not a new one
+    # Verifies under the SAME scheme the device-side updater/verify.py checks.
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
-    signature = base64.b64decode(body["signature"])
     message = updates_storage.canonical_manifest_bytes(body["manifest"])
     signing_key_pair.public_key().verify(signature, message, padding.PKCS1v15(), hashes.SHA256())  # raises on failure
 
 
-def test_published_release_without_signing_key_fails_closed(client, db_path, local_storage):
-    # No ANYAICAM_UPDATE_SIGNING_KEY_FILE set at all -- must never serve
-    # an unsigned manifest.
+def test_the_server_has_no_private_key_signing_code(signing_key_pair):
+    assert not hasattr(updates_storage, "load_signing_key")
+    assert not hasattr(updates_storage, "sign_manifest")
+
+
+def test_a_catalog_record_without_a_signature_fails_closed(client, db_path, local_storage):
+    import json
     _seeded(db_path)
-    updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=b"package-bytes")
+    local_storage.put("updates", "anyaicam-appliance/stable/upd-1/package.bin", PACKAGE)
+    local_storage.put("updates", "anyaicam-appliance/stable/latest.json",
+                      json.dumps({"manifest": _manifest(), "package_key": "anyaicam-appliance/stable/upd-1/package.bin"}).encode())
 
     response = client.get(
         "/api/appliance/updates/latest?target=anyaicam-appliance&channel=stable",
@@ -195,9 +214,35 @@ def test_published_release_without_signing_key_fails_closed(client, db_path, loc
     assert response.status_code == 503
 
 
+@pytest.mark.parametrize("tamper", ["signature", "package", "manifest"])
+def test_publishing_refuses_anything_that_was_not_signed_as_is(local_storage, signing_key_pair, tamper):
+    manifest = _manifest()
+    signature = _offline_sign(signing_key_pair, manifest)
+    package = PACKAGE
+    if tamper == "signature":
+        signature = bytes([signature[0] ^ 1]) + signature[1:]
+    elif tamper == "package":
+        package = b"other-bytes!!"
+    else:
+        manifest = dict(manifest, version="9.9.9")
+    with pytest.raises(updates_storage.PublishError):
+        updates_storage.publish_release("anyaicam-appliance", "stable", manifest=manifest, package_bytes=package,
+                                        signature=signature)
+    assert updates_storage.get_latest_release("anyaicam-appliance", "stable") is None
+
+
+def test_publishing_without_a_configured_public_key_fails_closed(local_storage, monkeypatch):
+    monkeypatch.delenv("ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE", raising=False)
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with pytest.raises(updates_storage.PublishError):
+        updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=PACKAGE,
+                                        signature=_offline_sign(private_key, _manifest()))
+
+
 def test_different_channel_still_reports_no_update_available(client, db_path, local_storage, signing_key_pair):
     _seeded(db_path)
-    updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=b"package-bytes")
+    updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=PACKAGE,
+                                    signature=_offline_sign(signing_key_pair, _manifest()))
 
     response = client.get(
         "/api/appliance/updates/latest?target=anyaicam-appliance&channel=beta",

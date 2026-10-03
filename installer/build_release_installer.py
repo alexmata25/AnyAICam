@@ -62,6 +62,7 @@ INSTALLER_RUNTIME_FILES = (
     "11-webrtc-firewall.sh",
     "08-systemd-setup.sh",
     "09-identity.sh",
+    "12-update-signing-key.sh",
     "validate.sh",
     "uninstall.sh",
     "rollback.sh",
@@ -118,6 +119,24 @@ def validate_commit(value: str, label: str) -> str:
     if not COMMIT_RE.fullmatch(value):
         raise SystemExit(f"{label} must be an exact 40-character lowercase Git SHA-1 commit hash")
     return value
+
+
+def validate_release_version(value: str) -> str:
+    if not re.fullmatch(r"\d{1,4}(\.\d{1,4}){1,3}", value or ""):
+        raise SystemExit(f"--release-version must be a dotted product version like 1.2.0, got {value!r}")
+    return value
+
+
+def read_update_signing_public_key(path: str) -> bytes:
+    """The PUBLIC key only: a private key (or anything that is not a single
+    PEM public key) is refused so it can never ship inside an installer."""
+    data = Path(path).read_bytes()
+    if b"PRIVATE KEY" in data:
+        raise SystemExit("--update-signing-public-key is a PRIVATE key; pass the public key only.")
+    text = data.decode("ascii", "replace").strip()
+    if not (text.startswith("-----BEGIN PUBLIC KEY-----") and text.endswith("-----END PUBLIC KEY-----")):
+        raise SystemExit("--update-signing-public-key must be one PEM 'BEGIN PUBLIC KEY' block.")
+    return (text + "\n").encode("ascii")
 
 
 def validate_sha256(value: str, label: str) -> str:
@@ -326,10 +345,23 @@ def main() -> int:
             "exclusive with --mediamtx-binary."
         ),
     )
+    # Software Update (2026-10-03): the dotted product release version
+    # (build_id stays the exact --vms-commit), and the release-signing
+    # PUBLIC key the installer provisions as the appliance's trust anchor.
+    # The private key is never given to this builder: releases are signed
+    # offline afterwards (installer/sign_update_release.py).
+    parser.add_argument("--release-version", default="1.1.0",
+                        help="Dotted product release version (e.g. 1.2.0); build_id stays --vms-commit")
+    parser.add_argument("--update-signing-public-key",
+                        help="PEM public key appliances use to verify Software Update releases")
+    parser.add_argument("--no-update-signing-key", action="store_true",
+                        help="Explicitly build without provisioning an update-signing key "
+                             "(Software Update will refuse every release on such installs)")
     parser.add_argument("--output-dir", default="dist")
     args = parser.parse_args()
 
     vms_commit = validate_commit(args.vms_commit, "--vms-commit")
+    release_version = validate_release_version(args.release_version)
 
     if args.mediamtx_binary and args.no_mediamtx:
         raise SystemExit("--mediamtx-binary and --no-mediamtx are mutually exclusive.")
@@ -343,6 +375,15 @@ def main() -> int:
             "docs/PROJECT_CHECKPOINT.md's 2026-09-17 MediaMTX packaging-regression "
             "entry for the real incident this now prevents."
         )
+    if args.update_signing_public_key and args.no_update_signing_key:
+        raise SystemExit("--update-signing-public-key and --no-update-signing-key are mutually exclusive.")
+    if not args.update_signing_public_key and not args.no_update_signing_key:
+        raise SystemExit(
+            "Software Update needs a trust anchor: pass --update-signing-public-key with the release-signing "
+            "PUBLIC key, or --no-update-signing-key to explicitly build an installer whose appliances can never "
+            "accept a Software Update."
+        )
+    update_key_bytes = read_update_signing_public_key(args.update_signing_public_key) if args.update_signing_public_key else b""
 
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
@@ -398,6 +439,20 @@ def main() -> int:
         shutil.copytree(agent_export / "appliance-agent", package / "payload/agent", copy_function=shutil.copy2)
 
         copy_release(release_root, package / "payload/vms")
+        # Served by the running VMS from its bind-mounted tree at
+        # /static/release-identity.json: Software Update proves with it that
+        # the swapped application is the one answering requests.
+        identity_path = package / "payload/vms/app/static/release-identity.json"
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(json.dumps({"product": "AnyAiCam VMS", "version": release_version,
+                                             "build_id": vms_commit}, sort_keys=True) + "\n",
+                                 encoding="utf-8", newline="\n")
+        update_key_sha256 = ""
+        if update_key_bytes:
+            key_dest = package / "payload/keys/update-signing-public-key.pem"
+            key_dest.parent.mkdir(parents=True, exist_ok=True)
+            key_dest.write_bytes(update_key_bytes)
+            update_key_sha256 = sha256_file(key_dest)
 
         mediamtx_included = False
         mediamtx_sha256_value = ""
@@ -446,6 +501,8 @@ def main() -> int:
             f"INSTALLER_SOURCE_COMMIT={installer_commit}\n"
             f"MEDIAMTX_INCLUDED={'true' if mediamtx_included else 'false'}\n"
             f"MEDIAMTX_SHA256={mediamtx_sha256_value}\n"
+            f"RELEASE_VERSION={release_version}\n"
+            f"UPDATE_SIGNING_KEY_SHA256={update_key_sha256}\n"
         )
         (package / "release.env").write_text(release_env, encoding="utf-8", newline="\n")
 
@@ -457,6 +514,8 @@ def main() -> int:
         manifest = {
             "schema": 1,
             "installer_version": "1.1.0",
+            "release_version": release_version,
+            "update_signing_key_sha256": update_key_sha256,
             "installer_source_commit": installer_commit,
             "vms_release_commit": vms_commit,
             "vms_release_source": release_source,
@@ -480,7 +539,7 @@ def main() -> int:
         outdir = Path(args.output_dir).resolve()
         outdir.mkdir(parents=True, exist_ok=True)
         executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
-        filename = f"anyaicam-appliance-installer-1.1.0-vms-{vms_commit[:12]}.tar.gz"
+        filename = f"anyaicam-appliance-installer-{release_version}-vms-{vms_commit[:12]}.tar.gz"
         output = outdir / filename
         write_deterministic_tar(package, output, installer_mtime, executable_paths)
         digest = sha256_file(output)
