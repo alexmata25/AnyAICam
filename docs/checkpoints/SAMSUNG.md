@@ -1,4 +1,22 @@
 # Samsung appliance — checkpoint
+## 2026-10-03 — physical clean-test authorization; target currently unreachable
+
+The user now explicitly authorizes wiping/reinstalling the dedicated Samsung for
+clean installer validation and waives preservation. This supersedes the historical
+no-reimage instructions below; do not infer that a wipe has happened.
+
+Authorized SSH: alejandro-mata@100.99.177.7. Read-only Tailscale status identifies
+anyaicam-samsung/Linux, offline, last seen 2026-09-30T13:19:13.1Z. Windows and existing
+WSL SSH attempts timed out. DMI/hardware identity, system disk and Ubuntu version
+have NOT been positively verified; no Samsung command or destructive action ran.
+A physical console/independent boot path is required before root-disk erasure.
+Dell host configuration and existing sessions remain unchanged; no Hyper-V/restart.
+
+Active procedure: ../../validation/installer-track/CLEAN_MACHINE_PROCEDURE.md.
+Exact archive remains unpublished installer 1.1.1/vms a1c81e0f4926, SHA-256
+9dd0fe3fef6b46752a74ea49b4426cf9030313b926b1795a2e50c68bc48a53ac.
+Historical inventory below is unverified until actual Samsung access is restored.
+
 
 **Read `docs/PROJECT_CHECKPOINT.md` first.** This file assumes that context.
 

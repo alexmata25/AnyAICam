@@ -1,146 +1,245 @@
-# Deferred Hyper-V and clean-machine procedure
+# Samsung physical clean-machine validation — active plan
 
-PREPARED ONLY. None of these host commands have been executed.
-Requires explicit approval for Hyper-V enablement, scheduled restart, VM storage
-and virtual-switch creation. Do not stop/reconfigure existing WSL or Docker now.
+This replaces the Dell Hyper-V plan. Dell host configuration, networking and
+existing WSL/Docker services remain unchanged. Do not enable Hyper-V or reboot
+Windows. Do not access Ryzen, shared staging, production, Billing, Household,
+Stripe or the website. Use the existing unpublished archive, not a rebuilt one.
 
-## Host prerequisites and approval
+## Authorization and current evidence
 
-Observed Dell: Windows Pro edition, ~32 GB RAM, 16 logical CPUs, ~289 GiB free C:.
-WSL2 is installed and currently used by CloudAdapter and Docker. Full Hyper-V
-features, service and management tools are disabled/absent. Current shell is not
-an elevated administrator. CPU virtualization flags reported by Win32_Processor
-are inconclusive while a hypervisor is already active; do not change BIOS based
-on those flags alone.
+The user explicitly authorized wiping/reinstalling the Samsung and stated that
+nothing important needs preservation. That supersedes the old Samsung checkpoint's
+no-reimage constraint. No wipe/repartition/install/reboot has been performed.
 
-When the user approves, open PowerShell **Run as administrator**:
+Authorized endpoint: alejandro-mata@100.99.177.7.
+Read-only Tailscale inventory: peer hostname anyaicam-samsung, Linux,
+DNS anyaicam-samsung-1.tail43a8dd.ts.net, Online=false, last seen
+2026-09-30T13:19:13.1Z. SSH from Windows and existing Ubuntu WSL timed out.
+Local Tailscale self is AlexDellLaptop / 100.119.39.95, a DIFFERENT endpoint.
+This peer record is NOT positive hardware/system-disk identification. Actual DMI,
+CPU/RAM, disk model/serial/layout/free space and Ubuntu version remain unverified.
+No commands executed on Samsung; only connection attempts and local status reads.
 
-    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart
+Blockers: Samsung must be reachable; physical console or independent remote boot
+access must be available; target hardware and system disk must be unambiguous.
+The SSH connection will be lost after erasing the OS/Tailscale credentials. Do NOT
+erase the mounted root disk over an SSH-only session and hope it reconnects.
 
-Review RestartNeeded. Save active work and schedule interruption/restoration of
-CloudAdapter/Docker with the user, THEN:
+## 1. Positive identification and read-only inventory — before any erase
 
-    Restart-Computer
+Use existing trusted SSH authentication; do not disable host-key checking. Record:
 
-Do not run wsl --shutdown, stop Docker/CloudAdapter, change .wslconfig, enable
-Windows firewall rules or alter the physical NIC as part of today's work.
+    hostnamectl
+    cat /etc/os-release
+    uname -m
+    lscpu
+    grep -E 'MemTotal|MemAvailable' /proc/meminfo
+    sudo dmidecode -t system -t baseboard
+    lsblk -b -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,TRAN,UUID
+    findmnt -no SOURCE,FSTYPE,OPTIONS /
+    df -B1 /
+    ip -brief address
+    ip route
+    timedatectl
 
-After the approved restart:
+Compare chassis/model/serial with the physical Samsung and explicit endpoint.
+Stop if DMI identifies Dell, if the endpoint or disk is ambiguous, or if any
+secondary/internal/external disk has an uncertain role. Record the root partition,
+its parent physical disk and persistent /dev/disk/by-id identifier, model, serial,
+size and existing partition layout. Never substitute a guessed /dev/sda or nvme0n1.
+No probing or discovery of other computers/cameras is authorized.
 
-    Get-Module -ListAvailable Hyper-V
-    Get-Service vmms
-    Get-VM
-    wsl --list --verbose
+Inspect state read-only, using sudo only for reads when necessary:
 
-## ISO and isolated VM creation (later elevated administration)
+    getent passwd anyaicam
+    systemctl list-unit-files 'anyaicam*'
+    systemctl list-units --all 'anyaicam*'
+    docker ps -a --format '{{.Names}} | {{.Image}} | {{.Status}}'
+    docker image ls --digests
+    ls -ld /etc/anyaicam /opt/anyaicam /opt/anyaicam-agent /var/lib/anyaicam /var/log/anyaicam
+    find /home /etc/anyaicam /var/lib/anyaicam /opt/anyaicam -xdev -maxdepth 3 -type f -name '*.db' -printf '%p %s bytes\n'
 
-Download Ubuntu 24.04.4 Desktop amd64 from Canonical's official release directory.
-Verify its SHA-256 against dependencies.lock.json AND authenticate the published
-SHA256SUMS signature using Ubuntu's image signing key before booting.
-The ISO is NOT downloaded here; metadata was retrieved only.
+Record service status, image/build identity, mount paths and directory sizes.
+Inspect no complete docker environment, .env, identity JSON, private keys, passwords,
+RTSP credentials or claim proofs in chat/logs. Do not query cameras or remote portal.
+Record any additional OS/data/recovery partitions, user files, recordings, database,
+Docker volumes, snapshots, network/SSH/Tailscale enrollment and encryption recovery
+material. Inventory may require additional targeted read-only commands after layout
+is known. Lack of sudo/read access is a blocker to a complete preservation report.
 
-Choose an empty VM storage directory and verify the private subnet is not already
-routed anywhere in the intended lab. Do not overwrite an existing VM/switch/VHD.
+Requirements: Ubuntu 24.04 x86_64, >=4 logical CPUs, >=8 GB installed RAM with the
+installer's >=7.2 GiB usable allowance; 16 GB preferable for analytics. Check disk
+health using already available read-only tools; install nothing for inventory.
+Budget a >=180 GB system disk for comfortable fresh-OS free-space margin, preferably
+256 GB or larger. Capacity is only a planning estimate: actual fresh root availability
+must be >=107,374,182,400 bytes (100 GiB) after Ubuntu installation and before VMS.
+A marketing disk size, current free space or unallocated secondary disk is not proof.
 
-    $vmName = 'AnyAiCam-Installer-Test'
-    $switchName = 'AnyAiCam-Installer-Private'
-    $vmRoot = 'C:\AnyAiCam-TestVMs\Installer-Test'
-    $isoPath = 'C:\AnyAiCam-TestVMs\ISO\ubuntu-24.04.4-desktop-amd64.iso'
-    if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) { throw 'VM name already exists' }
-    if (Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue) { throw 'Inspect existing switch before reuse' }
-    if (Test-Path -LiteralPath $vmRoot) { throw 'Use a new empty VM directory' }
-    New-Item -ItemType Directory -Path $vmRoot | Out-Null
-    New-VMSwitch -Name $switchName -SwitchType Private
-    New-VM -Name $vmName -Generation 2 -MemoryStartupBytes 12GB -Path $vmRoot -NewVHDPath "$vmRoot\Ubuntu.vhdx" -NewVHDSizeBytes 180GB -SwitchName $switchName
-    Set-VMProcessor -VMName $vmName -Count 4
-    Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $false
-    Set-VMFirmware -VMName $vmName -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority
-    Add-VMDvdDrive -VMName $vmName -Path $isoPath
-    $dvd = Get-VMDvdDrive -VMName $vmName
-    Set-VMFirmware -VMName $vmName -FirstBootDevice $dvd
-    Set-VM -Name $vmName -AutomaticStartAction Nothing -AutomaticStopAction ShutDown
+## 2. Loss/preservation decision
 
-The private switch has no host network adapter, physical bridge, DHCP or NAT.
-Prepare a separate helper VM on it: 2 vCPU, fixed 4 GB RAM, 40 GB disk, same ISO.
-Use static private guest addresses after identifying the actual guest NIC:
-installer 192.168.253.20/24, helper 192.168.253.10/24.
-No gateway is needed between the isolated guests.
+User has waived preservation. No backup is required by that decision, but record
+what exists before loss. Erasing the selected system disk destroys ALL partitions
+and accessible data on that disk: Ubuntu/other OS/recovery partitions, user files,
+recordings, customer/camera databases, configurations, identities/credentials,
+Docker images/volumes, SSH host/user keys, Tailscale enrollment, logs and rollback
+points. Nothing on other disks is authorized for erasure without exact identification.
+Existing remote appliance/claim records are NOT erased by wiping Samsung; do not
+edit/delete them in staging or production. Do not reuse old appliance identity in
+new lab enrollment. No old database/config is restored into clean acceptance state.
 
-Installation still requires dependency access. A separately approved temporary
-Default Switch NIC on the helper can provide an HTTP(S) dependency proxy/cache;
-do NOT bridge the private test segment to the customer LAN. Restrict proxy access
-to the test subnet and required public package registries. The appliance remains
-on the private NIC. The exact proxy allowlist must be validated against the
-installer/Docker dependency requests before the clean run; it is a prerequisite,
-not supplied/claimed functional here. Do not silently relax camera/claim network
-protections to make downloads work. This is preferable to modifying WinNAT or
-the physical host NIC while CloudAdapter/Docker are in use.
+If the user later elects preservation: stop, identify an external encrypted backup
+destination and enough free space. Quiesce AnyAiCam services only during an approved
+maintenance window, make consistent database backups plus configuration/state/user
+file backups or a full offline disk image, verify checksums and a restore sample,
+then disconnect backup media before erase. Keep secrets out of Git/chat. No backup,
+service stop or file copy on Samsung has occurred in this preparation.
 
-Starting/installing either VM and adding its NICs happen only after approval.
-Install a standard Ubuntu desktop user. Verify >=100 GiB real free root space,
-4+ CPUs, 8+ GB usable RAM allowance and no AnyAiCam markers. Take a clean snapshot.
+## 3. Fresh Ubuntu media and wipe procedure — conditional, not executed
 
-## Portal prerequisites — prepared, not provisioned
+Recommended first reproducible test: Ubuntu **24.04.4 LTS Desktop amd64**, matching
+the established Ubuntu 24.04 baseline and supporting the authenticated browser
+launcher. The installer checks VERSION_ID=24.04, not a Windows/WSL distribution.
+Canonical still lists the exact image (latest 24.04 Desktop is newer); use the
+exact filename rather than a release-directory headline or latest symlink:
 
-Use portal.env.example and owner-location.plan.json on the helper only.
-Export exact fixed app/schema files from a1c81e0f4926... (based on d5af9c53...); do not reuse an existing
-staging/prod checkout, environment, account database or bindings.
-Create a new guest-local CA/certificate for installer-test.test, trust it inside
-both disposable guests, and map the hostname to the helper address.
-Reverse proxy HTTPS to its local portal process. Set the application's exact
-public origin, trusted host, HTTPS-only/secure cookie and CSRF flags. Generate
-new ANYAICAM_APP_SECRETS, ANYAICAM_PORTAL_SECRET and Fernet claim-flow key at
-provisioning time; no real keys are stored in this repository.
+ubuntu-24.04.4-desktop-amd64.iso
+https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-desktop-amd64.iso
+SHA-256: 3a4c9877b483ab46d7c3fbe165a0db275e1ae3cfe56a5657e5a47c2f99a99d1e
 
-Initialize the exact pinned database schema only after approval; create the
-planned owner/customer/site and scoped identity grant through supported model
-helpers. Apply approved test camera_slots_local/vms_license fixtures (8 cameras)
-only to that isolated database, without payment API/webhook calls.
-Use the existing private installer download publisher only against isolated
-guest-local storage if needed for the browser download test; never publish the
-artifact to the public website. No database, owner account, certificate or portal
-instance has been created in this preparation step.
+Authenticate Canonical SHA256SUMS.gpg and compare downloaded ISO digest before
+writing media. ISO has not been downloaded or signature-authenticated this turn.
+Use a specifically identified empty/dedicated >=16 GB USB. Writing installer media
+also erases that USB; never select a backup disk. Prepare media on approved equipment;
+no Dell host changes or software installation. Console operator/independent boot
+management is necessary; exact Samsung boot-menu key is model-specific and cannot
+be assumed before model identification.
 
-## Clean-machine acceptance checklist
+After positive machine/disk identification and all above gates:
 
-For every step record pass/fail, command/UI evidence, source version and logs.
-Redact setup codes, possession secrets, credentials, cookies and claim proofs.
+1. Disconnect customer-camera networks and all backup/secondary drives where practical.
+   Connect Samsung only to the approved isolated wired lab segment. Record isolation.
+2. Boot the authenticated USB in UEFI mode. Choose Try Ubuntu first; re-check DMI,
+   CPU/RAM, NIC functionality, all disks and the exact system-disk serial at console.
+   Do not mount old disks read-write. Stop for driver, RAID/RST, encryption or disk
+   ambiguity; do not blindly change BIOS storage mode or firmware settings.
+3. Choose Install Ubuntu, Interactive/default Desktop installation. Select
+   **Erase disk and install Ubuntu** on the VERIFIED system disk only. Review final
+   partition-change summary: ALL old partitions on that disk are replaced. Use the
+   entire disk for a fresh root filesystem; no keep-home, alongside-OS or restore.
+   Use a plain ext4 layout for the reference test; record actual EFI/root allocation.
+4. At the final destructive installer confirmation, re-match model/serial to inventory.
+   Authorization is already given for this Samsung system disk, but any mismatch
+   requires stopping. No guessed destructive shell command is supplied or executed.
+5. Complete installation with a NEW normal desktop sudo user, fresh hostname
+   anyaicam-samsung-clean-test and a privately stored new password. No autologin.
+   Record ISO, installed OS/kernel, partition table and any chosen Ubuntu updates.
+6. Reboot Samsung only, remove USB and sign in. No Dell/Windows restart.
 
-- [ ] Authenticate ISO signature/checksum; install clean Ubuntu on a new VHD.
-- [ ] Confirm clean state, CPU/RAM/free disk and no existing service/user markers.
-- [ ] Take baseline snapshot. Start only the isolated portal and simulator.
-- [ ] Download exact versioned archive through the isolated licensed-owner portal.
-- [ ] Match outer checksum, embedded file manifest, release.env and source commits.
-- [ ] Extract fresh directory; run setup.sh as desktop user; allow real sudo install.
-- [ ] Real installer provisions dependencies, directories, identity and services.
-- [ ] Existing validate.sh succeeds against actual OS/Docker/VMS startup.
-- [ ] Browser opens; actual owner sign-in returns to claim page.
-- [ ] Choose owned location, review device and explicitly confirm.
-- [ ] Claim status/complete requires the actual device possession secret.
-- [ ] Agent completes real enrollment; VMS and agent start and show exact build.
-- [ ] Discovery sees ONLY the synthetic ONVIF device, including metadata/profile URI.
-- [ ] Add synthetic camera; verify RTSP transport, stream liveness and camera state.
-- [ ] Live view works through the supported local path; record actual decoded frames.
-- [ ] Record test video; locate generated media and prove browser playback.
-- [ ] Basic motion analytics detects moving test pattern and produces an event.
-- [ ] Guest reboot preserves identity/bindings, services, stream and recording.
-- [ ] Popup/origin/COOP failure preserves manual setup-code recovery.
-- [ ] Refuse wrong owner/site, missing/bad CSRF, wrong origin, expired/replayed claim,
-      incorrect possession secret and missing encryption key.
-- [ ] Corrupt package fails before privileges/mutations.
-- [ ] Verify exact 100 GiB byte boundary on disposable VM; verify the corrected exact-byte boundary.
-- [ ] Default uninstall preserves documented state; reinstall uses supported technician
-      install/claim flow, since the fresh launcher refuses retained identity.
-- [ ] Restore clean VM snapshot for fresh-install recovery; do not pretend initial
-      install has a previous-version rollback point.
-- [ ] Separately exercise an actual valid rollback point with reviewed fixture
-      previous release, database preservation and optional restore. No Software
-      Update changes or production deployments.
-- [ ] Freeze exact 1.1.1 investor archive/checksum plus install/uninstall/recovery docs.
-- [ ] Mark clean-machine acceptance complete only with actual OS lifecycle evidence.
-- [ ] Publish nothing; Windows native implementation waits for this acceptance.
+Erase/install provides a new partition/filesystem/OS and removes prior accessible
+AnyAiCam state; it is NOT a forensic SSD hardware sanitize. Do not invoke nvme format,
+blkdiscard, ATA secure erase, dd or other additional sanitization blindly. If forensic
+sanitization is specifically required, stop and select the model-supported method
+with explicit scope; it is unnecessary to prove a fresh installer filesystem.
 
-The offline camera-simulator bundle includes MediaMTX and the complete FFmpeg/Python
-package closure. Use its manifest and --no-download guest-only install instructions.
-The appliance installer still requires its existing Ubuntu/Docker/Python/VMS dependency
-network access; this simulator bundle does not convert the VMS installer to offline mode.
+## 4. Prove fresh OS and resources before installing AnyAiCam
+
+Record /etc/os-release, kernel, architecture, lscpu, MemTotal, lsblk and df -B1 /.
+Verify root available >=107374182400 bytes; installer rejects one byte below.
+Confirm no anyaicam account, services/units/drop-ins, Docker containers/images,
+/etc/anyaicam, /opt/anyaicam, /opt/anyaicam-agent, /var/lib/anyaicam or /var/log/anyaicam.
+Do not restore the old home, SSH/Tailscale identity or AnyAiCam database/configuration.
+Record baseline files/service list and take an optional offline CLEAN-OS disk image
+on approved external storage for physical-machine recovery (no VM snapshot assumed).
+Image must have NO AnyAiCam identity and must not be confused with any old-system backup.
+
+## 5. Isolated portal, simulator and real installer
+
+An independent isolated helper/test host is required and NOT YET IDENTIFIED. It must
+not be Dell Hyper-V, Ryzen, production or shared staging. Reserve a private wired
+switch/VLAN and non-overlapping addresses after inspection; example Samsung
+192.168.253.20/24, helper 192.168.253.10/24. Do not change Dell networking.
+The helper serves isolated HTTPS installer-test.test and the prepared synthetic
+camera. Provision only after isolation/host placement is confirmed. New SQLite
+schema from a1c81e0f4926, new signing/Fernet keys and local TLS CA, scoped test owner,
+owned location and approved 8-camera fixture license. No payment/webhook/API calls.
+Trust CA only in Samsung/helper and the test browser; exact HTTPS origin, trusted
+host, CSRF/secure cookies and all claim protections stay enabled.
+Existing portal.env.example and owner-location.plan.json define the scoped setup.
+No certificate, account, database, binding or portal is provisioned by this plan.
+
+The complete offline simulator bundle and OFFLINE_SIMULATOR.md provide 251 verified
+Ubuntu packages, MediaMTX v1.21.0, FFmpeg 6.1.1 and read-only Python ONVIF. Start only
+on the isolated helper; no real/customer camera by default. A real test camera needs
+explicit identity/authorization and isolated-network placement before connection.
+The VMS installer still uses real online Ubuntu/Docker/Python/model dependencies:
+validate isolated egress or helper proxy/cache, without altering source or protections.
+No staging/production connections. If dependencies unexpectedly require excluded
+systems, stop rather than repoint the appliance or modify those systems.
+
+Exact unchanged unpublished artifact:
+anyaicam-appliance-installer-1.1.1-vms-a1c81e0f4926.tar.gz
+SHA-256: 9dd0fe3fef6b46752a74ea49b4426cf9030313b926b1795a2e50c68bc48a53ac
+36,467,580 bytes; installer/VMS source a1c81e0f492633a80198503e721fc6c277e6a8b3.
+
+Download privately through the isolated licensed-owner portal; verify checksum after
+transfer and embedded manifest. Extract a NEW folder, run setup.sh as the normal
+Ubuntu desktop user. Technician command, future fresh Samsung only:
+
+    ./setup.sh --portal-url https://installer-test.test --product-mode local
+
+Approve real Ubuntu sudo installation. No mocked installer functions or replacement
+OS-install commands. Capture actual download/extract/launch usability, including any
+file-manager friction. Installer/validator must complete against actual systemd,
+Docker, services and filesystem before browser handoff. Browser sign-in uses the
+TEST owner, choose TEST location, review device and explicitly confirm. Existing
+possessed-device claim CLI completes enrollment; no code/proof/credential in URLs.
+Browser failure retains manual setup-code recovery; do not bypass CSRF, origin,
+nonce, expiry, ownership, possession or proof encryption to complete the test.
+
+## 6. Exact clean-machine acceptance evidence
+
+Record each as PASS/FAIL/BLOCKED with versions, timestamps, screenshots and redacted
+logs. Hardware/OS install proof is required; existing fixture test results do not count.
+
+- [ ] Positive Samsung hardware/serial/system-disk evidence; Dell/Ryzen excluded.
+- [ ] Authenticated ISO, explicit disk erase/install summary, successful physical boot.
+- [ ] Clean OS baseline/no prior AnyAiCam state; >=4 CPUs, >=8 GB RAM allowance,
+      >=100 GiB root availability; actual network/time/browser/TLS work.
+- [ ] Exact archive checksum + embedded source identity/manifest; no rebuild/relabel.
+- [ ] Real setup launcher and sudo installation; dependencies succeed without mocks.
+- [ ] validate.sh passes actual identity permissions, VMS build/self-test, agent and
+      required MediaMTX/firewall/port checks; source/build matches a1c81e0f4926.
+- [ ] Real authenticated owner sign-in, owned location selection and explicit confirm.
+- [ ] Real device-bound claim start/status/complete, credential/identity persistence
+      and enrollment into ONLY the isolated portal/customer/location.
+- [ ] Read-only discovery finds synthetic camera's stable EndpointReference UUID;
+      changing MessageID does not create duplicate cameras. Add camera, correct RTSP URI.
+- [ ] Actual live video decoded in the browser; no screenshot-only mock.
+- [ ] Record meaningful video interval, confirm files/metadata, browser playback seek.
+- [ ] Basic motion analytics produces an event from moving synthetic pattern;
+      do not modify LPR or unrelated analytics pipelines.
+- [ ] Reboot Samsung, confirm auto-start/enrollment/identity, live view and recording
+      persist; no new duplicate device claim. Record suspend behavior relevant to test.
+- [ ] Disable only the test browser handoff, confirm manual code path completes a
+      real claim; use isolated disposable test state and respect claim expiry.
+- [ ] Wrong owner/site, absent/bad CSRF, wrong origin/nonce, expired/replayed session,
+      bad possession secret and absent encryption key refuse; no security bypass.
+- [ ] Default uninstall removes software/services and preserves expected identity,
+      configuration/recordings; it does not automatically release remote bindings.
+- [ ] Supported technician reinstall with retained state; fresh launcher correctly
+      refuses existing identity. Validate preserved bindings/data and service restart.
+- [ ] Physical clean-install recovery from approved clean-OS image or authenticated
+      USB reinstall; fresh identity and new isolated enrollment as expected. Restoring
+      a disk image is destructive and must stay on the verified Samsung system disk.
+- [ ] Recovery from a failed install and manual claim timeout without corruption.
+      Fresh first install has no prior running-image rollback point; any actual
+      prior-image rollback needs a separately reviewed valid lab fixture, not a mock.
+- [ ] Final defect list and complete evidence ledger; no investor publication/deploy.
+
+## Stop conditions
+
+Offline/ambiguous target, unknown disk, absent independent console/boot path,
+USB/backup target ambiguity, insufficient resources/root free space, hardware I/O
+errors, absent isolated helper/portal/network, production/staging URL or real-camera
+exposure, or any weakened security protection: stop and report. User authorization
+covers identified Samsung wipe/reinstall, not an ambiguous disk or another machine.
