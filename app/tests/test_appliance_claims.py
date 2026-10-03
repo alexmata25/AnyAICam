@@ -440,7 +440,7 @@ def test_claim_page_redirects_unauthenticated_visitors_to_login(client, db_path)
     response = client.get("/customer/claim-appliance", follow_redirects=False)
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/partner-login"
+    assert response.headers["location"] == "/customer-login.html?next=/customer/claim-appliance"
 
 
 def test_claim_page_rejects_non_customer_owner_roles(client, db_path):

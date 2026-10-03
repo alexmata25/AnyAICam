@@ -1,5 +1,30 @@
 # AnyAiCam Customer-Ready Appliance Installer
 
+## Customer setup launcher (isolated candidate)
+
+New release packages include `setup.sh` and `customer_setup.py`. After extracting
+an approved package, start `setup.sh` in a terminal **as the normal Ubuntu
+24.04 desktop user**. The launcher asks for the HTTPS website used to sign in
+and the purchased Local/Hybrid plan, verifies the package file manifest, then
+runs the existing installer and validator with the usual Ubuntu password prompt.
+There are no installation or claim commands to copy once the launcher is running.
+
+When installation and validation succeed, setup opens the customer's browser.
+Click **Connect AnyAiCam**, sign in as the account owner, review the system,
+select its location and explicitly confirm. The setup code is filled in through
+a temporary local browser bridge; the existing device-bound claim CLI completes
+activation. The bridge never receives the device secret, claim proof or credential.
+If browser opening or the handoff is blocked, the existing manual code path is
+still available.
+
+This is a fresh-install wrapper, not an updater or repair tool: it refuses root
+launches and computers with existing AnyAiCam installation markers. If setup is
+interrupted after installation, a technician can resume the existing claim CLI;
+rerunning this fresh-install launcher will not reinstall a configured system.
+The download is still an Ubuntu archive. Extracting it and starting `setup.sh`
+remain manual and may require a technician or a file manager configured to run
+scripts. This candidate is not a Windows executable or a full graphical wizard.
+
 ## Release-driven installer
 
 This branch no longer treats the VMS application in the surrounding repository

@@ -156,6 +156,37 @@ CREDENTIAL_RECOVERY_TTL_MINUTES = 15
 DEVICE_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
 
 
+# Presentation-only handoff: accept a code from this tab's loopback opener,
+# then reuse the existing lookup button. Confirmation remains a user action.
+# No code/session/proof appears in a URL or browser storage.
+CLAIM_PREFILL_SCRIPT = r"""
+(() => {
+  let challenge = null, accepted = false;
+  window.addEventListener('message', event => {
+    if (!window.opener || event.source !== window.opener) return;
+    if (!/^http:\/\/127\.0\.0\.1:[0-9]+$/.test(event.origin)) return;
+    const data = event.data;
+    if (!data || typeof data.challenge !== 'string' || !/^[a-f0-9-]{36}$/.test(data.challenge)) return;
+    const field = document.getElementById('claim-code-input');
+    if (data.type === 'anyaicam-claim-probe' && !accepted && !field.value) {
+      challenge = data.challenge;
+      event.source.postMessage({type: 'anyaicam-claim-ready', challenge}, event.origin);
+    } else if (data.type === 'anyaicam-claim-prefill' && challenge && data.challenge === challenge) {
+      if (typeof data.code !== 'string' || !/^[A-Z0-9]{8}$/.test(data.code)) return;
+      if (!accepted && !field.value) {
+        accepted = true;
+        field.value = data.code;
+        document.getElementById('claim-lookup-button').click();
+      }
+      if (accepted && field.value === data.code) {
+        event.source.postMessage({type: 'anyaicam-claim-prefilled', challenge}, event.origin);
+      }
+    }
+  });
+})();
+"""
+
+
 def _now() -> datetime:
     return datetime.now()
 
@@ -684,7 +715,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
     def customer_claim_appliance_page(request: Request):
         identity = partner_identity(request)
         if not identity:
-            return RedirectResponse('/partner-login', status_code=303)
+            return RedirectResponse('/customer-login.html?next=/customer/claim-appliance', status_code=303)
         if identity.get('role') != 'customer_owner':
             raise HTTPException(status_code=403, detail='Customer owner permission required.')
         sites = rows('SELECT * FROM sites WHERE customer_id=?', (identity['customer_id'],))
@@ -736,4 +767,5 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           showToast('Appliance claim confirmed.');
         };
         </script>'''
+        scripts += '<script>' + CLAIM_PREFILL_SCRIPT + '</script>'
         return shell('Claim appliance', 'users', content, scripts)

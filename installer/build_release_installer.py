@@ -49,6 +49,8 @@ AGENT_RELEASE_PATHS = (
     "appliance-agent/system",
 )
 INSTALLER_RUNTIME_FILES = (
+    "setup.sh",
+    "customer_setup.py",
     "install.sh",
     "01-preflight.sh",
     "02-storage-check.sh",
