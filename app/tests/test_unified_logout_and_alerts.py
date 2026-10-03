@@ -94,8 +94,12 @@ def test_the_phone_layout_has_log_out_and_shows_who_is_signed_in(http_client, db
     assert 'class="mobile-logout logout-form" method="post" action="/logout"' in nav
     assert f"{role}@example.test" in nav and label in nav
     assert 'class="sidebar-identity"' in html and label in html
-    # Every logout form gets the CSRF token filled in on submit.
-    assert "document.querySelectorAll('.logout-form')" in html
+    # Every logout form -- including this mobile one, rendered after the
+    # script -- gets the CSRF token filled in on submit: one document-level
+    # listener, never forms looked up when the script runs (that missed the
+    # mobile form; see test_household_logout.py).
+    assert "document.addEventListener('submit'" in html and "contains('logout-form')" in html
+    assert "document.querySelectorAll('.logout-form')" not in html
 
 
 def test_signed_in_pages_are_never_cached_and_public_pages_are_unaffected(http_client, db_path):
