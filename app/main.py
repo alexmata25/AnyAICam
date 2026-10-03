@@ -9666,310 +9666,83 @@ def invite_base_url(request: Request | None = None) -> str:
 
 
 
-def send_user_invitation_email(invite: dict, request: Request | None = None) -> tuple[bool, str]:
-
-
-
-
-
-
-
-
-    if not SMTP_HOST or not SMTP_FROM:
-
-
-
-
-
-
-
-
-        return False, "SMTP is not configured."
-
-
-
-
-
-
-
-
+def send_user_invitation_email(invite: dict, request: Request | None = None) -> tuple[str, str]:
     invite_url = f"{invite_base_url(request)}/accept-invite?token={quote(invite['token'])}"
-
-
-
-
-
-
-
-
-    message = EmailMessage()
-
-
-
-
-
-
-
-
-    message["Subject"] = "You have been invited to AnyAiCam"
-
-
-
-
-
-
-
-
-    message["From"] = SMTP_FROM
-
-
-
-
-
-
-
-
-    message["To"] = invite["email"]
-
-
-
-
-
-
-
-
-    message.set_content(
-
-
-
-
-
-
-
-
-        "\n".join(
-
-
-
-
-
-
-
-
-            [
-
-
-
-
-
-
-
-
-                "You have been invited to access AnyAiCam.",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"Permission level: {invite['role']}",
-
-
-
-
-
-
-
-
-                f"Camera access: {'All cameras' if invite.get('all_cameras') else ', '.join('Camera ' + str(item) for item in invite.get('camera_ids', []))}",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"Create your account: {invite_url}",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"This invitation expires {invite['expires_at']}.",
-
-
-
-
-
-
-
-
-            ]
-
-
-
-
-
-
-
-
+    body = "\n".join(
+        [
+            "You have been invited to access AnyAiCam.",
+            "",
+            f"Permission level: {invite['role']}",
+            f"Camera access: {'All cameras' if invite.get('all_cameras') else ', '.join('Camera ' + str(item) for item in invite.get('camera_ids', []))}",
+            "",
+            f"Create your account: {invite_url}",
+            "",
+            f"This invitation expires {invite['expires_at']}.",
+        ]
+    )
+    try:
+        from email_service import get_email_service
+
+        result = get_email_service().send(
+            "invitation",
+            invite["email"],
+            "You have been invited to AnyAiCam",
+            body,
+            metadata={"invite_id": invite["id"]},
         )
+        delivery_status = result.get("status")
+        if delivery_status == "sent":
+            return "sent", "Invitation created and email accepted by the configured email service."
+        if delivery_status == "preview":
+            return "preview", "Invitation created; email preview saved, but no email was delivered."
+        return "failed", "Invitation created, but email delivery was not confirmed. Check email settings and retry."
+    except Exception as error:
+        logging.getLogger(__name__).warning(
+            "Household invitation email attempt failed (invite=%s, error_type=%s)",
+            invite.get("id", "unknown"),
+            type(error).__name__,
+        )
+        return "failed", "Invitation created, but email delivery failed. Check email settings and retry."
 
 
+def public_user_invite(invite: dict) -> dict:
+    """Return invite state without the bearer token used to accept it."""
+    return {key: value for key, value in invite.items() if key != "token"}
 
 
-
-
-
-
+def create_user_invite_token(invite_id: str, email: str) -> str:
+    return session_serializer.dumps(
+        {"invite_id": invite_id, "email": email, "token_id": uuid.uuid4().hex},
+        salt="anyaicam-user-invite",
     )
 
 
-
-
-
-
-
-
-    context = ssl.create_default_context()
-
-
-
-
-
-
-
-
+def user_invite_is_expired(invite: dict, now: datetime | None = None) -> bool:
     try:
-
-
-
-
-
-
-
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
-
-
-
-
-
-
-
-
-            if SMTP_USE_TLS:
-
-
-
-
-
-
-
-
-                smtp.starttls(context=context)
-
-
-
-
-
-
-
-
-            if SMTP_USERNAME:
-
-
-
-
-
-
-
-
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-
-
-
-
-
-
-
-
-            smtp.send_message(message)
-
-
-
-
-
-
-
-
-        return True, "Invitation email sent."
-
-
-
-
-
-
-
-
-    except (OSError, smtplib.SMTPException) as error:
-
-
-
-
-
-
-
-
-        return False, str(error)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        expires_at = datetime.fromisoformat(str(invite["expires_at"]))
+        current_time = now or (
+            datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+        )
+        return expires_at <= current_time
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def record_invite_email_attempt(
+    invite: dict,
+    attempt_status: str,
+    *,
+    update_delivery_status: bool,
+) -> None:
+    attempted_at = datetime.now().isoformat()
+    invite["email_last_attempt_status"] = attempt_status
+    invite["email_last_attempt_at"] = attempted_at
+    if update_delivery_status:
+        invite["email_status"] = attempt_status
+        if attempt_status == "sent":
+            invite["email_sent_at"] = attempted_at
+        else:
+            invite.pop("email_sent_at", None)
 
 
 
@@ -119629,374 +119402,63 @@ def accept_invite_page(token: str = "") -> HTMLResponse:
 
 
 @app.post("/api/user-invites/accept")
-
-
-
-
-
-
-
-
 def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
-
-
-
-
-
-
-
-
     try:
-
-
-
-
-
-
-
-
         token_payload = session_serializer.loads(
-
-
-
-
-
-
-
-
             payload.token,
-
-
-
-
-
-
-
-
             salt="anyaicam-user-invite",
-
-
-
-
-
-
-
-
             max_age=7 * 24 * 3600,
-
-
-
-
-
-
-
-
         )
-
-
-
-
-
-
-
-
     except (BadSignature, SignatureExpired):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Invitation expired or invalid."}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     invite_id = token_payload.get("invite_id")
-
-
-
-
-
-
-
-
     invites = load_user_invites()
-
-
-
-
-
-
-
-
     invite = next(
-
-
-
-
-
-
-
-
         (item for item in invites if item.get("id") == invite_id and item.get("status") == "pending"),
-
-
-
-
-
-
-
-
         None,
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
     if not invite:
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Invitation is no longer available."}
 
+    current_token = str(invite.get("token") or "")
+    token_email = str(token_payload.get("email") or "").strip().lower()
+    invite_email = str(invite.get("email") or "").strip().lower()
+    if (
+        not current_token
+        or not secrets.compare_digest(payload.token, current_token)
+        or not token_email
+        or not invite_email
+        or not secrets.compare_digest(token_email, invite_email)
+    ):
+        return {"status": "error", "message": "Invitation is no longer available."}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    if user_invite_is_expired(invite):
+        invite["status"] = "expired"
+        save_user_invites(invites)
+        return {"status": "error", "message": "Invitation expired or invalid."}
 
     users = load_users()
-
-
-
-
-
-
-
-
-    if any(item.get("email", "").lower() == invite["email"].lower() for item in users):
-
-
-
-
-
-
-
-
+    if any(item.get("email", "").lower() == invite_email for item in users):
         return {"status": "error", "message": "An account already exists for this email."}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     users.append(
-
-
-
-
-
-
-
-
         UserModel(
-
-
-
-
-
-
-
-
             display_name=payload.display_name,
-
-
-
-
-
-
-
-
             email=invite["email"],
-
-
-
-
-
-
-
-
             role=invite["role"],
-
-
-
-
-
-
-
-
             enabled=True,
-
-
-
-
-
-
-
-
             super_admin=invite.get("super_admin", False),
-
-
-
-
-
-
-
-
             site_ids=["home"],
-
-
-
-
-
-
-
-
             camera_ids=[] if invite.get("all_cameras") else invite.get("camera_ids", []),
-
-
-
-
-
-
-
-
             password_hash=hash_password(payload.password),
-
-
-
-
-
-
-
-
             invitation_status="active",
-
-
-
-
-
-
-
-
         ).model_dump(mode="json")
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
     save_users(users)
-
-
-
-
-
-
-
-
     invite["status"] = "accepted"
-
-
-
-
-
-
-
-
     invite["accepted_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
     save_user_invites(invites)
-
-
-
-
-
-
-
-
     return {"status": "complete", "message": "Account created. You can now sign in."}
 
 
@@ -120009,208 +119471,20 @@ def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @app.get("/api/user-invites")
-
-
-
-
-
-
-
-
 def user_invites_api(request: Request) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
     invites = load_user_invites()
-
-
-
-
-
-
-
-
-    now = datetime.now()
-
-
-
-
-
-
-
-
     changed = False
-
-
-
-
-
-
-
-
     for invite in invites:
-
-
-
-
-
-
-
-
-        if invite.get("status") == "pending":
-
-
-
-
-
-
-
-
-            try:
-
-
-
-
-
-
-
-
-                if datetime.fromisoformat(invite["expires_at"]) < now:
-
-
-
-
-
-
-
-
-                    invite["status"] = "expired"
-
-
-
-
-
-
-
-
-                    changed = True
-
-
-
-
-
-
-
-
-            except (KeyError, TypeError, ValueError):
-
-
-
-
-
-
-
-
-                pass
-
-
-
-
-
-
-
-
+        if invite.get("status") == "pending" and user_invite_is_expired(invite):
+            invite["status"] = "expired"
+            changed = True
     if changed:
-
-
-
-
-
-
-
-
         save_user_invites(invites)
-
-
-
-
-
-
-
-
-    return {"status": "complete", "invites": invites}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    return {"status": "complete", "invites": [public_user_invite(item) for item in invites]}
 
 
 
@@ -120223,453 +119497,55 @@ def user_invites_api(request: Request) -> dict:
 
 
 @app.post("/api/user-invites")
-
-
-
-
-
-
-
-
 def create_user_invite(request: Request, payload: UserInviteCreateModel) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
     if payload.role not in VALID_ROLES:
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Unsupported permission level."}
 
-
-
-
-
-
-
-
     email = payload.email.strip().lower()
-
-
-
-
-
-
-
-
     users = load_users()
-
-
-
-
-
-
-
-
     invites = load_user_invites()
-
-
-
-
-
-
-
-
     if any(item.get("email", "").lower() == email for item in users):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "That email already has an account."}
-
-
-
-
-
-
-
-
     if any(item.get("email", "").lower() == email and item.get("status") == "pending" for item in invites):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "A pending invitation already exists."}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     invite_id = uuid.uuid4().hex[:12]
-
-
-
-
-
-
-
-
-    token = session_serializer.dumps(
-
-
-
-
-
-
-
-
-        {"invite_id": invite_id, "email": email},
-
-
-
-
-
-
-
-
-        salt="anyaicam-user-invite",
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
     invite = {
-
-
-
-
-
-
-
-
         "id": invite_id,
-
-
-
-
-
-
-
-
         "email": email,
-
-
-
-
-
-
-
-
         "display_name": payload.display_name.strip(),
-
-
-
-
-
-
-
-
         "role": "admin" if payload.super_admin else payload.role,
-
-
-
-
-
-
-
-
         "super_admin": payload.super_admin,
-
-
-
-
-
-
-
-
         "all_cameras": payload.all_cameras,
-
-
-
-
-
-
-
-
         "camera_ids": [] if payload.all_cameras else sorted(set(payload.camera_ids)),
-
-
-
-
-
-
-
-
         "status": "pending",
-
-
-
-
-
-
-
-
         "created_at": datetime.now().isoformat(),
-
-
-
-
-
-
-
-
         "expires_at": (datetime.now() + timedelta(days=7)).isoformat(),
-
-
-
-
-
-
-
-
         "created_by": actor.get("id"),
-
-
-
-
-
-
-
-
-        "token": token,
-
-
-
-
-
-
-
-
+        "token": create_user_invite_token(invite_id, email),
+        "email_status": "sending",
+        "email_last_attempt_status": "sending",
+        "email_last_attempt_at": datetime.now().isoformat(),
     }
-
-
-
-
-
-
-
-
     invites.append(invite)
-
-
-
-
-
-
-
-
+    save_user_invites(invites)
+    delivery_status, message = send_user_invitation_email(invite, request)
+    record_invite_email_attempt(invite, delivery_status, update_delivery_status=True)
     save_user_invites(invites)
 
-
-
-
-
-
-
-
-    email_ok, email_detail = send_user_invitation_email(invite, request)
-
-
-
-
-
-
-
-
-    record_audit(
-
-
-
-
-
-
-
-
-        request,
-
-
-
-
-
-
-
-
-        "create",
-
-
-
-
-
-
-
-
-        "user_invite",
-
-
-
-
-
-
-
-
-        f"Invited {email}: {email_detail}",
-
-
-
-
-
-
-
-
-        "success" if email_ok else "failed",
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
+    outcome = "success" if delivery_status == "sent" else "failed"
+    record_audit(request, "create", "user_invite", f"Invited {email}: {delivery_status}", outcome)
     return {
-
-
-
-
-
-
-
-
         "status": "complete",
-
-
-
-
-
-
-
-
-        "message": email_detail if email_ok else f"Invitation saved, but email failed: {email_detail}",
-
-
-
-
-
-
-
-
-        "invite": invite,
-
-
-
-
-
-
-
-
+        "invitation_status": invite["status"],
+        "email_status": invite["email_status"],
+        "email_last_attempt_status": invite["email_last_attempt_status"],
+        "message": message,
+        "invite": public_user_invite(invite),
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -120682,174 +119558,57 @@ def create_user_invite(request: Request, payload: UserInviteCreateModel) -> dict
 
 
 @app.post("/api/user-invites/{invite_id}/resend")
-
-
-
-
-
-
-
-
 def resend_user_invite(request: Request, invite_id: str) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
 
-
-
-
-
-
-
-
     invites = load_user_invites()
-
-
-
-
-
-
-
-
     invite = next((item for item in invites if item.get("id") == invite_id), None)
-
-
-
-
-
-
-
-
     if not invite:
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Invitation not found."}
+    if invite.get("status") != "pending":
+        return {"status": "error", "message": "Only pending invitations can be resent."}
+    if user_invite_is_expired(invite):
+        invite["status"] = "expired"
+        save_user_invites(invites)
+        return {"status": "error", "message": "Invitation expired; create a new invitation."}
 
-
-
-
-
-
-
-
-    invite["status"] = "pending"
-
-
-
-
-
-
-
-
+    previous = {key: invite.get(key) for key in ("token", "expires_at", "email_status", "email_sent_at")}
     invite["expires_at"] = (datetime.now() + timedelta(days=7)).isoformat()
-
-
-
-
-
-
-
-
-    invite["token"] = session_serializer.dumps(
-
-
-
-
-
-
-
-
-        {"invite_id": invite["id"], "email": invite["email"]},
-
-
-
-
-
-
-
-
-        salt="anyaicam-user-invite",
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
+    invite["token"] = create_user_invite_token(invite["id"], invite["email"])
+    invite["email_last_attempt_status"] = "sending"
+    invite["email_last_attempt_at"] = datetime.now().isoformat()
     save_user_invites(invites)
 
+    attempt_status, message = send_user_invitation_email(invite, request)
+    if attempt_status == "sent":
+        record_invite_email_attempt(invite, attempt_status, update_delivery_status=True)
+    else:
+        invite["token"] = previous["token"]
+        invite["expires_at"] = previous["expires_at"]
+        if previous["email_status"] is None:
+            invite.pop("email_status", None)
+        else:
+            invite["email_status"] = previous["email_status"]
+        if previous["email_sent_at"] is None:
+            invite.pop("email_sent_at", None)
+        else:
+            invite["email_sent_at"] = previous["email_sent_at"]
+        record_invite_email_attempt(invite, attempt_status, update_delivery_status=False)
+        if attempt_status == "preview":
+            message = "Email preview saved, but no email was delivered; the existing invitation link remains active."
+        else:
+            message = "Resend failed; the existing invitation link remains active. Check email settings and retry."
 
-
-
-
-
-
-
-    ok, detail = send_user_invitation_email(invite, request)
-
-
-
-
-
-
-
-
-    return {"status": "complete" if ok else "error", "message": detail}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    save_user_invites(invites)
+    return {
+        "status": "complete",
+        "invitation_status": invite["status"],
+        "email_status": invite.get("email_status", "unknown"),
+        "email_last_attempt_status": invite["email_last_attempt_status"],
+        "message": message,
+    }
 
 
 
@@ -124938,7 +123697,7 @@ def users_page(request: Request) -> str:
 
 
 
-                <thead><tr><th>Email</th><th>Permission level</th><th>Cameras</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+                <thead><tr><th>Email</th><th>Permission level</th><th>Cameras</th><th>Expires</th><th>Invitation / email</th><th></th></tr></thead>
 
 
 
@@ -125505,7 +124264,7 @@ def users_page(request: Request) -> str:
 
 
 
-                <td><span class="pending-badge">${safe(invite.status)}</span></td>
+                <td><span class="pending-badge">${safe(invite.status)}</span><div class="health-detail">Email: ${safe(invite.email_status==='preview'?'preview only (not delivered)':invite.email_status==='sent'?'accepted by provider':invite.email_status||'unknown')}</div>${invite.email_last_attempt_status&&invite.email_last_attempt_status!==invite.email_status?'<div class="health-detail">Last attempt: '+safe(invite.email_last_attempt_status)+'</div>':''}</td>
 
 
 
