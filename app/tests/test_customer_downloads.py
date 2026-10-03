@@ -243,3 +243,69 @@ def test_steps_escape_the_portal_address():
     finally:
         main.PUBLIC_BASE_URL = original
     assert "<script>" not in steps
+
+
+# ----------------------------------------------------------- customer setup UX
+
+def _install_panel(html):
+    return html.split('id="install-anyaicam"', 1)[1].split('</section>', 1)[0]
+
+
+def test_customer_setup_is_simple_and_technician_details_are_collapsed(license_portal, db_path, storage, package):
+    client, _, _ = license_portal
+    _seed(db_path)
+    _license(db_path, product="camera_slots_local", quantity=8)
+    _license(db_path)
+    record = _publish(package)
+    panel = _install_panel(client.get("/subscription-portal", cookies=_cookie(*OWNER)).text)
+    simple, technical = panel.split('<details id="vms-technician-setup">', 1)
+    assert '<h3 style="margin-top:0">Install AnyAiCam</h3>' in simple
+    assert "Your AnyAiCam license includes up to 8 cameras." in simple
+    assert 'class="action-button" href="/api/customer/downloads/vms-installer" download>Download AnyAiCam' in simple
+    for step in ("Step 1 &mdash; Download AnyAiCam", "Step 2 &mdash; Install AnyAiCam", "Step 3 &mdash; Connect your system"):
+        assert step in simple
+    assert "requires a technician" in simple and "setup code" in simple
+    assert 'href="/customer/claim-appliance"' in simple
+    assert 'href="https://anyaicam.com/vms-support.html"' in simple
+    for term in ("SHA-256", record["sha256"], "build ", "tar.gz", "tar -xzf", "sudo", "--claim", "CPU cores"):
+        assert term not in simple
+        assert term in technical
+    assert '<summary>Advanced / Technician setup</summary>' in technical
+    assert "automatically" not in simple and "Download for Windows" not in simple
+
+
+def test_viewer_sees_allowance_but_no_download_or_technician_instructions(license_portal, db_path, storage, package):
+    client, _, _ = license_portal
+    _seed(db_path)
+    _license(db_path, product="camera_slots_local", quantity=8)
+    _license(db_path)
+    _publish(package)
+    panel = _install_panel(client.get("/subscription-portal", cookies=_cookie("viewer@example.test", "customer_viewer", "cust-1")).text)
+    assert "includes up to 8 cameras" in panel
+    assert "/api/customer/downloads/vms-installer" not in panel
+    assert "vms-technician-setup" not in panel and "sudo" not in panel
+
+
+def test_appliance_included_allowance_uses_the_existing_entitlement(license_portal, db_path, storage, package):
+    client, _, _ = license_portal
+    _seed(db_path)
+    _paid_appliance_order(db_path)
+    _license(db_path, product="camera_slots_local", quantity=16)
+    _publish(package)
+    panel = _install_panel(client.get("/subscription-portal", cookies=_cookie(*OWNER)).text)
+    assert "Included with your AnyAiCam appliance" in panel
+    assert "includes up to 16 cameras" in panel
+
+
+def test_advanced_release_metadata_stays_html_escaped(license_portal, db_path, storage, package, monkeypatch):
+    import customer_downloads
+    client, _, _ = license_portal
+    _seed(db_path)
+    _license(db_path, product="camera_slots_local", quantity=8)
+    _license(db_path)
+    release = _publish(package)
+    release["version"] = '<script>bad()</script>'
+    monkeypatch.setattr(customer_downloads, "latest_vms_installer", lambda: release)
+    panel = _install_panel(client.get("/subscription-portal", cookies=_cookie(*OWNER)).text)
+    assert '<script>bad()</script>' not in panel
+    assert '&lt;script&gt;bad()&lt;/script&gt;' in panel
