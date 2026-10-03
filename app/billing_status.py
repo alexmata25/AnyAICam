@@ -305,6 +305,18 @@ def _invoice_payment_failed(invoice: dict, subscription_id: str, at) -> dict:
     invoice_id = str(invoice.get("id") or "")
     if not invoice_id:
         return {"status": "ignored", "reason": "invoice has no id"}
+    if str(invoice.get("billing_reason") or "") == "subscription_update":
+        # A declined plan-change proration (Local -> Hybrid upgrade with
+        # payment_behavior=pending_if_incomplete): Stripe keeps the
+        # subscription on its paid plan and holds the change as
+        # pending_update, then voids this invoice when the change expires --
+        # without a subscription.updated. It is not an unpaid period, so it
+        # never starts grace, is never recorded as an unpaid renewal and
+        # never sends a payment-failed email. If Stripe did make the
+        # subscription past_due, customer.subscription.updated starts grace
+        # through apply_subscription_status. (Stripe TEST-mode evidence,
+        # 2026-10-03: tests/test_stripe_testmode_declined_upgrade.py.)
+        return {"status": "ignored", "reason": "a declined plan-change payment: the paid plan is unchanged"}
     if invoice_state(invoice_id) in SETTLED_INVOICE_STATES:
         return {"status": "ignored", "reason": "this invoice has already been paid"}
     import stripe_state
