@@ -107,8 +107,17 @@ def sign(manifest: dict, private_key_path: Path, embedded_public_key: bytes) -> 
     key = serialization.load_pem_private_key(resolved.read_bytes(), password=None)
     if not isinstance(key, rsa.RSAPrivateKey):
         raise SystemExit("The signing key must be an RSA private key.")
-    public_pem = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-    if embedded_public_key and embedded_public_key.strip() != public_pem.strip():
+    # Compare the KEYS (DER SubjectPublicKeyInfo), not PEM text: line endings
+    # or wrapping must never make a matching key look different.
+    public_der = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    embedded_der = b""
+    if embedded_public_key:
+        try:
+            embedded_der = serialization.load_pem_public_key(embedded_public_key).public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        except ValueError as error:
+            raise SystemExit(f"The installer's embedded public key is unreadable: {error}") from error
+    if embedded_public_key and embedded_der != public_der:
         raise SystemExit("This signing key does not match the public key the installer provisions; appliances would "
                          "refuse the release.")
     data = canonical_manifest_bytes(manifest)

@@ -69,6 +69,28 @@ class BuilderTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 builder.read_update_signing_public_key(str(junk))
 
+    def test_a_windows_exported_key_is_packaged_in_canonical_form(self):
+        """A key saved on Windows has CRLF line endings (and possibly other
+        wrapping). The packaged key must be the canonical SubjectPublicKeyInfo
+        PEM -- LF, 64-character lines -- byte for byte what the offline signer
+        derives from the private key."""
+        _private, public_pem = generate_keypair()
+        body = "".join(public_pem.decode().splitlines()[1:-1])
+        rewrapped = "\r\n".join(["-----BEGIN PUBLIC KEY-----", *[body[i:i + 76] for i in range(0, len(body), 76)],
+                                 "-----END PUBLIC KEY-----"]) + "\r\n\r\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            crlf = Path(tmp, "windows.pem")
+            crlf.write_bytes(rewrapped.encode())
+            self.assertEqual(builder.read_update_signing_public_key(str(crlf)), public_pem)
+            corrupt = Path(tmp, "corrupt.pem")
+            corrupt.write_bytes(b"-----BEGIN PUBLIC KEY-----\r\nnot*base64!\r\n-----END PUBLIC KEY-----\r\n")
+            with self.assertRaises(SystemExit):
+                builder.read_update_signing_public_key(str(corrupt))
+            two = Path(tmp, "two.pem")
+            two.write_bytes(public_pem + public_pem)
+            with self.assertRaises(SystemExit):
+                builder.read_update_signing_public_key(str(two))
+
     def test_the_new_install_step_ships_in_every_installer(self):
         self.assertIn("12-update-signing-key.sh", builder.INSTALLER_RUNTIME_FILES)
         install = _text(INSTALLER / "install.sh")
@@ -209,6 +231,13 @@ class OfflineSignerTests(unittest.TestCase):
                          "--previous-installer", str(self._installer("1.1.0", BUILD_A)), "--signing-key", str(self.key_file),
                          "--out-dir", str(self.tmp / "out")])
         self.assertIn("database", str(raised.exception))
+
+    def test_a_matching_key_with_windows_line_endings_is_accepted(self):
+        """The embedded key is compared as a key (DER), not as PEM text."""
+        crlf = self.public_pem.replace(b"\n", b"\r\n")
+        code = signer.main(["--installer", str(self._installer("1.2.0", BUILD_B, key=crlf)), "--first-release",
+                            "--signing-key", str(self.key_file), "--out-dir", str(self.tmp / "out")])
+        self.assertEqual(code, 0)
 
     def test_a_key_that_appliances_would_not_trust_is_refused(self):
         _other, other_public = generate_keypair()
