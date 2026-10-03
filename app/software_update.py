@@ -63,6 +63,10 @@ FINAL_LABELS = {
     "activation_failed": "Update failed",
 }
 _VERSION = re.compile(r"^\d{1,4}(\.\d{1,4}){1,3}$")
+# Shown for an appliance that has checked in but does not report an installed
+# AnyAiCam release (its software predates updates from this page).
+ONE_TIME_UPDATE_MESSAGE = ("This appliance needs a one-time update before updates can be installed from here. "
+                           "Contact AnyAiCam support to schedule it.")
 
 
 # ------------------------------------------------------------------ helpers
@@ -79,7 +83,10 @@ def is_newer(candidate: str, current: str) -> bool:
         return False
     old = _version_tuple(current)
     if old is None:
-        return not current  # unknown legacy label: let the appliance decide (it refuses downgrades)
+        # No valid installed release (an agent from before 1.2.0 reports its
+        # own package version, e.g. "0.1.0"): it cannot run an owner-requested
+        # install, so nothing is offered or accepted for it (2026-10-03).
+        return False
     width = max(len(new), len(old))
     return new + (0,) * (width - len(new)) > old + (0,) * (width - len(old))
 
@@ -188,7 +195,10 @@ def software_status(db, customer_id: str) -> dict:
         appliances.append({
             "id": row["id"], "name": row["cloud_id"], "current_version": version, "current_build": build,
             "last_check_in": row["last_check_in"], "online": (row["online_status"] or "") == "online",
-            "update_available": bool(release and is_newer(release["version"], version)),
+            "update_available": bool(release and version and is_newer(release["version"], version)),
+            # Checked in, but no valid installed release: a pre-1.2.0 agent
+            # that cannot run an owner-requested install (2026-10-03).
+            "one_time_update_required": bool(row["last_check_in"]) and not version,
             "in_progress": progress, "history": history,
         })
     return {"release": release, "appliances": appliances}
@@ -210,6 +220,10 @@ def request_install(db, *, identity: dict, appliance_id: str, update_id: str, ve
         raise HTTPException(status_code=409, detail="That release is no longer the published one. Refresh and try again.")
     row = db.execute("SELECT software_version FROM appliances WHERE id=?", (appliance_id,)).fetchone()
     current_version, _build = split_release_label(row["software_version"] or "")
+    if not current_version:
+        # Never queue a command this appliance cannot run: it would sit at
+        # "Waiting for appliance" forever.
+        raise HTTPException(status_code=409, detail=ONE_TIME_UPDATE_MESSAGE)
     if not is_newer(release["version"], current_version):
         raise HTTPException(status_code=409, detail="This appliance already runs this release or a newer one.")
     if _in_flight(db, appliance_id):
@@ -240,6 +254,7 @@ _SYSTEM_SCRIPT = r'''<script>
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const when=v=>v?new Date(v).toLocaleString([], {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}):'';
 const OWNER=document.body.dataset.owner==='1';
+const ONE_TIME=__ONE_TIME_MESSAGE__;
 let data=null,timer=null,pending=null;
 const say=(t,ok=true)=>{const m=$('su-message');m.textContent=t;m.style.color=ok?'':'#ffb4c0'};
 async function call(url,method='GET',body){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.detail||'Something went wrong.');return b}
@@ -247,9 +262,11 @@ function render(){
  const rel=data.release;
  $('su-release').innerHTML=rel?`<strong>AnyAiCam ${esc(rel.version)}</strong> <span class="health-detail">published ${esc(when(rel.issued_at))}</span>`:'<span class="health-detail">No update is published right now.</span>';
  $('su-appliances').innerHTML=data.appliances.map(a=>{
-  const cur=a.current_version?`AnyAiCam ${esc(a.current_version)}`:'Version not reported yet';
+  const cur=a.current_version?`AnyAiCam ${esc(a.current_version)}`:(a.one_time_update_required?'One-time update required':'Version not reported yet');
   let action='';
   if(a.in_progress){action=`<span class="pill">${esc(a.in_progress.label)}</span>`}
+  else if(a.one_time_update_required){action=`<span class="health-detail" style="max-width:340px;display:inline-block">${esc(ONE_TIME)}</span>`}
+  else if(!a.current_version){action=''}
   else if(a.update_available&&OWNER){action=`<button class="action-button" data-install="${esc(a.id)}">Install ${esc(rel.version)}</button>`}
   else if(a.update_available){action='<span class="health-detail">Update available -- only the account owner can install it.</span>'}
   else if(rel){action='<span class="pill">Up to date</span>'}
@@ -296,7 +313,8 @@ def register_software_update_routes(app: FastAPI, shell: Callable) -> None:
                        'style="margin-top:12px;display:inline-block">Sign in to Customer Portal</a></section>')
             return shell("System", "settings", content)
         marker = '1' if identity.get("role") == "customer_owner" else '0'
-        script = _SYSTEM_SCRIPT.replace("document.body.dataset.owner==='1'", "'" + marker + "'==='1'")
+        script = (_SYSTEM_SCRIPT.replace("document.body.dataset.owner==='1'", "'" + marker + "'==='1'")
+                  .replace("__ONE_TIME_MESSAGE__", json.dumps(ONE_TIME_UPDATE_MESSAGE)))
         return shell("System", "settings", _page(identity), script)
 
     @app.get("/api/customer/software-update")
