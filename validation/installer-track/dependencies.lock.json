@@ -1,0 +1,44 @@
+{
+  "status": "prepared, unpublished; simulator not started; not a complete offline installer",
+  "source_commit": "d5af9c53cbef1f2c400f56e148c5cb080770dc07",
+  "mediamtx": {
+    "version": "v1.21.0",
+    "platform": "linux_amd64",
+    "url": "https://github.com/bluenviron/mediamtx/releases/download/v1.21.0/mediamtx_v1.21.0_linux_amd64.tar.gz",
+    "archive_sha256": "e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b",
+    "binary_sha256": "9fac297a1b57762980fc1f7d91499211091366b3abecd0a7a0d8146387d901ad",
+    "verification": "release checksum and GitHub asset digest matched"
+  },
+  "ffmpeg": {
+    "version": "7:6.1.1-3ubuntu5",
+    "url": "https://archive.ubuntu.com/ubuntu/pool/universe/f/ffmpeg/ffmpeg_6.1.1-3ubuntu5_amd64.deb",
+    "sha256": "1a23baace5f2688a47e28119aedae6993cd638e6279a7227dfc52d9a337a1c17",
+    "runtime_lock": "ffmpeg-runtime.lock.json",
+    "runtime_note": "194 installed package versions and 214 library hashes recorded. Old installed libapparmor1 archive digest unavailable in cached apt metadata; resolve before offline VM build. No system packages installed/updated."
+  },
+  "onvif": {
+    "implementation": "onvif_simulator.py",
+    "runtime": "Ubuntu 24.04 Python 3.12 standard library; no pip dependencies",
+    "network": "opt-in helper VM only; explicit private /24, read-only ONVIF and WS-Discovery"
+  },
+  "ubuntu_iso": {
+    "filename": "ubuntu-24.04.4-desktop-amd64.iso",
+    "url": "https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-desktop-amd64.iso",
+    "sha256": "3a4c9877b483ab46d7c3fbe165a0db275e1ae3cfe56a5657e5a47c2f99a99d1e",
+    "verification": "Canonical SHA256SUMS retrieved; ISO download and signed metadata verification pending"
+  },
+  "prepared_file_sha256": {
+    "onvif_simulator.py": "b24ef7c5200d89504d3680fc8a98e35e866e59c3e8dd7d96e5c66950ee76f0c7",
+    "mediamtx.yml": "f0452ce3384d85f788ef8c24a6963518de8b84ebb0d5801753eeb267a0519abe",
+    "camera.env.example": "6db429ba1bf39954c7ab9eef09d65fa3d25a49ff1ef7d1dc64cdd9828e948ecf",
+    "publish-test-video.sh": "ec0944a7e1c01014c2ac2ba49ddcc29308daed1792180cb4715050cee5b5ae22",
+    "portal.env.example": "c3f2af6fb1843ffc2d3a972b143c5ea894ecd16a9eb2159c5e2ae38c678b1650",
+    "owner-location.plan.json": "f980855c251f8961aa84d979fef7c9e679c61533e21b9fd562f9f709cb6737bf"
+  },
+  "pinned_schema_source_sha256": {
+    "app/partner_db.py": "27dfba0c2d74b2d90ada4a51c3d7ecb58685de7fffcac3eed98b87bf60aa6498",
+    "app/db_migrations.py": "6c4f4e89b04f272e0a4b9a34eaec10a2e2a5f1607bef04f2f6a54ccc11013a93",
+    "app/appliance_claims.py": "a2917fd499e324e760bbfe9b09b74ae5a57d8701301390efdceb1050b557aad9",
+    "app/cloud_config.py": "72684d62c834f3df8833792d3ac28c3f52f18c69c53e4688c473d2a44a688ef9"
+  }
+}

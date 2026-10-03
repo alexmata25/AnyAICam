@@ -1,0 +1,54 @@
+{
+  "status": "prepared-only; do not execute or provision",
+  "source_commit": "d5af9c53cbef1f2c400f56e148c5cb080770dc07",
+  "database": {
+    "backend": "sqlite",
+    "path": "/var/lib/anyaicam-installer-test/portal.db",
+    "schema": "initialize_database() from pinned app/partner_db.py and db_migrations; no imported production data"
+  },
+  "partner": {
+    "id": "installer-test-partner",
+    "name": "Isolated installer test",
+    "approval_status": "approved",
+    "source": "real"
+  },
+  "customer": {
+    "id": "installer-test-customer",
+    "partner_id": "installer-test-partner",
+    "email": "installer-owner@example.test",
+    "status": "active",
+    "source": "real"
+  },
+  "location": {
+    "id": "installer-test-site",
+    "customer_id": "installer-test-customer",
+    "name": "Simulated Camera Lab"
+  },
+  "owner": {
+    "email": "installer-owner@example.test",
+    "role": "customer_owner",
+    "customer_id": "installer-test-customer",
+    "approved": true,
+    "password": "generate privately later; store application password hash only",
+    "authorization": "customer-scoped identity grant; no global/admin grant"
+  },
+  "test_license": {
+    "customer_id": "installer-test-customer",
+    "camera_slot_quantity": 8,
+    "products": [
+      "camera_slots_local",
+      "vms_license"
+    ],
+    "provisioning": "approved local fixture entitlements only; no checkout, payment API or webhook"
+  },
+  "claim_security": {
+    "owner_confirmation": "required",
+    "site_ownership": "required",
+    "device_possession_secret": "real installer generated; required for status/complete",
+    "csrf": "signed cookie/header required",
+    "origins": [
+      "https://installer-test.test"
+    ],
+    "encryption": "new Fernet key; refuse confirmation if missing"
+  }
+}

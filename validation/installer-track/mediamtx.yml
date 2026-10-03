@@ -1,0 +1,26 @@
+# PREPARED ONLY. Use exclusively on the later isolated simulator VM.
+logLevel: info
+api: no
+metrics: no
+pprof: no
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [tcp]
+authInternalUsers:
+  - user: any
+    ips: [127.0.0.1]
+    permissions:
+      - action: publish
+        path: testcamera
+  - user: any
+    ips: [192.168.253.0/24]
+    permissions:
+      - action: read
+        path: testcamera
+paths:
+  testcamera:
+    source: publisher
