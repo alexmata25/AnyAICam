@@ -254,3 +254,68 @@ def test_progress_moves_forward_and_a_final_outcome_is_never_overwritten(portal,
     assert appliance["history"][0]["state"] == "rolled_back"
     assert appliance["history"][0]["reason"] == "health_check_failed"
     assert "previous version restored" in appliance["history"][0]["label"]
+
+
+# ------------------------------------------------------------------ appliances without a valid installed release
+
+def _check_in(db_path, appliance_id="appl-1", when="2026-10-03T12:00:00"):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE appliances SET last_check_in=? WHERE id=?", (when, appliance_id))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("label", ["0.1.0", "Not installed", "Unknown", "1.1.0", "1.2.0+not-a-build"])
+def test_a_checked_in_appliance_without_a_valid_release_needs_a_one_time_update(portal, db_path, published, label):
+    """Regression (2026-10-03): an agent from before 1.2.0 reports its own
+    package version ("0.1.0"). The page offered "Install" (or "Up to date"),
+    and an install queued a command that appliance cannot run -- it sat at
+    "Waiting for appliance" forever."""
+    client, _, _ = portal
+    _appliances(db_path, label=label)
+    _check_in(db_path)
+    [appliance] = client.get("/api/customer/software-update", cookies=_cookie(*OWNER)).json()["appliances"]
+    assert appliance["current_version"] == ""
+    assert appliance["update_available"] is False and appliance["one_time_update_required"] is True
+    refused = _install(client)
+    assert refused.status_code == 409 and "one-time update" in refused.json()["detail"]
+    assert _q(db_path, "SELECT * FROM appliance_commands") == []
+    assert _q(db_path, "SELECT * FROM appliance_update_results") == []
+
+
+def test_an_appliance_that_never_checked_in_is_not_offered_an_update(portal, db_path, published):
+    client, _, _ = portal
+    _appliances(db_path, label="")
+    [appliance] = client.get("/api/customer/software-update", cookies=_cookie(*OWNER)).json()["appliances"]
+    assert appliance["update_available"] is False and appliance["one_time_update_required"] is False
+    assert _install(client).status_code == 409
+    assert _q(db_path, "SELECT * FROM appliance_commands") == []
+
+
+def test_a_valid_release_label_is_still_offered_the_update(portal, db_path, published):
+    client, _, _ = portal
+    _appliances(db_path)
+    _check_in(db_path)
+    [appliance] = client.get("/api/customer/software-update", cookies=_cookie(*OWNER)).json()["appliances"]
+    assert (appliance["update_available"], appliance["one_time_update_required"]) == (True, False)
+    assert _install(client).status_code == 200
+
+
+def test_the_page_explains_the_one_time_update_and_never_says_up_to_date_without_a_version(portal, db_path, published):
+    client, _, _ = portal
+    _appliances(db_path)
+    page = client.get("/settings/system", cookies=_cookie(*OWNER)).text
+    import software_update
+    assert "One-time update required" in page
+    assert json.dumps(software_update.ONE_TIME_UPDATE_MESSAGE) in page and "__ONE_TIME_MESSAGE__" not in page
+    script = page[page.index("function render()"):page.index("async function load()")]
+    # The explanation and the "no version" branch come before Install and "Up to date".
+    assert script.index("a.one_time_update_required") < script.index("a.update_available&&OWNER")
+    assert script.index("!a.current_version") < script.index("Up to date")
+
+
+def test_is_newer_never_treats_an_unknown_version_as_installable():
+    import software_update
+    assert software_update.is_newer("1.2.1", "1.2.0") is True
+    assert software_update.is_newer("1.2.1", "") is False
+    assert software_update.is_newer("1.2.1", "0.1.0+x") is False
