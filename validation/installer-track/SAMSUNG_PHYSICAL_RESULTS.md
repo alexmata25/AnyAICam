@@ -1,3 +1,8 @@
+# Current evidence supersedes earlier preparation status
+
+See SAMSUNG_FRESH_OS_LAB_PREFLIGHT.md: fresh physical Ubuntu 24.04.4 verified,
+18 helper preflight assertions passed; Samsung installer still pending local sudo/download.
+
 # Samsung physical acceptance evidence — 2026-10-03
 
 ## Live status

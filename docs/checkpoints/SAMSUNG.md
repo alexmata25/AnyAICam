@@ -1,4 +1,26 @@
 # Samsung appliance — checkpoint
+## 2026-10-03 — fresh Samsung verified; real isolated lab preflight passed
+
+User resumed after completing physical wipe/install. New SSH 100.76.177.87,
+hostname alejandro-mata-930MBE, independently supplied ED25519 fingerprint matched.
+Samsung model 930MBE and original NVMe serial 193077800308 positively matched.
+Ubuntu 24.04.4 LTS amd64; i7-8565U 4 cores/8 threads; ~16 GB RAM; 465,443,811,328
+root bytes free, exact 100 GiB gate PASS. No old AnyAiCam account/units/standard
+state directories/Docker executable; no old identity restored.
+Existing candidate installer remains unchanged and unpublished, SHA-256 9dd0fe3f...
+Disposable EC2 lab now runs real HTTPS portal + synthetic camera with fresh
+keys/database, one customer-scoped owner/location and 8-camera local fixture license.
+18/18 actual helper preflight assertions pass; 45 changing video frames decoded.
+Archive/710 installer manifest entries and simulator/269 checksum entries verified.
+These are NOT Samsung VMS/claim/live/recording/playback acceptance.
+Samsung GNOME preparation terminal currently awaits LOCAL sudo password entry;
+user was asked to enter it there, sign in using local test credential file and
+download the exact installer. No AnyAiCam install has begun. Camera tunnel client
+is not activated yet. Do not bypass password, TLS, claim or CSRF protections.
+Full current evidence: ../../validation/installer-track/SAMSUNG_FRESH_OS_LAB_PREFLIGHT.md.
+Exact cleanup inventory: ../../validation/installer-track/AWS_LAB_RESOURCES.json.
+All older pause/offline/old-OS notes below are historical. No excluded systems changed.
+
 ## 2026-10-03 — remote steps paused for physical USB installation
 
 User reports Samsung is booting USB and explicitly requests remote steps pause

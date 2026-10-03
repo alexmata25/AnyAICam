@@ -3,7 +3,7 @@
   "region": "us-east-1",
   "profile": "anyaicam-validation",
   "account": "880690594006",
-  "status": "paused-user-request-awaiting-fresh-samsung-network",
+  "status": "portal-and-simulator-running-awaiting-local-samsung-administrator-step",
   "samsung_egress_cidr": "66.60.254.93/32",
   "resources": {
     "vpc_id": "vpc-0a72adcbc48c33cb3",
@@ -16,16 +16,35 @@
     "key_pair_id": "key-03985336e7004d311",
     "instance_id": "i-0360bac15559416c1",
     "network_interface_id": "eni-0639eee634c4e81fb",
-    "root_volume_id": "vol-01a33df1c0a730d2d"
+    "root_volume_id": "vol-01a33df1c0a730d2d",
+    "default_security_group_id": "sg-0c74856a5045f7d10",
+    "default_route_table_id": "rtb-09706502d9b370891",
+    "default_network_acl_id": "acl-0670ae0b1064a0ff9",
+    "operator_ssh_ingress_rule_id": "sgr-0d8217515ce093fcb"
   },
   "ami_id": "ami-0045d7fc2ad003464",
   "instance_type": "t3.large",
   "public_ip": "100.27.41.127",
   "private_ip": "10.253.77.16",
-  "portal_provisioned": false,
-  "simulator_provisioned": false,
+  "portal_provisioned": true,
+  "simulator_provisioned": true,
   "blockers": [
-    "Physical Ubuntu installation/network recovery pending",
-    "Authenticated EC2 SSH host-key verification: validation identity lacks ec2:GetConsoleOutput"
-  ]
+    "Local Samsung sudo password entry and customer portal download pending",
+    "Samsung tunnel handshake/multicast and all physical VMS acceptance pending"
+  ],
+  "operator_ssh_cidr": "174.254.77.242/32",
+  "samsung_endpoint": "alejandro-mata@100.76.177.87",
+  "samsung_hostname": "alejandro-mata-930MBE",
+  "lab_portal_origin": "https://installer-test.test",
+  "lab_tunnel_server": "192.168.253.10/24",
+  "lab_tunnel_client_planned": "192.168.253.20/24",
+  "lab_tunnel_client_active": false,
+  "helper_ssh_fingerprint": "SHA256:/2TKPpgB6kw5QEvc521BbJw3PvcbkhbpOJ4ww8Gk/GU",
+  "samsung_ssh_fingerprint": "SHA256:uwo6Rxd1qaZHMEpECDymmgAemuV25i3RxVfLrvS23xI",
+  "preflight_tests": {
+    "https_api_passed": 12,
+    "decoded_synthetic_frames": 45,
+    "helper_onvif_directed_udp_passed": 6,
+    "samsung_installer_execution": "not-started"
+  }
 }
