@@ -50,12 +50,15 @@ run_uninstall() {
     fi
 
     rm -rf "$VMS_INSTALL_ROOT"
+    # Software Update (2026-10-03): the staged / previous / failed application trees.
+    rm -rf "$VMS_INSTALL_ROOT.next" "$VMS_INSTALL_ROOT.previous" "$VMS_INSTALL_ROOT.failed"
     docker image rm anyaicam-vms 2>/dev/null || true
     systemctl daemon-reload
 
     if [[ "$purge" -eq 1 ]]; then
         log "PURGE requested: removing all preserved state."
         rm -rf "$CONFIG_DIR" /var/lib/anyaicam /var/log/anyaicam
+        rm -rf /etc/anyaicam-update /var/lib/anyaicam-update
         # Confirmed live: without this, detect_install_state() never
         # reports 0/5 ("clean") again after a purge -- `id -u anyaicam`
         # still succeeds, so the very next install run goes through the
@@ -66,7 +69,7 @@ run_uninstall() {
         # user gone too, not just its data.
         userdel anyaicam 2>/dev/null || true
     else
-        log "Software removed. Preserved: $CONFIG_DIR, /var/lib/anyaicam, /var/log/anyaicam."
+        log "Software removed. Preserved: $CONFIG_DIR, /var/lib/anyaicam, /var/log/anyaicam, /etc/anyaicam-update, /var/lib/anyaicam-update."
     fi
 }
 

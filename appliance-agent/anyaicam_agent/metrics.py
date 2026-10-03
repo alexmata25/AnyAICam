@@ -106,4 +106,7 @@ def wireguard_state(config):
 
 
 def collect(config,cameras):
-    return {'software_version':config.software_version,'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),**local_storage_state(config),**wireguard_state(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}
+    # Software Update (2026-10-03): the installed VMS release ('1.2.0+<build12>')
+    # from the root-written release marker, not the agent's fixed placeholder.
+    from .updater.owner_update import installed_release_label
+    return {'software_version':installed_release_label(config),'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),**local_storage_state(config),**wireguard_state(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}

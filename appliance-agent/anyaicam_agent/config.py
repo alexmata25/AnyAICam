@@ -184,7 +184,24 @@ class AgentConfig:
     @property
     def current_version_pointer_file(self): return self.updates_dir/'current_version.txt'
     @property
-    def trusted_public_key_file(self): return Path(self.config_dir)/'trusted_signing_key.pem'
+    def trusted_public_key_file(self): return Path(self.config_dir).parent/'anyaicam-update'/'trusted_signing_key.pem'
+    # Software Update (2026-10-03): the trusted release-signing public key
+    # moved out of config_dir (which this agent may write) into the sibling
+    # root-owned directory the installer provisions (/etc/anyaicam-update/);
+    # the root applier reads the same file. The owner-requested release is staged by the agent under
+    # updates/staged/<update_id>/; the root applier writes its progress
+    # and outcome to updates/results/<update_id>.json. The installed
+    # release (version + full build_id) is the root-written release marker.
+    @property
+    def update_staged_dir(self): return self.updates_dir/'staged'
+    @property
+    def update_results_dir(self): return Path(self.state_dir).parent/'anyaicam-update'/'results'
+    # Root writes results in its own directory (the agent may only read them);
+    # which result states this agent already reported lives in its own state.
+    @property
+    def update_reported_dir(self): return self.updates_dir/'reported'
+    @property
+    def vms_release_marker_file(self): return Path(os.getenv('ANYAICAM_VMS_RELEASE_MARKER','/etc/anyaicam/vms_release.json'))
 
     # The three fields first_enroll()/coordinated_reenroll() write into
     # agent.json as part of a completed activation -- not general runtime

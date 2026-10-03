@@ -142,7 +142,7 @@ class DiagnosticsTests(unittest.TestCase):
 
 
 class WatcherDispatchTests(unittest.TestCase):
-    def test_dispatch_table_is_exactly_five_fixed_actions(self):
+    def test_dispatch_table_is_exactly_six_fixed_actions(self):
         # restart_agent added 2026-09-12: setup_wizard.py's own
         # _finish_enrollment() now queues an anyaicam-agent.service
         # restart through this same fixed-argv mechanism instead of an
@@ -163,6 +163,9 @@ class WatcherDispatchTests(unittest.TestCase):
             'restart_agent': ['systemctl', 'restart', 'anyaicam-agent.service'],
             'wireguard_interface_up': ['wg-quick', 'up', '/etc/anyaicam/wireguard/wg0.conf'],
             'wireguard_interface_down': ['wg-quick', 'down', '/etc/anyaicam/wireguard/wg0.conf'],
+            # Software Update (2026-10-03): see test_software_update_root_applier.py.
+            'apply_release': ['systemd-run', '--unit=anyaicam-software-update', '--property=CollectMode=inactive-or-failed',
+                              '--quiet', '/usr/bin/python3', '-I', '/opt/anyaicam-agent/privileged/apply_release.py'],
         })
 
     def _write_marker(self, tmp_path, marker):

@@ -25,6 +25,8 @@ from .updater.factory import build_update_state_machine
 from .updater.health import make_health_check
 from .updater.restart import make_restart_signal
 from .updater.s3_source import make_manifest_source
+from .updater.owner_update import OwnerUpdate, installed_release
+from .updater.apply_results import ResultRelay
 
 # How often run()'s pre-activation wait re-checks for a real credential.
 # Deliberately a short, fixed interval, not config.checkin_seconds (a
@@ -57,6 +59,11 @@ class ApplianceAgent:
         # always run at startup, regardless of whether this agent has
         # ever processed an install_update command.
         self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event),health_check=make_health_check(config,self.client),source=make_manifest_source(self.client))
+        # Software Update (2026-10-03): owner-requested installs are staged
+        # here and activated by the root applier; its progress/outcome is
+        # relayed back from updates/results/ every cycle.
+        self.owner_update=OwnerUpdate(config,history=self.state_machine.history,verifier=self.state_machine.verifier,source=self.state_machine.source,queue_privileged_action=self._queue_privileged_update)
+        self.result_relay=ResultRelay(config,history=self.state_machine.history,report=self.report_update_result)
         self.discovered_store=DiscoveredCameraStore(config.discovered_cameras_file)
         self.binding_store=CameraBindingStore(config.camera_bindings_file)
         self.vms_status=LocalVmsStatusReader(config.vms_hls_path,config.vms_recordings_path,config.vms_status_freshness_seconds,config.vms_recording_freshness_seconds)
@@ -97,6 +104,17 @@ class ApplianceAgent:
             self.state_machine.sweep_orphaned_state()
         except Exception:
             self.log.exception('sweep_orphaned_state() failed; continuing startup')
+    def _queue_privileged_update(self,action_type,payload):
+        # Same marker shape as commands._queue_privileged_action(): a known
+        # type and a correlation id, nothing executable. The root applier
+        # reads neither -- it finds the staged release itself.
+        marker={'type':action_type,'command_id':str(payload.get('update_id') or uuid.uuid4().hex),'requested_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+        atomic_write_json(self.config.pending_actions_dir/f'{action_type}.json',marker)
+    def relay_update_results(self):
+        try:
+            self.result_relay.poll()
+        except Exception:
+            self.log.exception('Relaying software update results failed; will retry next cycle')
     def report_update_result(self,result):
         # RDM-2 Group 2E: reports one concluded UpdateResult (from
         # resume_if_pending()) to Group 2D's dedicated endpoint. Payload
@@ -176,7 +194,9 @@ class ApplianceAgent:
             # activated and restarted on customer appliances with no customer
             # action. It now only CHECKS and remembers what is available;
             # applying an update is a separate, owner-confirmed action.
-            available=self.state_machine.check_available()
+            # The installed release is the root-written release marker, never
+            # the legacy current_version.txt pointer (which nothing runs from).
+            available=self.state_machine.check_available(installed_release(self.config.vms_release_marker_file).get('version',''))
             self.available_update=available
             if available is not None:
                 self.log.info('Update available (not installed; waiting for the owner): %s',available)
@@ -383,7 +403,7 @@ class ApplianceAgent:
     def poll_commands(self):
         try:
             for item in self.client.request('GET','/api/appliance/commands').get('commands',[]):
-                status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event,state_machine=self.state_machine,update_resume_failed=self.update_resume_failed); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
+                status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event,state_machine=self.state_machine,update_resume_failed=self.update_resume_failed,owner_update=self.owner_update); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
         except PortalError as error: self.log.debug('Command poll unavailable: %s',error)
     def resolve_media_uris(self,cloud_cameras):
         # Closes the last confirmed-live Samsung gap: cameras.onvif_
@@ -444,7 +464,7 @@ class ApplianceAgent:
         try: publish_lan_addresses(self.config.state_dir)
         except Exception: self.log.debug('LAN address publish failed', exc_info=True)
     def cycle(self):
-        self.publish_lan_addresses(); self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement()
+        self.publish_lan_addresses(); self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement(); self.relay_update_results()
     def _await_activation(self):
         """Waits for `anyaicam-setup` (interactive or --claim) to write a
         real credential, instead of treating a freshly-installed,

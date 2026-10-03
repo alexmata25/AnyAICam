@@ -6,6 +6,7 @@ path now only checks and remembers what is available; installing is a
 separate, owner-confirmed action."""
 import logging
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from anyaicam_agent.service import ApplianceAgent
@@ -19,7 +20,8 @@ class _Machine:
     def has_unresolved_activation(self):
         return False
 
-    def check_available(self):
+    def check_available(self, current_version=None):
+        self.checked_with = current_version
         return self.available
 
     def check_and_install(self, *args, **kwargs):
@@ -33,7 +35,8 @@ class _Machine:
 
 def _agent(machine):
     return SimpleNamespace(state_machine=machine, update_resume_failed=False, _next_source_check_at=0.0,
-                           available_update=None, config=SimpleNamespace(update_check_interval_seconds=900),
+                           available_update=None, config=SimpleNamespace(update_check_interval_seconds=900,
+                                                                    vms_release_marker_file=Path("no-such-marker.json")),
                            log=logging.getLogger("test"))
 
 

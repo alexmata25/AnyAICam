@@ -469,6 +469,10 @@ def _moment_within(moment: str,started_at: str,ended_at: str) -> bool:
 
 
 def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: Callable[[Request],dict] | None=None) -> None:
+    # Software Update (2026-10-03): registered first so /settings/system is
+    # matched before main.py's later generic /settings/{settings_slug}.
+    from software_update import register_software_update_routes
+    register_software_update_routes(app,shell)
     @app.get('/api/appliance/config')
     def appliance_config() -> dict:
         settings=cloud_settings(); return {'mode':settings['mode'],'base_url':settings['base_url'],'mock_cloud':settings['mock'],'timestamp_window_seconds':300,'camera_credentials_allowed':False}
@@ -2018,7 +2022,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # checked -- there is no shared import path between this package
         # and the agent's, so nothing from the request is trusted as-is.
         authenticate_appliance(request)
-        from updates_storage import get_latest_release,load_signing_key,sign_manifest,validate_path_segment
+        from updates_storage import get_latest_release,validate_path_segment
         try:
             target=validate_path_segment(target,'target'); channel=validate_path_segment(channel,'channel')
         except ValueError as error:
@@ -2030,13 +2034,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # py's ManifestSource treats exactly this shape as "no update
             # right now," not an error.
             return {'status':'no_update_available'}
-        signing_key=load_signing_key()
-        if signing_key is None:
-            logger.error('appliance_updates.signing_key_unavailable target=%s channel=%s',target,channel)
-            raise HTTPException(status_code=503,detail='Update signing is not configured.')
-        signature=sign_manifest(release['manifest'],signing_key)
+        # Software Update (2026-10-03): releases are signed offline; this
+        # server holds no private key and only serves the stored signature.
+        signature=release.get('signature')
+        if not isinstance(signature,str) or not signature:
+            logger.error('appliance_updates.release_unsigned target=%s channel=%s',target,channel)
+            raise HTTPException(status_code=503,detail='The published release has no offline signature.')
         package_url=get_storage().url('updates',release['package_key'],expires_seconds=300)
-        return {'manifest':release['manifest'],'signature':base64.b64encode(signature).decode('ascii'),'package_url':package_url}
+        return {'manifest':release['manifest'],'signature':signature,'package_url':package_url}
 
     @app.post('/api/appliance/updates/{update_id}/result')
     def appliance_update_result(request: Request,update_id: str,payload: dict) -> dict:
@@ -2050,7 +2055,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         state=str(payload.get('state','')).strip()
         if not state: raise HTTPException(status_code=400,detail='state is required.')
         now=datetime.now().isoformat()
+        from software_update import record_update_progress
         with connection() as db:
+            # Software Update (2026-10-03): one row per update and appliance
+            # carries the CURRENT state (downloading -> installing ->
+            # validating -> final). A final outcome is never overwritten.
+            if record_update_progress(db,update_id=update_id,appliance_id=appliance['id'],payload=payload,state=state,now=now):
+                audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.update_result_reported','appliance_update',update_id,{'state':state})
+                return {'status':'accepted'}
             try:
                 db.execute('INSERT INTO appliance_update_results(update_id,appliance_id,from_version,to_version,state,error,rollback_from,duration_seconds,reported_at) VALUES(?,?,?,?,?,?,?,?,?)',
                     (update_id,appliance['id'],payload.get('from_version'),payload.get('to_version'),state,str(payload.get('error',''))[:500],payload.get('rollback_from'),payload.get('duration_seconds'),now))
@@ -2361,6 +2373,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         command=str(payload.get('command',''))
         if not payload.get('confirmed'): raise HTTPException(status_code=400,detail='Explicit command confirmation is required.')
         if command not in ALLOWED_COMMANDS: raise HTTPException(status_code=400,detail='Only approved appliance commands are allowed. Remote shell is not supported.')
+        # Software Update (2026-10-03): installing software is the customer
+        # account owner's decision, from Settings -> System only
+        # (software_update.py). Partners and the Admin Portal bridge cannot.
+        if command=='install_update': raise HTTPException(status_code=403,detail='Software updates are installed by the account owner from Settings > System.')
         from partner_db import require_permission
         try: require_permission(identity,'appliance.action')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
@@ -2461,7 +2477,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             backlog_text=f'{pending_count} pending · {quarantined_count} quarantined' if pending_count is not None else 'Not yet reported'
             storage_free_percent=item.get('storage_free_percent')
             storage_text=f'{(storage_state or "healthy").replace("_"," ").title()} · {storage_free_percent:.1f}% free' if storage_state is not None and storage_free_percent is not None else 'Not yet reported'
-            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Local storage</span><strong>{escape(storage_text)}</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('install_update','Install update'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
+            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Local storage</span><strong>{escape(storage_text)}</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
         # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
         # this query previously had no tenant predicate at all, so any
         # partner-scoped administrator saw every other partner's queued

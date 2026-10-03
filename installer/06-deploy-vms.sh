@@ -154,6 +154,11 @@ ensure_vms_env() {
     # every reinstall/repair while all other customer configuration survives.
     upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VMS_COMMIT" "$VMS_RELEASE_COMMIT"
     upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_BUILD_ID" "$VMS_RELEASE_COMMIT"
+    # Software Update (2026-10-03): the product release version /version
+    # reports next to build_id (older installers carry none).
+    if [[ -n "${RELEASE_VERSION:-}" ]]; then
+        upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VERSION" "$RELEASE_VERSION"
+    fi
     chown anyaicam:anyaicam "$VMS_ENV_FILE" 2>/dev/null || true
     chmod 0640 "$VMS_ENV_FILE"
 }
@@ -342,6 +347,15 @@ deploy_vms() {
     # install already left with the wrong owner (rsync skips unchanged
     # files, so --no-owner alone would never fix those).
     relocate_stale_install_dirs || return 1
+    # The VMS container bind-mounts $VMS_INSTALL_ROOT/app as its /app, so it
+    # runs whatever is in that tree. A repair must not rewrite the tree
+    # under a running VMS (it could load half-old, half-new modules): stop
+    # it first; systemd_setup restarts it once the new release is in place.
+    # (Software Update does not use this path: it swaps whole directories.)
+    if [[ "$state" != "clean" ]] && systemctl is-active --quiet anyaicam-vms.service 2>/dev/null; then
+        log "Stopping the VMS before replacing its bind-mounted application tree ..."
+        systemctl stop anyaicam-vms.service
+    fi
     rsync -a --no-owner --no-group --delete \
         --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
         "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/"
