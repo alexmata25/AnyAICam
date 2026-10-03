@@ -1,4 +1,32 @@
 # Samsung appliance — checkpoint
+## 2026-10-03 — remote steps paused for physical USB installation
+
+User reports Samsung is booting USB and explicitly requests remote steps pause
+until fresh Ubuntu installation and network return. No further remote commands.
+ISO download SSH session disconnected at ~97%; ISO checksum/USB write/readback
+are unconfirmed. Operator must verify live USB Ubuntu 24.04.4 before system erase.
+No agent system-disk erase or new OS/VMS install is claimed.
+User authorized disposable isolated EC2 helper. New VPC/network/key/instance created,
+no portal or simulator provisioned. Helper i-0360bac15559416c1 remains running.
+Exact resource cleanup ledger: ../../validation/installer-track/AWS_LAB_RESOURCES.json.
+Physical evidence: ../../validation/installer-track/SAMSUNG_PHYSICAL_RESULTS.md.
+Do not resume remote steps until the operator reports installation/network ready.
+
+## 2026-10-03 — authenticated media preparation; USB identified and authorized
+
+Samsung remains positively verified, with the same NVMe serial 193077800308.
+User confirmed physical-console help and erasure of dedicated USB. Exact USB is
+General UDisk serial 2408200641348662589024, 31,457,280,000 bytes.
+Ubuntu CD Image signing fingerprint 843938DF228D22F7B3742BC0D94AA3F0EFE21092
+authenticated SHA256SUMS.gpg. Exact Ubuntu 24.04.4 Desktop ISO download is underway
+on Samsung. Guarded media writer is open on Samsung's physical desktop; local sudo
+password required, no password/private key through chat. Writes authorized USB only.
+No internal system-disk erase, Ubuntu install, VMS install or physical acceptance
+success is claimed. Isolated portal/helper/network placement remains unresolved.
+Dell host/services/networking unchanged; no excluded systems accessed.
+Current evidence: ../../validation/installer-track/SAMSUNG_PHYSICAL_RESULTS.md.
+Earlier read-only/offline statuses below are historical, superseded by this entry.
+
 ## 2026-10-03 — Samsung now verified online; destructive execution not started
 
 SSH via Samsung-specific key succeeded. Verified hostname anyaicam-samsung,

@@ -1,0 +1,31 @@
+{
+  "name": "anyaicam-installer-validation-20261003",
+  "region": "us-east-1",
+  "profile": "anyaicam-validation",
+  "account": "880690594006",
+  "status": "paused-user-request-awaiting-fresh-samsung-network",
+  "samsung_egress_cidr": "66.60.254.93/32",
+  "resources": {
+    "vpc_id": "vpc-0a72adcbc48c33cb3",
+    "subnet_id": "subnet-0ba14dc1e06ed4f8a",
+    "internet_gateway_id": "igw-0b0d7ff4b18603c66",
+    "route_table_id": "rtb-0042766559c0edb95",
+    "route_association_id": "rtbassoc-07ebd101ec302d664",
+    "security_group_id": "sg-0610d633892dd98ef",
+    "key_pair_name": "anyaicam-installer-validation-20261003-helper",
+    "key_pair_id": "key-03985336e7004d311",
+    "instance_id": "i-0360bac15559416c1",
+    "network_interface_id": "eni-0639eee634c4e81fb",
+    "root_volume_id": "vol-01a33df1c0a730d2d"
+  },
+  "ami_id": "ami-0045d7fc2ad003464",
+  "instance_type": "t3.large",
+  "public_ip": "100.27.41.127",
+  "private_ip": "10.253.77.16",
+  "portal_provisioned": false,
+  "simulator_provisioned": false,
+  "blockers": [
+    "Physical Ubuntu installation/network recovery pending",
+    "Authenticated EC2 SSH host-key verification: validation identity lacks ec2:GetConsoleOutput"
+  ]
+}

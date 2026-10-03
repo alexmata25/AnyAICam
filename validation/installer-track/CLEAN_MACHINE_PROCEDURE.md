@@ -12,18 +12,23 @@ nothing important needs preservation. That supersedes the old Samsung checkpoint
 no-reimage constraint. No wipe/repartition/install/reboot has been performed.
 
 Authorized endpoint: alejandro-mata@100.99.177.7.
-Read-only Tailscale inventory: peer hostname anyaicam-samsung, Linux,
-DNS anyaicam-samsung-1.tail43a8dd.ts.net, Online=false, last seen
-2026-09-30T13:19:13.1Z. SSH from Windows and existing Ubuntu WSL timed out.
-Local Tailscale self is AlexDellLaptop / 100.119.39.95, a DIFFERENT endpoint.
-This peer record is NOT positive hardware/system-disk identification. Actual DMI,
-CPU/RAM, disk model/serial/layout/free space and Ubuntu version remain unverified.
-No commands executed on Samsung; only connection attempts and local status reads.
+Samsung is now online and positively verified: hostname anyaicam-samsung, SAMSUNG
+930MBE/P02AHK, Intel i7-8565U (4 cores/8 threads), approximately 16 GB RAM, UEFI.
+Current Ubuntu is 24.04.5 LTS. System NVMe is SN520 SDAPNUW-512G-1004,
+serial 193077800308, 512,110,190,592 bytes, root nvme0n1p2 and EFI p1.
+Current disk capacity is sufficient; the fresh-OS free-space gate remains pending.
+The user confirmed physical console help and an erasable dedicated USB.
+USB is General UDisk, serial 2408200641348662589024, 31,457,280,000 bytes.
+Authenticated Ubuntu ISO download and guarded USB preparation are underway.
+See SAMSUNG_INVENTORY.md and SAMSUNG_PHYSICAL_RESULTS.md for live evidence.
 
-Blockers: Samsung must be reachable; physical console or independent remote boot
-access must be available; target hardware and system disk must be unambiguous.
-The SSH connection will be lost after erasing the OS/Tailscale credentials. Do NOT
-erase the mounted root disk over an SSH-only session and hope it reconnects.
+Samsung requires a local sudo password; never send it through chat. The media
+writer is open in Samsung GNOME Terminal, waits for a verified ISO, and writes
+ONLY the exact authorized USB. The system disk is erased only from the booted
+physical Ubuntu installer after rechecking hardware and disk identity.
+No isolated portal/helper host or lab network is reserved yet.
+SSH access is lost when the old Ubuntu/SSH/Tailscale state is erased.
+Do NOT erase the mounted root disk through the running SSH session.
 
 ## 1. Positive identification and read-only inventory — before any erase
 
@@ -107,7 +112,7 @@ https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-desktop-amd64.iso
 SHA-256: 3a4c9877b483ab46d7c3fbe165a0db275e1ae3cfe56a5657e5a47c2f99a99d1e
 
 Authenticate Canonical SHA256SUMS.gpg and compare downloaded ISO digest before
-writing media. ISO has not been downloaded or signature-authenticated this turn.
+writing media. Canonical metadata signature is now authenticated; ISO download is underway.
 Use a specifically identified empty/dedicated >=16 GB USB. Writing installer media
 also erases that USB; never select a backup disk. Prepare media on approved equipment;
 no Dell host changes or software installation. Console operator/independent boot
