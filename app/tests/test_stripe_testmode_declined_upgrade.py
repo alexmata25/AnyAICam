@@ -79,11 +79,25 @@ def _emails(env):
         conn.close()
 
 
+def _invoice_state(env, invoice_id):
+    conn = sqlite3.connect(env["path"])
+    try:
+        found = conn.execute("SELECT state FROM billing_invoice_states WHERE invoice_id=?", (invoice_id,)).fetchone()
+        return found[0] if found else None
+    finally:
+        conn.close()
+
+
 def test_a_declined_upgrade_proration_does_not_start_grace_on_the_paid_local_plan(env):
     _local_customer_with_declined_upgrade(env)
+    # No "your payment failed" email for a plan that is paid: that email only
+    # ever sends for an invoice recorded as 'failed'.
+    assert _invoice_state(env, PRORATION) != "failed"
+    import purchase_notifications
+    assert purchase_notifications.notify_payment_failed(PRORATION)["status"] == "ignored"
+    assert _emails(env) == 0
     plan = _plan(env["path"])
     assert plan["status"] == "active" and plan["payment_failed_at"] is None
-    assert _emails(env) == 0  # no "your payment failed" email for a plan that is paid
 
 
 def test_the_paid_local_plan_is_not_suspended_after_the_declined_upgrade_expires(env):
@@ -117,8 +131,20 @@ def test_a_failed_renewal_still_starts_grace_exactly_as_before(env):
     assert _deliver(env, _event("evt_renewal_failed", "invoice.payment_failed", renewal,
                                 int(NOW.timestamp()))).status_code == 200
     assert _plan(env["path"])["payment_failed_at"] is not None
+    assert _invoice_state(env, "in_renewal_cycle") == "failed"  # so the renewal-failure email is still due
     assert _sweep(env, NOW + timedelta(days=8)) == 1
     assert _plan(env["path"])["status"] == "suspended"
+
+
+def test_a_subscription_stripe_makes_past_due_still_starts_grace_after_a_declined_upgrade(env):
+    """Control: if Stripe itself reports the subscription past_due, grace starts as before."""
+    _local_customer_with_declined_upgrade(env)
+    past_due = dict(_pending_subscription(), status="past_due")
+    env["stripe"][SUB] = past_due
+    assert _deliver(env, _event("evt_past_due", "customer.subscription.updated", past_due,
+                                int(NOW.timestamp()) + 120)).status_code == 200
+    assert _plan(env["path"])["payment_failed_at"] is not None
+    assert _sweep(env, NOW + timedelta(days=8)) == 1
 
 
 # ---------------------------------------------------------------- real-object replays of the successful upgrade
