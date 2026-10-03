@@ -1733,7 +1733,11 @@ def apply_migrations():
         # nullable/defaulted and additive, so an older build is unaffected.
         invitation_columns=_columns('invitations')
         for column,ddl in (('name','TEXT'),('token_hash','TEXT'),('permissions_json','TEXT'),('accepted_at','TEXT'),
-                           ('cancelled_at','TEXT'),('accepted_user_id','TEXT'),('last_sent_at','TEXT'),('send_count','INTEGER')):
+                           ('cancelled_at','TEXT'),('accepted_user_id','TEXT'),('last_sent_at','TEXT'),('send_count','INTEGER'),
+                           # 2026-10-02: the outcome of the latest email attempt for the
+                           # invitation (sent / preview / failed), so a created invitation
+                           # is never shown as an emailed one when delivery failed.
+                           ('email_status','TEXT'),('email_error','TEXT'),('email_attempted_at','TEXT')):
             if column not in invitation_columns: db.execute(f'ALTER TABLE invitations ADD COLUMN {column} {ddl}')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_token_hash ON invitations(token_hash)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_invitations_customer_status ON invitations(customer_id,status)')
