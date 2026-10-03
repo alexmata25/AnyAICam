@@ -1,6 +1,7 @@
 {
   "status": "prepared, unpublished; simulator not started; not a complete offline installer",
-  "source_commit": "d5af9c53cbef1f2c400f56e148c5cb080770dc07",
+  "base_commit": "d5af9c53cbef1f2c400f56e148c5cb080770dc07",
+  "source_commit": "a1c81e0f492633a80198503e721fc6c277e6a8b3",
   "mediamtx": {
     "version": "v1.21.0",
     "platform": "linux_amd64",
@@ -13,8 +14,8 @@
     "version": "7:6.1.1-3ubuntu5",
     "url": "https://archive.ubuntu.com/ubuntu/pool/universe/f/ffmpeg/ffmpeg_6.1.1-3ubuntu5_amd64.deb",
     "sha256": "1a23baace5f2688a47e28119aedae6993cd638e6279a7227dfc52d9a337a1c17",
-    "runtime_lock": "ffmpeg-runtime.lock.json",
-    "runtime_note": "194 installed package versions and 214 library hashes recorded. Old installed libapparmor1 archive digest unavailable in cached apt metadata; resolve before offline VM build. No system packages installed/updated."
+    "runtime_lock": "offline-simulator.lock.json",
+    "runtime_note": "251-package FFmpeg/Python dependency closure resolved with temporary empty dpkg status and freshly signature-verified Ubuntu metadata; no system packages installed or updated. See offline-simulator.lock.json for exact versions, hashes and downloaded status."
   },
   "onvif": {
     "implementation": "onvif_simulator.py",
@@ -33,7 +34,7 @@
     "camera.env.example": "6db429ba1bf39954c7ab9eef09d65fa3d25a49ff1ef7d1dc64cdd9828e948ecf",
     "publish-test-video.sh": "ec0944a7e1c01014c2ac2ba49ddcc29308daed1792180cb4715050cee5b5ae22",
     "portal.env.example": "c3f2af6fb1843ffc2d3a972b143c5ea894ecd16a9eb2159c5e2ae38c678b1650",
-    "owner-location.plan.json": "f980855c251f8961aa84d979fef7c9e679c61533e21b9fd562f9f709cb6737bf"
+    "owner-location.plan.json": "3eaed9cc722ad22729a20ca52ca2e6812df74c72f580e3a99ba3a11fd1916d6b"
   },
   "pinned_schema_source_sha256": {
     "app/partner_db.py": "27dfba0c2d74b2d90ada4a51c3d7ecb58685de7fffcac3eed98b87bf60aa6498",

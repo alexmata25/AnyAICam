@@ -83,7 +83,7 @@ Install a standard Ubuntu desktop user. Verify >=100 GiB real free root space,
 ## Portal prerequisites — prepared, not provisioned
 
 Use portal.env.example and owner-location.plan.json on the helper only.
-Export exact pinned app/schema files from d5af9c53...; do not reuse an existing
+Export exact fixed app/schema files from a1c81e0f4926... (based on d5af9c53...); do not reuse an existing
 staging/prod checkout, environment, account database or bindings.
 Create a new guest-local CA/certificate for installer-test.test, trust it inside
 both disposable guests, and map the hostname to the helper address.
@@ -128,7 +128,7 @@ Redact setup codes, possession secrets, credentials, cookies and claim proofs.
 - [ ] Refuse wrong owner/site, missing/bad CSRF, wrong origin, expired/replayed claim,
       incorrect possession secret and missing encryption key.
 - [ ] Corrupt package fails before privileges/mutations.
-- [ ] Verify exact 100 GiB byte boundary on disposable VM; review rounding finding.
+- [ ] Verify exact 100 GiB byte boundary on disposable VM; verify the corrected exact-byte boundary.
 - [ ] Default uninstall preserves documented state; reinstall uses supported technician
       install/claim flow, since the fresh launcher refuses retained identity.
 - [ ] Restore clean VM snapshot for fresh-install recovery; do not pretend initial
@@ -136,6 +136,11 @@ Redact setup codes, possession secrets, credentials, cookies and claim proofs.
 - [ ] Separately exercise an actual valid rollback point with reviewed fixture
       previous release, database preservation and optional restore. No Software
       Update changes or production deployments.
-- [ ] Freeze exact investor archive/checksum plus install/uninstall/recovery docs.
+- [ ] Freeze exact 1.1.1 investor archive/checksum plus install/uninstall/recovery docs.
 - [ ] Mark clean-machine acceptance complete only with actual OS lifecycle evidence.
 - [ ] Publish nothing; Windows native implementation waits for this acceptance.
+
+The offline camera-simulator bundle includes MediaMTX and the complete FFmpeg/Python
+package closure. Use its manifest and --no-download guest-only install instructions.
+The appliance installer still requires its existing Ubuntu/Docker/Python/VMS dependency
+network access; this simulator bundle does not convert the VMS installer to offline mode.

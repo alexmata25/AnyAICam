@@ -1,11 +1,12 @@
 # Ubuntu investor candidate — unpublished, preliminary validation only
 
-Installer 1.1.0, VMS and installer source commit:
-d5af9c53cbef1f2c400f56e148c5cb080770dc07.
+Installer 1.1.1, VMS and installer source commit:
+a1c81e0f492633a80198503e721fc6c277e6a8b3.
+Derived from immutable base d5af9c53cbef1f2c400f56e148c5cb080770dc07.
 Exact proposed download artifact (not uploaded anywhere):
-anyaicam-appliance-installer-1.1.0-vms-d5af9c53cbef.tar.gz
-SHA-256: 45ce04ff237d55faff194d791f3a6a0aef6a7aa8384f7ef152a51f18298fef87
-Size: 36,465,857 bytes. Includes verified MediaMTX v1.21.0.
+anyaicam-appliance-installer-1.1.1-vms-a1c81e0f4926.tar.gz
+SHA-256: 9dd0fe3fef6b46752a74ea49b4426cf9030313b926b1795a2e50c68bc48a53ac
+Size: 36,467,580 bytes. Includes verified MediaMTX v1.21.0.
 
 This is an Ubuntu archive, not a Windows executable. Use only a disposable,
 clean Ubuntu 24.04 x86_64 desktop for the next acceptance test. Allow at least
@@ -29,7 +30,7 @@ Never send setup codes or device possession credentials to another person.
 
 For the lab technician, from the extracted directory (future VM only):
 
-    sha256sum ../anyaicam-appliance-installer-1.1.0-vms-d5af9c53cbef.tar.gz
+    sha256sum ../anyaicam-appliance-installer-1.1.1-vms-a1c81e0f4926.tar.gz
     ./setup.sh --portal-url https://installer-test.test --product-mode local
 
 Compare the checksum exactly. The launcher verifies the embedded package before

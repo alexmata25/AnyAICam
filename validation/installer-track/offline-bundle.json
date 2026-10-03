@@ -1,0 +1,13 @@
+{
+  "filename": "anyaicam-camera-simulator-ubuntu24.04-ffmpeg6.1.1-mediamtx1.21.0-a1c81e0f4926.tar.gz",
+  "sha256": "f1cab1a7c7488d2f8c501d1469ebb2ced437835067957651e42ea565f4f08c2b",
+  "size_bytes": 209869407,
+  "debian_packages": 251,
+  "manifest_files": 268,
+  "mediamtx": "v1.21.0",
+  "ffmpeg": "7:6.1.1-3ubuntu5",
+  "source_fix_commit": "a1c81e0f492633a80198503e721fc6c277e6a8b3",
+  "published": false,
+  "scope": "MediaMTX + FFmpeg + stdlib Python ONVIF simulator only; not the VMS/Docker installer dependency closure",
+  "runtime_validation": "offline apt simulation, extracted FFmpeg and Python/ONVIF passed; actual guest installation pending"
+}

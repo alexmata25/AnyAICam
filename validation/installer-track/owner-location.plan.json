@@ -1,6 +1,6 @@
 {
   "status": "prepared-only; do not execute or provision",
-  "source_commit": "d5af9c53cbef1f2c400f56e148c5cb080770dc07",
+  "source_commit": "a1c81e0f492633a80198503e721fc6c277e6a8b3",
   "database": {
     "backend": "sqlite",
     "path": "/var/lib/anyaicam-installer-test/portal.db",
