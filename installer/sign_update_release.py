@@ -97,6 +97,29 @@ def build_manifest(*, installer: Path, previous_installer: Path | None, first_re
         return manifest, embedded_key
 
 
+def load_signing_key(pem: bytes, prompt=None):
+    """Loads the offline private key. A passphrase-protected key (the
+    recommended form) is unlocked with a passphrase typed at an interactive
+    prompt (getpass: not echoed). The passphrase is never printed, logged,
+    written anywhere, or accepted from the command line or the environment."""
+    from cryptography.hazmat.primitives import serialization
+
+    try:
+        return serialization.load_pem_private_key(pem, password=None)
+    except TypeError:
+        pass  # encrypted: needs the passphrase
+    if prompt is None:
+        import getpass
+        prompt = getpass.getpass
+    passphrase = prompt("Passphrase for the offline signing key: ")
+    try:
+        return serialization.load_pem_private_key(pem, password=passphrase.encode("utf-8"))
+    except (TypeError, ValueError):
+        raise SystemExit("Could not unlock the signing key (wrong passphrase or not a PEM private key).") from None
+    finally:
+        passphrase = None  # noqa: F841 -- drop the reference as soon as possible
+
+
 def sign(manifest: dict, private_key_path: Path, embedded_public_key: bytes) -> bytes:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -104,7 +127,7 @@ def sign(manifest: dict, private_key_path: Path, embedded_public_key: bytes) -> 
     resolved = private_key_path.resolve()
     if REPO_ROOT in resolved.parents:
         raise SystemExit("Refusing a signing key stored inside the repository; keep it offline.")
-    key = serialization.load_pem_private_key(resolved.read_bytes(), password=None)
+    key = load_signing_key(resolved.read_bytes())
     if not isinstance(key, rsa.RSAPrivateKey):
         raise SystemExit("The signing key must be an RSA private key.")
     # Compare the KEYS (DER SubjectPublicKeyInfo), not PEM text: line endings
