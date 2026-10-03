@@ -1,4 +1,18 @@
 # Samsung appliance — checkpoint
+## 2026-10-03 — Samsung now verified online; destructive execution not started
+
+SSH via Samsung-specific key succeeded. Verified hostname anyaicam-samsung,
+SAMSUNG model 930MBE/P02AHK, Intel i7-8565U (4 cores/8 threads), ~16 GB RAM,
+Ubuntu 24.04.5 LTS, UEFI. System disk /dev/nvme0n1, SN520 SDAPNUW-512G-1004,
+serial 193077800308, 512,110,190,592 bytes; root nvme0n1p2 ext4, EFI p1.
+447,182,098,432 bytes currently available (~416.47 GiB); after-reinstall check pending.
+VMS image anyaicam-vms:f5a6d87 healthy/running; existing agent/VMS/watcher/config state.
+Read-only only: no file changes, stops, uploads, reboot, erase or installation on Samsung.
+Sudo needs authentication; independent console/USB boot path and isolated helper
+remain unconfirmed. Wipe authorization persists; blocked on these prerequisites.
+Full evidence: ../../validation/installer-track/SAMSUNG_INVENTORY.md.
+Earlier offline observations below are historical and superseded.
+
 ## 2026-10-03 — physical clean-test authorization; target currently unreachable
 
 The user now explicitly authorizes wiping/reinstalling the dedicated Samsung for
