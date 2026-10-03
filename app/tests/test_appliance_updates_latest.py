@@ -290,3 +290,50 @@ def test_update_result_requires_authentication(client, db_path):
     response = client.post("/api/appliance/updates/upd-1/result", json={"state": "healthy"})
 
     assert response.status_code == 401
+
+
+# --------------------------------------------------------- publish_update_release.py (the staging publish command)
+
+
+def _cli_files(tmp_path, private_key, manifest=None, package=PACKAGE, tamper_signature=False):
+    import json
+    manifest = manifest or _manifest()
+    signature = _offline_sign(private_key, manifest)
+    if tamper_signature:
+        signature = bytes([signature[0] ^ 1]) + signature[1:]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "manifest.sig").write_bytes(base64.b64encode(signature) + b"\n")
+    (tmp_path / "package.tar.gz").write_bytes(package)
+    return ["--manifest", str(tmp_path / "manifest.json"), "--signature", str(tmp_path / "manifest.sig"),
+            "--package", str(tmp_path / "package.tar.gz")]
+
+
+def test_publish_command_verify_only_checks_everything_and_stores_nothing(tmp_path, local_storage, signing_key_pair, capsys):
+    import publish_update_release
+    assert publish_update_release.main(_cli_files(tmp_path, signing_key_pair) + ["--verify-only"]) == 0
+    assert '"status": "verified"' in capsys.readouterr().out
+    assert updates_storage.get_latest_release("anyaicam-appliance", "stable") is None
+
+
+def test_publish_command_publishes_a_correctly_signed_release(client, db_path, tmp_path, local_storage, signing_key_pair, capsys):
+    import publish_update_release
+    _seeded(db_path)
+    assert publish_update_release.main(_cli_files(tmp_path, signing_key_pair)) == 0
+    assert '"status": "published"' in capsys.readouterr().out
+    served = client.get("/api/appliance/updates/latest?target=anyaicam-appliance&channel=stable",
+                        headers=_auth_headers("appl-1", "test-credential")).json()
+    assert served["manifest"] == _manifest()
+    assert base64.b64decode(served["signature"]) == _offline_sign(signing_key_pair, _manifest())
+
+
+@pytest.mark.parametrize("problem", ["bad_signature", "wrong_package", "no_public_key"])
+def test_publish_command_refuses_and_stores_nothing(tmp_path, local_storage, signing_key_pair, monkeypatch, capsys, problem):
+    import publish_update_release
+    args = _cli_files(tmp_path, signing_key_pair, tamper_signature=problem == "bad_signature")
+    if problem == "wrong_package":
+        (tmp_path / "package.tar.gz").write_bytes(b"a different package")
+    if problem == "no_public_key":
+        monkeypatch.delenv("ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE")
+    assert publish_update_release.main(args) == 1
+    assert '"status": "refused"' in capsys.readouterr().out
+    assert updates_storage.get_latest_release("anyaicam-appliance", "stable") is None

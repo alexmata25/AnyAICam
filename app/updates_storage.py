@@ -94,12 +94,10 @@ class PublishError(Exception):
     pass
 
 
-def publish_release(target: str, channel: str, *, manifest: dict, package_bytes: bytes, signature: bytes) -> dict:
-    """Publishes one offline-signed release as this target/channel's
-    'latest': the signature must verify under the configured public key,
-    and the package must have the manifest's SHA-256 and size. Stores the
-    package first and the catalog pointer LAST, so a reader never sees a
-    pointer to a missing package."""
+def verify_release(target: str, channel: str, *, manifest: dict, package_bytes: bytes, signature: bytes) -> None:
+    """Every check publish_release() makes, without storing anything: the
+    signature verifies under the configured PUBLIC key, and the package has
+    the manifest's SHA-256 and size, target and channel. Raises PublishError."""
     public_key = load_trusted_public_key()
     if public_key is None:
         raise PublishError("ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE is not configured; refusing to publish.")
@@ -113,6 +111,14 @@ def publish_release(target: str, channel: str, *, manifest: dict, package_bytes:
         raise PublishError("The package does not match the manifest's size.")
     if manifest.get("target") != target or manifest.get("channel") != channel:
         raise PublishError("The manifest is for a different target/channel.")
+
+
+def publish_release(target: str, channel: str, *, manifest: dict, package_bytes: bytes, signature: bytes) -> dict:
+    """Publishes one offline-signed release as this target/channel's
+    'latest' after verify_release(). Stores the package first and the
+    catalog pointer LAST, so a reader never sees a pointer to a missing
+    package."""
+    verify_release(target, channel, manifest=manifest, package_bytes=package_bytes, signature=signature)
     storage = get_storage()
     base = _catalog_key(target, channel).rsplit("/", 1)[0]
     update_id = validate_path_segment(str(manifest.get("update_id", "")), "update_id")

@@ -81,6 +81,11 @@ STAGING_MOUNTS = (
 # only gets GOOGLE_APPLICATION_CREDENTIALS (a path) from the env file.
 STAGING_SECRET_MOUNTS = (
     ("/etc/anyaicam-staging/firebase", "/run/secrets/firebase"),
+    # Software Update (2026-10-03): the release-signing PUBLIC key the cloud
+    # checks offline signatures against before publishing. Never a private
+    # key (releases are signed offline). The env file sets
+    # ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE=/run/secrets/update-signing/update-signing-public.pem.
+    ("/etc/anyaicam-staging/update-signing", "/run/secrets/update-signing"),
 )
 
 
