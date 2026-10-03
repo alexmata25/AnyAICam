@@ -288,3 +288,6 @@ def test_secret_folder_is_mounted_read_only_only_when_present():
     assert base == cut.STAGING_MOUNTS
     with_secret = cut.default_mounts(isdir=lambda path: path == "/etc/anyaicam-staging/firebase")
     assert with_secret == cut.STAGING_MOUNTS + ("/etc/anyaicam-staging/firebase:/run/secrets/firebase:ro",)
+    # Software Update: the signing PUBLIC key folder, read-only, only when present.
+    with_key = cut.default_mounts(isdir=lambda path: path == "/etc/anyaicam-staging/update-signing")
+    assert with_key == cut.STAGING_MOUNTS + ("/etc/anyaicam-staging/update-signing:/run/secrets/update-signing:ro",)

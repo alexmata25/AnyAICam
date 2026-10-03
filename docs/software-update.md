@@ -59,9 +59,14 @@ the agent. The installer's repair path also rsynced new code into that bind-moun
 3. Sign offline: `installer/sign_update_release.py --installer <tarball> --previous-installer <current release tarball>
    --signing-key <offline private key> --out-dir out/`. It refuses non-additive database changes and a key that
    does not match the one the installer provisions.
-4. Publish on the cloud host with the public key configured (`ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE`):
-   `updates_storage.publish_release(target, channel, manifest=…, package_bytes=…, signature=…)`. It verifies
-   the signature, SHA-256 and size before storing anything.
+4. Publish from inside the cloud portal container, which holds only the public key
+   (`ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE`). Use `--verify-only` first: it runs every check and stores nothing.
+   `python publish_update_release.py --manifest manifest.json --signature manifest.sig --package <installer> [--verify-only]`
+   The command verifies the signature, SHA-256, size, target and channel before storing anything.
+   On staging, the key folder `/etc/anyaicam-staging/update-signing/` (root 0755,
+   key 0444). `deploy/staging_bluegreen_cutover.py` mounts it read-only at `/run/secrets/update-signing`.
+   Appliances download packages from presigned S3 links, so the cloud must run `ANYAICAM_STORAGE_BACKEND=s3`.
+   The local backend's `/storage/…` paths are relative and not downloadable by the agent.
 
 ## Tests
 
