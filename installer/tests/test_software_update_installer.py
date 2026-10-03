@@ -239,6 +239,32 @@ class OfflineSignerTests(unittest.TestCase):
                             "--signing-key", str(self.key_file), "--out-dir", str(self.tmp / "out")])
         self.assertEqual(code, 0)
 
+    def test_a_passphrase_protected_key_is_unlocked_by_an_interactive_prompt(self):
+        """The owner's real key is passphrase-protected: the signer must ask
+        for the passphrase (not echoed) and never print it."""
+        from unittest import mock
+        from cryptography.hazmat.primitives import serialization
+        encrypted = self.tmp / "encrypted-signing-key.pem"
+        encrypted.write_bytes(self.private_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(b"correct horse battery staple")))
+        out = self.tmp / "out"
+        with mock.patch("getpass.getpass", return_value="correct horse battery staple") as prompt, \
+                mock.patch("sys.stdout") as stdout:
+            code = signer.main(["--installer", str(self._installer("1.2.0", BUILD_B)), "--first-release",
+                                "--signing-key", str(encrypted), "--out-dir", str(out)])
+        self.assertEqual(code, 0)
+        prompt.assert_called_once()
+        printed = "".join(str(call.args[0]) for call in stdout.write.call_args_list if call.args)
+        self.assertNotIn("correct horse", printed)
+        self.assertTrue((out / "manifest.sig").exists())
+        with mock.patch("getpass.getpass", return_value="Zq9-not-the-passphrase"):
+            with self.assertRaises(SystemExit) as raised:
+                signer.main(["--installer", str(self._installer("1.2.0", BUILD_B)), "--first-release",
+                             "--signing-key", str(encrypted), "--out-dir", str(self.tmp / "out2")])
+        self.assertIn("Could not unlock", str(raised.exception))
+        self.assertNotIn("Zq9-not-the-passphrase", str(raised.exception))
+
     def test_a_key_that_appliances_would_not_trust_is_refused(self):
         _other, other_public = generate_keypair()
         with self.assertRaises(SystemExit) as raised:
