@@ -19,10 +19,10 @@ for threshold in 99 100 101; do
   printf 'CLEAN_STORAGE_%s_GIB_EXIT=%s\n' "$threshold" "$result"
   [[ "$threshold" == 99 && $result -ne 0 || "$threshold" != 99 && $result -eq 0 ]]
 done
-# Synthetic boundary; no disk filling/mounting. GNU df -B1G rounds up.
-bytes=$((99 * 1024 * 1024 * 1024 + 1))
-rounded=$(((bytes + 1024*1024*1024 - 1) / (1024*1024*1024)))
-if (free_gb_root() { echo "$rounded"; }; total_gb_root() { echo 180; }; storage_preflight clean) >"$temp/rounding.log" 2>&1; then
-  printf 'STORAGE_ROUNDING_FINDING: %s bytes (<100 GiB) reported as %s passes current integer check\n' "$bytes" "$rounded"
-fi
+# Assert production df-byte parsing never rounds up; no mounts or disk filling.
+for bytes in 106300440577 107374182399 107374182400 107374182401; do
+  if (df() { printf 'Avail\n%s\n' "$bytes"; }; total_gb_root() { echo 180; }; storage_preflight clean) >"$temp/bytes.log" 2>&1; then result=0; else result=$?; fi
+  printf 'CLEAN_STORAGE_%s_BYTES_EXIT=%s\n' "$bytes" "$result"
+  [[ "$bytes" -lt 107374182400 && $result -ne 0 || "$bytes" -ge 107374182400 && $result -eq 0 ]]
+done
 printf 'No installer, service, firewall, user or package-manager mutation executed.\n'

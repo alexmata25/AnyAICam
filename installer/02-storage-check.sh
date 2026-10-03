@@ -8,6 +8,7 @@
 # even though a valid install -- consuming real disk for the Docker
 # image/dependencies -- already existed).
 
+# Thresholds are binary GiB (1 GiB = 1,073,741,824 bytes), never rounded up.
 CLEAN_INSTALL_MIN_FREE_GB=100
 # Working-space estimate for a reinstall/repair: room for the VMS
 # image pull/rebuild plus a safety margin -- NOT a repeat of the
@@ -22,7 +23,11 @@ EXISTING_INSTALL_MIN_WORKING_GB=15
 TOTAL_CAPACITY_FLOOR_PERCENT=90
 
 free_gb_root() {
-    df --output=avail -B1G / | tail -1 | tr -d ' '
+    local available
+    available="$(df --output=avail -B1 / | tail -1 | tr -d ' ')"
+    # Fail closed if df does not return an unsigned byte count.
+    [[ "$available" =~ ^[0-9]+$ ]] || { echo '[ERROR] Cannot determine available root disk bytes.' >&2; return 1; }
+    printf '%s\n' "$(( available / 1073741824 ))"
 }
 
 total_gb_root() {
@@ -31,13 +36,13 @@ total_gb_root() {
 
 storage_preflight() {
     local state="$1" free total
-    free="$(free_gb_root)"
+    free="$(free_gb_root)" || exit 1
     total="$(total_gb_root)"
 
     if [[ "$state" == "clean" ]]; then
-        log "Storage preflight (clean install): ${free}GB free, requiring >= ${CLEAN_INSTALL_MIN_FREE_GB}GB"
+        log "Storage preflight (clean install): ${free}GiB free, requiring >= ${CLEAN_INSTALL_MIN_FREE_GB}GiB"
         if (( free < CLEAN_INSTALL_MIN_FREE_GB )); then
-            echo "[ERROR] Only ${free}GB free storage detected; at least ${CLEAN_INSTALL_MIN_FREE_GB}GB are required for a clean install." >&2
+            echo "[ERROR] Only ${free}GiB free storage detected; at least ${CLEAN_INSTALL_MIN_FREE_GB}GiB are required for a clean install." >&2
             exit 1
         fi
         # Establishes the total-capacity baseline future reinstalls/
@@ -46,9 +51,9 @@ storage_preflight() {
         mkdir -p "$CONFIG_DIR"
         echo "$total" > "$CONFIG_DIR/disk_capacity_gb"
     else
-        log "Storage preflight (existing install, state=$state): ${free}GB free, requiring >= ${EXISTING_INSTALL_MIN_WORKING_GB}GB working space"
+        log "Storage preflight (existing install, state=$state): ${free}GiB free, requiring >= ${EXISTING_INSTALL_MIN_WORKING_GB}GiB working space"
         if (( free < EXISTING_INSTALL_MIN_WORKING_GB )); then
-            echo "[ERROR] Only ${free}GB free storage detected; at least ${EXISTING_INSTALL_MIN_WORKING_GB}GB of working space are required to update an existing installation." >&2
+            echo "[ERROR] Only ${free}GiB free storage detected; at least ${EXISTING_INSTALL_MIN_WORKING_GB}GiB of working space are required to update an existing installation." >&2
             exit 1
         fi
         if [[ -f "$CONFIG_DIR/disk_capacity_gb" ]]; then
@@ -61,5 +66,5 @@ storage_preflight() {
             fi
         fi
     fi
-    log "Storage preflight passed (state=$state, free=${free}GB, total=${total}GB)."
+    log "Storage preflight passed (state=$state, free=${free}GiB, total=${total}GB)."
 }

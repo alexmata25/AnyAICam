@@ -458,7 +458,7 @@ def main() -> int:
 
         manifest = {
             "schema": 1,
-            "installer_version": "1.1.0",
+            "installer_version": "1.1.1",
             "installer_source_commit": installer_commit,
             "vms_release_commit": vms_commit,
             "vms_release_source": release_source,
@@ -482,7 +482,7 @@ def main() -> int:
         outdir = Path(args.output_dir).resolve()
         outdir.mkdir(parents=True, exist_ok=True)
         executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
-        filename = f"anyaicam-appliance-installer-1.1.0-vms-{vms_commit[:12]}.tar.gz"
+        filename = f"anyaicam-appliance-installer-1.1.1-vms-{vms_commit[:12]}.tar.gz"
         output = outdir / filename
         write_deterministic_tar(package, output, installer_mtime, executable_paths)
         digest = sha256_file(output)

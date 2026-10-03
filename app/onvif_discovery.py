@@ -23,9 +23,9 @@ responses in tests instead of opening a real UDP socket.
 from __future__ import annotations
 
 import ipaddress
-import re
 import socket
 import uuid as uuid_module
+from xml.etree import ElementTree as ET
 from typing import Callable, Optional
 
 WS_DISCOVERY_ADDRESS = ("239.255.255.250", 3702)
@@ -45,8 +45,9 @@ _PROBE_MESSAGE = (
     '<w:Action e:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>'
     '</e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>'
 ).format
-_ENDPOINT_UUID_PATTERN = re.compile(r"uuid:([0-9a-fA-F-]{36})")
-_XADDRS_PATTERN = re.compile(r"<d:XAddrs>(.*?)</d:XAddrs>", re.DOTALL)
+_DISCOVERY_NAMESPACES = ("http://schemas.xmlsoap.org/ws/2005/04/discovery", "http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01")
+_ADDRESSING_NAMESPACES = ("http://schemas.xmlsoap.org/ws/2004/08/addressing", "http://www.w3.org/2005/08/addressing")
+
 
 
 def default_send_probe(timeout: float = WS_DISCOVERY_TIMEOUT_SECONDS) -> list[str]:
@@ -85,12 +86,40 @@ def parse_probe_response(xml_text: str) -> Optional[dict]:
     across reboot/DHCP, unlike an IP address) and the device's ONVIF
     service address (XAddrs) from one WS-Discovery ProbeMatch response.
     Returns None for anything that doesn't look like a real ProbeMatch."""
-    uuid_match = _ENDPOINT_UUID_PATTERN.search(xml_text)
-    xaddrs_match = _XADDRS_PATTERN.search(xml_text)
-    if not uuid_match or not xaddrs_match:
+    try:
+        xml = ET.fromstring(xml_text)
+    except ET.ParseError:
         return None
-    xaddrs = xaddrs_match.group(1).strip().split()
-    if not xaddrs:
+    # Identity and service URL must belong to the SAME ProbeMatch. Header
+    # MessageID/RelatesTo UUIDs are request identities, never device identities.
+    for namespace in _DISCOVERY_NAMESPACES:
+        for match in xml.iter("{" + namespace + "}ProbeMatch"):
+            endpoint = None
+            for addressing in _ADDRESSING_NAMESPACES:
+                endpoint = match.find("{" + addressing + "}EndpointReference/{" + addressing + "}Address")
+                if endpoint is not None:
+                    break
+            if endpoint is None or not endpoint.text:
+                continue
+            address = endpoint.text.strip()
+            if address.lower().startswith("urn:uuid:"):
+                address = address[9:]
+            elif address.lower().startswith("uuid:"):
+                address = address[5:]
+            else:
+                continue
+            try:
+                device_key = str(uuid_module.UUID(address))
+            except ValueError:
+                continue
+            xaddrs_element = match.find("{" + namespace + "}XAddrs")
+            xaddrs = (xaddrs_element.text or "").split() if xaddrs_element is not None else []
+            if xaddrs:
+                break
+        else:
+            continue
+        break
+    else:
         return None
     onvif_endpoint = xaddrs[0]
     try:
@@ -98,7 +127,7 @@ def parse_probe_response(xml_text: str) -> Optional[dict]:
     except IndexError:
         return None
     return {
-        "device_key": uuid_match.group(1).lower(),
+        "device_key": device_key,
         "onvif_endpoint": onvif_endpoint,
         "ip_address": host,
     }

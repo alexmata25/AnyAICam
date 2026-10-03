@@ -18,7 +18,6 @@ class SimulatorContractTests(unittest.TestCase):
         uri=next(x.text for x in xml.iter() if x.tag.endswith('}Uri'))
         self.assertEqual(uri,'rtsp://192.168.253.10:8554/testcamera')
 
-    @unittest.expectedFailure
     def test_pinned_vms_parser_uses_endpoint_uuid_instead_of_message_uuid(self):
         import sys
         sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'app'))

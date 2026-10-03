@@ -126,7 +126,7 @@ them explicitly.
   not specify a RAM threshold, while the AnyAiCam x86 hardware baseline is
   16 GiB or higher, so final appliance-class acceptance remains a validation
   item rather than being falsely attributed to the historical handoff
-- clean install retains the strict 100 GB free-space requirement
+- clean install requires at least 100 GiB (107,374,182,400 bytes) of available root filesystem space; byte counts are rounded down, so one byte below the minimum is refused
 - reinstall/repair uses the installation-aware working-space/capacity rule
 - Docker, compose, rsync, and Python venv dependencies are installed as needed
 - clean Ubuntu 24.04 remains the validation target

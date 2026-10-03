@@ -35,6 +35,7 @@ reset_fixture() {
     # Redirect every path constant the two functions under test read or
     # write into the disposable fixture root.
     CONFIG_DIR="$FIXTURE_ROOT/etc/anyaicam"
+    ROLLBACK_DIR="$FIXTURE_ROOT/var/lib/anyaicam/rollback"
     VMS_INSTALL_ROOT="$FIXTURE_ROOT/opt/anyaicam"
     VMS_SERVICE_FILE="$FIXTURE_ROOT/etc/systemd/system/anyaicam-vms.service"
     VERSION_MARKER="$CONFIG_DIR/installed_version"
@@ -91,6 +92,7 @@ reset_fixture() {
     export FAKE_AGENT_INSTALL_MARKER="$FIXTURE_ROOT/.fake-agent-install-ran"
     export FAKE_AGENT_UNINSTALL_MARKER="$FIXTURE_ROOT/.fake-agent-uninstall-ran"
     rm -f "$APT_PYTHON_VENV_MARKER" "$FAKE_AGENT_INSTALL_MARKER" "$FAKE_AGENT_UNINSTALL_MARKER"
+    unset DF_AVAIL_BYTES
     DF_AVAIL_GB=999999
     DF_TOTAL_GB=999999
     SYSTEMCTL_CALL_LOG="$FIXTURE_ROOT/.systemctl-calls"
@@ -217,8 +219,8 @@ userdel() {
 df() {
     # Only the two exact invocations storage_preflight() makes are
     # mocked; anything else falls through to the real df.
-    if [[ "$*" == "--output=avail -B1G /" ]]; then
-        printf '%s\n%s\n' "Avail" "$DF_AVAIL_GB"
+    if [[ "$*" == "--output=avail -B1 /" ]]; then
+        printf '%s\n%s\n' "Avail" "${DF_AVAIL_BYTES:-$((DF_AVAIL_GB * 1073741824))}"
         return 0
     fi
     if [[ "$*" == "--output=size -B1G /" ]]; then
@@ -351,6 +353,31 @@ reset_fixture
 DF_AVAIL_GB=99
 DF_TOTAL_GB=500
 assert_exit "clean install, 99GB free (<100GB) -> fails" 1 storage_preflight clean
+
+# Byte-precision boundary; never round less than 100 GiB upward.
+reset_fixture
+DF_AVAIL_BYTES=$((100 * 1073741824 - 1))
+assert_exit "clean, 100 GiB minus one byte -> fails" 1 storage_preflight clean
+reset_fixture
+DF_AVAIL_BYTES=$((100 * 1073741824))
+assert_exit "clean, exactly 100 GiB -> passes" 0 storage_preflight clean
+reset_fixture
+DF_AVAIL_BYTES=$((100 * 1073741824 + 1))
+assert_exit "clean, 100 GiB plus one byte -> passes" 0 storage_preflight clean
+reset_fixture
+DF_AVAIL_BYTES=$((99 * 1073741824 + 1))
+assert_exit "clean, 99 GiB plus one byte -> fails (rounding regression)" 1 storage_preflight clean
+reset_fixture
+DF_AVAIL_BYTES=unknown
+assert_exit "clean, unavailable byte count -> fails closed" 1 storage_preflight clean
+reset_fixture
+DF_AVAIL_BYTES=$((15 * 1073741824 - 1))
+assert_exit "existing, 15 GiB minus one byte -> fails" 1 storage_preflight existing
+reset_fixture
+DF_AVAIL_BYTES=$((15 * 1073741824))
+assert_exit "existing, exactly 15 GiB -> passes" 0 storage_preflight existing
+reset_fixture
+assert_eq "rollback directory is isolated inside fixture" "$FIXTURE_ROOT/var/lib/anyaicam/rollback" "$ROLLBACK_DIR"
 
 # 8. Existing install, the exact reported release blocker: ~98GB free
 #    used to fail against the clean-install 100GB minimum. Must now pass

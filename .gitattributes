@@ -1,3 +1,7 @@
 # Audio assets are binary: never line-ending converted (core.autocrlf on
 # Windows dev machines), so a published file matches its checked-in hash.
 *.wav binary
+
+# Installer harness and runtime scripts must run directly in Linux/WSL checkouts.
+/installer/** text eol=lf
+/docker-compose.yml text eol=lf
