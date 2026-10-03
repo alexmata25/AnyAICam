@@ -29,7 +29,98 @@ from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from object_storage import get_storage
+from object_storage import LocalStorage, get_storage, safe_key
+
+# ---------------------------------------------------------------- update storage (2026-10-03)
+#
+# Software Update packages and catalog records can live in S3 while the rest
+# of the application keeps its general backend (ANYAICAM_STORAGE_BACKEND --
+# thumbnails, clips, documents, downloads ... are unaffected).
+#
+#   ANYAICAM_UPDATE_STORAGE_BACKEND   unset/"default": the general backend
+#                                     (unchanged behaviour); "local"; or "s3"
+#   ANYAICAM_UPDATE_S3_BUCKET         bucket for "s3" (default ANYAICAM_S3_BUCKET)
+#   ANYAICAM_UPDATE_S3_REGION         region (default ANYAICAM_S3_REGION, then AWS_REGION, then us-east-1)
+#
+# Objects are written only under the "updates/" prefix. Credentials come from
+# the standard AWS chain (the instance role); none are configured here.
+# Releases are signed offline, so no private key is involved anywhere.
+UPDATE_BACKEND_ENV = "ANYAICAM_UPDATE_STORAGE_BACKEND"
+
+
+class UpdateStorageError(Exception):
+    """Update storage is misconfigured or unavailable. Callers fail safe:
+    nothing is published, no release is offered, no download link is served."""
+
+
+class UpdateS3Storage:
+    """S3 storage for the 'updates' category only (prefix updates/)."""
+
+    CATEGORY = "updates"
+
+    def __init__(self, *, client=None):
+        self.bucket = (os.environ.get("ANYAICAM_UPDATE_S3_BUCKET") or os.environ.get("ANYAICAM_S3_BUCKET") or "").strip()
+        if not self.bucket:
+            raise UpdateStorageError("ANYAICAM_UPDATE_STORAGE_BACKEND=s3 needs a bucket (ANYAICAM_UPDATE_S3_BUCKET or ANYAICAM_S3_BUCKET).")
+        self.region = (os.environ.get("ANYAICAM_UPDATE_S3_REGION") or os.environ.get("ANYAICAM_S3_REGION")
+                       or os.environ.get("AWS_REGION") or "us-east-1").strip()
+        if client is None:
+            try:
+                import boto3
+                from botocore.config import Config
+            except ImportError as error:
+                raise UpdateStorageError("boto3 is required for S3 update storage.") from error
+            endpoint = os.environ.get("ANYAICAM_S3_ENDPOINT", "").strip() or None
+            client = boto3.client("s3", region_name=self.region, endpoint_url=endpoint,
+                                  config=Config(signature_version="s3v4"))
+        self.client = client
+
+    def _key(self, category: str, key: str) -> str:
+        if category != self.CATEGORY:
+            raise ValueError("Update storage only holds the 'updates' category.")
+        return safe_key(category, key)
+
+    def put(self, category, key, data, content_type=None):
+        object_key = self._key(category, key)
+        self.client.put_object(Bucket=self.bucket, Key=object_key, Body=data,
+                               ContentType=content_type or "application/octet-stream")
+        return {"key": object_key, "size": len(data), "backend": "s3"}
+
+    def get(self, category, key):
+        return self.client.get_object(Bucket=self.bucket, Key=self._key(category, key))["Body"].read()
+
+    def delete(self, category, key):
+        self.client.delete_object(Bucket=self.bucket, Key=self._key(category, key))
+
+    def url(self, category, key, expires_seconds=900):
+        return self.client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": self._key(category, key)},
+                                                  ExpiresIn=expires_seconds)
+
+
+def get_update_storage():
+    """The storage Software Update uses. Raises UpdateStorageError for an
+    unknown setting or an incomplete S3 configuration (never falls back to
+    a different backend silently)."""
+    backend = os.environ.get(UPDATE_BACKEND_ENV, "").strip().lower()
+    if backend in ("", "default"):
+        return get_storage()
+    if backend == "local":
+        return LocalStorage()
+    if backend == "s3":
+        return UpdateS3Storage()
+    raise UpdateStorageError(f"{UPDATE_BACKEND_ENV}={backend!r} is not supported (use 's3', 'local' or leave unset).")
+
+
+def package_download_url(release: dict, expires_seconds: int = 300) -> str:
+    """An absolute http(s) link an appliance can download the package from
+    (a presigned S3 URL). A relative path -- what the local backend
+    returns, behind a locked-down route -- is useless to an appliance, so it
+    is refused rather than served."""
+    url = get_update_storage().url("updates", release["package_key"], expires_seconds=expires_seconds)
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        raise UpdateStorageError("Update packages are not downloadable from this storage backend; set "
+                                 f"{UPDATE_BACKEND_ENV}=s3.")
+    return url
 
 # Mirrors appliance-agent/anyaicam_agent/updater/s3_source.py's own
 # _validate_path_segment() exactly (same grammar, same reasoning) --
@@ -59,7 +150,7 @@ def get_latest_release(target: str, channel: str) -> dict | None:
     same way: no release, never an exception the route would have to
     turn into a 500."""
     try:
-        raw = get_storage().get("updates", _catalog_key(target, channel))
+        raw = get_update_storage().get("updates", _catalog_key(target, channel))
         record = json.loads(raw.decode("utf-8"))
     except Exception:
         return None
@@ -119,7 +210,10 @@ def publish_release(target: str, channel: str, *, manifest: dict, package_bytes:
     catalog pointer LAST, so a reader never sees a pointer to a missing
     package."""
     verify_release(target, channel, manifest=manifest, package_bytes=package_bytes, signature=signature)
-    storage = get_storage()
+    try:
+        storage = get_update_storage()
+    except UpdateStorageError as error:
+        raise PublishError(f"Update storage is not usable: {error}") from error
     base = _catalog_key(target, channel).rsplit("/", 1)[0]
     update_id = validate_path_segment(str(manifest.get("update_id", "")), "update_id")
     package_key = f"{base}/{update_id}/package.bin"

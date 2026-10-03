@@ -171,7 +171,11 @@ def _manifest(version="1.2.3", package=PACKAGE):
     }
 
 
-def test_published_release_is_served_with_its_offline_signature(client, db_path, local_storage, signing_key_pair):
+def test_published_release_is_served_with_its_offline_signature(client, db_path, local_storage, signing_key_pair, monkeypatch):
+    # The deployment shape: update storage on S3 (presigned links), the
+    # general backend untouched (test_update_storage_backend.py).
+    from update_storage_fakes import use_fake_s3_update_storage
+    use_fake_s3_update_storage(monkeypatch)
     _seeded(db_path)
     signature = _offline_sign(signing_key_pair, _manifest())
     updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=PACKAGE,
@@ -185,13 +189,24 @@ def test_published_release_is_served_with_its_offline_signature(client, db_path,
     assert response.status_code == 200
     body = response.json()
     assert body["manifest"] == _manifest()
-    assert body["package_url"]
+    assert body["package_url"].startswith("https://anyaicam2026.s3.amazonaws.com/updates/")
     assert base64.b64decode(body["signature"]) == signature  # the stored offline signature, not a new one
     # Verifies under the SAME scheme the device-side updater/verify.py checks.
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
     message = updates_storage.canonical_manifest_bytes(body["manifest"])
     signing_key_pair.public_key().verify(signature, message, padding.PKCS1v15(), hashes.SHA256())  # raises on failure
+
+
+def test_a_release_on_local_update_storage_is_not_served_with_an_undownloadable_link(client, db_path, local_storage,
+                                                                                    signing_key_pair, monkeypatch):
+    monkeypatch.delenv("ANYAICAM_UPDATE_STORAGE_BACKEND", raising=False)
+    _seeded(db_path)
+    updates_storage.publish_release("anyaicam-appliance", "stable", manifest=_manifest(), package_bytes=PACKAGE,
+                                    signature=_offline_sign(signing_key_pair, _manifest()))
+    response = client.get("/api/appliance/updates/latest?target=anyaicam-appliance&channel=stable",
+                          headers=_auth_headers("appl-1", "test-credential"))
+    assert response.status_code == 503  # a relative /storage/ path is never handed to an appliance
 
 
 def test_the_server_has_no_private_key_signing_code(signing_key_pair):
@@ -315,8 +330,11 @@ def test_publish_command_verify_only_checks_everything_and_stores_nothing(tmp_pa
     assert updates_storage.get_latest_release("anyaicam-appliance", "stable") is None
 
 
-def test_publish_command_publishes_a_correctly_signed_release(client, db_path, tmp_path, local_storage, signing_key_pair, capsys):
+def test_publish_command_publishes_a_correctly_signed_release(client, db_path, tmp_path, local_storage, signing_key_pair, capsys,
+                                                               monkeypatch):
     import publish_update_release
+    from update_storage_fakes import use_fake_s3_update_storage
+    use_fake_s3_update_storage(monkeypatch)
     _seeded(db_path)
     assert publish_update_release.main(_cli_files(tmp_path, signing_key_pair)) == 0
     assert '"status": "published"' in capsys.readouterr().out
