@@ -261,3 +261,178 @@ def test_real_upgrade_whose_answer_was_lost_is_recovered_without_a_second_charge
     conn.close()
     assert _capacity(env) == (8, "hybrid")
     assert len([r for r in _rows(env, "camera_slots_hybrid") if r["status"] == "active"]) == 1
+
+
+# ---------------------------------------------------------------- recovery after the card is corrected
+#
+# Stripe TEST mode, 2026-10-03 (same customer C): the owner added a working card
+# in the Customer Portal and paid the open proration invoice
+# in_1UMMorGllhK80H2n9w8lLbhC from its hosted page. Stripe then sent, in order:
+# invoice.payment_succeeded + invoice.paid (billing_reason=subscription_update,
+# $10.00, charge ch_3UMMorGllhK80H2n0TTJJZfy), customer.subscription.updated
+# (same subscription, same item, now Hybrid, pending_update=null, renewal
+# unchanged) and customer.subscription.pending_update_applied. AnyAiCam had
+# already answered the owner's upgrade request with 402 and closed that
+# attempt as declined, so the Hybrid plan arrives only through the webhook.
+
+RECOVERY_INVOICE = "in_1UMMorGllhK80H2n9w8lLbhC"
+
+
+def _hybrid_c():
+    return dict(_pending_subscription(), pending_update=None, latest_invoice=RECOVERY_INVOICE,
+                metadata={"anyaicam_camera_slot_maximum": "8", "anyaicam_camera_slot_plan_type": "hybrid",
+                          "anyaicam_customer_id": "cust-A", "anyaicam_stripe_price_id": HYBRID_8},
+                items={"data": [{"id": ITEM, "price": {"id": HYBRID_8}, "quantity": 1,
+                                 "current_period_end": int((NOW + timedelta(days=30)).timestamp())}]})
+
+
+def _recovery_invoice():
+    return dict(_proration_invoice("paid"), id=RECOVERY_INVOICE, amount_paid=1000, amount_remaining=0,
+                charge="ch_3UMMorGllhK80H2n0TTJJZfy")
+
+
+def _owner_upgrade_declined_like_stripe(env, monkeypatch):
+    """The owner's request: Stripe keeps Local and holds Hybrid in pending_update."""
+    main = env["main"]
+    send = main.stripe_api_post
+
+    def post(path, fields, idempotency_key=None):
+        if path == f"/v1/subscriptions/{SUB}" and "items[0][price]" in dict(fields):
+            env["posts"].append((path, dict(fields)))
+            env["keys"].append(idempotency_key)
+            env["stripe"][SUB] = _pending_subscription()
+            return _pending_subscription()
+        return send(path, fields, idempotency_key=idempotency_key)
+    monkeypatch.setattr(main, "stripe_api_post", post)
+    _customer(env, customer_id="cust-A", stripe_customer=CUS, sub_id=SUB)
+    env["stripe"][SUB] = dict(_pending_subscription(), pending_update=None)
+    assert _upgrade(env).status_code == 402
+    env["invoices"][RECOVERY_INVOICE] = dict(_proration_invoice("open"), id=RECOVERY_INVOICE)
+    assert _deliver(env, _event("evt_declined", "invoice.payment_failed", dict(_proration_invoice("open"), id=RECOVERY_INVOICE),
+                                int(NOW.timestamp()))).status_code == 200
+    assert _capacity(env) == (8, "local") and _plan(env["path"])["payment_failed_at"] is None
+
+
+def _attempts(env):
+    conn = sqlite3.connect(env["path"])
+    try:
+        return conn.execute("SELECT status, open_slot FROM plan_upgrade_attempts ORDER BY created_at").fetchall()
+    finally:
+        conn.close()
+
+
+def test_paying_the_declined_upgrade_invoice_later_gives_exactly_one_hybrid_plan(env, monkeypatch):
+    _owner_upgrade_declined_like_stripe(env, monkeypatch)
+    # The owner fixes the card and pays the invoice outside AnyAiCam: Stripe's real sequence, each delivered twice.
+    env["stripe"][SUB] = _hybrid_c()
+    env["invoices"][RECOVERY_INVOICE] = _recovery_invoice()
+    created = int(NOW.timestamp()) + 600
+    for _ in range(2):
+        for event_id, kind, obj in (("evt_1UMUBHGllhK80H2nslBP9wGJ", "invoice.payment_succeeded", _recovery_invoice()),
+                                    ("evt_1UMUBHGllhK80H2nZYSbUwWf", "invoice.paid", _recovery_invoice()),
+                                    ("evt_1UMUBHGllhK80H2nXzk4mU9F", "customer.subscription.updated", _hybrid_c()),
+                                    ("evt_1UMUBHGllhK80H2nXWryYvYt", "customer.subscription.pending_update_applied", _hybrid_c())):
+            assert _deliver(env, _event(event_id, kind, obj, created)).status_code == 200
+    assert _capacity(env) == (8, "hybrid")
+    [hybrid] = [r for r in _rows(env, "camera_slots_hybrid") if r["status"] == "active"]
+    assert hybrid["stripe_subscription_id"] == SUB and hybrid["payment_failed_at"] is None
+    assert not [r for r in _rows(env, "camera_slots_local") if r["status"] == "active"]
+    assert _invoice_state(env, RECOVERY_INVOICE) == "paid"
+    assert _attempts(env) == [("declined", None)]  # nothing left open, nothing re-sent
+    assert len(_upgrade_posts_c(env)) == 1
+    # Asking again changes nothing: already Hybrid, no second Stripe update or charge.
+    assert _upgrade(env).json()["status"] == "already_hybrid"
+    assert len(_upgrade_posts_c(env)) == 1
+    assert _sweep(env, NOW + timedelta(days=8)) == 0 and _capacity(env) == (8, "hybrid")
+
+
+def _upgrade_posts_c(env):
+    return [p for p in env["posts"] if p[0] == f"/v1/subscriptions/{SUB}" and "items[0][price]" in p[1]]
+
+
+# ---------------------------------------------------------------- genuine renewals (Stripe TEST mode, 2026-10-03)
+#
+# Two real-time Local 8 subscriptions whose first renewal Stripe ran for real
+# at 15:45 UTC (billing_reason=subscription_cycle, $14.99):
+# - sub_1UMU50GllhK80H2ny0L4bldb (declining card): invoice
+#   in_1UMUBCGllhK80H2n6VPxtHL1 failed (generic_decline), invoice.payment_failed
+#   evt_1UMV7vGllhK80H2nf5FbGluq + customer.subscription.updated past_due
+#   evt_1UMV7vGllhK80H2nEZavD1ad; the owner then used the Customer Portal's
+#   "Update payment method", which paid the SAME invoice through the SAME
+#   PaymentIntent: invoice.payment_succeeded evt_1UMVApGllhK80H2nFwUrl1qY,
+#   invoice.paid evt_1UMVApGllhK80H2nUBJJinQA, customer.subscription.updated
+#   active evt_1UMVApGllhK80H2nkePc4f9V.
+# - sub_1UMU4zGllhK80H2nug007m61 (good card): invoice
+#   in_1UMUBCGllhK80H2nPeSkZ09V paid at the first attempt.
+
+RENEW_SUB = "sub_1UMU50GllhK80H2ny0L4bldb"
+RENEW_CUS = "cus_VNEXKyqE9JBhKN"
+RENEW_INVOICE = "in_1UMUBCGllhK80H2n6VPxtHL1"
+
+
+def _renewal_subscription(status):
+    return {"id": RENEW_SUB, "object": "subscription", "customer": RENEW_CUS, "status": status, "cancel_at_period_end": False,
+            "pending_update": None, "latest_invoice": RENEW_INVOICE, "billing_cycle_anchor": 1791038640,
+            "metadata": {"anyaicam_customer_id": "cust-A", "anyaicam_stripe_price_id": LOCAL_8,
+                         "anyaicam_camera_slot_plan_type": "local", "anyaicam_camera_slot_maximum": "8"},
+            "items": {"data": [{"id": "si_VNEYN4aJl87nzX", "price": {"id": LOCAL_8}, "quantity": 1,
+                                "current_period_end": int((NOW + timedelta(days=30)).timestamp())}]}}
+
+
+def _renewal_invoice(status):
+    paid = 1499 if status == "paid" else 0
+    return {"id": RENEW_INVOICE, "object": "invoice", "customer": RENEW_CUS, "status": status, "billing_reason": "subscription_cycle",
+            "amount_due": 1499, "amount_paid": paid, "amount_remaining": 1499 - paid, "attempt_count": 1, "currency": "usd",
+            "collection_method": "charge_automatically",
+            "parent": {"type": "subscription_details", "subscription_details": {"subscription": RENEW_SUB,
+                                                                                "metadata": {"anyaicam_customer_id": "cust-A"}}}}
+
+
+def test_a_genuine_failed_renewal_starts_grace_and_paying_it_in_the_portal_ends_it(env):
+    _customer(env, customer_id="cust-A", stripe_customer=RENEW_CUS, sub_id=RENEW_SUB)
+    created = int(NOW.timestamp())
+    env["stripe"][RENEW_SUB] = _renewal_subscription("past_due")
+    env["invoices"][RENEW_INVOICE] = _renewal_invoice("open")
+    assert _deliver(env, _event("evt_1UMV7vGllhK80H2nf5FbGluq", "invoice.payment_failed", _renewal_invoice("open"),
+                                created)).status_code == 200
+    assert _deliver(env, _event("evt_1UMV7vGllhK80H2nEZavD1ad", "customer.subscription.updated", _renewal_subscription("past_due"),
+                                created)).status_code == 200
+    plan = _plan(env["path"])
+    assert plan["payment_failed_at"] is not None and plan["status"] == "active"  # grace: still usable
+    assert _invoice_state(env, RENEW_INVOICE) == "failed"  # so the renewal-failure email is due
+    # The owner updates the card in the portal; Stripe pays the same invoice. Each event twice.
+    env["stripe"][RENEW_SUB] = _renewal_subscription("active")
+    env["invoices"][RENEW_INVOICE] = _renewal_invoice("paid")
+    for _ in range(2):
+        for event_id, kind, obj in (("evt_1UMVApGllhK80H2nFwUrl1qY", "invoice.payment_succeeded", _renewal_invoice("paid")),
+                                    ("evt_1UMVApGllhK80H2nUBJJinQA", "invoice.paid", _renewal_invoice("paid")),
+                                    ("evt_1UMVApGllhK80H2nkePc4f9V", "customer.subscription.updated", _renewal_subscription("active"))):
+            assert _deliver(env, _event(event_id, kind, obj, created + 180)).status_code == 200
+    plan = _plan(env["path"])
+    assert plan["payment_failed_at"] is None and plan["status"] == "active"
+    assert _invoice_state(env, RENEW_INVOICE) == "paid"
+    assert len([r for r in _rows(env, "camera_slots_local") if r["status"] == "active"]) == 1
+    assert _sweep(env, NOW + timedelta(days=8)) == 0 and _capacity(env) == (8, "local")
+
+
+def test_a_genuine_failed_renewal_left_unpaid_suspends_after_the_grace(env):
+    _customer(env, customer_id="cust-A", stripe_customer=RENEW_CUS, sub_id=RENEW_SUB)
+    env["stripe"][RENEW_SUB] = _renewal_subscription("past_due")
+    env["invoices"][RENEW_INVOICE] = _renewal_invoice("open")
+    assert _deliver(env, _event("evt_1UMV7vGllhK80H2nf5FbGluq", "invoice.payment_failed", _renewal_invoice("open"),
+                                int(NOW.timestamp()))).status_code == 200
+    assert _sweep(env, NOW + timedelta(days=6)) == 0
+    assert _sweep(env, NOW + timedelta(days=8)) == 1 and _plan(env["path"])["status"] == "suspended"
+
+
+def test_a_genuine_paid_renewal_changes_nothing(env):
+    _customer(env, customer_id="cust-A", stripe_customer=RENEW_CUS, sub_id=RENEW_SUB)
+    env["stripe"][RENEW_SUB] = _renewal_subscription("active")
+    paid = dict(_renewal_invoice("paid"), id="in_1UMUBCGllhK80H2nPeSkZ09V")
+    env["invoices"][paid["id"]] = paid
+    for _ in range(2):
+        for event_id, kind in (("evt_1UMV7xGllhK80H2n30eGPolJ", "invoice.payment_succeeded"), ("evt_1UMV7xGllhK80H2nmigwbftL", "invoice.paid")):
+            assert _deliver(env, _event(event_id, kind, paid, int(NOW.timestamp()))).status_code == 200
+    assert _plan(env["path"])["payment_failed_at"] is None
+    assert len([r for r in _rows(env, "camera_slots_local") if r["status"] == "active"]) == 1
+    assert _capacity(env) == (8, "local")
