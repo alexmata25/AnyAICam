@@ -265,6 +265,9 @@ def test_customer_setup_is_simple_and_technician_details_are_collapsed(license_p
     for step in ("Step 1 &mdash; Download AnyAiCam", "Step 2 &mdash; Install AnyAiCam", "Step 3 &mdash; Connect your system"):
         assert step in simple
     assert "requires a technician" in simple and "setup code" in simple
+    assert "sign in as the account owner, choose a location" in simple
+    assert "confirm your system" in simple
+    assert "./setup.sh" not in simple and "./setup.sh" in technical
     assert 'href="/customer/claim-appliance"' in simple
     assert 'href="https://anyaicam.com/vms-support.html"' in simple
     for term in ("SHA-256", record["sha256"], "build ", "tar.gz", "tar -xzf", "sudo", "--claim", "CPU cores"):

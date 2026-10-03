@@ -104465,11 +104465,12 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                 '<a class="action-button" href="/api/customer/downloads/vms-installer" download>Download AnyAiCam</a></p>'
                 '<p class="health-detail">For Ubuntu 24.04 computers. This package requires a technician to install.</p></li>'
                 '<li><strong>Step 2 &mdash; Install AnyAiCam</strong>'
-                '<p>Ask your technician to install the downloaded package on your computer. '
+                '<p>Ask your technician to start AnyAiCam setup from the downloaded package. '
                 'Installation instructions are in Advanced / Technician setup below.</p></li>'
                 '<li><strong>Step 3 &mdash; Connect your system</strong>'
-                '<p>Your technician will give you a setup code. Sign in to your AnyAiCam account, '
-                '<a href="/customer/claim-appliance">connect your system</a>, and enter the code to choose its location.</p></li>'
+                '<p>If setup opens a sign-in window, sign in as the account owner, choose a location, '
+                'and confirm your system. If it does not, ask your technician for the setup code and '
+                '<a href="/customer/claim-appliance">connect your system</a> here.</p></li>'
                 '</ol><p><a href="https://anyaicam.com/vms-support.html" target="_blank" rel="noopener">Get setup help</a></p>'
                 '<details id="vms-technician-setup"><summary>Advanced / Technician setup</summary>'
                 f'<p>AnyAiCam VMS installer {escape(str(_installer["version"]))}<br>'
@@ -104477,6 +104478,11 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                 f'{customer_downloads.human_size(int(_installer["size_bytes"]))} &middot; build {escape(_installer["commit"][:7])}</span><br>'
                 f'<span class="health-detail">SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></span></p>'
                 + _installer_steps_html(mode, str(_installer["filename"]), str(_installer["sha256"]))
+                + '<p>Newly built packages include a fresh-install launcher. After verifying and extracting '
+                'the package, a technician can start <code>./setup.sh</code> as the normal Ubuntu desktop user '
+                'instead of running the manual install and claim commands. It asks for the HTTPS portal address '
+                'and Local or Hybrid plan, installs and validates, then opens a browser for owner confirmation. '
+                'Older packages use the manual instructions above. Setup-code recovery remains available.</p>'
                 + '</details></div>')
         else:
             _download_html = '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
