@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import shutil
 import time
 from datetime import datetime, timezone
@@ -35,6 +36,12 @@ from .source import PackageDownloadError, SourceUnavailable
 from .verify import ManifestSignatureInvalid, PackageChecksumMismatch, TrustedKeyUnavailable
 
 ACTION_TYPE = "apply_release"
+
+# One line per step of an owner-requested install (2026-10-03), so the whole
+# path can be traced from the appliance's own journal. Identifiers, versions,
+# sizes and hashes only -- never the presigned download URL.
+log = logging.getLogger("anyaicam.agent.update")
+_FAILED_STATES = {UpdateState.REJECTED, UpdateState.DOWNLOAD_FAILED, UpdateState.VERIFY_FAILED, UpdateState.INSTALL_FAILED}
 
 
 class UpdateBusy(Exception):
@@ -105,6 +112,8 @@ class OwnerUpdate:
         return bool(self.history.in_progress_update_ids()) or (staged.is_dir() and any(staged.iterdir()))
 
     def _result(self, update_id, from_version, to_version, state, error="", started=None) -> UpdateResult:
+        if state in _FAILED_STATES:
+            log.warning("Software update %s: %s -- %s", update_id or "?", state.value, error)
         return UpdateResult(update_id=update_id, from_version=from_version, to_version=to_version, state=state,
                             error=error, duration_seconds=(self._now() - started) if started else 0.0)
 
@@ -126,8 +135,11 @@ class OwnerUpdate:
             return self._result(str((payload or {}).get("update_id") or "") if isinstance(payload, dict) else "",
                                 from_version, "", UpdateState.REJECTED, f"{error.code}: {error}", started)
         update_id = request["update_id"]
+        log.info("Software update %s: owner request received (install %s, requested by %s, installed %s)",
+                 update_id, request["version"], request["requested_by"] or "?", from_version or "unknown")
         if self.history.is_terminal(update_id):
             row = self.history.get(update_id) or {}
+            log.info("Software update %s: already concluded as %s; not repeated", update_id, row.get("state"))
             return self._result(update_id, row.get("from_version", ""), row.get("to_version", ""),
                                 UpdateState(row.get("state", UpdateState.REJECTED.value)), row.get("error") or "", started)
         if self.busy():
@@ -149,6 +161,8 @@ class OwnerUpdate:
         except (TrustedKeyUnavailable, ManifestSignatureInvalid, ValueError) as error:
             return self._result(update_id, from_version, request["version"], UpdateState.REJECTED,
                                 f"bad_signature: {error}", started)
+        log.info("Software update %s: manifest signature verified with the trusted key (release %s, build %s, %d bytes)",
+                 update_id, manifest.version, str(getattr(manifest, "build_id", "") or "")[:12], manifest.package_size_bytes)
         if (manifest.update_id, manifest.version, manifest.sha256.lower()) != (update_id, request["version"], request["sha256"]):
             return self._result(update_id, from_version, request["version"], UpdateState.REJECTED,
                                 "release_changed: the published release is not the one that was confirmed", started)
@@ -162,6 +176,8 @@ class OwnerUpdate:
             return self._result(update_id, from_version, manifest.version, UpdateState.REJECTED,
                                 f"{error.code}: {error}", started)
 
+        log.info("Software update %s: release checks passed (target, platform, architecture, newer version, "
+                 "migration safety, free disk)", update_id)
         # Durable from here on: the attempt is authenticated and allowed.
         self.history.begin_attempt(update_id, from_version, manifest.version, now=started)
         staged_dir = self.config.update_staged_dir / update_id
@@ -169,12 +185,16 @@ class OwnerUpdate:
         staged_dir.mkdir(parents=True)
         package_path = staged_dir / "package.tar.gz"
         self.history.record_transition(update_id, UpdateState.DOWNLOADING, now=self._now())
+        log.info("Software update %s: downloading the package (%d bytes expected)", update_id, manifest.package_size_bytes)
+        download_started = self._now()
         try:
             self.source.download_package(manifest.as_dict(), package_path)
         except PackageDownloadError as error:
             return self._fail(update_id, UpdateState.DOWNLOAD_FAILED, f"download_failed: {error}",
                               from_version, manifest.version, started, staged_dir)
         self.history.record_transition(update_id, UpdateState.VERIFYING, now=self._now())
+        log.info("Software update %s: downloaded %d bytes in %.1f s", update_id,
+                 package_path.stat().st_size if package_path.exists() else 0, self._now() - download_started)
         try:
             self.verifier.verify_package(manifest, package_path)
             if package_path.stat().st_size != manifest.package_size_bytes:
@@ -183,6 +203,8 @@ class OwnerUpdate:
             return self._fail(update_id, UpdateState.VERIFY_FAILED, f"bad_hash: {error}",
                               from_version, manifest.version, started, staged_dir)
         self.history.record_transition(update_id, UpdateState.VERIFIED, now=self._now())
+        log.info("Software update %s: package verified (sha256 %s..., %d bytes match the signed manifest)",
+                 update_id, manifest.sha256.lower()[:12], manifest.package_size_bytes)
 
         # Stage exactly what was verified: the signed manifest bytes as
         # received, the signature, the package, and who asked.
@@ -193,10 +215,12 @@ class OwnerUpdate:
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }).encode("utf-8"))
         self.history.record_transition(update_id, UpdateState.STAGED, now=self._now())
+        log.info("Software update %s: staged in %s", update_id, staged_dir)
         try:
             self.queue_privileged_action(ACTION_TYPE, {"update_id": update_id})
         except OSError as error:
             return self._fail(update_id, UpdateState.INSTALL_FAILED, f"activation_request_failed: {error}",
                               from_version, manifest.version, started, staged_dir)
         self.history.record_transition(update_id, UpdateState.ACTIVATION_REQUESTED, now=self._now())
+        log.info("Software update %s: activation requested from the privileged updater", update_id)
         return self._result(update_id, from_version, manifest.version, UpdateState.ACTIVATION_REQUESTED, "", started)

@@ -274,7 +274,15 @@ class ApplianceAgent:
     def flush(self):
         for item in self.queue.ready():
             try: self.client.request(item['method'],item['path'],json.loads(item['payload_json'])); self.queue.success(item['id'])
-            except PortalError: self.queue.fail(item['id'])
+            except PortalError as error:
+                # A queued update-result report follows report_update_result()'s
+                # own rule (2026-10-03): 404 (reporting disabled) and 409 (a
+                # final outcome is already recorded) never succeed on retry, so
+                # the item is dropped instead of being re-sent forever.
+                if item['path'].startswith('/api/appliance/updates/') and item['path'].endswith('/result') and error.status_code in (404,409):
+                    self.log.info('Dropping queued update result report %s: the cloud answered %s (not retryable)',item['path'],error.status_code)
+                    self.queue.success(item['id'])
+                else: self.queue.fail(item['id'])
     def poll_discovery(self):
         try:
             response=self.client.request('GET',f'/api/appliance/{self.config.cloud_id}/scan-jobs')

@@ -11,6 +11,7 @@ request can never block future updates forever.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import stat
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .models import TERMINAL_STATES, UpdateResult, UpdateState
+
+log = logging.getLogger("anyaicam.agent.update")
 
 # Root-applier states -> the agent's UpdateState vocabulary.
 ROOT_STATES = {
@@ -107,10 +110,17 @@ class ResultRelay:
             rollback_from=result.get("to_version") if state in (UpdateState.ROLLED_BACK, UpdateState.ROLLBACK_FAILED) else None,
             duration_seconds=float(result.get("duration_seconds") or 0.0),
         )
+        if state in TERMINAL_STATES:
+            log.log(logging.INFO if state == UpdateState.HEALTHY else logging.WARNING,
+                    "Software update %s: finished as %s (%s -> %s, %.1f s)%s", update_id, state.value,
+                    outcome.from_version or "?", outcome.to_version or "?", outcome.duration_seconds,
+                    f" -- {outcome.error}" if outcome.error else "")
+        else:
+            log.info("Software update %s: privileged updater reports %s", update_id, state.value)
         try:
             self.report(outcome)
         except Exception:  # noqa: BLE001 -- report_update_result queues offline itself; never let reporting block the relay
-            pass
+            log.exception("Software update %s: reporting %s to the cloud failed", update_id, state.value)
         return outcome
 
     @staticmethod
