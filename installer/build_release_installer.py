@@ -8,6 +8,7 @@ release archive is accepted.
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import hashlib
 import io
@@ -133,10 +134,26 @@ def read_update_signing_public_key(path: str) -> bytes:
     data = Path(path).read_bytes()
     if b"PRIVATE KEY" in data:
         raise SystemExit("--update-signing-public-key is a PRIVATE key; pass the public key only.")
-    text = data.decode("ascii", "replace").strip()
-    if not (text.startswith("-----BEGIN PUBLIC KEY-----") and text.endswith("-----END PUBLIC KEY-----")):
+    # Canonical form (2026-10-03): a key exported on Windows arrives with CRLF
+    # line endings. Appliances parse either, but the offline signer compares
+    # this embedded key with the public half of the private key, which is
+    # always LF and wrapped at 64 characters. So the key is normalized here:
+    # LF endings, base64 body re-wrapped at 64, exactly one SubjectPublicKeyInfo
+    # block (DER SEQUENCE). Stdlib only: the build machine may lack cryptography.
+    text = data.decode("ascii", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    if (len(lines) < 3 or lines[0] != "-----BEGIN PUBLIC KEY-----" or lines[-1] != "-----END PUBLIC KEY-----"
+            or any(line.startswith("-----") for line in lines[1:-1])):
         raise SystemExit("--update-signing-public-key must be one PEM 'BEGIN PUBLIC KEY' block.")
-    return (text + "\n").encode("ascii")
+    encoded = "".join(lines[1:-1])
+    try:
+        der = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise SystemExit(f"--update-signing-public-key has an invalid base64 body: {error}") from error
+    if not der or der[0] != 0x30:
+        raise SystemExit("--update-signing-public-key is not a SubjectPublicKeyInfo (DER SEQUENCE) key.")
+    wrapped = [encoded[index:index + 64] for index in range(0, len(encoded), 64)]
+    return ("\n".join(["-----BEGIN PUBLIC KEY-----", *wrapped, "-----END PUBLIC KEY-----"]) + "\n").encode("ascii")
 
 
 def validate_sha256(value: str, label: str) -> str:
