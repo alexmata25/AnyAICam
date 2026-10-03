@@ -65,8 +65,12 @@ the agent. The installer's repair path also rsynced new code into that bind-moun
    The command verifies the signature, SHA-256, size, target and channel before storing anything.
    On staging, the key folder `/etc/anyaicam-staging/update-signing/` (root 0755,
    key 0444). `deploy/staging_bluegreen_cutover.py` mounts it read-only at `/run/secrets/update-signing`.
-   Appliances download packages from presigned S3 links, so the cloud must run `ANYAICAM_STORAGE_BACKEND=s3`.
-   The local backend's `/storage/…` paths are relative and not downloadable by the agent.
+   Appliances download packages from presigned S3 links, so Software Update has its own storage setting.
+   The general `ANYAICAM_STORAGE_BACKEND` (thumbnails, clips, …) is unchanged:
+   `ANYAICAM_UPDATE_STORAGE_BACKEND=s3` with bucket `ANYAICAM_UPDATE_S3_BUCKET` (default `ANYAICAM_S3_BUCKET`) and
+   region `ANYAICAM_UPDATE_S3_REGION`; objects go under `updates/`. The cloud's AWS role needs
+   `s3:GetObject` and `s3:PutObject` on `arn:aws:s3:::<bucket>/updates/*`. The appliance endpoint answers 503
+   rather than hand out an undownloadable link: a local backend's `/storage/…` paths are relative.
 
 ## Tests
 

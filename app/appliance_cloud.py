@@ -2040,7 +2040,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not isinstance(signature,str) or not signature:
             logger.error('appliance_updates.release_unsigned target=%s channel=%s',target,channel)
             raise HTTPException(status_code=503,detail='The published release has no offline signature.')
-        package_url=get_storage().url('updates',release['package_key'],expires_seconds=300)
+        # Software Update storage (ANYAICAM_UPDATE_STORAGE_BACKEND, 2026-10-03):
+        # an absolute presigned link or nothing -- never an undownloadable one.
+        from updates_storage import UpdateStorageError,package_download_url
+        try:
+            package_url=package_download_url(release,expires_seconds=300)
+        except UpdateStorageError as error:
+            logger.error('appliance_updates.package_not_downloadable target=%s channel=%s error=%s',target,channel,error)
+            raise HTTPException(status_code=503,detail='The published release is not downloadable right now.') from error
         return {'manifest':release['manifest'],'signature':signature,'package_url':package_url}
 
     @app.post('/api/appliance/updates/{update_id}/result')
