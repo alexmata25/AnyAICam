@@ -36,6 +36,16 @@ the customer's next explicit try, after fixing the card, is a new attempt
 with a new key -- Stripe would otherwise replay the cached decline. Always
 the same subscription; a request that finds it already on Hybrid sends
 nothing.
+
+An attempt is closed by Stripe's authoritative state, not only by the
+answer to its own request (Codex final review of dffe171): whenever Stripe
+shows the subscription on the requested price -- a retry after a lost
+response, the subscription webhook, or the check after the request -- every
+open attempt for that price is closed as applied (reconcile_upgrade_attempts).
+So a later, legitimate upgrade after a return to Local is always a new
+attempt with a new key, never the old one whose cached answer Stripe might
+replay. After every request the result is taken from Stripe's subscription
+itself; an answer claiming Hybrid while Stripe shows Local is never trusted.
 """
 from __future__ import annotations
 
@@ -71,6 +81,25 @@ def _close_upgrade_attempt(attempt_id: str, status: str) -> None:
     with connection() as db:
         db.execute("UPDATE plan_upgrade_attempts SET status=?,open_slot=NULL,updated_at=? WHERE id=? AND open_slot='open'",
                    (status, datetime.now().isoformat(), attempt_id))
+
+
+def reconcile_upgrade_attempts(subscription: dict) -> int:
+    """Close every open upgrade attempt whose requested price Stripe now
+    shows on this subscription (applied, whether or not AnyAiCam saw the
+    answer to the request that applied it)."""
+    from partner_db import connection
+    subscription_id = str(subscription.get("id") or "")
+    if not subscription_id or subscription.get("pending_update"):
+        return 0
+    prices = sorted({str((i.get("price") or {}).get("id") or "") for i in ((subscription.get("items") or {}).get("data") or [])
+                     if isinstance(i, dict)} - {""})
+    if not prices:
+        return 0
+    with connection() as db:
+        return db.execute(
+            f"UPDATE plan_upgrade_attempts SET status='applied',open_slot=NULL,updated_at=? WHERE stripe_subscription_id=? "
+            f"AND open_slot='open' AND stripe_price_id IN ({','.join('?' * len(prices))})",
+            (datetime.now().isoformat(), subscription_id, *prices)).rowcount
 
 
 def _on_price(subscription: dict, price_id: str) -> bool:
@@ -130,9 +159,13 @@ def upgrade_to_hybrid(identity: dict) -> dict:
         item = items[0]
     if item is None or not item.get("id"):
         raise HTTPException(status_code=409, detail="This plan's billing record needs attention. Please contact AnyAiCam support.")
-    if str((item.get("price") or {}).get("id") or "") != hybrid_price:  # a repeated request finds it already moved
+    if str((item.get("price") or {}).get("id") or "") == hybrid_price:
+        # A repeated request (e.g. after a lost response) finds it already
+        # moved: nothing is sent, and the attempt that moved it is closed.
+        reconcile_upgrade_attempts(current)
+    else:
         attempt = _open_upgrade_attempt(customer_id, subscription_id, hybrid_price)
-        current = main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [
+        answer = main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [
             ("items[0][id]", str(item["id"])),
             ("items[0][price]", hybrid_price),
             ("proration_behavior", UPGRADE_PRORATION_BEHAVIOR),
@@ -143,21 +176,25 @@ def upgrade_to_hybrid(identity: dict) -> dict:
             ("metadata[anyaicam_camera_slot_plan_type]", "hybrid"),
             ("metadata[anyaicam_camera_slot_maximum]", str(camera_slot_maximum)),
         ], idempotency_key=f"anyaicam-upgrade-{subscription_id}-{item['id']}-{hybrid_price}-{attempt['id']}")
-        if not _on_price(current, hybrid_price) or current.get("pending_update"):
-            # pending_if_incomplete: the proration payment did not go
-            # through. Confirm with Stripe's current state before closing
-            # this attempt (the next try is then a new attempt, new key).
-            try:
-                confirmed = stripe_state.current_subscription(subscription_id)
-            except stripe_state.RetryableStripeEventError as error:
-                raise HTTPException(status_code=502, detail="Could not reach Stripe. Please try again shortly.") from error
-            applied = _on_price(confirmed, hybrid_price) and not confirmed.get("pending_update")
+        # The result is what Stripe's subscription shows now, never only the
+        # answer (which Stripe may replay for a key). Unreadable: the attempt
+        # stays open and a retry reuses its key.
+        try:
+            current = stripe_state.current_subscription(subscription_id)
+        except stripe_state.RetryableStripeEventError as error:
+            raise HTTPException(status_code=502, detail="Could not reach Stripe. Please try again shortly.") from error
+        applied = _on_price(current, hybrid_price) and not current.get("pending_update")
+        if applied:
+            reconcile_upgrade_attempts(current)
+        elif _on_price(answer, hybrid_price) and not answer.get("pending_update"):
+            # The answer says Hybrid but the subscription is not: an old
+            # answer replayed for this key. Close it; the next try is new.
+            _close_upgrade_attempt(attempt["id"], "stale")
+            raise HTTPException(status_code=409, detail="Your upgrade could not be confirmed. Please try again.")
         else:
-            applied = True
-        _close_upgrade_attempt(attempt["id"], "applied" if applied else "declined")
-        if applied and not _on_price(current, hybrid_price):
-            current = confirmed
-        if not applied:
+            # pending_if_incomplete: the proration payment did not go
+            # through and Stripe kept the subscription on Local.
+            _close_upgrade_attempt(attempt["id"], "declined")
             audit(identity, "customer.plan_upgrade_payment_incomplete", "customer", customer_id, {"to": "hybrid"})
             raise HTTPException(status_code=402, detail="The payment for the upgrade didn't go through, so your plan is still Local. "
                                                         "Please check your payment method and try again.")

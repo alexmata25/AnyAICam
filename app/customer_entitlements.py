@@ -819,6 +819,9 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     import plan_changes
     plan_changes.sync_scheduled_change(entitlement, current)
     plan_changes.sync_addons_with_base(entitlement, current)
+    # Stripe shows the price an upgrade asked for: that attempt is done,
+    # however its own answer was lost (webhook recovery).
+    plan_changes.reconcile_upgrade_attempts(current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}
 
 

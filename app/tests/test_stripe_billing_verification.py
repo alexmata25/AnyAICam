@@ -8,10 +8,15 @@ replays its first answer for a repeated Idempotency-Key. No live Stripe.
    retry after fixing the card is a new attempt with a new key.
 3. A delayed invoice.paid for an older period never clears grace started by
    a newer failed renewal.
+Codex final review of dffe171: an upgrade attempt Stripe applied while
+AnyAiCam lost the answer is closed once Stripe's state shows Hybrid, so a
+later, legitimate upgrade is a new attempt with a new key.
 """
 import sqlite3
 import threading
 from datetime import timedelta
+
+import pytest
 
 from test_stripe_billing_launch import (  # noqa: F401 -- fixtures and helpers
     HYBRID_8, LOCAL_8, OWNER_A, _checkout, _cookie, _deliver, _plan, _sub_event, _subscription, env,
@@ -108,6 +113,48 @@ def test_simultaneous_requests_for_one_upgrade_attempt_share_one_key(env, monkey
     keys = {key for _, key in _upgrade_posts(env)}
     assert len(_upgrade_posts(env)) == 5 and len(keys) == 1  # one attempt: Stripe applies it once
     assert _capacity(env) == (8, "hybrid")
+    assert _count(env, "SELECT COUNT(*) FROM customer_entitlements WHERE customer_id='cust-A' AND product='camera_slots_hybrid'") == 1
+    assert _count(env, "SELECT COUNT(*) FROM customer_entitlements WHERE customer_id='cust-A' AND product='camera_slots_hybrid' "
+                       "AND status='active'") == 1
+    assert _count(env, "SELECT COUNT(*) FROM plan_upgrade_attempts WHERE open_slot='open'") == 0
+
+
+@pytest.mark.parametrize("recovery", ["customer_retry", "webhook"])
+def test_an_upgrade_applied_while_its_answer_was_lost_never_lends_its_key_to_a_later_upgrade(env, monkeypatch, recovery):
+    from fastapi import HTTPException
+    _customer(env)  # Local on sub_A1
+    main = env["main"]
+    send = main.stripe_api_post
+
+    def answer_lost(path, fields, idempotency_key=None):
+        answer = send(path, fields, idempotency_key=idempotency_key)  # Stripe applies Hybrid...
+        if path == "/v1/subscriptions/sub_A1" and "items[0][price]" in dict(fields):
+            raise HTTPException(status_code=502, detail="connection reset")  # ...and the answer never arrives
+        return answer
+    monkeypatch.setattr(main, "stripe_api_post", answer_lost)
+    assert _upgrade(env).status_code == 502
+    monkeypatch.setattr(main, "stripe_api_post", send)
+    assert env["stripe"]["sub_A1"]["items"]["data"][0]["price"]["id"] == HYBRID_8
+    if recovery == "customer_retry":  # Stripe already shows Hybrid: nothing is sent again
+        assert _upgrade(env).status_code == 200
+    else:
+        assert _deliver(env, _sub_event("evt_upgrade_seen", "updated", env["stripe"]["sub_A1"], 3_000)).status_code == 200
+    assert _capacity(env) == (8, "hybrid") and len(_upgrade_posts(env)) == 1
+    assert _count(env, "SELECT COUNT(*) FROM plan_upgrade_attempts WHERE open_slot='open'") == 0  # the attempt is closed
+
+    env["stripe"]["sub_A1"]["items"]["data"][0]["price"] = {"id": LOCAL_8}  # later, legitimately back on Local
+    env["stripe"]["sub_A1"]["metadata"]["anyaicam_stripe_price_id"] = LOCAL_8
+    assert _deliver(env, _sub_event("evt_back_to_local", "updated", env["stripe"]["sub_A1"], 4_000)).status_code == 200
+    assert _capacity(env) == (8, "local")
+
+    assert _upgrade(env).status_code == 200  # the customer upgrades again
+    (_, first_key), (_, second_key) = _upgrade_posts(env)
+    assert second_key != first_key  # a new attempt: never the old key whose answer Stripe may still replay
+    assert env["stripe"]["sub_A1"]["items"]["data"][0]["price"]["id"] == HYBRID_8  # Stripe really applied it
+    assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]  # the same subscription, never a second one
+    assert _capacity(env) == (8, "hybrid")
+    for product in ("camera_slots_hybrid", "camera_slots_local"):
+        assert _count(env, f"SELECT COUNT(*) FROM customer_entitlements WHERE customer_id='cust-A' AND product='{product}'") == 1
 
 
 # ================================================================ 3. old invoice.paid vs newer failed renewal
