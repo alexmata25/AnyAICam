@@ -328,16 +328,23 @@ def _send_invitation_email(*, to: str, name: str, owner_name: str, link: str, ex
 
 
 def record_invitation_delivery(db, *, invitation_id: str, recipient: str, status: str, error: str, now: datetime,
-                               resend: bool) -> None:
+                               resend: bool, current_link: bool = True) -> None:
     """Stores the outcome of one invitation email attempt: on the invitation
     (what the owner's list shows) and in email_messages, beside password
     resets and account mail, so the operator's email-delivery readiness
-    warning covers invitations too. Never the link or its token."""
+    warning covers invitations too. Never the link or its token.
+
+    current_link=False is a resend whose new link was not stored (not
+    delivered, or the invitation changed meanwhile): the invitation keeps
+    the delivery state of the link it still holds."""
     from cloud_config import settings
 
-    db.execute("UPDATE invitations SET email_status=?,email_error=?,email_attempted_at=? WHERE id=?",
-               (status, error or None, now.isoformat(), invitation_id))
+    if current_link:
+        db.execute("UPDATE invitations SET email_status=?,email_error=?,email_attempted_at=? WHERE id=?",
+                   (status, error or None, now.isoformat(), invitation_id))
     metadata = {"kind": "household", "invitation_id": invitation_id, "resend": resend}
+    if not current_link:
+        metadata["earlier_link_kept"] = True
     if status == "failed" and error:
         metadata["error"] = error[:300]
     db.execute("INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -390,20 +397,38 @@ def _own_invitation(db, customer_id: str, invitation_id: str) -> dict:
 
 
 def resend_invitation(db, *, customer_id: str, invitation_id: str, now: datetime) -> tuple[dict, str]:
+    """Checks a resend and prepares a new link, without storing it: the new
+    link replaces the current one only once its email was actually sent
+    (commit_resent_link). A resend that fails or runs in preview mode must
+    never leave the recipient holding a dead link. Records the attempt
+    time, so failed attempts are spaced a minute apart too."""
     invitation = _own_invitation(db, customer_id, invitation_id)
-    if invitation["status"] not in ("pending",):
-        raise HouseholdError("Only a waiting or expired invitation can be sent again.")
+    if invitation["status"] != "pending" or invitation.get("invitee_user_id"):
+        raise HouseholdError("Only a waiting invitation can be sent again.")
+    if (invitation.get("expires_at") or "") < now.isoformat():
+        raise HouseholdError("This invitation has expired. Use Invite again to send a new one.")
     if int(invitation.get("send_count") or 0) >= MAX_SENDS_PER_INVITATION:
         raise HouseholdError("This invitation has been sent the maximum number of times. Cancel it and invite again.")
     last = invitation.get("last_sent_at")
     if last and (now - datetime.fromisoformat(last)).total_seconds() < RESEND_MIN_SECONDS:
         raise HouseholdError("Please wait a minute before sending it again.")
-    raw = secrets.token_urlsafe(32)  # the earlier link stops working
-    expires_at = (now + timedelta(days=INVITE_TTL_DAYS)).isoformat()
-    db.execute("UPDATE invitations SET token_hash=?,expires_at=?,last_sent_at=?,send_count=COALESCE(send_count,1)+1 WHERE id=?",
-               (token_hash(raw), expires_at, now.isoformat(), invitation_id))
-    invitation["expires_at"] = expires_at
+    db.execute("UPDATE invitations SET last_sent_at=? WHERE id=?", (now.isoformat(), invitation_id))
+    raw = secrets.token_urlsafe(32)
+    invitation["new_expires_at"] = (now + timedelta(days=INVITE_TTL_DAYS)).isoformat()
     return invitation, raw
+
+
+def commit_resent_link(db, *, invitation: dict, raw: str, now: datetime) -> bool:
+    """Makes the just-emailed link the only working one (the earlier link
+    stops working). Conditional on the invitation still being exactly what
+    was checked -- waiting, unexpired, unclaimed and holding the same link --
+    so a cancel, acceptance or another resend during the send is never
+    undone. False when it changed."""
+    return db.execute(
+        "UPDATE invitations SET token_hash=?,expires_at=?,send_count=COALESCE(send_count,1)+1 "
+        "WHERE id=? AND status='pending' AND token_hash=? AND expires_at>=? AND invitee_user_id IS NULL",
+        (token_hash(raw), invitation["new_expires_at"], invitation["id"], invitation["token_hash"], now.isoformat()),
+    ).rowcount == 1
 
 
 def cancel_invitation(db, *, customer_id: str, invitation_id: str, now: datetime) -> None:
@@ -526,11 +551,17 @@ def household_overview(db, customer_id: str, now: datetime) -> dict:
     # email_status/email_attempted_at: whether the latest email actually went
     # out. The provider's reason (email_error) stays operator-side.
     for row in db.execute("SELECT id,email,name,status,expires_at,created_at,accepted_at,cancelled_at,last_sent_at,send_count,"
-                          "email_status,email_attempted_at "
+                          "email_status,email_attempted_at,permissions_json "
                           "FROM invitations WHERE customer_id=? AND role='customer_viewer' AND token_hash IS NOT NULL "
                           "ORDER BY created_at DESC LIMIT 50", (customer_id,)).fetchall():
         item = dict(row)
         item["status"] = _invitation_status(item, stamp)
+        # What the invitation grants, so "Invite again" on an expired one
+        # starts from the same choices (the owner's own data).
+        try:
+            item["permissions"] = json.loads(item.pop("permissions_json") or "{}")
+        except (TypeError, ValueError):
+            item["permissions"] = {}
         if item["status"] in ("pending", "expired"):
             invitations.append(item)
     cameras = customer_cameras(db, customer_id)
@@ -544,19 +575,30 @@ def household_overview(db, customer_id: str, now: datetime) -> dict:
 def _delivery_message(status: str, email: str, *, first: bool) -> str:
     if status == "sent":
         return f"Invitation sent to {email}." if first else f"Invitation sent again to {email}."
-    if status == "preview":  # email preview mode (development/staging without SMTP): nothing left the server
-        return (f"Invitation created for {email} (email preview mode: nothing was emailed)." if first
-                else f"New invitation link created for {email} (email preview mode: nothing was emailed).")
+    if status == "preview":  # email preview mode (no email provider configured): nothing left the server
+        return (f"Invitation created for {email}, but it was not delivered: email preview mode is on, so nothing was emailed."
+                if first else f"The invitation to {email} was not delivered: email preview mode is on, so nothing was emailed.")
     return (f"Invitation created for {email}, but the email could not be sent, so they have not received it. "
             "Use Try again in Waiting invitations." if first
             else f"The email to {email} could not be sent, so they have not received it. Please try again in a minute.")
 
 
-def _record_delivery(invitation_id: str, recipient: str, status: str, error: str, now: datetime, *, resend: bool) -> None:
+def _resend_not_delivered_message(status: str, invitation: dict) -> str:
+    """A resend that was not delivered changed nothing: the earlier link
+    (and its expiry) still stands."""
+    first_line = _delivery_message(status, invitation["email"], first=False)
+    if invitation.get("email_status") == "sent":
+        when = datetime.fromisoformat(invitation["expires_at"]).strftime("%B %d, %Y").replace(" 0", " ")
+        return f"{first_line} Their earlier invitation link still works until {when}."
+    return first_line
+
+
+def _record_delivery(invitation_id: str, recipient: str, status: str, error: str, now: datetime, *, resend: bool,
+                     current_link: bool = True) -> None:
     try:
         with connection() as db:
             record_invitation_delivery(db, invitation_id=invitation_id, recipient=recipient, status=status, error=error,
-                                       now=now, resend=resend)
+                                       now=now, resend=resend, current_link=current_link)
     except Exception:  # recording the outcome must never hide the outcome from the owner
         logger.exception("household.invitation_delivery_record_failed")
 
@@ -618,10 +660,24 @@ def register_household_routes(app: FastAPI, page_shell) -> None:
         except HouseholdError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         status, error = _send_invitation_email(to=invitation["email"], name=invitation.get("name") or "", owner_name=owner_name,
-                                               link=join_link(public_base_url(request), raw), expires_at=invitation["expires_at"])
-        _record_delivery(invitation_id, invitation["email"], status, error, now, resend=True)
-        audit(identity, "household.invitation_resent", "invitation", invitation_id, {"email_status": status})
-        return _delivery_response(_delivery_message(status, invitation["email"], first=False), status)
+                                               link=join_link(public_base_url(request), raw), expires_at=invitation["new_expires_at"])
+        committed = False
+        if status == "sent":
+            # Only a delivered link replaces the current one.
+            with connection() as db:
+                committed = commit_resent_link(db, invitation=invitation, raw=raw, now=now)
+            if not committed:
+                status, error = "failed", "The invitation changed while its new email was being sent; the new link was not used."
+        _record_delivery(invitation_id, invitation["email"], status, error, now, resend=True, current_link=committed)
+        audit(identity, "household.invitation_resent", "invitation", invitation_id,
+              {"email_status": status, "link_replaced": committed})
+        if committed:
+            message = _delivery_message(status, invitation["email"], first=False)
+        elif error.startswith("The invitation changed"):
+            message = "This invitation is no longer waiting (it was accepted, cancelled or sent again), so nothing changed."
+        else:
+            message = _resend_not_delivered_message(status, invitation)
+        return _delivery_response(message, status)
 
     @app.post("/api/customer/household/invitations/{invitation_id}/cancel")
     def cancel(request: Request, invitation_id: str) -> dict:
@@ -776,7 +832,7 @@ function delivery(i){const d=DELIVERY[i.email_status];if(!d)return '';return ` <
 function render(){
  $('hh-users').innerHTML=data.users.map(u=>`<div class="health-row" style="align-items:flex-start;gap:12px;flex-wrap:wrap"><span><strong>${esc(u.name||u.email)}</strong>${u.role==='customer_owner'?' <span class="pill">Owner</span>':''}${u.status==='disabled'?' <span class="pill" style="background:#5c3140;color:#ffd0da">Disabled</span>':''}<br><span class="health-detail">${esc(u.email)}</span>${u.permissions?`<br><span class="health-detail">${esc(permSummary(u.permissions))}</span>`:''}</span>`+
  (u.role==='customer_viewer'?`<span style="display:flex;gap:8px;flex-wrap:wrap"><button class="ghost-button" data-edit="${esc(u.id)}">Permissions</button>`+(u.status==='disabled'?`<button class="ghost-button" data-act="enable" data-id="${esc(u.id)}">Turn on</button>`:`<button class="ghost-button" data-act="disable" data-id="${esc(u.id)}">Disable</button>`)+`<button class="ghost-button" data-act="remove" data-id="${esc(u.id)}">Remove</button></span>`:'')+`</div>`).join('')||'No users yet.';
- $('hh-invites').innerHTML=data.invitations.map(i=>`<div class="health-row" style="gap:12px;flex-wrap:wrap"><span><strong>${esc(i.name||i.email)}</strong> <span class="pill">${i.status==='expired'?'Expired':'Waiting'}</span>${delivery(i)}<br><span class="health-detail">${esc(i.email)} · ${i.status==='expired'?'expired':'expires'} ${esc(when(i.expires_at))}${i.email_status==='sent'&&i.email_attempted_at?` · emailed ${esc(when(i.email_attempted_at))}`:''}${i.email_status==='failed'?' · the email could not be sent, so they have not received it':''}${i.email_status==='preview'?' · email is not set up, so nothing was emailed':''}</span></span><span style="display:flex;gap:8px"><button class="ghost-button" data-inv="resend" data-id="${esc(i.id)}">${i.email_status==='failed'?'Try again':'Resend'}</button><button class="ghost-button" data-inv="cancel" data-id="${esc(i.id)}">Cancel</button></span></div>`).join('')||'No invitations waiting.';
+ $('hh-invites').innerHTML=data.invitations.map(i=>`<div class="health-row" style="gap:12px;flex-wrap:wrap"><span><strong>${esc(i.name||i.email)}</strong> <span class="pill">${i.status==='expired'?'Expired':'Waiting'}</span>${delivery(i)}<br><span class="health-detail">${esc(i.email)} · ${i.status==='expired'?'expired':'expires'} ${esc(when(i.expires_at))}${i.email_status==='sent'&&i.email_attempted_at?` · emailed ${esc(when(i.email_attempted_at))}`:''}${i.email_status==='failed'?' · the email could not be sent, so they have not received it':''}${i.email_status==='preview'?' · email is not set up, so nothing was emailed':''}</span></span><span style="display:flex;gap:8px">${i.status==='expired'?`<button class="ghost-button" data-again="${esc(i.id)}">Invite again</button>`:`<button class="ghost-button" data-inv="resend" data-id="${esc(i.id)}">${i.email_status==='failed'?'Try again':'Resend'}</button>`}<button class="ghost-button" data-inv="cancel" data-id="${esc(i.id)}">Cancel</button></span></div>`).join('')||'No invitations waiting.';
 }
 async function load(){try{data=await call('/api/customer/household','GET');render()}catch(e){$('hh-users').textContent=e.message}}
 function fill(p){
@@ -787,13 +843,14 @@ function fill(p){
  $('hh-doors').innerHTML=doors.map(c=>`<label><input type="checkbox" class="hh-door" value="${esc(c.id)}" ${p.door_ids.includes(c.id)?'checked':''}> ${esc(c.name)}</label>`).join('');
 }
 function collect(){const p={camera_ids:[...document.querySelectorAll('.hh-cam:checked')].map(x=>x.value),door_ids:[...document.querySelectorAll('.hh-door:checked')].map(x=>x.value)};PERMS.forEach(k=>p[k]=!!document.querySelector(`.hh-perm[value="${k}"]`)?.checked);return p}
-function open(user){editing=user;$('hh-form-message').textContent='';$('hh-identity').style.display=user?'none':'grid';$('hh-title').textContent=user?`Permissions · ${user.name||user.email}`:'Add user';$('hh-submit').textContent=user?'Save permissions':'Send invitation';
- const p=user?user.permissions:{...data.default_permissions,camera_ids:data.cameras.map(c=>c.id),door_ids:[]};if(!user){$('hh-name').value='';$('hh-email').value=''}fill(p);$('hh-dialog').showModal()}
+function open(user,again){editing=user;$('hh-form-message').textContent='';$('hh-identity').style.display=user?'none':'grid';$('hh-title').textContent=user?`Permissions · ${user.name||user.email}`:'Add user';$('hh-submit').textContent=user?'Save permissions':'Send invitation';
+ const p=user?user.permissions:again?{...data.default_permissions,camera_ids:[],door_ids:[],...again.permissions}:{...data.default_permissions,camera_ids:data.cameras.map(c=>c.id),door_ids:[]};if(!user){$('hh-name').value=again?again.name||'':'';$('hh-email').value=again?again.email:''}fill(p);$('hh-dialog').showModal()}
 $('hh-add').onclick=()=>data&&open(null);$('hh-cancel').onclick=()=>$('hh-dialog').close();
 $('hh-all').onchange=e=>document.querySelectorAll('.hh-cam').forEach(x=>x.checked=e.target.checked);
 $('hh-form').onsubmit=async e=>{e.preventDefault();const p=collect();try{let r;if(editing){r=await call(`/api/customer/household/users/${encodeURIComponent(editing.id)}/permissions`,'PUT',p)}else{r=await call('/api/customer/household/invitations','POST',{name:$('hh-name').value,email:$('hh-email').value,permissions:p})}$('hh-dialog').close();say(r.message,r.email_sent!==false);load()}catch(err){$('hh-form-message').textContent=err.message}};
 document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b||!data)return;
  if(b.dataset.edit){open(data.users.find(u=>u.id===b.dataset.edit));return}
+ if(b.dataset.again){open(null,data.invitations.find(i=>i.id===b.dataset.again));return}
  if(b.dataset.act){const u=data.users.find(x=>x.id===b.dataset.id),name=u.name||u.email;if(b.dataset.act==='remove'&&!confirm(`Remove ${name}? They are signed out everywhere and lose all access.`))return;if(b.dataset.act==='disable'&&!confirm(`Disable ${name}? They are signed out everywhere until you turn them back on.`))return;
   try{const r=await call(`/api/customer/household/users/${encodeURIComponent(b.dataset.id)}/${b.dataset.act}`);say(r.message);load()}catch(err){say(err.message,false)}return}
  if(b.dataset.inv){try{const r=await call(`/api/customer/household/invitations/${encodeURIComponent(b.dataset.id)}/${b.dataset.inv}`);say(r.message,r.email_sent!==false);load()}catch(err){say(err.message,false)}}});

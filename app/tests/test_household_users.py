@@ -470,5 +470,5 @@ def test_delivery_messages_say_what_actually_happened():
     assert hu._delivery_message("sent", "a@x.test", first=True) == "Invitation sent to a@x.test."
     assert hu._delivery_message("sent", "a@x.test", first=False) == "Invitation sent again to a@x.test."
     assert "created" in hu._delivery_message("preview", "a@x.test", first=True)
-    assert hu._delivery_message("preview", "a@x.test", first=False).startswith("New invitation link created")
+    assert "not delivered" in hu._delivery_message("preview", "a@x.test", first=False)
     assert "could not be sent" in hu._delivery_message("failed", "a@x.test", first=True)
