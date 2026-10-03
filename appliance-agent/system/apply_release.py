@@ -392,6 +392,7 @@ class Applier:
 
     def _write_result(self, update_id: str, payload: dict) -> None:
         safe_replace(self.paths.results, f"{update_id}.json", json.dumps(payload, sort_keys=True).encode("utf-8"))
+        _journal(payload)
 
     def _audit(self, entry: dict) -> None:
         """Append-only JSON lines in root's own directory (never the
@@ -842,6 +843,24 @@ class Applier:
         safe_replace(path.parent, path.name, ("\n".join(output) + "\n").encode("utf-8"),
                      mode=(info.st_mode & 0o7777) if info is not None else 0o640,
                      owner=(info.st_uid, info.st_gid) if info is not None and _posix() else None)
+
+
+def _journal(payload: dict) -> None:
+    """One line per state change on stderr -- the anyaicam-software-update
+    unit's journal (2026-10-03). Identifiers, versions, states and error
+    summaries only, like the root audit log."""
+    try:
+        parts = [f"update_id={payload.get('update_id')}", f"state={payload.get('state')}"]
+        if payload.get("to_version") or payload.get("to_build_id"):
+            parts.append(f"{payload.get('from_version') or '?'}+{str(payload.get('from_build_id') or '')[:12]}"
+                         f" -> {payload.get('to_version') or '?'}+{str(payload.get('to_build_id') or '')[:12]}")
+        if payload.get("final"):
+            parts.append(f"final duration={payload.get('duration_seconds')}s")
+        if payload.get("error"):
+            parts.append(f"error={str(payload.get('error'))[:300]}")
+        print("apply_release: " + " ".join(parts), file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 -- logging never changes the outcome
+        pass
 
 
 def main() -> int:
