@@ -33,7 +33,7 @@ from anyaicam_agent.commands import execute
 from anyaicam_agent.config import AgentConfig
 from anyaicam_agent.updater import installer
 from anyaicam_agent.updater.factory import build_update_state_machine
-from anyaicam_agent.updater.models import PendingValidation
+from anyaicam_agent.updater.models import PendingValidation, UpdateResult, UpdateState
 from anyaicam_agent.updater.source import FakeUpdateSourceProvider
 from anyaicam_agent.updater.verify import canonical_manifest_bytes, sha256_of_file
 
@@ -70,6 +70,7 @@ class CommandsInstallUpdateTestCase(unittest.TestCase):
         self.config = AgentConfig(state_dir=str(self.root), config_dir=str(self.root), log_dir=str(self.root))
 
         self.private_key, self.public_key = _generate_keypair()
+        self.config.trusted_public_key_file.parent.mkdir(parents=True, exist_ok=True)
         self.config.trusted_public_key_file.write_bytes(_pem_bytes(self.public_key))
 
         self.restart = RecordingRestart()
@@ -115,142 +116,127 @@ class CommandsInstallUpdateTestCase(unittest.TestCase):
         machine.pending_validation_file.write_text(json.dumps(marker.as_dict()), encoding="utf-8")
 
 
-# -- good payload / mapping -------------------------------------------------
+# -- owner-requested staging (Software Update, 2026-10-03) ---------------------
+#
+# install_update no longer runs the legacy pointer-flip pipeline: it hands
+# the owner-confirmed release to OwnerUpdate.stage() (tested in
+# test_owner_update_staging.py) and reports its outcome. These tests pin the
+# command-channel contract around it.
 
-class GoodPayloadTests(CommandsInstallUpdateTestCase):
-    def test_good_payload_reaches_restarting_and_is_reported_completed_but_provisional(self):
+class RecordingOwnerUpdate:
+    def __init__(self, state=UpdateState.ACTIVATION_REQUESTED, error=""):
+        self.state = state
+        self.error = error
+        self.calls = []
+
+    def stage(self, payload):
+        self.calls.append(payload)
+        return UpdateResult(update_id=str((payload or {}).get("update_id") or ""), from_version="1.1.0",
+                            to_version="1.2.0", state=self.state, error=self.error)
+
+
+OWNER_PAYLOAD = {"update_id": "rel-1-2-0", "version": "1.2.0", "sha256": "a" * 64, "confirmed": True,
+                 "requested_by": "owner@example.test"}
+
+
+class OwnerStagingTests(CommandsInstallUpdateTestCase):
+    def test_install_update_stages_the_owner_release_and_reports_it_as_provisional(self):
+        machine = self.make_machine()
+        owner = RecordingOwnerUpdate()
+
+        status, result, error = execute("install_update", OWNER_PAYLOAD, self.config, state_machine=machine,
+                                        owner_update=owner)
+
+        self.assertEqual((status, error), ("completed", ""))
+        self.assertEqual(result["state"], "activation_requested")
+        self.assertFalse(result["health_confirmed"])
+        self.assertEqual(owner.calls, [OWNER_PAYLOAD])
+        # The legacy pointer never moves and nothing restarts from here.
+        self.assertEqual(installer.current_version(self.config.current_version_pointer_file), "")
+        self.assertEqual(self.restart.calls, 0)
+
+    def test_a_rejected_release_is_reported_failed_with_its_reason(self):
+        owner = RecordingOwnerUpdate(state=UpdateState.REJECTED, error="bad_signature: no")
+
+        status, result, error = execute("install_update", OWNER_PAYLOAD, self.config, state_machine=self.make_machine(),
+                                        owner_update=owner)
+
+        self.assertEqual(status, "failed")
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(error, "bad_signature: no")
+
+    def test_without_the_owner_updater_install_update_is_refused(self):
+        status, _result, error = execute("install_update", OWNER_PAYLOAD, self.config, state_machine=self.make_machine())
+
+        self.assertEqual(status, "failed")
+        self.assertIn("not configured", error)
+
+    def test_the_legacy_pointer_flip_pipeline_is_unreachable_from_commands(self):
         manifest_dict, signature, package_bytes = self.make_update()
         machine = self.make_machine(source=FakeUpdateSourceProvider(package_bytes=package_bytes))
-        payload = self.payload_for(manifest_dict, signature)
+        machine.process_install_update = lambda *a, **k: self.fail("process_install_update must not run")
+        machine.check_and_install = lambda *a, **k: self.fail("check_and_install must not run")
 
-        status, result, error = execute("install_update", payload, self.config, state_machine=machine)
+        execute("install_update", self.payload_for(manifest_dict, signature), self.config, state_machine=machine,
+                owner_update=RecordingOwnerUpdate(state=UpdateState.REJECTED, error="bad_request: x"))
 
-        self.assertEqual(status, "completed")
-        self.assertEqual(error, "")
-        self.assertEqual(result["state"], "restarting")
-        self.assertFalse(result["health_confirmed"])
-        self.assertEqual(self.restart.calls, 1)
-        self.assertEqual(installer.current_version(self.config.current_version_pointer_file), "1.1.0")
-
-
-# -- malformed / missing payload ---------------------------------------------
-
-class MalformedPayloadTests(CommandsInstallUpdateTestCase):
-    def test_malformed_base64_signature_fails_cleanly(self):
-        manifest_dict, signature, package_bytes = self.make_update()
-        source = FakeUpdateSourceProvider(package_bytes=package_bytes)
-        machine = self.make_machine(source=source)
-        payload = {"manifest": manifest_dict, "signature": "not_valid_base64!!!"}
-
-        status, result, error = execute("install_update", payload, self.config, state_machine=machine)
-
-        self.assertEqual(status, "failed")
-        self.assertIn("base64", error.lower())
-        self.assertEqual(result, {})
-        self.assertEqual(source.download_calls, [])
-        self.assertIsNone(machine.history.get(manifest_dict["update_id"]))
-
-    def test_missing_manifest_key_fails_cleanly(self):
-        _, signature, _ = self.make_update()
-        source = FakeUpdateSourceProvider()
-        machine = self.make_machine(source=source)
-        payload = {"signature": base64.b64encode(signature).decode("ascii")}
-
-        status, result, error = execute("install_update", payload, self.config, state_machine=machine)
-
-        self.assertEqual(status, "failed")
-        self.assertIn("manifest", error.lower())
-        self.assertEqual(source.download_calls, [])
-
-    def test_missing_signature_key_fails_cleanly(self):
-        manifest_dict, _, _ = self.make_update()
-        source = FakeUpdateSourceProvider()
-        machine = self.make_machine(source=source)
-        payload = {"manifest": manifest_dict}
-
-        status, result, error = execute("install_update", payload, self.config, state_machine=machine)
-
-        self.assertEqual(status, "failed")
-        self.assertIn("signature", error.lower())
-        self.assertEqual(source.download_calls, [])
+        self.assertEqual(installer.current_version(self.config.current_version_pointer_file), "")
 
 
 # -- the startup/update interlock --------------------------------------------
 
 class InterlockTests(CommandsInstallUpdateTestCase):
     def test_blocked_after_failed_startup_resume(self):
-        manifest_dict, signature, package_bytes = self.make_update()
-        source = FakeUpdateSourceProvider(package_bytes=package_bytes)
-        machine = self.make_machine(source=source)
-        payload = self.payload_for(manifest_dict, signature)
+        owner = RecordingOwnerUpdate()
 
         status, result, error = execute(
-            "install_update", payload, self.config, state_machine=machine, update_resume_failed=True,
+            "install_update", OWNER_PAYLOAD, self.config, state_machine=self.make_machine(), update_resume_failed=True,
+            owner_update=owner,
         )
 
         self.assertEqual(status, "failed")
         self.assertIn("resume", error.lower())
-        self.assertEqual(source.download_calls, [])
+        self.assertEqual(owner.calls, [])
 
     def test_blocked_while_marker_exists_before_process_exit(self):
-        manifest_dict, signature, package_bytes = self.make_update()
-        source = FakeUpdateSourceProvider(package_bytes=package_bytes)
-        machine = self.make_machine(source=source)
+        machine = self.make_machine()
         self.write_marker(machine)
-        payload = self.payload_for(manifest_dict, signature)
+        owner = RecordingOwnerUpdate()
 
-        status, result, error = execute("install_update", payload, self.config, state_machine=machine)
+        status, result, error = execute("install_update", OWNER_PAYLOAD, self.config, state_machine=machine,
+                                        owner_update=owner)
 
         self.assertEqual(status, "failed")
         self.assertIn("awaiting restart", error.lower())
-        self.assertEqual(source.download_calls, [])
+        self.assertEqual(owner.calls, [])
 
     def test_blocked_when_marker_stat_fails(self):
-        manifest_dict, signature, package_bytes = self.make_update()
-        source = FakeUpdateSourceProvider(package_bytes=package_bytes)
-        machine = self.make_machine(source=source)
+        machine = self.make_machine()
         blocking_file = self.root / "blocking_file"
         blocking_file.write_text("not a directory", encoding="utf-8")
         machine.pending_validation_file = blocking_file / "pending_validation.json"
-        payload = self.payload_for(manifest_dict, signature)
+        owner = RecordingOwnerUpdate()
 
-        status, result, error = execute("install_update", payload, self.config, state_machine=machine)
+        status, result, error = execute("install_update", OWNER_PAYLOAD, self.config, state_machine=machine,
+                                        owner_update=owner)
 
         self.assertEqual(status, "failed")
         self.assertIn("storage error", error.lower())
-        self.assertEqual(source.download_calls, [])
+        self.assertEqual(owner.calls, [])
 
     def test_unblocked_after_a_clean_fresh_process_resume(self):
-        manifest_dict, signature, package_bytes = self.make_update()
-        source = FakeUpdateSourceProvider(package_bytes=package_bytes)
-        machine = self.make_machine(source=source)
+        machine = self.make_machine()
         self.assertIsNone(machine.resume_if_pending())  # nothing pending -- the "fresh process" case
-        payload = self.payload_for(manifest_dict, signature)
+        owner = RecordingOwnerUpdate()
 
         status, result, error = execute(
-            "install_update", payload, self.config, state_machine=machine, update_resume_failed=False,
+            "install_update", OWNER_PAYLOAD, self.config, state_machine=machine, update_resume_failed=False,
+            owner_update=owner,
         )
 
         self.assertEqual(status, "completed")
-        self.assertEqual(result["state"], "restarting")
-
-
-# -- idempotent replay --------------------------------------------------------
-
-class IdempotentReplayTests(CommandsInstallUpdateTestCase):
-    def test_replaying_the_same_manifest_after_a_terminal_conclusion_does_not_redownload(self):
-        manifest_dict, signature, package_bytes = self.make_update()
-        source = FakeUpdateSourceProvider(package_bytes=package_bytes, fail_download=True)
-        machine = self.make_machine(source=source)
-        payload = self.payload_for(manifest_dict, signature)
-
-        status1, result1, error1 = execute("install_update", payload, self.config, state_machine=machine)
-        status2, result2, error2 = execute("install_update", payload, self.config, state_machine=machine)
-
-        self.assertEqual(status1, "failed")
-        self.assertEqual(result1["state"], "download_failed")
-        self.assertEqual((status1, result1, error1), (status2, result2, error2))
-        self.assertEqual(len(source.download_calls), 1)  # NOT re-downloaded on replay
+        self.assertEqual(result["state"], "activation_requested")
+        self.assertEqual(len(owner.calls), 1)
 
 
 # -- non-update commands are unaffected ---------------------------------------

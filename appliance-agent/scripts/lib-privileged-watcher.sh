@@ -56,6 +56,19 @@ install_privileged_watcher() {
     # anyaicam-vms.service.
     install -d -m 0700 -o root -g root "$watcher_dir"
     install -m 0700 -o root -g root "$watcher_src" "$watcher_dir/watcher.py"
+    # Software Update (2026-10-03): the root applier and its stdlib-only
+    # checks, root-owned in this 0700 directory -- the applier imports
+    # nothing from the agent's venv.
+    local applier_src="$source_dir/system/apply_release.py"
+    local checks_src="$source_dir/anyaicam_agent/updater/release_checks.py"
+    for f in "$applier_src" "$checks_src"; do
+        if [[ ! -f "$f" ]]; then
+            echo "[ERROR] Missing bundled software-update file: $f" >&2
+            return 1
+        fi
+    done
+    install -m 0700 -o root -g root "$applier_src" "$watcher_dir/apply_release.py"
+    install -m 0600 -o root -g root "$checks_src" "$watcher_dir/anyaicam_release_checks.py"
     install -m 0644 -o root -g root "$path_unit_src" "$systemd_dir/anyaicam-privileged-watcher.path"
     install -m 0644 -o root -g root "$service_unit_src" "$systemd_dir/anyaicam-privileged-watcher.service"
 

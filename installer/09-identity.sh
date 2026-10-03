@@ -39,9 +39,15 @@ stamp_release() {
         echo "  \"mediamtx_included\": \"${MEDIAMTX_INCLUDED:-unknown}\","
         echo "  \"mediamtx_sha256\": \"${MEDIAMTX_SHA256:-}\","
         echo "  \"installer_version\": \"$INSTALLER_VERSION\","
+        echo "  \"release_version\": \"${RELEASE_VERSION:-}\","
         echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
         echo "}"
     } > "$VMS_RELEASE_MARKER"
     chmod 0644 "$VMS_RELEASE_MARKER"
+    # Software Update keeps its own root-owned copy for the downgrade check
+    # (the marker above sits in a directory the agent user owns).
+    if [[ -n "${RELEASE_VERSION:-}" && -d "${UPDATE_STATE_DIR:-/var/lib/anyaicam-update}" ]]; then
+        install -m 0644 -o root -g root "$VMS_RELEASE_MARKER" "${UPDATE_STATE_DIR:-/var/lib/anyaicam-update}/installed_release.json"
+    fi
     log "Stamped installed VMS release: $VMS_RELEASE_COMMIT"
 }

@@ -19,6 +19,8 @@ GET /api/appliance/updates/latest must answer no_update_available, never
 a 404 or an unhandled error (that 404/traceback loop is the actively
 reported bug this module fixes).
 """
+import base64
+import hashlib
 import json
 import os
 import re
@@ -66,56 +68,57 @@ def get_latest_release(target: str, channel: str) -> dict | None:
     return record
 
 
-def publish_release(target: str, channel: str, *, manifest: dict, package_bytes: bytes) -> dict:
-    """Publishes one release: stores the package bytes and then the
-    catalog pointer (which must be written LAST, so a reader can never
-    observe a catalog entry whose package object doesn't exist yet) as
-    this target/channel's new 'latest'. A full release-publishing CLI
-    (signing, versioning, rollout control) is out of scope for this
-    repair pass -- the actively reported bug is the total absence of a
-    catalog/endpoint, not the absence of tooling to operate one; this
-    function exists so that absence is directly testable."""
-    storage = get_storage()
-    base = _catalog_key(target, channel).rsplit("/", 1)[0]
-    package_key = f"{base}/{validate_path_segment(str(manifest.get('version', '')), 'version')}/package.bin"
-    storage.put("updates", package_key, package_bytes, content_type="application/octet-stream")
-    record = {"manifest": manifest, "package_key": package_key}
-    storage.put("updates", _catalog_key(target, channel), json.dumps(record).encode("utf-8"), content_type="application/json")
-    return record
-
-
-def load_signing_key():
-    """Loads the RSA private key used to sign manifests, from the PEM
-    file at ANYAICAM_UPDATE_SIGNING_KEY_FILE. Returns None (never raises)
-    if unset, missing, or invalid -- callers must treat that as "signing
-    unavailable" and fail closed (503) rather than serve an unsigned or
-    partially-signed manifest. Mirrors the fail-closed posture of the
-    device-side counterpart, updater/verify.py's
-    load_trusted_public_key(), just inverted (private key, loaded fresh
-    on every call for the same reason: a verifier/signer must never keep
-    using a key that was cached before the file existed or before an
-    operator corrected a provisioning mistake)."""
-    path = os.environ.get("ANYAICAM_UPDATE_SIGNING_KEY_FILE", "").strip()
+def load_trusted_public_key():
+    """The release-signing PUBLIC key (ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE),
+    used only to check that what is published was signed offline by the
+    owner. Software Update (2026-10-03): the cloud never holds the private
+    key and never signs anything -- it stores and serves the offline
+    signature. None when unset/unreadable (publishing then fails closed)."""
+    path = os.environ.get("ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE", "").strip()
     if not path:
         return None
     try:
-        return serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+        return serialization.load_pem_public_key(Path(path).read_bytes())
     except (OSError, ValueError, TypeError):
         return None
 
 
 def canonical_manifest_bytes(manifest_dict: dict) -> bytes:
-    """Byte-for-byte the same canonicalization as updater/verify.py's own
-    canonical_manifest_bytes() -- signer and verifier must agree exactly,
-    or every signature this server issues would fail verification on the
-    device."""
+    """Byte-for-byte the canonicalization the appliance verifies
+    (updater/verify.py, system/apply_release.py) and the offline signer
+    signs (installer/sign_update_release.py)."""
     return json.dumps(manifest_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def sign_manifest(manifest_dict: dict, private_key) -> bytes:
-    """RSA-PKCS1v15+SHA-256 over canonical_manifest_bytes() -- the exact
-    padding/hash pair updater/verify.py's verify_manifest_signature()
-    checks against (deliberately SHA-256, not live_cdn_signing.py's
-    CloudFront-fixed SHA-1; see that module's own verify-side docstring
-    for why the two differ)."""
-    return private_key.sign(canonical_manifest_bytes(manifest_dict), padding.PKCS1v15(), hashes.SHA256())
+class PublishError(Exception):
+    pass
+
+
+def publish_release(target: str, channel: str, *, manifest: dict, package_bytes: bytes, signature: bytes) -> dict:
+    """Publishes one offline-signed release as this target/channel's
+    'latest': the signature must verify under the configured public key,
+    and the package must have the manifest's SHA-256 and size. Stores the
+    package first and the catalog pointer LAST, so a reader never sees a
+    pointer to a missing package."""
+    public_key = load_trusted_public_key()
+    if public_key is None:
+        raise PublishError("ANYAICAM_UPDATE_SIGNING_PUBLIC_KEY_FILE is not configured; refusing to publish.")
+    try:
+        public_key.verify(signature, canonical_manifest_bytes(manifest), padding.PKCS1v15(), hashes.SHA256())
+    except Exception as error:
+        raise PublishError("The manifest signature does not verify; refusing to publish.") from error
+    if hashlib.sha256(package_bytes).hexdigest() != str(manifest.get("sha256", "")).lower():
+        raise PublishError("The package does not match the manifest's SHA-256.")
+    if len(package_bytes) != int(manifest.get("package_size_bytes", -1)):
+        raise PublishError("The package does not match the manifest's size.")
+    if manifest.get("target") != target or manifest.get("channel") != channel:
+        raise PublishError("The manifest is for a different target/channel.")
+    storage = get_storage()
+    base = _catalog_key(target, channel).rsplit("/", 1)[0]
+    update_id = validate_path_segment(str(manifest.get("update_id", "")), "update_id")
+    package_key = f"{base}/{update_id}/package.bin"
+    storage.put("updates", package_key, package_bytes, content_type="application/octet-stream")
+    record = {"manifest": manifest, "package_key": package_key,
+              "signature": base64.b64encode(signature).decode("ascii")}
+    storage.put("updates", _catalog_key(target, channel), json.dumps(record).encode("utf-8"), content_type="application/json")
+    return record

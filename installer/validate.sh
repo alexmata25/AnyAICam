@@ -190,6 +190,17 @@ vms_database_integrity_ok() {
     docker exec "${ANYAICAM_VMS_CONTAINER:-anyaicam-vms}" python3 -c 'import sqlite3,sys; c=sqlite3.connect("file:/app/recordings/partner_portal.db?mode=ro",uri=True); sys.exit(0 if c.execute("PRAGMA quick_check").fetchone()[0]=="ok" else 1)'
 }
 
+# Software Update (2026-10-03).
+vms_reports_release_version() {
+    curl -fsS -m 5 http://127.0.0.1:8000/version | grep -Fq "\"version\":\"$RELEASE_VERSION\""
+}
+update_signing_key_ok() {
+    local key="${UPDATE_KEY_FILE:-/etc/anyaicam-update/trusted_signing_key.pem}"
+    [[ -f "$key" && ! -L "$key" ]] || return 1
+    [[ "$(stat -c %U "$key")" == "root" && "$(stat -c %U "$(dirname "$key")")" == "root" ]] || return 1
+    [[ "$(sha256sum "$key" | awk '{print $1}')" == "$UPDATE_SIGNING_KEY_SHA256" ]]
+}
+
 run_validate() {
     load_release_metadata
     detect_install_state
@@ -201,6 +212,13 @@ run_validate() {
     check "VMS release marker exists" test -f "$VMS_RELEASE_MARKER"
     check "installed release marker contains exact approved commit" grep -q "\"vms_release_commit\": \"$VMS_RELEASE_COMMIT\"" "$VMS_RELEASE_MARKER"
     check "VMS env contains exact approved commit" grep -q "^ANYAICAM_VMS_COMMIT=$VMS_RELEASE_COMMIT$" "$VMS_ENV_FILE"
+    if [[ -n "${RELEASE_VERSION:-}" ]]; then
+        check "VMS env reports the release version ($RELEASE_VERSION)" grep -q "^ANYAICAM_VERSION=$RELEASE_VERSION$" "$VMS_ENV_FILE"
+        check "VMS /version reports release $RELEASE_VERSION" retry_until_vms_started vms_reports_release_version
+    fi
+    if [[ -n "${UPDATE_SIGNING_KEY_SHA256:-}" ]]; then
+        check "Software Update signing key is provisioned root-owned" update_signing_key_ok
+    fi
     # Existence/non-emptiness only -- the actual value is never read, printed,
     # or compared here. Without this key, camera provisioning with ONVIF/RTSP
     # credentials fails closed (see 06-deploy-vms.sh's ensure_vms_env()).

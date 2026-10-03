@@ -24,6 +24,8 @@ Docker.
 import argparse
 import json
 import logging
+import os
+import stat
 import subprocess
 import sys
 import time
@@ -88,11 +90,53 @@ DISPATCH = {
     'reboot': ['systemctl', 'reboot'],
     'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
     'restart_agent': ['systemctl', 'restart', 'anyaicam-agent.service'],
+    # Software Update (2026-10-03): activate the ONE release the agent
+    # staged after the account owner confirmed it in Settings -> System.
+    # Same rule as every entry: a fixed argv, nothing from the marker. The
+    # applier takes no arguments, finds the staged release itself, and
+    # re-verifies it (signature, hash, platform, architecture, version,
+    # disk, migrations) before touching /opt/anyaicam. It runs as its own
+    # transient unit so an agent restart during the update cannot stop it,
+    # and the fixed unit name means a second start fails while one runs.
+    # Periodic update checks never queue this marker (check-only).
+    'apply_release': ['systemd-run', '--unit=anyaicam-software-update', '--property=CollectMode=inactive-or-failed', '--quiet',
+                      '/usr/bin/python3', '-I', '/opt/anyaicam-agent/privileged/apply_release.py'],
     'wireguard_interface_up': ['wg-quick', 'up', '/etc/anyaicam/wireguard/wg0.conf'],
     'wireguard_interface_down': ['wg-quick', 'down', '/etc/anyaicam/wireguard/wg0.conf'],
 }
 
 log = logging.getLogger('anyaicam.privileged_watcher')
+
+
+# Software Update (2026-10-03): files root will execute or import for an
+# action. Before running it, every one -- and each directory above it -- must
+# be a real (non-symlink) entry owned by root and not writable by group or
+# others; otherwise a less-privileged user could have replaced the code root
+# is about to run. Checked at the moment of use, not only at install time.
+ROOT_OWNED_BEFORE_RUN = {
+    'apply_release': (
+        '/opt/anyaicam-agent',
+        '/opt/anyaicam-agent/privileged',
+        '/opt/anyaicam-agent/privileged/apply_release.py',
+        '/opt/anyaicam-agent/privileged/anyaicam_release_checks.py',
+    ),
+}
+
+
+def untrusted_code_reason(action_type, lstat=os.lstat):
+    """'' when every file the action runs is root-controlled, else why not."""
+    for candidate in ROOT_OWNED_BEFORE_RUN.get(action_type, ()):
+        try:
+            info = lstat(candidate)
+        except OSError as error:
+            return f'{candidate} is missing ({error})'
+        if stat.S_ISLNK(info.st_mode):
+            return f'{candidate} is a symbolic link'
+        if info.st_uid != 0:
+            return f'{candidate} is not owned by root'
+        if info.st_mode & 0o022:
+            return f'{candidate} is writable by group or others'
+    return ''
 
 
 def _read_marker(path: Path):
@@ -118,7 +162,7 @@ def _await_grace_period(path: Path, expected_command_id, grace_seconds: float, s
     return current.get('command_id') == expected_command_id
 
 
-def process_marker(path: Path, dry_run: bool, grace_seconds: float = GRACE_SECONDS, sleep=time.sleep):
+def process_marker(path: Path, dry_run: bool, grace_seconds: float = GRACE_SECONDS, sleep=time.sleep, lstat=os.lstat):
     """Returns the argv that was (or would be) executed, or None if the
     marker was invalid, unknown, or cancelled during its grace period."""
     marker = _read_marker(path)
@@ -145,6 +189,10 @@ def process_marker(path: Path, dry_run: bool, grace_seconds: float = GRACE_SECON
     argv = DISPATCH.get(action_type)
     if argv is None:
         log.warning('Ignoring marker %s with unknown type=%r', path, action_type)
+        return None
+    reason = untrusted_code_reason(action_type, lstat)
+    if reason:
+        log.warning('Refusing marker %s type=%s: %s', path, action_type, reason)
         return None
     if not dry_run and not _await_grace_period(path, command_id, grace_seconds, sleep):
         log.info('Marker %s cancelled or superseded during grace period; taking no action', path)

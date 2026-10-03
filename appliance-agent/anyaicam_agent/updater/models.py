@@ -31,6 +31,11 @@ class UpdateState(str, Enum):
     ROLLING_BACK = "rolling_back"
     ROLLED_BACK = "rolled_back"
     ROLLBACK_FAILED = "rollback_failed"
+    # Software Update (2026-10-03): the owner-requested release is downloaded
+    # and verified by the agent, then handed to the root applier, which
+    # re-verifies it and activates it under /opt/anyaicam.
+    STAGED = "staged"
+    ACTIVATION_REQUESTED = "activation_requested"
 
 
 # Reached, attempted, or concluded without further automatic action --
@@ -83,6 +88,12 @@ class Manifest:
     channel: str
     issued_at: str
     package_size_bytes: int
+    # Software Update (2026-10-03): the exact Git commit the release was
+    # built from, and the publisher's signed migration check result
+    # ("additive" is the only value an appliance accepts). Optional so
+    # older manifests still parse; release_checks refuses them.
+    build_id: str = ""
+    migration_safety: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -95,6 +106,8 @@ class Manifest:
             "channel": self.channel,
             "issued_at": self.issued_at,
             "package_size_bytes": self.package_size_bytes,
+            "build_id": self.build_id,
+            "migration_safety": self.migration_safety,
         }
 
     @classmethod
@@ -112,6 +125,8 @@ class Manifest:
                 channel=str(_require(data, "channel")),
                 issued_at=str(_require(data, "issued_at")),
                 package_size_bytes=int(_require(data, "package_size_bytes")),
+                build_id=str(data.get("build_id") or ""),
+                migration_safety=str(data.get("migration_safety") or ""),
             )
         except (TypeError, ValueError) as error:
             raise ValueError(f"malformed manifest: {error}") from error

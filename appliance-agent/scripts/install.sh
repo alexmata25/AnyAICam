@@ -6,7 +6,12 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SOURCE_DIR/scripts/lib-privileged-watcher.sh"
 chmod 0755 "$SOURCE_DIR"/scripts/*.sh
 id -u anyaicam >/dev/null 2>&1 || useradd --system --home /var/lib/anyaicam --shell /usr/sbin/nologin anyaicam
-install -d -m 0750 -o anyaicam -g anyaicam /opt/anyaicam-agent /etc/anyaicam /var/lib/anyaicam /var/lib/anyaicam/recordings /var/log/anyaicam
+# /opt/anyaicam-agent holds the venv and the root-only privileged/ folder the
+# root watcher executes from: it must be root-owned (2026-10-03, Software
+# Update review) or a process running as anyaicam could swap privileged/ and
+# have root run its code. The agent only ever reads it. Re-applied on repair.
+install -d -m 0755 -o root -g root /opt/anyaicam-agent
+install -d -m 0750 -o anyaicam -g anyaicam /etc/anyaicam /var/lib/anyaicam /var/lib/anyaicam/recordings /var/log/anyaicam
 python3 -m venv /opt/anyaicam-agent/venv
 /opt/anyaicam-agent/venv/bin/pip install --no-cache-dir "$SOURCE_DIR"
 install -m 0644 "$SOURCE_DIR/systemd/anyaicam-agent.service" /etc/systemd/system/anyaicam-agent.service

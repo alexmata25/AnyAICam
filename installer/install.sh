@@ -40,6 +40,11 @@ INSTALLER_SOURCE_COMMIT=""
 # already-built historical artifact must keep installing.
 MEDIAMTX_INCLUDED=""
 MEDIAMTX_SHA256=""
+# Software Update (2026-10-03): dotted product release version and the
+# SHA-256 of the packaged update-signing PUBLIC key (empty = none). Absent
+# from installers built before these fields existed.
+RELEASE_VERSION=""
+UPDATE_SIGNING_KEY_SHA256=""
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
@@ -93,7 +98,15 @@ load_release_metadata() {
         echo "[ERROR] Built VMS systemd unit is missing." >&2
         return 1
     fi
-    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256
+    if [[ -n "${RELEASE_VERSION:-}" && ! "${RELEASE_VERSION}" =~ ^[0-9]{1,4}(\.[0-9]{1,4}){1,3}$ ]]; then
+        echo "[ERROR] RELEASE_VERSION is present but is not a dotted product version." >&2
+        return 1
+    fi
+    if [[ -n "${UPDATE_SIGNING_KEY_SHA256:-}" && ! "${UPDATE_SIGNING_KEY_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "[ERROR] UPDATE_SIGNING_KEY_SHA256 is present but is not a lowercase SHA-256." >&2
+        return 1
+    fi
+    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256 RELEASE_VERSION UPDATE_SIGNING_KEY_SHA256
 }
 
 # shellcheck source=01-preflight.sh
@@ -119,6 +132,8 @@ source "$INSTALLER_DIR/11-webrtc-firewall.sh"
 source "$INSTALLER_DIR/08-systemd-setup.sh"
 # shellcheck source=09-identity.sh
 source "$INSTALLER_DIR/09-identity.sh"
+# shellcheck source=12-update-signing-key.sh
+source "$INSTALLER_DIR/12-update-signing-key.sh"
 
 run_install() {
     local mode="install"
@@ -153,6 +168,7 @@ run_install() {
     systemd_setup
     disable_system_suspend
     identity_provision "$INSTALL_STATE"
+    provision_update_signing_key
     stamp_release
     log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."
 }

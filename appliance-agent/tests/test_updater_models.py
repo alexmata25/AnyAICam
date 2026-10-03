@@ -35,7 +35,8 @@ VALID_MANIFEST_DICT = {
 class ManifestTests(unittest.TestCase):
     def test_from_dict_round_trips_through_as_dict(self):
         manifest = Manifest.from_dict(VALID_MANIFEST_DICT)
-        self.assertEqual(manifest.as_dict(), VALID_MANIFEST_DICT)
+        # build_id / migration_safety are optional (Software Update, 2026-10-03).
+        self.assertEqual(manifest.as_dict(), dict(VALID_MANIFEST_DICT, build_id="", migration_safety=""))
 
     def test_from_dict_rejects_non_dict(self):
         with self.assertRaises(ValueError):
