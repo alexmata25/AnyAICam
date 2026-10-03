@@ -355,3 +355,38 @@ def test_publish_command_refuses_and_stores_nothing(tmp_path, local_storage, sig
     assert publish_update_release.main(args) == 1
     assert '"status": "refused"' in capsys.readouterr().out
     assert updates_storage.get_latest_release("anyaicam-appliance", "stable") is None
+
+
+def _ledger(db_path, update_id="upd-1"):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT state,from_version,to_version FROM appliance_update_results WHERE update_id=?", (update_id,))]
+
+
+def test_progress_reports_move_an_owner_requested_row_through_to_final(client, db_path):
+    """Regression (Ryzen 1.2.0 -> 1.2.1, 2026-10-03): an owner request writes
+    the ledger row first, so every appliance report takes the
+    record_update_progress() path. The audit entry was written while that
+    UPDATE's transaction was still open -- a second writer -- and SQLite
+    answered "database is locked": every report was a 500, the ledger stayed
+    "requested" and the owner saw "Waiting for appliance" forever."""
+    _seeded(db_path)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT INTO appliance_update_results(update_id,appliance_id,from_version,to_version,state,error,"
+                       "rollback_from,duration_seconds,reported_at) VALUES('upd-1','appl-1','1.2.0','1.2.1','requested','',NULL,NULL,'t0')")
+    for state in ("verifying", "installing", "healthy"):
+        response = client.post("/api/appliance/updates/upd-1/result", headers=_auth_headers("appl-1", "test-credential"),
+                               json={"from_version": "1.2.0", "to_version": "1.2.1", "state": state})
+        assert response.status_code == 200, (state, response.text)
+        assert response.json() == {"status": "accepted"}
+        assert _ledger(db_path) == [{"state": state, "from_version": "1.2.0", "to_version": "1.2.1"}]
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            audited = db.execute("SELECT COUNT(*) AS n FROM audit_logs WHERE action='appliance.update_result_reported'").fetchone()["n"]
+    assert audited == 3
+    # A final outcome is never overwritten.
+    late = client.post("/api/appliance/updates/upd-1/result", headers=_auth_headers("appl-1", "test-credential"),
+                       json={"state": "failed"})
+    assert late.status_code == 409 and _ledger(db_path)[0]["state"] == "healthy"

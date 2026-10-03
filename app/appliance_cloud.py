@@ -2067,14 +2067,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # Software Update (2026-10-03): one row per update and appliance
             # carries the CURRENT state (downloading -> installing ->
             # validating -> final). A final outcome is never overwritten.
-            if record_update_progress(db,update_id=update_id,appliance_id=appliance['id'],payload=payload,state=state,now=now):
-                audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.update_result_reported','appliance_update',update_id,{'state':state})
-                return {'status':'accepted'}
-            try:
-                db.execute('INSERT INTO appliance_update_results(update_id,appliance_id,from_version,to_version,state,error,rollback_from,duration_seconds,reported_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                    (update_id,appliance['id'],payload.get('from_version'),payload.get('to_version'),state,str(payload.get('error',''))[:500],payload.get('rollback_from'),payload.get('duration_seconds'),now))
-            except Exception as error:
-                raise HTTPException(status_code=409,detail='An update result was already reported for this update_id.') from error
+            # The audit entry is written after this block commits: audit()
+            # opens its own connection, and a second writer inside this
+            # still-open transaction is "database is locked" (a 500 on every
+            # progress report of an owner-requested update, 2026-10-03).
+            if not record_update_progress(db,update_id=update_id,appliance_id=appliance['id'],payload=payload,state=state,now=now):
+                try:
+                    db.execute('INSERT INTO appliance_update_results(update_id,appliance_id,from_version,to_version,state,error,rollback_from,duration_seconds,reported_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                        (update_id,appliance['id'],payload.get('from_version'),payload.get('to_version'),state,str(payload.get('error',''))[:500],payload.get('rollback_from'),payload.get('duration_seconds'),now))
+                except Exception as error:
+                    raise HTTPException(status_code=409,detail='An update result was already reported for this update_id.') from error
         audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.update_result_reported','appliance_update',update_id,{'state':state})
         return {'status':'accepted'}
 
