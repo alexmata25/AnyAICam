@@ -426,7 +426,7 @@ def test_a_mail_failure_keeps_the_invitation_for_resend(portal, db_path, monkeyp
     _home(db_path)
     response = _invite(client)
     assert response.status_code == 200 and response.json()["email_status"] == "failed"
-    assert "Use Resend" in response.json()["message"]
+    assert response.json()["email_sent"] is False and "have not received it" in response.json()["message"]
     assert _q(db_path, "SELECT status FROM invitations WHERE email='maria@example.test'")[0]["status"] == "pending"
 
 

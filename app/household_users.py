@@ -291,7 +291,10 @@ def join_link(base: str, raw: str) -> str:
     return f"{base}/customer/join?token={raw}"
 
 
-def _send_invitation_email(*, to: str, name: str, owner_name: str, link: str, expires_at: str) -> str:
+def _send_invitation_email(*, to: str, name: str, owner_name: str, link: str, expires_at: str) -> tuple[str, str]:
+    """(status, reason): 'sent', 'preview' (no email provider configured --
+    nothing left the server) or 'failed' with the provider's or the
+    exception's reason. Never raises: the invitation is saved either way."""
     import email_layout
     from email_service import get_email_service
     when = datetime.fromisoformat(expires_at).strftime("%B %d, %Y").replace(" 0", " ")
@@ -314,10 +317,32 @@ def _send_invitation_email(*, to: str, name: str, owner_name: str, link: str, ex
         result = get_email_service().send("invitation", to, subject, text,
                                           html=email_layout.wrap(body, preheader=f"{inviter} invited you to AnyAiCam."),
                                           metadata={"kind": "household", "expires_at": expires_at})
-    except Exception:  # the invitation is saved either way; the owner can resend
+    except Exception as error:  # the invitation is saved either way; the owner can resend
         logger.exception("household.invitation_email_failed")
-        return "failed"
-    return str((result or {}).get("status") or "failed")
+        return "failed", f"{type(error).__name__}: {error}"[:300]
+    result = result if isinstance(result, dict) else {}
+    status = str(result.get("status") or "failed")
+    if status not in ("sent", "preview"):
+        return "failed", str(result.get("error") or "The email service did not confirm the send.")[:300]
+    return status, ""
+
+
+def record_invitation_delivery(db, *, invitation_id: str, recipient: str, status: str, error: str, now: datetime,
+                               resend: bool) -> None:
+    """Stores the outcome of one invitation email attempt: on the invitation
+    (what the owner's list shows) and in email_messages, beside password
+    resets and account mail, so the operator's email-delivery readiness
+    warning covers invitations too. Never the link or its token."""
+    from cloud_config import settings
+
+    db.execute("UPDATE invitations SET email_status=?,email_error=?,email_attempted_at=? WHERE id=?",
+               (status, error or None, now.isoformat(), invitation_id))
+    metadata = {"kind": "household", "invitation_id": invitation_id, "resend": resend}
+    if status == "failed" and error:
+        metadata["error"] = error[:300]
+    db.execute("INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)",
+               (f"inv-{secrets.token_hex(8)}", "invitation", recipient, status, settings.email_backend, json.dumps(metadata),
+                now.isoformat()))
 
 
 def create_invitation(db, *, owner: dict, name: str, email: str, permissions: dict, now: datetime) -> tuple[str, str]:
@@ -498,7 +523,10 @@ def household_overview(db, customer_id: str, now: datetime) -> dict:
             item["permissions"] = read_permissions(db, customer_id=customer_id, user_id=item["id"])
         users.append(item)
     invitations = []
-    for row in db.execute("SELECT id,email,name,status,expires_at,created_at,accepted_at,cancelled_at,last_sent_at,send_count "
+    # email_status/email_attempted_at: whether the latest email actually went
+    # out. The provider's reason (email_error) stays operator-side.
+    for row in db.execute("SELECT id,email,name,status,expires_at,created_at,accepted_at,cancelled_at,last_sent_at,send_count,"
+                          "email_status,email_attempted_at "
                           "FROM invitations WHERE customer_id=? AND role='customer_viewer' AND token_hash IS NOT NULL "
                           "ORDER BY created_at DESC LIMIT 50", (customer_id,)).fetchall():
         item = dict(row)
@@ -519,8 +547,22 @@ def _delivery_message(status: str, email: str, *, first: bool) -> str:
     if status == "preview":  # email preview mode (development/staging without SMTP): nothing left the server
         return (f"Invitation created for {email} (email preview mode: nothing was emailed)." if first
                 else f"New invitation link created for {email} (email preview mode: nothing was emailed).")
-    return (f"Invitation created for {email}, but the email could not be sent. Use Resend to try again." if first
-            else "The email could not be sent. Please try again.")
+    return (f"Invitation created for {email}, but the email could not be sent, so they have not received it. "
+            "Use Try again in Waiting invitations." if first
+            else f"The email to {email} could not be sent, so they have not received it. Please try again in a minute.")
+
+
+def _record_delivery(invitation_id: str, recipient: str, status: str, error: str, now: datetime, *, resend: bool) -> None:
+    try:
+        with connection() as db:
+            record_invitation_delivery(db, invitation_id=invitation_id, recipient=recipient, status=status, error=error,
+                                       now=now, resend=resend)
+    except Exception:  # recording the outcome must never hide the outcome from the owner
+        logger.exception("household.invitation_delivery_record_failed")
+
+
+def _delivery_response(message: str, status: str, **extra) -> dict:
+    return {"message": message, "email_status": status, "email_sent": status == "sent", **extra}
 
 
 def _owner(request: Request) -> dict:
@@ -558,12 +600,12 @@ def register_household_routes(app: FastAPI, page_shell) -> None:
         except HouseholdError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         email = str(payload.get("email", "")).strip().lower()
-        status = _send_invitation_email(to=email, name=str(payload.get("name", "")).strip(), owner_name=owner_name,
-                                        link=join_link(public_base_url(request), raw),
-                                        expires_at=(now + timedelta(days=INVITE_TTL_DAYS)).isoformat())
+        status, error = _send_invitation_email(to=email, name=str(payload.get("name", "")).strip(), owner_name=owner_name,
+                                               link=join_link(public_base_url(request), raw),
+                                               expires_at=(now + timedelta(days=INVITE_TTL_DAYS)).isoformat())
+        _record_delivery(invitation_id, email, status, error, now, resend=False)
         audit(identity, "household.invited", "invitation", invitation_id, {"email_status": status, "permissions": permissions})
-        message = _delivery_message(status, email, first=True)
-        return {"message": message, "invitation_id": invitation_id, "email_status": status}
+        return _delivery_response(_delivery_message(status, email, first=True), status, invitation_id=invitation_id)
 
     @app.post("/api/customer/household/invitations/{invitation_id}/resend")
     def resend(request: Request, invitation_id: str) -> dict:
@@ -575,10 +617,11 @@ def register_household_routes(app: FastAPI, page_shell) -> None:
                 owner_name = _owner_name(db, identity)
         except HouseholdError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        status = _send_invitation_email(to=invitation["email"], name=invitation.get("name") or "", owner_name=owner_name,
-                                        link=join_link(public_base_url(request), raw), expires_at=invitation["expires_at"])
+        status, error = _send_invitation_email(to=invitation["email"], name=invitation.get("name") or "", owner_name=owner_name,
+                                               link=join_link(public_base_url(request), raw), expires_at=invitation["expires_at"])
+        _record_delivery(invitation_id, invitation["email"], status, error, now, resend=True)
         audit(identity, "household.invitation_resent", "invitation", invitation_id, {"email_status": status})
-        return {"message": _delivery_message(status, invitation["email"], first=False), "email_status": status}
+        return _delivery_response(_delivery_message(status, invitation["email"], first=False), status)
 
     @app.post("/api/customer/household/invitations/{invitation_id}/cancel")
     def cancel(request: Request, invitation_id: str) -> dict:
@@ -700,9 +743,9 @@ def _join_page_html(invitation: dict | None, token: str) -> str:
 _HOUSEHOLD_CONTENT = '''<header class="topbar"><div><p class="eyebrow">Account</p><h1>Users &amp; household</h1></div>
 <button class="action-button" id="hh-add" type="button">Add user</button></header>
 <p class="health-detail" style="margin-top:-6px">Give the people you live or work with their own sign-in. Each person only sees what you allow.</p>
+<p id="hh-message" class="health-detail" role="status" aria-live="polite" style="font-weight:600"></p>
 <section class="panel"><h3 style="margin-top:0">Users</h3><div id="hh-users" class="health-detail">Loading…</div></section>
 <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Waiting invitations</h3><div id="hh-invites" class="health-detail">Loading…</div></section>
-<p id="hh-message" class="health-detail" role="status" aria-live="polite"></p>
 <dialog id="hh-dialog" style="width:min(560px,calc(100vw - 32px));border:0;border-radius:14px;padding:0;background:#18213a;color:#eef2f6">
 <style>#hh-form input:not([type=checkbox]){padding:10px 12px;border:1px solid #4a5675;border-radius:8px;background:#0f1628;color:#eef2f6;font:inherit}#hh-form label{color:#eef2f6}#hh-form legend{padding:0 6px;font-weight:700}</style><form id="hh-form" method="dialog" style="display:grid;gap:12px;padding:20px">
 <h2 id="hh-title" style="margin:0">Add user</h2>
@@ -727,10 +770,13 @@ let data=null,editing=null;
 const say=(t,ok=true)=>{const m=$('hh-message');m.textContent=t;m.style.color=ok?'':'#ffb4c0'};
 async function call(url,method='POST',body){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.detail||'Something went wrong.');return b}
 function permSummary(p){if(!p)return '';const on=PERMS.filter(k=>p[k]).map(k=>data.permission_labels[k]);const cams=p.camera_ids.length;return `${cams} camera${cams===1?'':'s'}`+(on.length?' · '+on.join(', '):'')+(p.door_ids.length?` · unlock ${p.door_ids.length} door${p.door_ids.length===1?'':'s'}`:'')}
+// Delivery of the latest invitation email: created is not the same as emailed.
+const DELIVERY={sent:['Email sent',''],preview:['Not emailed','#ffd59a'],failed:['Email not sent','#ffb4c0']};
+function delivery(i){const d=DELIVERY[i.email_status];if(!d)return '';return ` <span class="pill"${d[1]?` style="background:#5c3140;color:${d[1]}"`:''}>${d[0]}</span>`}
 function render(){
  $('hh-users').innerHTML=data.users.map(u=>`<div class="health-row" style="align-items:flex-start;gap:12px;flex-wrap:wrap"><span><strong>${esc(u.name||u.email)}</strong>${u.role==='customer_owner'?' <span class="pill">Owner</span>':''}${u.status==='disabled'?' <span class="pill" style="background:#5c3140;color:#ffd0da">Disabled</span>':''}<br><span class="health-detail">${esc(u.email)}</span>${u.permissions?`<br><span class="health-detail">${esc(permSummary(u.permissions))}</span>`:''}</span>`+
  (u.role==='customer_viewer'?`<span style="display:flex;gap:8px;flex-wrap:wrap"><button class="ghost-button" data-edit="${esc(u.id)}">Permissions</button>`+(u.status==='disabled'?`<button class="ghost-button" data-act="enable" data-id="${esc(u.id)}">Turn on</button>`:`<button class="ghost-button" data-act="disable" data-id="${esc(u.id)}">Disable</button>`)+`<button class="ghost-button" data-act="remove" data-id="${esc(u.id)}">Remove</button></span>`:'')+`</div>`).join('')||'No users yet.';
- $('hh-invites').innerHTML=data.invitations.map(i=>`<div class="health-row" style="gap:12px;flex-wrap:wrap"><span><strong>${esc(i.name||i.email)}</strong> <span class="pill">${i.status==='expired'?'Expired':'Waiting'}</span><br><span class="health-detail">${esc(i.email)} · ${i.status==='expired'?'expired':'expires'} ${esc(when(i.expires_at))}</span></span><span style="display:flex;gap:8px"><button class="ghost-button" data-inv="resend" data-id="${esc(i.id)}">Resend</button><button class="ghost-button" data-inv="cancel" data-id="${esc(i.id)}">Cancel</button></span></div>`).join('')||'No invitations waiting.';
+ $('hh-invites').innerHTML=data.invitations.map(i=>`<div class="health-row" style="gap:12px;flex-wrap:wrap"><span><strong>${esc(i.name||i.email)}</strong> <span class="pill">${i.status==='expired'?'Expired':'Waiting'}</span>${delivery(i)}<br><span class="health-detail">${esc(i.email)} · ${i.status==='expired'?'expired':'expires'} ${esc(when(i.expires_at))}${i.email_status==='sent'&&i.email_attempted_at?` · emailed ${esc(when(i.email_attempted_at))}`:''}${i.email_status==='failed'?' · the email could not be sent, so they have not received it':''}${i.email_status==='preview'?' · email is not set up, so nothing was emailed':''}</span></span><span style="display:flex;gap:8px"><button class="ghost-button" data-inv="resend" data-id="${esc(i.id)}">${i.email_status==='failed'?'Try again':'Resend'}</button><button class="ghost-button" data-inv="cancel" data-id="${esc(i.id)}">Cancel</button></span></div>`).join('')||'No invitations waiting.';
 }
 async function load(){try{data=await call('/api/customer/household','GET');render()}catch(e){$('hh-users').textContent=e.message}}
 function fill(p){
@@ -745,12 +791,12 @@ function open(user){editing=user;$('hh-form-message').textContent='';$('hh-ident
  const p=user?user.permissions:{...data.default_permissions,camera_ids:data.cameras.map(c=>c.id),door_ids:[]};if(!user){$('hh-name').value='';$('hh-email').value=''}fill(p);$('hh-dialog').showModal()}
 $('hh-add').onclick=()=>data&&open(null);$('hh-cancel').onclick=()=>$('hh-dialog').close();
 $('hh-all').onchange=e=>document.querySelectorAll('.hh-cam').forEach(x=>x.checked=e.target.checked);
-$('hh-form').onsubmit=async e=>{e.preventDefault();const p=collect();try{let r;if(editing){r=await call(`/api/customer/household/users/${encodeURIComponent(editing.id)}/permissions`,'PUT',p)}else{r=await call('/api/customer/household/invitations','POST',{name:$('hh-name').value,email:$('hh-email').value,permissions:p})}$('hh-dialog').close();say(r.message);load()}catch(err){$('hh-form-message').textContent=err.message}};
+$('hh-form').onsubmit=async e=>{e.preventDefault();const p=collect();try{let r;if(editing){r=await call(`/api/customer/household/users/${encodeURIComponent(editing.id)}/permissions`,'PUT',p)}else{r=await call('/api/customer/household/invitations','POST',{name:$('hh-name').value,email:$('hh-email').value,permissions:p})}$('hh-dialog').close();say(r.message,r.email_sent!==false);load()}catch(err){$('hh-form-message').textContent=err.message}};
 document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b||!data)return;
  if(b.dataset.edit){open(data.users.find(u=>u.id===b.dataset.edit));return}
  if(b.dataset.act){const u=data.users.find(x=>x.id===b.dataset.id),name=u.name||u.email;if(b.dataset.act==='remove'&&!confirm(`Remove ${name}? They are signed out everywhere and lose all access.`))return;if(b.dataset.act==='disable'&&!confirm(`Disable ${name}? They are signed out everywhere until you turn them back on.`))return;
   try{const r=await call(`/api/customer/household/users/${encodeURIComponent(b.dataset.id)}/${b.dataset.act}`);say(r.message);load()}catch(err){say(err.message,false)}return}
- if(b.dataset.inv){try{const r=await call(`/api/customer/household/invitations/${encodeURIComponent(b.dataset.id)}/${b.dataset.inv}`);say(r.message);load()}catch(err){say(err.message,false)}}});
+ if(b.dataset.inv){try{const r=await call(`/api/customer/household/invitations/${encodeURIComponent(b.dataset.id)}/${b.dataset.inv}`);say(r.message,r.email_sent!==false);load()}catch(err){say(err.message,false)}}});
 load();
 })();
 </script>'''
