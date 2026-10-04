@@ -22,6 +22,7 @@ import logging
 import re
 import secrets
 import socket
+from urllib.parse import urlsplit
 
 from .discovery import scan
 
@@ -485,6 +486,36 @@ def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):
 # per-device discovered path (once one exists) should take priority
 # over this default, not replace it as the fallback.
 DEFAULT_RTSP_STREAM_PATH = '/Streaming/Channels/101'
+DEFAULT_RTSP_PORT = 554
+
+
+def _resolve_stream_uri(ip, device_key):
+    """The camera's own stream URI from ONVIF GetStreamUri, asked WITHOUT
+    credentials (credentials still reach ONVIF only through service.py's
+    post-provisioning lookup). None when it does not resolve."""
+    from .onvif_media import resolve_media_uri
+    try:
+        result = resolve_media_uri(ip, device_key)
+    except Exception:  # noqa: BLE001 -- ONVIF is best effort here; verification falls back to discovery
+        return None
+    return result.get('rtsp_uri') if result.get('status') == 'resolved' else None
+
+
+def stream_target(device, device_key):
+    """(port, path, source) a credential check must use (2026-10-04): the
+    camera's own ONVIF stream URI when it resolves -- its real port and
+    path, e.g. rtsp://camera:8554/testcamera -- else the RTSP port
+    discovery found open, with the known default path. Never assumes 554
+    when the camera serves another port."""
+    if device.get('onvif_support'):
+        uri = _resolve_stream_uri(device['ip'], device_key)
+        if uri:
+            parts = urlsplit(uri)
+            path = parts.path or '/'
+            if parts.query:
+                path += '?' + parts.query
+            return parts.port or DEFAULT_RTSP_PORT, path, 'onvif'
+    return int(device.get('rtsp_port') or DEFAULT_RTSP_PORT), device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH, 'discovery'
 
 
 def verify_device(device_key, credentials, networks=None):
@@ -503,7 +534,7 @@ def verify_device(device_key, credentials, networks=None):
     password = str((credentials or {}).get('password', ''))
     if not username and not password:
         return True, 'Device is reachable; no credentials were provided to verify.'
-    # A per-device discovered path always wins once discovery.py can
-    # supply one; falls back to the fleet's known-good default above.
-    path = device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH
-    return verify_rtsp_credentials(device['ip'], 554, username, password, path=path)
+    # The camera's own port and path (ONVIF stream URI, else the port
+    # discovery found) -- see stream_target().
+    port, path, _source = stream_target(device, device_key)
+    return verify_rtsp_credentials(device['ip'], port, username, password, path=path)

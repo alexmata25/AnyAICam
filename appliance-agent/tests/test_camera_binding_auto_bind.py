@@ -109,10 +109,14 @@ class AutoBindDiscoveredCamerasTests(unittest.TestCase):
         self.assertEqual(bound, [])
         self.assertEqual(self.store.bindings(), [])
 
-    def test_discovered_candidate_with_unresolved_mac_is_not_bound(self):
+    def test_discovered_candidate_with_unresolved_mac_is_bound_by_its_device_key(self):
+        # Changed 2026-10-04 (Samsung acceptance, layer-3 simulator): a camera
+        # with no ARP MAC used to stay unbound forever; its stable device_key
+        # (the ONVIF endpoint UUID here) is now its binding identity.
         bound = auto_bind_discovered_cameras([_cloud_camera()], [_discovered(mac='Unknown')], self.store)
-        self.assertEqual(bound, [])
-        self.assertEqual(self.store.bindings(), [])
+        self.assertEqual(bound, ['cam-1'])
+        [binding] = self.store.bindings()
+        self.assertEqual((binding['mac_address'], binding['device_key']), ('', 'urn:uuid:1111'))
 
 
 # --------------------------------------------------------------------------

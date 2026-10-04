@@ -15783,13 +15783,18 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
             ).fetchone()
     except Exception:
         return None
-    if not credential_row:
-        return None
-    credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
-    if not credentials:
-        return None
     rtsp_url = camera["onvif_endpoint"] or ""
     if not rtsp_url.startswith("rtsp://"):
+        return None
+    if not credential_row:
+        # A camera provisioned without credentials (it serves RTSP without
+        # authentication) has no camera_credentials row at all: stream its
+        # URL as-is (2026-10-04, Samsung acceptance -- such a camera never
+        # started). A stored credential that cannot be decrypted is NOT this
+        # case: it still returns None below, never falling back to anonymous.
+        return {"rtsp_url": rtsp_url, "username": "", "password": ""}
+    credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
+    if not credentials:
         return None
     return {
         "rtsp_url": rtsp_url,

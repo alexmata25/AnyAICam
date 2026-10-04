@@ -67,7 +67,10 @@ def scan(networks=None,max_hosts=1024):
         if len(addresses)>=max_hosts: break
     addresses=list({str(item) for item in addresses}|set(onvif)); results=[]
     def inspect(ip):
-        rtsp=_port(ip,554) or _port(ip,8554); onvif_info=onvif.get(ip,{}); scopes=onvif_info.get('scopes',''); onvif_supported=bool(scopes) or _port(ip,80) or _port(ip,8000)
+        # Which RTSP port answered, not only whether one did (2026-10-04):
+        # verification must test the port the camera actually serves.
+        rtsp_port=554 if _port(ip,554) else (8554 if _port(ip,8554) else None); rtsp=rtsp_port is not None
+        onvif_info=onvif.get(ip,{}); scopes=onvif_info.get('scopes',''); onvif_supported=bool(scopes) or _port(ip,80) or _port(ip,8000)
         if not rtsp and not scopes: return None
         mac=arp.get(ip,'Unknown')
         # Stable device identity, preferred in this order: the device's
@@ -84,7 +87,7 @@ def scan(networks=None,max_hosts=1024):
         if onvif_info.get('endpoint'): device_key=onvif_info['endpoint']
         elif mac!='Unknown': device_key='mac-'+hashlib.sha256(mac.lower().encode()).hexdigest()[:32]
         else: device_key='ip-'+hashlib.sha256(ip.encode()).hexdigest()[:32]
-        return {'id':'camera-'+ip.replace('.','-'),'device_key':device_key,'name':'Camera '+ip,'ip':ip,'manufacturer':_scope_value(scopes,'manufacturer'),'model':_scope_value(scopes,'model'),'mac_address':mac,'onvif_support':onvif_supported,'rtsp_support':rtsp,'connection_status':'reachable','online':True,'recording':False,'analytics':False,'last_recording_at':None,'last_error':None}
+        return {'id':'camera-'+ip.replace('.','-'),'device_key':device_key,'name':'Camera '+ip,'ip':ip,'manufacturer':_scope_value(scopes,'manufacturer'),'model':_scope_value(scopes,'model'),'mac_address':mac,'onvif_support':onvif_supported,'rtsp_support':rtsp,'rtsp_port':rtsp_port,'connection_status':'reachable','online':True,'recording':False,'analytics':False,'last_recording_at':None,'last_error':None}
     with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
         for item in pool.map(inspect,addresses):
             if item: results.append(item)
