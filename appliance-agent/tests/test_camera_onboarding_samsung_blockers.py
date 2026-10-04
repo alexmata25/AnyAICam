@@ -67,7 +67,7 @@ class VerificationUsesTheCamerasPortTests(unittest.TestCase):
 
     def test_the_cameras_own_onvif_stream_uri_sets_port_and_path(self):
         with _FakeRtspCamera('digest', username='viewer', password='right') as camera:
-            provisioning._resolve_stream_uri = lambda ip, key, **kwargs: f'rtsp://127.0.0.1:{camera.port}/testcamera'
+            provisioning._resolve_stream_uri = lambda ip, key, username=None, password=None: f'rtsp://127.0.0.1:{camera.port}/testcamera'
             ok, message = self.verify({'ip': '127.0.0.1', 'rtsp_support': True, 'rtsp_port': 554, 'onvif_support': True,
                                        'device_key': UUID})
             uri = camera.last_describe_uri
