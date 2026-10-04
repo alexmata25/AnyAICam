@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Install AnyAiCam on Ubuntu 24.04 | AnyAiCam for Linux</title>
-<meta name="description" content="How to install AnyAiCam 1.2.3 on your own PC running Ubuntu 24.04 (64-bit Intel or AMD): requirements, download, checksum, install and updates.">
+<meta name="description" content="How to install AnyAiCam on your own PC running Ubuntu 24.04 (64-bit Intel or AMD): requirements, download, checksum, install and updates.">
 <link rel="icon" href="favicon.png">
 <style>
 :root{
@@ -113,16 +113,16 @@ header.stage-header nav.stage-nav a:focus {
     <div>
       <div class="eyebrow">AnyAiCam for Linux</div>
       <h1>Install AnyAiCam on your own Ubuntu 24.04 PC.</h1>
-      <p>AnyAiCam 1.2.3 runs on a PC with Ubuntu 24.04 LTS (64-bit Intel or AMD). Prefer a ready-made system? An <a href="edge-appliance.html#appliances">AnyAiCam Ryzen appliance</a> arrives with AnyAiCam installed and a licence included.</p>
+      <p>AnyAiCam runs on a PC with Ubuntu 24.04 LTS (64-bit Intel or AMD). Prefer a ready-made system? An <a href="edge-appliance.html#appliances">AnyAiCam Ryzen appliance</a> arrives with AnyAiCam installed and a licence included.</p>
       <div class="button-row">
-        <a class="button primary" href="https://app.anyaicam.com/customer-login.html">Sign in to download</a>
-        <a class="button light" href="https://app.anyaicam.com/customer-register">Create an account</a>
+        <!--release:linux-hero-actions state=pending--><a class="button primary" href="https://app.anyaicam.com/customer-register">Create an account</a>
+        <a class="button light" href="https://app.anyaicam.com/customer-login.html">Sign in</a><!--/release:linux-hero-actions-->
       </div>
     </div>
     <aside class="hero-card">
-      <h2>This release</h2>
-      <p><strong>AnyAiCam 1.2.3</strong><br>Ubuntu 24.04 · x86_64</p>
-      <p style="overflow-wrap:anywhere;font-size:.85rem">SHA-256<br><code>5729f5ded4331b01e7cbe3b4f86afc55051fa68b04e02e6c04d8d4c6b57ce29e</code></p>
+      <!--release:linux-hero-release state=pending--><h2>Release status</h2>
+      <p><strong>AnyAiCam for Linux</strong><br>Ubuntu 24.04 · x86_64</p>
+      <p style="font-size:.85rem">Release finalizing. The version and SHA-256 are listed here when the installer is released.</p><!--/release:linux-hero-release-->
       <p style="font-size:.9rem">Windows version coming soon.</p>
     </aside>
   </div>
@@ -134,7 +134,7 @@ header.stage-header nav.stage-nav a:focus {
     <div class="grid">
       <article class="card"><h3>Computer</h3><ul class="checklist"><li>Ubuntu 24.04 LTS, 64-bit (a fresh install is recommended)</li><li>64-bit Intel or AMD processor with 4 or more cores</li><li>8 GB RAM or more; 16 GB recommended</li><li>100 GB free storage, plus storage for recordings</li></ul></article>
       <article class="card"><h3>Network</h3><ul class="checklist"><li>Wired connection on the same network as your cameras</li><li>Internet access during installation</li><li>Ports TCP 8000 and UDP 8189 free on this PC</li></ul></article>
-      <article class="card"><h3>Account</h3><ul class="checklist"><li>An AnyAiCam account with a VMS licence</li><li>A licence comes with every AnyAiCam appliance, or add one for your own PC in My subscription</li><li>A Ubuntu user that can run <code>sudo</code></li></ul></article>
+      <article class="card"><h3>Account</h3><ul class="checklist"><li>An AnyAiCam account with a VMS licence</li><li>A licence comes with every AnyAiCam appliance, or add one for your own PC in My subscription</li><li>An Ubuntu user that can run <code>sudo</code></li></ul></article>
     </div>
   </div>
 </section>
@@ -142,14 +142,15 @@ header.stage-header nav.stage-nav a:focus {
 <section class="section">
   <div class="wrap">
     <h2>Install</h2>
+    <!--release:linux-install-status state=pending--><div class="notice" style="margin-bottom:1rem;max-width:62rem"><strong>Release finalizing:</strong> the Linux installer is not available to download yet. These steps apply once it appears in <strong>My subscription</strong>.</div><!--/release:linux-install-status-->
     <ol class="steps" style="max-width:62rem;padding-left:1.2rem;line-height:1.7">
       <li>Sign in to the AnyAiCam portal, open <strong>My subscription</strong> and select <strong>Download installer</strong>.</li>
-      <li>Check the download is complete. In a terminal, in the folder you saved it to, run the first command below. The result must be <code style="overflow-wrap:anywhere">5729f5ded4331b01e7cbe3b4f86afc55051fa68b04e02e6c04d8d4c6b57ce29e</code>.</li>
+      <li><!--release:linux-checksum-step state=pending-->Check the download is complete. In a terminal, in the folder you saved it to, run the first command below. The result must match the SHA-256 shown for the release.<!--/release:linux-checksum-step--></li>
       <li>Unpack it, run the installer, then run the built-in check:</li>
     </ol>
-    <pre style="overflow-x:auto;background:#0b1530;color:#e6f0ff;padding:1rem 1.1rem;border-radius:12px;font-size:.9rem;line-height:1.55;max-width:62rem">sha256sum anyaicam-appliance-installer-1.2.3-vms-9f59f11561d9.tar.gz
+    <pre style="overflow-x:auto;background:#0b1530;color:#e6f0ff;padding:1rem 1.1rem;border-radius:12px;font-size:.9rem;line-height:1.55;max-width:62rem"><!--release:linux-commands state=pending-->sha256sum anyaicam-appliance-installer-*.tar.gz
 mkdir -p ~/anyaicam-installer
-tar -xzf anyaicam-appliance-installer-1.2.3-vms-9f59f11561d9.tar.gz -C ~/anyaicam-installer
+tar -xzf anyaicam-appliance-installer-*.tar.gz -C ~/anyaicam-installer<!--/release:linux-commands-->
 cd ~/anyaicam-installer
 sudo ./install.sh
 sudo ./validate.sh</pre>
