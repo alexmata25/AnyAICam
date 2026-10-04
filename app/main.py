@@ -41896,6 +41896,13 @@ app.mount("/recordings", RecordingsStaticFiles(directory="/app/recordings"), nam
 # customer account, and the existing local-emergency-recovery /login
 # is the correct destination for them -- unchanged here.
 CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
+    # Settings (2026-10-03): the cloud customer nav's Settings and its
+    # sub-pages (e.g. /settings/system, Software Update). Same bug as the
+    # entries below: a signed-out customer landed on the local emergency
+    # recovery /login instead of the customer sign-in. Cloud partners and
+    # administrators use their own /partner* and /admin* pages, and an
+    # appliance keeps /login (this list is cloud-only).
+    "/settings",
     "/dashboard",
     "/playback",
     "/events",

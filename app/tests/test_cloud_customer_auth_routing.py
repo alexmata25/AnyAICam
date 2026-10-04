@@ -91,6 +91,9 @@ PREVIOUSLY_BROKEN_CUSTOMER_PATHS = [
     "/mobile-devices",
     "/mobile-app",
     "/help",
+    # 2026-10-03: Settings and its sub-pages (Settings -> System).
+    "/settings",
+    "/settings/system",
 ]
 
 
@@ -345,6 +348,7 @@ def test_cloud_customer_nav_path_prefixes_defined_and_matches_the_customer_nav()
         "/aac/voice-call",  # the Voice Call email's call screen (test_notification_email_deep_links.py)
         # remaining customer sidebar pages (2026-09-30)
         "/aac/people", "/phone-connect", "/mobile-devices", "/mobile-app", "/help",
+        "/settings",  # Settings and its sub-pages, e.g. /settings/system (2026-10-03)
     }
 
 
@@ -462,3 +466,24 @@ def test_registration_page_states_terms_and_plain_language_approval(http_client)
     html = http_client.get("/customer-register").text
     assert "Terms of Service" in html and "Privacy Policy" in html and "At least 10 characters." in html
     assert "master administrator" not in html
+
+
+def test_signed_out_settings_system_goes_to_customer_login_on_cloud_and_login_on_an_appliance(http_client, monkeypatch):
+    """Signed-out /settings/system (Settings -> System) went to the local
+    emergency recovery /login on the cloud portal; it belongs on the
+    customer sign-in. An appliance keeps /login."""
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    cloud = http_client.get("/settings/system")
+    assert cloud.status_code == 303 and cloud.headers["location"] == "/customer-login.html?next=/settings/system"
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
+    edge = http_client.get("/settings/system")
+    assert edge.status_code == 303 and edge.headers["location"] == "/login?next=/settings/system"
+
+
+def test_partner_and_admin_signed_out_redirects_are_unchanged_by_the_settings_entry(http_client, monkeypatch):
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    for path in ("/partner", "/partner-quotes", "/admin-portal"):
+        response = http_client.get(path)
+        assert response.status_code == 303 and response.headers["location"].startswith("/partner.html?next="), path
+    # A path that only starts with the same letters is not a Settings page.
+    assert http_client.get("/settingsx").headers["location"].startswith("/login?next=")
