@@ -1,4 +1,17 @@
 # Samsung appliance — checkpoint
+## 2026-10-04 UTC — real installation and device-bound claim passed
+
+Exact downloaded installer and all 710 inner files verified on fresh Samsung.
+Real install and all 26 validator checks passed; VMS/agent active, exact a1c81e0
+build. Browser handoff failed; owner used the normal manual claim page.
+Expired first code recovered through installed CLI; one completed lab-only
+appliance scoped to test customer/site, retry exited 0. No credential rotation
+or security bypass. Eight real Samsung SOAP/multicast/simulator assertions pass.
+Lab-only narrow scan range/container DNS/CA applied; verified container HTTPS and 45 distinct decoded video frames. Normal owner discovery/provisioning produced one configured synthetic camera and real ONVIF-resolved RTSP URI. Recording/log inspection awaits local sudo in AnyAiCam-VMS-Inspection.
+Camera/live/record/playback/analytics/reboot/uninstall/recovery remain pending.
+See ../../validation/installer-track/SAMSUNG_INSTALL_CLAIM_RESULTS.md.
+Older entries below are historical; do not repeat initial install/claim.
+
 ## 2026-10-03 — fresh Samsung verified; real isolated lab preflight passed
 
 User resumed after completing physical wipe/install. New SSH 100.76.177.87,
