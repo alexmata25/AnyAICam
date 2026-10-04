@@ -35,7 +35,47 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
+from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, copy_release, is_test_only_release_path, run_git, validate_installer_version, write_deterministic_tar  # noqa: E402
+
+
+class InstallerVersionAndReleaseHygieneTests(unittest.TestCase):
+    def test_requested_numeric_installer_version_is_validated(self):
+        self.assertEqual(validate_installer_version("1.2.3"), "1.2.3")
+        for invalid in ("", "1.2", "1.2.3-beta", "../1.2.3", "1.2.3\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
+                validate_installer_version(invalid)
+
+    def test_release_copy_excludes_test_fixtures_but_preserves_runtime_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "release"
+            (root / "app/tests").mkdir(parents=True)
+            (root / "app/static/js").mkdir(parents=True)
+            (root / "app/main.py").write_text("runtime", encoding="utf-8")
+            (root / "app/test_probe.py").write_text("fixture", encoding="utf-8")
+            (root / "app/tests/fake_credentials.py").write_text("fixture", encoding="utf-8")
+            (root / "app/static/js/player.js").write_text("runtime", encoding="utf-8")
+            (root / "app/static/js/player.test.js").write_text("fixture", encoding="utf-8")
+            output = Path(td) / "package"
+            copy_release(root, output)
+            self.assertTrue((output / "app/main.py").is_file())
+            self.assertTrue((output / "app/static/js/player.js").is_file())
+            self.assertFalse((output / "app/test_probe.py").exists())
+            self.assertFalse((output / "app/tests").exists())
+            self.assertFalse((output / "app/static/js/player.test.js").exists())
+
+
+    def test_secret_scanner_ignores_test_fixtures_that_are_not_packaged(self):
+        from build_release_installer import reject_unsafe_release_files
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "app/static").mkdir(parents=True)
+            (root / "app/db_migrations.py").write_text("# runtime", encoding="utf-8")
+            (root / "app/tests").mkdir()
+            (root / "app/tests/credentials.env").write_text("sk_live_12345678901234567890", encoding="utf-8")
+            reject_unsafe_release_files(root)
+            (root / "app/runtime.pem").write_text("not a real key", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                reject_unsafe_release_files(root)
 
 
 class RunGitAutocrlfOverrideTests(unittest.TestCase):

@@ -24,6 +24,7 @@ import zipfile
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+INSTALLER_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 REQUIRED_RELEASE_PATHS = (
     "app",
     "requirements.txt",
@@ -128,6 +129,23 @@ def validate_sha256(value: str, label: str) -> str:
     return value
 
 
+def validate_installer_version(value: str) -> str:
+    if not INSTALLER_VERSION_RE.fullmatch(value):
+        raise SystemExit("--installer-version must be a stable numeric version such as 1.2.3")
+    return value
+
+
+def is_test_only_release_path(relative_path: Path) -> bool:
+    """Exclude source tests and fixtures accidentally captured by app/ allowlisting."""
+    parts = relative_path.parts
+    if any(part.casefold() in {"test", "tests", "fixtures", "__tests__", "__pycache__"} for part in parts):
+        return True
+    name = parts[-1].casefold() if parts else ""
+    return (name.startswith("test_") or name.endswith("_test.py")
+            or name.endswith((".test.js", ".test.mjs", ".test.ts", ".test.tsx", ".test.jsx"))
+            or name.endswith(".pyc"))
+
+
 def safe_tar_extract(data: bytes, destination: Path) -> None:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
         for member in tf.getmembers():
@@ -200,7 +218,10 @@ def reject_unsafe_release_files(release_root: Path) -> None:
             raise SystemExit(f"Symlinks are not allowed in the release payload: {path.relative_to(release_root)}")
         if not path.is_file():
             continue
-        rel = path.relative_to(release_root).as_posix()
+        rel_path = path.relative_to(release_root)
+        if is_test_only_release_path(rel_path):
+            continue  # never scan or ship test secrets/fixtures as runtime content
+        rel = rel_path.as_posix()
         for pattern in DANGEROUS_NAME_PATTERNS:
             if pattern.search(rel):
                 raise SystemExit(f"Refusing release payload with secret/state/backup-like file: {rel}")
@@ -225,13 +246,18 @@ def scan_payload_for_secrets(root: Path) -> None:
 
 def copy_release(release_root: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
+
+    def ignore_test_content(directory: str, names: list[str]) -> set[str]:
+        parent = Path(directory).relative_to(release_root)
+        return {name for name in names if is_test_only_release_path(parent / name)}
+
     for rel in REQUIRED_RELEASE_PATHS + OPTIONAL_RELEASE_PATHS:
         src = release_root / rel
-        if not src.exists():
+        if not src.exists() or is_test_only_release_path(Path(rel)):
             continue
         target = dest / rel
         if src.is_dir():
-            shutil.copytree(src, target, copy_function=shutil.copy2)
+            shutil.copytree(src, target, copy_function=shutil.copy2, ignore=ignore_test_content)
         else:
             shutil.copy2(src, target)
 
@@ -329,9 +355,11 @@ def main() -> int:
         ),
     )
     parser.add_argument("--output-dir", default="dist")
+    parser.add_argument("--installer-version", default="1.1.1", help="Stable numeric installer version (default preserves legacy builds)")
     args = parser.parse_args()
 
     vms_commit = validate_commit(args.vms_commit, "--vms-commit")
+    installer_version = validate_installer_version(args.installer_version)
 
     if args.mediamtx_binary and args.no_mediamtx:
         raise SystemExit("--mediamtx-binary and --no-mediamtx are mutually exclusive.")
@@ -458,7 +486,7 @@ def main() -> int:
 
         manifest = {
             "schema": 1,
-            "installer_version": "1.1.1",
+            "installer_version": installer_version,
             "installer_source_commit": installer_commit,
             "vms_release_commit": vms_commit,
             "vms_release_source": release_source,
@@ -482,7 +510,7 @@ def main() -> int:
         outdir = Path(args.output_dir).resolve()
         outdir.mkdir(parents=True, exist_ok=True)
         executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
-        filename = f"anyaicam-appliance-installer-1.1.1-vms-{vms_commit[:12]}.tar.gz"
+        filename = f"anyaicam-appliance-installer-{installer_version}-vms-{vms_commit[:12]}.tar.gz"
         output = outdir / filename
         write_deterministic_tar(package, output, installer_mtime, executable_paths)
         digest = sha256_file(output)

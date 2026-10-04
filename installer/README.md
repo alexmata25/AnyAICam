@@ -34,7 +34,7 @@ checkout as the install payload. A customer installer must first be built with
 1. one exact 40-character VMS Git commit, or
 2. one release archive whose SHA-256 is supplied and verified.
 
-The exact VMS commit is required in both modes because it is the canonical build
+The installer version is a stable numeric version (default `1.1.1` for legacy builds); set it explicitly for a release. Source test/fixture files under the VMS app tree are excluded from the package. The exact VMS commit is required in both modes because it is the canonical build
 identifier stamped into the appliance and passed to the VMS as
 `ANYAICAM_VMS_COMMIT` / `ANYAICAM_BUILD_ID`.
 
