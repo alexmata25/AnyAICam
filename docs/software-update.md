@@ -41,6 +41,35 @@ the agent. The installer's repair path also rsynced new code into that bind-moun
 5. **Relay**: the agent reports progress and outcome from the root-owned result file to the update ledger,
    which keeps the current state per update and appliance. A final outcome is never overwritten.
 
+## Manual rollback (supported, 2026-10-04)
+
+The automatic rollback above covers an update that fails validation. To go back from a release that *did*
+validate (for example 1.2.2 → 1.2.1), an operator runs on the appliance:
+
+```bash
+sudo anyaicam-rollback            # restores the newest rollback point; keeps the current database
+sudo anyaicam-rollback --restore-database   # also puts back the database copy taken at upgrade time
+```
+
+- **Rollback points** live in root's `/var/lib/anyaicam-update/rollback/` (0750). The root applier writes one
+  after every validated in-app update, for the release it replaced; the installer writes one before every
+  repair/upgrade. Each holds the code archive, the image tag, the database backup, the build, the product version
+  and a copy of the installed-release record. The applier keeps its newest three; the installer's are kept.
+- **What is restored:** code, image, `ANYAICAM_BUILD_ID`/`ANYAICAM_VMS_COMMIT`/`ANYAICAM_VERSION`, and the
+  installed-release record for the agent (`/etc/anyaicam/vms_release.json`) and for root (so the newer release
+  can be installed again later). Recordings, settings, credentials and MediaMTX are never touched. The command
+  then waits for `/version` to report the restored build and `/health` to pass.
+- **Stale points are refused.** A point belongs to the release that replaced it. If the appliance runs any
+  other build (neither that release nor the rollback build), restoring it would skip releases, so it stops
+  before changing anything (`--allow-stale` overrides). Re-running a point on its own rollback build is allowed.
+- **Where the command comes from:** the installer installs `rollback.sh` as `/usr/local/sbin/anyaicam-rollback`.
+  An in-app update replaces only `/opt/anyaicam` -- never the agent, the root applier or this command -- so an
+  appliance gets these from the installer (install or `--repair`). An appliance whose agent predates this
+  change (for example one installed with the 1.2.0 installer) must run the newer installer with `--repair`
+  first; that repair also takes a correct rollback point for the release it replaces.
+- The older location `/var/lib/anyaicam/rollback/` is read only when nothing newer exists, and only files
+  owned by root are used.
+
 ## Where things live
 
 | Path | Owner | Contents |
