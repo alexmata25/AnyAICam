@@ -1,4 +1,20 @@
 # Samsung appliance — checkpoint
+## 2026-10-04 UTC — live FAIL; simulator adaptation required
+
+Operator reported black screen. VMS has one configured camera and capacity 8,
+but zero online cameras/recording workers. Candidate rejects credential-free
+stream lookup; authenticated retry failed because verifier always uses RTSP
+554 while simulator serves 8554. L3 WireGuard provides no ARP MAC; binding
+requires MAC and reports camera_binding_conflict despite stable ONVIF UUID.
+Local mode also disables cloud remote transports by default. Do not bypass
+checks or change pinned installer. Lab now has a protected synthetic read
+credential and fresh camera-encryption key (no old key/identity rotation).
+Eight real CSRF/origin/authorization/code-refusal assertions passed.
+Full physical acceptance NOT passed; reboot/uninstall/recovery NOT RUN.
+Next: real isolated L2 simulator networking + standard RTSP/credentials,
+then supported Local browser access. Detailed evidence in
+../../validation/installer-track/SAMSUNG_INSTALL_CLAIM_RESULTS.md.
+
 ## 2026-10-04 UTC — real installation and device-bound claim passed
 
 Exact downloaded installer and all 710 inner files verified on fresh Samsung.

@@ -85,3 +85,82 @@ negative security assertions. No complete physical acceptance pass is claimed.
 No staging, production, Billing, Household, Stripe, public website, Ryzen,
 Software Update or LPR source changes. AWS cleanup inventory remains in
 AWS_LAB_RESOURCES.json; helper is still running for acceptance.
+
+## Follow-up: browser live FAIL and simulator compatibility blockers
+
+Operator explicitly reported a black screen at the authenticated lab customer-live
+page. Real Samsung readiness: cameras_total=1, cameras_online=0,
+recording_workers=0. Actual container SQLite camera row has the correct RTSP URI,
+configured state and number 1. Authoritative persisted capacity is 8/8/8 and
+product mode Local. Installed identity, agent config and credential files are
+all mode 0600. No license/auth/possession bypass is appropriate.
+
+1. Credential-free stream defect: app/main.py::_provisioned_camera_stream
+   (line 15764 onward) returns None unless an encrypted camera_credentials row
+   exists, despite normal provisioning explicitly accepting a credential-free
+   camera. Cloud camera_credentials count was zero. This prevents its supervisor
+   from starting a stream. Keep as an open candidate defect; no source patch.
+2. Non-default RTSP port limitation: discovery detects 8554, and ONVIF resolves
+   rtsp://192.168.253.10:8554/testcamera, but the installed agent's
+   provisioning.verify_device always calls verify_rtsp_credentials(..., 554,
+   path='/Streaming/Channels/101' unless discovery supplies a path). The current
+   simulator uses 8554/testcamera. A normal authenticated retry failed with
+   Device unreachable: ConnectionRefusedError. Not a wrong-password outcome.
+3. Layer-3 simulator limitation: WireGuard provides no Ethernet ARP MAC for the
+   remote synthetic camera. Normal discovery finds its stable ONVIF UUID, but
+   auto_bind_discovered_cameras requires normalize_mac to succeed before binding.
+   Portal heartbeat reports camera_binding_conflict. No fake ARP entry or manual
+   binding/database insert was used. A real isolated layer-2 simulator network
+   is needed to reproduce an ordinary LAN camera, or a separately reviewed
+   UUID-based binding improvement. Preserve collision/ownership checks.
+4. Local license vs cloud viewing: this test selected Local mode, whose normal
+   defaults disable P2P/relay/cloud uploads. A cloud customer-live black screen
+   cannot establish whether local browser playback works. Need supported local
+   owner access for Local acceptance, or a separate permitted Hybrid fixture;
+   never enable remote features by overriding licensing or modifying Billing.
+
+Authenticated simulator trial configuration: generated a NEW synthetic read
+credential stored only in a mode-0600 lab file; reader remains limited to the
+private camera subnet and path. New lab camera encryption key was necessary
+because the lab initially had none; no prior camera credentials were present.
+Existing claim/session/signing/device identity keys were not rotated. Normal
+owner provisioning API accepted the retry, then the agent failed safely on
+port 554. No ciphertext/plaintext secret values are printed in evidence.
+Simulator bundle archive/checksum and investor archive remain unchanged; live
+lab runtime configuration now requires a read credential.
+
+Eight additional real security assertions PASS: anonymous camera access 401;
+authenticated scan with missing/invalid CSRF or foreign Origin 403; unowned
+appliance scan 404; unowned-site provisioning 404; invalid claim lookup and
+confirmation 404. No accounts, claims or cameras created by negative tests.
+
+Diagnostic harness findings: a script initially called nonexistent
+edge_camera_sync.persisted_identity; the actual implementation uses
+appliance_activation.load_persisted_identity. This stopped that read-only
+script after useful camera/capacity checks; not a candidate runtime exception.
+An API harness needs urllib.parse.unquote on the signed CSRF cookie, matching
+the browser's decodeURIComponent; retry succeeded after decoding. These do
+not justify weakening CSRF or changing the candidate.
+
+The initial protected-file scan counted MP4 only, whereas real recordings use
+MKV; do not infer an all-format recording-file result from MP4 count zero.
+The live /ready counters independently confirm zero recording workers.
+Historical updater-auth exceptions were observed in agent logs; updater code
+was not investigated or changed, as Software Update is excluded.
+
+Current result: real install PASS (26/26); device-bound claim/manual expiry
+recovery PASS; real Samsung discovery preflight PASS (8/8); owner API discovery
+and credential-free commissioning PASS; actual VMS-container transport/decoding
+PASS before authenticated simulator configuration (45 distinct frames);
+negative API security PASS (8/8); browser live FAIL. Recording/playback/basic
+analytics are BLOCKED pending a compatible simulator/local access path.
+Reboot persistence, uninstall/reinstall and clean recovery remain NOT RUN.
+This pinned installer has NOT passed full physical acceptance and is NOT
+investor-ready. AWS resources remain live only for continuing isolated tests.
+
+Next safe lab adjustment, without modifying the pinned installer: standard
+RTSP 554 and expected stream path, authenticated synthetic read account,
+real Ethernet/ARP via an isolated layer-2 overlay carried inside the existing
+private tunnel, and the supported Local browser authentication/viewing path.
+Do not synthesize a MAC in agent state or bypass checks. Record all new lab
+interfaces/services and repeat discovery/provisioning before later acceptance.
