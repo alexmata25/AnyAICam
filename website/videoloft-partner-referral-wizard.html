@@ -1262,7 +1262,9 @@ main{padding:24px 14px 70px}
 
         // Universal cloud pricing includes a $4 margin per camera.
 const referralPartner = new URLSearchParams(location.search).get('partner') || localStorage.getItem('anyaicamReferralPartner') || '';
-        if (!referralPartner) location.href='referral-entry.html';
+        if (!referralPartner) {
+            location.replace('sales-partner-login.html');
+        }
         localStorage.setItem('anyaicamReferralPartner', referralPartner);
 
         let selectedValues = {

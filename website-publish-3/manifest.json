@@ -1,0 +1,838 @@
+{
+ "delete_from_host": [
+  "anyaicam-test-checkout.html",
+  "homepage-button-snippet.html",
+  "anyaicam-test-checkout.php",
+  "anyaicam-test-webhook.php"
+ ],
+ "files": {
+  ".htaccess": {
+   "sha256": "35c52ba3930944614f3120a3279332fa67198cb32730ab7e333928f06ed93191",
+   "status": "on host, unchanged since the host export"
+  },
+  "14-day-video-cloud-storage-for-2mp.html": {
+   "sha256": "f2134558a8826ebdd04428c45c52dab149413f1cb2f02d2c1b3cfbdc354db1e6",
+   "status": "same as live"
+  },
+  "14-day-video-cloud-storage-for-4mp.html": {
+   "sha256": "0410963fe16c568fddf8fff2746eb0bfae155956d3b317f574d9ff15683ccb5b",
+   "status": "same as live"
+  },
+  "14-day-video-cloud-storage-for-8mp.html": {
+   "sha256": "2f2fff25256bdf864edd711fe0584121d1e6ad5514717c9ad3aacd7ece302142",
+   "status": "same as live"
+  },
+  "16-camera-videoloft-cloud-adapter.html": {
+   "sha256": "38d278eae2a82bbe684758dcf774a23b9d71e2a9d044a5a4490cbc9c65d7f69c",
+   "status": "same as live"
+  },
+  "30-day-video-cloud-storage-for-2mp.html": {
+   "sha256": "a6ef97aa2d92f1bf00b75cbabb4100d40364df5326f621883d76ce21e60c8584",
+   "status": "same as live"
+  },
+  "30-day-video-cloud-storage-for-4mp.html": {
+   "sha256": "ea2a7931279c9f3873a21296ea92d896a09944b5788fd101f9213a7a0b26865c",
+   "status": "same as live"
+  },
+  "30-day-video-cloud-storage-for-8mp.html": {
+   "sha256": "6397634d0795e80cbe96e66ee03501bdeea8c572c3808d62852191485684b120",
+   "status": "same as live"
+  },
+  "404.html": {
+   "sha256": "ec3665559d9def4cb10b8a5ad64793929e63378e4733c8c5d95504c4a4b58aec",
+   "status": "changed",
+   "upload": true
+  },
+  "7-day-video-cloud-storage-for-2mp.html": {
+   "sha256": "04c20a578ea73b682793927dfeb158a413981682d4335a6e4da528ec440634fe",
+   "status": "same as live"
+  },
+  "7-day-video-cloud-storage-for-4mp.html": {
+   "sha256": "3a2ea216a7717fb4ef36914c8a92b72d793e64fc4c91f8e3efcd7e668bb7a94f",
+   "status": "same as live"
+  },
+  "7-day-video-cloud-storage-for-8mp.html": {
+   "sha256": "3f3e44736d80312e651c189ce053c86637d10a4805d9458340fb1d84beda654e",
+   "status": "same as live"
+  },
+  "8-camera-videoloft-cloud-adapter.html": {
+   "sha256": "a33624a9f0df3700f4314abcad24c38860f584d7c62fbca54b29b13e6771d843",
+   "status": "same as live"
+  },
+  "CCTV connect image.webp": {
+   "sha256": "c84198aae40ee5fdc276f83446996ef67d2436a52cd4356b4b9424dd21697599",
+   "special": "the live URL serves different bytes from the host file (CDN); not uploaded",
+   "status": "on host, unchanged since the host export"
+  },
+  "CCTV-Connect-image.webp": {
+   "sha256": "88f674b2bba22032e3c07756daf645141dc42063b780902ebca257190c63bb25",
+   "status": "same as live"
+  },
+  "Cloud-Video-Surveillance-2048x1269.webp": {
+   "sha256": "2c160c8b397ff004e54b2f292d69a0bc4cafe8d10773821817571f2d807f9d49",
+   "status": "same as live"
+  },
+  "Compressed_Videoloft_LPR.webp": {
+   "sha256": "438db4e26be26eba9ba109eb147073f92a46b2b605812c05b9ec583e073890fe",
+   "status": "same as live"
+  },
+  "FOOTER-LINKS.html": {
+   "sha256": "c9cfb4a7a2d90d9dc891ab0b5929e4ef01b168f0f472512885b6a54afbed4bfd",
+   "status": "same as live"
+  },
+  "FullLogo_Transparent_NoBuffer.png": {
+   "sha256": "8712ed11c013214369b0a39387b7e4ad4c2ca3ac5f1f3a2c889cdd26f7d05bd5",
+   "status": "same as live"
+  },
+  "IconOnly_Transparent.png": {
+   "sha256": "87d61d5578818cdaf3b33c64d092988199ddb22dc703946d42f446bc13cb5e63",
+   "status": "same as live"
+  },
+  "IconOnly_Transparent_NoBuffer.png": {
+   "sha256": "d6b10441204fbe6608d534b410eaacbfda61c051c077261af1266cd505f4ef45",
+   "status": "same as live"
+  },
+  "PHPMailer/Exception.php": {
+   "sha256": "22ab858ae438d98f58f41f38ad2191d1b0d59570aebea0463a7948cfae1021b7",
+   "status": "on host, unchanged since the host export"
+  },
+  "PHPMailer/PHPMailer.php": {
+   "sha256": "cbdd444f5514cfd0636fce6df9b69630076a0ace4667ccd4da8dfd665634d9d8",
+   "status": "on host, unchanged since the host export"
+  },
+  "PHPMailer/SMTP.php": {
+   "sha256": "0c55c416e779bcfced26893ede9a391f527eacef5b61d0cf751d19713d171eb7",
+   "status": "on host, unchanged since the host export"
+  },
+  "Smart-Motion-1.webp": {
+   "sha256": "731bfa638d7a6fad0312f79e9052ef69e1fbcb955b6183bb281c29f37030d268",
+   "status": "same as live"
+  },
+  "Smart-Motion-Add-On.html": {
+   "sha256": "950844e2fe93d50c143400dfa0b578f96ccfd77ba6990eb7f4cf34db291b15bc",
+   "status": "same as live"
+  },
+  "Smart-Motion-Alerts-1.webp": {
+   "sha256": "b98649e8ed332ec0b0bb61aa56bb46e62224b61c8bb15a765ee53834be5b7e4d",
+   "status": "same as live"
+  },
+  "Videoloft App Logo.jpg": {
+   "sha256": "40dfe89db413a1a0d708a4116dc44ef4ebeebb1a65eef6007622b03903cf3465",
+   "status": "same as live"
+  },
+  "Videoloft Cloud adapter.jpg": {
+   "sha256": "83a7ed5c619fb68ec5e5404cf413b707494367165274325a374d38936bca542c",
+   "status": "same as live"
+  },
+  "Videoloft-AI-driven-video-analytics-1-1024x740.webp": {
+   "sha256": "c12a3ef02a772753b0b2a3da07f547faabe6155fb977067ccd1706c69e3f60a6",
+   "status": "same as live"
+  },
+  "Videoloft-People-Counting.webp": {
+   "sha256": "e76fc6a9431ac9488953eac3a72ed877e1bd074f112d47152fa68d788cbf59fa",
+   "status": "same as live"
+  },
+  "Virtual-Cloud-Adapter (1).webp": {
+   "sha256": "5274f78411482199578e4a20343922c67bfaafda0802491c59941e74aab2e059",
+   "status": "same as live"
+  },
+  "Virtual-Cloud-Adapter.webp": {
+   "sha256": "5274f78411482199578e4a20343922c67bfaafda0802491c59941e74aab2e059",
+   "status": "same as live"
+  },
+  "aac-ai-access-edge.webp": {
+   "sha256": "8574454e449170d9a8db4fd5713b1ffb29446c6d7d023897bcdd357d85288dac",
+   "status": "same as live"
+  },
+  "aac-features.html": {
+   "sha256": "fb7a8d5bddfb9e41e479dacf71018dd93694c71fc55198a33956aed3c76e0f67",
+   "status": "same as live"
+  },
+  "aac-standalone-relay.png": {
+   "sha256": "6b0484fab1c994f26a991f81ff5ffbed2b6929728d689d16643c4165cabd651c",
+   "status": "same as live"
+  },
+  "aac-vms-edge-ryzen5.webp": {
+   "sha256": "364dd394a8f0e6078e60755f1869e1446414fc07a4450bbb9765247c8cb06517",
+   "status": "same as live"
+  },
+  "aac-vms-edge-ryzen7.webp": {
+   "sha256": "b3e130b19f492ab638ffc9a5e3084a0006369a5348c55e02b7068afbf7b0c89f",
+   "status": "same as live"
+  },
+  "aac-vms-edge-x1-255-ryzen7.jpg": {
+   "sha256": "4fa04c8d0480176a5f4ae6cff4546e8736bb08557b718a7cd2521e97588d3318",
+   "status": "same as live"
+  },
+  "aac-vms-edge-x1-ryzen9.jpg": {
+   "sha256": "7681991fb645d5b84c41dc0c84db409753bf4078b1086ed4f066a15e56258ae9",
+   "status": "same as live"
+  },
+  "aaco.html": {
+   "sha256": "934af44b8e576fa6655a2a6a05116295afc7c1f4683a8e4a3547b3ae1d7abdf7",
+   "status": "same as live"
+  },
+  "adapter-enterprise.html": {
+   "sha256": "4a38332c8febda5cb991732360e429dde1b334cd5e41a65f6efffde5570a28bc",
+   "status": "same as live"
+  },
+  "adapter-payment.html": {
+   "sha256": "5d96c6221d7595fc845fb171f3614fe121e28ee17eec965b0cdbcc28bdd2179d",
+   "status": "same as live"
+  },
+  "adapter.html": {
+   "sha256": "05c4fb5d6c65d6e2c751558049b8e58c48c21a64d14fd194bd41a76cc88c79af",
+   "status": "same as live"
+  },
+  "adapters.html": {
+   "sha256": "974873788d0dd7a44f01cb9003b7e87d38d895f8b3d3cc4e2325c79ce6417425",
+   "status": "changed",
+   "upload": true
+  },
+  "analytics.html": {
+   "sha256": "80455269df560d7ff77be08349e4f6ba3d3bb5873f7301107fa0393d0ff3a204",
+   "status": "changed",
+   "upload": true
+  },
+  "app-screens/aaco-person-events.webp": {
+   "sha256": "773094d6b4048d5d97a4bf9c8e541826c7dee635baf7f067d497c134350fca60",
+   "status": "same as live"
+  },
+  "app-screens/live-front-door-phone.webp": {
+   "sha256": "eeb003474aabffa7eba1ecd00b9614a3a492ffd59d41d929f1b90a9093749ead",
+   "status": "same as live"
+  },
+  "app-screens/secure-edge-arm-disarm.webp": {
+   "sha256": "1faf4b83ff7c46097ca7b427a1c998430bc5b9215d6c6db3fdfd77d3962daaa3",
+   "status": "same as live"
+  },
+  "app-screens/visitor-call-email-phone.webp": {
+   "sha256": "a423a4d645a9be7eab2d30cfcc7e138a45fa19dc2ce6b9698236d59af6ef8814",
+   "status": "same as live"
+  },
+  "app-screens/visitor-call-settings.webp": {
+   "sha256": "839bf0f5ac23773953315c52f5d0fb0ade6ef362215d482417e4c11ca4533294",
+   "status": "same as live"
+  },
+  "app-screens/vms-dashboard-security.webp": {
+   "sha256": "9b86da28cc95833d500cba30d3ffe1ffee2d6bd8b3a577101125206c31d1b228",
+   "status": "same as live"
+  },
+  "app-screens/vms-live-camera.webp": {
+   "sha256": "b19b651526e972549f2be924973261c8153d54a8fedfea61a61a9441ea7e0fcd",
+   "status": "same as live"
+  },
+  "app-screens/vms-playback-timeline.webp": {
+   "sha256": "b399110e85a660c7e0bf61b356ef64710accbc6f31f57a4bae1c53cd0014cede",
+   "status": "same as live"
+  },
+  "app-screens/vms-smart-alerts.webp": {
+   "sha256": "9ff152ce5ff77cb024d98289f8f96ce231b709b915d9edba908fcc3b83cf6db0",
+   "status": "same as live"
+  },
+  "basket.html": {
+   "sha256": "34c5584f0ad882f4f436d42831cad75db6b235f4cb8ef8c7339b3aa2fb787bd2",
+   "status": "changed",
+   "upload": true
+  },
+  "billing.html": {
+   "sha256": "cc764c27f78cab3ae554669c92445e1f9a24098d33325856949f41ff41cd88eb",
+   "status": "same as live"
+  },
+  "build-your-system.html": {
+   "sha256": "e3c13760871e97bd430febe95a48bccb8c03b9ecff7c2e5c2524bb52716f1221",
+   "status": "changed",
+   "upload": true
+  },
+  "camera-checkout.php": {
+   "sha256": "959e59ffd9041f4aa9af3a2ed5bea5e93facf0d5326e2d95692a8b94673846be",
+   "status": "on host, unchanged since the host export"
+  },
+  "camera-compatibility-check.html": {
+   "sha256": "2033a5015631d0424e8bf6509b7100e730d0067ce941f0ee46a277bc6a5b24bb",
+   "status": "changed",
+   "upload": true
+  },
+  "camera-compatibility-check.js": {
+   "sha256": "78e7130ff1707fab27ce5b905d7c6379216fc7cb729f8897ab2bdd9fddad4236",
+   "status": "same as live"
+  },
+  "camera-straight-to-cloud-setup.webp": {
+   "sha256": "dbd70d058f7c0660cd76763e5c8da50c92f112bee8042f37bef157965b8bef28",
+   "status": "same as live"
+  },
+  "cameras.html": {
+   "sha256": "3d6b0a468c50f0f33f491c9638fb35cd0e69fb2d48095497b3858e5c8439bb8e",
+   "status": "changed",
+   "upload": true
+  },
+  "cctv-connect-anyaicam-app.png": {
+   "sha256": "8f7f054155ba1c77f31b1ccd91acd220d8d112c679d8a7af7fb56d8b4feeef16",
+   "status": "same as live"
+  },
+  "cctv-connect-anyaicam-icon-app.png": {
+   "sha256": "85f418ad89d455ccdb880224fc201ac24a284fdd34e70b2600b33adbd19711e6",
+   "status": "same as live"
+  },
+  "checkout.php": {
+   "sha256": "f58f2c97b09927a8face6a950673b407850bdb24d774575dd1bb1fec543f7b76",
+   "status": "on host, unchanged since the host export"
+  },
+  "cloud-adapter-enterprise.png": {
+   "sha256": "2997693171eb8aea4d32e4bae12509b6ecda09f8644691865591bf986ad348ed",
+   "status": "same as live"
+  },
+  "cloud-adapter-mini.webp": {
+   "sha256": "1ddc7fbc1ffc9141924eb8518945b1a5c4ad3efe6ab6c6450321b31b061fa756",
+   "status": "same as live"
+  },
+  "cloud-checkout.html": {
+   "sha256": "2474a8716a60077af74d82008e2051422b9cceeef01c10b9e240d46b98f375b4",
+   "status": "same as live"
+  },
+  "cloud-setup-wizard.html": {
+   "sha256": "6c16fa3edd36ad9fb8eac9257fb81e07063cfe936c7affb8b24a588167a08535",
+   "status": "same as live"
+  },
+  "cloud-storage-pricing.html": {
+   "sha256": "4b2883f0e7b3f409bf2dea6550839a3fe304aa1a30390ad73157708bd44716aa",
+   "status": "changed",
+   "upload": true
+  },
+  "cloud-videoloft-adapter.jpg": {
+   "sha256": "83a7ed5c619fb68ec5e5404cf413b707494367165274325a374d38936bca542c",
+   "status": "same as live"
+  },
+  "compatibility.html": {
+   "sha256": "3381b7e23dcd6114161b4d95cd9a6e4da14281656914c200fab341d18145f2d7",
+   "status": "same as live"
+  },
+  "contact-submit.php": {
+   "sha256": "bf458533962e4ca8cd411d38bb33194e09a9d717061f62873be8cc756bf99649",
+   "status": "on host, unchanged since the host export"
+  },
+  "contact-thank-you.html": {
+   "sha256": "f32f8a01ac345a5c23590e6cf0fbae968874dd1718d1aef7140b9f7b71689109",
+   "status": "same as live"
+  },
+  "contact.html": {
+   "sha256": "85654f73ccc325757724c07b14cace296f8536a3e1d9f8136a7050dffebb4084",
+   "status": "changed",
+   "upload": true
+  },
+  "customer-account.html": {
+   "sha256": "45c3956c37850ab734dc36a3c1fa54d5235ad724f7ccb0aa954715baa2211f81",
+   "status": "same as live"
+  },
+  "customer-checkout.html": {
+   "sha256": "b89512023dd9c831147af196a956c76d3c26224dfdd6af2f8d9eb454f24af4e7",
+   "status": "changed",
+   "upload": true
+  },
+  "customer-login.html": {
+   "sha256": "a0cff7270b91b242cf18ef388d50b914aab9dd22da53f6caeb88555394858d14",
+   "status": "same as live"
+  },
+  "customer-setup.html": {
+   "sha256": "022fd89055817446980d024f8cf1a823ec3324d0a6e504b9b37a03f9b9913c0c",
+   "status": "changed",
+   "upload": true
+  },
+  "edge-appliance.html": {
+   "sha256": "36fd54a487c31e54b0b6fecc8502b000bca80569e44547b6dde0d8e69cc6cb91",
+   "status": "changed",
+   "upload": true
+  },
+  "face-access.html": {
+   "sha256": "17b60aeccc5402317f26d2a008f64fa4819332417f5dbef0430b7b6e73f1d772",
+   "status": "changed",
+   "upload": true
+  },
+  "favicon.png": {
+   "sha256": "2410355e0331917be55134ddb220c6624b4c9b621865f166c15c5ee9671caf94",
+   "status": "same as live"
+  },
+  "full-logo-transparent.png": {
+   "sha256": "313006509c5b3ee3a910c6cca773c2f2dc1a57c8aa97c285d60736e5a230ea5e",
+   "status": "same as live"
+  },
+  "hardware-catalog.css": {
+   "sha256": "c4aacd69370133e901b7d5442be3fd6196d809bbc083ea5d00a637bc018a7555",
+   "status": "same as live"
+  },
+  "hardware-catalog.js": {
+   "sha256": "5d12cfc93995ce27411d6572ee164baa709041ab6d1563136a7d82ce7f874cb9",
+   "status": "same as live"
+  },
+  "hardware.html": {
+   "sha256": "afa685391144dbb6b3c909cd5a7e23bbd05bdb0b259bfd0a872ff251b7f1f62d",
+   "status": "changed",
+   "upload": true
+  },
+  "header-standard.css": {
+   "sha256": "843c9a7be8a8626498da9ce3a26ab980e7ce4e1da0a99e3a015065e9ba8afb58",
+   "status": "same as live"
+  },
+  "how-it-works.html": {
+   "sha256": "1665199b476e9a93f2bdfbf8bc7590ad8b164d80258b0bebf1fd274c00dc35e5",
+   "status": "changed",
+   "upload": true
+  },
+  "how-vms-works.html": {
+   "sha256": "3cd40e750da3d0d4c7f1a1258a53dbeb6f44e01653053896518d9d6ac2f911c3",
+   "status": "changed",
+   "upload": true
+  },
+  "icon-only-transparent-no-buffer.png": {
+   "sha256": "d6b10441204fbe6608d534b410eaacbfda61c051c077261af1266cd505f4ef45",
+   "status": "same as live"
+  },
+  "icon-only-transparent.png": {
+   "sha256": "87d61d5578818cdaf3b33c64d092988199ddb22dc703946d42f446bc13cb5e63",
+   "status": "same as live"
+  },
+  "index-no-public-qr.html": {
+   "sha256": "b28e1f477dc296bef419be89f05681375efe98339b7e907277f044a368e2827b",
+   "status": "changed",
+   "upload": true
+  },
+  "index.html": {
+   "sha256": "833d2fa9f5d551aefa4c72e19ec75ecc353d62fee311b2cd7dc2fbb1d3a1d5cf",
+   "status": "changed",
+   "upload": true
+  },
+  "mokerlink-16-port-poe.jpg": {
+   "sha256": "fbc267cc511e609e0ad62a90b09578819563674cf5605df76b8173963b3319f3",
+   "status": "same as live"
+  },
+  "mokerlink-24-port-poe.jpg": {
+   "sha256": "d0e177be4f3a5edbde1148a31dc1bfb5675954bc0fed4bbb63e5090c5984c666",
+   "status": "same as live"
+  },
+  "mokerlink-48-port-poe.jpg": {
+   "sha256": "e160602bd4a77c5a194511029ff2298d8fcab7824021ef241c820aef6c063f99",
+   "status": "same as live"
+  },
+  "mokerlink-8-port-poe.jpg": {
+   "sha256": "effdb28c8fb89778da041c3c47a7d1bdf55445bef4eca92c879309390fe2f544",
+   "status": "same as live"
+  },
+  "nvr-cloud-recorder-setup.webp": {
+   "sha256": "728b21c983949aa31df4c326ab17fa3efa1bd197d2d50bf77d317bd01c8a8928",
+   "status": "same as live"
+  },
+  "nvr.html": {
+   "sha256": "c96dce2b4b5e031204ea675a005614dea04d453bc8616065e376bff7206a6532",
+   "status": "changed",
+   "upload": true
+  },
+  "order-confirmation-mailer.php": {
+   "sha256": "0306d796aed0453116dbbd1835637217e47590f2ef25fda0bb7c224ceccec1ee",
+   "status": "on host, unchanged since the host export"
+  },
+  "partner-assisted-setup.html": {
+   "sha256": "1042189da9035aea2f93b37839ca95508b090023c285b1d1daf35ca130f759cf",
+   "status": "changed",
+   "upload": true
+  },
+  "partner-icon-180.png": {
+   "sha256": "ae49cca772b74c266227b20d2def39ca1f975c6819d92d289c1f6fa59049c7e6",
+   "status": "same as live"
+  },
+  "partner-icon-192.png": {
+   "sha256": "8c694a214efa3889e24b67eab45dc41f3a8485439852bc1ac6b4d672d0110f61",
+   "status": "same as live"
+  },
+  "partner-icon-512.png": {
+   "sha256": "4c8bf8edc248fa3032802273f626287a081d6d14b5076b1ad967b8a6b105a729",
+   "status": "same as live"
+  },
+  "partner-icon-maskable-512.png": {
+   "sha256": "f45291a58f5700716cb21e642e052bf59425a651440b848afdbc0a898f268382",
+   "status": "same as live"
+  },
+  "partner-manifest.webmanifest": {
+   "sha256": "71692278d4836f20841fbc80a3c369fb4de24ca5f0322f42f6e588ec105574f5",
+   "status": "same as live"
+  },
+  "partner-offline.html": {
+   "sha256": "b097480d6527568434b1716d63ec3ff5695f696c29386f1f6384184a79aa79f6",
+   "status": "same as live"
+  },
+  "partner-referral-wizard.html": {
+   "sha256": "2ce66f8f9d91a0cd31deb3a049123c135556ed5ee95b4387914200185e71d3b8",
+   "status": "same as live"
+  },
+  "partner-sales-calculator.html": {
+   "sha256": "73ffe3994dcc474e6e5f6de06b65ec47e917e3c02b27fe5dea444c3795f4d7f0",
+   "status": "changed",
+   "upload": true
+  },
+  "partner-service-worker.js": {
+   "sha256": "7cc89a4020da36f6a057a63cd1a97fa010e0cd05ceea806b6d6a7f364e8d03cf",
+   "status": "same as live"
+  },
+  "partner-software-trial.html": {
+   "sha256": "699d6caca7a4c445684f346fbd8278d70f2bc9d9815bd32610fd55e0f69c8035",
+   "status": "same as live"
+  },
+  "partner.html": {
+   "sha256": "781b83e2dbe65c56d3aae5bdfdccbe8c30463dffd352de956a584aed01edc5b5",
+   "status": "same as live"
+  },
+  "partner.js": {
+   "sha256": "6d2bb17c5abc358c7e8e1fd01b98e3e0fb5a8d4c0317ff78e16cd62453e0cc01",
+   "status": "same as live"
+  },
+  "payment-status.php": {
+   "sha256": "f5c4cd40d5ae422d7e5511c06f77459a25e756361cf25e0ca7d81d2bac69db2f",
+   "status": "on host, unchanged since the host export"
+  },
+  "payment-success.php": {
+   "sha256": "fe4562f719fcc398bf053970de28419284563d29ee93a3c72862775901e7a14b",
+   "status": "on host, unchanged since the host export"
+  },
+  "plans.html": {
+   "sha256": "81d780ed16c7c543721bb5f5c968e1adc5d281dd3801d007e534582f6e4bc4e8",
+   "status": "changed",
+   "upload": true
+  },
+  "poe-email-helper.php": {
+   "sha256": "7c486b0bce64333ca66299882e506bf1b8b2ca24ef3398dc8c7facb0cd1a9dd0",
+   "status": "on host, unchanged since the host export"
+  },
+  "pricing.html": {
+   "sha256": "e57845cbb7fcf9eed109d77e9e81d0b9d5e820f16ed5fa87e715c850cf59f515",
+   "status": "changed",
+   "upload": true
+  },
+  "privacy-policy.html": {
+   "sha256": "c97b2fd26d30ee2b9ac6ab7aa5a62638347a547642ffa59467491bd39d78538b",
+   "status": "changed",
+   "upload": true
+  },
+  "robots.txt": {
+   "sha256": "96340d5add1f92db732708ebfb75a7f7ecb491bc3752dde628233124a6b273df",
+   "status": "same as live"
+  },
+  "sales-calculator.html": {
+   "sha256": "51692e2f10edd960d98c0e642c60642063357379af649d8b765e14540bf5bd26",
+   "status": "changed",
+   "upload": true
+  },
+  "sales-partner-login.html": {
+   "sha256": "6dd78bffb5be71cc581b5e732d2ae1ae22c76cbf9909ecb0ce6ad909a8a3431e",
+   "status": "changed",
+   "upload": true
+  },
+  "save-checkout-lead.php": {
+   "sha256": "869e7f9e3d48fc3c904bfb474c206f242194d98c97be9794d620d0cf2823ccbf",
+   "status": "on host, unchanged since the host export"
+  },
+  "script.js": {
+   "sha256": "ee5e2ee1cf7e31adae827a4341a5c7baab4dfa2fcfc9072b2d7ace1d42491c3e",
+   "status": "same as live"
+  },
+  "secure-edge.html": {
+   "sha256": "7d3c1da411a9c2e841c0fda01c2c96139c1bbd18dcf8c088a7a5287ce1489417",
+   "status": "changed",
+   "upload": true
+  },
+  "security-cloud-hero.png": {
+   "sha256": "b9dcfac668b55a714f98ab141f271d704b69c56e5f4c6446da0f146e68495141",
+   "status": "same as live"
+  },
+  "shipping-returns.html": {
+   "sha256": "ac83828ff8a8900d42f237fe53075013512f87fae8d6f2563120af107b439ed5",
+   "status": "changed",
+   "upload": true
+  },
+  "signin.html": {
+   "sha256": "320bab84a0a93423f0189660adb0cc8784f658ccc9fb6bd977b275a7e0a4ecf0",
+   "status": "same as live"
+  },
+  "sitemap.xml": {
+   "sha256": "bb1ecebe204e4f6527b13d001cf23797cbafb4023d17c628aa677e3ccf76be2d",
+   "status": "changed",
+   "upload": true
+  },
+  "software-free-trial-camera.html": {
+   "sha256": "8550314389bea3541aef27d5c612d4310b0ff42ab0b630057ee4ef80bedc5030",
+   "status": "same as live"
+  },
+  "software-free-trial-request.html": {
+   "sha256": "b9d5184b502e5039fcc0bf3c9eb47cc2059f25eac1a4f14cfc73634063119e53",
+   "status": "changed",
+   "upload": true
+  },
+  "software-free-trial-review.html": {
+   "sha256": "cebddc0d60e92d32583f4c9de10b9c9d92b799f2eca151ba0c0e2bd4da35e905",
+   "status": "same as live"
+  },
+  "software-trial-request.html": {
+   "sha256": "5f4c7d2e1fbe6c78b99dcba62cbcc77b2e7b4b4603929a284d92d33332f16c9b",
+   "status": "changed",
+   "upload": true
+  },
+  "software-trial-thank-you.html": {
+   "sha256": "41d241e50988c8ac92abc3926c709bdf343e430a8eaa5772fb7f99ef0a3f8567",
+   "status": "same as live"
+  },
+  "software-trial-wizard-thank-you.html": {
+   "sha256": "81bdf8a711ef30930102d845689923537b370c9c553a69105a690bfd92551230",
+   "status": "same as live"
+  },
+  "software-trial-wizard.html": {
+   "sha256": "9a40083e908087e97198691385d8a8caf0b0f33e7d64a1390155abccdb7ec5ef",
+   "status": "same as live"
+  },
+  "software-trial.html": {
+   "sha256": "91a8fdcab81b66f7993460f60dfefc79f14887658a3b765af35ea838f9df22f8",
+   "status": "same as live"
+  },
+  "software.html": {
+   "sha256": "5bfae56ed005de49dc6f9bbd1a28710e624b46f64f82346a5828506974eafdf2",
+   "status": "changed",
+   "upload": true
+  },
+  "spec-fd9380-hv-v2.pdf": {
+   "sha256": "6fc796af1db240a36d99d7892ca4d4290e0f5e3128be41b38dedc3ea05a5ce71",
+   "status": "same as live"
+  },
+  "spec-fe9380-hv.pdf": {
+   "sha256": "0c1e0318f610f020a64344176a9d83386ff0b6294f4b0dd319f388eaf48e750c",
+   "status": "same as live"
+  },
+  "spec-ib9380-htv-v2.pdf": {
+   "sha256": "90d9395a6ad12aa4f57ad235a870eaaee0b4becae0cecd3502cbac221f490cf1",
+   "status": "same as live"
+  },
+  "spec-ma9312-ehtv.pdf": {
+   "sha256": "12c74ca35dbcde805d6bdfb4a706e538f7bae35cbd8f82b37ad921b30cc35dcc",
+   "status": "same as live"
+  },
+  "starter-camera-trial.html": {
+   "sha256": "7fa2ab00cb21d89051f1a457849db0e3cb83f623c54c69e04528391faa677e2b",
+   "status": "changed",
+   "upload": true
+  },
+  "stripe-checkout.php": {
+   "sha256": "976c23a38d6d213a7af523abddf2c3a8b2f093d71ed52d1caf699f04838df067",
+   "status": "on host, unchanged since the host export"
+  },
+  "stripe-success.php": {
+   "sha256": "67b23d85ebd3ff5295a2677a363f9db5ebc9cfa2243e58449ea385f3380593dc",
+   "status": "on host, unchanged since the host export"
+  },
+  "stripe-webhook.php": {
+   "sha256": "55ccdad36c3f2001d429a79b45de19d8dc1cbe301d6616c7949976e3fc1a87e1",
+   "status": "on host, unchanged since the host export"
+  },
+  "styles.css": {
+   "sha256": "40c75e4db1be2f74d6657e010b4b1d205fe02b2f7ad097dfca822a6a9486dfb2",
+   "status": "same as live"
+  },
+  "submit-software-free-trial.php": {
+   "sha256": "08d1c9cad1115c6ce224b67b13617a3c845861ca819906edd4dd2165b70c8834",
+   "status": "on host, unchanged since the host export"
+  },
+  "submit-software-trial-request-2.php": {
+   "sha256": "7e6c2e542d44cb1e862c724e55ee159b40a9a6bde282cadc62d239740693b99c",
+   "status": "on host, unchanged since the host export"
+  },
+  "submit-software-trial-request.php": {
+   "sha256": "7e6c2e542d44cb1e862c724e55ee159b40a9a6bde282cadc62d239740693b99c",
+   "status": "on host, unchanged since the host export"
+  },
+  "submit-software-trial-wizard.php": {
+   "sha256": "e468525112a32ee492da40786b4d902d888bb667f1484803019703b8f267a3d1",
+   "status": "on host, unchanged since the host export"
+  },
+  "submit-software-trial.php": {
+   "sha256": "13f9e4d1b1263fa65745d17e57d46f4c6351be2cf35ff2ca8f208f55752fa72e",
+   "status": "on host, unchanged since the host export"
+  },
+  "support-diagnostic.html": {
+   "sha256": "a9d406cfb1a7513d548144a4d9231e849168431e7c3e1aba2ae79be3dc4c8696",
+   "status": "changed",
+   "upload": true
+  },
+  "support-escalation.html": {
+   "sha256": "cdf4ed1aae94c04a8150e9c72b76f22da95b2aa9fbcc2c8ef74a789304fac300",
+   "status": "changed",
+   "upload": true
+  },
+  "support-form.php": {
+   "sha256": "1705e06273cf7ac1ee47e4b72ab0c0f656b2f066278a2a956aad9d8a3f373a5c",
+   "status": "on host, unchanged since the host export"
+  },
+  "support-ticket.php": {
+   "sha256": "f8d59ecd57f710a37a56f8b79ba721f3f3339dc34df695e95ff3148b6b569bde",
+   "status": "on host, unchanged since the host export"
+  },
+  "support.html": {
+   "sha256": "a6f73e4b2de474673a71302973369d8aca5d7690c4fea3bfda28551ccaeae4c3",
+   "status": "changed",
+   "upload": true
+  },
+  "system-options.html": {
+   "sha256": "a3b5731d6f228810eb2dbc7606f237b7c76029ee8b8e816eee7a19f4410fcd75",
+   "status": "same as live"
+  },
+  "terms.html": {
+   "sha256": "f4b864a7ca39f7c383a09fe023f297eef3fde29670ce1f4279d37d72ba49721d",
+   "status": "changed",
+   "upload": true
+  },
+  "thank-you.html": {
+   "sha256": "4503feb73916dbce5c4b360061448319a19186ed09d29ff84da41ef64e962f9d",
+   "status": "changed",
+   "upload": true
+  },
+  "troubleshooting.html": {
+   "sha256": "e51fe2857d1a02128acabfff90f8ef01fc89915f6ff896a4d8b14d23da1ed218",
+   "status": "changed",
+   "upload": true
+  },
+  "videoloft adapter (1).jpg": {
+   "sha256": "8555d4766ddbf4d40e4f1a36fd9302edb7131038c73ba4062dffe3349f0bad41",
+   "status": "same as live"
+  },
+  "videoloft adapter.jpg": {
+   "sha256": "8555d4766ddbf4d40e4f1a36fd9302edb7131038c73ba4062dffe3349f0bad41",
+   "status": "same as live"
+  },
+  "videoloft provision.png": {
+   "sha256": "2384c17916968407eeba2c01f74d8ba4a2f8438769473a2e72d66f151ad772f2",
+   "status": "same as live"
+  },
+  "videoloft-partner-manifest.webmanifest": {
+   "sha256": "3f41949664bb24d577e71d1fb4ac37476f2271fc67bd4609aa3bd8937b81150e",
+   "status": "same as live"
+  },
+  "videoloft-partner-referral-wizard.html": {
+   "sha256": "af9375ddb7cc960be6363c36b4167485c016a1ccd772121fe34efc0b95d128ba",
+   "status": "changed",
+   "upload": true
+  },
+  "videoloft-partner-sales-calculator.html": {
+   "sha256": "73ffe3994dcc474e6e5f6de06b65ec47e917e3c02b27fe5dea444c3795f4d7f0",
+   "status": "changed",
+   "upload": true
+  },
+  "videoloft-partner-service-worker.js": {
+   "sha256": "5f9b0812c9297b06ae7fb585f03bf5ac5914d58209f5fa5d8278504514f9853b",
+   "status": "same as live"
+  },
+  "videoloft-partner-software-trial.html": {
+   "sha256": "699d6caca7a4c445684f346fbd8278d70f2bc9d9815bd32610fd55e0f69c8035",
+   "status": "same as live"
+  },
+  "videoloft-partner.html": {
+   "sha256": "7d081c40dc3ce95cafa10a0923f69f2e91e379847d46d31a6e87cd072d0108ed",
+   "status": "changed",
+   "upload": true
+  },
+  "visitor-call.html": {
+   "sha256": "f81356a61ee28a3fe47f91b2d5862d54d9132d283b25af8fcad7d29516e822cb",
+   "status": "same as live"
+  },
+  "vivotek-fd9380-hero.png": {
+   "sha256": "1ec7fb7130fafb97e249dc2cb84aaf614c8c97310aecc51c2ed0a3d3d900c129",
+   "status": "same as live"
+  },
+  "vivotek-fd9380-hv-v2.png": {
+   "sha256": "7c670e5dca68d1970b497ab752e4d0d1e5fb1e42133eb8f96974d357d43ab8fe",
+   "status": "same as live"
+  },
+  "vivotek-fd9380-product.jpg": {
+   "sha256": "b1db42186ce27808940bba1d2b40d4cc9e454c3a782dc8c0958bdba27401ebe7",
+   "status": "same as live"
+  },
+  "vivotek-fd9380-specifications.png": {
+   "sha256": "d67263a048ab94c4d46ca0e9335779afabe3d10fcb9d58c84cdee03787be7a70",
+   "status": "same as live"
+  },
+  "vivotek-fe9380-hv.png": {
+   "sha256": "011c55214686e40ae4ce2115169d9645d8a1a176dbfe474b6d5e0fcf316b212a",
+   "status": "same as live"
+  },
+  "vivotek-ib9380-htv-v2.png": {
+   "sha256": "769b258fcff894fb4cc15247c4ef7a580d9060760f27ab45b3b2439f10c4d9bd",
+   "status": "same as live"
+  },
+  "vivotek-ma9312-ehtv.png": {
+   "sha256": "d5c54c67eb61d557a9396e31f4dd21bf172dce960213457bd2edca8a1905ba94",
+   "status": "same as live"
+  },
+  "vms-cloud-video-surveillance.webp": {
+   "sha256": "2c160c8b397ff004e54b2f292d69a0bc4cafe8d10773821817571f2d807f9d49",
+   "status": "same as live"
+  },
+  "vms-contact.html": {
+   "sha256": "d6c2e87a0b443733abdbb3f57ef2ba4d562c37e78e94e292ada31f6086ec4b5e",
+   "status": "same as live"
+  },
+  "vms-features.html": {
+   "sha256": "ee6a586e87292ecca45f5cd031bedca1622830fd7563e44ea772d20d053304cc",
+   "status": "changed",
+   "upload": true
+  },
+  "vms-footer.js": {
+   "sha256": "6d5770361030ca465b16d600ce6cb42a7686c64a403650d9cb264a843a418772",
+   "status": "changed",
+   "upload": true
+  },
+  "vms-linux.html": {
+   "sha256": "1a0c41080bec2ec0ddabea181954ae19f3dae6784fff1c455cb1ef935dd58566",
+   "status": "new",
+   "upload": true
+  },
+  "vms-pages.css": {
+   "sha256": "968dbe86bd5815993814f43d5ba7bb3cfc78fcf98360c31eb76f05df8bdfefe0",
+   "status": "same as live"
+  },
+  "vms-partner-admin.html": {
+   "sha256": "45d1565a62bbdb181255604eed8080e20def394334bd7bc7f0255b100fd56e30",
+   "status": "same as live"
+  },
+  "vms-partner-apply.html": {
+   "sha256": "9431cc3321038764e9121f466d7ddb9f7a1ed000852235c66f9dce92b8102317",
+   "status": "changed",
+   "upload": true
+  },
+  "vms-partner-sales.html": {
+   "sha256": "7845702ba7b877f6c40b040febbc59b1bfe7d1c2db3fcdf78d8d54d7187ef686",
+   "status": "changed",
+   "upload": true
+  },
+  "vms-product.css": {
+   "sha256": "d95191ef6b1b87fbd4f6a1297831aff8919ab986a4c26054a4c84b13bbd2f602",
+   "status": "changed",
+   "upload": true
+  },
+  "vms-software-dashboard.svg": {
+   "sha256": "ac832c1a499f7ee964236e114ef9938488af9c2f256089bf399d44efd21886dc",
+   "status": "same as live"
+  },
+  "vms-software-path.svg": {
+   "sha256": "f1e9b21509a9a08a64a995c8f23e6a4ba6674990317823baea5ec75f2908e2bf",
+   "status": "same as live"
+  },
+  "vms-support.html": {
+   "sha256": "7badfe3e8fb90e908cc9ef67feaf919d37e703618c32260ebdb40dd12839102c",
+   "status": "changed",
+   "upload": true
+  },
+  "vms.html": {
+   "sha256": "3910571950fe1cc5e8135fcdf72f394cf4d708b35da6bc36f8f3b0cc262b2c2a",
+   "status": "changed",
+   "upload": true
+  },
+  "welcome-email.php": {
+   "sha256": "3b7ea4939903f6fa281dc4d8a34304f36adc01a1dffd3aee2d487052ee50e9eb",
+   "status": "on host, unchanged since the host export"
+  }
+ },
+ "release": "release blocks pending"
+}

@@ -127,6 +127,15 @@ def test_mixed_pending_and_published_blocks_fail_the_check(site):
     ("vms.html", "Professional $1,749.99", "Professional $1,799.99", "Professional"),
     ("vms.html", "A Windows version is coming soon.", "AnyAiCam for Windows is ready.", "Windows availability"),
     ("vms.html", "An AnyAiCam Ryzen appliance arrives", "Sign in to download. An AnyAiCam Ryzen appliance arrives", "outside the release blocks"),
+    ("plans.html", "<td>$49.99 one-time</td>", "<td>$49.99</td>", "prices"),
+    ("vms.html", "buy a one-time licence for your own PC", "buy a licence for your own PC", "one-time licence"),
+    ("vms-linux.html", "from $49.99 for 8 cameras", "from $39.99 for 8 cameras", "licence next to an unexpected price"),
+    ("plans.html", "Plans are priced", "Sandbox plans are priced", "'sandbox' wording"),
+    ("analytics.html", "Coming soon as a premium analytics module.", "Future premium roadmap category.", "internal wording"),
+    ("face-access.html", "Contact AnyAiCam to confirm", "AnyAiCam should publish a list. Contact AnyAiCam to confirm", "internal wording"),
+    ("vms.html", "A Windows version is coming soon.", "Download the Free AnyAiCam VMS. A Windows version is coming soon.", "free VMS"),
+    ("videoloft-partner-referral-wizard.html", "location.replace('sales-partner-login.html')",
+     "location.href='referral-entry.html'", "broken link referral-entry.html"),
     ("vms.html", "github.com", "github.com", None),
 ])
 def test_the_launch_check_catches_each_kind_of_launch_defect(site, page, old, new, expected):

@@ -3,8 +3,9 @@
     python tools/website_launch_check.py
 
 Fails on: superseded releases, installers and checksums; old, sandbox or
-wrong AnyAiCam prices; "staging", draft or candidate wording; Windows VMS
-availability claims; download wording while the release is pending; release
+wrong AnyAiCam prices; a VMS licence not shown as one-time; "staging",
+"sandbox", draft, candidate or internal roadmap wording; "free VMS" claims;
+Windows VMS availability claims; download wording while the release is pending; release
 blocks that disagree; broken local links and anchors.
 """
 from __future__ import annotations
@@ -25,7 +26,7 @@ RELAY = "$149.99"
 PLAN_TABLES = {  # plans.html, in page order
     "Local plan": ["$14.99/month", "$24.99/month", "$39.99/month", "$69.99/month"],
     "Hybrid plan": ["$24.99/month", "$39.99/month", "$69.99/month", "$99.99/month"],
-    "AnyAiCam VMS licence": ["$49.99", "$79.99", "$129.99", "$199.99"],
+    "AnyAiCam VMS licence": ["$49.99 one-time", "$79.99 one-time", "$129.99 one-time", "$199.99 one-time"],
 }
 TIERS = ["Up to 8 cameras", "Up to 16 cameras", "Up to 32 cameras", "Up to 64 cameras"]
 # Pages that sell AnyAiCam appliances (Videoloft pages have their own catalogue).
@@ -33,6 +34,7 @@ APPLIANCE_PAGES = {name: list(APPLIANCES) for name in ("index.html", "hardware.h
 APPLIANCE_PAGES["face-access.html"] = ["Enterprise"]  # sells only the Face Access appliance
 RELAY_PAGES = ["hardware.html", "face-access.html", "build-your-system.html"]
 RELEASE_PAGES = ["vms.html", "vms-linux.html", "index.html"]
+LICENCE_PAGES = ["vms.html", "vms-linux.html"]  # tell a customer how to license their own PC
 
 STALE = [
     (re.compile(r"(?<![\w.])(?:v)?(1\.2\.2|0\.1\.3)(?!\.?\w)"), "superseded release number"),
@@ -40,9 +42,14 @@ STALE = [
     (re.compile(r"\$(?:999|1,499|2,499)(?:\.00)?(?![\d,])"), "old appliance price"),
     (re.compile(r"\$0\.5[0-3](?!\d)"), "sandbox price"),
     (re.compile(r"\bstag(?:ing|ed)\b", re.I), "'staging' wording"),
+    (re.compile(r"\bsandbox\b", re.I), "'sandbox' wording"),
 ] + [(re.compile(re.escape(p)), "superseded installer checksum") for p in website_release.SUPERSEDED_SHA256_PREFIXES] \
   + [(re.compile(re.escape(p)), "superseded installer build") for p in website_release.SUPERSEDED_FILENAME_PARTS if not p.startswith("-")]
-DRAFT = re.compile(r"\b(draft|candidate|subject to (?:final )?(?:AnyAiCam )?validation|before launch|lorem ipsum|TBD|TODO)\b", re.I)
+DRAFT = re.compile(r"\b(draft|candidate|subject to (?:final )?(?:AnyAiCam )?validation|before launch|lorem ipsum|TBD|TODO"
+                   r"|roadmap|is being structured|product direction|before (?:professional )?production (?:launch|sales)"
+                   r"|server-authori[sz]ed|authoritative backend|should publish)\b", re.I)
+# The AnyAiCam VMS is sold (with an appliance or as a one-time licence); the free product is the Videoloft Software Bridge.
+FREE_VMS = re.compile(r"\bfree\s+(?:AnyAiCam\s+)?VMS\b|\bVMS\s+(?:software\s+)?(?:is\s+)?free\b|\bfree\s+AnyAiCam\s+(?:software|download)", re.I)
 SERVED = ("*.html", "*.php", "*.js", "*.css", "*.txt", "*.md", "*.json", "*.webmanifest")
 # Repository notes about the mirror itself, never uploaded (see website/README.md).
 REPO_ONLY = {"README.md", "SOURCE_MANIFEST.json", "SERVER_CLEANUP.json"}
@@ -79,6 +86,8 @@ def check_stale(website: Path, fail):
         if path.suffix == ".html":
             for match in DRAFT.finditer(visible_text(text)):
                 fail(f"{rel}: internal wording visible to customers: {match.group(0)!r}")
+            for match in FREE_VMS.finditer(visible_text(text)):
+                fail(f"{rel}: 'free VMS' claim: {match.group(0)!r}")
             for match in re.finditer(r'\balt="([^"]*)"', text):
                 if DRAFT.search(match.group(1)):
                     fail(f"{rel}: internal wording in an image description: {match.group(1)!r}")
@@ -110,6 +119,13 @@ def check_prices(website: Path, fail):
         rows = re.findall(r"<tr><th>([^<]+)</th><td>([^<]+)</td></tr>", card.group(0))
         if rows != list(zip(TIERS, prices)):
             fail(f"plans.html: '{title}' prices {rows} != authoritative {list(zip(TIERS, prices))}")
+    for name in LICENCE_PAGES:
+        text = visible_text((website / name).read_text(encoding="utf-8"))
+        if "one-time licence" not in text:
+            fail(f"{name}: the VMS licence for your own PC is not described as a one-time licence")
+        for match in re.finditer(r"licen[cs]e\b[^$]{0,80}?\$([\d,]+\.\d\d)", text, re.I):
+            if f"${match.group(1)} one-time" not in PLAN_TABLES["AnyAiCam VMS licence"]:
+                fail(f"{name}: licence next to an unexpected price ${match.group(1)}")
 
 
 def check_release(website: Path, fail):
@@ -146,8 +162,9 @@ def check_links(website: Path, fail):
 
     for page in sorted(website.rglob("*.html")):
         text = page.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r'\b(?:href|src)="([^"]*)"', text):
-            url = html.unescape(match.group(1)).strip()
+        # Attributes, and script redirects such as location.href='x.html' or location.replace('x.html').
+        for match in re.finditer(r'\b(?:href|src)="([^"]*)"|\blocation(?:\.href\s*=|\.replace\()\s*[\'"]([^\'"+]+\.html[^\'"+]*)[\'"]', text):
+            url = html.unescape(match.group(1) if match.group(1) is not None else match.group(2)).strip()
             if not url or url.startswith(("http:", "https:", "mailto:", "tel:", "sms:", "javascript:", "data:", "//", "{", "$")):
                 continue
             parts = urlsplit(url)
