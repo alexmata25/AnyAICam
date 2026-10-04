@@ -48723,6 +48723,8 @@ from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
 from customer_billing import register_customer_billing_routes
 register_customer_billing_routes(app)
+from per_camera_billing import register_routes as register_per_camera_billing_routes
+register_per_camera_billing_routes(app)
 from plan_changes import register_plan_change_routes, register_plan_management_routes
 register_plan_change_routes(app)
 register_plan_management_routes(app)
@@ -104294,6 +104296,14 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     entitlements (camera-slot plan + Local/Hybrid mode) and analytics_
     entitlements (add-ons) -- never a static/mock JSON file."""
     from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS, product_mode_for_customer
+    import per_camera_billing as _per_camera_billing
+    _v2_entitlement = _per_camera_billing.entitlement_for_customer(identity["customer_id"])
+    _legacy_base = [e for e in get_entitlements_for_customer(identity["customer_id"])
+                    if e["product"] in ("camera_slots_local", "camera_slots_hybrid")
+                    and e["status"] in ("active", "suspended")]
+    if ((_v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended")) or not _legacy_base):
+        return _per_camera_billing.customer_portal_page(identity, _v2_entitlement
+            if _v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended") else None)
     from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
 
     customer_id = identity["customer_id"]
@@ -113964,6 +113974,18 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         raise HTTPException(status_code=403, detail="Customer owner permission required.")
     from analytics_entitlements import ANALYTICS_CATALOG, checkout_item
     addon_key = payload.addon_key.strip().lower()
+    # In billing v2, supported Talk Down is already part of AI Local and
+    # Hybrid. Keep the existing separately billed add-on unchanged for
+    # Basic Local and grandfathered legacy accounts, but refuse a duplicate
+    # purchase through a direct API call for v2 plans that include it.
+    if addon_key == "talk_down":
+        try:
+            import per_camera_billing
+            _v2_plan = per_camera_billing.entitlement_for_customer(identity["customer_id"])
+        except Exception:
+            _v2_plan = None
+        if _v2_plan and _v2_plan.get("status") == "active" and _v2_plan.get("plan_key") in {"ai_local", "hybrid"}:
+            raise HTTPException(status_code=409, detail="Talk Down is included with your plan on supported cameras.")
     catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == addon_key), None)
     if not catalog_entry:
         raise HTTPException(status_code=400, detail="Unknown analytics add-on.")
@@ -114961,6 +114983,10 @@ def _stripe_webhook_steps() -> list:
         from customer_entitlements import sync_entitlement_from_stripe_event
         sync_entitlement_from_stripe_event(event)
 
+    def camera_plan_v2(event):
+        from per_camera_billing import sync_from_stripe_event
+        sync_from_stripe_event(event)
+
     def hardware(event):
         from hardware_orders import sync_hardware_order_from_stripe_event
         sync_hardware_order_from_stripe_event(event)
@@ -114985,6 +115011,7 @@ def _stripe_webhook_steps() -> list:
     return [
         ("legacy_billing", process_stripe_webhook_event),
         ("camera_slot_entitlements", entitlements),
+        ("camera_plan_v2_entitlements", camera_plan_v2),
         ("hardware_orders", hardware),
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),

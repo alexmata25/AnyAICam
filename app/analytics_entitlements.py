@@ -314,7 +314,23 @@ def account_wide_feature_active(db, customer_id: str, feature_key: str) -> bool:
     package (packages are never per camera). Takes the caller's open
     connection so it can run inside customer_analytics_panel's own
     transaction."""
-    if feature_key in _catalog.INCLUDED_FEATURE_KEYS:
+    try:
+        import per_camera_billing
+        v2 = per_camera_billing.entitlement_for_customer(customer_id)
+    except Exception:
+        v2 = None
+    if v2 and v2.get("status") == "active":
+        plan = per_camera_billing.PLANS.get(v2.get("plan_key"), {})
+        included = set(plan.get("features") or [])
+        v2_feature = {"smart_motion": "smart_motion", "talk_down": "supported_talk_down",
+                      "voice_call": "supported_talk_down", "aaco": "core_aaco_retrieval"}.get(feature_key)
+        if v2_feature:
+            return v2_feature in included
+        # Do not fall through to the legacy Local/Hybrid global feature set:
+        # Basic Local must not inherit Smart Motion or AACO from that model.
+        if feature_key in _catalog.INCLUDED_FEATURE_KEYS:
+            return False
+    elif feature_key in _catalog.INCLUDED_FEATURE_KEYS:
         plan = db.execute(
             "SELECT 1 FROM customer_entitlements WHERE customer_id=? AND status='active' AND camera_slot_quantity>0 "
             "AND product IN ('camera_slots_local','camera_slots_hybrid') LIMIT 1",

@@ -176,7 +176,9 @@ def _classify_invoice(invoice: dict) -> tuple[Optional[str], Optional[dict], str
         price_id = _line_price_id(line)
         product_class, product = _classify(price_id)
         classified.append((product_class, product, price_id, max(0, int(line.get("amount") or 0))))
-    base = sorted((c for c in classified if c[0] == "base"), key=lambda c: (-int(c[1].get("camera_slot_maximum") or 0), c[2]))
+    plan_classes = {"base", "base_v2_commissionable", "base_v2_noncommissionable"}
+    base = sorted((c for c in classified if c[0] in plan_classes),
+                  key=lambda c: (-int(c[1].get("camera_slot_maximum") or c[1].get("camera_quantity") or 0), c[2]))
     addon = sorted((c for c in classified if c[0] == "addon"), key=lambda c: c[2])
     chosen = base[0] if base else (addon[0] if addon else None)
     if not chosen:
@@ -237,6 +239,10 @@ def _invoice_for_payment_intent(intent: str) -> Optional[str]:
 
 
 def _classify(price_id: str) -> tuple[Optional[str], Optional[dict]]:
+    import per_camera_billing
+    v2_plan = per_camera_billing.resolve_price(price_id)
+    if v2_plan:
+        return v2_plan["product_class"], v2_plan
     from customer_entitlements import resolve_tier
     tier = resolve_tier(price_id)
     if tier:
@@ -291,6 +297,36 @@ def _base_paid_months(customer_id: str) -> int:
     return int((found or {}).get("n") or 0)
 
 
+def _per_camera_commission_paid_months(customer_id: str) -> int:
+    """Only successfully paid AI Local/Hybrid base invoices start/consume
+    the v2 12-month recurring commission window. Basic Local never counts."""
+    found = row("SELECT COUNT(*) AS n FROM subscription_payments WHERE customer_id=? AND product_class='base_v2_commissionable'",
+                (customer_id,))
+    return int((found or {}).get("n") or 0)
+
+
+def _commissionable_invoice_fraction(invoice: dict) -> float:
+    """Commission only recognized, commissionable invoice lines. A Basic
+    Local line remains zero-rate even if a commissionable add-on shares the
+    invoice; unknown prices never enter the basis."""
+    lines = [line for line in ((invoice.get("lines") or {}).get("data") or []) if isinstance(line, dict)]
+    if not lines:
+        product_class, product = _classify(_invoice_price_id(invoice))
+        if product_class == "base_v2_noncommissionable":
+            return 0.0
+        return 1.0 if product_class in {"base", "addon", "base_v2_commissionable"} else 0.0
+    total = sum(max(0, int(line.get("amount") or 0)) for line in lines)
+    if total <= 0:
+        return 0.0
+    eligible = 0
+    for line in lines:
+        price_id = _line_price_id(line)
+        product_class, _product = _classify(price_id)
+        if product_class in {"base", "addon", "base_v2_commissionable"}:
+            eligible += max(0, int(line.get("amount") or 0))
+    return min(1.0, eligible / total)
+
+
 # ------------------------------------------------------------ event handlers
 
 def _invoice_paid(event: dict) -> dict:
@@ -308,7 +344,7 @@ def _invoice_paid(event: dict) -> dict:
         logger.warning("commission.invoice_rejected invoice=%s reason=%s", invoice_id, why)
         return {"status": "rejected" if why != "customer not resolved" else "ignored", "reason": why}
     tax = int(invoice.get("tax") or 0) + sum(int(t.get("amount") or 0) for t in (invoice.get("total_taxes") or []) if isinstance(t, dict))
-    basis = int(round(max(0, amount_paid - tax) * eligible_fraction))  # unknown price lines earn nothing
+    basis = int(round(max(0, amount_paid - tax) * _commissionable_invoice_fraction(invoice)))
     if not row("SELECT id FROM subscription_payments WHERE id=?", (invoice_id,)):
         with connection() as db:
             db.execute(
@@ -322,9 +358,24 @@ def _invoice_paid(event: dict) -> dict:
     if not attribution:
         return {"status": "payment_recorded", "commission": "no salesperson attribution"}
     ff = _ff_approved(customer_id)
-    paid_months = _base_paid_months(customer_id)
+    if product_class == "base_v2_commissionable":
+        paid_months = _per_camera_commission_paid_months(customer_id)
+    elif product_class == "base_v2_noncommissionable":
+        paid_months = 0
+    elif product_class == "addon":
+        try:
+            import per_camera_billing
+            v2 = per_camera_billing.entitlement_for_customer(customer_id)
+        except Exception:
+            v2 = None
+        paid_months = (_per_camera_commission_paid_months(customer_id)
+                       if v2 and v2.get("plan_key") in {"ai_local", "hybrid"} and v2.get("status") in {"active", "suspended"}
+                       else _base_paid_months(customer_id))
+    else:
+        paid_months = _base_paid_months(customer_id)
     written = []
     plan_type = tier_slots = None
+    is_v2_base = product_class in {"base_v2_commissionable", "base_v2_noncommissionable"}
     if product_class == "base":
         plan_type = product["product"].replace("camera_slots_", "")
         tier_slots = int(product["camera_slot_maximum"])
@@ -335,8 +386,10 @@ def _invoice_paid(event: dict) -> dict:
                        stripe_subscription_id=subscription_id, stripe_invoice_id=invoice_id,
                        plan_type=plan_type, camera_slot_tier=tier_slots, paid_month_index=paid_months):
                 written.append("activation")
-    if 0 < paid_months <= pricing_catalog.RECURRING_COMMISSION_MAX_PAID_MONTHS:
-        amount = int(round(basis * pricing_catalog.RECURRING_COMMISSION_PERCENT / 100))
+    if 0 < paid_months <= pricing_catalog.RECURRING_COMMISSION_MAX_PAID_MONTHS and basis > 0:
+        commission_percent = (int(product.get("commission_percent") or 0) if is_v2_base
+                              else pricing_catalog.RECURRING_COMMISSION_PERCENT)
+        amount = int(round(basis * commission_percent / 100))
         if _record(kind="recurring", source_ref=f"invoice:{invoice_id}", customer_id=customer_id,
                    attribution=attribution, amount_cents=amount, basis_cents=basis, friends_family=ff,
                    stripe_subscription_id=subscription_id, stripe_invoice_id=invoice_id,

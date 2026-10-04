@@ -260,6 +260,16 @@ def product_mode_for_customer(customer_id: str) -> str:
     appliance_configuration()) must treat "" as "no mode to report",
     the same fail-closed discipline resolve_tier()/resolve_addon() use
     for an unconfigured Price ID."""
+    # Billing v2 is authoritative when a v2 subscription exists; legacy
+    # camera_slots_local/hybrid rows remain untouched for grandfathered
+    # accounts and are consulted only when no active v2 plan is present.
+    try:
+        import per_camera_billing
+        v2_mode = per_camera_billing.product_mode(customer_id)
+        if v2_mode:
+            return v2_mode
+    except Exception:
+        pass  # databases before the additive v2 migration retain legacy behavior
     active_products = {
         item["product"] for item in get_entitlements_for_customer(customer_id)
         if item["status"] == "active"
@@ -288,7 +298,15 @@ def total_camera_slots(customer_id: str) -> int:
     # it here would double a customer's capacity.
     active = [item for item in get_entitlements_for_customer(customer_id)
               if item["status"] == "active" and item["product"] != VMS_LICENSE_PRODUCT]
-    base = max((int(item["camera_slot_quantity"] or 0) for item in active if item["product"] in BASE_PLAN_PRODUCTS), default=0)
+    try:
+        import per_camera_billing
+        v2 = per_camera_billing.entitlement_for_customer(customer_id)
+    except Exception:
+        v2 = None
+    if v2 and v2.get("status") == "active":
+        base = int(v2.get("camera_quantity") or 0)
+    else:
+        base = max((int(item["camera_slot_quantity"] or 0) for item in active if item["product"] in BASE_PLAN_PRODUCTS), default=0)
     return base + sum(int(item["camera_slot_quantity"] or 0) for item in active if item["product"] not in BASE_PLAN_PRODUCTS)
 
 
@@ -307,6 +325,13 @@ def vms_license_capacity(customer_id: str) -> int:
     (DIY) license, or -- for an appliance customer -- the capacity of their
     current Local/Hybrid plan, which the appliance's included license
     follows. 0 means no license on record."""
+    try:
+        import per_camera_billing
+        v2_capacity = per_camera_billing.vms_license_capacity(customer_id)
+        if v2_capacity:
+            return v2_capacity
+    except Exception:
+        pass  # pre-v2 database: preserve the fixed-capacity path
     entitlements = [e for e in get_entitlements_for_customer(customer_id) if e["status"] == "active"]
     purchased = max((int(e["camera_slot_quantity"] or 0) for e in entitlements if e["product"] == VMS_LICENSE_PRODUCT), default=0)
     included = 0

@@ -233,11 +233,14 @@ class ProvisioningPending(Exception):
     this step fails, so Stripe redelivers the event, and the claim stays."""
 
 
-def _provisioned(event_id: str) -> bool:
+def _provisioned(event_id: str, session: dict | None = None) -> bool:
     with connection() as db:
         done = {r["step"] for r in db.execute(
             "SELECT step FROM stripe_webhook_steps WHERE event_id=? AND status='completed'", (event_id,)).fetchall()}
-    return all(step in done for step in PROVISIONING_STEPS)
+    required = PROVISIONING_STEPS
+    if ((session or {}).get("metadata") or {}).get("anyaicam_billing_version") == "2":
+        required = (*required, "camera_plan_v2_entitlements")
+    return all(step in done for step in required)
 
 
 def sync_from_stripe_event(event: dict) -> dict:
@@ -255,7 +258,7 @@ def sync_from_stripe_event(event: dict) -> dict:
         with connection() as db:  # paid: blocking, whatever happens to provisioning
             db.execute("UPDATE checkout_pending SET status='paid',updated_at=? WHERE session_id=? AND status<>'completed'",
                        (_now_iso(), session_id))
-        if not _provisioned(str(event.get("id") or "")):
+        if not _provisioned(str(event.get("id") or ""), session):
             raise ProvisioningPending("the purchase is paid but not provisioned yet")
         state, expires = "completed", None
     elif event_type in ("checkout.session.expired", "checkout.session.async_payment_failed"):

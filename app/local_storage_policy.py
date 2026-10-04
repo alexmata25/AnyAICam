@@ -70,4 +70,15 @@ def local_storage_policy_for_customer(db, customer_id: str) -> dict:
             warning_free_percent = int(row["warning_free_percent"])
         if row["local_retention_days"] is not None:
             local_retention_days = int(row["local_retention_days"])
+    # An explicit RDM storage choice still wins (including 14/30 days).
+    # Otherwise a paid v2 plan supplies its included local-retention baseline;
+    # legacy customers continue to receive the existing no-age-limit default.
+    if local_retention_days is None:
+        try:
+            from per_camera_billing import entitlement_for_customer
+            entitlement = entitlement_for_customer(customer_id)
+            if entitlement and entitlement.get("status") == "active":
+                local_retention_days = int(entitlement.get("local_retention_days") or 0) or None
+        except Exception:
+            pass
     return {"reserved_free_percent": reserved_free_percent, "warning_free_percent": warning_free_percent, "local_retention_days": local_retention_days}

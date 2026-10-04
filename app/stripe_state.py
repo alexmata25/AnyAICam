@@ -151,6 +151,11 @@ def stripe_customer_accounts(stripe_customer_id: str | None) -> set[str]:
         "SELECT customer_id FROM customer_entitlements WHERE stripe_customer_id=?", (stripe_customer_id,))}
     try:
         accounts |= {r["customer_id"] for r in rows(
+            "SELECT customer_id FROM camera_plan_entitlements_v2 WHERE stripe_customer_id=?", (stripe_customer_id,))}
+    except Exception:
+        pass  # database predates the additive per-camera billing-v2 migration
+    try:
+        accounts |= {r["customer_id"] for r in rows(
             "SELECT customer_id FROM stripe_customer_bindings WHERE stripe_customer_id=?", (stripe_customer_id,))}
     except Exception:
         pass  # a database before canonical bindings

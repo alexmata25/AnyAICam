@@ -85,6 +85,12 @@ def stripe_customer_ids_for_customer(customer_id: str) -> set[str]:
         (customer_id,))}
     try:
         ids |= {r["stripe_customer_id"] for r in rows(
+            "SELECT stripe_customer_id FROM camera_plan_entitlements_v2 WHERE customer_id=? AND stripe_customer_id IS NOT NULL AND stripe_customer_id<>''",
+            (customer_id,))}
+    except Exception:
+        pass  # database predates the additive per-camera billing-v2 migration
+    try:
+        ids |= {r["stripe_customer_id"] for r in rows(
             "SELECT stripe_customer_id FROM addon_subscriptions WHERE customer_id=? AND stripe_customer_id IS NOT NULL AND stripe_customer_id<>''",
             (customer_id,))}
     except Exception:

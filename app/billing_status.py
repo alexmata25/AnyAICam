@@ -105,6 +105,11 @@ def _suspend(subscription_id: str, reason: str) -> int:
         if addon["status"] == "active":
             _set_addon(addon, "suspended", reason)
             changed += 1
+    try:
+        import per_camera_billing
+        changed += per_camera_billing._suspend(subscription_id, reason)
+    except Exception:
+        pass  # retain compatibility with databases before billing v2
     if changed:
         logger.info("billing.suspended subscription=%s reason=%s rows=%s", subscription_id, reason, changed)
     return changed
@@ -120,6 +125,11 @@ def _restore(subscription_id: str, reasons: tuple[str, ...]) -> int:
         if addon["status"] == "suspended" and addon.get("suspended_reason") in reasons:
             _set_addon(addon, "active", None)
             changed += 1
+    try:
+        import per_camera_billing
+        changed += per_camera_billing._restore(subscription_id, reasons)
+    except Exception:
+        pass
     return changed
 
 
@@ -136,6 +146,11 @@ def mark_payment_failed(subscription_id: str, *, at=None) -> None:
                        "AND status IN ('active','suspended')", (stamp, subscription_id))
         except Exception:
             pass
+    try:
+        import per_camera_billing
+        per_camera_billing._set_subscription_payment_failed(subscription_id, at)
+    except Exception:
+        pass
 
 
 def payment_recovered(subscription_id: str) -> int:
@@ -145,7 +160,13 @@ def payment_recovered(subscription_id: str) -> int:
             db.execute("UPDATE addon_subscriptions SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
         except Exception:
             pass
-    return _restore(subscription_id, RESTORED_BY_PAYMENT)
+    changed = _restore(subscription_id, RESTORED_BY_PAYMENT)
+    try:
+        import per_camera_billing
+        changed += per_camera_billing._resume_paid(subscription_id)
+    except Exception:
+        pass
+    return changed
 
 
 def sweep_grace(now: datetime | None = None, *, customer_id: str | None = None) -> int:
@@ -160,6 +181,11 @@ def sweep_grace(now: datetime | None = None, *, customer_id: str | None = None) 
                          f"AND payment_failed_at<=?{scope}", (cutoff, *args)):
             _set_plan(plan["id"], "suspended", "payment_failed")
             changed += 1
+        v2_scope, v2_args = ("", ()) if customer_id is None else (" AND customer_id=?", (customer_id,))
+        v2_rows = rows("SELECT id,stripe_subscription_id FROM camera_plan_entitlements_v2 WHERE status='active' AND payment_failed_at IS NOT NULL "
+                       f"AND payment_failed_at<=?{v2_scope}", (cutoff, *v2_args))
+        for plan in v2_rows:
+            changed += _suspend(str(plan["stripe_subscription_id"]), "payment_failed")
         for addon in rows("SELECT * FROM addon_subscriptions WHERE status='active' AND payment_failed_at IS NOT NULL "
                           f"AND payment_failed_at<=?{scope}", (cutoff, *args)):
             _set_addon(addon, "suspended", "payment_failed")
@@ -395,7 +421,8 @@ def _reverse_purchase(event: dict, reason: str) -> dict:
     _record_reversal(charge_id, intent, (payment or {}).get("id") or invoice_id, reason)
     if payment is None:
         found = _stripe_invoice_subscription(intent)
-        if found and (_plan_rows(found[1]) or _addon_rows(found[1])):
+        if found and (_plan_rows(found[1]) or _addon_rows(found[1]) or row(
+                "SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (found[1],))):
             _record_reversal(charge_id, intent, found[0], reason)
             return {"status": "suspended", "rows": _suspend(found[1], reason)}
     if payment and payment.get("stripe_subscription_id"):

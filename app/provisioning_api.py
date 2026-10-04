@@ -67,6 +67,16 @@ from customer_entitlements import get_entitlements_for_customer, total_camera_sl
 from analytics_entitlements import get_active_analytics_for_customer
 
 
+def _billing_v2_payload(customer_id: str) -> dict | None:
+    try:
+        from per_camera_billing import subscription_for_customer
+        return subscription_for_customer(customer_id)
+    except Exception:
+        # A database that has not applied the additive v2 migration keeps
+        # returning the legacy provisioning contract unchanged.
+        return None
+
+
 def _customer_owner(request: Request) -> dict:
     identity = partner_identity(request)
     if not identity or identity.get("role") != "customer_owner":
@@ -85,6 +95,7 @@ def register_provisioning_api_routes(app: FastAPI) -> None:
             "entitlements": entitlements,
             "total_camera_slots": total_camera_slots(customer_id),
             "enabled_analytics": get_active_analytics_for_customer(customer_id),
+            "billing_plan": _billing_v2_payload(customer_id),
         }
 
     @app.get("/api/customer/installations")
@@ -160,4 +171,7 @@ def register_provisioning_api_routes(app: FastAPI) -> None:
             # analytics_entitlements.py's module docstring for why this is
             # the existing analytics_subscriptions table, not a new one.
             "enabled_analytics": get_active_analytics_for_customer(customer_id),
+            # Versioned entitlement details are additive; legacy products
+            # and enabled_analytics keep their existing meaning.
+            "billing_plan": _billing_v2_payload(customer_id),
         }

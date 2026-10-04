@@ -1249,6 +1249,29 @@ CREATE TABLE IF NOT EXISTS billing_invoice_states(invoice_id TEXT PRIMARY KEY, s
     ('20261002_plan_upgrade_attempts','''
 CREATE TABLE IF NOT EXISTS plan_upgrade_attempts(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, stripe_subscription_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL, open_slot TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(stripe_subscription_id, stripe_price_id, open_slot));
 '''),
+    # Additive fixed-capacity-independent per-camera billing v2. Legacy
+    # customer_entitlements rows keep their original capacity semantics.
+    ('20261004_per_camera_billing_v2','''
+CREATE TABLE IF NOT EXISTS camera_plan_entitlements_v2(
+ id TEXT PRIMARY KEY, customer_id TEXT NOT NULL UNIQUE, plan_key TEXT NOT NULL,
+ camera_quantity INTEGER NOT NULL, stripe_customer_id TEXT NOT NULL,
+ stripe_subscription_id TEXT NOT NULL UNIQUE, stripe_subscription_item_id TEXT NOT NULL,
+ stripe_price_id TEXT NOT NULL, status TEXT NOT NULL, stripe_status TEXT,
+ payment_failed_at TEXT, suspended_reason TEXT, current_period_end INTEGER,
+ cancel_at_period_end INTEGER NOT NULL DEFAULT 0, scheduled_plan_key TEXT,
+ scheduled_camera_quantity INTEGER, scheduled_at INTEGER, stripe_schedule_id TEXT,
+ local_retention_days INTEGER NOT NULL, cloud_event_storage INTEGER NOT NULL DEFAULT 0,
+ cloud_event_retention_days INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_camera_plan_v2_customer_status ON camera_plan_entitlements_v2(customer_id,status);
+CREATE TABLE IF NOT EXISTS camera_plan_change_attempts_v2(
+ id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, stripe_subscription_id TEXT NOT NULL,
+ plan_key TEXT NOT NULL, stripe_price_id TEXT NOT NULL, camera_quantity INTEGER NOT NULL,
+ action TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, open_slot TEXT,
+ status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(stripe_subscription_id,open_slot)
+);
+'''),
 ]
 
 

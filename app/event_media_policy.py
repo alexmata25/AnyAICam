@@ -80,6 +80,21 @@ def motion_event_policy(db, customer_id: str) -> dict | None:
     separately in recording_uploader.py on the appliance) and must keep
     working normally even after that allowance is reached."""
     override = cloud_policy_for_customer(db, customer_id)
+    # Billing v2 cloud event protection belongs only to Hybrid. The 14-day
+    # entitlement is the default; an existing explicit RDM retention choice
+    # remains an override. Basic/AI Local never inherit legacy Cloud behavior.
+    try:
+        from per_camera_billing import entitlement_for_customer
+        v2 = entitlement_for_customer(customer_id)
+    except Exception:
+        v2 = None
+    if v2:
+        if v2.get("status") != "active" or not v2.get("cloud_event_storage"):
+            return None
+        retention = override["retention_days"] or int(v2.get("cloud_event_retention_days") or 14)
+        if retention not in MOTION_RETENTION_DAYS:
+            return None
+        return {"retention_days": retention}
     if override["retention_days"] is not None:
         if override["retention_days"] not in MOTION_RETENTION_DAYS:
             return None
