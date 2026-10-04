@@ -14,6 +14,7 @@ through the actual files, not just in-memory continuity.
 import hashlib
 import io
 import json
+import os
 import shutil
 import sys
 import tarfile
@@ -197,6 +198,7 @@ class HasUnresolvedActivationTests(StateMachineTestCase):
         machine.pending_validation_file.write_text("{}", encoding="utf-8")
         self.assertTrue(machine.has_unresolved_activation())
 
+    @unittest.skipIf(os.name == "nt", "Windows reports a regular-file parent as FileNotFoundError (WinError 3), not POSIX ENOTDIR")
     def test_a_real_stat_failure_other_than_missing_propagates(self):
         # A real OS-level condition (ENOTDIR), not a mock: pending_
         # validation_file is pointed at a path whose PARENT component is

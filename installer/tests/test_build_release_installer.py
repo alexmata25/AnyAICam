@@ -35,7 +35,50 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
+from build_release_installer import (AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS,
+                                     REQUIRED_RELEASE_PATHS, copy_release, file_manifest,
+                                     is_test_only_release_path, run_git, write_deterministic_tar)  # noqa: E402
+
+
+class ReleasePayloadHygieneAndManifestTests(unittest.TestCase):
+    def test_test_and_fixture_paths_are_recognized(self):
+        for name in ("app/tests/test_api.py", "app/fixtures/sample.json", "app/test_probe.py",
+                     "app/static/player.test.js", "app/__pycache__/module.pyc"):
+            with self.subTest(name=name):
+                self.assertTrue(is_test_only_release_path(Path(name)))
+        self.assertFalse(is_test_only_release_path(Path("app/main.py")))
+
+    def test_release_copy_excludes_test_fixtures_and_keeps_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "release"
+            (root / "app/tests").mkdir(parents=True)
+            (root / "app/static/js").mkdir(parents=True)
+            (root / "app/main.py").write_text("runtime", encoding="utf-8")
+            (root / "app/tests/credentials.env").write_text("fixture", encoding="utf-8")
+            (root / "app/test_probe.py").write_text("fixture", encoding="utf-8")
+            (root / "app/static/js/player.test.js").write_text("fixture", encoding="utf-8")
+            (root / "app/static/js/player.js").write_text("runtime", encoding="utf-8")
+            output = Path(td) / "payload"
+            copy_release(root, output)
+            self.assertTrue((output / "app/main.py").is_file())
+            self.assertTrue((output / "app/static/js/player.js").is_file())
+            self.assertFalse((output / "app/tests").exists())
+            self.assertFalse((output / "app/test_probe.py").exists())
+            self.assertFalse((output / "app/static/js/player.test.js").exists())
+
+    def test_file_manifest_modes_match_archive_on_windows_and_posix(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "payload"
+            source.mkdir()
+            (source / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (source / "README.md").write_text("readme\n", encoding="utf-8")
+            executable = frozenset({"install.sh"})
+            rows = file_manifest(source, executable)
+            archive = Path(td) / "sample.tar.gz"
+            write_deterministic_tar(source, archive, mtime=0, executable_paths=executable)
+            with tarfile.open(archive, "r:gz") as tf:
+                modes = {member.name: oct(member.mode) for member in tf.getmembers() if member.isfile()}
+        self.assertEqual({row["path"]: row["mode"] for row in rows}, modes)
 
 
 class RunGitAutocrlfOverrideTests(unittest.TestCase):

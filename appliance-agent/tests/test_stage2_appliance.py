@@ -24,11 +24,24 @@ class DeviceKeyTests(unittest.TestCase):
 
     def test_onvif_endpoint_preferred_when_present(self):
         results = self._scan_with(
-            onvif={'192.168.1.1': {'scopes': '', 'endpoint': 'urn:uuid:abc-123'}},
+            onvif={'192.168.1.1': {'scopes': '', 'endpoint': 'urn:uuid:414e5941-4943-414d-8123-123456789abc'}},
             arp={'192.168.1.1': 'AA:BB:CC:DD:EE:FF'},
             rtsp_ips={'192.168.1.1'},  # a real ONVIF device also has RTSP open; scan()'s own filter needs rtsp or non-empty scopes
         )
-        self.assertEqual(results[0]['device_key'], 'urn:uuid:abc-123')
+        self.assertEqual(results[0]['device_key'], 'urn:uuid:414e5941-4943-414d-8123-123456789abc')
+
+    def test_ws_discovery_message_uuid_is_never_used_as_the_camera_identity(self):
+        message_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        camera_id = '414e5941-4943-414d-8123-123456789abc'
+        text = (f'<e:Envelope xmlns:e="urn:test" xmlns:w="urn:wsa" xmlns:a="urn:wsa">'
+                f'<e:Header><w:MessageID>uuid:{message_id}</w:MessageID></e:Header>'
+                f'<e:Body><a:EndpointReference><a:Address>urn:uuid:{camera_id}</a:Address>'
+                f'</a:EndpointReference></e:Body></e:Envelope>')
+        self.assertEqual(discovery._endpoint_uuid(text), 'urn:uuid:' + camera_id)
+        self.assertNotEqual(discovery._endpoint_uuid(text), 'urn:uuid:' + message_id)
+        self.assertIsNone(discovery._endpoint_uuid(
+            f'<e:Envelope xmlns:e="urn:test" xmlns:w="urn:wsa"><e:Header><w:MessageID>uuid:{message_id}'
+            '</w:MessageID></e:Header></e:Envelope>'))
 
     def test_mac_hash_used_when_no_onvif_endpoint(self):
         results = self._scan_with(
@@ -80,13 +93,13 @@ class VerifyDeviceTests(unittest.TestCase):
         self.assertTrue(success)
         verify.assert_not_called()
 
-    def test_no_credentials_supplied_succeeds_on_reachability_alone(self):
+    def test_no_credentials_still_verifies_rtsp_media_endpoint(self):
         device = {'ip': '192.168.1.5', 'rtsp_support': True}
         with patch.object(provisioning, 'locate_device', return_value=device), \
-             patch.object(provisioning, 'verify_rtsp_credentials') as verify:
+             patch.object(provisioning, 'verify_rtsp_credentials', return_value=(True, 'anonymous stream')) as verify:
             success, message = provisioning.verify_device('k', None)
         self.assertTrue(success)
-        verify.assert_not_called()
+        verify.assert_called_once_with('192.168.1.5', 554, '', '', path=provisioning.DEFAULT_RTSP_STREAM_PATH)
 
     def test_credentials_supplied_delegates_to_rtsp_check(self):
         # path is now DEFAULT_RTSP_STREAM_PATH, not omitted (which used

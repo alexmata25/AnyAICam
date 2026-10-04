@@ -67,7 +67,7 @@ class VerificationUsesTheCamerasPortTests(unittest.TestCase):
 
     def test_the_cameras_own_onvif_stream_uri_sets_port_and_path(self):
         with _FakeRtspCamera('digest', username='viewer', password='right') as camera:
-            provisioning._resolve_stream_uri = lambda ip, key: f'rtsp://127.0.0.1:{camera.port}/testcamera'
+            provisioning._resolve_stream_uri = lambda ip, key, **kwargs: f'rtsp://127.0.0.1:{camera.port}/testcamera'
             ok, message = self.verify({'ip': '127.0.0.1', 'rtsp_support': True, 'rtsp_port': 554, 'onvif_support': True,
                                        'device_key': UUID})
             uri = camera.last_describe_uri
@@ -88,18 +88,34 @@ class VerificationUsesTheCamerasPortTests(unittest.TestCase):
         onvif_media.resolve_media_uri = lambda ip, key, **kwargs: seen.append(kwargs) or {'status': 'auth_required'}
         self.addCleanup(setattr, onvif_media, 'resolve_media_uri', original)
         provisioning._resolve_stream_uri = self._orig[1]
-        port, path, source = provisioning.stream_target({'ip': '127.0.0.1', 'onvif_support': True, 'rtsp_port': 8554}, UUID)
-        self.assertEqual(seen, [{}])  # no username/password ever passed to ONVIF here
-        self.assertEqual((port, path, source), (8554, provisioning.DEFAULT_RTSP_STREAM_PATH, 'discovery'))
+        with self.assertRaisesRegex(ValueError, 'requires ONVIF credentials'):
+            provisioning.stream_target({'ip': '127.0.0.1', 'onvif_support': True, 'rtsp_port': 8554}, UUID)
+        self.assertEqual(seen, [{'username': None, 'password': None}])
 
     def test_a_record_without_port_information_keeps_the_previous_default(self):
         self.assertEqual(provisioning.stream_target({'ip': '127.0.0.1'}, 'k')[:2], (554, provisioning.DEFAULT_RTSP_STREAM_PATH))
 
-    def test_a_credential_free_camera_is_still_accepted_without_a_check(self):
-        ok, message = self.verify({'ip': '127.0.0.1', 'rtsp_support': True, 'rtsp_port': 8554, 'device_key': 'k'},
-                                  {'username': '', 'password': ''})
-        self.assertTrue(ok)
+    def test_anonymous_camera_is_accepted_only_after_real_describe(self):
+        with _FakeRtspCamera('open') as camera:
+            ok, message = self.verify({'ip': '127.0.0.1', 'rtsp_support': True, 'rtsp_port': camera.port, 'device_key': 'k'},
+                                      {'username': '', 'password': ''})
+        self.assertTrue(ok, message)
+        self.assertEqual(camera.requests_seen, 2)  # OPTIONS plus actual media DESCRIBE
+
+    def test_protected_camera_cannot_be_provisioned_without_credentials(self):
+        with _FakeRtspCamera('basic', username='viewer', password='secret') as camera:
+            ok, message = self.verify({'ip': '127.0.0.1', 'rtsp_support': True, 'rtsp_port': camera.port, 'device_key': 'k'},
+                                      {'username': '', 'password': ''})
+        self.assertFalse(ok)
         self.assertIn('no credentials', message)
+        self.assertEqual(camera.requests_seen, 2)
+
+    def test_stream_endpoint_must_match_camera_and_cannot_embed_credentials(self):
+        for uri in ('rtsp://192.0.2.2:8554/live', 'rtsp://user:secret@127.0.0.1/live',
+                    'https://127.0.0.1/live', 'rtsp://127.0.0.1:0/live', 'rtsp://127.0.0.1/live#fragment'):
+            with self.subTest(uri=uri):
+                with self.assertRaisesRegex(ValueError, 'invalid'):
+                    provisioning.stream_target({'ip': '127.0.0.1', 'rtsp_uri': uri}, 'key')
 
 
 # ------------------------------------------------------------------ 2. binding without a MAC
@@ -122,7 +138,7 @@ class BindingWithoutMacTests(unittest.TestCase):
     def test_a_camera_without_an_arp_mac_is_bound_by_its_stable_identity(self):
         self.assertEqual(auto_bind_discovered_cameras([_cloud()], [_found()], self.store), ['cam-1'])
         [binding] = self.store.bindings()
-        self.assertEqual((binding['camera_number'], binding['mac_address'], binding['device_key']), (1, '', UUID))
+        self.assertEqual((binding['camera_number'], binding.get('mac_address', ''), binding['device_key']), (1, '', UUID))
         # Idempotent: an unchanged binding is not rewritten.
         approved = binding['approved_at']
         self.assertEqual(auto_bind_discovered_cameras([_cloud()], [_found()], self.store), [])
@@ -144,6 +160,13 @@ class BindingWithoutMacTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'MAC'):
             self.store.bind('cam-1', 1, 'Unknown')
 
+    def test_macless_binding_requires_a_canonical_non_nil_onvif_uuid(self):
+        for key in ('ip-' + 'a' * 32, 'mac-' + 'a' * 32, 'urn:uuid:1111',
+                    'urn:uuid:00000000-0000-0000-0000-000000000000'):
+            with self.subTest(key=key):
+                self.assertEqual(auto_bind_discovered_cameras([_cloud(device_key=key)], [_found(device_key=key)], self.store), [])
+                self.assertEqual(self.store.bindings(), [])
+
     def test_a_camera_with_a_valid_mac_binds_by_mac_as_before(self):
         auto_bind_discovered_cameras([_cloud()], [_found(mac='14:2F:FD:A2:F6:AF')], self.store)
         [binding] = self.store.bindings()
@@ -161,6 +184,26 @@ class BindingWithoutMacTests(unittest.TestCase):
         self.assertIsNone(camera['last_error'])
         self.assertTrue(camera['online'])
         self.assertNotIn('mac_address', json.dumps(camera))
+
+    def test_ambiguous_duplicate_uuid_is_not_bound_and_clears_after_unique_scan(self):
+        discovered = __import__('anyaicam_agent.camera_binding', fromlist=['DiscoveredCameraStore']).DiscoveredCameraStore(
+            self.root / 'discovered.json')
+        first, second = _found(), _found()
+        second['ip'] = '192.168.253.11'
+        second['device_key'] = UUID.upper()
+        self.assertEqual(auto_bind_discovered_cameras([_cloud()], [first, second], self.store), [])
+        discovered.save_scan([first, second])
+        self.assertTrue(discovered.cameras()[0]['identity_ambiguous'])
+        self.assertEqual(auto_bind_discovered_cameras([_cloud()], discovered.cameras(), self.store), [])
+        discovered.save_scan([first])
+        self.assertFalse(discovered.cameras()[0]['identity_ambiguous'])
+        self.assertEqual(auto_bind_discovered_cameras([_cloud()], discovered.cameras(), self.store), ['cam-1'])
+
+    def test_existing_real_mac_cannot_be_overridden_by_matching_uuid(self):
+        self.store.bind('cam-1', 1, '02:00:00:00:00:01', device_key=UUID)
+        candidate = _found(mac='02:00:00:00:00:02')
+        self.assertEqual(auto_bind_discovered_cameras([_cloud()], [candidate], self.store), [])
+        self.assertEqual(self.store.bindings()[0]['mac_address'], normalize_mac('02:00:00:00:00:01'))
 
 
 if __name__ == '__main__':

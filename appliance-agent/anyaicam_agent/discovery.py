@@ -7,6 +7,7 @@ import socket
 import subprocess
 import uuid
 from pathlib import Path
+from xml.etree import ElementTree
 
 
 def local_networks(configured=None):
@@ -48,12 +49,44 @@ def _onvif_probe(timeout=2):
                 # is stable across reboots and IP/DHCP changes -- unlike
                 # the IP address, it's a real device identity. Kept
                 # alongside scopes so scan() can use it as device_key.
-                endpoint=re.search(r'<[^>]*Address[^>]*>\s*(urn:uuid:[^\s<]+)',text,re.I)
-                found[address[0]]={'scopes':scopes,'endpoint':endpoint.group(1) if endpoint else None}
+                endpoint=_endpoint_uuid(text)
+                found[address[0]]={'scopes':scopes,'endpoint':endpoint}
             except socket.timeout: continue
     except OSError: pass
     finally: sock.close()
     return found
+
+
+def _endpoint_uuid(text):
+    """Extract only a canonical, non-nil EndpointReference UUID.
+
+    MessageID values are intentionally ignored; they identify the probe
+    exchange and may otherwise be mistaken for a camera identity by loose
+    UUID searches.
+    """
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return None
+    endpoint = None
+    for node in root.iter():
+        if node.tag.rsplit('}', 1)[-1].lower() != 'endpointreference':
+            continue
+        for child in node.iter():
+            if child.tag.rsplit('}', 1)[-1].lower() == 'address' and (child.text or '').strip().lower().startswith('urn:uuid:'):
+                endpoint = (child.text or '').strip()
+                break
+        if endpoint:
+            break
+    if not endpoint:
+        return None
+    try:
+        identity = uuid.UUID(endpoint[9:])
+    except (ValueError, AttributeError):
+        return None
+    if identity.int == 0:
+        return None
+    return 'urn:uuid:' + str(identity)
 
 
 def _scope_value(scopes,key):

@@ -17,7 +17,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import stat
 import subprocess
 import tarfile
 import tempfile
@@ -162,6 +161,16 @@ def validate_sha256(value: str, label: str) -> str:
     return value
 
 
+def is_test_only_release_path(relative_path: Path) -> bool:
+    """Recognize tests and fixtures that must not enter a customer payload."""
+    parts = relative_path.parts
+    if any(part.casefold() in {"test", "tests", "fixtures", "__tests__", "__pycache__"} for part in parts):
+        return True
+    name = parts[-1].casefold() if parts else ""
+    return (name.startswith("test_") or name.endswith("_test.py")
+            or name.endswith((".test.js", ".test.mjs", ".test.ts", ".test.tsx", ".test.jsx", ".pyc")))
+
+
 def safe_tar_extract(data: bytes, destination: Path) -> None:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
         for member in tf.getmembers():
@@ -234,7 +243,10 @@ def reject_unsafe_release_files(release_root: Path) -> None:
             raise SystemExit(f"Symlinks are not allowed in the release payload: {path.relative_to(release_root)}")
         if not path.is_file():
             continue
-        rel = path.relative_to(release_root).as_posix()
+        rel_path = path.relative_to(release_root)
+        if is_test_only_release_path(rel_path):
+            continue  # excluded by copy_release(), so fixtures are not runtime content
+        rel = rel_path.as_posix()
         for pattern in DANGEROUS_NAME_PATTERNS:
             if pattern.search(rel):
                 raise SystemExit(f"Refusing release payload with secret/state/backup-like file: {rel}")
@@ -259,13 +271,18 @@ def scan_payload_for_secrets(root: Path) -> None:
 
 def copy_release(release_root: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
+
+    def ignore_test_content(directory: str, names: list[str]) -> set[str]:
+        parent = Path(directory).relative_to(release_root)
+        return {name for name in names if is_test_only_release_path(parent / name)}
+
     for rel in REQUIRED_RELEASE_PATHS + OPTIONAL_RELEASE_PATHS:
         src = release_root / rel
-        if not src.exists():
+        if not src.exists() or is_test_only_release_path(Path(rel)):
             continue
         target = dest / rel
         if src.is_dir():
-            shutil.copytree(src, target, copy_function=shutil.copy2)
+            shutil.copytree(src, target, copy_function=shutil.copy2, ignore=ignore_test_content)
         else:
             shutil.copy2(src, target)
 
@@ -286,14 +303,16 @@ def ensure_lf_and_modes(package_root: Path) -> tuple[int, list[str]]:
     return len(shell_files), failures
 
 
-def file_manifest(root: Path) -> list[dict[str, object]]:
+def file_manifest(root: Path, executable_paths: frozenset[str] = frozenset()) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         rows.append(
             {
                 "path": path.relative_to(root).as_posix(),
                 "sha256": sha256_file(path),
-                "mode": oct(stat.S_IMODE(path.stat().st_mode)),
+                # Keep manifest modes identical to write_deterministic_tar()
+                # on Windows, where POSIX executable bits cannot be stat'ed.
+                "mode": oct(0o755 if path.relative_to(root).as_posix() in executable_paths else 0o644),
                 "size": path.stat().st_size,
             }
         )
@@ -547,15 +566,14 @@ def main() -> int:
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
         )
 
-        (package / "artifact-files.json").write_text(
-            json.dumps(file_manifest(package), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-
         outdir = Path(args.output_dir).resolve()
         outdir.mkdir(parents=True, exist_ok=True)
         executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
+        (package / "artifact-files.json").write_text(
+            json.dumps(file_manifest(package, executable_paths), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         filename = f"anyaicam-appliance-installer-{release_version}-vms-{vms_commit[:12]}.tar.gz"
         output = outdir / filename
         write_deterministic_tar(package, output, installer_mtime, executable_paths)

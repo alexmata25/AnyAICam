@@ -369,7 +369,7 @@ def classify_rtsp_authentication(ip, port, username, password, path='/', timeout
     results is identified): every return path here logs one
     'rtsp_auth_diagnostic' line via _log_rtsp_diagnostic() -- see its
     own docstring for the exact, secret-free field list."""
-    diag = {'path': path, 'scheme': None, 'qop_offered': None, 'qop_selected': None,
+    diag = {'path': path.split('?', 1)[0], 'scheme': None, 'qop_offered': None, 'qop_selected': None,
             'first_status': None, 'retry_status': None, 'algorithm': None,
             'challenge_issue': None, 'stale_retry': False, 'stale_retry_status': None}
 
@@ -489,33 +489,49 @@ DEFAULT_RTSP_STREAM_PATH = '/Streaming/Channels/101'
 DEFAULT_RTSP_PORT = 554
 
 
-def _resolve_stream_uri(ip, device_key):
-    """The camera's own stream URI from ONVIF GetStreamUri, asked WITHOUT
-    credentials (credentials still reach ONVIF only through service.py's
-    post-provisioning lookup). None when it does not resolve."""
+def _resolve_stream_uri(ip, device_key, username=None, password=None):
+    """Resolve the camera's own URI, passing credentials only to the
+    discovered device when the read-only ONVIF call requests them."""
     from .onvif_media import resolve_media_uri
     try:
-        result = resolve_media_uri(ip, device_key)
+        result = resolve_media_uri(ip, device_key, username=username or None, password=password or None)
     except Exception:  # noqa: BLE001 -- ONVIF is best effort here; verification falls back to discovery
         return None
+    if result.get('status') == 'auth_required':
+        raise ValueError('Device requires ONVIF credentials.')
     return result.get('rtsp_uri') if result.get('status') == 'resolved' else None
 
 
-def stream_target(device, device_key):
+def stream_target(device, device_key, username=None, password=None):
     """(port, path, source) a credential check must use (2026-10-04): the
     camera's own ONVIF stream URI when it resolves -- its real port and
     path, e.g. rtsp://camera:8554/testcamera -- else the RTSP port
     discovery found open, with the known default path. Never assumes 554
     when the camera serves another port."""
-    if device.get('onvif_support'):
-        uri = _resolve_stream_uri(device['ip'], device_key)
-        if uri:
+    uri = device.get('rtsp_uri')
+    source = 'discovery'
+    if not uri and device.get('onvif_support'):
+        uri = _resolve_stream_uri(device['ip'], device_key, username, password)
+        source = 'onvif'
+    if uri:
+        try:
             parts = urlsplit(uri)
+            if (parts.scheme.lower() != 'rtsp' or parts.hostname != device['ip']
+                    or parts.username is not None or parts.password is not None or parts.fragment):
+                raise ValueError('Camera returned an invalid or different-host RTSP endpoint.')
+            port = parts.port if parts.port is not None else DEFAULT_RTSP_PORT
+            if not 1 <= port <= 65535:
+                raise ValueError('Camera returned an invalid RTSP port.')
             path = parts.path or '/'
             if parts.query:
                 path += '?' + parts.query
-            return parts.port or DEFAULT_RTSP_PORT, path, 'onvif'
-    return int(device.get('rtsp_port') or DEFAULT_RTSP_PORT), device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH, 'discovery'
+            return port, path, source
+        except (TypeError, ValueError) as error:
+            raise ValueError('Camera returned an invalid RTSP endpoint.') from error
+    port = device.get('rtsp_port', DEFAULT_RTSP_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError('Camera returned an invalid RTSP port.')
+    return port, device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH, 'discovery'
 
 
 def verify_device(device_key, credentials, networks=None):
@@ -532,9 +548,10 @@ def verify_device(device_key, credentials, networks=None):
         return True, 'Device is reachable; no RTSP credential check applicable.'
     username = str((credentials or {}).get('username', ''))
     password = str((credentials or {}).get('password', ''))
-    if not username and not password:
-        return True, 'Device is reachable; no credentials were provided to verify.'
-    # The camera's own port and path (ONVIF stream URI, else the port
-    # discovery found) -- see stream_target().
-    port, path, _source = stream_target(device, device_key)
+    try:
+        port, path, _source = stream_target(device, device_key, username, password)
+    except ValueError as error:
+        return False, str(error)
+    # Always DESCRIBE, including anonymous setup, so a protected media
+    # endpoint cannot be commissioned without valid camera credentials.
     return verify_rtsp_credentials(device['ip'], port, username, password, path=path)
