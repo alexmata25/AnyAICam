@@ -1,4 +1,6 @@
 """Focused standard-library regressions for the selectively ported camera hardening."""
+import base64
+import ipaddress
 import logging
 import socketserver
 import threading
@@ -39,9 +41,15 @@ class _RtspHandler(socketserver.StreamRequestHandler):
             status = "200 OK"
             extra = ""
             body = b""
-            if method == "DESCRIBE" and self.server.protected:
-                status = "401 Unauthorized"
-                extra = 'WWW-Authenticate: Basic realm="test-camera"\r\n'
+            if method == "DESCRIBE" and self.server.auth_credentials:
+                expected = "Basic " + base64.b64encode(":".join(self.server.auth_credentials).encode()).decode()
+                if headers.get("authorization") == expected:
+                    status = "200 OK"
+                    body = b"v=0\r\n"
+                    extra = "Content-Type: application/sdp\r\n"
+                else:
+                    status = "401 Unauthorized"
+                    extra = 'WWW-Authenticate: Basic realm="test-camera"\r\n'
             elif method == "DESCRIBE":
                 body = b"v=0\r\n"
                 extra = "Content-Type: application/sdp\r\n"
@@ -58,7 +66,7 @@ class _RtspServer:
     def __init__(self, protected=False):
         self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _RtspHandler)
         self.server.daemon_threads = True
-        self.server.protected = protected
+        self.server.auth_credentials = ("viewer", "secret") if protected else None
         self.server.requests = []
         self.port = self.server.server_address[1]
 
@@ -146,6 +154,28 @@ class CameraHardeningTests(unittest.TestCase):
                 success, detail = provisioning.verify_device(UUID, None)
         self.assertFalse(success)
         self.assertIn("no credentials", detail)
+
+    def test_protected_camera_accepts_its_authenticated_rtsp_describe(self):
+        with _RtspServer(protected=True) as camera:
+            device = {"ip": "127.0.0.1", "rtsp_support": True, "rtsp_port": camera.port}
+            with patch.object(provisioning, "locate_device", return_value=device):
+                success, detail = provisioning.verify_device(UUID, {"username": "viewer", "password": "secret"})
+        self.assertTrue(success, detail)
+
+    def test_discovered_rtsp_endpoint_controls_the_verified_port_and_resource(self):
+        with _RtspServer() as camera:
+            uri = f"rtsp://127.0.0.1:{camera.port}/camera/live?profile=main"
+            port, path, source = provisioning.stream_target(
+                {"ip": "127.0.0.1", "rtsp_port": 554, "rtsp_uri": uri}, UUID)
+        self.assertEqual((port, path, source), (camera.port, "/camera/live?profile=main", "discovery"))
+
+    def test_discovery_records_port_8554_when_it_is_the_open_endpoint(self):
+        with patch.object(discovery, "local_networks", return_value=[ipaddress.ip_network("192.0.2.10/32")]), \
+             patch.object(discovery, "_onvif_probe", return_value={}), \
+             patch.object(discovery, "arp_table", return_value={}), \
+             patch.object(discovery, "_port", side_effect=lambda ip, port, timeout=.25: port == 8554):
+            found = discovery.scan()
+        self.assertEqual(found[0]["rtsp_port"], 8554)
 
     def test_rtsp_endpoint_must_be_same_camera_and_cannot_embed_credentials(self):
         for uri in ("rtsp://192.0.2.2:8554/live", "rtsp://u:p@127.0.0.1/live",
