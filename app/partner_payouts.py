@@ -12,6 +12,15 @@ entry, ever). The statement is:
     reversals and amounts the partner owes AnyAiCam)
   = period total; payable = max(0, total); carried forward = min(0, total).
 
+Partner money collected by AnyAiCam carries its share of the Stripe
+processing fee (sales_commissions.settle_processing_fee). Before a quarter is
+closed every such fee is settled from Stripe; an invoice whose fee Stripe
+does not report yet is held, with all its entries, for the next statement,
+so a partner is never paid gross of a fee that is later deducted.
+
+A statement is marked paid only to a payee whose payout bank account is
+verified with the payout provider (partner_banking.py).
+
 A refund or chargeback after a statement was issued is a new negative entry,
 so it lands on the next statement and the issued one never changes. The
 payee is the partner company (partner_id), or the salesperson when they
@@ -20,6 +29,8 @@ the ledger, so each payout is auditable.
 """
 from __future__ import annotations
 
+import csv
+import io
 import re
 import uuid
 from datetime import date, datetime
@@ -74,11 +85,20 @@ def close_quarter(identity: dict, quarter: str, *, today: Optional[date] = None)
     if (today or date.today()) < end:
         raise PayoutError(f"{quarter} has not ended yet.", status=409)
     cutoff = end.isoformat()
+    import sales_commissions
+    for invoice_id in sales_commissions.unsettled_processing_fees(cutoff):
+        try:
+            sales_commissions.settle_processing_fee(invoice_id)
+        except Exception:
+            pass  # held below and reported
+    held_invoices = set(sales_commissions.unsettled_processing_fees(cutoff))
     pending = rows(f"SELECT l.*, {_payee_expr()} AS payee FROM commission_ledger l "
                    "LEFT JOIN partner_payout_items i ON i.ledger_entry_id=l.id WHERE i.ledger_entry_id IS NULL AND l.earned_at < ?",
                    (cutoff,))
     by_payee: dict[str, list[dict]] = {}
     for entry in pending:
+        if entry.get("stripe_invoice_id") in held_invoices:
+            continue  # its processing fee is not known yet: next statement
         by_payee.setdefault(entry["payee"], []).append(entry)
     now, actor, issued = datetime.now().isoformat(), identity.get("email", ""), []
     for payee, entries in sorted(by_payee.items()):
@@ -109,6 +129,8 @@ def close_quarter(identity: dict, quarter: str, *, today: Optional[date] = None)
                "payable_cents": statement["payable_cents"], "carried_forward_cents": statement["carried_forward_cents"],
                "entries": len(entries)})
         issued.append(statement)
+    if held_invoices:
+        audit(identity, "partner_payout.held_unsettled_fees", "partner_payout", quarter, {"invoices": sorted(held_invoices)})
     return issued
 
 
@@ -124,6 +146,9 @@ def mark_paid(identity: dict, payout_id: str, *, reference: str) -> dict:
         raise LookupError("Payout not found.")
     if payout["status"] != ISSUED:
         raise PayoutError("Only an issued statement with an amount payable can be marked paid.", status=409)
+    import partner_banking
+    if not partner_banking.is_verified(payout["payee_key"]):
+        raise PayoutError("This payee has no verified payout bank account yet.", status=409)
     now = datetime.now().isoformat()
     with connection() as db:
         db.execute("UPDATE partner_payouts SET status=?,paid_at=?,paid_by=?,payment_reference=? WHERE id=?",
@@ -175,3 +200,63 @@ def next_payout_for(partner_id: Optional[str], salesperson_user_id: str, *, toda
             "carried_forward_cents": int((last or {}).get("carried_forward_cents") or 0),
             "accrued_cents": int((accrued or {}).get("n") or 0),
             "last_statement": {k: last[k] for k in ("quarter", "status", "payable_cents")} if last else None}
+
+
+KIND_LABELS = {"recurring": "20% residual", "partner_upcharge": "Partner monthly upcharge",
+               "partner_activation_fee": "Partner activation / setup fee", "partner_processing_fee": "Stripe processing fee on partner money",
+               "partner_base_due": "AnyAiCam base owed by partner", "partner_base_remitted": "Base paid to AnyAiCam",
+               "hardware": "Hardware commission (discontinued)", "activation": "Activation commission (discontinued)"}
+
+
+def dashboard(partner_id: Optional[str], salesperson_user_id: Optional[str] = None, *, today: Optional[date] = None) -> dict:
+    """What the payee has accrued and not yet received, split the way a
+    partner reads it: 20% residual, partner markup (upcharge and activation
+    fee net of their processing fees), adjustments (refunds, chargebacks and
+    partner-billed base owed/paid), the balance carried from the last
+    statement, the current quarter and the next payout."""
+    payee = payee_key(partner_id, salesperson_user_id or "")
+    entries = rows(f"SELECT l.* FROM commission_ledger l LEFT JOIN partner_payout_items i ON i.ledger_entry_id=l.id "
+                   f"WHERE i.ledger_entry_id IS NULL AND {_payee_expr()}=? AND l.status<>'not_eligible_friends_family'", (payee,))
+    residual = sum(int(e["amount_cents"]) for e in entries if e["kind"] == "recurring" and not e.get("reverses_entry_id"))
+    markup = sum(int(e["amount_cents"]) for e in entries if not e.get("reverses_entry_id")
+                 and e["kind"] in ("partner_upcharge", "partner_activation_fee", "partner_processing_fee"))
+    other = sum(int(e["amount_cents"]) for e in entries if not e.get("reverses_entry_id")
+                and e["kind"] not in ("recurring", "partner_upcharge", "partner_activation_fee", "partner_processing_fee"))
+    adjustments = sum(int(e["amount_cents"]) for e in entries if e.get("reverses_entry_id")) + other
+    last = _last(payee)
+    carried = int((last or {}).get("carried_forward_cents") or 0)
+    current = quarter_of(today or date.today())
+    _, end = bounds(current)
+    accrued = residual + markup + adjustments
+    return {"payee_key": payee, "quarter": current, "statement_after": end.isoformat(), "residual_cents": residual,
+            "markup_cents": markup, "adjustments_cents": adjustments, "accrued_cents": accrued, "carried_forward_cents": carried,
+            "estimated_next_payout_cents": max(0, accrued + carried),
+            "history": rows("SELECT * FROM partner_payouts WHERE payee_key=? ORDER BY period_end DESC", (payee,))}
+
+
+def _text(value: str) -> str:
+    """A spreadsheet must never run a customer name or note as a formula."""
+    value = str(value)
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
+def statement_csv(identity: dict, payout_id: str) -> tuple[str, str]:
+    """(file name, CSV text) of one statement with every payment-level line."""
+    s = statement(identity, payout_id)
+    names = {c["id"]: c["name"] for c in rows("SELECT id,name FROM customers")} if s["entries"] else {}
+    out = io.StringIO()
+    writer = csv.writer(out)
+    money = lambda cents: f"{int(cents) / 100:.2f}"
+    for label, value in (("Quarter", s["quarter"]), ("Payee", s["payee_key"]), ("Period", f"{s['period_start']} to {s['period_end']}"),
+                         ("Opening balance", money(s["opening_balance_cents"])), ("This quarter", money(s["period_total_cents"])),
+                         ("Payable", money(s["payable_cents"])), ("Carried forward", money(s["carried_forward_cents"])),
+                         ("Status", s["status"]), ("Paid", s.get("paid_at") or ""), ("Payment reference", s.get("payment_reference") or "")):
+        writer.writerow([label, value])
+    writer.writerow([])
+    writer.writerow(["Recorded", "Customer", "Type", "Reversal of", "Invoice", "Service month", "Collected", "Amount", "Note"])
+    for e in s["entries"]:
+        writer.writerow([e["earned_at"], _text(names.get(e["customer_id"], e["customer_id"])), KIND_LABELS.get(e["kind"], e["kind"]),
+                         e.get("reverses_entry_id") or "", e.get("stripe_invoice_id") or "", e.get("service_month") or "",
+                         money(e["collected_cents"]) if e.get("collected_cents") is not None else "", money(e["amount_cents"]),
+                         _text(e.get("note") or "")])
+    return f"anyaicam-payout-{s['quarter']}-{s['payee_key'].replace(':', '-')}.csv", out.getvalue()

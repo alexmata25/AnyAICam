@@ -1255,10 +1255,12 @@ CREATE TABLE IF NOT EXISTS plan_upgrade_attempts(id TEXT PRIMARY KEY, customer_i
     # partner's activation/setup fee, who bills the customer and the residual
     # terms -- all as agreed at the time; a change is a new version, never an
     # edit. The money itself stays in commission_ledger (new columns below).
-    # Additive only. Rollback: DROP these three tables; the new ledger columns
+    # partner_payout_accounts holds only the payout provider's account id and
+    # safe display/status fields -- never a routing or full account number.
+    # Additive only. Rollback: DROP these four tables; the new ledger columns
     # are ignored by older code.
     ('20261004_partner_agreements_payouts','''
-CREATE TABLE IF NOT EXISTS partner_agreements(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, partner_id TEXT, salesperson_user_id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, previous_agreement_id TEXT, plan_type TEXT NOT NULL, tier_label TEXT NOT NULL, camera_tier INTEGER NOT NULL, base_price_cents INTEGER NOT NULL, upcharge_cents INTEGER NOT NULL DEFAULT 0, customer_price_cents INTEGER NOT NULL, activation_fee_cents INTEGER NOT NULL DEFAULT 0, billing_party TEXT NOT NULL, commission_rate_bps INTEGER NOT NULL, commission_max_paid_months INTEGER NOT NULL, commission_start_at TEXT, commission_end_at TEXT, status TEXT NOT NULL, stripe_subscription_id TEXT, activation_fee_collected_at TEXT, approved_at TEXT, approved_by TEXT, ended_at TEXT, end_reason TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS partner_agreements(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, partner_id TEXT, salesperson_user_id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, previous_agreement_id TEXT, plan_type TEXT NOT NULL, tier_label TEXT NOT NULL, camera_tier INTEGER NOT NULL, base_price_cents INTEGER NOT NULL, upcharge_cents INTEGER NOT NULL DEFAULT 0, customer_price_cents INTEGER NOT NULL, activation_fee_cents INTEGER NOT NULL DEFAULT 0, billing_party TEXT NOT NULL, commission_rate_bps INTEGER NOT NULL, commission_max_paid_months INTEGER NOT NULL, commission_start_at TEXT, commission_end_at TEXT, status TEXT NOT NULL, stripe_subscription_id TEXT, activation_fee_collected_at TEXT, service_activated_at TEXT, service_activated_by TEXT, service_suspended_at TEXT, service_suspended_by TEXT, approved_at TEXT, approved_by TEXT, ended_at TEXT, end_reason TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_partner_agreements_customer ON partner_agreements(customer_id, status);
 CREATE INDEX IF NOT EXISTS idx_partner_agreements_partner ON partner_agreements(partner_id, status);
 CREATE INDEX IF NOT EXISTS idx_partner_agreements_subscription ON partner_agreements(stripe_subscription_id);
@@ -1267,6 +1269,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_agreements_one_pending ON partner_
 CREATE TABLE IF NOT EXISTS partner_payouts(id TEXT PRIMARY KEY, payee_key TEXT NOT NULL, partner_id TEXT, salesperson_user_id TEXT, quarter TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL, opening_balance_cents INTEGER NOT NULL, period_total_cents INTEGER NOT NULL, payable_cents INTEGER NOT NULL, carried_forward_cents INTEGER NOT NULL, status TEXT NOT NULL, issued_at TEXT NOT NULL, issued_by TEXT NOT NULL, paid_at TEXT, paid_by TEXT, payment_reference TEXT, UNIQUE(payee_key, quarter));
 CREATE TABLE IF NOT EXISTS partner_payout_items(ledger_entry_id TEXT PRIMARY KEY, payout_id TEXT NOT NULL, amount_cents INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_partner_payout_items_payout ON partner_payout_items(payout_id);
+CREATE TABLE IF NOT EXISTS partner_payout_accounts(payee_key TEXT PRIMARY KEY, partner_id TEXT, salesperson_user_id TEXT, provider TEXT NOT NULL, provider_account_id TEXT, status TEXT NOT NULL, bank_name TEXT, last4 TEXT, currency TEXT, details_submitted INTEGER NOT NULL DEFAULT 0, payouts_enabled INTEGER NOT NULL DEFAULT 0, requirements_due INTEGER NOT NULL DEFAULT 0, disabled_reason TEXT, last_synced_at TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
 '''),
 ]
 

@@ -152,19 +152,19 @@ FRIENDS_FAMILY_COUPON_ENV = {
 #   the base amount AnyAiCam actually receives from the partner.
 # - Paid out per calendar quarter; a reversal after a payout carries forward
 #   as a negative balance (partner_payouts.py).
+# - No hardware commission (owner, 2026-10-04; the earlier $50/$75/$100 per
+#   appliance was removed) and no residual on hardware: partner hardware
+#   economics come from the approved hardware selling price. Rows already
+#   earned stay as history.
+# - Stripe processing fees attributable to the partner's upcharge and
+#   activation fee are deducted from what the partner is owed
+#   (sales_commissions.settle_processing_fee).
 # --------------------------------------------------------------------------
 RECURRING_COMMISSION_PERCENT = 20
 RECURRING_COMMISSION_MAX_PAID_MONTHS = 12
 BILLING_ANYAICAM = "ANYAICAM_BILLED"
 BILLING_PARTNER = "PARTNER_BILLED"
 BILLING_PARTIES = (BILLING_ANYAICAM, BILLING_PARTNER)
-# Appliance SKU (hardware_orders.HARDWARE_CATALOG) -> commission cents. Any
-# other SKU (e.g. the relay) and "no appliance" earn nothing.
-HARDWARE_COMMISSION_CENTS = {
-    "AIC-APPLIANCE-RYZEN-STARTER": 5000,
-    "AIC-APPLIANCE-RYZEN-ENTERPRISE": 7500,
-    "AIC-APPLIANCE-RYZEN-AAC-FACIAL": 10000,
-}
 
 
 # ------------------------------------------------------------------ lookups

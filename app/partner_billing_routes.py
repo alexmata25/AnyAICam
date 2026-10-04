@@ -14,9 +14,10 @@ from html import escape
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 import partner_agreements as pa
+import partner_banking as pb
 import partner_payouts as pp
 import pricing_catalog
 from partner_db import connection, rows, tenant_owns_partner
@@ -24,7 +25,8 @@ from partner_db import connection, rows, tenant_owns_partner
 PARTNER_ROLES = {"administrator", "partner_owner", "salesperson"}
 KIND_LABELS = {"recurring": "20% residual", "partner_upcharge": "Partner monthly upcharge",
                "partner_activation_fee": "Partner activation / setup fee", "partner_base_due": "AnyAiCam base owed by partner",
-               "partner_base_remitted": "Base paid to AnyAiCam", "hardware": "Hardware commission",
+               "partner_base_remitted": "Base paid to AnyAiCam", "partner_processing_fee": "Stripe processing fee on your charges",
+               "hardware": "Hardware commission (discontinued)",
                "activation": "Activation commission (discontinued)"}
 STATUS_LABELS = {"pending_approval": "Waiting for AnyAiCam approval", "approved": "Approved", "active": "Active",
                  "superseded": "Replaced by a newer version", "rejected": "Rejected", "cancelled": "Cancelled", "ended": "Ended",
@@ -63,7 +65,7 @@ def _call(fn, *args, **kwargs):
         raise HTTPException(status_code=403, detail=str(error)) from error
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
-    except (pa.AgreementError, pp.PayoutError) as error:
+    except (pa.AgreementError, pp.PayoutError, pb.BankingError) as error:
         raise HTTPException(status_code=error.status, detail=str(error)) from error
 
 
@@ -147,6 +149,52 @@ def register_partner_billing_routes(app: FastAPI, shell: Callable) -> None:
     @app.post("/api/partner/agreements/{agreement_id}/collections")
     def collection_api(request: Request, agreement_id: str, payload: dict):
         return _call(pa.record_collection, _identity(request), agreement_id, service_month=payload.get("service_month", ""))
+
+    @app.post("/api/admin/partner-agreements/{agreement_id}/activate-service")
+    def activate_service_api(request: Request, agreement_id: str):
+        return _call(pa.activate_service, _identity(request), agreement_id)
+
+    @app.post("/api/admin/partner-agreements/{agreement_id}/suspend-service")
+    def suspend_service_api(request: Request, agreement_id: str, payload: dict):
+        return _call(pa.suspend_service, _identity(request), agreement_id, payload.get("reason", ""))
+
+    @app.get("/api/partner/payout-account")
+    def payout_account_api(request: Request):
+        payee = _call(pb.payee_of, _identity(request))
+        return pb.public_view(pb.account(payee["payee_key"]), payee["payee_key"])
+
+    @app.post("/api/partner/payout-account/onboarding")
+    def payout_onboarding_api(request: Request):
+        from main import PUBLIC_BASE_URL
+        if not PUBLIC_BASE_URL:
+            raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for bank account setup.")
+        url = _call(pb.start_onboarding, _identity(request), return_url=f"{PUBLIC_BASE_URL}/partner-payouts/banking/return",
+                    refresh_url=f"{PUBLIC_BASE_URL}/partner-payouts?banking=expired")
+        return {"url": url}
+
+    @app.post("/api/partner/payout-account/refresh")
+    def payout_refresh_api(request: Request, payload: dict | None = None):
+        return _call(pb.refresh, _identity(request), (payload or {}).get("payee_key"))
+
+    @app.get("/partner-payouts/banking/return")
+    def payout_banking_return(request: Request):
+        identity = _page_identity(request)
+        if not identity:
+            return RedirectResponse("/partner-login", status_code=303)
+        try:
+            pb.refresh(identity)
+        except (pb.BankingError, pa.AgreementForbidden):
+            return RedirectResponse("/partner-payouts?banking=check-later", status_code=303)
+        return RedirectResponse("/partner-payouts?banking=updated", status_code=303)
+
+    @app.get("/partner-payouts/{payout_id}/statement.csv")
+    def statement_csv(request: Request, payout_id: str):
+        identity = _page_identity(request)
+        if not identity:
+            return RedirectResponse("/partner-login", status_code=303)
+        filename, text = _call(pp.statement_csv, identity, payout_id)
+        return Response(text, media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"})
 
     @app.post("/api/admin/partner-agreements/{agreement_id}/remittances")
     def remittance_api(request: Request, agreement_id: str, payload: dict):
@@ -280,6 +328,20 @@ act(document.getElementById('ag-save'),'/api/partner/agreements',body,document.g
         if admin and a["status"] in (pa.PENDING, *pa.IN_FORCE):
             actions.append('<button class="ghost-button" id="cancel">Cancel agreement</button>')
         partner_forms = ""
+        if partner_billed:
+            if a.get("service_activated_at") and not a.get("service_suspended_at"):
+                service = f"Active since {_when(a['service_activated_at'])}"
+            elif a.get("service_suspended_at"):
+                service = f"Suspended {_when(a['service_suspended_at'])}"
+            else:
+                service = "Not active yet: AnyAiCam activates service after receiving your base payment."
+            buttons = ""
+            if admin and a["status"] in pa.IN_FORCE:
+                buttons = ('<button class="action-button" id="activate">Activate service</button> '
+                           if not a.get("service_activated_at") or a.get("service_suspended_at") else
+                           '<button class="ghost-button" id="suspend">Suspend service</button>')
+            partner_forms += (f'<section class="panel" style="margin-top:14px"><h2>Service</h2><p>{service}</p>{buttons}'
+                              '<span id="svc-status" role="status"></span></section>')
         if partner_billed and a["status"] in pa.IN_FORCE:
             partner_forms += ('<form class="panel rule-form" id="collect"><h2>Record a month you billed</h2>'
                               f'<p class="health-detail">You owe AnyAiCam {money(a["base_price_cents"])} for each month you bill this customer.</p>'
@@ -316,6 +378,8 @@ act(document.getElementById('ag-save'),'/api/partner/agreements',body,document.g
         scripts = ("<script>" + CSRF_JS + "const id=" + agreement_json + ",st=document.getElementById('act-status');"
                    """const on=(i,f)=>{const el=document.getElementById(i);if(el)el.addEventListener('click',f);};
 on('approve',e=>act(e.target,`/api/admin/partner-agreements/${id}/approve`,{},st));
+on('activate',e=>act(e.target,`/api/admin/partner-agreements/${id}/activate-service`,{},document.getElementById('svc-status')));
+on('suspend',e=>{const reason=prompt('Reason for suspending service');if(reason)act(e.target,`/api/admin/partner-agreements/${id}/suspend-service`,{reason},document.getElementById('svc-status'));});
 on('reject',e=>{const reason=prompt('Reason for rejecting');if(reason)act(e.target,`/api/admin/partner-agreements/${id}/reject`,{reason},st);});
 on('cancel',e=>{const reason=prompt('Reason for cancelling');if(reason)act(e.target,`/api/admin/partner-agreements/${id}/cancel`,{reason},st);});
 document.querySelectorAll('[data-reverse]').forEach(b=>b.addEventListener('click',()=>{const reason=prompt('Reason for the reversal');
@@ -336,38 +400,89 @@ document.getElementById('remit-status'));});
             return RedirectResponse("/partner-login", status_code=303)
         admin = pa.is_global_admin(identity)
         statements = pp.statements(identity)
+        try:
+            payee = pb.payee_of(identity)
+        except pa.AgreementForbidden:
+            payee = None
+        sections = []
+        notice = {"updated": "Your bank details were sent to the payout provider. The status is shown below.",
+                  "check-later": "The payout provider has not confirmed your details yet. Check back shortly.",
+                  "expired": "The setup link expired. Start the bank setup again."}.get(request.query_params.get("banking", ""))
+        if notice:
+            sections.append(f'<div class="panel" role="status" style="margin-bottom:14px">{escape(notice)}</div>')
+        if payee:
+            sections.append(_earnings_and_banking(payee))
+        elif identity.get("role") == "salesperson":
+            sections.append('<div class="panel">Payouts for your sales go to your partner company, which receives the quarterly statement. '
+                            'Your own earnings are listed on <a href="/partner-revenue">Recurring revenue</a>.</div>')
+        if admin:
+            sections.append('<form class="panel rule-form" id="close" style="margin-top:14px"><h2>Issue quarterly statements</h2>'
+                            '<label>Quarter (after it has ended)<input id="close-quarter" placeholder="2026-Q3" pattern="\\d{4}-Q[1-4]" required></label>'
+                            '<button class="action-button">Issue statements</button> <span id="close-status" role="status"></span></form>')
+        banks = {b["payee_key"]: b for b in pb.all_accounts()} if admin else {}
         selected = request.query_params.get("statement")
-        detail = ""
-        if selected:
-            s = _call(pp.statement, identity, selected)
-            names = _names(e["customer_id"] for e in s["entries"])
-            lines = "".join(
-                f"<tr><td>{_when(e['earned_at'])}</td><td>{escape(names.get(e['customer_id']) or 'Customer')}</td>"
-                f"<td>{escape(KIND_LABELS.get(e['kind'], e['kind']))}{' (reversal)' if e.get('reverses_entry_id') else ''}</td>"
-                f"<td>{escape(e.get('service_month') or e.get('stripe_invoice_id') or '—')}</td><td>{money(e['amount_cents'])}</td></tr>"
-                for e in s["entries"])
-            detail = (f'<section class="panel" style="overflow:auto;margin-top:14px"><h2>{escape(s["quarter"])} statement · {escape(s["payee_key"])}</h2>'
-                      f'<p>Opening balance {money(s["opening_balance_cents"])} + this quarter {money(s["period_total_cents"])} = '
-                      f'payable <strong>{money(s["payable_cents"])}</strong>, carried forward {money(s["carried_forward_cents"])}.</p>'
-                      '<table class="data-table"><thead><tr><th>Recorded</th><th>Customer</th><th>Type</th><th>Invoice / month</th><th>Amount</th></tr></thead>'
-                      f'<tbody>{lines}</tbody></table></section>')
-        table = "".join(
-            f"<tr><td><a href=\"/partner-payouts?statement={escape(s['id'], quote=True)}\">{escape(s['quarter'])}</a></td><td>{escape(s['payee_key'])}</td>"
-            f"<td>{money(s['opening_balance_cents'])}</td><td>{money(s['period_total_cents'])}</td><td><strong>{money(s['payable_cents'])}</strong></td>"
-            f"<td>{money(s['carried_forward_cents'])}</td><td>{escape(STATUS_LABELS.get(s['status'], s['status']))}"
-            f"{' · ' + escape(s['payment_reference'] or '') if s.get('payment_reference') else ''}</td>"
-            + (f"<td>{_paid_button(s)}</td>" if admin else "")
-            + "</tr>" for s in statements) or f'<tr><td colspan="{8 if admin else 7}">No payout statements yet.</td></tr>'
-        close_form = ('<form class="panel rule-form" id="close"><h2>Issue quarterly statements</h2><label>Quarter (after it has ended)'
-                      '<input id="close-quarter" placeholder="2026-Q3" pattern="\\d{4}-Q[1-4]" required></label>'
-                      '<button class="action-button">Issue statements</button> <span id="close-status" role="status"></span></form>') if admin else ""
-        content = (f'<header class="topbar"><div><p class="eyebrow">Confidential · partner billing</p><h1>Quarterly payouts</h1></div>'
-                   f'<a class="ghost-button" href="/partner-agreements">Customer agreements</a></header>{_residual_terms()}{close_form}'
-                   '<section class="panel" style="overflow:auto;margin-top:14px"><h2>Statements</h2><table class="data-table"><thead><tr><th>Quarter</th>'
-                   '<th>Payee</th><th>Opening</th><th>This quarter</th><th>Payable</th><th>Carried forward</th><th>Status</th>'
-                   f'{"<th></th>" if admin else ""}</tr></thead><tbody>{table}</tbody></table></section>{detail}')
+        detail = _statement_detail(_call(pp.statement, identity, selected)) if selected else ""
+        table = "".join(_statement_row(s, admin, banks) for s in statements) \
+            or f'<tr><td colspan="{10 if admin else 8}">No payout statements yet.</td></tr>'
+        content = (f'<header class="topbar"><div><p class="eyebrow">Confidential · partner billing</p><h1>Payouts</h1></div>'
+                   f'<a class="ghost-button" href="/partner-agreements">Customer agreements</a></header>{"".join(sections)}{_residual_terms()}'
+                   '<section class="panel" style="overflow:auto;margin-top:14px"><h2>Payout history</h2><table class="data-table"><thead><tr><th>Quarter</th>'
+                   '<th>Payee</th><th>Opening</th><th>This quarter</th><th>Payable</th><th>Carried forward</th><th>Status</th><th>Statement</th>'
+                   f'{"<th>Bank</th><th></th>" if admin else ""}</tr></thead><tbody>{table}</tbody></table></section>{detail}')
         scripts = ("<script>" + CSRF_JS + """const c=document.getElementById('close');if(c)c.addEventListener('submit',e=>{e.preventDefault();
 act(c.querySelector('button'),'/api/admin/partner-payouts/close',{quarter:document.getElementById('close-quarter').value},document.getElementById('close-status'));});
 document.querySelectorAll('[data-paid]').forEach(b=>b.addEventListener('click',()=>{const reference=prompt('Payment reference');
-if(reference)act(b,`/api/admin/partner-payouts/${b.dataset.paid}/paid`,{reference},b.parentElement);}));</script>""")
-        return shell("Quarterly payouts", "partner-payouts", content, scripts)
+if(reference)act(b,`/api/admin/partner-payouts/${b.dataset.paid}/paid`,{reference},b.parentElement);}));
+const bs=document.getElementById('bank-setup');if(bs)bs.addEventListener('click',()=>{const st=document.getElementById('bank-status');bs.disabled=true;
+st.textContent='Opening the secure bank setup…';send('/api/partner/payout-account/onboarding',{}).then(p=>{location.href=p.url;})
+.catch(e=>{st.textContent=e.message;bs.disabled=false;});});
+const br=document.getElementById('bank-refresh');if(br)br.addEventListener('click',()=>act(br,'/api/partner/payout-account/refresh',{},document.getElementById('bank-status')));
+</script>""")
+        return shell("Payouts", "partner-payouts", content, scripts)
+
+
+def _earnings_and_banking(payee: dict) -> str:
+    d = pp.dashboard(payee["partner_id"], payee["salesperson_user_id"])
+    bank = pb.public_view(pb.account(payee["payee_key"]), payee["payee_key"])
+    bank_line = (f"{escape(bank.get('bank_name') or 'Bank account')} ending {escape(bank['last4'])}"
+                 if bank.get("last4") else "No bank account on file")
+    started = bank["status"] != pb.NOT_STARTED
+    refresh = '<button class="ghost-button" id="bank-refresh">Refresh status</button>' if started else ""
+    return f'''<section class="health-grid"><div class="panel"><h2>Earnings not yet paid</h2><table class="data-table"><tbody>
+<tr><th>20% residual earned</th><td>{money(d["residual_cents"])}</td></tr>
+<tr><th>Partner markup owed (upcharges and activation fees, after processing fees)</th><td>{money(d["markup_cents"])}</td></tr>
+<tr><th>Adjustments (refunds, chargebacks, partner-billed base)</th><td>{money(d["adjustments_cents"])}</td></tr>
+<tr><th>Carried from the last statement</th><td>{money(d["carried_forward_cents"])}</td></tr>
+<tr><th>Estimated next payout</th><td><strong>{money(d["estimated_next_payout_cents"])}</strong></td></tr>
+</tbody></table><p>Current quarter: <strong>{escape(d["quarter"])}</strong>. Its statement is issued after the quarter ends ({escape(d["statement_after"])}).</p></div>
+<div class="panel"><h2>Payouts / Banking</h2><p>Status: <strong>{escape(bank["status_label"])}</strong></p><p>{bank_line}</p>
+<p class="health-detail">You enter your bank details on our payout provider's secure page (Stripe). AnyAiCam never sees or stores your routing or account number; we keep only the bank name, the last four digits and the verification status.</p>
+<button class="action-button" id="bank-setup">{"Update bank account" if started else "Set up bank account"}</button> {refresh}
+<span id="bank-status" role="status"></span></div></section>'''
+
+
+def _statement_row(s: dict, admin: bool, banks: dict) -> str:
+    sid = escape(s["id"], quote=True)
+    cells = (f"<tr><td><a href=\"/partner-payouts?statement={sid}\">{escape(s['quarter'])}</a></td><td>{escape(s['payee_key'])}</td>"
+             f"<td>{money(s['opening_balance_cents'])}</td><td>{money(s['period_total_cents'])}</td><td><strong>{money(s['payable_cents'])}</strong></td>"
+             f"<td>{money(s['carried_forward_cents'])}</td><td>{escape(STATUS_LABELS.get(s['status'], s['status']))}"
+             f"{' · ' + escape(s['payment_reference'] or '') if s.get('payment_reference') else ''}</td>"
+             f"<td><a href=\"/partner-payouts/{sid}/statement.csv\">CSV</a></td>")
+    if admin:
+        cells += f"<td>{escape((banks.get(s['payee_key']) or {}).get('status_label') or 'Not set up')}</td><td>{_paid_button(s)}</td>"
+    return cells + "</tr>"
+
+
+def _statement_detail(s: dict) -> str:
+    names = _names(e["customer_id"] for e in s["entries"])
+    lines = "".join(
+        f"<tr><td>{_when(e['earned_at'])}</td><td>{escape(names.get(e['customer_id']) or 'Customer')}</td>"
+        f"<td>{escape(KIND_LABELS.get(e['kind'], e['kind']))}{' (reversal)' if e.get('reverses_entry_id') else ''}</td>"
+        f"<td>{escape(e.get('service_month') or e.get('stripe_invoice_id') or '—')}</td><td>{money(e['amount_cents'])}</td></tr>"
+        for e in s["entries"])
+    return (f'<section class="panel" style="overflow:auto;margin-top:14px"><h2>{escape(s["quarter"])} statement · {escape(s["payee_key"])}</h2>'
+            f'<p>Opening balance {money(s["opening_balance_cents"])} + this quarter {money(s["period_total_cents"])} = '
+            f'payable <strong>{money(s["payable_cents"])}</strong>, carried forward {money(s["carried_forward_cents"])}. '
+            f'<a href="/partner-payouts/{escape(s["id"], quote=True)}/statement.csv">Download statement (CSV)</a></p>'
+            '<table class="data-table"><thead><tr><th>Recorded</th><th>Customer</th><th>Type</th><th>Invoice / month</th><th>Amount</th></tr></thead>'
+            f'<tbody>{lines}</tbody></table></section>')

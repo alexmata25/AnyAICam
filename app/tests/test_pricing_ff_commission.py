@@ -478,8 +478,8 @@ def test_recurring_commission_is_20_percent_of_collected_revenue_for_12_paid_mon
 
 
 def test_first_year_example_matches_the_approved_structure(ledger, db_path):
-    """Local 8 + Ryzen 7 Starter, 12 paid months: $50 + ~$35.98 (no activation
-    commission since 2026-10-04)."""
+    """Local 8 + Ryzen 7 Starter, 12 paid months: ~$35.98 residual only (no
+    activation or hardware commission since 2026-10-04)."""
     sc = ledger
     for month in range(1, 13):
         sc.sync_commissions_from_stripe_event(_invoice_event(f"evt_{month}", f"in_{month}", "price_local_8", 1499))
@@ -491,9 +491,9 @@ def test_first_year_example_matches_the_approved_structure(ledger, db_path):
     sc.sync_commissions_from_stripe_event({"id": "evt_hw", "type": "checkout.session.completed",
                                            "data": {"object": {"id": "cs_hw", "mode": "payment", "payment_status": "paid"}}})
     summary = sc.summarize(sc.ledger_for())
-    assert summary["by_kind_cents"] == {"hardware": 5000, "recurring": 3600}
+    assert summary["by_kind_cents"] == {"hardware": 0, "recurring": 3600}
     # 12 x round(20% of 1499) = 12 x 300 = $36.00 (per-payment cent rounding of $35.976)
-    assert summary["earned_cents"] == 8600
+    assert summary["earned_cents"] == 3600
 
 
 def test_failed_or_unpaid_invoices_earn_nothing(ledger):
@@ -557,11 +557,11 @@ def test_refunds_and_disputes_reverse_the_commission_they_generated(ledger):
     assert sc.summarize(sc.ledger_for())["earned_cents"] == 0
 
 
-@pytest.mark.parametrize("sku,cents", [
-    ("AIC-APPLIANCE-RYZEN-STARTER", 5000), ("AIC-APPLIANCE-RYZEN-ENTERPRISE", 7500),
-    ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", 10000), ("AIC-RELAY-NUMATO-3CH", 0),
-])
-def test_hardware_commission_by_appliance(ledger, db_path, sku, cents):
+@pytest.mark.parametrize("sku", ["AIC-APPLIANCE-RYZEN-STARTER", "AIC-APPLIANCE-RYZEN-ENTERPRISE",
+                                 "AIC-APPLIANCE-RYZEN-AAC-FACIAL", "AIC-RELAY-NUMATO-3CH"])
+def test_hardware_earns_no_commission_since_20261004(ledger, db_path, sku):
+    """Owner, 2026-10-04: the $50/$75/$100 appliance commission was removed and
+    hardware earns no residual either."""
     sc = ledger
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO hardware_orders(id,customer_id,sku,product_name,stripe_price_id,stripe_checkout_session_id,quantity,amount_cents,currency,status,fulfillment_status,created_at,updated_at) "
@@ -570,7 +570,7 @@ def test_hardware_commission_by_appliance(ledger, db_path, sku, cents):
     conn.close()
     sc.sync_commissions_from_stripe_event({"id": "evt_hw", "type": "checkout.session.completed",
                                            "data": {"object": {"id": "cs_hw", "mode": "payment", "payment_status": "paid"}}})
-    assert sum(e["amount_cents"] for e in _entries(sc, "hardware")) == cents
+    assert _entries(sc) == [] and not hasattr(pc, "HARDWARE_COMMISSION_CENTS")
 
 
 def test_no_hardware_means_no_hardware_commission(ledger):

@@ -16,6 +16,12 @@ Owner rules, 2026-10-04. Code: `app/partner_agreements.py`, `app/partner_payouts
 | Partner-billed residual | 20% of the base amount AnyAiCam actually receives from the partner, for 12 paid months. |
 | Payouts | Calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec), one statement per payee. |
 | Reversal after a payout | Carries forward as a negative balance into the next statement. |
+| Hardware | No commission and no residual. The old $50 / $75 / $100 was removed; earlier rows stay as history. |
+| Processing fees | The Stripe fee attributable to the partner's upcharge and activation fee is deducted from what the partner is owed. |
+| Friends & Family | Never combined with partner pricing (an upcharge, activation fee or partner billing), in either order. |
+| Partner-billed service | Activated by a global administrator only after AnyAiCam records receiving the partner's base payment. |
+| Upcharge and fee limits | No fixed maximum; every partner proposal needs AnyAiCam approval. |
+| Running subscriptions | Never repriced. An agreement applies at a new checkout. |
 
 ## Data
 
@@ -29,6 +35,8 @@ Owner rules, 2026-10-04. Code: `app/partner_agreements.py`, `app/partner_payouts
 
   New columns: `agreement_id`, `billing_party`, `commission_rate_bps`, `collected_cents`, `collected_at`, `service_month`, `reverses_entry_id`, `created_by` and `note`.
 - **Reversals:** refunds, disputes, bounced remittances and partner refunds are new negative rows (status `reversal`, `reverses_entry_id` set). An original row's amount never changes.
+- **`partner_processing_fee`** ledger rows: one per invoice with partner money, = Stripe fee × (upcharge + fee collected) ÷ charge amount, rounded half up. The note records the fee, the charge, the share and the result. A refund never reverses it, because Stripe keeps its fee.
+- **`partner_payout_accounts`** (new): the payout provider (Stripe Connect Express) account id, the derived status (`not_started`, `onboarding`, `verification_pending`, `verified`, `restricted`), details submitted, payouts enabled, requirements due, disabled reason, bank name, last four and currency. Routing and account numbers are never stored; the provider's response is reduced to these fields first. Changes are audited.
 - **`partner_payouts`** and **`partner_payout_items`** (new): the quarterly statement (opening balance, period total, payable, carried forward, status, payment reference). Each items row attaches exactly one ledger entry to exactly one statement.
 - **Audit:** proposals, approvals, rejections, cancellations, collections, remittances, reversals, statements and payments are written to `audit_logs`, with the money terms before and after.
 
@@ -62,12 +70,15 @@ Checkout is refused in these cases:
 - payable = max(0, carried + period total);
 - carried forward = min(0, carried + period total).
 
-Statements are marked paid with a payment reference.
+Before a quarter closes, every unsettled processing fee is read from Stripe. An invoice whose fee Stripe has not reported is held, with all its entries, for the next statement, so a partner is never paid before its fee is deducted. A statement is marked paid only to a payee with a verified payout bank account, and with a payment reference.
+
+**Payout bank account.** The partner owner, or an independent salesperson, starts setup on the Payouts page. AnyAiCam creates one Stripe Connect Express account for the payee and redirects to Stripe's hosted onboarding, where the bank details are entered. On return, and on Refresh, the account is re-read and only the safe fields are kept. Nothing here moves money; payouts are still made and recorded by an administrator.
 
 ## Pages
 
 - **`/partner-agreements`:** the list and the new or changed agreement form. It shows the catalog base price, upcharge, activation fee, live final price, billing party and residual terms.
 - **`/partner-agreements/{id}`:** the price breakdown, residual months, accrued amounts, next payout, payment-level detail and version history. Administrators also see approve, reject, cancel, remittance and reversal actions.
-- **`/partner-payouts`:** the statements with their payment-level detail. Administrators can issue a quarter and mark statements paid.
+- **`/partner-payouts`:** earnings not yet paid (20% residual, partner markup after processing fees, adjustments, carried balance, estimated next payout), the current quarter and when its statement is issued, the Payouts / Banking section, payout history, and CSV statements. Administrators can also issue a quarter, see each payee's bank status, and mark statements paid.
+- **Partner-billed agreement page:** service status, with Activate and Suspend for administrators.
 
 Partners see only their own customers. Salespeople see only agreements where they earn the residual. Global administrators see everything.

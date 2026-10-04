@@ -109,6 +109,12 @@ def decide(request_id: str, *, approve: bool, decided_by: str, note: str = "") -
         raise LookupError("Request not found.")
     if request["status"] != PENDING:
         raise ValueError(f"This request was already {request['status']}.")
+    import partner_agreements
+    if approve and partner_agreements.blocks_friends_family(request["customer_id"]):
+        # Owner, 2026-10-04: never combined with partner pricing -- the coupon
+        # would also discount the partner's upcharge and fee.
+        raise ValueError("This customer has partner pricing (an upcharge, activation fee or partner billing); "
+                         "Friends & Family cannot be combined with it.")
     with connection() as db:
         db.execute(
             "UPDATE friends_family_requests SET status=?,decided_at=?,decided_by=?,decision_note=? WHERE id=? AND status=?",

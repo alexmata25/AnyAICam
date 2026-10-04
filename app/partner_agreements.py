@@ -102,6 +102,17 @@ def pending(customer_id: str) -> Optional[dict]:
     return row("SELECT * FROM partner_agreements WHERE customer_id=? AND status=?", (customer_id, PENDING))
 
 
+def partner_priced(agreement: Optional[dict]) -> bool:
+    """Carries partner pricing: an upcharge, an activation fee, or partner
+    billing. Never combined with Friends & Family (owner, 2026-10-04)."""
+    return bool(agreement) and (int(agreement["upcharge_cents"]) > 0 or int(agreement["activation_fee_cents"]) > 0
+                                or agreement["billing_party"] == pricing_catalog.BILLING_PARTNER)
+
+
+def blocks_friends_family(customer_id: str) -> bool:
+    return any(partner_priced(a) for a in (in_force(customer_id), pending(customer_id)))
+
+
 def _money_view(agreement: Optional[dict]) -> Optional[dict]:
     return {k: agreement.get(k) for k in ("id", "version", "status", *MONEY_FIELDS)} if agreement else None
 
@@ -113,12 +124,25 @@ def _require_editor(identity: dict) -> None:
         raise AgreementForbidden("Partner permission required.")
 
 
+def _independent(identity: dict) -> Optional[dict]:
+    """The signed-in salesperson when they belong to no partner company."""
+    if identity.get("role") != "salesperson":
+        return None
+    me = _user(identity.get("email", ""))
+    return me if me and not me.get("partner_id") else None
+
+
 def _customer(identity: dict, customer_id: str) -> dict:
     customer = row("SELECT id,partner_id,name FROM customers WHERE id=?", (str(customer_id or ""),))
     if not customer:
         raise LookupError("Customer not found.")
     with connection() as db:
-        if not tenant_owns_partner(db, identity, customer.get("partner_id")):
+        owned = tenant_owns_partner(db, identity, customer.get("partner_id"))
+    if not owned:
+        indie = _independent(identity)
+        from sales_commissions import attribution_for
+        attribution = attribution_for(customer["id"]) if indie else None
+        if not (attribution and attribution["salesperson_user_id"] == indie["id"]):
             raise AgreementForbidden("This customer belongs to another partner.")
     return customer
 
@@ -126,6 +150,9 @@ def _customer(identity: dict, customer_id: str) -> dict:
 def _can_see(identity: dict, agreement: dict) -> bool:
     if is_global_admin(identity):
         return True
+    indie = _independent(identity)
+    if indie:
+        return indie["id"] == agreement["salesperson_user_id"]
     with connection() as db:
         if not tenant_owns_partner(db, identity, agreement.get("partner_id")):
             return False
@@ -166,7 +193,9 @@ def _salesperson_for(identity: dict, customer: dict, salesperson: Optional[str])
             user = _user(attribution["salesperson_user_id"]) if attribution else None
     if not user or user.get("role") not in SALES_ROLES:
         raise AgreementError("Choose the salesperson or partner owner who earns the residual.")
-    if customer.get("partner_id") and user.get("partner_id") != customer["partner_id"]:
+    from direct_onboarding import HOUSE_PARTNER_ID
+    if user.get("partner_id") != customer.get("partner_id") and not (not user.get("partner_id")
+                                                                      and customer.get("partner_id") in (None, HOUSE_PARTNER_ID)):
         raise AgreementError("The salesperson must belong to this customer's partner.")
     return user
 
@@ -211,6 +240,10 @@ def propose(identity: dict, *, customer_id: str, plan_type: str, tier_label: str
     new = terms(plan_type, tier_label, upcharge_cents, activation_fee_cents)
     new["billing_party"] = billing_party
     seller = _salesperson_for(identity, customer, salesperson)
+    import friends_family
+    if partner_priced(new) and friends_family.is_approved(customer["id"]):
+        raise AgreementError("This customer has a Friends & Family discount, which cannot be combined with partner pricing "
+                             "(an upcharge, activation fee or partner billing).", status=409)
     current = in_force(customer["id"])
     _check_change_allowed(current, new)
     admin = is_global_admin(identity)
@@ -224,7 +257,7 @@ def propose(identity: dict, *, customer_id: str, plan_type: str, tier_label: str
             "camera_tier,base_price_cents,upcharge_cents,customer_price_cents,activation_fee_cents,billing_party,commission_rate_bps,"
             "commission_max_paid_months,status,approved_at,approved_by,created_at,created_by,updated_at,updated_by) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (agreement_id, customer["id"], customer.get("partner_id"), seller["id"], version, (current or {}).get("id"),
+            (agreement_id, customer["id"], seller.get("partner_id"), seller["id"], version, (current or {}).get("id"),
              new["plan_type"], new["tier_label"], new["camera_tier"], new["base_price_cents"], new["upcharge_cents"],
              new["customer_price_cents"], new["activation_fee_cents"], billing_party, new["commission_rate_bps"],
              new["commission_max_paid_months"], PENDING, None, None, now, actor, now, actor))
@@ -513,6 +546,72 @@ def reverse_partner_entry(identity: dict, entry_id: str, *, reason: str) -> list
     audit(identity, "partner_agreement.entry_reversed", "commission_ledger", entry["id"],
           {"customer_id": entry["customer_id"], "kind": entry["kind"], "reason": reason, "reversal_ids": [r["id"] for r in reversals]})
     return reversals
+
+
+# ------------------------------------------------------------ partner-billed service
+
+def _confirmed_remittances(customer_id: str) -> int:
+    kept = rows("SELECT * FROM commission_ledger WHERE kind=? AND customer_id=? AND reverses_entry_id IS NULL",
+                (BASE_REMITTED, customer_id))
+    return sum(1 for e in kept if _net(e) > 0)
+
+
+def activate_service(identity: dict, agreement_id: str) -> dict:
+    """A partner-billed customer's camera capacity is granted only by a
+    global administrator, and only after AnyAiCam has recorded receiving the
+    partner's base payment -- never because the partner reports collecting
+    from its customer (owner, 2026-10-04). The entitlement carries no Stripe
+    reference, so Stripe synchronisation never touches it."""
+    if not is_global_admin(identity):
+        raise AgreementForbidden("Global administrator grant required.")
+    agreement = get(identity, agreement_id)
+    _partner_billed(agreement)
+    if agreement["status"] not in IN_FORCE:
+        raise AgreementError("This agreement is not in force.", status=409)
+    if not _confirmed_remittances(agreement["customer_id"]):
+        raise AgreementError("Record the base payment received from the partner before activating service.", status=409)
+    from customer_entitlements import BASE_PLAN_PRODUCTS, get_entitlements_for_customer, upsert_entitlement
+    product = f"camera_slots_{agreement['plan_type']}"
+    for held in get_entitlements_for_customer(agreement["customer_id"]):
+        if held["product"] in BASE_PLAN_PRODUCTS and held["status"] in ("active", "suspended") and held.get("stripe_subscription_id"):
+            raise AgreementError("This customer already has an AnyAiCam-billed plan in Stripe. End it before partner billing.", status=409)
+    upsert_entitlement(customer_id=agreement["customer_id"], product=product, camera_slot_quantity=int(agreement["camera_tier"]),
+                       status="active")
+    now = _now()
+    with connection() as db:
+        db.execute("UPDATE partner_agreements SET status=?,service_activated_at=?,service_activated_by=?,service_suspended_at=NULL,"
+                   "service_suspended_by=NULL,updated_at=?,updated_by=? WHERE id=?",
+                   (ACTIVE, now, identity.get("email", ""), now, identity.get("email", ""), agreement["id"]))
+    audit(identity, "partner_agreement.service_activated", "partner_agreement", agreement["id"],
+          {"customer_id": agreement["customer_id"], "product": product, "camera_slots": int(agreement["camera_tier"]),
+           "confirmed_remittances": _confirmed_remittances(agreement["customer_id"])})
+    return row("SELECT * FROM partner_agreements WHERE id=?", (agreement["id"],))
+
+
+def suspend_service(identity: dict, agreement_id: str, reason: str) -> dict:
+    """Suspend a partner-billed customer's service (for example the partner
+    stopped paying). Global administrator only; recorded and reversible by
+    activating again."""
+    if not is_global_admin(identity):
+        raise AgreementForbidden("Global administrator grant required.")
+    agreement = get(identity, agreement_id)
+    _partner_billed(agreement)
+    reason = str(reason or "").strip()[:300]
+    if not reason:
+        raise AgreementError("Enter the reason.")
+    if not agreement.get("service_activated_at") or agreement.get("service_suspended_at"):
+        raise AgreementError("Service is not active for this customer.", status=409)
+    from customer_entitlements import upsert_entitlement
+    product = f"camera_slots_{agreement['plan_type']}"
+    upsert_entitlement(customer_id=agreement["customer_id"], product=product, camera_slot_quantity=int(agreement["camera_tier"]),
+                       status="suspended")
+    now = _now()
+    with connection() as db:
+        db.execute("UPDATE partner_agreements SET service_suspended_at=?,service_suspended_by=?,updated_at=?,updated_by=? WHERE id=?",
+                   (now, identity.get("email", ""), now, identity.get("email", ""), agreement["id"]))
+    audit(identity, "partner_agreement.service_suspended", "partner_agreement", agreement["id"],
+          {"customer_id": agreement["customer_id"], "product": product, "reason": reason})
+    return row("SELECT * FROM partner_agreements WHERE id=?", (agreement["id"],))
 
 
 # ------------------------------------------------------------ reporting

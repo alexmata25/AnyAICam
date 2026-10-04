@@ -20,7 +20,13 @@ Rules (pricing_catalog):
   'partner_activation_fee' rows, owed to the partner in full) and earn no
   commission; the 20% applies only to the AnyAiCam plan/add-on lines, at
   the rate recorded on the agreement.
-- Hardware: $50 / $75 / $100 for the three appliance SKUs, $0 otherwise.
+- Hardware: no commission and no residual (owner, 2026-10-04; the earlier
+  $50 / $75 / $100 per appliance was removed). Rows already earned stay as
+  history, and a refund of such an order still reverses them.
+- Stripe processing fees on the partner's own money: the share of the
+  charge's Stripe fee attributable to the upcharge and activation fee is a
+  negative 'partner_processing_fee' row (settle_processing_fee). Stripe keeps
+  its fee when a payment is refunded, so a refund never reverses that row.
 - Friends & Family approved: every commission is $0 (the row is still
   written, status not_eligible_friends_family, for attribution/reporting).
   A partner's own upcharge and fee are still owed to the partner.
@@ -50,6 +56,8 @@ SALES_ROLES = {"salesperson", "partner_owner"}
 EARNED, REVERSED, NOT_ELIGIBLE_FF = "earned", "reversed", "not_eligible_friends_family"
 REVERSAL = "reversal"  # status of an appended negative row; kind stays the original's
 PARTNER_UPCHARGE, PARTNER_ACTIVATION_FEE = "partner_upcharge", "partner_activation_fee"
+PARTNER_PROCESSING_FEE = "partner_processing_fee"
+PARTNER_MONEY_KINDS = (PARTNER_UPCHARGE, PARTNER_ACTIVATION_FEE)
 
 
 def _now() -> str:
@@ -409,26 +417,69 @@ def _invoice_paid(event: dict) -> dict:
                 written.append(kind)
         partner_agreements.note_payment(agreement, paid_month_index=paid_months,
                                         activation_fee_collected=split["activation_fee"] > 0, subscription_id=subscription_id)
+        try:
+            settle_processing_fee(invoice_id)
+        except Exception:  # Stripe unreadable now: settled before the quarter closes (partner_payouts)
+            logger.warning("commission.processing_fee_unsettled invoice=%s", invoice_id, exc_info=True)
     return {"status": "commission_recorded", "kinds": written, "paid_month_index": paid_months, "friends_family": ff}
 
 
 def _hardware_paid(event: dict) -> dict:
-    session = (event.get("data") or {}).get("object") or {}
-    if session.get("mode") != "payment" or session.get("payment_status") not in ("paid", "no_payment_required"):
-        return {"status": "ignored", "reason": "not a paid hardware checkout"}
-    order = row("SELECT * FROM hardware_orders WHERE stripe_checkout_session_id=?", (str(session.get("id") or ""),))
-    if not order or not order.get("customer_id"):
-        return {"status": "ignored", "reason": "no hardware order for this session"}
-    attribution = attribution_for(order["customer_id"])
-    if not attribution:
-        return {"status": "ignored", "reason": "no salesperson attribution"}
-    amount = pricing_catalog.HARDWARE_COMMISSION_CENTS.get(order["sku"], 0) * int(order.get("quantity") or 1)
-    if not amount:
-        return {"status": "ignored", "reason": "no hardware commission for this SKU", "sku": order["sku"]}
-    record = _record(kind="hardware", source_ref=f"hardware:{order['id']}", customer_id=order["customer_id"],
-                     attribution=attribution, amount_cents=amount, basis_cents=int(order.get("amount_cents") or 0),
-                     friends_family=_ff_approved(order["customer_id"]), hardware_order_id=order["id"])
-    return {"status": "commission_recorded" if record else "already_recorded", "kinds": ["hardware"] if record else []}
+    """Hardware earns no commission since 2026-10-04 (owner decision)."""
+    return {"status": "ignored", "reason": "hardware earns no commission"}
+
+
+def _charge_fee(payment: dict) -> Optional[tuple[str, int, int]]:
+    """(charge id, charge amount, Stripe fee) for a recorded payment, read
+    from the charge's balance transaction; None while Stripe has no fee yet."""
+    charge = None
+    if payment.get("stripe_charge_id"):
+        charge = _stripe_get(f"/v1/charges/{payment['stripe_charge_id']}?expand[]=balance_transaction")
+    elif payment.get("stripe_payment_intent_id"):
+        intent = _stripe_get(f"/v1/payment_intents/{payment['stripe_payment_intent_id']}?expand[]=latest_charge.balance_transaction")
+        charge = intent.get("latest_charge") if isinstance(intent.get("latest_charge"), dict) else None
+    balance = (charge or {}).get("balance_transaction")
+    if not isinstance(balance, dict) or balance.get("fee") is None or not int(charge.get("amount") or 0):
+        return None
+    return str(charge.get("id") or ""), int(charge["amount"]), int(balance["fee"])
+
+
+def settle_processing_fee(invoice_id: str) -> Optional[dict]:
+    """Deduct from the partner the Stripe fee attributable to the partner's
+    own money on one invoice (owner, 2026-10-04): fee x (partner upcharge +
+    activation fee collected) / charge amount, rounded half up to the cent.
+    One row per invoice, written once; the note records every input so the
+    figure can be recomputed. Returns the row, or None when the invoice has no
+    partner money, is already settled, or Stripe has no fee yet."""
+    partner = [e for e in rows("SELECT * FROM commission_ledger WHERE stripe_invoice_id=? AND reverses_entry_id IS NULL", (invoice_id,))
+               if e["kind"] in PARTNER_MONEY_KINDS]
+    if not partner or row("SELECT id FROM commission_ledger WHERE kind=? AND source_ref=?", (PARTNER_PROCESSING_FEE, f"fee:{invoice_id}")):
+        return None
+    payment = row("SELECT * FROM subscription_payments WHERE id=?", (invoice_id,))
+    found = _charge_fee(payment or {})
+    if not found:
+        return None
+    charge_id, charge_amount, fee = found
+    partner_cents = sum(int(e["amount_cents"]) for e in partner)
+    share = (2 * fee * partner_cents + charge_amount) // (2 * charge_amount)
+    first = partner[0]
+    return _record(kind=PARTNER_PROCESSING_FEE, source_ref=f"fee:{invoice_id}", customer_id=first["customer_id"],
+                   attribution={"salesperson_user_id": first["salesperson_user_id"], "partner_id": first.get("partner_id")},
+                   amount_cents=-share, basis_cents=partner_cents, friends_family=False, agreement_id=first.get("agreement_id"),
+                   billing_party=first.get("billing_party"), stripe_subscription_id=first.get("stripe_subscription_id"),
+                   stripe_invoice_id=invoice_id, collected_cents=charge_amount, collected_at=_now(), created_by="stripe",
+                   earned_at=min(e["earned_at"] for e in partner),
+                   note=f"Stripe fee {fee} cents on charge {charge_id} of {charge_amount} cents; partner share "
+                        f"{partner_cents}/{charge_amount} = {share} cents")
+
+
+def unsettled_processing_fees(before: str) -> list[str]:
+    """Invoices with partner money recorded before `before` and no fee row yet."""
+    found = rows("SELECT DISTINCT l.stripe_invoice_id AS invoice_id FROM commission_ledger l WHERE l.kind IN (?,?) "
+                 "AND l.reverses_entry_id IS NULL AND l.stripe_invoice_id IS NOT NULL AND l.earned_at < ? AND NOT EXISTS "
+                 "(SELECT 1 FROM commission_ledger f WHERE f.kind=? AND f.source_ref='fee:' || l.stripe_invoice_id)",
+                 (*PARTNER_MONEY_KINDS, before, PARTNER_PROCESSING_FEE))
+    return [r["invoice_id"] for r in found]
 
 
 def net_amount(entry: dict) -> int:
@@ -476,8 +527,8 @@ def _reverse(entries: list[dict], *, fraction: float, reason: str) -> list[str]:
     original amount."""
     changed = []
     for entry in entries:
-        if entry["status"] != EARNED or entry.get("reverses_entry_id"):
-            continue
+        if entry["status"] != EARNED or entry.get("reverses_entry_id") or entry["kind"] == PARTNER_PROCESSING_FEE:
+            continue  # Stripe keeps its processing fee on a refund
         remaining = 0 if fraction >= 0.999 else int(round(int(entry["original_amount_cents"]) * (1 - fraction)))
         if reverse_entry(entry, remaining_cents=remaining, reason=reason):
             changed.append(entry["id"])
@@ -554,7 +605,7 @@ def ledger_for(*, salesperson_user_id: Optional[str] = None, partner_id: Optiona
     return rows("SELECT * FROM commission_ledger ORDER BY earned_at DESC")
 
 
-SUMMARY_KINDS = ("activation", "hardware", "recurring", PARTNER_UPCHARGE, PARTNER_ACTIVATION_FEE,
+SUMMARY_KINDS = ("activation", "hardware", "recurring", PARTNER_UPCHARGE, PARTNER_ACTIVATION_FEE, PARTNER_PROCESSING_FEE,
                  "partner_base_due", "partner_base_remitted")
 
 
