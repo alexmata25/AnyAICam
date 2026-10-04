@@ -369,8 +369,10 @@ def create_invitation(db, *, owner: dict, name: str, email: str, permissions: di
             # "owns another account" and "is a partner": an owner learns
             # nothing about who else uses AnyAiCam.
             raise HouseholdError("This email can't be invited. Use a different email address.")
+    # This person's own waiting invitation is replaced below (Invite again),
+    # so it does not count toward the waiting limit.
     pending = db.execute("SELECT COUNT(*) AS n FROM invitations WHERE customer_id=? AND role='customer_viewer' AND status='pending' "
-                         "AND expires_at>=?", (customer_id, now.isoformat())).fetchone()["n"]
+                         "AND expires_at>=? AND lower(email)<>?", (customer_id, now.isoformat(), email)).fetchone()["n"]
     if pending >= MAX_PENDING_INVITATIONS:
         raise HouseholdError("Too many invitations are waiting. Cancel one before sending another.")
     # One live invitation per person: a new one replaces any earlier link.
@@ -562,6 +564,12 @@ def household_overview(db, customer_id: str, now: datetime) -> dict:
             item["permissions"] = json.loads(item.pop("permissions_json") or "{}")
         except (TypeError, ValueError):
             item["permissions"] = {}
+        # resend_limit_reached: the server refuses another resend
+        # (MAX_SENDS_PER_INVITATION), so the page offers Invite again instead.
+        # delivery_recorded: False for invitations emailed before delivery
+        # tracking existed (2026-10-02) -- their outcome is unknown, not "sent".
+        item["resend_limit_reached"] = int(item.get("send_count") or 0) >= MAX_SENDS_PER_INVITATION
+        item["delivery_recorded"] = bool(item.get("email_status"))
         if item["status"] in ("pending", "expired"):
             invitations.append(item)
     cameras = customer_cameras(db, customer_id)
@@ -828,11 +836,11 @@ async function call(url,method='POST',body){const r=await fetch(url,{method,head
 function permSummary(p){if(!p)return '';const on=PERMS.filter(k=>p[k]).map(k=>data.permission_labels[k]);const cams=p.camera_ids.length;return `${cams} camera${cams===1?'':'s'}`+(on.length?' · '+on.join(', '):'')+(p.door_ids.length?` · unlock ${p.door_ids.length} door${p.door_ids.length===1?'':'s'}`:'')}
 // Delivery of the latest invitation email: created is not the same as emailed.
 const DELIVERY={sent:['Email sent',''],preview:['Not emailed','#ffd59a'],failed:['Email not sent','#ffb4c0']};
-function delivery(i){const d=DELIVERY[i.email_status];if(!d)return '';return ` <span class="pill"${d[1]?` style="background:#5c3140;color:${d[1]}"`:''}>${d[0]}</span>`}
+function delivery(i){const d=DELIVERY[i.email_status]||(i.delivery_recorded===false?['Delivery not recorded','#ffd59a']:null);if(!d)return '';return ` <span class="pill"${d[1]?` style="background:#5c3140;color:${d[1]}"`:''}>${d[0]}</span>`}
 function render(){
  $('hh-users').innerHTML=data.users.map(u=>`<div class="health-row" style="align-items:flex-start;gap:12px;flex-wrap:wrap"><span><strong>${esc(u.name||u.email)}</strong>${u.role==='customer_owner'?' <span class="pill">Owner</span>':''}${u.status==='disabled'?' <span class="pill" style="background:#5c3140;color:#ffd0da">Disabled</span>':''}<br><span class="health-detail">${esc(u.email)}</span>${u.permissions?`<br><span class="health-detail">${esc(permSummary(u.permissions))}</span>`:''}</span>`+
  (u.role==='customer_viewer'?`<span style="display:flex;gap:8px;flex-wrap:wrap"><button class="ghost-button" data-edit="${esc(u.id)}">Permissions</button>`+(u.status==='disabled'?`<button class="ghost-button" data-act="enable" data-id="${esc(u.id)}">Turn on</button>`:`<button class="ghost-button" data-act="disable" data-id="${esc(u.id)}">Disable</button>`)+`<button class="ghost-button" data-act="remove" data-id="${esc(u.id)}">Remove</button></span>`:'')+`</div>`).join('')||'No users yet.';
- $('hh-invites').innerHTML=data.invitations.map(i=>`<div class="health-row" style="gap:12px;flex-wrap:wrap"><span><strong>${esc(i.name||i.email)}</strong> <span class="pill">${i.status==='expired'?'Expired':'Waiting'}</span>${delivery(i)}<br><span class="health-detail">${esc(i.email)} · ${i.status==='expired'?'expired':'expires'} ${esc(when(i.expires_at))}${i.email_status==='sent'&&i.email_attempted_at?` · emailed ${esc(when(i.email_attempted_at))}`:''}${i.email_status==='failed'?' · the email could not be sent, so they have not received it':''}${i.email_status==='preview'?' · email is not set up, so nothing was emailed':''}</span></span><span style="display:flex;gap:8px">${i.status==='expired'?`<button class="ghost-button" data-again="${esc(i.id)}">Invite again</button>`:`<button class="ghost-button" data-inv="resend" data-id="${esc(i.id)}">${i.email_status==='failed'?'Try again':'Resend'}</button>`}<button class="ghost-button" data-inv="cancel" data-id="${esc(i.id)}">Cancel</button></span></div>`).join('')||'No invitations waiting.';
+ $('hh-invites').innerHTML=data.invitations.map(i=>`<div class="health-row" style="gap:12px;flex-wrap:wrap"><span><strong>${esc(i.name||i.email)}</strong> <span class="pill">${i.status==='expired'?'Expired':'Waiting'}</span>${delivery(i)}<br><span class="health-detail">${esc(i.email)} · ${i.status==='expired'?'expired':'expires'} ${esc(when(i.expires_at))}${i.email_status==='sent'&&i.email_attempted_at?` · emailed ${esc(when(i.email_attempted_at))}`:''}${i.email_status==='failed'?' · the email could not be sent, so they have not received it':''}${i.email_status==='preview'?' · email is not set up, so nothing was emailed':''}${i.delivery_recorded===false?' · sent before delivery tracking, so whether it was emailed is not recorded':''}${i.resend_limit_reached&&i.status!=='expired'?' · this invitation reached the resend limit, so it cannot be sent again. Use Invite again to send a fresh invitation (it replaces this one)':''}</span></span><span style="display:flex;gap:8px">${i.status==='expired'||i.resend_limit_reached?`<button class="ghost-button" data-again="${esc(i.id)}">Invite again</button>`:`<button class="ghost-button" data-inv="resend" data-id="${esc(i.id)}">${i.email_status==='failed'?'Try again':'Resend'}</button>`}<button class="ghost-button" data-inv="cancel" data-id="${esc(i.id)}">Cancel</button></span></div>`).join('')||'No invitations waiting.';
 }
 async function load(){try{data=await call('/api/customer/household','GET');render()}catch(e){$('hh-users').textContent=e.message}}
 function fill(p){
@@ -843,7 +851,7 @@ function fill(p){
  $('hh-doors').innerHTML=doors.map(c=>`<label><input type="checkbox" class="hh-door" value="${esc(c.id)}" ${p.door_ids.includes(c.id)?'checked':''}> ${esc(c.name)}</label>`).join('');
 }
 function collect(){const p={camera_ids:[...document.querySelectorAll('.hh-cam:checked')].map(x=>x.value),door_ids:[...document.querySelectorAll('.hh-door:checked')].map(x=>x.value)};PERMS.forEach(k=>p[k]=!!document.querySelector(`.hh-perm[value="${k}"]`)?.checked);return p}
-function open(user,again){editing=user;$('hh-form-message').textContent='';$('hh-identity').style.display=user?'none':'grid';$('hh-title').textContent=user?`Permissions · ${user.name||user.email}`:'Add user';$('hh-submit').textContent=user?'Save permissions':'Send invitation';
+function open(user,again){editing=user;$('hh-form-message').textContent=again&&again.status!=='expired'?'This sends a fresh invitation and cancels the earlier one, which reached the resend limit.':'';$('hh-identity').style.display=user?'none':'grid';$('hh-title').textContent=user?`Permissions · ${user.name||user.email}`:'Add user';$('hh-submit').textContent=user?'Save permissions':'Send invitation';
  const p=user?user.permissions:again?{...data.default_permissions,camera_ids:[],door_ids:[],...again.permissions}:{...data.default_permissions,camera_ids:data.cameras.map(c=>c.id),door_ids:[]};if(!user){$('hh-name').value=again?again.name||'':'';$('hh-email').value=again?again.email:''}fill(p);$('hh-dialog').showModal()}
 $('hh-add').onclick=()=>data&&open(null);$('hh-cancel').onclick=()=>$('hh-dialog').close();
 $('hh-all').onchange=e=>document.querySelectorAll('.hh-cam').forEach(x=>x.checked=e.target.checked);
