@@ -18,6 +18,12 @@ RUN apt-get update \
 # tarball checksum this image was built from).
 COPY . /var/www/html/
 
+# The offline/integration test scripts (staging/tests/, which include a
+# script that calls Stripe with this container's key) and internal
+# Markdown notes are not customer pages: never serve them.
+RUN rm -rf /var/www/html/staging/tests \
+    && find /var/www/html -name '*.md' -delete
+
 # A tiny convenience redirect so the bare hostname lands on the actual
 # customer-facing entry point instead of Apache's directory listing.
 RUN printf '<!doctype html><meta http-equiv="refresh" content="0; url=/staging/build-your-system.html">' > /var/www/html/index.html
