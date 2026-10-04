@@ -1,7 +1,7 @@
 # Archived: public AnyAiCam VMS 0.1.3 downloads (removed from the website 2026-10-04)
 
 The Linux/Ryzen launch removed these links from `vms.html`. They are not part of the launch path:
-AnyAiCam 1.2.2 for Linux is downloaded from My subscription by an account owner with a VMS licence, and the
+AnyAiCam 1.2.3 for Linux is downloaded from My subscription by an account owner with a VMS licence, and the
 Windows version is "coming soon". The release material itself was **not** deleted (owner decision: preserve and
 archive unless deletion is separately authorized).
 
