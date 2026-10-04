@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +27,52 @@ def normalize_mac(value: str) -> str:
     if len(compact) != 12:
         raise ValueError('A valid 12-digit camera MAC address is required.')
     return ':'.join(compact[index:index + 2] for index in range(0, 12, 2))
+
+
+def stable_device_key(value) -> str | None:
+    """Only a real ONVIF UUID can replace an unavailable link-layer MAC.
+
+    IP hashes, names and incomplete UUIDs are not stable device identities.
+    """
+    text = str(value or '').strip().lower()
+    if text.startswith('urn:uuid:'):
+        text = text[9:]
+    elif text.startswith('uuid:'):
+        text = text[5:]
+    try:
+        identity = uuid.UUID(text)
+        if not identity.int:
+            return None
+        return 'urn:uuid:' + str(identity)
+    except (ValueError, AttributeError):
+        return None
+
+
+def optional_mac(value) -> str | None:
+    try:
+        return normalize_mac(value)
+    except ValueError:
+        return None
+
+
+def _identity_key(camera: dict):
+    return stable_device_key(camera.get('device_key')) or str(camera.get('device_key') or '').strip()
+
+
+def _discovered_by_identity(cameras: list[dict]) -> dict:
+    by_key = {}
+    ambiguous = set()
+    for camera in cameras:
+        key = _identity_key(camera)
+        if not key:
+            continue
+        previous = by_key.get(key)
+        if (camera.get('identity_ambiguous') or previous and
+                (previous.get('ip'), optional_mac(previous.get('mac_address'))) !=
+                (camera.get('ip'), optional_mac(camera.get('mac_address')))):
+            ambiguous.add(key)
+        by_key[key] = camera
+    return {key: camera for key, camera in by_key.items() if key not in ambiguous}
 
 
 def _load_json(path: Path, default):
@@ -61,7 +108,7 @@ def _record_key(camera: dict):
     there is nothing safe to key or merge it by."""
     device_key = str(camera.get('device_key') or '').strip()
     if device_key:
-        return ('device_key', device_key)
+        return ('device_key', stable_device_key(device_key) or device_key)
     mac = _normalized_mac_or_raw(camera.get('mac_address', ''))
     if not _is_missing(mac):
         return ('mac', mac)
@@ -111,7 +158,13 @@ class DiscoveredCameraStore:
             if key not in by_key:
                 order.append(key)
             by_key[key] = {**camera, 'mac_address': _normalized_mac_or_raw(camera.get('mac_address', ''))}
+        locations = {}
         for camera in cameras:
+            key = _record_key(camera)
+            if key is not None:
+                locations.setdefault(key, set()).add((camera.get('ip'), optional_mac(camera.get('mac_address'))))
+        for camera in cameras:
+            camera = {**camera, 'identity_ambiguous': len(locations.get(_record_key(camera), ())) > 1}
             key = _record_key(camera)
             if key is None:
                 continue  # neither a device_key nor a resolvable MAC -- no safe identity to store this candidate under
@@ -136,45 +189,39 @@ class CameraBindingStore:
         payload = _load_json(self.path, {'version': 1, 'bindings': []})
         return payload.get('bindings', []) if isinstance(payload, dict) else []
 
-    def bind(self, cloud_camera_id: str, camera_number: int, mac_address: str, *, valid_cloud_camera_ids: set[str] | None = None) -> dict:
+    def bind(self, cloud_camera_id: str, camera_number: int, mac_address: str | None = None,
+             *, device_key: str | None = None, valid_cloud_camera_ids: set[str] | None = None) -> dict:
         cloud_camera_id = str(cloud_camera_id).strip()
         if not cloud_camera_id:
             raise ValueError('cloud_camera_id is required.')
         if isinstance(camera_number, bool) or not isinstance(camera_number, int) or not 1 <= camera_number <= 256:
             raise ValueError('camera_number must be an integer between 1 and 256.')
-        mac_address = normalize_mac(mac_address)
+        mac = normalize_mac(mac_address) if mac_address is not None else None
+        key = stable_device_key(device_key)
+        if not mac and not key:
+            raise ValueError('A real MAC or stable ONVIF UUID is required.')
         retained = []
         for item in self.bindings():
             if item.get('cloud_camera_id') == cloud_camera_id:
                 continue
-            if normalize_mac(item.get('mac_address', '')) == mac_address or item.get('camera_number') == camera_number:
-                # Orphan self-healing (2026-09-13): a binding is only a
-                # genuine collision if the cloud camera it names is still
-                # part of THIS appliance's own current, authoritative
-                # camera configuration. Confirmed live: an appliance
-                # re-enrolled under a brand-new customer/cloud_id kept its
-                # PRIOR identity's bindings forever, permanently blocking
-                # a real, currently-valid camera from ever claiming the
-                # same physical hardware, because this check had no way
-                # to know the old binding's cloud_camera_id no longer
-                # exists anywhere. valid_cloud_camera_ids is only trusted
-                # when the caller actually supplies it (auto_bind_
-                # discovered_cameras() always does) -- a direct call that
-                # omits it keeps the original, strictly conservative
-                # "always a collision" behavior, so nothing that already
-                # depends on bind() raising here is weakened.
+            same_device = (key is not None and stable_device_key(item.get('device_key')) == key
+                           or mac is not None and optional_mac(item.get('mac_address')) == mac)
+            same_slot = item.get('camera_number') == camera_number
+            if same_device or same_slot:
+                # Supersede only an orphan absent from this appliance's current
+                # authorized cloud configuration. Direct calls stay conservative.
                 if valid_cloud_camera_ids is not None and item.get('cloud_camera_id') not in valid_cloud_camera_ids:
-                    continue  # orphaned binding, superseded -- not retained
-                if normalize_mac(item.get('mac_address', '')) == mac_address:
+                    continue
+                if same_device:
                     raise ValueError('This physical camera is already bound to another cloud camera.')
                 raise ValueError('This local camera number is already bound to another cloud camera.')
             retained.append(item)
-        binding = {
-            'cloud_camera_id': cloud_camera_id,
-            'camera_number': camera_number,
-            'mac_address': mac_address,
-            'approved_at': datetime.now(timezone.utc).isoformat(),
-        }
+        binding = {'cloud_camera_id': cloud_camera_id, 'camera_number': camera_number,
+                   'approved_at': datetime.now(timezone.utc).isoformat()}
+        if mac:
+            binding['mac_address'] = mac
+        if key:
+            binding['device_key'] = key
         retained.append(binding)
         atomic_write_json(self.path, {'version': 1, 'bindings': retained})
         return binding
@@ -205,11 +252,7 @@ def auto_bind_discovered_cameras(cloud_cameras: list[dict], discovered_cameras: 
     camera is simply skipped and surfaces to the cloud via
     reconcile_cloud_cameras()'s own last_error instead.
     """
-    discovered_by_device_key = {}
-    for camera in discovered_cameras:
-        device_key = str(camera.get('device_key') or '').strip()
-        if device_key:
-            discovered_by_device_key[device_key] = camera
+    discovered_by_device_key = _discovered_by_identity(discovered_cameras)
     existing_by_cloud_id = {item.get('cloud_camera_id'): item for item in binding_store.bindings()}
     # The current, authoritative set of cloud camera ids this appliance
     # actually has -- passed to bind() so it can tell a genuine, still-
@@ -224,21 +267,27 @@ def auto_bind_discovered_cameras(cloud_cameras: list[dict], discovered_cameras: 
     for cloud_camera in cloud_cameras:
         cloud_id = str(cloud_camera.get('id', '')).strip()
         camera_number = cloud_camera.get('camera_number')
-        device_key = str(cloud_camera.get('device_key') or '').strip()
+        device_key = _identity_key(cloud_camera)
         if not cloud_id or camera_number is None or not device_key:
             continue  # nothing to bind yet -- no relay slot, or no physical identity to match against
         physical = discovered_by_device_key.get(device_key)
         if not physical:
             continue  # not (or not yet) seen on this appliance's own network scan
-        try:
-            mac_address = normalize_mac(physical.get('mac_address', ''))
-        except ValueError:
-            continue  # discovered record has no resolved MAC yet -- nothing safe to bind
+        mac_address = optional_mac(physical.get('mac_address'))
+        stable_key = stable_device_key(device_key)
+        if not mac_address and not stable_key:
+            continue  # IP-derived identity cannot replace a missing MAC
         existing = existing_by_cloud_id.get(cloud_id)
-        if existing and existing.get('camera_number') == camera_number and existing.get('mac_address') == mac_address:
-            continue  # already correctly bound
+        if (existing and optional_mac(existing.get('mac_address')) and mac_address
+                and optional_mac(existing.get('mac_address')) != mac_address):
+            continue  # a UUID cannot silently replace an established real MAC
+        if (existing and existing.get('camera_number') == camera_number
+                and optional_mac(existing.get('mac_address')) == mac_address
+                and stable_device_key(existing.get('device_key')) == stable_key):
+            continue
         try:
-            binding_store.bind(cloud_id, camera_number, mac_address, valid_cloud_camera_ids=valid_cloud_camera_ids)
+            binding_store.bind(cloud_id, camera_number, mac_address, device_key=stable_key,
+                               valid_cloud_camera_ids=valid_cloud_camera_ids)
             bound.append(cloud_id)
         except ValueError:
             continue  # camera_number or MAC still genuinely claimed by another currently-valid cloud camera
@@ -282,16 +331,16 @@ class LocalVmsStatusReader:
 
 def reconcile_cloud_cameras(cloud_cameras: list[dict], discovered_cameras: list[dict],
                             bindings: list[dict], status_reader: LocalVmsStatusReader) -> list[dict]:
+    discovered_by_device_key = _discovered_by_identity(discovered_cameras)
     discovered_by_mac = {}
-    discovered_by_device_key = {}
+    for camera in discovered_by_device_key.values():
+        mac = optional_mac(camera.get('mac_address'))
+        if mac:
+            discovered_by_mac[mac] = camera
+    # Keep legacy discoveries with no device_key usable by their real MAC.
     for camera in discovered_cameras:
-        device_key = str(camera.get('device_key') or '').strip()
-        if device_key:
-            discovered_by_device_key[device_key] = camera
-        try:
-            discovered_by_mac[normalize_mac(camera.get('mac_address', ''))] = camera
-        except ValueError:
-            continue
+        if not _identity_key(camera) and optional_mac(camera.get('mac_address')):
+            discovered_by_mac[optional_mac(camera['mac_address'])] = camera
     bindings_by_cloud_id = {item.get('cloud_camera_id'): item for item in bindings}
     reconciled = []
     for cloud_camera in cloud_cameras:
@@ -311,7 +360,7 @@ def reconcile_cloud_cameras(cloud_cameras: list[dict], discovered_cameras: list[
             # also shows. Narrowly scoped: only ever overrides the
             # default when this exact device_key genuinely has discovery
             # evidence on file; never changes anything else here.
-            device_key = str(cloud_camera.get('device_key') or '').strip()
+            device_key = _identity_key(cloud_camera)
             if device_key and device_key in discovered_by_device_key:
                 safe['last_error'] = 'camera_binding_conflict'
         if binding:
@@ -322,10 +371,19 @@ def reconcile_cloud_cameras(cloud_cameras: list[dict], discovered_cameras: list[
                 safe['last_error'] = 'binding_camera_number_mismatch'
                 reconciled.append(safe)
                 continue
-            try:
-                physical = discovered_by_mac.get(normalize_mac(binding.get('mac_address', '')))
-            except ValueError:
-                physical = None
+            key = stable_device_key(binding.get('device_key'))
+            if key:
+                if key != stable_device_key(cloud_camera.get('device_key')):
+                    safe['last_error'] = 'binding_device_key_mismatch'
+                    reconciled.append(safe)
+                    continue
+                physical = discovered_by_device_key.get(key)
+                bound_mac = optional_mac(binding.get('mac_address'))
+                if (physical and bound_mac
+                        and optional_mac(physical.get('mac_address')) != bound_mac):
+                    physical = None  # preserve an established MAC possession check
+            else:
+                physical = discovered_by_mac.get(optional_mac(binding.get('mac_address')))
             if not physical:
                 safe['last_error'] = 'camera_not_discovered'
             else:

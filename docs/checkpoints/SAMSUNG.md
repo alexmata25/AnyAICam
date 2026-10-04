@@ -1,4 +1,29 @@
 # Samsung appliance — checkpoint
+
+## Current authoritative status — physical gate passed; software-only correction complete
+
+User confirms PHYSICAL ACCEPTANCE PASSED for the previously physically accepted
+1.2.3 artifact. Local mode uses supported local owner viewing; cloud-remote live
+view is not required for that mode. Do not reopen the physical gate or rerun
+onboarding/claim/install/acceptance based on the historical failures below.
+
+Branch codex/linux-launch-camera-acceptance contains isolated VMS/agent runtime
+corrections and regression evidence. Linux agent: 626 passed; VMS/API: 699 passed;
+Chromium: 18 passed; total 1,343 passed, 0 failed, 0 skipped, 0 errors. Other-browser
+cases: 27 deselected. Real anonymous and authenticated RTSP/media E2E passed.
+Samsung touched during this software regression: NO. Accepted 1.2.3 artifact
+unchanged. No installer candidate built, signed, installed, published or deployed.
+A separately versioned candidate is needed to distribute the newly changed runtime.
+
+See validation/installer-track/CAMERA_RUNTIME_SOFTWARE_GATE.md and
+CAMERA_RUNTIME_REGRESSION_RESULTS.json for exact suites, evidence digests and scope.
+Older checkpoint entries describe historical observations and are superseded by
+this current user-confirmed physical status.
+
+LINUX SOFTWARE GATE: PASSED
+SAMSUNG PHYSICAL GATE: PASSED
+DEPLOYMENT PERFORMED: NO
+
 ## 2026-10-04 UTC — live FAIL; simulator adaptation required
 
 Operator reported black screen. VMS has one configured camera and capacity 8,

@@ -1,0 +1,75 @@
+{
+  "agent": [
+    "appliance-agent/tests"
+  ],
+  "vms": [
+    "tests/test_anonymous_provisioned_stream.py",
+    "app/tests/test_edge_camera_sync.py",
+    "app/tests/test_edge_camera_sync_analytics_rules.py",
+    "app/tests/test_local_provisioned_camera_credential_endpoint.py",
+    "app/tests/test_camera_discovery_provisioning.py",
+    "app/tests/test_camera_discovery_migration_restore.py",
+    "app/tests/test_onvif_endpoint_identity.py",
+    "app/tests/test_camera_multi_appliance_isolation.py",
+    "app/tests/test_aaco_duplicate_camera_names.py",
+    "app/tests/test_camera_numbers_phantom_fallback.py",
+    "app/tests/test_vms_license_capacity.py",
+    "app/tests/test_camera_capabilities.py",
+    "app/tests/test_camera_health_and_analytics_authorization.py",
+    "app/tests/test_live_view_page_customer_auth.py",
+    "app/tests/test_live_view_wireguard.py",
+    "app/tests/test_live_view_sessions_relay_flow.py",
+    "app/tests/test_live_view_black_tile_fix.py",
+    "app/tests/test_live_view_hls_fatal_error_recovery.py",
+    "app/tests/test_live_playlist_cloud_relay_path.py",
+    "app/tests/test_recording_credentials.py",
+    "app/tests/test_recording_read_credentials_cache.py",
+    "app/tests/test_recording_uploader_credential_hardening.py",
+    "app/tests/test_recording_remux.py",
+    "app/tests/test_recording_codec_aware.py",
+    "app/tests/test_recordings_catalog.py",
+    "app/tests/test_recording_date_index.py",
+    "app/tests/test_local_recording_policy.py",
+    "app/tests/test_camera_local_recording_mode.py",
+    "app/tests/test_process_supervisor_recording_nonblocking.py",
+    "app/tests/test_edge_sync_recording_catalog_integration.py",
+    "app/tests/test_customer_playback_date_api.py",
+    "app/tests/test_customer_recording_url_local_fallback.py",
+    "app/tests/test_playback_cache_control.py",
+    "app/tests/test_playback_thumbnail_authorization.py",
+    "app/tests/test_playback_discovery_and_timeline_date_scoping.py",
+    "app/tests/test_playback_recording_event_clip_union.py",
+    "app/tests/test_analytics_sync.py",
+    "app/tests/test_analytics_sync_rule_details.py",
+    "app/tests/test_analytics_rules_engine.py",
+    "app/tests/test_appliance_cloud_analytics_events.py",
+    "app/tests/test_analytics_media_reuse_cloud.py",
+    "app/tests/test_customer_analytics_integration.py",
+    "app/tests/test_customer_analytics_rule_worker.py",
+    "app/tests/test_event_media_credential_path.py",
+    "app/tests/test_event_media_local_capture.py",
+    "app/tests/test_samsung_mock_e2e.py"
+  ],
+  "linux_browser": [
+    "app/tests/test_live_p2p_upgrade_browser.py",
+    "app/tests/test_playback_inline_player_browser.py"
+  ],
+  "test_dependencies": {
+    "pytest": "8.4.2",
+    "httpx": "0.28.1",
+    "playwright": "1.55.0"
+  },
+  "agent_environment": {
+    "ANYAICAM_RUN_RTSP_E2E": "1",
+    "ANYAICAM_TEST_MEDIAMTX": "/home/ubuntu/anyaicam-lab/simulator/mediamtx"
+  },
+  "linux_browser_environment": {
+    "ANYAICAM_RUN_BROWSER_TESTS": "1"
+  },
+  "linux_browser_filter": "chromium",
+  "notes": [
+    "Use throwaway databases and separate source/test dependency directories.",
+    "Do not run e2e/conftest.py: it targets approved shared staging/production hosts, which are excluded.",
+    "Four real MediaMTX/FFmpeg tests are included in the final full agent total, not added again."
+  ]
+}

@@ -80,13 +80,13 @@ class VerifyDeviceTests(unittest.TestCase):
         self.assertTrue(success)
         verify.assert_not_called()
 
-    def test_no_credentials_supplied_succeeds_on_reachability_alone(self):
+    def test_no_credentials_supplied_still_requires_rtsp_acceptance(self):
         device = {'ip': '192.168.1.5', 'rtsp_support': True}
         with patch.object(provisioning, 'locate_device', return_value=device), \
-             patch.object(provisioning, 'verify_rtsp_credentials') as verify:
+             patch.object(provisioning, 'verify_rtsp_credentials', return_value=(False, 'Authentication required')) as verify:
             success, message = provisioning.verify_device('k', None)
-        self.assertTrue(success)
-        verify.assert_not_called()
+        self.assertFalse(success)
+        verify.assert_called_once_with('192.168.1.5', 554, '', '', path=provisioning.DEFAULT_RTSP_STREAM_PATH)
 
     def test_credentials_supplied_delegates_to_rtsp_check(self):
         # path is now DEFAULT_RTSP_STREAM_PATH, not omitted (which used

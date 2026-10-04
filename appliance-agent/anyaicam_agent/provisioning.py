@@ -22,6 +22,9 @@ import logging
 import re
 import secrets
 import socket
+from urllib.parse import urlsplit
+
+from .onvif_media import resolve_media_uri
 
 from .discovery import scan
 
@@ -368,7 +371,7 @@ def classify_rtsp_authentication(ip, port, username, password, path='/', timeout
     results is identified): every return path here logs one
     'rtsp_auth_diagnostic' line via _log_rtsp_diagnostic() -- see its
     own docstring for the exact, secret-free field list."""
-    diag = {'path': path, 'scheme': None, 'qop_offered': None, 'qop_selected': None,
+    diag = {'path': path.split('?', 1)[0], 'scheme': None, 'qop_offered': None, 'qop_selected': None,
             'first_status': None, 'retry_status': None, 'algorithm': None,
             'challenge_issue': None, 'stale_retry': False, 'stale_retry_status': None}
 
@@ -501,9 +504,31 @@ def verify_device(device_key, credentials, networks=None):
         return True, 'Device is reachable; no RTSP credential check applicable.'
     username = str((credentials or {}).get('username', ''))
     password = str((credentials or {}).get('password', ''))
-    if not username and not password:
-        return True, 'Device is reachable; no credentials were provided to verify.'
-    # A per-device discovered path always wins once discovery.py can
-    # supply one; falls back to the fleet's known-good default above.
+    # Discovery is local to the appliance; never accept a browser-supplied
+    # host or send credentials to a different host advertised by a camera.
+    port = device.get('rtsp_port', 554)
     path = device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH
-    return verify_rtsp_credentials(device['ip'], 554, username, password, path=path)
+    uri = device.get('rtsp_uri')
+    if not uri and device.get('onvif_support'):
+        media = resolve_media_uri(device['ip'], device_key,
+                                  username=username or None, password=password or None)
+        if media.get('status') == 'auth_required':
+            return False, 'Device requires ONVIF credentials.'
+        if media.get('status') == 'resolved':
+            uri = media.get('rtsp_uri')
+    if uri:
+        try:
+            parsed = urlsplit(uri)
+            if (parsed.scheme != 'rtsp' or parsed.hostname != device['ip']
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.fragment):
+                return False, 'Device returned an invalid or different-host RTSP endpoint.'
+            port = parsed.port if parsed.port is not None else 554
+            path = (parsed.path or '/') + ('?' + parsed.query if parsed.query else '')
+        except (ValueError, TypeError):
+            return False, 'Device returned an invalid RTSP endpoint.'
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return False, 'Device returned an invalid RTSP port.'
+    # DESCRIBE is required even without credentials: a 401 must ask the
+    # customer for credentials, never commission a protected camera as anonymous.
+    return verify_rtsp_credentials(device['ip'], port, username, password, path=path)

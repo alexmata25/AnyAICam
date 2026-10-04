@@ -92,7 +92,13 @@ class FakePC extends EventTarget {
           this.packetsReceived += 10; this.framesDecoded += 1;
         }
       }, 100);
-      if (this.ontrack) this.ontrack({streams: [window.__makeFakeStream()]});
+      if (this.ontrack) {
+        const stream = window.__makeFakeStream();
+        // RTCTrackEvent supplies track as well as streams. The real player
+        // adds that track to its shared audio/video MediaStream.
+        const track = stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+        if (track) this.ontrack({track, streams: [stream]});
+      }
     }, window.__p2pDelayMs);
   }
   async addIceCandidate() {}

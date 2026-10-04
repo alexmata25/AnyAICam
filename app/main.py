@@ -15783,11 +15783,14 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
             ).fetchone()
     except Exception:
         return None
-    if not credential_row:
-        return None
-    credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
-    if not credentials:
-        return None
+    # A commissioned anonymous camera has no credential row. Its own RTSP
+    # server still enforces authentication; missing credentials never bypass
+    # a challenge. An existing but unreadable credential fails closed.
+    credentials = {}
+    if credential_row:
+        credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
+        if not credentials:
+            return None
     rtsp_url = camera["onvif_endpoint"] or ""
     if not rtsp_url.startswith("rtsp://"):
         return None
