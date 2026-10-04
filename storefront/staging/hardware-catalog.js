@@ -93,21 +93,13 @@
     // aac-standalone-relay.png) -- not verified present in this docroot
     // copy; confirm before promoting to live.
     //
-    // SANDBOX TEST PRICES, not real retail: these four `price` values were
-    // deliberately dropped to the tiny Stripe TEST-mode amounts (matching
-    // staging/stripe-config.php's RYZEN_*/RELAY_MODULE_3CH_PRICE_ID Stripe
-    // TEST Price IDs, unit_amount $0.50/$0.51/$0.52/$0.53) so a sandbox
-    // checkout is cheap and visibly distinguishable from a real purchase.
-    // Real retail is $1,249.99 / $1,749.99 / $2,249.99 / $149.99 -- restore
-    // those values (and repoint the Price IDs at live ones) before any
-    // promotion of this file to production. Do not copy these test prices
-    // into the live catalog.
+    // Prices are the published launch prices and match hardware-price-catalog.php.
     {
       sku: 'AIC-APPLIANCE-RYZEN-STARTER',
       kind: 'appliance',
       name: 'AnyAiCam Starter',
       model: 'MINISFORUM AI X1-255 (Ryzen 7 255)',
-      price: 0.50,
+      price: 1249.99,
       image: 'aac-vms-edge-x1-255-ryzen7.jpg'
     },
     {
@@ -115,7 +107,7 @@
       kind: 'appliance',
       name: 'AnyAiCam Professional',
       model: 'MINISFORUM AI X1 (Ryzen AI 9 HX 470)',
-      price: 0.51,
+      price: 1749.99,
       image: 'aac-vms-edge-x1-ryzen9.jpg'
     },
     {
@@ -123,7 +115,7 @@
       kind: 'appliance',
       name: 'AnyAiCam Enterprise',
       model: 'MINISFORUM AI X1 Pro-470',
-      price: 0.52,
+      price: 2249.99,
       image: 'aac-ai-access-edge.webp'
     },
     {
@@ -131,7 +123,7 @@
       kind: 'accessory',
       name: 'Numato 3-Channel Relay Module',
       model: 'Numato 3-channel Ethernet relay',
-      price: 0.53,
+      price: 149.99,
       image: 'aac-standalone-relay.png'
     }
   ];

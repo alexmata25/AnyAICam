@@ -153,6 +153,19 @@ $response = buy('analytics', 'talk_down');
 check($response['status'] === 503 && sessions_created() === 0, 'a one-time Price for a monthly add-on refuses checkout');
 reset_fake([$talkDown => $priceObject($talkDown, 499, ['interval' => 'year', 'interval_count' => 1])]);
 check(buy('analytics', 'talk_down')['status'] === 503 && sessions_created() === 0, 'a yearly Price for a monthly add-on refuses checkout');
+$license8 = $portal['ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8']['price_id'];
+foreach ([
+    'a Price in another currency' => ['hardware', 'AIC-APPLIANCE-RYZEN-STARTER', $starter, ['currency' => 'eur'] + $priceObject($starter, 124999)],
+    'a decimal/custom-amount Price (unit_amount null)' => ['vms_license', '8', $license8, ['unit_amount' => null] + $priceObject($license8, 4999)],
+    'a Price billed every 2 months' => ['analytics', 'talk_down', $talkDown, $priceObject($talkDown, 499, ['interval' => 'month', 'interval_count' => 2])],
+    'an inactive add-on Price' => ['analytics', 'talk_down', $talkDown, $priceObject($talkDown, 499, ['interval' => 'month', 'interval_count' => 1], false)],
+    'an add-on Price at another amount' => ['analytics', 'talk_down', $talkDown, $priceObject($talkDown, 99, ['interval' => 'month', 'interval_count' => 1])],
+    'a monthly Price for a one-time license' => ['vms_license', '8', $license8, $priceObject($license8, 4999, ['interval' => 'month', 'interval_count' => 1])],
+] as $what => [$kind, $key, $id, $object]) {
+    reset_fake([$id => $object]);
+    $response = buy($kind, $key);
+    check($response['status'] === 503 && sessions_created() === 0 && count(session_posts()) === 0, "$what refuses checkout, no session");
+}
 reset_fake([$starter => ['_status' => 404]]);
 $response = buy('hardware', 'AIC-APPLIANCE-RYZEN-STARTER');
 check($response['status'] === 502 && sessions_created() === 0, 'a Price Stripe does not know refuses checkout, no session');
@@ -212,6 +225,12 @@ check(($continueQuery['journey_id'] ?? '') === $j, 'the journey id travels to ch
 // ------------------------------------------------ legacy cart is retired
 $legacy = post_checkout(['adapter_type' => '8ch', 'camera_quantity' => 1], 'stripe-checkout.php');
 check($legacy['status'] === 410, 'the legacy stripe-checkout.php cart (cameras/PoE/adapters, ad-hoc price_data) is retired');
+$legacyPriced = post_checkout(['line_items' => [['price_data' => ['currency' => 'usd', 'unit_amount' => 1]]]], 'stripe-checkout.php');
+check($legacyPriced['status'] === 410, 'a client-priced price_data body to the legacy cart is refused too');
+reset_fake();
+check(post_checkout(['journey_id' => journey(), 'customer_email' => 'buyer@example.test', 'legs' => []])['status'] === 400 && sessions_created() === 0,
+    'an empty cart is refused');
+check(count(array_filter(stripe_log(), fn($r) => $r['path'] === '/v1/customers')) === 0, 'and creates no Stripe Customer');
 
 echo "\n{$passed} passed, {$failures} failed.\n";
 exit($failures > 0 ? 1 : 0);

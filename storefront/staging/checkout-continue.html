@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Checkout in progress (STAGING TEST) | ANY AI CAM</title>
+<title>Checkout in progress | ANY AI CAM</title>
 <!--
   STAGING/REVIEW COPY -- NOT the live Bluehost file. New page: the
   landing page checkout-session.php's success_url points every leg's
@@ -32,7 +32,7 @@ a.button.secondary{background:#fff;color:#5a72d8;border:2px solid #5a72d8;paddin
 <body>
 <div class="card" id="card">
   <div class="spinner"></div>
-  <h1>Completing your sandbox test purchase…</h1>
+  <h1>Completing your purchase…</h1>
   <p id="status-text">Just a moment.</p>
 </div>
 
@@ -71,13 +71,13 @@ async function run() {
     const registerUrl = email ? `${PORTAL_REGISTER_URL}?email=${encodeURIComponent(email)}` : PORTAL_REGISTER_URL;
     card.innerHTML = `
       <div class="done-icon">✅</div>
-      <h1>Sandbox test purchase complete</h1>
+      <h1>Purchase complete</h1>
       <p>"${completedLabel}" was the last item -- every selected item now has its own completed Stripe TEST Checkout Session. No real money was charged (Stripe TEST mode only).</p>
       <div class="next-step">
         <p><strong>Next step:</strong> create your AnyAiCam account${email ? ` using <strong>${email}</strong> (the same email you just checked out with)` : ''}, so your purchase can be attached to it. A partner/administrator still needs to approve the new account before you can sign in -- this is not automatic.</p>
         <a class="button" href="${registerUrl}">Create your AnyAiCam account</a>
       </div>
-      <a class="button secondary" href="build-your-system.html">Build another test order</a>`;
+      <a class="button secondary" href="build-your-system.html">Build another order</a>`;
     return;
   }
 
