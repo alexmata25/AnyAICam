@@ -35,25 +35,41 @@ function throws(callable $fn): ?string {
     }
 }
 
-$hardwareCatalog = [
-    'AIC-APPLIANCE-RYZEN-STARTER' => ['name' => 'AnyAiCam Starter', 'unit_amount' => 50, 'price_id' => 'price_1UDnklGllhK80H2nBAHTk6ZP'],
-    'AIC-APPLIANCE-RYZEN-ENTERPRISE' => ['name' => 'AnyAiCam Professional', 'unit_amount' => 51, 'price_id' => 'price_1UDnmeGllhK80H2nshtCoJD5'],
-    'AIC-APPLIANCE-RYZEN-AAC-FACIAL' => ['name' => 'AnyAiCam Enterprise', 'unit_amount' => 52, 'price_id' => 'price_1UDnnyGllhK80H2nlbwTWX69'],
-    'AIC-RELAY-NUMATO-3CH' => ['name' => 'Numato 3-Channel Relay Module', 'unit_amount' => 53, 'price_id' => 'price_1UDnpkGllhK80H2n2EA2lFmQ'],
-];
+// The real hardware catalog (2026-10-04), not a copy: published prices and
+// the portal-recognized TEST Price IDs from stripe-config.php.
+$hardwareCatalog = require __DIR__ . '/../hardware-price-catalog.php';
+check($hardwareCatalog['AIC-APPLIANCE-RYZEN-STARTER']['unit_amount'] === 124999 && $hardwareCatalog['AIC-APPLIANCE-RYZEN-STARTER']['price_id'] === 'price_1ULTEfGllhK80H2nlzTBBk7G', 'Starter: $1,249.99 on the portal-recognized Price');
+check($hardwareCatalog['AIC-APPLIANCE-RYZEN-ENTERPRISE']['unit_amount'] === 174999 && $hardwareCatalog['AIC-APPLIANCE-RYZEN-ENTERPRISE']['price_id'] === 'price_1ULTEgGllhK80H2n2GBTpJ3v', 'Professional: $1,749.99 on the portal-recognized Price');
+check($hardwareCatalog['AIC-APPLIANCE-RYZEN-AAC-FACIAL']['unit_amount'] === 224999 && $hardwareCatalog['AIC-APPLIANCE-RYZEN-AAC-FACIAL']['price_id'] === 'price_1ULTEgGllhK80H2nbVKxBgNy', 'Enterprise: $2,249.99 on the portal-recognized Price');
+check($hardwareCatalog['AIC-RELAY-NUMATO-3CH']['unit_amount'] === 14999 && $hardwareCatalog['AIC-RELAY-NUMATO-3CH']['price_id'] === 'price_1ULTEhGllhK80H2ncXLynne4', 'Relay: $149.99 on the portal-recognized Price');
+foreach ($hardwareCatalog as $sku => $item) {
+    if (!in_array($sku, SELLABLE_HARDWARE_SKUS, true)) {
+        check($item['price_id'] === '', "{$sku} is not sold here (no Price in this Stripe account)");
+    }
+}
 
 // ------------------------------------------------------------ price IDs
 
 check(count(CAMERA_PLAN_CATALOG) === 8, 'camera plan catalog has all 8 tiers (4 Local + 4 Hybrid)');
 check(count(ANALYTICS_CATALOG) === 5, 'analytics catalog is the 4 packages + Talk Down (2026-09-30 pricing)');
-// Sandbox TEST amounts only -- retail lives in app/pricing_catalog.py and is
-// never mixed into this sandbox catalog.
-foreach (array_merge(CAMERA_PLAN_CATALOG, ANALYTICS_CATALOG, VMS_LICENSE_CATALOG) as $key => $entry) {
-    check($entry['display_price'] === null || $entry['display_price'] < 1.00, "{$key} shows a sandbox TEST amount, never a retail price");
+// Published catalog amounts (app/pricing_catalog.py); the display price is
+// always exactly the amount the server verifies against Stripe.
+$expectedCents = ['local_1_8' => 1499, 'local_9_16' => 2499, 'local_17_32' => 3999, 'local_33_64' => 6999,
+                  'hybrid_1_8' => 2499, 'hybrid_9_16' => 3999, 'hybrid_17_32' => 6999, 'hybrid_33_64' => 9999,
+                  'ai_essentials' => 799, 'ai_professional' => 1499, 'vehicle_intelligence' => 1499,
+                  'advanced_analytics' => 2499, 'talk_down' => 499, 8 => 4999, 16 => 7999, 32 => 12999, 64 => 19999];
+foreach ([CAMERA_PLAN_CATALOG, ANALYTICS_CATALOG, VMS_LICENSE_CATALOG] as $catalog) {
+    foreach ($catalog as $key => $entry) {
+        check($entry['amount_cents'] === $expectedCents[$key], "{$key} charges the published {$expectedCents[$key]} cents");
+        check(abs($entry['display_price'] - $entry['amount_cents'] / 100) < 0.001, "{$key} displays exactly its charged amount");
+    }
 }
 check(array_column(CAMERA_PLAN_CATALOG, 'capacity') === [8, 16, 32, 64, 8, 16, 32, 64], 'every plan carries its camera capacity');
 check(array_keys(VMS_LICENSE_CATALOG) === [8, 16, 32, 64], 'one VMS software license per capacity (8/16/32/64)');
-check(resolve_vms_license(8) === null, 'VMS license fails closed until its TEST Price ID exists');
+foreach ([8 => 'price_1ULTDjGllhK80H2n4cd5fVX1', 16 => 'price_1ULTDjGllhK80H2n7QtlNYHf', 32 => 'price_1ULTDkGllhK80H2nsuVnC8cw', 64 => 'price_1ULTDkGllhK80H2nlPrgGVOL'] as $capacity => $priceId) {
+    check((resolve_vms_license($capacity)['price_id'] ?? '') === $priceId, "VMS license {$capacity} uses the portal-recognized Price");
+}
+check(resolve_vms_license(12) === null, 'an unknown license capacity fails closed');
 check(INCLUDED_FEATURES === ['Secure Edge', 'Smart Motion', 'AACO'], 'Secure Edge, Smart Motion and AACO are included, not sold');
 check(!isset(ANALYTICS_CATALOG['smart_motion']), 'Smart Motion is no longer sold separately');
 check(!isset(ANALYTICS_CATALOG['facial_recognition']) && !isset(ANALYTICS_CATALOG['cloud_overflow']), 'Face Access and Cloud Overflow are not sold here');
@@ -64,20 +80,17 @@ foreach (CAMERA_PLAN_CATALOG as $key => $entry) {
     check($resolved !== null && $resolved['price_id'] !== '', "camera plan '{$key}' has a non-empty price_id");
 }
 foreach (ANALYTICS_CATALOG as $key => $entry) {
-    if ($key === 'advanced_analytics') {
-        continue;  // no TEST Price ID yet -- asserted to fail closed below
-    }
     $resolved = resolve_analytic($key);
     check($resolved !== null, "analytic '{$key}' resolves");
     check($resolved !== null && $resolved['price_id'] !== '', "analytic '{$key}' has a non-empty price_id");
 }
 
-check(resolve_camera_plan('local_1_8')['price_id'] === 'price_1UD2xKGllhK80H2nFJwtFJvw', 'local_1_8 price_id matches the exact TEST Price ID');
-check(resolve_camera_plan('hybrid_33_64')['price_id'] === 'price_1UD33SGllhK80H2nxrbBT2ch', 'hybrid_33_64 price_id matches the exact TEST Price ID');
+check(resolve_camera_plan('local_1_8')['price_id'] === 'price_1ULTDbGllhK80H2nG5js8TyE', 'local_1_8 uses the portal-recognized TEST Price');
+check(resolve_camera_plan('hybrid_33_64')['price_id'] === 'price_1ULTDeGllhK80H2nD8jd8rpd', 'hybrid_33_64 uses the portal-recognized TEST Price');
 check(resolve_analytic('facial_recognition') === null, 'Face Access is not sold here (per door, sized by enrolled people)');
-check(resolve_analytic('advanced_analytics') === null, 'Advanced Analytics fails closed until its TEST Price ID exists');
+check(resolve_analytic('advanced_analytics')['price_id'] === 'price_1ULTDgGllhK80H2nGYQNvKw5', 'Advanced Analytics uses the portal-recognized TEST Price');
 check(resolve_analytic('smart_motion') === null, 'Smart Motion cannot be bought (included in every plan)');
-check(resolve_analytic('talk_down')['price_id'] === 'price_1UD377GllhK80H2nC1Z2VNh0', 'talk_down price_id matches the exact TEST Price ID');
+check(resolve_analytic('talk_down')['price_id'] === 'price_1ULTDhGllhK80H2nJBZtYL9i', 'talk_down uses the portal-recognized TEST Price');
 
 // Fail-closed on unknown keys -- never a guess.
 check(resolve_camera_plan('local_1_9000') === null, 'unknown camera plan key fails closed (null)');
@@ -92,10 +105,6 @@ check(resolve_analytic('not_a_real_analytic') === null, 'unknown analytic key fa
 // price id).
 foreach (array_merge(array_column(CAMERA_PLAN_CATALOG, 'price_id_const'), array_column(ANALYTICS_CATALOG, 'price_id_const')) as $const) {
     $value = config_value_checked($const);
-    if ($const === 'ANALYTICS_ADVANCED_PRICE_ID') {
-        check($value === '', 'ANALYTICS_ADVANCED_PRICE_ID is intentionally empty until created');
-        continue;
-    }
     check(str_starts_with($value, 'price_'), "{$const} looks like a Price ID, not a live secret key or blank value");
 }
 
@@ -129,7 +138,7 @@ check(!is_array($validCart['camera_plan']) || isset($validCart['camera_plan']['k
 
 // Duplicate analytics keys collapse to one, not an error and not two legs.
 $dedupedCart = normalize_cart(['analytics' => ['ai_essentials', 'ai_essentials', 'talk_down']], $hardwareCatalog);
-check(throws(fn() => normalize_cart(['analytics' => ['advanced_analytics']], $hardwareCatalog)) !== null, 'Advanced Analytics is rejected until configured');
+check(throws(fn() => normalize_cart(['analytics' => ['advanced_analytics']], $hardwareCatalog)) === null, 'Advanced Analytics can be bought');
 check(throws(fn() => normalize_cart(['analytics' => ['smart_motion']], $hardwareCatalog)) !== null, 'Smart Motion is rejected (included, not sold)');
 check(count($dedupedCart['analytics']) === 2, 'duplicate analytics keys are deduplicated, not doubled');
 
@@ -147,17 +156,18 @@ $hardwareOnlyCart = normalize_cart(['appliance_sku' => 'AIC-APPLIANCE-RYZEN-STAR
 $hardwareOnlyLegs = build_checkout_legs($hardwareOnlyCart, $hardwareCatalog);
 check(count($hardwareOnlyLegs) === 1 && $hardwareOnlyLegs[0]['mode'] === 'payment', 'hardware alone stays a single one-time leg');
 
-// DIY (customer-owned PC): a camera plan without an appliance needs the
-// one-time VMS software license, so it fails closed until that TEST Price
-// ID exists -- never silently sold without the license.
-check(throws(fn() => normalize_cart(['camera_plan' => 'local_1_8'], $hardwareCatalog)) !== null,
-    'a DIY plan-only cart is refused while the VMS license is unconfigured');
+// DIY (customer-owned PC): a camera plan without an appliance carries the
+// one-time VMS software license of the same capacity -- never sold without it.
+$diyLegs = build_checkout_legs(normalize_cart(['camera_plan' => 'local_9_16'], $hardwareCatalog), $hardwareCatalog);
+check(array_column($diyLegs, 'kind') === ['camera_plan', 'vms_license'], 'a DIY plan-only cart adds the license leg');
+check($diyLegs[1]['key'] === '16' && $diyLegs[1]['price_id'] === 'price_1ULTDjGllhK80H2n7QtlNYHf' && abs($diyLegs[1]['amount'] - 79.99) < 0.001,
+    'the DIY license matches the plan capacity: 16 cameras, $79.99');
 
 $appliancePlanCart = normalize_cart(['appliance_sku' => 'AIC-APPLIANCE-RYZEN-STARTER', 'camera_plan' => 'hybrid_1_8'], $hardwareCatalog);
 $appliancePlanLegs = build_checkout_legs($appliancePlanCart, $hardwareCatalog);
 check(count($appliancePlanLegs) === 2, 'appliance + Hybrid = 2 legs, no separate license leg');
 check(!in_array('vms_license', array_column($appliancePlanLegs, 'kind'), true), 'no VMS license leg when an appliance is bought (no double charge)');
-check($appliancePlanLegs[1]['price_id'] === 'price_1UD31AGllhK80H2nMKtYEmVw', 'Hybrid resolves the correct recurring Price ID');
+check($appliancePlanLegs[1]['price_id'] === 'price_1ULTDdGllhK80H2ncLHUF7XQ', 'Hybrid resolves the portal-recognized recurring Price');
 
 $analyticsOnlyCart = normalize_cart(['analytics' => ['talk_down']], $hardwareCatalog);
 check(count(build_checkout_legs($analyticsOnlyCart, $hardwareCatalog)) === 1, 'one analytic alone stays a single recurring leg');
@@ -167,8 +177,23 @@ check(count(build_checkout_legs($analyticsOnlyCart, $hardwareCatalog)) === 1, 'o
 $summary = order_summary($legs);
 check(count($summary['one_time']['items']) === 2, 'summary separates the 2 one-time items (appliance + relay)');
 check(count($summary['monthly']['items']) === 4, 'summary separates the 4 monthly items (camera plan + 3 analytics)');
-check(abs($summary['one_time']['subtotal'] - 1.03) < 0.001, 'one-time subtotal is $0.50 + $0.53 = $1.03 (license included with the appliance)');
-check(abs($summary['monthly']['subtotal'] - (0.60 + 0.85 + 0.87 + 0.84)) < 0.001, 'monthly subtotal is the sandbox $0.60 + $0.85 + $0.87 + $0.84 (Local 8 + AI Essentials + Vehicle Intelligence + Talk Down)');
+check(abs($summary['one_time']['subtotal'] - 1399.98) < 0.001, 'one-time subtotal is $1,249.99 + $149.99 = $1,399.98 (license included with the appliance)');
+check(abs($summary['monthly']['subtotal'] - (14.99 + 7.99 + 14.99 + 4.99)) < 0.001, 'monthly subtotal is $14.99 + $7.99 + $14.99 + $4.99 (Local 8 + AI Essentials + Vehicle Intelligence + Talk Down)');
+
+// --------------------------------------------- Stripe Price verification
+$good = ['id' => 'price_x', 'active' => true, 'currency' => 'usd', 'unit_amount' => 124999, 'recurring' => null];
+check(stripe_price_problem($good, 'price_x', 124999, 'payment') === null, 'a matching one-time Price passes');
+check(stripe_price_problem(['unit_amount' => 50] + $good, 'price_x', 124999, 'payment') !== null, 'a Price that charges another amount is refused');
+check(stripe_price_problem(['unit_amount' => '124999'] + $good, 'price_x', 124999, 'payment') !== null, 'a non-integer amount is refused');
+check(stripe_price_problem(['active' => false] + $good, 'price_x', 124999, 'payment') !== null, 'an inactive Price is refused');
+check(stripe_price_problem(['currency' => 'eur'] + $good, 'price_x', 124999, 'payment') !== null, 'a non-USD Price is refused');
+check(stripe_price_problem(['id' => 'price_other'] + $good, 'price_x', 124999, 'payment') !== null, 'a different Price is refused');
+check(stripe_price_problem(['recurring' => ['interval' => 'month']] + $good, 'price_x', 124999, 'payment') !== null, 'a recurring Price is refused for a one-time item');
+$monthly = ['id' => 'price_m', 'active' => true, 'currency' => 'usd', 'unit_amount' => 1499, 'recurring' => ['interval' => 'month', 'interval_count' => 1]];
+check(stripe_price_problem($monthly, 'price_m', 1499, 'subscription') === null, 'a matching monthly Price passes');
+check(stripe_price_problem(['recurring' => ['interval' => 'year', 'interval_count' => 1]] + $monthly, 'price_m', 1499, 'subscription') !== null, 'a yearly Price is refused for a monthly plan');
+check(stripe_price_problem(['recurring' => null] + $monthly, 'price_m', 1499, 'subscription') !== null, 'a one-time Price is refused for a monthly plan');
+check(stripe_price_problem([], 'price_m', 1499, 'subscription') !== null, 'an empty answer is refused');
 // Never combined into one misleading total: assert the two buckets are
 // genuinely separate keys, not summed into a single 'total' field.
 check(!array_key_exists('total', $summary), 'order summary never exposes a combined one-time+monthly total');

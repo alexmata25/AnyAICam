@@ -1,0 +1,26 @@
+{
+  "_about": "The Stripe TEST Price IDs the STAGING portal recognizes (ANYAICAM_STRIPE_PRICE_* in /etc/anyaicam-staging/vms-staging.env, read 2026-10-04) for everything the staging storefront sells. Stripe account acct_1U87e9GllhK80H2n, TEST mode. Each Price was created by tools/stripe_create_catalog_prices.py with the lookup key below, and its amount equals the published catalog price (app/pricing_catalog.py, app/hardware_orders.py). Price IDs are not secrets. The storefront (storefront/staging/stripe-config.php) must use exactly these IDs; app/tests/test_storefront_portal_price_ids.py enforces it. Never put these TEST IDs in a live configuration.",
+  "prices": {
+    "ANYAICAM_STRIPE_PRICE_RYZEN_STARTER":          {"price_id": "price_1ULTEfGllhK80H2nlzTBBk7G", "lookup_key": "anyaicam_hw_aic_appliance_ryzen_starter_124999",    "amount_cents": 124999, "interval": null},
+    "ANYAICAM_STRIPE_PRICE_RYZEN_ENTERPRISE":       {"price_id": "price_1ULTEgGllhK80H2n2GBTpJ3v", "lookup_key": "anyaicam_hw_aic_appliance_ryzen_enterprise_174999", "amount_cents": 174999, "interval": null},
+    "ANYAICAM_STRIPE_PRICE_RYZEN_AAC_FACIAL":       {"price_id": "price_1ULTEgGllhK80H2nbVKxBgNy", "lookup_key": "anyaicam_hw_aic_appliance_ryzen_aac_facial_224999", "amount_cents": 224999, "interval": null},
+    "ANYAICAM_STRIPE_PRICE_RELAY_NUMATO_3CH":       {"price_id": "price_1ULTEhGllhK80H2ncXLynne4", "lookup_key": "anyaicam_hw_aic_relay_numato_3ch_14999",             "amount_cents": 14999,  "interval": null},
+    "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8":          {"price_id": "price_1ULTDjGllhK80H2n4cd5fVX1", "lookup_key": "anyaicam_vms_license_8_4999",    "amount_cents": 4999,  "interval": null},
+    "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_16":         {"price_id": "price_1ULTDjGllhK80H2n7QtlNYHf", "lookup_key": "anyaicam_vms_license_16_7999",   "amount_cents": 7999,  "interval": null},
+    "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_32":         {"price_id": "price_1ULTDkGllhK80H2nsuVnC8cw", "lookup_key": "anyaicam_vms_license_32_12999",  "amount_cents": 12999, "interval": null},
+    "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64":         {"price_id": "price_1ULTDkGllhK80H2nlPrgGVOL", "lookup_key": "anyaicam_vms_license_64_19999",  "amount_cents": 19999, "interval": null},
+    "ANYAICAM_STRIPE_PRICE_LOCAL_1_8":              {"price_id": "price_1ULTDbGllhK80H2nG5js8TyE", "lookup_key": "anyaicam_local_8_1499",   "amount_cents": 1499, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_LOCAL_9_16":             {"price_id": "price_1ULTDbGllhK80H2nsHlQqGqE", "lookup_key": "anyaicam_local_16_2499",  "amount_cents": 2499, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_LOCAL_17_32":            {"price_id": "price_1ULTDcGllhK80H2n7uwbVonf", "lookup_key": "anyaicam_local_32_3999",  "amount_cents": 3999, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_LOCAL_33_64":            {"price_id": "price_1ULTDcGllhK80H2nTd2PMMSn", "lookup_key": "anyaicam_local_64_6999",  "amount_cents": 6999, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_HYBRID_1_8":             {"price_id": "price_1ULTDdGllhK80H2ncLHUF7XQ", "lookup_key": "anyaicam_hybrid_8_2499",  "amount_cents": 2499, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_HYBRID_9_16":            {"price_id": "price_1ULTDdGllhK80H2nUxGoG1mj", "lookup_key": "anyaicam_hybrid_16_3999", "amount_cents": 3999, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_HYBRID_17_32":           {"price_id": "price_1ULTDeGllhK80H2n16rH7dIK", "lookup_key": "anyaicam_hybrid_32_6999", "amount_cents": 6999, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_HYBRID_33_64":           {"price_id": "price_1ULTDeGllhK80H2nD8jd8rpd", "lookup_key": "anyaicam_hybrid_64_9999", "amount_cents": 9999, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS":        {"price_id": "price_1ULTDfGllhK80H2noos78Omo", "lookup_key": "anyaicam_ai_essentials_799",         "amount_cents": 799,  "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_PROFESSIONAL":      {"price_id": "price_1ULTDfGllhK80H2nnMlSGoz7", "lookup_key": "anyaicam_ai_professional_1499",      "amount_cents": 1499, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE": {"price_id": "price_1ULTDgGllhK80H2nkLTjPGlD", "lookup_key": "anyaicam_vehicle_intelligence_1499", "amount_cents": 1499, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS":             {"price_id": "price_1ULTDgGllhK80H2nGYQNvKw5", "lookup_key": "anyaicam_advanced_analytics_2499",   "amount_cents": 2499, "interval": "month"},
+    "ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN":            {"price_id": "price_1ULTDhGllhK80H2nJBZtYL9i", "lookup_key": "anyaicam_talk_down_499",             "amount_cents": 499,  "interval": "month"}
+  }
+}
