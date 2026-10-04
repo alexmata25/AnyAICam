@@ -7,7 +7,7 @@ document.addEventListener("DOMContentLoaded", function () {
         <img src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection">
         <p>Local-first and hybrid video management, edge appliances, cloud protection, and modular AI analytics.</p>
       </section>
-      <section><h2>Products</h2><a href="plans.html">Plan Explainer</a><a href="pricing.html">Pricing</a><a href="analytics.html">Analytics Catalog</a><a href="hardware.html">Hardware Selector</a><a href="build-your-system.html">Build Your System</a></section>
+      <section><h2>Products</h2><a href="plans.html">Plan Explainer</a><a href="pricing.html">Pricing</a><a href="analytics.html">Analytics Catalog</a><a href="edge-appliance.html#appliances">Ryzen Appliances</a><a href="vms.html#linux-download">AnyAiCam for Linux</a><a href="hardware.html">Hardware Selector</a><a href="build-your-system.html">Build Your System</a></section>
       <section><h2>Resources</h2><a href="signin.html">Customer Sign In</a><a href="support.html">Support</a><a href="contact.html">Contact</a><a href="sales-partner-login.html">Sales Partner Login</a><a href="/camera-compatibility-check.html">Camera Compatibility</a><a href="/cloud-storage-pricing.html">Videoloft Cloud Pricing</a></section>
       <section><h2>Contact</h2><a href="tel:+13465544699">(346) 554-4699</a><a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a><address>6218 Arcadia Sound Lane<br>Porter, Texas 77365</address></section>
     </div>
