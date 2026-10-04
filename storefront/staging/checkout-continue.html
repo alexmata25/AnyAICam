@@ -88,6 +88,7 @@ async function run() {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
+        journey_id: p.journey_id || '',
         customer_email: p.customer_email || '',
         stripe_customer_id: p.stripe_customer_id || '',
         legs: remainingLegs,

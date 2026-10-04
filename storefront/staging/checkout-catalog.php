@@ -41,17 +41,18 @@ declare(strict_types=1);
  * subscriptions end to end) -- B is materially larger and riskier for a
  * staging build with no product requirement driving it yet.
  *
- * SANDBOX TEST PRICES: every display_price below is the tiny Stripe TEST
- * amount the Price IDs in stripe-config.php actually charge -- never the
- * retail price. Retail prices live ONLY in app/pricing_catalog.py
- * (approved 2026-09-30); never promote these numbers to production.
- * Structure follows that catalog: Local/Hybrid plans, the four analytics
+ * PRICES (2026-10-04): every amount_cents below is the published catalog
+ * price (app/pricing_catalog.py, approved 2026-09-30) -- the same amount the
+ * portal-recognized Stripe TEST Price in stripe-config.php charges. Before
+ * this they were tiny sandbox amounts on Prices the portal ignored.
+ * checkout-session.php verifies each Stripe Price against amount_cents
+ * before creating a Checkout Session (stripe_price_problem() below) and
+ * refuses on any mismatch. Structure follows that catalog: Local/Hybrid plans, the four analytics
  * packages (flat, never per camera), Talk Down (per site, includes AAC
  * Voice Call), and the one-time VMS software license -- charged for a DIY
  * install, included (not charged) when an AnyAiCam appliance is in the
  * cart. Secure Edge, Smart Motion and AACO are included in every plan.
- * Advanced Analytics and the VMS licenses have no TEST Price ID yet and
- * fail closed. Friends & Family is never a code: it is requested from the
+ * Friends & Family is never a code: it is requested from the
  * customer's signed-in AnyAiCam account and approved by an administrator.
  */
 
@@ -75,20 +76,19 @@ function config_value_checked(string $name): string {
 // Analytics packages (flat, never per camera) and Talk Down (per site,
 // includes AAC Voice Call). Package contents live in app/pricing_catalog.py.
 const ANALYTICS_CATALOG = [
-    'ai_essentials'        => ['label' => 'AI Essentials',                        'display_price' => 0.85, 'price_id_const' => 'ANALYTICS_AI_ESSENTIALS_PRICE_ID'],
-    'ai_professional'      => ['label' => 'AI Professional',                      'display_price' => 0.86, 'price_id_const' => 'ANALYTICS_AI_PROFESSIONAL_PRICE_ID'],
-    'vehicle_intelligence' => ['label' => 'Vehicle Intelligence',                 'display_price' => 0.87, 'price_id_const' => 'ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID'],
-    'advanced_analytics'   => ['label' => 'Advanced Analytics',                   'display_price' => null, 'price_id_const' => 'ANALYTICS_ADVANCED_PRICE_ID'],
-    'talk_down'            => ['label' => 'Talk Down (includes AAC Voice Call)',  'display_price' => 0.84, 'price_id_const' => 'ANALYTICS_TALK_DOWN_PRICE_ID'],
+    'ai_essentials'        => ['label' => 'AI Essentials',                        'amount_cents' => 799, 'display_price' => 7.99, 'price_id_const' => 'ANALYTICS_AI_ESSENTIALS_PRICE_ID'],
+    'ai_professional'      => ['label' => 'AI Professional',                      'amount_cents' => 1499, 'display_price' => 14.99, 'price_id_const' => 'ANALYTICS_AI_PROFESSIONAL_PRICE_ID'],
+    'vehicle_intelligence' => ['label' => 'Vehicle Intelligence',                 'amount_cents' => 1499, 'display_price' => 14.99, 'price_id_const' => 'ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID'],
+    'advanced_analytics'   => ['label' => 'Advanced Analytics',                   'amount_cents' => 2499, 'display_price' => 24.99, 'price_id_const' => 'ANALYTICS_ADVANCED_PRICE_ID'],
+    'talk_down'            => ['label' => 'Talk Down (includes AAC Voice Call)',  'amount_cents' => 499, 'display_price' => 4.99, 'price_id_const' => 'ANALYTICS_TALK_DOWN_PRICE_ID'],
 ];
 
-// One-time VMS software license, keyed by camera capacity. Sandbox TEST
-// amounts (retail: $49.99 / $79.99 / $129.99 / $199.99, app/pricing_catalog.py).
+// One-time VMS software license, keyed by camera capacity (app/pricing_catalog.py).
 const VMS_LICENSE_CATALOG = [
-    8  => ['label' => 'VMS software license, 8 cameras',  'display_price' => 0.40, 'price_id_const' => 'VMS_LICENSE_8_PRICE_ID'],
-    16 => ['label' => 'VMS software license, 16 cameras', 'display_price' => 0.41, 'price_id_const' => 'VMS_LICENSE_16_PRICE_ID'],
-    32 => ['label' => 'VMS software license, 32 cameras', 'display_price' => 0.42, 'price_id_const' => 'VMS_LICENSE_32_PRICE_ID'],
-    64 => ['label' => 'VMS software license, 64 cameras', 'display_price' => 0.43, 'price_id_const' => 'VMS_LICENSE_64_PRICE_ID'],
+    8  => ['label' => 'VMS software license, 8 cameras',  'amount_cents' => 4999, 'display_price' => 49.99, 'price_id_const' => 'VMS_LICENSE_8_PRICE_ID'],
+    16 => ['label' => 'VMS software license, 16 cameras', 'amount_cents' => 7999, 'display_price' => 79.99, 'price_id_const' => 'VMS_LICENSE_16_PRICE_ID'],
+    32 => ['label' => 'VMS software license, 32 cameras', 'amount_cents' => 12999, 'display_price' => 129.99, 'price_id_const' => 'VMS_LICENSE_32_PRICE_ID'],
+    64 => ['label' => 'VMS software license, 64 cameras', 'amount_cents' => 19999, 'display_price' => 199.99, 'price_id_const' => 'VMS_LICENSE_64_PRICE_ID'],
 ];
 
 /** Fail-closed: an unknown or unconfigured license capacity resolves to null. */
@@ -105,6 +105,42 @@ function resolve_vms_license(int $capacity): ?array {
 }
 
 const INCLUDED_FEATURES = ['Secure Edge', 'Smart Motion', 'AACO'];
+
+// The only hardware this storefront sells (2026-10-04): the three Ryzen
+// appliances and the Numato relay. Cameras, PoE switches and adapters stay in
+// the hardware catalog for display but have no Price in this Stripe account,
+// so a checkout leg naming them is refused.
+const SELLABLE_HARDWARE_SKUS = ['AIC-APPLIANCE-RYZEN-STARTER', 'AIC-APPLIANCE-RYZEN-ENTERPRISE',
+                                'AIC-APPLIANCE-RYZEN-AAC-FACIAL', 'AIC-RELAY-NUMATO-3CH'];
+
+/**
+ * Fail-closed check of a Stripe Price object (GET /v1/prices/<id>) against
+ * the catalog: null when it charges exactly $expectedCents in USD, is active,
+ * and is one-time for mode "payment" / monthly for mode "subscription";
+ * otherwise a short reason. Never trusts a client-side amount.
+ */
+function stripe_price_problem(array $price, string $expectedPriceId, int $expectedCents, string $mode): ?string {
+    if ((string)($price['id'] ?? '') !== $expectedPriceId) {
+        return 'Stripe returned a different Price';
+    }
+    if (($price['active'] ?? false) !== true) {
+        return 'the Stripe Price is not active';
+    }
+    if (strtolower((string)($price['currency'] ?? '')) !== 'usd') {
+        return 'the Stripe Price is not in USD';
+    }
+    if (!is_int($price['unit_amount'] ?? null) || $price['unit_amount'] !== $expectedCents) {
+        return 'the Stripe Price does not charge the published amount';
+    }
+    $recurring = $price['recurring'] ?? null;
+    if ($mode === 'payment') {
+        return $recurring === null ? null : 'the Stripe Price is recurring, not one-time';
+    }
+    if (!is_array($recurring) || ($recurring['interval'] ?? '') !== 'month' || (int)($recurring['interval_count'] ?? 1) !== 1) {
+        return 'the Stripe Price is not monthly';
+    }
+    return null;
+}
 
 /** Fail-closed: an unknown analytic key resolves to null, never a guess. */
 function resolve_analytic(string $key): ?array {

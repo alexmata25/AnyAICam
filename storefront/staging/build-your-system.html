@@ -9,9 +9,11 @@
   equivalent exists yet. Built for the Local/Hybrid camera-slot
   subscription + analytics add-on checkout flow this repo has never had
   before (see checkout-catalog.php/checkout-session.php for the backend
-  half). Do not promote this page's PRICES to production as-is -- every
-  dollar figure on this page is a Stripe TEST-mode sandbox amount, not
-  real retail (see the banner below and each section's own note).
+  half). Prices (2026-10-04): every amount here is the published AnyAiCam
+  catalog price (app/pricing_catalog.py), charged in Stripe TEST mode through
+  the same TEST Prices the staging portal recognizes
+  (deploy/staging-stripe-test-prices.json); the server verifies each Stripe
+  Price against these amounts before checkout. Test cards only.
 -->
 <style>
 :root{--navy:#0b1332;--ink:#182443;--blue:#5a72d8;--pink:#bf2a91;--cyan:#31cad2;--paper:#f5f7fc;--muted:#61708c;--warn:#8b1730;--warnbg:#fff0f2}
@@ -58,8 +60,8 @@ h1{font-size:clamp(1.6rem,3vw,2.2rem);margin:.4rem 0 .2rem}
 </style>
 </head>
 <body>
-<div class="test-banner">SANDBOX / STRIPE TEST MODE ONLY -- every price on this page is a test amount, never real retail
-  <small>This page and every price shown must never be promoted to production. See staging/stripe-config.php for the real Stripe TEST Price IDs behind each item.</small>
+<div class="test-banner">STRIPE TEST MODE ONLY -- published AnyAiCam prices, paid with Stripe test cards; no real money is charged
+  <small>Checkout uses the Stripe TEST Prices in staging/stripe-config.php. Never use these TEST Price IDs in production.</small>
 </div>
 <header class="site-header"><a class="brand" href="/vms.html">ANY AI CAM</a><span style="color:var(--muted);font-weight:700;font-size:.9rem">Build Your System &middot; Staging Sandbox</span></header>
 
@@ -127,27 +129,29 @@ h1{font-size:clamp(1.6rem,3vw,2.2rem);margin:.4rem 0 .2rem}
 
 <script>
 const APPLIANCES = [
-  {sku:'AIC-APPLIANCE-RYZEN-STARTER', name:'AnyAiCam Starter', model:'MINISFORUM AI X1-255 (Ryzen 7 255)', price:0.50},
-  {sku:'AIC-APPLIANCE-RYZEN-ENTERPRISE', name:'AnyAiCam Professional', model:'MINISFORUM AI X1 (Ryzen AI 9 HX 470)', price:0.51},
-  {sku:'AIC-APPLIANCE-RYZEN-AAC-FACIAL', name:'AnyAiCam Enterprise', model:'MINISFORUM AI X1 Pro-470', price:0.52},
+  {sku:'AIC-APPLIANCE-RYZEN-STARTER', name:'AnyAiCam Starter', model:'MINISFORUM AI X1-255 (Ryzen 7 255)', price:1249.99},
+  {sku:'AIC-APPLIANCE-RYZEN-ENTERPRISE', name:'AnyAiCam Professional', model:'MINISFORUM AI X1 (Ryzen AI 9 HX 470)', price:1749.99},
+  {sku:'AIC-APPLIANCE-RYZEN-AAC-FACIAL', name:'AnyAiCam Enterprise', model:'MINISFORUM AI X1 Pro-470', price:2249.99},
 ];
-const RELAY = {sku:'AIC-RELAY-NUMATO-3CH', name:'Numato 3-Channel Relay Module', model:'Numato 3-channel Ethernet relay', price:0.53};
-// One-time VMS software license by capacity (sandbox TEST amounts; retail in
-// app/pricing_catalog.py). Included with an appliance, charged for DIY.
+const RELAY = {sku:'AIC-RELAY-NUMATO-3CH', name:'Numato 3-Channel Relay Module', model:'Numato 3-channel Ethernet relay', price:149.99};
+// One-time VMS software license by size (app/pricing_catalog.py).
+// Included with an appliance, charged for a customer-owned PC.
 const LICENSE_SIZES = [8, 16, 32, 64];
-const VMS_LICENSE_PRICES = {8:0.40, 16:0.41, 32:0.42, 64:0.43};
-// Sandbox TEST amounts (retail lives only in app/pricing_catalog.py). Packages
-// are flat add-ons, never per camera; Secure Edge, Smart Motion and AACO are
-// included in every plan. price null = no TEST Price ID yet (not selectable).
+const VMS_LICENSE_PRICES = {8:49.99, 16:79.99, 32:129.99, 64:199.99};
+// Monthly add-ons (app/pricing_catalog.py). Packages are flat, never per
+// camera; Secure Edge, Smart Motion and AACO are included in every plan.
 const ANALYTICS = [
-  {key:'ai_essentials', label:'AI Essentials', note:'People Counting', price:0.85},
-  {key:'ai_professional', label:'AI Professional', note:'People Counting and PPE', price:0.86},
-  {key:'vehicle_intelligence', label:'Vehicle Intelligence', note:'License plates and vehicle events', price:0.87},
-  {key:'advanced_analytics', label:'Advanced Analytics', note:'People Counting, License plates and PPE', price:null},
-  {key:'talk_down', label:'Talk Down', note:'Per site, includes AAC Voice Call', price:0.84},
+  {key:'ai_essentials', label:'AI Essentials', note:'People Counting', price:7.99},
+  {key:'ai_professional', label:'AI Professional', note:'People Counting and PPE', price:14.99},
+  {key:'vehicle_intelligence', label:'Vehicle Intelligence', note:'License plates and vehicle events', price:14.99},
+  {key:'advanced_analytics', label:'Advanced Analytics', note:'People Counting, License plates and PPE', price:24.99},
+  {key:'talk_down', label:'Talk Down', note:'Per site, includes AAC Voice Call', price:4.99},
 ];
 
 const state = {applianceSku:null, relay:false, licenseSize:null, analytics:new Set()};
+// One id per visit (2026-10-04): the server derives Stripe Idempotency-Keys
+// from it, so a double click opens the same Checkout Session, never a second.
+const JOURNEY_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).replace(/[^A-Za-z0-9_-]/g, '');
 
 const money = v => Number(v || 0).toLocaleString('en-US', {style:'currency', currency:'USD'});
 
@@ -271,7 +275,7 @@ document.getElementById('checkout-button').addEventListener('click', async () =>
     const response = await fetch('checkout-session.php', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({customer_email: email, stripe_customer_id: '', legs}),
+      body: JSON.stringify({journey_id: JOURNEY_ID, customer_email: email, stripe_customer_id: '', legs}),
     });
     const data = await response.json();
     if (!response.ok) {

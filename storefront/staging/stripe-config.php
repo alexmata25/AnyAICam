@@ -41,115 +41,81 @@ define('STRIPE_WEBHOOK_SECRET', _anyaicam_stripe_secret('STRIPE_WEBHOOK_SECRET')
 // Publishable key is optional for the current server-created Checkout Session flow.
 define('STRIPE_PUBLISHABLE_KEY', '');
 
-// Existing adapter Stripe Prices -- unchanged from the live file.
-define('WEBHOOK_TEST_PRICE_ID', 'price_1Tu07GLeOpYDAzwemdlVNWUa');
-define('ADAPTER_8CH_PRICE_ID', 'price_1Tov5kLeOpYDAzwe7fCiPrky');
-define('ADAPTER_16CH_PRICE_ID', 'price_1Tov7DLeOpYDAzweEXqbq0rY');
-define('ADAPTER_32CH_PRICE_ID', 'price_1TovAkLeOpYDAzwegtDbHRvM');
-define('ADAPTER_64CH_PRICE_ID', 'price_1TovC9LeOpYDAzwepOg2TTSk');
-
-// Camera Stripe Prices -- unchanged from the live file.
-define('CAMERA_5MP_DOME_PRICE_ID', 'price_1TwwzkLeOpYDAzweaUOb0Hu8');
-define('CAMERA_5MP_BULLET_PRICE_ID', 'price_1Twx2dLeOpYDAzweRLXdygCP');
-define('CAMERA_5MP_FISHEYE_PRICE_ID', 'price_1Twx55LeOpYDAzweDoUvcVTN');
-define('CAMERA_DUAL_LENS_PRICE_ID', 'price_1TwxA0LeOpYDAzwegMdXH5zr');
-
-// PoE switch Stripe Prices -- unchanged from the live file.
-define('POE_8_PORT_PRICE_ID', 'price_1TwxGjLeOpYDAzweuDZxytf3');
-define('POE_16_PORT_PRICE_ID', 'price_1TwxKALeOpYDAzweEjb26IK0');
-define('POE_24_PORT_PRICE_ID', 'price_1TwxMELeOpYDAzweMoI6xuIZ');
-define('POE_48_PORT_PRICE_ID', 'price_1TwxNsLeOpYDAzwew9WMiGV4');
-
 // ---------------------------------------------------------------------
-// NEW: staging hardware -- Ryzen appliances + Numato relay module.
-//
-// Every constant below is read exactly like every pre-existing Price ID
-// constant above (config_value() in stripe-checkout.php already treats
-// an unset/empty constant as "not payable yet" and fails closed -- see
-// camera_checkout.php's and stripe-checkout.php's existing handling).
-// These four are STRIPE TEST/SANDBOX Price IDs, confirmed by the site
-// owner -- NOT live/production values. Do not copy these into the live
-// stripe-config.php; the live file must only ever hold live-mode
-// (price_... created under a live Stripe account) IDs.
-//
-// Prices match the approved staging source of truth (website-pricing-
-// review/build-your-system.html) as of this pass:
-//   AnyAiCam Starter (MINISFORUM AI X1-255 -- Ryzen 7 255)      $1,249.99 one-time (124999 cents)
-//   AnyAiCam Professional (MINISFORUM AI X1 -- Ryzen AI 9 HX 470) $1,749.99 one-time (174999 cents)
-//   AnyAiCam Enterprise (MINISFORUM AI X1 Pro-470)  $2,249.99 one-time (224999 cents)
-//   Numato Lab 3-Channel Ethernet Relay Module                 $149.99 one-time ( 14999 cents)
-//
-// Display-name rename (this pass): customer-facing names are now
-// "AnyAiCam Starter/Professional/Enterprise" -- the underlying hardware
-// model spec is unchanged, and the AAC Facial Recognition unit's correct
-// model is still "MINISFORUM AI X1 Pro-470", never "AI X1-255" (that
-// model belongs to the Starter unit, a different unit entirely). Only
-// the 'name' values in $hardwareCatalog below changed; the array keys
-// (SKUs) and price_id lookups are untouched.
-//
-// RYZEN_ENTERPRISE_PRICE_ID is deliberately named distinctly from any
-// existing "enterprise" identifier in this codebase (there is none in
-// this PHP site's own config; the AnyAiCam-VMS backend separately has a
-// legacy "enterprise" SOFTWARE plan key that must never be confused with
-// this HARDWARE appliance -- see that repo's customer_entitlements.py/
-// hardware_orders.py for the equivalent guard on that side).
-// Hardcoded exactly like every other Price ID constant above (Price IDs
-// are not secrets -- only STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET use the
-// env/local-secrets-file mechanism in this file).
-define('RYZEN_STARTER_PRICE_ID', 'price_1UDnklGllhK80H2nBAHTk6ZP');
-define('RYZEN_ENTERPRISE_PRICE_ID', 'price_1UDnmeGllhK80H2nshtCoJD5');
-define('RYZEN_AAC_FACIAL_PRICE_ID', 'price_1UDnnyGllhK80H2nlbwTWX69');
-define('RELAY_MODULE_3CH_PRICE_ID', 'price_1UDnpkGllhK80H2n2EA2lFmQ');
+// Price IDs (2026-10-04): every product this staging storefront sells uses
+// EXACTLY the Stripe TEST Price the staging portal recognizes -- the same
+// Stripe account as STRIPE_SECRET_KEY (acct_1U87e9GllhK80H2n, TEST mode),
+// each charging the published catalog price. Source of truth:
+// deploy/staging-stripe-test-prices.json (the portal's ANYAICAM_STRIPE_PRICE_*
+// values); app/tests/test_storefront_portal_price_ids.py fails if any ID here
+// differs from it. Before this, the storefront used separate cent-priced
+// sandbox Prices the portal ignored, so a storefront purchase never became a
+// portal order, plan or license. Never copy these TEST IDs into a live file.
 
-// ---------------------------------------------------------------------
-// NEW: staging recurring products -- Local/Hybrid camera-slot
-// subscriptions + the 10 analytics add-ons. No live equivalent exists
-// yet (this checkout path has never been built anywhere -- website or
-// backend). SANDBOX TEST Price IDs only, verified against the current
-// Stripe TEST catalog (see the reconciliation pass that confirmed these
-// exact IDs and amounts). Never copy these into a live config file --
-// this file has no test/live switch of its own, exactly like every
-// hardware constant above; environment is what's staged, not the code.
-//
+// Adapters, cameras, PoE switches and the old webhook test price: their Price
+// IDs belonged to a DIFFERENT Stripe account ("No such price" in this one) and
+// no Price exists for them in this account, so they are not sold here -- an
+// empty ID fails closed in every checkout path. Not replaced with invented prices.
+define('WEBHOOK_TEST_PRICE_ID', '');
+define('ADAPTER_8CH_PRICE_ID', '');
+define('ADAPTER_16CH_PRICE_ID', '');
+define('ADAPTER_32CH_PRICE_ID', '');
+define('ADAPTER_64CH_PRICE_ID', '');
+define('CAMERA_5MP_DOME_PRICE_ID', '');
+define('CAMERA_5MP_BULLET_PRICE_ID', '');
+define('CAMERA_5MP_FISHEYE_PRICE_ID', '');
+define('CAMERA_DUAL_LENS_PRICE_ID', '');
+define('POE_8_PORT_PRICE_ID', '');
+define('POE_16_PORT_PRICE_ID', '');
+define('POE_24_PORT_PRICE_ID', '');
+define('POE_48_PORT_PRICE_ID', '');
+
+// Ryzen appliances and the Numato relay -- one-time (portal: app/hardware_orders.py).
+// RYZEN_ENTERPRISE_PRICE_ID is the "AnyAiCam Professional" SKU and
+// RYZEN_AAC_FACIAL_PRICE_ID the "AnyAiCam Enterprise" SKU (display names only;
+// SKUs unchanged), never the legacy "enterprise" software plan key.
+define('RYZEN_STARTER_PRICE_ID', 'price_1ULTEfGllhK80H2nlzTBBk7G');     // $1,249.99
+define('RYZEN_ENTERPRISE_PRICE_ID', 'price_1ULTEgGllhK80H2n2GBTpJ3v');  // $1,749.99 (AnyAiCam Professional)
+define('RYZEN_AAC_FACIAL_PRICE_ID', 'price_1ULTEgGllhK80H2nbVKxBgNy');  // $2,249.99 (AnyAiCam Enterprise)
+define('RELAY_MODULE_3CH_PRICE_ID', 'price_1ULTEhGllhK80H2ncXLynne4');  // $149.99
+
 // RETIRED 2026-10-08 -- not sold. The fixed 8/16/32/64-camera Local/Hybrid
-// tiers were removed (camera plans are per camera, chosen in the AnyAiCam
-// account); nothing reads these constants any more. They stay recorded,
-// unchanged, as the TEST Price IDs that exist in Stripe.
-// LOCAL -- recurring monthly, $0.60/$0.61/$0.62/$0.63 TEST.
-define('LOCAL_1_8_PRICE_ID', 'price_1UD2xKGllhK80H2nFJwtFJvw');
-define('LOCAL_9_16_PRICE_ID', 'price_1UD2yLGllhK80H2n7Z2q8AM3');
-define('LOCAL_17_32_PRICE_ID', 'price_1UD2z4GllhK80H2ncjHZVhms');
-define('LOCAL_33_64_PRICE_ID', 'price_1UD30bGllhK80H2nfmvPZnSA');
-// HYBRID -- recurring monthly, $0.70/$0.71/$0.72/$0.73 TEST.
-define('HYBRID_1_8_PRICE_ID', 'price_1UD31AGllhK80H2nMKtYEmVw');
-define('HYBRID_9_16_PRICE_ID', 'price_1UD31mGllhK80H2nJqorGzU6');
-define('HYBRID_17_32_PRICE_ID', 'price_1UD32kGllhK80H2nGaOQB9XI');
-define('HYBRID_33_64_PRICE_ID', 'price_1UD33SGllhK80H2nxrbBT2ch');
-// ANALYTICS -- recurring monthly add-ons, $0.80-$0.89 TEST. Facial
-// Recognition here is deliberately distinct from the one-time
-// RYZEN_AAC_FACIAL_PRICE_ID hardware appliance above -- it stays an
-// analytics add-on, never an appliance category (see app/analytics_
-// entitlements.py's own module docstring for the same separation on
-// the backend side).
-define('ANALYTICS_SMART_MOTION_PRICE_ID', 'price_1UD34JGllhK80H2nxP2T6pq0');
-define('ANALYTICS_PEOPLE_COUNTING_PRICE_ID', 'price_1UD353GllhK80H2nEaJnu9jZ');
-define('ANALYTICS_LPR_PRICE_ID', 'price_1UD35kGllhK80H2nFIdXc5yW');
-define('ANALYTICS_PPE_PRICE_ID', 'price_1UD36UGllhK80H2nfDIIb4kC');
-define('ANALYTICS_TALK_DOWN_PRICE_ID', 'price_1UD377GllhK80H2nC1Z2VNh0');
-define('ANALYTICS_AI_ESSENTIALS_PRICE_ID', 'price_1UD37tGllhK80H2naT95ryKA');
-define('ANALYTICS_AI_PROFESSIONAL_PRICE_ID', 'price_1UD38aGllhK80H2nMSdir4BE');
-define('ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID', 'price_1UD39XGllhK80H2nnyJJoXKQ');
-define('ANALYTICS_CLOUD_OVERFLOW_PRICE_ID', 'price_1UD3UMGllhK80H2nqMJhbPe6');
-define('ANALYTICS_FACIAL_RECOGNITION_PRICE_ID', 'price_1UD3UuGllhK80H2nAdGKN4ff');
-// Advanced Analytics ($24.99 flat, 2026-09-30): no TEST Price ID exists yet --
-// empty means checkout-catalog.php rejects it (fail closed).
-define('ANALYTICS_ADVANCED_PRICE_ID', '');
-// One-time VMS software license (2026-09-30): no TEST Price IDs yet -- empty
-// means a DIY cart with a camera plan is refused (fail closed).
-define('VMS_LICENSE_8_PRICE_ID', '');
-define('VMS_LICENSE_16_PRICE_ID', '');
-define('VMS_LICENSE_32_PRICE_ID', '');
-define('VMS_LICENSE_64_PRICE_ID', '');
+// subscription tiers were removed (camera plans are per camera -- Basic Local,
+// AI Local, Hybrid -- chosen in the AnyAiCam account); nothing reads these
+// constants any more. They stay recorded, unchanged, as the TEST Prices
+// that exist in Stripe (no Stripe Price is created, changed or deleted).
+// Local / Hybrid camera-slot subscriptions -- monthly.
+define('LOCAL_1_8_PRICE_ID', 'price_1ULTDbGllhK80H2nG5js8TyE');    // $14.99
+define('LOCAL_9_16_PRICE_ID', 'price_1ULTDbGllhK80H2nsHlQqGqE');   // $24.99
+define('LOCAL_17_32_PRICE_ID', 'price_1ULTDcGllhK80H2n7uwbVonf');  // $39.99
+define('LOCAL_33_64_PRICE_ID', 'price_1ULTDcGllhK80H2nTd2PMMSn');  // $69.99
+define('HYBRID_1_8_PRICE_ID', 'price_1ULTDdGllhK80H2ncLHUF7XQ');   // $24.99
+define('HYBRID_9_16_PRICE_ID', 'price_1ULTDdGllhK80H2nUxGoG1mj');  // $39.99
+define('HYBRID_17_32_PRICE_ID', 'price_1ULTDeGllhK80H2n16rH7dIK'); // $69.99
+define('HYBRID_33_64_PRICE_ID', 'price_1ULTDeGllhK80H2nD8jd8rpd'); // $99.99
+
+// Analytics packages and Talk Down -- monthly (portal: app/pricing_catalog.py ADDONS).
+define('ANALYTICS_AI_ESSENTIALS_PRICE_ID', 'price_1ULTDfGllhK80H2noos78Omo');        // $7.99
+define('ANALYTICS_AI_PROFESSIONAL_PRICE_ID', 'price_1ULTDfGllhK80H2nnMlSGoz7');      // $14.99
+define('ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID', 'price_1ULTDgGllhK80H2nkLTjPGlD'); // $14.99
+define('ANALYTICS_ADVANCED_PRICE_ID', 'price_1ULTDgGllhK80H2nGYQNvKw5');             // $24.99
+define('ANALYTICS_TALK_DOWN_PRICE_ID', 'price_1ULTDhGllhK80H2nJBZtYL9i');            // $4.99
+// Not sold by this storefront (Smart Motion is included with every plan; Cloud
+// Overflow has no published price; the single-price Facial Recognition, LPR,
+// People Counting and PPE SKUs are retired): empty, fail closed.
+define('ANALYTICS_SMART_MOTION_PRICE_ID', '');
+define('ANALYTICS_PEOPLE_COUNTING_PRICE_ID', '');
+define('ANALYTICS_LPR_PRICE_ID', '');
+define('ANALYTICS_PPE_PRICE_ID', '');
+define('ANALYTICS_CLOUD_OVERFLOW_PRICE_ID', '');
+define('ANALYTICS_FACIAL_RECOGNITION_PRICE_ID', '');
+
+// One-time VMS software license by camera capacity (for a customer-owned PC;
+// included with an appliance).
+define('VMS_LICENSE_8_PRICE_ID', 'price_1ULTDjGllhK80H2n4cd5fVX1');   // $49.99
+define('VMS_LICENSE_16_PRICE_ID', 'price_1ULTDjGllhK80H2n7QtlNYHf');  // $79.99
+define('VMS_LICENSE_32_PRICE_ID', 'price_1ULTDkGllhK80H2nsuVnC8cw');  // $129.99
+define('VMS_LICENSE_64_PRICE_ID', 'price_1ULTDkGllhK80H2nlPrgGVOL');  // $199.99
 
 // Env-overridable, same convention as STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET
 // above: the deployed storefront container sets ANYAICAM_STOREFRONT_BASE_URL
