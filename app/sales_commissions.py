@@ -317,7 +317,21 @@ def _commissionable_invoice_fraction(invoice: dict) -> float:
         return 1.0 if product_class in {"base", "addon", "base_v2_commissionable"} else 0.0
     total = sum(max(0, int(line.get("amount") or 0)) for line in lines)
     if total <= 0:
-        return 0.0
+        # Preserve legacy handling for Stripe API/test shapes that provide
+        # recognized invoice lines without per-line amounts. For a mixed
+        # billing-v2 invoice, remain conservative because the eligible share
+        # cannot be allocated; Basic Local is always noncommissionable.
+        classified = [_classify(_line_price_id(line))[0] for line in lines]
+        if "base_v2_noncommissionable" in classified:
+            return 0.0
+        v2_classes = {kind for kind in classified if kind in {
+            "base_v2_commissionable", "base_v2_noncommissionable"}}
+        if v2_classes:
+            allowed = {"base", "addon", "base_v2_commissionable"}
+            return 1.0 if all(kind in allowed for kind in classified) else 0.0
+        # _classify_invoice retains the established legacy 1.0 fallback when
+        # no usable line amounts exist and at least one known price is present.
+        return max(0.0, min(1.0, _classify_invoice(invoice)[3]))
     eligible = 0
     for line in lines:
         price_id = _line_price_id(line)

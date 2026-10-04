@@ -251,10 +251,39 @@ def test_basic_local_does_not_start_or_consume_v2_commission_window(db_path, mon
     with override_target(sqlite_path=str(db_path)), __import__("partner_db").connection() as db:
         db.execute("INSERT INTO subscription_payments(id,customer_id,product_class,amount_paid_cents,paid_at,status) VALUES(?,?,?,?,?,?)",
                    ("basic_invoice", "cust-v2", "base_v2_noncommissionable", 5994, "2026-10-04", "paid"))
+        db.commit()
         assert sales_commissions._per_camera_commission_paid_months("cust-v2") == 0
         db.execute("INSERT INTO subscription_payments(id,customer_id,product_class,amount_paid_cents,paid_at,status) VALUES(?,?,?,?,?,?)",
                    ("ai_invoice", "cust-v2", "base_v2_commissionable", 8994, "2026-11-04", "paid"))
+        db.commit()
         assert sales_commissions._per_camera_commission_paid_months("cust-v2") == 1
+        db.execute("INSERT INTO subscription_payments(id,customer_id,product_class,amount_paid_cents,paid_at,status) VALUES(?,?,?,?,?,?)",
+                   ("later_basic_invoice", "cust-v2", "base_v2_noncommissionable", 3996, "2026-12-04", "paid"))
+        db.commit()
+        assert sales_commissions._per_camera_commission_paid_months("cust-v2") == 1
+
+
+@pytest.mark.parametrize("price_ids,expected_fraction", [
+    (["legacy_base"], 1.0),
+    (["basic_local"], 0.0),
+    (["ai_local"], 1.0),
+    (["ai_local", "unrecognized"], 0.0),
+    (["basic_local", "eligible_addon"], 0.0),
+])
+def test_invoice_without_line_amounts_keeps_legacy_fallback_and_v2_commission_rules(
+        price_ids, expected_fraction, monkeypatch):
+    import sales_commissions
+
+    classes = {
+        "legacy_base": ("base", {"camera_slot_maximum": 8}),
+        "basic_local": ("base_v2_noncommissionable", {"commission_percent": 0}),
+        "ai_local": ("base_v2_commissionable", {"commission_percent": 20}),
+        "eligible_addon": ("addon", {}),
+    }
+    monkeypatch.setattr(sales_commissions, "_classify", lambda price_id: classes.get(price_id, (None, None)))
+    invoice = {"lines": {"data": [{"price": {"id": price_id}} for price_id in price_ids]}}
+
+    assert sales_commissions._commissionable_invoice_fraction(invoice) == expected_fraction
 
 
 def test_activation_payout_remains_legacy_only(db_path, monkeypatch):

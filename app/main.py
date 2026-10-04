@@ -104298,12 +104298,8 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS, product_mode_for_customer
     import per_camera_billing as _per_camera_billing
     _v2_entitlement = _per_camera_billing.entitlement_for_customer(identity["customer_id"])
-    _legacy_base = [e for e in get_entitlements_for_customer(identity["customer_id"])
-                    if e["product"] in ("camera_slots_local", "camera_slots_hybrid")
-                    and e["status"] in ("active", "suspended")]
-    if ((_v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended")) or not _legacy_base):
-        return _per_camera_billing.customer_portal_page(identity, _v2_entitlement
-            if _v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended") else None)
+    if _v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended"):
+        return _per_camera_billing.customer_portal_page(identity, _v2_entitlement)
     from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
 
     customer_id = identity["customer_id"]
