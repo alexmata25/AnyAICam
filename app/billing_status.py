@@ -348,6 +348,45 @@ def _stripe_invoice_subscription(intent: str) -> tuple[str, str] | None:
     return (invoice_id, subscription_id) if subscription_id else None
 
 
+def reverse_hardware_orders(intent: str, reason: str) -> int:
+    """A refunded or disputed hardware purchase (2026-10-04): its PAID orders
+    become 'refunded'/'disputed', so an appliance order no longer includes the
+    VMS license (customer_entitlements.appliance_includes_vms_license counts
+    paid appliance orders only). Only that payment's orders change -- other
+    appliances and standalone licenses are untouched -- and a replay finds
+    nothing left to change."""
+    if not intent:
+        return 0
+    with connection() as db:
+        changed = db.execute("UPDATE hardware_orders SET status=?,updated_at=? WHERE stripe_payment_intent_id=? AND status='paid'",
+                             (reason, datetime.now().isoformat(), intent)).rowcount
+    if changed or not row("SELECT id FROM hardware_orders WHERE stripe_payment_intent_id IS NULL AND status='paid' LIMIT 1"):
+        return changed
+    # An order recorded before its PaymentIntent was kept: ask Stripe which
+    # Checkout Session this payment belongs to (retried by the webhook if
+    # Stripe cannot answer).
+    import stripe_state
+    from urllib.parse import quote
+    found = stripe_state.stripe_get(f"/v1/checkout/sessions?payment_intent={quote(intent, safe='')}&limit=1",
+                                    "the Checkout Session of this payment")
+    session_ids = [str(item.get("id") or "") for item in (found.get("data") or []) if isinstance(item, dict)]
+    with connection() as db:
+        for session_id in filter(None, session_ids):
+            changed += db.execute("UPDATE hardware_orders SET status=?,stripe_payment_intent_id=?,updated_at=? "
+                                  "WHERE stripe_checkout_session_id=? AND status='paid'",
+                                  (reason, intent, datetime.now().isoformat(), session_id)).rowcount
+    return changed
+
+
+def restore_hardware_orders(intent: str) -> int:
+    """A won dispute: the payment stands, so the order is paid again."""
+    if not intent:
+        return 0
+    with connection() as db:
+        return db.execute("UPDATE hardware_orders SET status='paid',updated_at=? WHERE stripe_payment_intent_id=? AND status='disputed'",
+                          (datetime.now().isoformat(), intent)).rowcount
+
+
 def _reverse_purchase(event: dict, reason: str) -> dict:
     charge_id, intent, invoice_id, full = _charge_parts(event)
     if not full:
@@ -363,13 +402,14 @@ def _reverse_purchase(event: dict, reason: str) -> dict:
         if not _covers_current_period(payment):
             return {"status": "ignored", "reason": "an earlier period; the current period is paid"}
         return {"status": "suspended", "rows": _suspend(payment["stripe_subscription_id"], reason)}
-    if intent:  # a one-time purchase (VMS license)
+    if intent:  # a one-time purchase (VMS license, hardware)
         changed = 0
         for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='active'", (intent,)):
             _set_plan(license_row["id"], "suspended", reason)
             changed += 1
-        if changed:
-            return {"status": "suspended", "rows": changed}
+        hardware = reverse_hardware_orders(intent, reason)
+        if changed or hardware:
+            return {"status": "suspended", "rows": changed, "hardware_orders": hardware}
     return {"status": "ignored", "reason": "no AnyAiCam purchase for this charge"}
 
 
@@ -392,6 +432,7 @@ def _dispute_closed(event: dict) -> dict:
                                 "AND suspended_reason='disputed'", (intent,)):
             _set_plan(license_row["id"], "active", None)
             restored += 1
+        restored += restore_hardware_orders(intent)
     return {"status": "restored" if restored else "ignored", "rows": restored}
 
 

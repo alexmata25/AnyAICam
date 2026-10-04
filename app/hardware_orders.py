@@ -245,7 +245,10 @@ def upsert_order(
     with connection() as db:
         if existing:
             db.execute(
-                "UPDATE hardware_orders SET customer_id=COALESCE(?,customer_id),status=?,"
+                # A refunded/disputed order never returns to paid on a replayed
+                # checkout event (2026-10-04); only a won dispute restores it.
+                "UPDATE hardware_orders SET customer_id=COALESCE(?,customer_id),"
+                "status=CASE WHEN status IN ('refunded','disputed') THEN status ELSE ? END,"
                 "stripe_payment_intent_id=COALESCE(?,stripe_payment_intent_id),"
                 "stripe_customer_id=COALESCE(?,stripe_customer_id),updated_at=? WHERE id=?",
                 (customer_id, status, stripe_payment_intent_id,
@@ -363,6 +366,11 @@ def sync_hardware_order_from_stripe_event(event: dict) -> dict:
     authoritative_customer_id = str(metadata.get("anyaicam_customer_id") or "") or None
     stripe_customer_id = str(session_obj.get("customer") or "") or None
     stripe_checkout_session_id = str(session_obj.get("id") or "") or None
+    # The PaymentIntent (2026-10-04): refunds and disputes name it, so a
+    # refunded or disputed order -- and the VMS license an appliance includes --
+    # can be reversed (billing_status.reverse_hardware_orders).
+    intent = session_obj.get("payment_intent")
+    stripe_payment_intent_id = str((intent.get("id") if isinstance(intent, dict) else intent) or "") or None
     payment_status = str(session_obj.get("payment_status") or "")
     status = "paid" if payment_status == "paid" else "pending"
     # The amount recorded is what Stripe actually charged (the signed
@@ -397,6 +405,6 @@ def sync_hardware_order_from_stripe_event(event: dict) -> dict:
         customer_id=customer["id"], sku=hardware["sku"], product_name=hardware["name"],
         stripe_price_id=price_id, quantity=quantity, amount_cents=amount_cents,
         stripe_checkout_session_id=stripe_checkout_session_id, stripe_customer_id=stripe_customer_id,
-        status=status,
+        stripe_payment_intent_id=stripe_payment_intent_id, status=status,
     )
     return {"status": "order_recorded", "order_id": order["id"], "customer_id": customer["id"], "sku": hardware["sku"]}

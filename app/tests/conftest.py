@@ -120,6 +120,11 @@ def fake_stripe_prices(monkeypatch):
         for lic in pc.vms_licenses():
             if lic["stripe_price_id"] == price_id:
                 return {"id": price_id, "unit_amount": lic["one_time_cents"], "currency": "usd", "active": True, "recurring": None}
+        import os
+        from hardware_orders import HARDWARE_CATALOG  # one-time hardware (2026-10-04)
+        for _sku, _product, _name, cents, env_var in HARDWARE_CATALOG:
+            if os.environ.get(env_var, "").strip() == price_id:
+                return {"id": price_id, "unit_amount": cents, "currency": "usd", "active": True, "recurring": None}
         raise AssertionError(f"unexpected Stripe price lookup: {price_id}")
 
     monkeypatch.setattr(main, "stripe_api_get", _get)
