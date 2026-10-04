@@ -390,8 +390,13 @@ Path("/var/lib/anyaicam/pending_actions/apply_release.json").write_text(json.dum
         check(Path("/var/lib/anyaicam/vms/recordings/partner_portal.db").read_text() == "customer database", "database untouched")
         check((live / "mediamtx/mediamtx").read_text() == "installer-provisioned binary", "mediamtx kept")
         again = sh(str(tool), "--yes", check_rc=False)
-        check(again.returncode != 0 and "skip releases" in again.stderr,
-              "running it a second time is refused: that point belongs to the newer release")
+        check(again.returncode == 0 and serving() == ("1.1.0", BUILD_A, BUILD_A),
+              "running it again is harmless: still 1.1.0 / build A")
+        Path("/etc/anyaicam/vms.env").write_text(env_now.replace(f"ANYAICAM_BUILD_ID={BUILD_A}", f"ANYAICAM_BUILD_ID={BUILD_C}"))
+        stale = sh(str(tool), "--yes", check_rc=False)
+        check(stale.returncode != 0 and "skip releases" in stale.stderr and serving() == ("1.1.0", BUILD_A, BUILD_A),
+              "a point that belongs to neither the running build nor its own is refused, nothing changed")
+        Path("/etc/anyaicam/vms.env").write_text(env_now)
 
         step("RE-UPDATE after the rollback: 1.2.0 installs again through the owner flow")
         manifest_r, offer_r = publish("1.2.0", BUILD_B, {"serve.py": SERVE}, update_id="1.2.0-reinstall")

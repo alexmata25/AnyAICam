@@ -92,7 +92,8 @@ STUBS = {
 }
 
 
-@unittest.skipUnless(BASH and shutil.which("rsync") and os.name == "posix", "needs bash and rsync on Linux (as on an appliance)")
+@unittest.skipUnless(BASH and shutil.which("rsync") and os.name == "posix" and (INSTALLER / "rollback.sh").is_file(),
+                     "needs bash and rsync on Linux (as on an appliance) and the repository's installer/ folder")
 class RollbackScriptRoundTripTests(ApplierTestCase):
     """The applier's point, restored by the real installer/rollback.sh."""
 
@@ -133,6 +134,13 @@ class RollbackScriptRoundTripTests(ApplierTestCase):
         self.host.run(["systemctl", "start", "anyaicam-vms.service"], 1)
         self.stage("1.2.0", BUILD_B, manifest_overrides={"update_id": "1.2.0-reinstall"})
         self.assertEqual(self.applier().apply_staged()["state"], "healthy")
+
+    def test_re_applying_the_same_point_is_allowed(self):
+        self.assertEqual(self.rollback().returncode, 0)
+        again = self.rollback("--restore-database")
+        self.assertNotEqual(again.returncode, 0)  # no database backup file exists in this fixture...
+        self.assertIn("No database backup", again.stderr)  # ...which is the only reason it stops
+        self.assertEqual(self.rollback().returncode, 0)
 
     def test_a_point_for_another_release_is_refused_unless_allowed(self):
         self.paths.vms_env.write_text(self.paths.vms_env.read_text().replace(f"ANYAICAM_BUILD_ID={BUILD_B}",

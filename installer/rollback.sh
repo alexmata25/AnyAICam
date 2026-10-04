@@ -21,6 +21,7 @@
 # If the appliance runs a different build now -- for example an in-app update
 # happened after an installer rollback point -- restoring it would skip
 # releases, so it is refused unless --allow-stale is given (2026-10-04).
+# Re-applying a point while its rollback build is running is allowed.
 #
 # Recordings, configuration (/etc/anyaicam) and credentials are never
 # touched. Stops and restarts anyaicam-vms.service, then checks /version.
@@ -107,7 +108,9 @@ if [[ -n "$ROLLBACK_MARKER" && "$ROLLBACK_MARKER" != "none" ]]; then
 fi
 
 running="$(sed -n 's/^ANYAICAM_BUILD_ID=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1)"
-if [[ -n "$UPGRADE_TO_COMMIT" && -n "$running" && "$running" != "$UPGRADE_TO_COMMIT" ]]; then
+# Running the rollback build already (re-applying the same point, e.g. to add
+# --restore-database afterwards) is allowed; any other build is not.
+if [[ -n "$UPGRADE_TO_COMMIT" && -n "$running" && "$running" != "$UPGRADE_TO_COMMIT" && "$running" != "$ROLLBACK_COMMIT" ]]; then
     if [[ "$allow_stale" != "1" ]]; then
         die "This rollback point was taken when ${UPGRADE_TO_COMMIT:0:12} was installed, but this appliance now runs ${running:0:12}. Restoring it would skip releases. Use the rollback point for the running release, or pass --allow-stale if you are sure."
     fi
