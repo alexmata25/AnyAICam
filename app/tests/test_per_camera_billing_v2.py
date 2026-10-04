@@ -42,7 +42,7 @@ def test_v2_catalog_is_customer_safe_and_keeps_premium_analytics_separate():
     assert plans["hybrid"]["cloud_event_retention_days"] == 14
     assert plans["hybrid"]["cloud_event_storage"] is True
     assert plans["ai_local"]["cloud_event_storage"] is False
-    assert all(plan["resolution_classes"] == ["standard"] for plan in plans.values())
+    assert all(plan["resolution_classes"] == ["standard", "high_resolution"] for plan in plans.values())
     assert "supported_talk_down" in {item["key"] for item in plans["ai_local"]["included_features"]}
     assert catalog["resolution_classes"] == [
         {"key": "standard", "display_name": "Standard", "maximum_megapixels": 4},
@@ -102,6 +102,7 @@ def test_current_stripe_item_creates_exact_versioned_entitlement_and_capacity(db
     payload = billing.entitlement_payload(entitlement)
     assert payload["monthly_per_camera_amount"] == 14.99
     assert payload["monthly_base_total"] == 89.94
+    assert payload["resolution_classes"] == ["standard", "high_resolution"]
 
 
 @pytest.mark.parametrize("plan_key,retention,cloud", [("basic_local", 2, False), ("ai_local", 7, False), ("hybrid", 7, True)])
@@ -159,6 +160,8 @@ def test_v2_my_subscription_shows_plan_and_does_not_offer_included_talk_down(db_
     assert 'data-addon-key="talk_down"' not in html
     assert "Premium Add-ons" in html and "Advanced People Counting" in html
     assert 'id="friends-family-panel"' in html
+    assert "Advanced Line Crossing is not sold separately today" in html
+    assert "existing Smart Motion and line-crossing behavior are unchanged" in html
 
 
 @pytest.mark.parametrize("plan_key,unit_cents", [("basic_local", 999), ("ai_local", 1499), ("hybrid", 2499)])

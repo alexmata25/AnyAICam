@@ -33,6 +33,7 @@ PLANS = {
         "display_name": "Basic Local", "monthly_cents_per_camera": 999,
         "local_retention_days": 2, "cloud_event_storage": False,
         "cloud_event_retention_days": None, "mode": "local", "commission_percent": 0,
+        "resolution_classes": ["standard", "high_resolution"],
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
                      "standard_camera_management", "remote_viewing_where_supported"],
     },
@@ -40,6 +41,7 @@ PLANS = {
         "display_name": "AI Local", "monthly_cents_per_camera": 1499,
         "local_retention_days": 7, "cloud_event_storage": False,
         "cloud_event_retention_days": None, "mode": "local", "commission_percent": 20,
+        "resolution_classes": ["standard", "high_resolution"],
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
@@ -49,6 +51,7 @@ PLANS = {
         "display_name": "Hybrid", "monthly_cents_per_camera": 2499,
         "local_retention_days": 7, "cloud_event_storage": True,
         "cloud_event_retention_days": 14, "mode": "hybrid", "commission_percent": 20,
+        "resolution_classes": ["standard", "high_resolution"],
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
@@ -131,10 +134,9 @@ def public_catalog() -> dict:
              "billing_interval": "month", "included_features": [
                  {"key": feature, "label": FEATURE_LABELS[feature]} for feature in plan["features"]
              ], "local_retention_days": plan["local_retention_days"],
-             # The selected base-plan proposal includes cameras up to 4MP.
-             # High Resolution (5-8MP) remains a customer-facing class whose
-             # storage/pricing rule needs separate approval; do not bundle it.
-             "resolution_classes": ["standard"],
+             # Both resolution classes are included at the same per-camera
+             # subscription price. Resolution affects local storage sizing.
+             "resolution_classes": list(plan["resolution_classes"]),
              "cloud_event_storage": plan["cloud_event_storage"],
              "cloud_event_retention_days": plan["cloud_event_retention_days"],
              "quantity": {"minimum": MIN_CAMERA_QUANTITY, "maximum": MAX_CAMERA_QUANTITY}}
@@ -173,6 +175,7 @@ def entitlement_payload(entitlement: dict | None) -> dict | None:
         "local_retention_days": int(entitlement.get("local_retention_days") or plan["local_retention_days"]),
         "cloud_event_storage": bool(entitlement.get("cloud_event_storage")),
         "cloud_event_retention_days": entitlement.get("cloud_event_retention_days"),
+        "resolution_classes": list(plan["resolution_classes"]),
         "included_features": [{"key": feature, "label": FEATURE_LABELS[feature]} for feature in plan["features"]],
         "billing_period_end": entitlement.get("current_period_end"),
         "cancel_at_period_end": bool(entitlement.get("cancel_at_period_end")),
@@ -520,7 +523,7 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
         rendered.append('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">Custom pricing</span></span><span class="health-detail">Contact AnyAiCam</span></div>')
     if not rendered:
         rendered.append('<p class="health-detail">No premium analytics add-ons are available for purchase yet.</p>')
-    rendered.append('<p class="health-detail">Advanced analytics such as LPR, facial recognition, advanced people counting, advanced line crossing, PPE, and future behavior analytics remain separately licensed. No add-on prices are changed here.</p>')
+    rendered.append('<p class="health-detail">LPR / Vehicle Intelligence, Face Access, advanced people counting, PPE, and other available premium analytics remain separately licensed. Advanced Line Crossing is not sold separately today; existing Smart Motion and line-crossing behavior are unchanged. A separate Advanced Line Crossing entitlement may be offered in the future.</p>')
     return "".join(rendered)
 
 
