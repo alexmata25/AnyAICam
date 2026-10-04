@@ -278,14 +278,17 @@ def ensure_lf_and_modes(package_root: Path) -> tuple[int, list[str]]:
     return len(shell_files), failures
 
 
-def file_manifest(root: Path) -> list[dict[str, object]]:
+def file_manifest(root: Path, executable_paths: frozenset[str] = frozenset()) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         rows.append(
             {
                 "path": path.relative_to(root).as_posix(),
                 "sha256": sha256_file(path),
-                "mode": oct(stat.S_IMODE(path.stat().st_mode)),
+                # Match write_deterministic_tar() rather than the host OS.
+                # Windows cannot represent POSIX executable bits, so stat()
+                # would otherwise record modes that disagree with the archive.
+                "mode": oct(0o755 if path.relative_to(root).as_posix() in executable_paths else 0o644),
                 "size": path.stat().st_size,
             }
         )
@@ -501,15 +504,15 @@ def main() -> int:
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
         )
 
+        outdir = Path(args.output_dir).resolve()
+        outdir.mkdir(parents=True, exist_ok=True)
+        executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
         (package / "artifact-files.json").write_text(
-            json.dumps(file_manifest(package), indent=2, sort_keys=True) + "\n",
+            json.dumps(file_manifest(package, executable_paths), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
             newline="\n",
         )
 
-        outdir = Path(args.output_dir).resolve()
-        outdir.mkdir(parents=True, exist_ok=True)
-        executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
         filename = f"anyaicam-appliance-installer-{installer_version}-vms-{vms_commit[:12]}.tar.gz"
         output = outdir / filename
         write_deterministic_tar(package, output, installer_mtime, executable_paths)

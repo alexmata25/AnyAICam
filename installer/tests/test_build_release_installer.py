@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, copy_release, is_test_only_release_path, run_git, validate_installer_version, write_deterministic_tar  # noqa: E402
+from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, copy_release, file_manifest, is_test_only_release_path, run_git, validate_installer_version, write_deterministic_tar  # noqa: E402
 
 
 class InstallerVersionAndReleaseHygieneTests(unittest.TestCase):
@@ -147,6 +147,21 @@ class DeterministicTarExecutableBitTests(unittest.TestCase):
         self.assertTrue(modes["install.sh"] & 0o111, "install.sh must be stored with an executable bit")
         self.assertTrue(modes["validate.sh"] & 0o111, "validate.sh must be stored with an executable bit")
         self.assertFalse(modes["README.md"] & 0o111, "README.md must NOT be stored executable")
+
+    def test_manifest_modes_match_deterministic_tar_modes_on_every_host(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "package"
+            source.mkdir()
+            (source / "install.sh").write_text("#!/usr/bin/env bash\n", newline="\n")
+            (source / "README.md").write_text("readme\n", newline="\n")
+            executable_paths = frozenset({"install.sh"})
+            rows = file_manifest(source, executable_paths)
+            output = Path(td) / "sample.tar.gz"
+            write_deterministic_tar(source, output, mtime=0, executable_paths=executable_paths)
+            with tarfile.open(output, "r:gz") as tf:
+                archived_modes = {member.name: oct(member.mode) for member in tf.getmembers() if member.isfile()}
+
+        self.assertEqual({row["path"]: row["mode"] for row in rows}, archived_modes)
 
     @unittest.skipIf(os.name == "nt", "Windows cannot represent real POSIX executable bits at all -- this is exactly the platform gap the fix works around, not something extraction-based assertions can meaningfully re-check here.")
     def test_extracted_files_are_actually_executable_without_a_manual_chmod(self):
