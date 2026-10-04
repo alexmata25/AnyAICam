@@ -5571,3 +5571,13 @@ Goal: routine updates without AnyAiCam staff remoting in, via Settings → Syste
 - Facial Recognition parent-clip timing issue (not addressed by the shared media work).
 - Physical camera checks on approved cameras (line direction, occlusion, exclusions, LPR, face, PPE) -- needs an approved device; Ryzen/Samsung untouched overnight.
 - Cloudflare purge of the old cached installer URL (owner action; it expires on its own within 4 h of 05:00 UTC).
+
+## 2026-10-04 partner billing, upcharges, activation fees, residuals and payouts (branch `feature/partner-billing-compensation-20261004`, base `bcc3137`)
+
+Owner rules: no company-paid activation commission; the partner's activation/setup fee and
+monthly upcharge belong to the partner (AnyAiCam approves them); ANYAICAM_BILLED or
+PARTNER_BILLED per customer; 20% residual on the AnyAiCam portion collected (partner-billed:
+on base received from the partner) for 12 paid months; calendar-quarter payouts; a reversal
+after a payout carries forward as a negative balance. Details: `docs/partner-billing.md`.
+Not deployed. No Stripe objects created or changed. Open owner decisions are listed in
+that document's commit message.

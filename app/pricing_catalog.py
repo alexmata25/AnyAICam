@@ -141,12 +141,23 @@ FRIENDS_FAMILY_COUPON_ENV = {
 }
 
 # --------------------------------------------------------------------------
-# 10-11. Salesperson commission (working structure). Never a customer
-# discount; zero on any Friends & Family sale.
+# 10-11. Salesperson/partner compensation (owner, 2026-10-04). Never a
+# customer discount; zero on any Friends & Family sale.
+# - AnyAiCam pays no activation commission (the earlier $40-$125 was removed).
+#   A partner may instead charge the customer its own activation/setup fee,
+#   which belongs to the partner (partner_agreements.py).
+# - Residual: 20% of the AnyAiCam portion actually collected (plan and
+#   add-on lines; never the partner's upcharge or activation fee, never tax),
+#   for the customer's first 12 paid months. Partner-billed customers: 20% of
+#   the base amount AnyAiCam actually receives from the partner.
+# - Paid out per calendar quarter; a reversal after a payout carries forward
+#   as a negative balance (partner_payouts.py).
 # --------------------------------------------------------------------------
-ACTIVATION_COMMISSION_CENTS = {8: 4000, 16: 6000, 32: 9000, 64: 12500}
 RECURRING_COMMISSION_PERCENT = 20
 RECURRING_COMMISSION_MAX_PAID_MONTHS = 12
+BILLING_ANYAICAM = "ANYAICAM_BILLED"
+BILLING_PARTNER = "PARTNER_BILLED"
+BILLING_PARTIES = (BILLING_ANYAICAM, BILLING_PARTNER)
 # Appliance SKU (hardware_orders.HARDWARE_CATALOG) -> commission cents. Any
 # other SKU (e.g. the relay) and "no appliance" earn nothing.
 HARDWARE_COMMISSION_CENTS = {

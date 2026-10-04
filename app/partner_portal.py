@@ -155,15 +155,19 @@ def _earned_commissions_panel(identity: dict) -> str:
     ids = sorted({e['customer_id'] for e in entries[:100]})
     names = ({c['id']: c['name'] for c in _rows(f"SELECT id,name FROM customers WHERE id IN ({','.join('?' for _ in ids)})", tuple(ids))}
              if ids else {})
-    kinds = {'activation': 'Activation', 'hardware': 'Hardware', 'recurring': 'Recurring'}
+    kinds = {'activation': 'Activation (discontinued)', 'hardware': 'Hardware', 'recurring': '20% residual',
+             'partner_upcharge': 'Your monthly upcharge', 'partner_activation_fee': 'Your activation fee',
+             'partner_base_due': 'AnyAiCam base owed', 'partner_base_remitted': 'Base paid to AnyAiCam'}
+    money = lambda cents: f"{'-' if cents < 0 else ''}${abs(cents) / 100:,.2f}"
     rows_html = ''.join(
         f"<tr><td>{kinds.get(e['kind'], e['kind'])}</td><td>{_esc(names.get(e['customer_id']) or 'Customer')}</td>"
-        f"<td>${int(e['amount_cents']) / 100:,.2f}</td><td>{_esc(e['status'].replace('_', ' '))}</td>"
+        f"<td>{money(int(e['amount_cents']))}</td><td>{_esc(e['status'].replace('_', ' '))}</td>"
         f"<td data-local-time=\"{_esc(e['earned_at'], quote=True)}\">{_esc(e['earned_at'][:10])}</td></tr>"
         for e in entries[:100]
     ) or '<tr><td colspan="5">No earned commissions yet.</td></tr>'
     return (f'<section class="panel" style="margin-top:14px"><h2>Earned commissions</h2>'
-            f'<p class="health-detail">Recorded when payments are confirmed. Total earned: ${summary["earned_cents"] / 100:,.2f}.</p>'
+            f'<p class="health-detail">Recorded when payments are confirmed; refunds and chargebacks appear as negative rows. '
+            f'Net total: {money(summary["earned_cents"])}. <a href="/partner-payouts">Quarterly payouts</a></p>'
             f'<table><tr><th>Type</th><th>Customer</th><th>Amount</th><th>Status</th><th>Earned</th></tr>{rows_html}</table>'
             '<script>document.querySelectorAll("[data-local-time]").forEach(el=>{const d=new Date(el.dataset.localTime);if(!isNaN(d))el.textContent=d.toLocaleDateString();});</script></section>')
 

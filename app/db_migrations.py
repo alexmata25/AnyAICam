@@ -1249,6 +1249,25 @@ CREATE TABLE IF NOT EXISTS billing_invoice_states(invoice_id TEXT PRIMARY KEY, s
     ('20261002_plan_upgrade_attempts','''
 CREATE TABLE IF NOT EXISTS plan_upgrade_attempts(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, stripe_subscription_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL, open_slot TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(stripe_subscription_id, stripe_price_id, open_slot));
 '''),
+    # Partner agreements and quarterly payouts (2026-10-04, partner_agreements.py,
+    # partner_payouts.py). An agreement records, per customer, the AnyAiCam base
+    # price, the partner's monthly upcharge, the final customer price, the
+    # partner's activation/setup fee, who bills the customer and the residual
+    # terms -- all as agreed at the time; a change is a new version, never an
+    # edit. The money itself stays in commission_ledger (new columns below).
+    # Additive only. Rollback: DROP these three tables; the new ledger columns
+    # are ignored by older code.
+    ('20261004_partner_agreements_payouts','''
+CREATE TABLE IF NOT EXISTS partner_agreements(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, partner_id TEXT, salesperson_user_id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, previous_agreement_id TEXT, plan_type TEXT NOT NULL, tier_label TEXT NOT NULL, camera_tier INTEGER NOT NULL, base_price_cents INTEGER NOT NULL, upcharge_cents INTEGER NOT NULL DEFAULT 0, customer_price_cents INTEGER NOT NULL, activation_fee_cents INTEGER NOT NULL DEFAULT 0, billing_party TEXT NOT NULL, commission_rate_bps INTEGER NOT NULL, commission_max_paid_months INTEGER NOT NULL, commission_start_at TEXT, commission_end_at TEXT, status TEXT NOT NULL, stripe_subscription_id TEXT, activation_fee_collected_at TEXT, approved_at TEXT, approved_by TEXT, ended_at TEXT, end_reason TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_partner_agreements_customer ON partner_agreements(customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_partner_agreements_partner ON partner_agreements(partner_id, status);
+CREATE INDEX IF NOT EXISTS idx_partner_agreements_subscription ON partner_agreements(stripe_subscription_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_agreements_one_in_force ON partner_agreements(customer_id) WHERE status IN ('approved', 'active');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_agreements_one_pending ON partner_agreements(customer_id) WHERE status = 'pending_approval';
+CREATE TABLE IF NOT EXISTS partner_payouts(id TEXT PRIMARY KEY, payee_key TEXT NOT NULL, partner_id TEXT, salesperson_user_id TEXT, quarter TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL, opening_balance_cents INTEGER NOT NULL, period_total_cents INTEGER NOT NULL, payable_cents INTEGER NOT NULL, carried_forward_cents INTEGER NOT NULL, status TEXT NOT NULL, issued_at TEXT NOT NULL, issued_by TEXT NOT NULL, paid_at TEXT, paid_by TEXT, payment_reference TEXT, UNIQUE(payee_key, quarter));
+CREATE TABLE IF NOT EXISTS partner_payout_items(ledger_entry_id TEXT PRIMARY KEY, payout_id TEXT NOT NULL, amount_cents INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_partner_payout_items_payout ON partner_payout_items(payout_id);
+'''),
 ]
 
 
@@ -1834,6 +1853,17 @@ def apply_migrations():
         # (plan_changes.align_addons_with_base); resuming the base plan
         # resumes exactly these. Additive.
         if 'ended_with_base' not in addon_columns: db.execute('ALTER TABLE addon_subscriptions ADD COLUMN ended_with_base INTEGER')
+        # Partner money in the commission ledger (2026-10-04): which agreement
+        # an entry belongs to, the entry it reverses (reversals are new rows,
+        # so a closed payout never changes), who billed the customer, the
+        # rate applied, what was actually collected and when, and the service
+        # month of a partner-billed collection. Additive.
+        ledger_columns=_columns('commission_ledger')
+        for column, kind in (('agreement_id', 'TEXT'), ('reverses_entry_id', 'TEXT'), ('billing_party', 'TEXT'),
+                             ('commission_rate_bps', 'INTEGER'), ('collected_cents', 'INTEGER'), ('collected_at', 'TEXT'),
+                             ('service_month', 'TEXT'), ('created_by', 'TEXT'), ('note', 'TEXT')):
+            if column not in ledger_columns: db.execute(f'ALTER TABLE commission_ledger ADD COLUMN {column} {kind}')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_commission_ledger_agreement ON commission_ledger(agreement_id)')
         # Visitor Call lifecycle (2026-10-02, aac_voice_call_events.reconcile):
         # last heartbeat from an open call page, why a call closed, and the
         # call that replaced an expired/abandoned one. Additive.

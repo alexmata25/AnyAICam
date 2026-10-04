@@ -452,18 +452,19 @@ def _entries(sc, kind=None):
     return [e for e in sc.ledger_for() if kind is None or e["kind"] == kind]
 
 
-@pytest.mark.parametrize("price_id,slots,cents", [
-    ("price_local_8", 8, 4000), ("price_local_16", 16, 6000), ("price_local_32", 32, 9000), ("price_local_64", 64, 12500),
+@pytest.mark.parametrize("price_id,slots", [
+    ("price_local_8", 8), ("price_local_16", 16), ("price_local_32", 32), ("price_local_64", 64),
 ])
-def test_activation_commission_by_tier_on_the_first_paid_month(ledger, price_id, slots, cents):
+def test_no_company_paid_activation_commission_any_more(ledger, price_id, slots):
+    """Owner, 2026-10-04: AnyAiCam no longer pays the $40/$60/$90/$125
+    activation commission; the first paid month earns only the residual."""
     sc = ledger
     sc.sync_commissions_from_stripe_event(_invoice_event("evt_1", "in_1", price_id, 1499))
-    activation = _entries(sc, "activation")
-    assert len(activation) == 1
-    assert activation[0]["amount_cents"] == cents and activation[0]["camera_slot_tier"] == slots
-    assert activation[0]["salesperson_user_id"] == "sales-1" and activation[0]["plan_type"] == "local"
     sc.sync_commissions_from_stripe_event(_invoice_event("evt_2", "in_2", price_id, 1499))
-    assert len(_entries(sc, "activation")) == 1  # once per customer
+    assert _entries(sc, "activation") == []
+    first = next(e for e in _entries(sc, "recurring") if e["paid_month_index"] == 1)
+    assert first["camera_slot_tier"] == slots and first["salesperson_user_id"] == "sales-1" and first["plan_type"] == "local"
+    assert not hasattr(pc, "ACTIVATION_COMMISSION_CENTS")
 
 
 def test_recurring_commission_is_20_percent_of_collected_revenue_for_12_paid_months_only(ledger):
@@ -477,7 +478,8 @@ def test_recurring_commission_is_20_percent_of_collected_revenue_for_12_paid_mon
 
 
 def test_first_year_example_matches_the_approved_structure(ledger, db_path):
-    """Local 8 + Ryzen 7 Starter, 12 paid months: $40 + $50 + ~$35.98."""
+    """Local 8 + Ryzen 7 Starter, 12 paid months: $50 + ~$35.98 (no activation
+    commission since 2026-10-04)."""
     sc = ledger
     for month in range(1, 13):
         sc.sync_commissions_from_stripe_event(_invoice_event(f"evt_{month}", f"in_{month}", "price_local_8", 1499))
@@ -489,9 +491,9 @@ def test_first_year_example_matches_the_approved_structure(ledger, db_path):
     sc.sync_commissions_from_stripe_event({"id": "evt_hw", "type": "checkout.session.completed",
                                            "data": {"object": {"id": "cs_hw", "mode": "payment", "payment_status": "paid"}}})
     summary = sc.summarize(sc.ledger_for())
-    assert summary["by_kind_cents"] == {"activation": 4000, "hardware": 5000, "recurring": 3600}
+    assert summary["by_kind_cents"] == {"hardware": 5000, "recurring": 3600}
     # 12 x round(20% of 1499) = 12 x 300 = $36.00 (per-payment cent rounding of $35.976)
-    assert summary["earned_cents"] == 12600
+    assert summary["earned_cents"] == 8600
 
 
 def test_failed_or_unpaid_invoices_earn_nothing(ledger):
@@ -515,7 +517,7 @@ def test_webhook_retries_never_double_count(ledger):
     event = _invoice_event("evt_1", "in_1", "price_local_8", 1499)
     sc.sync_commissions_from_stripe_event(event)
     sc.sync_commissions_from_stripe_event(event)
-    assert len(_entries(sc, "recurring")) == 1 and len(_entries(sc, "activation")) == 1
+    assert len(_entries(sc, "recurring")) == 1 and _entries(sc, "activation") == []
 
 
 def test_tax_is_not_commissionable(ledger):
@@ -532,18 +534,26 @@ def test_refunds_and_disputes_reverse_the_commission_they_generated(ledger):
     half = {"id": "evt_r1", "type": "charge.refunded", "data": {"object": {"object": "charge", "id": "ch_in_2", "payment_intent": "pi_in_2",
                                                                           "invoice": "in_2", "amount": 1499, "amount_refunded": 750}}}
     sc.sync_commissions_from_stripe_event(half)
-    month2 = next(e for e in _entries(sc, "recurring") if e["stripe_invoice_id"] == "in_2")
-    assert month2["status"] == "earned" and month2["amount_cents"] == 150
+
+    def original(invoice):
+        return next(e for e in _entries(sc, "recurring") if e["stripe_invoice_id"] == invoice and not e["reverses_entry_id"])
+
+    month2 = original("in_2")
+    # Reversals are appended rows; the original keeps its amount (2026-10-04),
+    # so a payout that already included it never changes.
+    assert month2["status"] == "earned" and month2["amount_cents"] == 300 and sc.net_amount(month2) == 150
     full = {"id": "evt_r2", "type": "charge.refunded", "data": {"object": {"object": "charge", "id": "ch_in_2", "payment_intent": "pi_in_2",
                                                                           "invoice": "in_2", "amount": 1499, "amount_refunded": 1499}}}
     sc.sync_commissions_from_stripe_event(full)
-    month2 = next(e for e in _entries(sc, "recurring") if e["stripe_invoice_id"] == "in_2")
-    assert month2["status"] == "reversed" and month2["amount_cents"] == 0 and month2["original_amount_cents"] == 300
-    # A dispute on the first payment reverses its recurring AND activation commission.
+    sc.sync_commissions_from_stripe_event(full)  # a retried refund event reverses once
+    month2 = original("in_2")
+    assert month2["status"] == "reversed" and month2["amount_cents"] == 300 and sc.net_amount(month2) == 0
+    assert sorted(e["amount_cents"] for e in _entries(sc, "recurring") if e["reverses_entry_id"] == month2["id"]) == [-150, -150]
+    # A dispute on the first payment reverses its commission.
     dispute = {"id": "evt_d", "type": "charge.dispute.created", "data": {"object": {"object": "dispute", "charge": "ch_in_1",
                                                                                  "payment_intent": "pi_in_1", "amount": 1499}}}
     sc.sync_commissions_from_stripe_event(dispute)
-    assert all(e["status"] == "reversed" for e in _entries(sc) if e["stripe_invoice_id"] == "in_1")
+    assert original("in_1")["status"] == "reversed" and sc.net_amount(original("in_1")) == 0
     assert sc.summarize(sc.ledger_for())["earned_cents"] == 0
 
 
@@ -576,7 +586,7 @@ def test_friends_family_sales_earn_zero_commission_but_keep_attribution(ledger, 
     friends_family.decide(request["id"], approve=True, decided_by="admin@example.test")
     sc.sync_commissions_from_stripe_event(_invoice_event("evt_1", "in_1", "price_local_8", 750))
     entries = _entries(sc)
-    assert {e["kind"] for e in entries} == {"activation", "recurring"}
+    assert {e["kind"] for e in entries} == {"recurring"}
     assert all(e["amount_cents"] == 0 and e["status"] == "not_eligible_friends_family" and e["salesperson_user_id"] == "sales-1"
                for e in entries)
 
@@ -628,7 +638,7 @@ def test_commission_records_are_scoped_to_the_salesperson(portal, db_path, monke
     import sales_commissions
     sales_commissions.sync_commissions_from_stripe_event(_invoice_event("evt_1", "in_1", "price_local_8", 1499))
     mine = client.get("/api/sales/commissions", cookies=_cookie("sales@example.test", "salesperson"))
-    assert mine.status_code == 200 and mine.json()["summary"]["earned_cents"] == 4000 + 300
+    assert mine.status_code == 200 and mine.json()["summary"]["earned_cents"] == 300
     assert client.get("/api/sales/commissions", cookies=_cookie(*OWNER)).status_code == 403
     page = client.get("/partner-revenue", cookies=_cookie("sales@example.test", "salesperson"))
     assert "Earned commissions" in page.text and "Real Customer" in page.text and "cust-1" not in page.text
@@ -966,6 +976,7 @@ def test_refunds_reverse_commission_with_current_stripe_api_shapes(ledger, monke
     # Dispute on month 2: no PaymentIntent was stored, so Stripe is asked which invoice pi_d2 paid.
     sc.sync_commissions_from_stripe_event({"id": "evt_dd2", "type": "charge.dispute.created", "data": {"object": {
         "object": "dispute", "charge": "ch_d2", "payment_intent": "pi_d2", "amount": 1499}}})
-    assert {e["stripe_invoice_id"]: e["status"] for e in _entries(sc, "recurring")} == {"in_d1": "reversed", "in_d2": "reversed"}
-    assert _entries(sc, "activation")[0]["status"] == "reversed"
+    originals = [e for e in _entries(sc, "recurring") if not e["reverses_entry_id"]]
+    assert {e["stripe_invoice_id"]: e["status"] for e in originals} == {"in_d1": "reversed", "in_d2": "reversed"}
+    assert all(sc.net_amount(e) == 0 for e in originals)
     assert any("payment_intent]=pi_d2" in c for c in calls)

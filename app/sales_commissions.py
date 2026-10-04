@@ -7,19 +7,28 @@ its salesperson, customer, subscription/order, tier, the payment that
 generated it, status and dates; reversals are recorded on the same rows.
 
 Rules (pricing_catalog):
-- Activation: $40 / $60 / $90 / $125 for an 8 / 16 / 32 / 64-camera plan,
-  once per customer, earned when Stripe confirms the customer's FIRST
-  paid base-plan invoice (owner decision 2026-09-30).
+- No activation commission (owner, 2026-10-04; the earlier $40-$125 was
+  removed). Rows already written stay as history.
 - Recurring: 20% of subscription revenue actually collected (invoice
   amount paid, excluding tax), for invoices within the customer's first 12
   paid months (counted by paid base-plan invoices). Nothing is paid ahead:
   each month's commission exists only once that month's invoice is paid,
   so a cancellation simply stops it. Failed/unpaid invoices earn nothing.
+- Partner agreements (partner_agreements.py, 2026-10-04): on an AnyAiCam-
+  billed partner customer's invoice, the partner's upcharge line and
+  activation/setup fee line are the partner's money ('partner_upcharge',
+  'partner_activation_fee' rows, owed to the partner in full) and earn no
+  commission; the 20% applies only to the AnyAiCam plan/add-on lines, at
+  the rate recorded on the agreement.
 - Hardware: $50 / $75 / $100 for the three appliance SKUs, $0 otherwise.
 - Friends & Family approved: every commission is $0 (the row is still
   written, status not_eligible_friends_family, for attribution/reporting).
-- Refunds and disputes reverse the commissions tied to that payment
-  (proportionally for a partial refund).
+  A partner's own upcharge and fee are still owed to the partner.
+- Refunds and disputes reverse what that payment generated (proportionally
+  for a partial refund) by APPENDING a negative 'reversal' row per entry;
+  the original row is never changed in amount, so a closed quarterly payout
+  (partner_payouts.py) stays exactly as issued and a reversal after it
+  carries forward.
 
 Attribution: sales_attributions (set by an administrator) or, when absent,
 the salesperson who created the customer in the Partner Portal
@@ -39,6 +48,8 @@ logger = logging.getLogger("anyaicam.sales_commissions")
 
 SALES_ROLES = {"salesperson", "partner_owner"}
 EARNED, REVERSED, NOT_ELIGIBLE_FF = "earned", "reversed", "not_eligible_friends_family"
+REVERSAL = "reversal"  # status of an appended negative row; kind stays the original's
+PARTNER_UPCHARGE, PARTNER_ACTIVATION_FEE = "partner_upcharge", "partner_activation_fee"
 
 
 def _now() -> str:
@@ -291,6 +302,44 @@ def _base_paid_months(customer_id: str) -> int:
     return int((found or {}).get("n") or 0)
 
 
+def _line_kind(line: dict) -> str:
+    """'recurring' for a subscription line, 'one_time' for an invoice item."""
+    price = line.get("price") if isinstance(line.get("price"), dict) else {}
+    parent_type = str((line.get("parent") or {}).get("type") or "")
+    if line.get("type") == "invoiceitem" or parent_type == "invoice_item_details" or price.get("type") == "one_time":
+        return "one_time"
+    return "recurring"
+
+
+def _split_agreement_invoice(invoice: dict) -> dict:
+    """What an AnyAiCam-billed partner customer actually paid, by owner:
+    AnyAiCam plan/add-on lines (known catalog prices), the partner's monthly
+    upcharge (any other recurring line) and the partner's activation/setup
+    fee (any other one-time line). Each line counts net of its discounts,
+    and the total is scaled to the amount actually paid excluding tax."""
+    lines = [line for line in ((invoice.get("lines") or {}).get("data") or []) if isinstance(line, dict)]
+    parts = {"anyaicam": 0, "upcharge": 0, "activation_fee": 0}
+    for line in lines:
+        net = int(line.get("amount") or 0) - sum(int(d.get("amount") or 0) for d in (line.get("discount_amounts") or []) if isinstance(d, dict))
+        if net <= 0:
+            continue
+        if _classify(_line_price_id(line))[0] is not None:
+            parts["anyaicam"] += net
+        elif _line_kind(line) == "recurring":
+            parts["upcharge"] += net
+        else:
+            parts["activation_fee"] += net
+    tax = int(invoice.get("tax") or 0) + sum(int(t.get("amount") or 0) for t in (invoice.get("total_taxes") or []) if isinstance(t, dict))
+    collected = max(0, int(invoice.get("amount_paid") or 0) - tax)
+    total = sum(parts.values())
+    if total > 0 and collected != total:  # credits, rounding: scale, keeping the cents exact
+        scaled = {k: int(v * collected // total) for k, v in parts.items()}
+        scaled["anyaicam"] += collected - sum(scaled.values())
+        parts = scaled
+    parts["collected"] = collected
+    return parts
+
+
 # ------------------------------------------------------------ event handlers
 
 def _invoice_paid(event: dict) -> dict:
@@ -309,6 +358,11 @@ def _invoice_paid(event: dict) -> dict:
         return {"status": "rejected" if why != "customer not resolved" else "ignored", "reason": why}
     tax = int(invoice.get("tax") or 0) + sum(int(t.get("amount") or 0) for t in (invoice.get("total_taxes") or []) if isinstance(t, dict))
     basis = int(round(max(0, amount_paid - tax) * eligible_fraction))  # unknown price lines earn nothing
+    import partner_agreements
+    agreement = partner_agreements.agreement_for_invoice(customer_id, subscription_id, _invoice_metadata(invoice))
+    split = _split_agreement_invoice(invoice) if agreement else None
+    if split:
+        basis = split["anyaicam"]  # the partner's upcharge and fee are never commission basis
     if not row("SELECT id FROM subscription_payments WHERE id=?", (invoice_id,)):
         with connection() as db:
             db.execute(
@@ -318,7 +372,15 @@ def _invoice_paid(event: dict) -> dict:
                  str(invoice.get("currency") or "usd"), str(invoice.get("period_start") or ""), _now(),
                  str(invoice.get("charge") or "") or None, _invoice_payment_intent(invoice), "paid"),
             )
-    attribution = attribution_for(customer_id)
+    if agreement:
+        attribution = {"salesperson_user_id": agreement["salesperson_user_id"], "partner_id": agreement.get("partner_id"),
+                       "source": "partner_agreement"}
+        rate_bps = int(agreement["commission_rate_bps"])
+        max_months = int(agreement["commission_max_paid_months"])
+    else:
+        attribution = attribution_for(customer_id)
+        rate_bps = pricing_catalog.RECURRING_COMMISSION_PERCENT * 100
+        max_months = pricing_catalog.RECURRING_COMMISSION_MAX_PAID_MONTHS
     if not attribution:
         return {"status": "payment_recorded", "commission": "no salesperson attribution"}
     ff = _ff_approved(customer_id)
@@ -328,20 +390,25 @@ def _invoice_paid(event: dict) -> dict:
     if product_class == "base":
         plan_type = product["product"].replace("camera_slots_", "")
         tier_slots = int(product["camera_slot_maximum"])
-        activation = pricing_catalog.ACTIVATION_COMMISSION_CENTS.get(tier_slots, 0)
-        if activation and paid_months == 1:  # the customer's first paid plan month
-            if _record(kind="activation", source_ref=f"activation:{customer_id}", customer_id=customer_id,
-                       attribution=attribution, amount_cents=activation, friends_family=ff,
-                       stripe_subscription_id=subscription_id, stripe_invoice_id=invoice_id,
-                       plan_type=plan_type, camera_slot_tier=tier_slots, paid_month_index=paid_months):
-                written.append("activation")
-    if 0 < paid_months <= pricing_catalog.RECURRING_COMMISSION_MAX_PAID_MONTHS:
-        amount = int(round(basis * pricing_catalog.RECURRING_COMMISSION_PERCENT / 100))
+    common = {"stripe_subscription_id": subscription_id, "stripe_invoice_id": invoice_id, "plan_type": plan_type,
+              "camera_slot_tier": tier_slots, "paid_month_index": paid_months, "collected_at": _now(),
+              "agreement_id": (agreement or {}).get("id"), "billing_party": (agreement or {}).get("billing_party")}
+    if 0 < paid_months <= max_months:
+        amount = int(round(basis * rate_bps / 10000))
         if _record(kind="recurring", source_ref=f"invoice:{invoice_id}", customer_id=customer_id,
                    attribution=attribution, amount_cents=amount, basis_cents=basis, friends_family=ff,
-                   stripe_subscription_id=subscription_id, stripe_invoice_id=invoice_id,
-                   plan_type=plan_type, camera_slot_tier=tier_slots, paid_month_index=paid_months):
+                   commission_rate_bps=rate_bps, collected_cents=basis, **common):
             written.append("recurring")
+    if split:
+        # The partner's own money, owed to the partner in full (Friends &
+        # Family zeroes AnyAiCam's commission, never the partner's charges).
+        for kind, cents in ((PARTNER_UPCHARGE, split["upcharge"]), (PARTNER_ACTIVATION_FEE, split["activation_fee"])):
+            if cents > 0 and _record(kind=kind, source_ref=f"invoice:{invoice_id}", customer_id=customer_id,
+                                     attribution=attribution, amount_cents=cents, basis_cents=cents, friends_family=False,
+                                     collected_cents=cents, **common):
+                written.append(kind)
+        partner_agreements.note_payment(agreement, paid_month_index=paid_months,
+                                        activation_fee_collected=split["activation_fee"] > 0, subscription_id=subscription_id)
     return {"status": "commission_recorded", "kinds": written, "paid_month_index": paid_months, "friends_family": ff}
 
 
@@ -364,24 +431,55 @@ def _hardware_paid(event: dict) -> dict:
     return {"status": "commission_recorded" if record else "already_recorded", "kinds": ["hardware"] if record else []}
 
 
-def _reverse(entries: list[dict], *, fraction: float, reason: str) -> list[str]:
-    """Reverse (fully or partly) earned commission rows. A full reversal marks
-    the row reversed; a partial one lowers amount_cents to what remains."""
-    changed = []
-    with connection() as db:
-        for entry in entries:
-            if entry["status"] != EARNED:
-                continue
-            # Stripe reports the CUMULATIVE refunded amount, so the remainder is
-            # always computed from the original commission, never the
-            # already-reduced one.
-            remaining = int(round(int(entry["original_amount_cents"]) * (1 - fraction)))
-            if fraction >= 0.999 or remaining <= 0:
-                db.execute("UPDATE commission_ledger SET status=?,amount_cents=0,reversed_at=?,reversal_reason=? WHERE id=?",
+def net_amount(entry: dict) -> int:
+    """What an original entry is worth now: its amount plus its reversals.
+    Rows reversed before 2026-10-04 were zeroed in place and have none."""
+    found = row("SELECT COALESCE(SUM(amount_cents),0) AS n FROM commission_ledger WHERE reverses_entry_id=?", (entry["id"],))
+    return int(entry["amount_cents"]) + int((found or {}).get("n") or 0)
+
+
+def reverse_entry(entry: dict, *, remaining_cents: int, reason: str, created_by: str = "stripe") -> Optional[dict]:
+    """Bring an earned entry down to remaining_cents by APPENDING a negative
+    row (status 'reversal', same kind, reverses_entry_id=the original). The
+    original's amount never changes, so a payout that already included it
+    stays as issued and the reversal lands in the next one. Idempotent: the
+    same target for the same entry writes once."""
+    original = int(entry["amount_cents"])
+    if entry["status"] not in (EARNED, REVERSED) or original == 0:
+        return None
+    delta = int(remaining_cents) - net_amount(entry)
+    # A reversal moves an entry toward zero: down for money owed to the
+    # partner, up for money the partner owes (partner_base_due).
+    if delta == 0 or (delta > 0) == (original > 0):
+        return None
+    reversal = _record(kind=entry["kind"], source_ref=f"reversal:{entry['id']}:{int(remaining_cents)}",
+                       customer_id=entry["customer_id"],
+                       attribution={"salesperson_user_id": entry["salesperson_user_id"], "partner_id": entry.get("partner_id")},
+                       amount_cents=delta, basis_cents=0, friends_family=False, reverses_entry_id=entry["id"],
+                       stripe_subscription_id=entry.get("stripe_subscription_id"), stripe_invoice_id=entry.get("stripe_invoice_id"),
+                       hardware_order_id=entry.get("hardware_order_id"), agreement_id=entry.get("agreement_id"),
+                       billing_party=entry.get("billing_party"), service_month=entry.get("service_month"),
+                       created_by=created_by, note=reason, status=REVERSAL)
+    if reversal:
+        with connection() as db:
+            if remaining_cents == 0:  # status/time are annotations; the amount stays as earned
+                db.execute("UPDATE commission_ledger SET status=?,reversed_at=?,reversal_reason=? WHERE id=?",
                            (REVERSED, _now(), reason, entry["id"]))
             else:
-                db.execute("UPDATE commission_ledger SET amount_cents=?,reversal_reason=? WHERE id=?",
-                           (remaining, f"partial {reason}", entry["id"]))
+                db.execute("UPDATE commission_ledger SET reversal_reason=? WHERE id=?", (f"partial {reason}", entry["id"]))
+    return reversal
+
+
+def _reverse(entries: list[dict], *, fraction: float, reason: str) -> list[str]:
+    """Reverse (fully or partly) what a payment generated. Stripe reports the
+    CUMULATIVE refunded amount, so the target is always computed from the
+    original amount."""
+    changed = []
+    for entry in entries:
+        if entry["status"] != EARNED or entry.get("reverses_entry_id"):
+            continue
+        remaining = 0 if fraction >= 0.999 else int(round(int(entry["original_amount_cents"]) * (1 - fraction)))
+        if reverse_entry(entry, remaining_cents=remaining, reason=reason):
             changed.append(entry["id"])
     return changed
 
@@ -436,6 +534,13 @@ def sync_commissions_from_stripe_event(event: dict) -> dict:
         return _charge_reversed(event, reason="refund")
     if event_type == "charge.dispute.created":
         return _charge_reversed(event, reason="dispute")
+    if event_type == "customer.subscription.deleted":
+        # Nothing already earned changes; the agreement simply ends, so no
+        # further invoice (and no further residual) follows.
+        import partner_agreements
+        subscription = (event.get("data") or {}).get("object") or {}
+        ended = partner_agreements.end_for_subscription(str(subscription.get("id") or ""), reason="subscription cancelled")
+        return {"status": "agreement_ended" if ended else "ignored"}
     return {"status": "ignored", "reason": f"unhandled event type {event_type!r}"}
 
 
@@ -449,9 +554,18 @@ def ledger_for(*, salesperson_user_id: Optional[str] = None, partner_id: Optiona
     return rows("SELECT * FROM commission_ledger ORDER BY earned_at DESC")
 
 
+SUMMARY_KINDS = ("activation", "hardware", "recurring", PARTNER_UPCHARGE, PARTNER_ACTIVATION_FEE,
+                 "partner_base_due", "partner_base_remitted")
+
+
 def summarize(entries: list[dict]) -> dict:
-    earned = [e for e in entries if e["status"] == EARNED]
-    by_kind = {kind: sum(int(e["amount_cents"]) for e in earned if e["kind"] == kind) for kind in ("activation", "hardware", "recurring")}
+    """Net amounts: earned rows plus their appended reversals (and rows that
+    were reversed before reversals were appended, which hold 0). A kind is
+    listed when it has any row ('activation' only for history)."""
+    counted = [e for e in entries if e["status"] in (EARNED, REVERSED, REVERSAL)]
+    present = {e["kind"] for e in entries}
+    by_kind = {kind: sum(int(e["amount_cents"]) for e in counted if e["kind"] == kind)
+               for kind in SUMMARY_KINDS if kind in present or kind in ("hardware", "recurring")}
     return {"earned_cents": sum(by_kind.values()), "by_kind_cents": by_kind,
             "reversed_count": sum(1 for e in entries if e["status"] == REVERSED),
             "friends_family_count": sum(1 for e in entries if e["status"] == NOT_ELIGIBLE_FF)}

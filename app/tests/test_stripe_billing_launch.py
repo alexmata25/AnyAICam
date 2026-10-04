@@ -389,7 +389,7 @@ def test_direct_customers_earn_nobody_a_commission_and_partner_customers_still_d
     with override_target(sqlite_path=str(env["path"])):
         entries = sales_commissions.ledger_for()
     assert {e["customer_id"] for e in entries} == {"cust-B"}
-    assert len([e for e in entries if e["kind"] == "activation"]) == 1  # replay never doubles
+    assert len([e for e in entries if e["kind"] == "recurring"]) == 1  # replay never doubles
 
 
 def test_the_owner_portal_can_be_turned_off(env, monkeypatch):

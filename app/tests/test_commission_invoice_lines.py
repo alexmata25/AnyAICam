@@ -41,7 +41,7 @@ def _outcome(sc):
 def test_base_and_add_on_lines_earn_the_same_whatever_their_order(ledger, order):
     sc = ledger
     sc.sync_commissions_from_stripe_event(_invoice("evt_1", "in_1", order))
-    assert _outcome(sc) == [("activation", 4000, 0, 8), ("recurring", 600, 2998, 8)]  # $40 activation + 20% of $29.98
+    assert _outcome(sc) == [("recurring", 600, 2998, 8)]  # 20% of $29.98; no activation commission since 2026-10-04
 
 
 def test_the_two_orders_produce_identical_ledgers(db_path, monkeypatch, tmp_path):

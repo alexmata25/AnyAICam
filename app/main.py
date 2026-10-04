@@ -48781,6 +48781,10 @@ register_pricing_routes(app, page_shell)
 
 
 register_partner_routes(app, page_shell)
+# Customer agreements (base price, partner upcharge, activation fee, billing
+# party) and quarterly partner payouts (2026-10-04).
+from partner_billing_routes import register_partner_billing_routes
+register_partner_billing_routes(app, page_shell)
 
 register_customer_registration_routes(app, page_shell, current_user, is_master_admin)
 
@@ -113902,6 +113906,25 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         ("metadata[anyaicam_camera_slot_plan_type]", plan_type),
         ("metadata[anyaicam_camera_slot_tier_label]", tier_label),
     ]
+    # Partner agreement (2026-10-04, partner_agreements.py): an AnyAiCam-
+    # billed partner customer pays the agreed final price -- the catalog
+    # plan line above (verified against the catalog) plus the partner's
+    # monthly upcharge and first-invoice activation/setup fee as inline
+    # lines built only from the stored, approved agreement. A partner-billed
+    # customer is refused (the partner charges them), as is a plan other
+    # than the agreed one.
+    import partner_agreements
+    try:
+        _agreement, _agreement_fields = partner_agreements.checkout_lines(customer_id, plan_type, tier_label)
+    except partner_agreements.AgreementError as refused:
+        raise HTTPException(status_code=refused.status, detail=str(refused))
+    if _agreement and stripe_mode != "subscription":
+        raise HTTPException(status_code=409, detail="This plan cannot carry your partner's monthly charge. Please contact AnyAiCam support.")
+    if _agreement_fields and friends_family.is_approved(customer_id):
+        # A Friends & Family coupon would also discount the partner's own
+        # charges; how the two combine is not decided, so nothing is charged.
+        raise HTTPException(status_code=409, detail="Your Friends & Family discount and your partner's charges need an AnyAiCam review before checkout. Please contact AnyAiCam support.")
+    fields += _agreement_fields
     # Friends & Family (approved by an administrator) is applied here, as
     # a server-side coupon, before the session exists; otherwise the
     # normal promotion-code field is offered. Never both.
