@@ -19734,7 +19734,13 @@ def stripe_api_post(path: str, fields: list[tuple[str, str]], *, idempotency_key
 
 
 
-        raise HTTPException(status_code=502, detail=message) from exc
+        error = HTTPException(status_code=502, detail=message)
+        # Whether Stripe definitely did NOT perform the request (2026-10-04): a
+        # 4xx answer is a refusal; 409 (a concurrent request with the same
+        # Idempotency-Key) and 5xx may or may not have run it. checkout_guard
+        # keeps its attempt for an uncertain outcome, so a retry reuses the key.
+        error.stripe_outcome = "rejected" if 400 <= exc.code < 500 and exc.code != 409 else "uncertain"
+        raise error from exc
 
 
 
@@ -19806,34 +19812,9 @@ def stripe_api_post(path: str, fields: list[tuple[str, str]], *, idempotency_key
 
 
 
-        raise HTTPException(
-
-
-
-
-
-
-
-
-            status_code=502,
-
-
-
-
-
-
-
-
-            detail="Could not connect to Stripe.",
-
-
-
-
-
-
-
-
-        ) from exc
+        error = HTTPException(status_code=502, detail="Could not connect to Stripe.")
+        error.stripe_outcome = "uncertain"  # the answer was lost: Stripe may have done it
+        raise error from exc
 
 
 
@@ -41901,6 +41882,13 @@ app.mount("/recordings", RecordingsStaticFiles(directory="/app/recordings"), nam
 # customer account, and the existing local-emergency-recovery /login
 # is the correct destination for them -- unchanged here.
 CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
+    # Settings (2026-10-03): the cloud customer nav's Settings and its
+    # sub-pages (e.g. /settings/system, Software Update). Same bug as the
+    # entries below: a signed-out customer landed on the local emergency
+    # recovery /login instead of the customer sign-in. Cloud partners and
+    # administrators use their own /partner* and /admin* pages, and an
+    # appliance keeps /login (this list is cloud-only).
+    "/settings",
     "/dashboard",
     "/playback",
     "/events",
@@ -114194,6 +114182,9 @@ def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Requ
 
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    # Pricing guard (2026-10-04, as for licences, plans and add-ons): the
+    # configured Stripe Price must charge exactly the published one-time price.
+    require_stripe_price_matches_catalog(price_id, amount_cents, None)
 
     fields = [
         ("mode", "payment"),
@@ -114209,14 +114200,30 @@ def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Requ
     if authoritative_customer_id:
         fields.append(("metadata[anyaicam_customer_id]", authoritative_customer_id))
 
-    account = billing_account_for_user(user)
-    customer_id_for_stripe = stripe_customer_id_for_account(account)
-    if customer_id_for_stripe:
-        fields.append(("customer", customer_id_for_stripe))
-    elif authoritative_email or account.get("billing_email") or user.get("email"):
-        fields.append(("customer_email", str(authoritative_email or account.get("billing_email") or user.get("email"))))
-
-    session = stripe_api_post("/v1/checkout/sessions", fields)
+    import checkout_guard
+    if authoritative_customer_id:
+        # The account's one canonical Stripe customer, as for licences and plans.
+        fields.append(("customer", checkout_guard.canonical_stripe_customer(authoritative_customer_id, email=authoritative_email)))
+        claim_owner = authoritative_customer_id
+    else:
+        account = billing_account_for_user(user)
+        customer_id_for_stripe = stripe_customer_id_for_account(account)
+        if customer_id_for_stripe:
+            fields.append(("customer", customer_id_for_stripe))
+        elif account.get("billing_email") or user.get("email"):
+            fields.append(("customer_email", str(account.get("billing_email") or user.get("email"))))
+        # Whose purchase this is, for the one-payable-session claim: never a
+        # key shared by unrelated people (the "anonymous" fallback user).
+        if _identity and _identity.get("email"):
+            claim_owner = f"partner:{str(_identity['email']).lower()}"
+        elif user.get("id") and user.get("id") != "anonymous":
+            claim_owner = f"user:{user['id']}"
+        else:
+            raise HTTPException(status_code=401, detail="Sign in to buy hardware.")
+    # One payable Checkout Session per (account, SKU) at a time (2026-10-04):
+    # a double click, a second tab or a retry after a lost answer gets the
+    # same session back; a paid one blocks until its order is recorded.
+    session = checkout_guard.create_session(claim_owner, f"hardware:{sku}", price_id=price_id, quantity=quantity, fields=fields)
     session_id = str(session.get("id") or "")
     checkout_url = str(session.get("url") or "")
     if not session_id or not checkout_url:

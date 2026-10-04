@@ -46,10 +46,17 @@ from partner_db import connection, row
 CHECKOUT_SESSION_SECONDS = 31 * 60
 CLOCK_SKEW_SECONDS = 60
 MIN_REUSE_SECONDS = 5 * 60  # a session about to expire is replaced, not reused
+# An attempt whose Stripe answer was lost stays "creating" (2026-10-04). After
+# this long it is no longer in flight: a DIFFERENT checkout for the same
+# purchase may take its place. Its session, if Stripe made one, was never
+# shown to anyone (the URL was in the lost answer), so it cannot be paid.
+IN_FLIGHT_SECONDS = 60
 AWAITING_PAYMENT_SECONDS = 14 * 24 * 3600  # bank debits can take days
 FREE_STATES = ("completed", "expired", "abandoned")
 # Webhook steps that provision what a Checkout Session bought (main._stripe_webhook_steps).
-PROVISIONING_STEPS = ("camera_slot_entitlements", "analytics_entitlements")
+# hardware_orders (2026-10-04): a paid hardware checkout holds its claim until the
+# order is recorded, like a plan or add-on until its entitlement is.
+PROVISIONING_STEPS = ("camera_slot_entitlements", "analytics_entitlements", "hardware_orders")
 
 IN_PROGRESS = "A checkout for this purchase is already in progress. Finish it in the other window, or try again in a few minutes."
 NEEDS_ATTENTION = "This account's billing records need attention. Please contact AnyAiCam support."
@@ -157,6 +164,26 @@ def _take_over(existing: dict, price_id: str, quantity: int, fingerprint: str) -
     return _pending(existing["customer_id"], existing["purchase"]) if swapped else None
 
 
+def _retake_stalled(existing: dict, price_id: str, quantity: int, fingerprint: str) -> dict | None:
+    """A "creating" attempt no longer in flight (its answer was lost) gives
+    way to a different checkout: a new token, so a new Idempotency-Key."""
+    try:
+        stalled = (datetime.now() - datetime.fromisoformat(str(existing.get("updated_at") or ""))).total_seconds() >= IN_FLIGHT_SECONDS
+    except ValueError:
+        stalled = True
+    if existing["status"] != "creating" or not stalled:
+        return None
+    now = int(time.time())
+    token = uuid.uuid4().hex
+    with connection() as db:
+        swapped = db.execute(
+            "UPDATE checkout_pending SET token=?,price_id=?,quantity=?,fingerprint=?,session_id=NULL,checkout_url=NULL,status='creating',"
+            "expires_at=?,created_at=?,updated_at=? WHERE customer_id=? AND purchase=? AND token=? AND status='creating'",
+            (token, price_id, quantity, fingerprint, now + CHECKOUT_SESSION_SECONDS, _now_iso(), _now_iso(),
+             existing["customer_id"], existing["purchase"], existing["token"])).rowcount
+    return _pending(existing["customer_id"], existing["purchase"]) if swapped else None
+
+
 def create_session(customer_id: str, purchase: str, *, price_id: str, quantity: int, fields: list) -> dict:
     """The Checkout Session for this purchase: created once, or the one
     already open for exactly the same purchase. HTTPException 409 while a
@@ -172,19 +199,25 @@ def create_session(customer_id: str, purchase: str, *, price_id: str, quantity: 
         if same and existing["status"] == "open" and existing.get("checkout_url") and remaining >= MIN_REUSE_SECONDS:
             return {"id": existing["session_id"], "url": existing["checkout_url"], "reused": True}
         if same and existing["status"] == "creating":
-            claim = existing  # a concurrent request: the same Idempotency-Key returns the same session
+            # A concurrent request, or a retry after a lost answer: the same
+            # Idempotency-Key returns the same session from Stripe.
+            claim = existing
         else:
-            claim = _take_over(existing, price_id, quantity, fingerprint)
+            claim = _take_over(existing, price_id, quantity, fingerprint) or _retake_stalled(existing, price_id, quantity, fingerprint)
             if claim is None:
                 raise HTTPException(status_code=409, detail=IN_PROGRESS)
     session_fields = list(fields) + [("expires_at", str(int(claim["expires_at"])))]
     try:
         session = _main().stripe_api_post("/v1/checkout/sessions", session_fields,
                                           idempotency_key=f"anyaicam-checkout-{claim['token']}")
-    except Exception:
-        with connection() as db:  # nothing was created: free the claim for a retry
-            db.execute("UPDATE checkout_pending SET status='abandoned',updated_at=? WHERE customer_id=? AND purchase=? "
-                       "AND token=? AND session_id IS NULL", (_now_iso(), customer_id, purchase, claim["token"]))
+    except Exception as error:
+        if getattr(error, "stripe_outcome", None) == "rejected":
+            with connection() as db:  # Stripe refused it, so nothing was created: free the claim
+                db.execute("UPDATE checkout_pending SET status='abandoned',updated_at=? WHERE customer_id=? AND purchase=? "
+                           "AND token=? AND session_id IS NULL", (_now_iso(), customer_id, purchase, claim["token"]))
+        # Otherwise the answer may have been lost after Stripe made the session:
+        # the claim stays "creating", so a retry of this same checkout sends the
+        # same Idempotency-Key and gets that session back -- never a second one.
         raise
     session_id, url = str(session.get("id") or ""), str(session.get("url") or "")
     if session_id and url:
