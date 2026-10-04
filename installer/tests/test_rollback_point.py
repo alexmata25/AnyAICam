@@ -76,6 +76,8 @@ class RollbackPointTests(unittest.TestCase):
         self.env_file.write_text(f"ANYAICAM_VMS_COMMIT={OLD}\nANYAICAM_BUILD_ID={OLD}\nOTHER=kept\n")
         self.rollback_dir = self.tmp / "rollback"
         self.log = self.tmp / "stub.log"
+        self.marker = self.tmp / "vms_release.json"
+        self.marker.write_text('{"vms_release_commit": "%s", "release_version": "1.2.1", "installer_version": "1.2.1"}' % OLD)
 
     def env(self, **extra):
         env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}", STUB_LOG=str(self.log),
@@ -93,11 +95,23 @@ class RollbackPointTests(unittest.TestCase):
             VMS_RECORDINGS_DIR="{bash_path(self.recordings)}"
             VMS_DATA_CONFIG_DIR="{bash_path(self.tmp / "data-config")}"
             VMS_RELEASE_COMMIT={NEW}
+            VMS_RELEASE_MARKER="{bash_path(self.marker)}"
             ''')
         result = subprocess.run([BASH, "-c", prelude + script], cwd=ROOT, text=True, capture_output=True, env=self.env(**extra))
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
+
+    def rollback_paths(self, **extra):
+        state = self.tmp / "update-state"
+        state.mkdir(exist_ok=True)
+        paths = dict(VMS_INSTALL_ROOT=bash_path(self.install_root), VMS_ENV_FILE=bash_path(self.env_file),
+                     VMS_RECORDINGS_DIR=bash_path(self.recordings), ANYAICAM_ROLLBACK_ALLOW_NON_ROOT="1",
+                     VMS_RELEASE_MARKER=bash_path(self.marker), ANYAICAM_UPDATE_STATE_DIR=bash_path(state),
+                     ANYAICAM_LEGACY_ROLLBACK_DIR=bash_path(self.tmp / "legacy-rollback"),
+                     ANYAICAM_ROLLBACK_VALIDATE_SECONDS="0")
+        paths.update(extra)
+        return paths
 
     def manifest(self):
         return dict(line.split("=", 1) for line in (self.rollback_dir / "latest.env").read_text().splitlines())
@@ -160,8 +174,7 @@ deploy_vms clean
         (self.install_root / "app" / "main.py").write_text("NEW RELEASE CODE\n")
         (self.recordings / "partner_portal.db").write_text("database after upgrade")
         self.env_file.write_text(f"ANYAICAM_VMS_COMMIT={NEW}\nANYAICAM_BUILD_ID={NEW}\nOTHER=kept\n")
-        paths = dict(VMS_INSTALL_ROOT=bash_path(self.install_root), VMS_ENV_FILE=bash_path(self.env_file),
-                     VMS_RECORDINGS_DIR=bash_path(self.recordings), ANYAICAM_ROLLBACK_ALLOW_NON_ROOT="1")
+        paths = self.rollback_paths()
         result = subprocess.run([BASH, "./rollback.sh", "--yes"], cwd=ROOT, text=True, capture_output=True, env=self.env(**paths))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.install_root / "app" / "main.py").read_text(), "OLD RELEASE CODE\n")
@@ -189,6 +202,74 @@ deploy_vms clean
         refused = subprocess.run([BASH, "./rollback.sh", "--yes", bash_path(bad)], cwd=ROOT, text=True, capture_output=True, env=env)
         self.assertNotEqual(refused.returncode, 0)
         self.assertEqual(self.log.read_text() if self.log.exists() else "", "")  # nothing stopped or tagged
+
+    # ------------------------------------------------------------------ release identity (2026-10-04)
+
+    def test_the_rollback_point_records_the_release_version_and_the_installed_record(self):
+        self.env_file.write_text(f"ANYAICAM_VERSION=1.2.1\nANYAICAM_VMS_COMMIT={OLD}\nANYAICAM_BUILD_ID={OLD}\n")
+        self.run_bash("create_rollback_point")
+        values = self.manifest()
+        self.assertEqual((values["ROLLBACK_VERSION"], values["CREATED_BY"]), ("1.2.1", "installer"))
+        saved = from_bash(values["ROLLBACK_MARKER"])
+        self.assertEqual(saved.parent, self.rollback_dir)
+        self.assertIn('"release_version": "1.2.1"', saved.read_text())
+
+    def test_by_default_rollback_points_live_in_roots_update_state_directory(self):
+        state = self.tmp / "update-state-default"
+        result = self.run_bash('echo "DIR=$ROLLBACK_DIR"', ANYAICAM_ROLLBACK_DIR="", UPDATE_STATE_DIR=bash_path(state))
+        self.assertIn(f"DIR={bash_path(state)}/rollback", result.stdout)
+
+    @unittest.skipUnless(shutil.which("rsync"), "rsync is required to run rollback.sh")
+    def test_rollback_sh_restores_the_version_and_the_installed_record(self):
+        self.env_file.write_text(f"ANYAICAM_VERSION=1.2.1\nANYAICAM_VMS_COMMIT={OLD}\nANYAICAM_BUILD_ID={OLD}\nOTHER=kept\n")
+        self.run_bash("create_rollback_point")
+        # Upgraded to 1.2.2.
+        self.env_file.write_text(f"ANYAICAM_VERSION=1.2.2\nANYAICAM_VMS_COMMIT={NEW}\nANYAICAM_BUILD_ID={NEW}\nOTHER=kept\n")
+        self.marker.write_text('{"vms_release_commit": "%s", "release_version": "1.2.2"}' % NEW)
+        paths = self.rollback_paths()
+        result = subprocess.run([BASH, "./rollback.sh", "--yes"], cwd=ROOT, text=True, capture_output=True, env=self.env(**paths))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        env = self.env_file.read_text()
+        self.assertIn("ANYAICAM_VERSION=1.2.1", env)
+        self.assertIn(f"ANYAICAM_BUILD_ID={OLD}", env)
+        self.assertIn("OTHER=kept", env)
+        self.assertIn('"release_version": "1.2.1"', self.marker.read_text())
+        root_record = from_bash(paths["ANYAICAM_UPDATE_STATE_DIR"]) / "installed_release.json"
+        self.assertIn(f'"vms_release_commit": "{OLD}"', root_record.read_text())
+
+    @unittest.skipUnless(shutil.which("rsync"), "rsync is required to run rollback.sh")
+    def test_rolling_back_to_a_release_without_a_version_drops_the_version_key(self):
+        self.marker.unlink()
+        self.run_bash("create_rollback_point")
+        self.env_file.write_text(f"ANYAICAM_VERSION=1.2.0\nANYAICAM_VMS_COMMIT={NEW}\nANYAICAM_BUILD_ID={NEW}\n")
+        paths = self.rollback_paths()
+        state = from_bash(paths["ANYAICAM_UPDATE_STATE_DIR"])
+        (state / "installed_release.json").write_text('{"release_version": "1.2.0"}')
+        result = subprocess.run([BASH, "./rollback.sh", "--yes"], cwd=ROOT, text=True, capture_output=True, env=self.env(**paths))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ANYAICAM_VERSION=", self.env_file.read_text())
+        self.assertFalse((state / "installed_release.json").exists())
+        self.assertIn(f'"vms_release_commit": "{OLD}"', self.marker.read_text())
+
+    def test_rollback_sh_refuses_a_point_taken_for_a_different_running_release(self):
+        self.run_bash("create_rollback_point")
+        other = "c" * 40
+        self.env_file.write_text(f"ANYAICAM_VMS_COMMIT={other}\nANYAICAM_BUILD_ID={other}\n")
+        result = subprocess.run([BASH, "./rollback.sh", "--yes"], cwd=ROOT, text=True, capture_output=True,
+                                env=self.env(**self.rollback_paths()))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Restoring it would skip releases", result.stderr)
+        self.assertNotIn("systemctl stop", self.log.read_text() if self.log.exists() else "")
+        self.assertEqual((self.install_root / "app" / "main.py").read_text(), "OLD RELEASE CODE\n")
+
+    def test_rollback_sh_falls_back_to_the_legacy_location_only_when_nothing_newer_exists(self):
+        legacy = self.tmp / "legacy-rollback"
+        legacy.mkdir()
+        (legacy / "latest.env").write_text("ROLLBACK_COMMIT=not-valid\n")
+        paths = self.rollback_paths(ANYAICAM_ROLLBACK_DIR=bash_path(self.tmp / "empty-rollback"))
+        result = subprocess.run([BASH, "./rollback.sh", "--yes"], cwd=ROOT, text=True, capture_output=True, env=self.env(**paths))
+        self.assertIn("Using the legacy rollback point", result.stdout)
+        self.assertIn("no valid ROLLBACK_COMMIT", result.stderr)
 
 
 if __name__ == "__main__":

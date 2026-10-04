@@ -162,6 +162,7 @@ run_install() {
     docker_setup
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"
+    install_rollback_tool
     install_agent "$INSTALL_STATE"
     install_mediamtx "$INSTALL_STATE"
     install_webrtc_firewall

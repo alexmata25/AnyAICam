@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Disposable Software Update E2E: a throwaway container (--rm), no network,
 # the repository mounted read-only. Uses a locally available image that has
-# python3 + cryptography + openssl (the VMS image built from this repo's
+# python3 + cryptography + openssl + rsync (rsync: rollback.sh) (the VMS image built from this repo's
 # Dockerfile works). Nothing outside the container is touched.
 #
 #   appliance-agent/tests/e2e/run_software_update_e2e.sh [image]

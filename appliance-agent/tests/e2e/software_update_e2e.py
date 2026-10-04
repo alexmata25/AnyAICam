@@ -19,7 +19,9 @@ a bind mount -- a running VMS keeps serving its own tree until restarted),
 and `systemd-run` (runs the command in the foreground).
 
 Proves: old version/build running -> update -> new version/build running ->
-bad release -> automatic rollback -> old version/build running again; plus
+bad release -> automatic rollback -> old version/build running again ->
+manual `sudo anyaicam-rollback` -> the release before the update running, with
+its identity restored -> the newer release installs again; plus
 the unprivileged user cannot touch root's code, key or state, a planted
 symlink cannot redirect a root write, and a forged release changes nothing.
 """
@@ -221,10 +223,11 @@ def main():
         check(done.returncode != 0 and ("Permission" in done.stderr or "denied" in done.stderr), f"anyaicam cannot {label}")
 
     def publish(version, build, app_files, signer=None, update_id=None):
-        package = write_tarball(WORK / f"release-{version}.tar.gz", release_files(version, build, app_files=app_files))
+        label = update_id or version
+        package = write_tarball(WORK / f"release-{label}.tar.gz", release_files(version, build, app_files=app_files))
         manifest = manifest_for(package, version=version, build_id=build, platform=os_id, architecture=arch,
                                 update_id=update_id)
-        offer = WORK / f"offer-{version}"
+        offer = WORK / f"offer-{label}"
         offer.mkdir()
         (offer / "manifest.json").write_text(json.dumps(manifest))
         (offer / "manifest.sig").write_bytes(base64.b64encode(sign(signer or private_key, manifest)))
@@ -358,6 +361,46 @@ Path("/var/lib/anyaicam/pending_actions/apply_release.json").write_text(json.dum
     check(serving() == ("1.2.0", BUILD_B, BUILD_B), "still 1.2.0 / build B")
     commands = Path("/var/log/e2e-commands.log").read_text()
     check("reboot" not in commands and "shadow" not in commands, "nothing from the request reached a command")
+
+    step("MANUAL ROLLBACK: sudo anyaicam-rollback returns to the release the in-app update replaced")
+    if not shutil.which("rsync"):
+        check(False, "rsync is installed (every appliance has it; this E2E image needs it for rollback.sh)")
+    else:
+        sh("bash", "-c", f'set -e; log(){{ echo "$*"; }}; INSTALLER_DIR={WORK}/installer; '
+                         f'source {WORK}/installer/06-deploy-vms.sh; install_rollback_tool')
+        tool = Path("/usr/local/sbin/anyaicam-rollback")
+        check(tool.stat().st_uid == 0 and oct(tool.stat().st_mode & 0o777) == "0o755", "the rollback command is installed root:root 0755")
+        points = Path("/var/lib/anyaicam-update/rollback")
+        check(points.stat().st_uid == 0 and oct(points.stat().st_mode & 0o777) == "0o750", "rollback points live in a root-only directory")
+        latest = dict(line.split("=", 1) for line in (points / "latest.env").read_text().splitlines() if "=" in line)
+        check((latest["ROLLBACK_COMMIT"], latest["ROLLBACK_VERSION"], latest["UPGRADE_TO_COMMIT"]) == (BUILD_A, "1.1.0", BUILD_B),
+              "the newest point is for 1.1.0, written when 1.2.0 was installed (the failed 1.3.0 wrote none)")
+        probe = sh("python3", "-c", "open('/var/lib/anyaicam-update/rollback/latest.env','a')", user="anyaicam", check_rc=False)
+        check(probe.returncode != 0, "anyaicam cannot touch the rollback points")
+        done = sh(str(tool), "--yes", check_rc=False)
+        check(done.returncode == 0, f"anyaicam-rollback completed and validated ({done.stdout.strip().splitlines()[-1][:120] if done.stdout.strip() else done.stderr[-160:]})")
+        check(serving() == ("1.1.0", BUILD_A, BUILD_A), "ROLLED BACK: /version and the served tree are 1.1.0 / build A")
+        marker_now = json.loads(Path("/etc/anyaicam/vms_release.json").read_text())
+        root_record = json.loads(Path("/var/lib/anyaicam-update/installed_release.json").read_text())
+        check(marker_now["release_version"] == "1.1.0" and root_record["release_version"] == "1.1.0",
+              "the installed-release record is 1.1.0 again, for the agent and for root")
+        env_now = Path("/etc/anyaicam/vms.env").read_text()
+        check(f"ANYAICAM_VERSION=1.1.0" in env_now and f"ANYAICAM_BUILD_ID={BUILD_A}" in env_now and "ANYAICAM_APP_SECRETS=keep-me" in env_now,
+              "vms.env identity is 1.1.0 / build A; secrets kept")
+        check(Path("/var/lib/anyaicam/vms/recordings/partner_portal.db").read_text() == "customer database", "database untouched")
+        check((live / "mediamtx/mediamtx").read_text() == "installer-provisioned binary", "mediamtx kept")
+        again = sh(str(tool), "--yes", check_rc=False)
+        check(again.returncode != 0 and "skip releases" in again.stderr,
+              "running it a second time is refused: that point belongs to the newer release")
+
+        step("RE-UPDATE after the rollback: 1.2.0 installs again through the owner flow")
+        manifest_r, offer_r = publish("1.2.0", BUILD_B, {"serve.py": SERVE}, update_id="1.2.0-reinstall")
+        staged_r = stage_as_agent(manifest_r, offer_r)
+        check(staged_r["state"] == "activation_requested", f"agent staged 1.2.0 again ({staged_r['state']} {staged_r['error']})")
+        run_watcher()
+        result, _ = root_result(manifest_r["update_id"])
+        check(result["state"] == "healthy", f"root applier result: {result['state']} {result.get('error', '')}")
+        check(serving() == ("1.2.0", BUILD_B, BUILD_B), "1.2.0 / build B serving again")
 
     passed = sum(1 for ok, _ in RESULTS if ok)
     print(f"\nE2E RESULT: {passed}/{len(RESULTS)} checks passed")

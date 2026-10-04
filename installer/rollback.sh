@@ -1,64 +1,120 @@
 #!/usr/bin/env bash
-# Restores the VMS to a rollback point created by install.sh (see
-# create_rollback_point() in 06-deploy-vms.sh).
+# Restores the VMS to the previous release from a rollback point.
 #
-#   sudo ./rollback.sh [MANIFEST] [--restore-database] [--yes]
+#   sudo anyaicam-rollback [MANIFEST] [--restore-database] [--allow-stale] [--yes]
+#   (the same script is also ./rollback.sh in every installer folder)
 #
-# MANIFEST defaults to /var/lib/anyaicam/rollback/latest.env (the point
-# taken before the most recent repair/upgrade). By default this restores
-# the previous image, code and recorded release commit and KEEPS the
-# current database (recordings, events and settings made since the
-# upgrade stay). --restore-database also puts back the database copy taken
-# at upgrade time; the current database is first saved beside it
+# Rollback points are written by the installer (create_rollback_point() in
+# 06-deploy-vms.sh, before a repair/upgrade) and by Software Update (the root
+# applier, after a validated in-app update). MANIFEST defaults to the newest
+# one: ROLLBACK_DIR/latest.env (/var/lib/anyaicam-update/rollback, root-owned),
+# or the legacy /var/lib/anyaicam/rollback/latest.env when only that exists.
+#
+# By default this restores the previous image, code and release identity
+# (build, version and the installed-release record) and KEEPS the current
+# database (recordings, events and settings made since the upgrade stay).
+# --restore-database also puts back the database copy taken at upgrade time;
+# the current database is first saved beside it
 # (partner_portal-before-rollback-<time>.db), never deleted.
+#
+# A rollback point belongs to the release that replaced it (UPGRADE_TO_COMMIT).
+# If the appliance runs a different build now -- for example an in-app update
+# happened after an installer rollback point -- restoring it would skip
+# releases, so it is refused unless --allow-stale is given (2026-10-04).
+#
 # Recordings, configuration (/etc/anyaicam) and credentials are never
-# touched. Stops and restarts anyaicam-vms.service.
+# touched. Stops and restarts anyaicam-vms.service, then checks /version.
 set -euo pipefail
 
 VMS_INSTALL_ROOT="${VMS_INSTALL_ROOT:-/opt/anyaicam}"
 VMS_ENV_FILE="${VMS_ENV_FILE:-/etc/anyaicam/vms.env}"
 VMS_RECORDINGS_DIR="${VMS_RECORDINGS_DIR:-/var/lib/anyaicam/vms/recordings}"
-ROLLBACK_DIR="${ANYAICAM_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}"
+VMS_RELEASE_MARKER="${VMS_RELEASE_MARKER:-/etc/anyaicam/vms_release.json}"
+UPDATE_STATE_DIR="${ANYAICAM_UPDATE_STATE_DIR:-/var/lib/anyaicam-update}"
+ROLLBACK_DIR="${ANYAICAM_ROLLBACK_DIR:-$UPDATE_STATE_DIR/rollback}"
+LEGACY_ROLLBACK_DIR="${ANYAICAM_LEGACY_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}"
 VMS_IMAGE="${ANYAICAM_VMS_IMAGE:-anyaicam-vms}"
 VMS_SERVICE="${ANYAICAM_VMS_SERVICE:-anyaicam-vms.service}"
+VMS_URL="${ANYAICAM_VMS_URL:-http://127.0.0.1:8000}"
+VALIDATE_SECONDS="${ANYAICAM_ROLLBACK_VALIDATE_SECONDS:-180}"
 VMS_DATABASE_NAME="partner_portal.db"
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
-manifest="$ROLLBACK_DIR/latest.env"
+manifest=""
 restore_database=0
 assume_yes=0
+allow_stale=0
 for arg in "$@"; do
     case "$arg" in
         --restore-database) restore_database=1 ;;
+        --allow-stale) allow_stale=1 ;;
         --yes) assume_yes=1 ;;
-        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
         -*) die "Unknown option: $arg" ;;
         *) manifest="$arg" ;;
     esac
 done
 
-[[ "${ANYAICAM_ROLLBACK_ALLOW_NON_ROOT:-}" == "1" || "$(id -u)" == "0" ]] || die "Run as root (sudo)."
-[[ -f "$manifest" ]] || die "Rollback manifest not found: $manifest"
+non_root_test=0
+[[ "${ANYAICAM_ROLLBACK_ALLOW_NON_ROOT:-}" == "1" ]] && non_root_test=1
+[[ "$non_root_test" == "1" || "$(id -u)" == "0" ]] || die "Run as root (sudo)."
 
+if [[ -z "$manifest" ]]; then
+    if [[ -f "$ROLLBACK_DIR/latest.env" ]]; then
+        manifest="$ROLLBACK_DIR/latest.env"
+    elif [[ -f "$LEGACY_ROLLBACK_DIR/latest.env" ]]; then
+        manifest="$LEGACY_ROLLBACK_DIR/latest.env"
+        log "Using the legacy rollback point in $LEGACY_ROLLBACK_DIR (no newer one in $ROLLBACK_DIR)."
+    else
+        manifest="$ROLLBACK_DIR/latest.env"
+    fi
+fi
+
+# A file root will act on must be a regular file owned by root: the legacy
+# rollback folder sits inside a directory the unprivileged agent user owns.
+trusted_file() {
+    local path="$1" what="$2"
+    [[ -f "$path" && ! -L "$path" ]] || die "$what is missing or not a regular file: $path"
+    if [[ "$non_root_test" != "1" && "$(stat -c %u "$path")" != "0" ]]; then
+        die "$what is not owned by root; refusing to use it: $path"
+    fi
+}
+
+[[ -f "$manifest" ]] || die "Rollback manifest not found: $manifest"
+trusted_file "$manifest" "Rollback manifest"
 # Parsed, never sourced: only these keys, only KEY=value lines.
 manifest_value() { sed -n "s/^$1=//p" "$manifest" | tail -n 1; }
 ROLLBACK_COMMIT="$(manifest_value ROLLBACK_COMMIT)"
 ROLLBACK_IMAGE="$(manifest_value ROLLBACK_IMAGE)"
 ROLLBACK_CODE_ARCHIVE="$(manifest_value ROLLBACK_CODE_ARCHIVE)"
 ROLLBACK_DATABASE_BACKUP="$(manifest_value ROLLBACK_DATABASE_BACKUP)"
-
+ROLLBACK_VERSION="$(manifest_value ROLLBACK_VERSION)"
+ROLLBACK_MARKER="$(manifest_value ROLLBACK_MARKER)"
+UPGRADE_TO_COMMIT="$(manifest_value UPGRADE_TO_COMMIT)"
 [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{7,40}$ ]] || die "Manifest has no valid ROLLBACK_COMMIT."
+[[ -z "$ROLLBACK_VERSION" || "$ROLLBACK_VERSION" =~ ^[0-9]{1,4}(\.[0-9]{1,4}){1,3}$ ]] || die "Manifest has an invalid ROLLBACK_VERSION."
 [[ "$ROLLBACK_IMAGE" != "none" && -n "$ROLLBACK_IMAGE" ]] || die "Manifest has no rollback image (nothing was running before that upgrade)."
 docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1 || die "Rollback image $ROLLBACK_IMAGE no longer exists."
-[[ -f "$ROLLBACK_CODE_ARCHIVE" ]] || die "Rollback code archive missing: $ROLLBACK_CODE_ARCHIVE"
+trusted_file "$ROLLBACK_CODE_ARCHIVE" "Rollback code archive"
 gzip -t "$ROLLBACK_CODE_ARCHIVE" || die "Rollback code archive is corrupt: $ROLLBACK_CODE_ARCHIVE"
 if [[ "$restore_database" == "1" ]]; then
     [[ -f "$ROLLBACK_DATABASE_BACKUP" ]] || die "No database backup in this rollback point (--restore-database impossible)."
 fi
+if [[ -n "$ROLLBACK_MARKER" && "$ROLLBACK_MARKER" != "none" ]]; then
+    trusted_file "$ROLLBACK_MARKER" "Saved release record"
+fi
 
-log "Rolling back the VMS to $ROLLBACK_COMMIT (image $ROLLBACK_IMAGE, code $ROLLBACK_CODE_ARCHIVE, database: $([[ $restore_database == 1 ]] && echo "restore $ROLLBACK_DATABASE_BACKUP" || echo 'keep current'))."
+running="$(sed -n 's/^ANYAICAM_BUILD_ID=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1)"
+if [[ -n "$UPGRADE_TO_COMMIT" && -n "$running" && "$running" != "$UPGRADE_TO_COMMIT" ]]; then
+    if [[ "$allow_stale" != "1" ]]; then
+        die "This rollback point was taken when ${UPGRADE_TO_COMMIT:0:12} was installed, but this appliance now runs ${running:0:12}. Restoring it would skip releases. Use the rollback point for the running release, or pass --allow-stale if you are sure."
+    fi
+    log "WARNING: --allow-stale: restoring a rollback point taken for ${UPGRADE_TO_COMMIT:0:12} while ${running:0:12} is running."
+fi
+
+log "Rolling back the VMS to ${ROLLBACK_VERSION:-an unversioned release} (build $ROLLBACK_COMMIT; image $ROLLBACK_IMAGE, code $ROLLBACK_CODE_ARCHIVE, database: $([[ $restore_database == 1 ]] && echo "restore $ROLLBACK_DATABASE_BACKUP" || echo 'keep current'))."
 if [[ "$assume_yes" != "1" ]]; then
     read -r -p "Proceed? This stops and restarts the VMS. [y/N] " answer
     [[ "$answer" == "y" || "$answer" == "Y" ]] || die "Cancelled; nothing was changed."
@@ -66,12 +122,37 @@ fi
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
+
+# Prepared and checked before anything changes.
+# The installed-release record: the agent reports it to the cloud, and root's
+# copy is what Software Update trusts for its downgrade check -- after a
+# rollback the newer release must be installable again.
+record="$(mktemp)"
+trap 'rm -rf "$staging" "$record"' EXIT
+if [[ -n "$ROLLBACK_MARKER" && "$ROLLBACK_MARKER" != "none" ]]; then
+    cp "$ROLLBACK_MARKER" "$record"
+else
+    printf '{\n  "vms_release_commit": "%s",\n  "release_version": "%s",\n  "installer_version": "%s"\n}\n' \
+        "$ROLLBACK_COMMIT" "$ROLLBACK_VERSION" "$ROLLBACK_VERSION" > "$record"
+fi
+python3 - "$record" "$ROLLBACK_COMMIT" "$ROLLBACK_VERSION" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path, commit, version = sys.argv[1:4]
+data = json.load(open(path, encoding="utf-8"))
+if not isinstance(data, dict) or data.get("vms_release_commit") != commit:
+    sys.exit("The saved release record does not belong to the rollback build.")
+data["release_version"] = version
+data["installer_version"] = data.get("installer_version") or version
+data["restored_by"] = "rollback"
+data["restored_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2) + "\n")
+PY
 tar -xzf "$ROLLBACK_CODE_ARCHIVE" -C "$staging"
 root_name="$(basename "$VMS_INSTALL_ROOT")"
 [[ -d "$staging/$root_name/app" ]] || die "Rollback code archive does not contain $root_name/app."
 
 systemctl stop "$VMS_SERVICE"
-
 # Same exclusions as deploy_vms(): persistent state and secrets stay put.
 # --checksum: the restored files can have the same size and a timestamp
 # within the same second as the current ones, which rsync's default
@@ -82,14 +163,37 @@ rsync -a --checksum --delete \
     "$staging/$root_name/" "$VMS_INSTALL_ROOT/"
 docker tag "$ROLLBACK_IMAGE" "$VMS_IMAGE:latest"
 
-for key in ANYAICAM_VMS_COMMIT ANYAICAM_BUILD_ID; do
+set_env_key() {
+    local key="$1" value="$2"
     if grep -q "^$key=" "$VMS_ENV_FILE"; then
-        sed -i "s/^$key=.*/$key=$ROLLBACK_COMMIT/" "$VMS_ENV_FILE"
+        sed -i "s/^$key=.*/$key=$value/" "$VMS_ENV_FILE"
     else
-        printf '%s=%s\n' "$key" "$ROLLBACK_COMMIT" >> "$VMS_ENV_FILE"
+        printf '%s=%s\n' "$key" "$value" >> "$VMS_ENV_FILE"
     fi
-done
+}
+set_env_key ANYAICAM_VMS_COMMIT "$ROLLBACK_COMMIT"
+set_env_key ANYAICAM_BUILD_ID "$ROLLBACK_COMMIT"
+if [[ -n "$ROLLBACK_VERSION" ]]; then
+    set_env_key ANYAICAM_VERSION "$ROLLBACK_VERSION"
+else
+    # The previous release had no product version: let its code report its own.
+    sed -i '/^ANYAICAM_VERSION=/d' "$VMS_ENV_FILE"
+fi
 
+[[ -L "$VMS_RELEASE_MARKER" ]] && rm -f "$VMS_RELEASE_MARKER"
+cp "$record" "$VMS_RELEASE_MARKER.rollback-tmp" && mv -f "$VMS_RELEASE_MARKER.rollback-tmp" "$VMS_RELEASE_MARKER"
+chmod 0644 "$VMS_RELEASE_MARKER"
+if [[ -d "$UPDATE_STATE_DIR" ]]; then
+    if [[ -n "$ROLLBACK_VERSION" ]]; then
+        if [[ "$non_root_test" == "1" ]]; then
+            cp "$record" "$UPDATE_STATE_DIR/installed_release.json"
+        else
+            install -m 0644 -o root -g root "$record" "$UPDATE_STATE_DIR/installed_release.json"
+        fi
+    else
+        rm -f "$UPDATE_STATE_DIR/installed_release.json"
+    fi
+fi
 if [[ "$restore_database" == "1" ]]; then
     current="$VMS_RECORDINGS_DIR/$VMS_DATABASE_NAME"
     kept="$VMS_RECORDINGS_DIR/partner_portal-before-rollback-$(date -u +%Y%m%dT%H%M%SZ).db"
@@ -100,6 +204,35 @@ if [[ "$restore_database" == "1" ]]; then
     if [[ -f "$ROLLBACK_DATABASE_BACKUP-wal" ]]; then cp -p "$ROLLBACK_DATABASE_BACKUP-wal" "$current-wal"; fi
     log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept as $kept."
 fi
-
 systemctl start "$VMS_SERVICE"
-log "Rollback to $ROLLBACK_COMMIT complete. Check: curl -fsS http://127.0.0.1:8000/version (build_id $ROLLBACK_COMMIT) and /health."
+
+if [[ "$VALIDATE_SECONDS" == "0" ]]; then
+    log "Rollback to $ROLLBACK_COMMIT applied (validation skipped). Check: curl -fsS $VMS_URL/version and /health."
+    exit 0
+fi
+log "Waiting up to ${VALIDATE_SECONDS}s for the VMS to report build ${ROLLBACK_COMMIT:0:12}..."
+deadline=$(( $(date +%s) + VALIDATE_SECONDS ))
+while :; do
+    if python3 - "$VMS_URL" "$ROLLBACK_COMMIT" "$ROLLBACK_VERSION" <<'PY'
+import json, sys, urllib.request
+url, build, version = sys.argv[1:4]
+try:
+    with urllib.request.urlopen(url + "/version", timeout=5) as response:
+        reported = json.loads(response.read())
+    with urllib.request.urlopen(url + "/health", timeout=5) as response:
+        healthy = response.status == 200
+except Exception:
+    sys.exit(1)
+ok = reported.get("build_id") == build and (not version or reported.get("version") == version) and healthy
+sys.exit(0 if ok else 1)
+PY
+    then
+        log "Rollback complete: the VMS reports ${ROLLBACK_VERSION:-its own version} build ${ROLLBACK_COMMIT:0:12} and /health passes."
+        exit 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+        echo "[ERROR] The VMS did not report build ${ROLLBACK_COMMIT:0:12} and pass /health within ${VALIDATE_SECONDS}s. The files are restored; check: systemctl status $VMS_SERVICE; curl $VMS_URL/version" >&2
+        exit 3
+    fi
+    sleep 3
+done

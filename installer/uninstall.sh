@@ -52,6 +52,7 @@ run_uninstall() {
     rm -rf "$VMS_INSTALL_ROOT"
     # Software Update (2026-10-03): the staged / previous / failed application trees.
     rm -rf "$VMS_INSTALL_ROOT.next" "$VMS_INSTALL_ROOT.previous" "$VMS_INSTALL_ROOT.failed"
+    rm -f /usr/local/sbin/anyaicam-rollback
     docker image rm anyaicam-vms 2>/dev/null || true
     systemctl daemon-reload
 

@@ -68,6 +68,7 @@ import shutil
 import stat as statmod
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -117,6 +118,7 @@ class Paths:
     trusted_key: Path = Path("/etc/anyaicam-update/trusted_signing_key.pem")
     vms_env: Path = Path("/etc/anyaicam/vms.env")                   # in an agent-owned directory
     release_marker: Path = Path("/etc/anyaicam/vms_release.json")   # in an agent-owned directory
+    recordings: Path = Path("/var/lib/anyaicam/vms/recordings")     # where the database backups are
     lock: Path = Path("/run/anyaicam-software-update.lock")
     os_release: Path = Path("/etc/os-release")
     vms_url: str = "http://127.0.0.1:8000"
@@ -136,6 +138,12 @@ class Paths:
     @property
     def installed_record(self) -> Path:
         return self.root_state / "installed_release.json"
+
+    @property
+    def rollback_dir(self) -> Path:
+        """Rollback points for `sudo anyaicam-rollback` (installer/rollback.sh);
+        the installer writes its own here too."""
+        return self.root_state / "rollback"
 
     @property
     def next(self) -> Path:
@@ -444,7 +452,7 @@ class Applier:
 
     def _apply(self, update_id: str) -> dict:
         started = self.now()
-        self.rollback_image, self.database_backup, self.previous_env = "", "", None
+        self.rollback_image, self.database_backup, self.previous_env, self.previous_marker = "", "", None, None
         previous = self._installed_release()
         record = {"update_id": update_id, "from_version": previous.get("version", ""),
                   "from_build_id": previous.get("build_id", ""), "to_version": "", "to_build_id": "",
@@ -483,7 +491,14 @@ class Applier:
                 raise Failure("rolling_back", "health_check_failed", problem)
             self._record_release(manifest, release_root, update_id)
             self._cleanup_after_success(update_id)
-            return finish("healthy")
+            # A manual way back to the release just replaced (2026-10-04). The
+            # update itself already succeeded: a problem here is reported in
+            # the result, never turned into a failed update.
+            try:
+                rollback_point = self._write_rollback_point(manifest, previous, update_id)
+            except Exception as error:  # noqa: BLE001
+                rollback_point = f"unavailable: {type(error).__name__}: {error}"[:300]
+            return finish("healthy", rollback_point=rollback_point)
         except Failure as failure:
             if not downtime_started:
                 self._cleanup_without_change(update_id)
@@ -655,6 +670,7 @@ class Applier:
             raise Failure("install_failed", "image_tag_failed", f"keeping the current image failed: {output[-300:]}")
         self.rollback_image = rollback_tag
         self.previous_env = self._read_identity_env()
+        self.previous_marker = self._read_marker_for_rollback()
 
     # ------------------------------------------------------------------ activate (downtime)
     def _systemctl(self, action: str) -> tuple:
@@ -766,8 +782,8 @@ class Applier:
             recovery = ("Rollback did not complete. Previous application: "
                         f"{self.paths.previous if self.paths.previous.exists() else self.paths.live}; failed release: "
                         f"{self.paths.failed}; previous image: {self.rollback_image or 'unknown'}; database backup: "
-                        f"{self.database_backup or 'none'} (in /var/lib/anyaicam/vms/recordings). The installer's "
-                        "rollback.sh can also restore the last installer rollback point.")
+                        f"{self.database_backup or 'none'} (in /var/lib/anyaicam/vms/recordings). `sudo anyaicam-rollback` "
+                        "restores the newest rollback point; it refuses one that does not belong to the running release.")
             return finish("rollback_failed", f"{reason}; rollback failed: {error}", recovery=recovery,
                           rollback_steps=steps)
         return finish("rolled_back", reason, rollback_steps=steps)
@@ -794,6 +810,114 @@ class Applier:
         # the shared marker the agent and the installer read.
         safe_replace(self.paths.root_state, self.paths.installed_record.name, data)
         safe_replace(self.paths.release_marker.parent, self.paths.release_marker.name, data)
+
+    # ------------------------------------------------------------------ manual rollback point
+    _ARCHIVE_EXCLUDES = ("recordings", "data/config", ".env", "mediamtx", "app/static/hls", "app/recordings",
+                         "app/auto.key", "app/auto.crt")
+    ROLLBACK_POINTS_KEPT = 3
+
+    def _read_marker_for_rollback(self) -> Optional[dict]:
+        """The installed-release record as it is before the update: root's
+        own copy when there is one, else the shared marker."""
+        for path, uid in ((self.paths.installed_record, 0 if _posix() else None), (self.paths.release_marker, None)):
+            try:
+                data = json.loads(read_untrusted(path, max_bytes=_MAX_SMALL_FILE, expected_uid=uid))
+            except (Failure, ValueError):
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
+
+    def _archive_previous(self, archive: Path) -> None:
+        """The replaced application folder as rollback.sh expects it:
+        <live folder name>/app/..., without state, secrets or live segments."""
+        source = self.paths.previous
+        top = self.paths.live.name
+        temporary = archive.with_name(f".{archive.name}.{secrets.token_hex(6)}.tmp")
+
+        def keep(member: tarfile.TarInfo) -> Optional[tarfile.TarInfo]:
+            relative = member.name.split("/", 1)[1] if "/" in member.name else ""
+            parts = relative.split("/")
+            if "__pycache__" in parts:
+                return None
+            if any(relative == item or relative.startswith(item + "/") for item in self._ARCHIVE_EXCLUDES):
+                return None
+            member.uid = member.gid = 0
+            member.uname = member.gname = "root"
+            return member
+
+        try:
+            with tarfile.open(temporary, "w:gz") as tar:
+                tar.add(str(source), arcname=top, recursive=True, filter=keep)
+            if _posix():
+                os.chmod(temporary, 0o640)
+            os.replace(temporary, archive)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    def _write_rollback_point(self, manifest: _Manifest, previous: dict, update_id: str) -> str:
+        env = self.previous_env or {}
+        build = previous.get("build_id") or env.get("ANYAICAM_BUILD_ID") or ""
+        if not re.fullmatch(r"[0-9a-f]{7,40}", build):
+            raise RuntimeError("the replaced release has no known build")
+        if not self.rollback_image or not self.paths.previous.is_dir():
+            raise RuntimeError("the replaced image or application folder is missing")
+        version = previous.get("version") or env.get("ANYAICAM_VERSION") or ""
+        try:
+            release_checks.parse_release_version(version)
+        except release_checks.ReleaseCheckError:
+            version = ""
+        directory = ensure_root_dir(self.paths.rollback_dir, 0o750)
+        short = build[:12]
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archive = directory / f"vms-code-{short}-{stamp}.tar.gz"
+        self._archive_previous(archive)
+        marker = dict(self.previous_marker or {})
+        if marker.get("vms_release_commit") != build:
+            marker = {"vms_release_commit": build, "release_version": version, "installer_version": version}
+        marker_name = f"release-marker-{short}-{stamp}.json"
+        safe_replace(directory, marker_name, (json.dumps(marker, indent=2) + "\n").encode("utf-8"), mode=0o640)
+        values = {
+            "ROLLBACK_COMMIT": build,
+            "ROLLBACK_VERSION": version,
+            "ROLLBACK_MARKER": str(directory / marker_name),
+            "ROLLBACK_IMAGE": self.rollback_image,
+            "ROLLBACK_CODE_ARCHIVE": str(archive),
+            "ROLLBACK_DATABASE_BACKUP": str(self.paths.recordings / self.database_backup) if self.database_backup else "none",
+            "ROLLBACK_CREATED_AT": stamp,
+            "UPGRADE_TO_COMMIT": manifest.build_id,
+            "UPDATE_ID": update_id,
+            "CREATED_BY": "software_update",
+        }
+        text = "".join(f"{key}={value}\n" for key, value in values.items()).encode("utf-8")
+        name = f"rollback-{short}-{stamp}.env"
+        safe_replace(directory, name, text, mode=0o640)
+        safe_replace(directory, "latest.env", text, mode=0o640)
+        self._prune_rollback_points(directory)
+        return str(directory / name)
+
+    def _prune_rollback_points(self, directory: Path) -> None:
+        """Keeps the newest ROLLBACK_POINTS_KEPT points this applier wrote;
+        never touches the installer's."""
+        mine = []
+        for path in directory.glob("rollback-*.env"):
+            try:
+                values = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
+            except OSError:
+                continue
+            if values.get("CREATED_BY") == "software_update":
+                mine.append((values.get("ROLLBACK_CREATED_AT", ""), path, values))
+        mine.sort(key=lambda item: item[0], reverse=True)
+        for _, path, values in mine[self.ROLLBACK_POINTS_KEPT:]:
+            for key in ("ROLLBACK_CODE_ARCHIVE", "ROLLBACK_MARKER"):
+                target = Path(values.get(key, ""))
+                if target.parent == directory and target.is_file():
+                    target.unlink()
+            path.unlink()
 
     def _cleanup_after_success(self, update_id: str) -> None:
         shutil.rmtree(self._work_dir(update_id), ignore_errors=True)

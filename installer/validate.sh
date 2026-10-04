@@ -174,7 +174,7 @@ mediamtx_required_and_usable() {
 # create_rollback_point()). Passes when no point was taken for THIS
 # release (a clean install, or ANYAICAM_SKIP_ROLLBACK_POINT=1).
 rollback_point_usable() {
-    local manifest="${ANYAICAM_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}/latest.env" value
+    local manifest="${ANYAICAM_ROLLBACK_DIR:-/var/lib/anyaicam-update/rollback}/latest.env" value
     [[ -f "$manifest" ]] || return 0
     grep -qx "UPGRADE_TO_COMMIT=$VMS_RELEASE_COMMIT" "$manifest" || return 0
     value="$(sed -n 's/^ROLLBACK_IMAGE=//p' "$manifest")"
@@ -252,6 +252,7 @@ run_validate() {
     check "anyaicam-webrtc-firewall.service is enabled" systemctl is-enabled --quiet anyaicam-webrtc-firewall.service
     check "VMS database passes SQLite integrity check (read-only)" retry_until_vms_started vms_database_integrity_ok
     check "a repair/upgrade left a usable rollback point (image, code archive, database backup)" rollback_point_usable
+    check "the rollback command is installed (sudo anyaicam-rollback)" test -x "${ANYAICAM_ROLLBACK_TOOL:-/usr/local/sbin/anyaicam-rollback}"
 
     if [[ "$FAILURES" -eq 0 ]]; then
         log "Validation PASSED (0 failures; expected VMS release $VMS_RELEASE_COMMIT)."

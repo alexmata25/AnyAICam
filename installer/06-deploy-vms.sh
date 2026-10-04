@@ -212,13 +212,38 @@ relocate_stale_install_dirs() {
 #     restores from.
 # Nothing here deletes or rewrites existing data; old rollback points are
 # kept (pruning them is left to the operator).
-ROLLBACK_DIR="${ANYAICAM_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}"
+# Root's own state directory (2026-10-04), not /var/lib/anyaicam/rollback:
+# that older location sits inside a directory the unprivileged agent user
+# owns, which could swap in a forged manifest for an operator to run as root.
+# Software Update writes its rollback points here too.
+ROLLBACK_DIR="${ANYAICAM_ROLLBACK_DIR:-${UPDATE_STATE_DIR:-/var/lib/anyaicam-update}/rollback}"
+ROLLBACK_TOOL="${ANYAICAM_ROLLBACK_TOOL:-/usr/local/sbin/anyaicam-rollback}"
 VMS_IMAGE="${ANYAICAM_VMS_IMAGE:-anyaicam-vms}"
 VMS_CONTAINER="${ANYAICAM_VMS_CONTAINER:-anyaicam-vms}"
 VMS_DATABASE_NAME="partner_portal.db"
 
 previous_vms_commit() {
     sed -n 's/^ANYAICAM_VMS_COMMIT=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1
+}
+
+# The running release's product version ("" for releases from before
+# product versions), so a rollback restores the version as well as the build.
+previous_vms_version() {
+    local version
+    version="$(sed -n 's/^ANYAICAM_VERSION=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1)"
+    [[ "$version" =~ ^[0-9]{1,4}(\.[0-9]{1,4}){1,3}$ ]] && printf '%s' "$version"
+    return 0
+}
+
+# Installs rollback.sh as a fixed command (2026-10-04). An in-app update
+# replaces only /opt/anyaicam, so the installer folder an operator still has
+# may be older than the release running; this copy is always the one from
+# the last installer run.
+install_rollback_tool() {
+    install -d -m 0755 "$(dirname "$ROLLBACK_TOOL")"
+    install -m 0755 "$INSTALLER_DIR/rollback.sh" "$ROLLBACK_TOOL"
+    if [[ "$(id -u)" == "0" ]]; then chown root:root "$ROLLBACK_TOOL"; fi
+    log "Installed the rollback command at $ROLLBACK_TOOL."
 }
 
 # Prints the backup's path ("none" when there is no database yet). Online
@@ -252,13 +277,14 @@ sys.exit(0 if check.execute("PRAGMA integrity_check").fetchone()[0] == "ok" else
 }
 
 create_rollback_point() {
-    local previous short stamp image_tag="" archive db_backup manifest root_parent root_name
+    local previous previous_version short stamp image_tag="" archive db_backup manifest root_parent root_name marker_copy="none"
     previous="$(previous_vms_commit)"
+    previous_version="$(previous_vms_version)"
     [[ -n "$previous" ]] || previous="unknown"
     short="${previous:0:12}"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$ROLLBACK_DIR" && chmod 0750 "$ROLLBACK_DIR" || return 1
-    if [[ "$(id -u)" == "0" ]]; then chown root:root "$ROLLBACK_DIR"; fi
+    if [[ "$(id -u)" == "0" ]]; then chown root:root "$(dirname "$ROLLBACK_DIR")" "$ROLLBACK_DIR"; fi
 
     if docker image inspect "$VMS_IMAGE:latest" >/dev/null 2>&1; then
         image_tag="$VMS_IMAGE:rollback-$short"
@@ -282,14 +308,23 @@ create_rollback_point() {
 
     db_backup="$(backup_vms_database "partner_portal-pre-${VMS_RELEASE_COMMIT:0:12}-$stamp.db")" || return 1
 
+    # The installed-release record as it is now, so a rollback restores it.
+    if [[ -f "${VMS_RELEASE_MARKER:-}" && ! -L "${VMS_RELEASE_MARKER:-}" ]]; then
+        marker_copy="$ROLLBACK_DIR/release-marker-$short-$stamp.json"
+        cp "$VMS_RELEASE_MARKER" "$marker_copy" && chmod 0640 "$marker_copy" || return 1
+    fi
+
     manifest="$ROLLBACK_DIR/rollback-$short-$stamp.env"
     {
         printf 'ROLLBACK_COMMIT=%s\n' "$previous"
+        printf 'ROLLBACK_VERSION=%s\n' "$previous_version"
+        printf 'ROLLBACK_MARKER=%s\n' "$marker_copy"
         printf 'ROLLBACK_IMAGE=%s\n' "${image_tag:-none}"
         printf 'ROLLBACK_CODE_ARCHIVE=%s\n' "$archive"
         printf 'ROLLBACK_DATABASE_BACKUP=%s\n' "$db_backup"
         printf 'ROLLBACK_CREATED_AT=%s\n' "$stamp"
         printf 'UPGRADE_TO_COMMIT=%s\n' "$VMS_RELEASE_COMMIT"
+        printf 'CREATED_BY=installer\n'
     } > "$manifest"
     chmod 0640 "$manifest"
     cp -f "$manifest" "$ROLLBACK_DIR/latest.env"
