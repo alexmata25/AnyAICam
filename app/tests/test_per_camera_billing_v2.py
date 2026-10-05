@@ -164,6 +164,55 @@ def test_v2_my_subscription_shows_plan_and_does_not_offer_included_talk_down(db_
     assert "existing Smart Motion and line-crossing behavior are unchanged" in html
 
 
+def _v2_page(db_path, monkeypatch, *, quantity, **subscription_fields):
+    import per_camera_billing as billing
+    import stripe_state
+    seed_customer(db_path)
+    monkeypatch.setenv(billing.PRICE_ENV["basic_local"], "price_basic")
+    sub = {"id": "sub_page", "customer": "cus_v2", "status": "active", "metadata": {"anyaicam_customer_id": "cust-v2"},
+           "current_period_end": 1800000000,
+           "items": {"data": [{"id": "si", "quantity": quantity, "price": {"id": "price_basic"}}]}, **subscription_fields}
+    monkeypatch.setattr(stripe_state, "subscription_payment_reversal", lambda _subscription: None)
+    billing._upsert_current(sub)
+    return billing
+
+
+def test_my_subscription_renewal_is_a_readable_local_date_not_a_raw_timestamp(db_path, monkeypatch):
+    billing = _v2_page(db_path, monkeypatch, quantity=1)
+    html = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
+    # 1800000000 = 2027-01-15 08:00 UTC; the page script rewrites it in the viewer's time zone.
+    assert 'Renews on <time datetime="2027-01-15T08:00:00+00:00" data-local-date>Jan 15, 2027</time>.' in html
+    assert "1800000000" not in html
+    assert "time[data-local-date]" in html and "toLocaleDateString" in html
+
+
+def test_my_subscription_says_1_camera_and_6_cameras(db_path, monkeypatch):
+    billing = _v2_page(db_path, monkeypatch, quantity=1)
+    one = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
+    assert "Basic Local · 1 licensed camera · $9.99 per camera/month" in one
+    assert "Included with the subscription · 1 camera<" in one
+    assert "1 licensed cameras" not in one and "· 1 cameras" not in one
+    billing._upsert_current({"id": "sub_page", "customer": "cus_v2", "status": "active", "metadata": {"anyaicam_customer_id": "cust-v2"},
+                             "current_period_end": 1800000000,
+                             "items": {"data": [{"id": "si", "quantity": 6, "price": {"id": "price_basic"}}]}})
+    six = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
+    assert "Basic Local · 6 licensed cameras · " in six and "Included with the subscription · 6 cameras<" in six
+
+
+def test_my_subscription_cancellation_and_scheduled_change_show_their_dates(db_path, monkeypatch):
+    billing = _v2_page(db_path, monkeypatch, quantity=6, cancel_at_period_end=True)
+    html = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
+    assert 'will stay active until <time datetime="2027-01-15T08:00:00+00:00" data-local-date>Jan 15, 2027</time> and will not renew' in html
+    billing._upsert_current({"id": "sub_page", "customer": "cus_v2", "status": "active", "metadata": {"anyaicam_customer_id": "cust-v2"},
+                             "current_period_end": 1800000000,
+                             "items": {"data": [{"id": "si", "quantity": 6, "price": {"id": "price_basic"}}]}})
+    billing._save_scheduled("cust-v2", "basic_local", 4, 1800000000, "sub_sched_test")
+    html = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
+    assert ('Scheduled change: Basic Local · 4 licensed cameras on '
+            '<time datetime="2027-01-15T08:00:00+00:00" data-local-date>Jan 15, 2027</time>.') in html
+    assert "1800000000" not in html
+
+
 @pytest.mark.parametrize("plan_key,unit_cents", [("basic_local", 999), ("ai_local", 1499), ("hybrid", 2499)])
 def test_friends_family_base_coupon_applies_to_camera_quantity(plan_key, unit_cents, db_path, monkeypatch):
     import friends_family

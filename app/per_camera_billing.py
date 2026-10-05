@@ -527,6 +527,19 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
     return "".join(rendered)
 
 
+def _local_date_html(epoch) -> str:
+    """A Stripe period timestamp as a readable date: the server renders the
+    UTC date, the page script rewrites it in the viewer's own time zone
+    (same <time data-local-date> convention as the legacy My Subscription)."""
+    from datetime import timezone
+    moment = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    return f'<time datetime="{moment.isoformat()}" data-local-date>{moment.strftime("%b %d, %Y")}</time>'
+
+
+def _camera_count(quantity, noun: str = "camera") -> str:
+    return f"{int(quantity)} {noun}{'' if int(quantity) == 1 else 's'}"
+
+
 def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
     """The v2 My Subscription panel. Legacy accounts stay on the legacy
     renderer; v2 customers see their exact quantity, plan entitlements and
@@ -544,14 +557,21 @@ def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
     if payload and payload.get("status") == "suspended":
         billing_note = '<p class="health-detail">Your plan is paused because of a billing problem. Update your payment method or contact AnyAiCam support.</p>'
     elif payload and payload.get("cancel_at_period_end"):
-        billing_note = '<p class="health-detail">Your plan will stay active until the end of the current paid period and will not renew.</p>'
+        until = f'until {_local_date_html(payload["billing_period_end"])}' if payload.get("billing_period_end") else 'until the end of the current paid period'
+        billing_note = f'<p class="health-detail">Your plan will stay active {until} and will not renew.</p>'
     elif payload and payload.get("billing_period_end"):
-        billing_note = f'<p class="health-detail">Renews at the end of the current billing period ({int(payload["billing_period_end"])}).</p>'
+        billing_note = f'<p class="health-detail">Renews on {_local_date_html(payload["billing_period_end"])}.</p>'
+    scheduled = (payload or {}).get("scheduled_change")
+    if scheduled and scheduled.get("plan_key") in PLANS and scheduled.get("camera_quantity"):
+        effective = f' on {_local_date_html(scheduled["effective_at"])}' if scheduled.get("effective_at") else ' at the next renewal'
+        billing_note += (f'<p class="health-detail" id="v2-scheduled-change">Scheduled change: '
+                         f'{escape(PLANS[scheduled["plan_key"]]["display_name"])} · '
+                         f'{_camera_count(scheduled["camera_quantity"], "licensed camera")}{effective}.</p>')
     features = payload["included_features"] if payload else []
     plan_summary = "No per-camera plan selected yet. Choose a plan and licensed camera count to continue."
     current_html = ""
     if payload:
-        plan_summary = (f"{escape(payload['display_name'])} · {payload['camera_quantity']} licensed cameras · "
+        plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
                         f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
                         f"${payload['monthly_base_total']:.2f} monthly base total")
         retention = f"{payload['local_retention_days']}-day local retention"
@@ -583,8 +603,8 @@ def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
     addons = _addon_portal_rows(customer_id, plan_key, is_owner)
     vms_capacity = customer_entitlements.vms_license_capacity(customer_id)
-    license_card = f'<div class="health-row"><span>VMS license</span><span class="pill">Included with the subscription · {payload["camera_quantity"] if payload else vms_capacity} cameras</span></div>' if payload else (
-        f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{vms_capacity} cameras</span></div>' if vms_capacity else '')
+    license_card = f'<div class="health-row"><span>VMS license</span><span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>' if payload else (
+        f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>' if vms_capacity else '')
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{billing_note}{action_html}</section>
     {friends_family.customer_panel_html()}
@@ -603,6 +623,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
     const cancelButton=document.getElementById('v2-cancel-plan');if(cancelButton)cancelButton.onclick=async()=>{{if(!confirm('Cancel at the end of the paid period?'))return;const response=await fetch('/api/v2/customer/subscription/cancel',{{method:'POST'}}),data=await response.json();document.getElementById('v2-message').textContent=data.detail||'Your plan will stay active through the paid period.';if(response.ok)setTimeout(()=>location.reload(),1000);}};
     document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;const response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}}),data=await response.json();if(!response.ok){{button.disabled=false;message.textContent=data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
     const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=async()=>{{const response=await fetch('/api/customer/billing-portal',{{method:'POST'}}),data=await response.json();if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}};
+    document.querySelectorAll('time[data-local-date]').forEach(t=>{{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {{dateStyle:'medium'}})}});
     </script>'''
     return main.page_shell("My subscription", "subscription-portal", content, scripts)
 
