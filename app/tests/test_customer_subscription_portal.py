@@ -99,20 +99,32 @@ def test_hybrid_customer_sees_the_hybrid_plan_badge_and_no_upgrade_panel(http_cl
     assert 'id="upgrade-to-hybrid"' not in response.text
 
 
-def test_customer_with_no_plan_sees_no_active_plan(http_client, db_path):
+def test_customer_with_no_plan_gets_the_billing_v2_plan_picker(http_client, db_path):
+    """2026-10-05 owner decision: new purchases are billing v2 only. A customer
+    with no camera plan is offered the per-camera plans, never the legacy
+    fixed-capacity chooser (legacy plan holders keep the legacy page)."""
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
     conn.close()
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert '<span class="pill">No active plan</span>' in response.text
+    html = response.text
+    assert "No per-camera plan selected yet" in html
+    assert 'id="v2-checkout-button"' in html and "/api/v2/customer/subscription/checkout" in html
+    for option in ("Basic Local · $9.99 per camera/month", "AI Local · $14.99 per camera/month", "Hybrid · $24.99 per camera/month"):
+        assert option in html
+    assert 'id="choose-plan-button"' not in html and "Local vs Hybrid" not in html
 
 
-def test_local_vs_hybrid_comparison_is_always_shown(http_client, db_path):
+def test_local_vs_hybrid_comparison_is_shown_to_legacy_plan_customers(http_client, db_path):
+    """Grandfathered legacy customers keep the legacy page and its comparison."""
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
     conn.close()
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Local vs Hybrid" in html
@@ -189,7 +201,7 @@ def test_an_active_addon_shows_an_active_pill_not_a_buy_button(http_client, db_p
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Advanced Analytics" in html
-    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">[^<]*Includes: [^<]+</span></span><span class="pill">Active</span>', html)
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">\$24\.99/mo · [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, monkeypatch):
@@ -201,7 +213,7 @@ def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, m
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert 'data-addon-key="ai_essentials"' in html
-    assert "$7.99/mo · Includes: People Counting" in html
+    assert "$7.99/mo · Advanced people-counting rules and reports" in html
 
 
 def test_face_access_offers_one_size_per_door_and_never_the_old_sku(http_client, db_path, monkeypatch):
@@ -215,9 +227,9 @@ def test_face_access_offers_one_size_per_door_and_never_the_old_sku(http_client,
     conn.close()
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert html.count("<span>Face Access Small<br>") == 1
+    assert html.count("<span>Face Access / Facial Recognition — Small<br>") == 1
     assert "$39.99/mo per door" in html
-    assert "Face Access Medium" not in html and "Face Access Large" not in html
+    assert "Facial Recognition — Medium" not in html and "Facial Recognition — Large" not in html
     assert 'data-addon-key="facial_recognition"' not in html
     assert 'data-addon-key="face_access_' not in html  # no Face Access Price ID configured here
 
@@ -239,7 +251,7 @@ def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(ht
     assert "Advanced Analytics" in html
     # 2026-09-25: shown as clearly unavailable (not an active-looking
     # "Coming soon"), with what it includes from the catalog mapping.
-    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">\$24\.99/mo · Includes: People Counting, LPR, PPE</span></span>'
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">\$24\.99/mo · LPR, advanced people counting, and PPE</span></span>'
                      r'<span class="pending-badge" aria-disabled="true"[^>]*>Not available yet</span>', html)
     assert 'data-addon-key="advanced_analytics"' not in html
 
@@ -261,7 +273,7 @@ def test_an_addon_already_active_without_its_price_id_configured_still_shows_act
             upsert_analytics_subscription(customer_id="cust-1", analytic_key=key, status="active")
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">[^<]*Includes: [^<]+</span></span><span class="pill">Active</span>', html)
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">\$24\.99/mo · [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 # ------------------------------------------------------- customer_viewer role

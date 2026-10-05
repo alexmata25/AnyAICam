@@ -512,6 +512,9 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
         detail = f"{door_count} door{'s' if door_count != 1 else ''}" if door_count else "No door cameras set up yet"
         if is_active:
             action = '<span class="pill">Active</span>'
+        elif os.environ.get(tier["price_env_var"], "").strip() and not item["sellable"] and item.get("unavailable_reason"):
+            # Same as the legacy page: say why (e.g. no door camera yet), not "Not available yet".
+            action = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(item["unavailable_reason"])}</span>'
         elif not os.environ.get(tier["price_env_var"], "").strip() or not item["sellable"]:
             action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
         elif is_owner:
@@ -520,7 +523,7 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
             action = '<span class="health-detail">Not purchased</span>'
         rendered.append(f'<div class="health-row"><span>Face Access / Facial Recognition — {escape(tier["size"].title())}<br><span class="health-detail">{price} · {detail}</span></span>{action}</div>')
     if "enterprise" == face_size and not face_held:
-        rendered.append('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">Custom pricing</span></span><span class="health-detail">Contact AnyAiCam</span></div>')
+        rendered.append('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">More than 500 enrolled people: custom pricing</span></span><span class="health-detail">Contact AnyAiCam</span></div>')
     if not rendered:
         rendered.append('<p class="health-detail">No premium analytics add-ons are available for purchase yet.</p>')
     rendered.append('<p class="health-detail">LPR / Vehicle Intelligence, Face Access, advanced people counting, PPE, and other available premium analytics remain separately licensed. Advanced Line Crossing is not sold separately today; existing Smart Motion and line-crossing behavior are unchanged. A separate Advanced Line Crossing entitlement may be offered in the future.</p>')

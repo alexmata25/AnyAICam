@@ -317,17 +317,29 @@ def test_a_mail_outage_is_reported_plainly_and_creates_nothing(site, db_path):
 
 # ------------------------------------------------------------------ choose a plan on My subscription
 
-def test_my_subscription_lets_a_new_direct_owner_choose_a_plan_through_the_existing_checkout(site, db_path):
+def test_my_subscription_offers_a_new_direct_owner_the_billing_v2_plans(site, db_path, monkeypatch):
+    """2026-10-05 owner decision: a new direct owner chooses Basic Local, AI
+    Local or Hybrid and a camera quantity on My Subscription (billing v2
+    checkout); the legacy fixed-capacity chooser is never offered."""
     client, captured, mail = site
     _direct_owner(client, mail, "chooser@example.test")
     page = client.get("/subscription-portal").text
-    assert 'id="choose-plan-button"' in page and 'value="local|1-8"' in page
-    assert "/api/customer/camera-slots/checkout" in page  # the one existing checkout, not a copy
+    assert 'id="v2-checkout-button"' in page and "/api/v2/customer/subscription/checkout" in page
+    for option in ("Basic Local · $9.99", "AI Local · $14.99", "Hybrid · $24.99"):
+        assert option in page
+    assert 'id="choose-plan-button"' not in page and 'value="local|1-8"' not in page
     customer_id = _one(db_path, "SELECT id FROM customers WHERE email='chooser@example.test'")["id"]
-    assert client.post("/api/customer/camera-slots/checkout", json={"plan_type": "local", "tier_label": "1-8"}).status_code == 200
-    _webhook(client, _completed("evt_choose", "price_local_8", customer_id, "chooser@example.test"))
+    import per_camera_billing as billing
+    import stripe_state
+    monkeypatch.setenv(billing.PRICE_ENV["ai_local"], "price_v2_ai_local")
+    monkeypatch.setattr(stripe_state, "subscription_payment_reversal", lambda _subscription: None)
+    with override_target(sqlite_path=str(db_path)):
+        billing._upsert_current({"id": "sub_chooser", "customer": "cus_chooser", "status": "active",
+                                 "metadata": {"anyaicam_customer_id": customer_id},
+                                 "items": {"data": [{"id": "si", "quantity": 2, "price": {"id": "price_v2_ai_local"}}]}})
     after = client.get("/subscription-portal").text
-    assert 'id="choose-plan-button"' not in after  # offered only while there is no plan
+    assert 'id="v2-checkout-button"' not in after  # offered only while there is no plan
+    assert "AI Local · 2 licensed cameras" in after
 
 
 def test_the_plan_chooser_is_not_offered_without_configured_prices(site, db_path, monkeypatch):

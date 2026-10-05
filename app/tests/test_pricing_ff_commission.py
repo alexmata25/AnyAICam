@@ -922,7 +922,7 @@ def test_my_subscription_offers_only_the_matching_face_access_size(face_portal, 
     _doors(db_path, ["cam-1"])
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
     assert 'data-addon-key="face_access_large"' in html
-    assert "$69.99/mo per door · Includes: Facial Recognition · 1 door" in html
+    assert "Face Access / Facial Recognition — Large<br>" in html and "$69.99/mo per door · 1 door" in html
     assert 'data-addon-key="face_access_small"' not in html and 'data-addon-key="face_access_medium"' not in html
 
 

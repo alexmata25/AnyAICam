@@ -104300,6 +104300,15 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     _v2_entitlement = _per_camera_billing.entitlement_for_customer(identity["customer_id"])
     if _v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended"):
         return _per_camera_billing.customer_portal_page(identity, _v2_entitlement)
+    # New purchases are billing v2 only (owner decision 2026-10-05): a
+    # customer with no active/suspended camera plan -- v2 or legacy -- gets
+    # the per-camera plan picker, never the legacy fixed-capacity chooser.
+    # Customers with a legacy plan stay on the legacy page (grandfathered).
+    _legacy_plan = [e for e in get_entitlements_for_customer(identity["customer_id"])
+                    if e["product"] in ("camera_slots_local", "camera_slots_hybrid")
+                    and e["status"] in ("active", "suspended")]
+    if not _legacy_plan:
+        return _per_camera_billing.customer_portal_page(identity, None)
     from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
 
     customer_id = identity["customer_id"]
