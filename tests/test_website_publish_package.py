@@ -62,8 +62,13 @@ def test_new_page_and_unmatched_live_page_are_reported():
 
 
 def test_build_refuses_a_pending_release_unless_preparing(tmp_path):
-    with pytest.raises(SystemExit, match="pending"):
-        package.build(tmp_path / "pkg", fetcher=lambda rel: (200, b""), history=lambda rel: [])
+    import shutil
+    import website_release
+    copy = tmp_path / "website"
+    shutil.copytree(WEBSITE, copy)
+    website_release.apply(None, copy)  # back to "release finalizing"
+    with pytest.raises(SystemExit, match="release blocks are still pending"):
+        package.build(tmp_path / "pkg", website=copy, fetcher=lambda rel: (200, b""), history=lambda rel: [])
 
 
 def test_preparation_build_lists_uploads_checksums_and_host_cleanup(tmp_path):
@@ -93,5 +98,6 @@ def test_preparation_build_lists_uploads_checksums_and_host_cleanup(tmp_path):
     assert "anyaicam-test-webhook.php" in manifest["delete_from_host"]
     assert "CMHT1722-28LS, 2MP HD-TVI.html" not in manifest["delete_from_host"]
     publish = (out / "PUBLISH.md").read_text(encoding="utf-8")
-    assert "preparation build: do not upload" in publish and "`vms-linux.html` (new)" in publish
+    # The committed site names the published 1.2.3 release, so this is a real (uploadable) build.
+    assert "preparation build" not in publish and "release blocks published (1.2.3" in publish and "`vms-linux.html` (new)" in publish
     assert json.loads((out / "manifest.json").read_text(encoding="utf-8"))["files"]["index.html"]["status"] == "same as live"

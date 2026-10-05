@@ -4,7 +4,7 @@ Every line of the website that names an AnyAiCam installer release sits
 between markers:
 
     <!--release:ID state=pending-->...<!--/release:ID-->
-    <!--release:ID state=published version=X filename=Y sha256=Z url=U-->...<!--/release:ID-->
+    <!--release:ID state=published version=X filename=Y sha256=Z url=U [size=BYTES]-->...<!--/release:ID-->
 
 and is rendered only from the templates below, so the final release is a
 single command once the installer exists:
@@ -14,8 +14,11 @@ single command once the installer exists:
     python tools/website_release.py pending     # back to "release finalizing"
     python tools/website_release.py check       # used by tools/website_launch_check.py
 
---installer recomputes the SHA-256 and checks the file name against the real
-file. Superseded installers are refused. Nothing is uploaded or published:
+--installer recomputes the SHA-256, checks the file name against the real
+file and records its size. --url is where customers download it: since
+2026-10-05 the installer file itself, served from the website (activating
+AnyAiCam still needs an account with a VMS licence). Superseded installers
+are refused. Nothing is uploaded or published:
 this only edits website/ in the working tree.
 """
 from __future__ import annotations
@@ -31,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WEBSITE = ROOT / "website"
 DEFAULT_URL = "https://app.anyaicam.com/customer-login.html"
 REGISTER = "https://app.anyaicam.com/customer-register"
+FIELDS = ("version", "filename", "sha256", "url", "size")  # size (bytes) is optional
 
 # Installers that must never be named on the website again.
 SUPERSEDED_SHA256 = {
@@ -58,27 +62,32 @@ BLOCKS = {
             'When it is released, you download it from <strong>My subscription</strong>, and its version and SHA-256 '
             'are listed here. <a href="vms-linux.html" style="color:#16778b;text-decoration:underline;font-weight:700">Installation guide</a></p>',
             '<div class="button-row" style="margin-top:.6rem">\n'
-            f'          <a class="button primary" href="{REGISTER}">Create an account</a>\n'
-            '          <a class="button light" href="{url}">Sign in to download</a>\n'
+            '          <a class="button primary" href="{url}" download>Download for Linux</a>\n'
+            f'          <a class="button light" href="{REGISTER}">Create an account</a>\n'
             '        </div>\n'
-            '        <p style="font-size:.9rem;color:#64748b;margin-top:.7rem">After signing in, download the installer from '
-            '<strong>My subscription</strong>. <a href="vms-linux.html" style="color:#16778b;text-decoration:underline;font-weight:700">Installation guide</a></p>\n'
-            '        <p style="font-size:.82rem;color:#64748b;margin-top:.4rem;overflow-wrap:anywhere">Version {version} · Ubuntu 24.04 · x86_64 · SHA-256 <code>{sha256}</code></p>',
+            '        <p style="font-size:.9rem;color:#64748b;margin-top:.7rem">Activating AnyAiCam needs an AnyAiCam account with a VMS licence. '
+            '<a href="vms-linux.html" style="color:#16778b;text-decoration:underline;font-weight:700">Installation guide</a></p>\n'
+            '        <p style="font-size:.82rem;color:#64748b;margin-top:.4rem;overflow-wrap:anywhere">Version {version} · Ubuntu 24.04 · x86_64{size_text} · SHA-256 <code>{sha256}</code></p>',
         ),
     },
     "vms-linux.html": {
         "linux-hero-actions": (
             f'<a class="button primary" href="{REGISTER}">Create an account</a>\n'
             f'        <a class="button light" href="{DEFAULT_URL}">Sign in</a>',
-            '<a class="button primary" href="{url}">Sign in to download</a>\n'
+            '<a class="button primary" href="{url}" download>Download for Linux</a>\n'
             f'        <a class="button light" href="{REGISTER}">Create an account</a>',
+        ),
+        "linux-download-step": (
+            'Sign in to the AnyAiCam portal, open <strong>My subscription</strong> and select <strong>Download installer</strong>.',
+            'Download the installer, <a href="{url}" download><code style="overflow-wrap:anywhere">{filename}</code></a>{size_paren}. '
+            'Activating AnyAiCam needs an AnyAiCam account with a VMS licence.',
         ),
         "linux-hero-release": (
             '<h2>Release status</h2>\n'
             '      <p><strong>AnyAiCam for Linux</strong><br>Ubuntu 24.04 · x86_64</p>\n'
             '      <p style="font-size:.85rem">Release finalizing. The version and SHA-256 are listed here when the installer is released.</p>',
             '<h2>This release</h2>\n'
-            '      <p><strong>AnyAiCam {version}</strong><br>Ubuntu 24.04 · x86_64</p>\n'
+            '      <p><strong>AnyAiCam {version}</strong><br>Ubuntu 24.04 · x86_64{size_text}</p>\n'
             '      <p style="overflow-wrap:anywhere;font-size:.85rem">SHA-256<br><code>{sha256}</code></p>',
         ),
         "linux-install-status": (
@@ -139,7 +148,19 @@ def validate_values(values: dict) -> dict:
         raise ReleaseError("SHA-256 belongs to a superseded installer")
     if not re.match(r"^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/%-]*)?$", url) or "--" in url:
         raise ReleaseError(f"download URL must be a plain https URL, got {url!r}")
-    return {"version": version, "filename": filename, "sha256": sha, "url": url}
+    if url.endswith(".tar.gz") and not url.endswith("/" + filename):
+        raise ReleaseError(f"download URL {url!r} is a different file than {filename!r}")
+    checked = {"version": version, "filename": filename, "sha256": sha, "url": url}
+    size = str(values.get("size") or "")
+    if size:
+        if not size.isdigit() or int(size) <= 0:
+            raise ReleaseError(f"size must be a positive number of bytes, got {size!r}")
+        checked["size"] = size
+    return checked
+
+
+def _megabytes(size: str) -> str:
+    return f"{int(size) / 1_000_000:.1f} MB"
 
 
 def sha256_of(path: Path) -> str:
@@ -153,8 +174,10 @@ def sha256_of(path: Path) -> str:
 def render(block_id: str, templates: tuple, values: dict | None) -> str:
     if values is None:
         return f"<!--release:{block_id} state=pending-->{templates[0]}<!--/release:{block_id}-->"
-    attrs = " ".join(f"{key}={values[key]}" for key in ("version", "filename", "sha256", "url"))
-    return f"<!--release:{block_id} state=published {attrs}-->{templates[1].format(**values)}<!--/release:{block_id}-->"
+    attrs = " ".join(f"{key}={values[key]}" for key in FIELDS if key in values)
+    size = values.get("size")
+    fields = dict(values, size_text=f" · {_megabytes(size)}" if size else "", size_paren=f" ({_megabytes(size)})" if size else "")
+    return f"<!--release:{block_id} state=published {attrs}-->{templates[1].format(**fields)}<!--/release:{block_id}-->"
 
 
 def _read(path: Path) -> tuple[str, str]:
@@ -194,7 +217,7 @@ def check(website: Path = WEBSITE) -> tuple[str, dict | None, list[str]]:
             values = None
             if state == "published":
                 try:
-                    values = validate_values({key: attrs.get(key, "") for key in ("version", "filename", "sha256", "url")})
+                    values = validate_values({key: attrs.get(key, "") for key in FIELDS})
                 except ReleaseError as exc:
                     problems.append(f"{name}:{block_id}: {exc}")
                     continue
@@ -248,6 +271,7 @@ def main(argv=None) -> int:
                 actual = sha256_of(args.installer)
                 if actual != values["sha256"]:
                     raise ReleaseError(f"--sha256 does not match the installer (actual {actual})")
+                values["size"] = str(args.installer.stat().st_size)
         changed = apply(values, args.website)
         print(("published " + values["version"]) if values else "pending", "->", ", ".join(changed) or "no change")
         state, _, problems = check(args.website)

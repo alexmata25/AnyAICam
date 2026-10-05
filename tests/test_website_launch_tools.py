@@ -36,21 +36,40 @@ def read(site, name):
     return (site / name).read_text(encoding="utf-8")
 
 
-def test_the_committed_website_passes_the_launch_check_with_the_release_pending():
+# The approved Linux release (2026-10-05): VMS 1.2.3 built from 38a9a7a, a
+# direct download from the website, verified against the real file.
+LAUNCHED = {"version": "1.2.3", "filename": "anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz",
+            "sha256": "e32c4898f74b5135ecfe6191299cfad826951af1b94b5bf9a1fff98be2ebfaed",
+            "url": "https://anyaicam.com/downloads/anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz",
+            "size": "35258116"}
+
+
+def test_the_committed_website_passes_the_launch_check_with_the_release_published():
     failures, summary = launch.run()
     assert failures == []
-    assert summary == "release blocks pending"
+    assert summary == f"release blocks published ({LAUNCHED['version']}, {LAUNCHED['filename']})"
+    assert release.check()[:2] == ("published", LAUNCHED)
 
 
-def test_pending_pages_name_no_installer_version_or_checksum():
-    for name in launch.RELEASE_PAGES:
-        text = launch.visible_text((ROOT / "website" / name).read_text(encoding="utf-8"))
-        assert not re.search(r"\b\d+\.\d+\.\d+\b", text) and not re.search(r"\b[0-9a-f]{64}\b", text)
-        assert ".tar.gz" not in text.replace("anyaicam-appliance-installer-*.tar.gz", "")
-        assert "Sign in to download" not in text and "Available now" not in text
+def test_the_published_pages_name_exactly_the_approved_linux_release():
+    vms = launch.visible_text((ROOT / "website" / "vms.html").read_text(encoding="utf-8"))
+    linux = launch.visible_text((ROOT / "website" / "vms-linux.html").read_text(encoding="utf-8"))
+    assert "AnyAiCam 1.2.3 for Linux" in vms and LAUNCHED["sha256"] in vms and "35.3 MB" in vms
+    assert f"sha256sum {LAUNCHED['filename']}" in linux and "My subscription and select Download installer" not in linux
+    source = (ROOT / "website" / "vms.html").read_text(encoding="utf-8")
+    assert f'href="{LAUNCHED["url"]}" download>Download for Linux' in source
+    # The tooling inside the package reports its own version; the website names only the VMS release.
+    assert "1.1.0" not in vms and "1.1.0" not in linux
+
+
+def test_the_signed_windows_installer_stays_downloadable():
+    source = (ROOT / "website" / "vms.html").read_text(encoding="utf-8")
+    assert 'href="https://github.com/alexmata25/AnyAICam/releases/download/v0.1.3/AnyAiCam-VMS-Setup-0.1.3-ec5272f.exe">Download for Windows' in source
+    assert "anyaicam-vms_0.1.3" not in source  # the old 0.1.3 Linux package is replaced by 1.2.3
 
 
 def test_publish_names_the_final_installer_everywhere_and_pending_restores_the_page(site):
+    release.apply(None, site)
     before = {name: (site / name).read_bytes() for name in release.BLOCKS}
     assert release.apply(release.validate_values(dict(FINAL)), site) == list(release.BLOCKS)
     assert launch.run(site)[0] == []
@@ -60,7 +79,7 @@ def test_publish_names_the_final_installer_everywhere_and_pending_restores_the_p
     assert f"sha256sum {FINAL['filename']}" in linux and f"tar -xzf {FINAL['filename']}" in linux
     assert FINAL["sha256"] in linux and "AnyAiCam 1.2.3" in linux and "Release finalizing" not in linux
     vms = launch.visible_text(read(site, "vms.html"))
-    assert "AnyAiCam 1.2.3 for Linux" in vms and f"SHA-256 {FINAL['sha256']}" in vms and "Sign in to download" in vms
+    assert "AnyAiCam 1.2.3 for Linux" in vms and f"SHA-256 {FINAL['sha256']}" in vms and "Download for Linux" in vms
     release.apply(None, site)
     assert {name: (site / name).read_bytes() for name in release.BLOCKS} == before  # byte-identical, line endings kept
 
@@ -89,14 +108,14 @@ def test_publish_with_the_real_installer_checks_its_name_and_checksum(site, tmp_
     actual = hashlib.sha256(b"installer bytes").hexdigest()
     args = ["publish", "--version", "1.2.3", "--filename", FINAL["filename"], "--installer", str(installer), "--website", str(site)]
     assert release.main(args + ["--sha256", "cd" * 32]) == 2
-    assert release.check(site)[0] == "pending"  # nothing written on refusal
+    assert release.check(site)[:2] == ("published", LAUNCHED)  # nothing written on refusal
     assert release.main(args + ["--sha256", actual]) == 0
     assert release.check(site)[1]["sha256"] == actual
 
 
 def test_a_hand_edited_or_missing_release_block_fails_the_check(site):
     page = site / "vms.html"
-    page.write_text(read(site, "vms.html").replace("Release finalizing", "Available now"), encoding="utf-8")
+    page.write_text(read(site, "vms.html").replace(">Download for Linux<", ">Download now<", 1), encoding="utf-8")
     assert any("edited by hand" in p for p in release.check(site)[2])
     page.write_text(read(site, "vms.html").replace("<!--/release:vms-card-status-->", ""), encoding="utf-8")
     assert any("vms-card-status missing" in p for p in release.check(site)[2])
@@ -115,25 +134,33 @@ def test_mixed_pending_and_published_blocks_fail_the_check(site):
 
 @pytest.mark.parametrize("page, old, new, expected", [
     ("vms.html", "Ubuntu 24.04.", "Ubuntu 24.04. Version 1.2.2.", "superseded release number"),
-    ("index.html", "$1,249.99", "$999", "old appliance price"),
+    ("hardware.html", "$1,249.99", "$999", "old appliance price"),
     ("sales-calculator.html", "No adapter</option>", "No adapter</option><option>Test - $0.53</option>", "sandbox price"),
-    ("plans.html", "Plans are priced", "Staging plans are priced", "'staging' wording"),
+    ("plans.html", "Simple per-camera pricing.", "Staging per-camera pricing.", "'staging' wording"),
     ("hardware.html", "Premium appliance", "Draft appliance", "internal wording"),
     ("vms.html", "Ubuntu 24.04.", "Ubuntu 24.04. 5729f5ded433", "superseded installer checksum"),
     ("vms.html", 'href="vms-linux.html"', 'href="vms-linux-old.html"', "broken link"),
     ("vms.html", 'href="edge-appliance.html#appliances"', 'href="edge-appliance.html#gone"', "missing anchor"),
-    ("plans.html", "$69.99/month</td></tr>\n</tbody>", "$59.99/month</td></tr>\n</tbody>", "prices"),
+    ("plans.html", 'data-plan-price="14.99"', 'data-plan-price="13.99"', "AI Local must show $14.99"),
+    ("plans.html", "<p class=\"v2-price\">$24.99 <small>", "<p class=\"v2-price\">$29.99 <small>", "Hybrid must show $24.99"),
+    ("plans.html", 'data-price="9.99">Basic Local', 'data-price="8.99">Basic Local', "estimator price for Basic Local"),
+    ("plans.html", 'max="64"', 'max="100"', "1-64"),
+    ("plans.html", "<h2 style=\"margin-top:0\">How plans work</h2>", "<p>Up to 8 cameras $14.99/month</p><h2 style=\"margin-top:0\">How plans work</h2>", "legacy fixed-capacity"),
+    ("plans.html", "customer-login.html?next=/subscription-portal", "customer-login.html", "My subscription"),
+    ("plans.html", "<h2 style=\"margin-top:0\">How plans work</h2>", "<!-- price_1AbCdEfGhIjKl --><h2 style=\"margin-top:0\">How plans work</h2>", "Stripe Price ID"),
+    ("contact.html", "(346) 554-4699", "(832) 510-8240", "old company phone"),
+    ("vms.html", "Download for Windows</a>", "Download for Windows</a> <a href=\"https://github.com/x/y/releases/download/v0.1.3/anyaicam-vms_0.1.3.deb\">Linux</a>", "GitHub release download link"),
     ("hardware.html", "$149.99", "$129.99", "relay price"),
     ("vms.html", "Professional $1,749.99", "Professional $1,799.99", "Professional"),
-    ("vms.html", "A Windows version is coming soon.", "AnyAiCam for Windows is ready.", "Windows availability"),
+    ("vms-linux.html", "Windows version coming soon.", "AnyAiCam for Windows is ready.", "Windows availability"),
     ("vms.html", "An AnyAiCam Ryzen appliance arrives", "Sign in to download. An AnyAiCam Ryzen appliance arrives", "outside the release blocks"),
     ("plans.html", "<td>$49.99 one-time</td>", "<td>$49.99</td>", "prices"),
     ("vms.html", "buy a one-time licence for your own PC", "buy a licence for your own PC", "one-time licence"),
     ("vms-linux.html", "from $49.99 for 8 cameras", "from $39.99 for 8 cameras", "licence next to an unexpected price"),
-    ("plans.html", "Plans are priced", "Sandbox plans are priced", "'sandbox' wording"),
+    ("plans.html", "Simple per-camera pricing.", "Sandbox per-camera pricing.", "'sandbox' wording"),
     ("analytics.html", "Coming soon as a premium analytics module.", "Future premium roadmap category.", "internal wording"),
     ("face-access.html", "Contact AnyAiCam to confirm", "AnyAiCam should publish a list. Contact AnyAiCam to confirm", "internal wording"),
-    ("vms.html", "A Windows version is coming soon.", "Download the Free AnyAiCam VMS. A Windows version is coming soon.", "free VMS"),
+    ("vms.html", "AnyAiCam 1.2.3 for Windows is coming soon.", "Download the Free AnyAiCam VMS. AnyAiCam 1.2.3 for Windows is coming soon.", "free VMS"),
     ("videoloft-partner-referral-wizard.html", "location.replace('sales-partner-login.html')",
      "location.href='referral-entry.html'", "broken link referral-entry.html"),
     ("vms.html", "github.com", "github.com", None),

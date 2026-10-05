@@ -166,23 +166,131 @@ header.stage-header nav.stage-nav a:focus {
 <main>
 <section class="hero-small">
 <div class="wrap">
-<div class="eyebrow">Choose how video is protected</div>
-<h1>Local-first control with optional cloud services.</h1>
-<p>The same AnyAiCam experience supports local and hybrid designs; cloud overflow is coming soon. Plans are priced by the number of cameras.</p>
+<div class="eyebrow">AnyAiCam plans</div>
+<h1>Simple per-camera pricing.</h1>
+<p>Choose a plan and pay for the cameras you connect: from 1 to 64 cameras per account. Recording stays on your AnyAiCam appliance; Hybrid adds cloud event protection.</p>
 </div>
 </section>
-<section class="section">
+<section class="section" id="plans">
 <div class="wrap">
-<div class="grid">
-<article class="card">
+<style>
+.v2-plans .card{display:flex;flex-direction:column}
+.v2-price{font-size:2rem;font-weight:850;margin:.35rem 0 .1rem;font-variant-numeric:tabular-nums}
+.v2-price small{font-size:.95rem;font-weight:650;color:#52627a}
+.v2-retention{font-weight:700;margin:.2rem 0 .6rem}
+.v2-plans ul{margin:.2rem 0 0;padding-left:1.15rem;line-height:1.6}
+.v2-estimator{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));align-items:end;margin-top:1rem}
+.v2-estimator label{display:grid;gap:.35rem;font-weight:700}
+.v2-estimator select,.v2-estimator input{font:inherit;padding:.6rem .7rem;border-radius:10px;border:1px solid #c0cad3;min-height:46px;width:100%;box-sizing:border-box}
+.v2-qty{display:grid;grid-template-columns:46px minmax(0,1fr) 46px;gap:.4rem}
+.v2-qty button{font:inherit;font-weight:800;border-radius:10px;border:1px solid #c0cad3;background:#fff;min-height:46px;cursor:pointer}
+.v2-total{font-size:1.35rem;font-weight:850;font-variant-numeric:tabular-nums;margin:0}
+.v2-rules{line-height:1.7;padding-left:1.15rem;margin:.4rem 0 0}
+</style>
+<div class="grid v2-plans">
+<article class="card" id="plan-basic-local" data-plan="basic_local" data-plan-price="9.99">
 <span class="pill">Local</span>
-<h3>Local-first</h3>
-<p>Recording and playback stay on the site appliance. Remote services and analytics can be licensed separately.</p>
+<h3>Basic Local</h3>
+<p class="v2-price">$9.99 <small>per camera / month</small></p>
+<p class="v2-retention">2-day local recording</p>
+<ul>
+<li>Local recording and playback on your AnyAiCam appliance</li>
+<li>Basic motion and events</li>
+<li>Camera management</li>
+<li>Remote viewing where supported</li>
+<li>No cloud event storage</li>
+</ul>
 </article>
-<article class="card">
+<article class="card" id="plan-ai-local" data-plan="ai_local" data-plan-price="14.99">
+<span class="pill">Local + AI</span>
+<h3>AI Local</h3>
+<p class="v2-price">$14.99 <small>per camera / month</small></p>
+<p class="v2-retention">7-day local recording</p>
+<ul>
+<li>Everything in Basic Local</li>
+<li>Person and vehicle detection, Smart Motion</li>
+<li>AI event search and filters</li>
+<li>Intelligent notifications</li>
+<li>AACO video and event retrieval</li>
+<li>Talk Down / two-way audio on supported cameras</li>
+<li>No cloud event storage</li>
+</ul>
+</article>
+<article class="card" id="plan-hybrid" data-plan="hybrid" data-plan-price="24.99">
 <span class="pill">Recommended</span>
 <h3>Hybrid</h3>
-<p>Local recording plus selected cloud protection, remote access and the analytics on your account.</p>
+<p class="v2-price">$24.99 <small>per camera / month</small></p>
+<p class="v2-retention">7-day local recording + 14-day cloud event retention</p>
+<ul>
+<li>Everything in AI Local</li>
+<li>Cloud event protection: events kept in the cloud for 14 days</li>
+<li>Remote cloud services</li>
+<li>Continuous cloud recording is not included (coming soon as a separate option)</li>
+</ul>
+</article>
+</div>
+
+<article class="card" id="plan-estimator" style="margin-top:1.4rem">
+<h2 style="margin-top:0">Estimate your monthly price</h2>
+<div class="v2-estimator">
+<label for="v2-plan">Plan
+<select id="v2-plan">
+<option value="basic_local" data-price="9.99">Basic Local — $9.99 per camera</option>
+<option value="ai_local" data-price="14.99" selected>AI Local — $14.99 per camera</option>
+<option value="hybrid" data-price="24.99">Hybrid — $24.99 per camera</option>
+</select>
+</label>
+<label for="v2-cameras">Number of cameras (1–64)
+<span class="v2-qty"><button type="button" id="v2-minus" aria-label="One camera fewer">−</button><input id="v2-cameras" type="number" min="1" max="64" step="1" value="4" inputmode="numeric"><button type="button" id="v2-plus" aria-label="One camera more">+</button></span>
+</label>
+<div aria-live="polite"><p class="v2-total" id="v2-total">4 × $14.99/month = $59.96/month</p><p class="health-detail" id="v2-note" style="margin:.2rem 0 0">Estimate before any applicable tax.</p></div>
+</div>
+<p style="margin-top:1rem">You choose your plan and number of cameras in <strong>My subscription</strong> after signing in. The amount you pay is calculated by AnyAiCam and confirmed at checkout.</p>
+<div class="button-row">
+<a class="button primary" href="https://app.anyaicam.com/customer-register">Create an account</a>
+<a class="button" href="https://app.anyaicam.com/customer-login.html?next=/subscription-portal">Sign in to choose your plan</a>
+</div>
+</article>
+
+<article class="card" style="margin-top:1.4rem">
+<h2 style="margin-top:0">How plans work</h2>
+<ul class="v2-rules">
+<li>Pay per licensed camera, from 1 to 64 cameras per account. A licensed camera stays billable while it is offline.</li>
+<li>Standard cameras (up to 4MP) and high-resolution cameras (5–8MP) are the same price.</li>
+<li>Longer local recording (14 or 30 days) can be selected when your appliance's storage supports it, at no change to the plan price.</li>
+<li>Continuous cloud recording is coming soon as a separate paid option.</li>
+<li>Existing customers keep their current plan. Nothing changes automatically.</li>
+</ul>
+</article>
+</div>
+</section>
+<section class="section" id="plan-pricing">
+<div class="wrap">
+<div class="eyebrow">Also available</div>
+<h2>Hardware and your own PC</h2>
+<style>
+.plan-prices{width:100%;border-collapse:collapse;margin-top:.6rem;font-variant-numeric:tabular-nums}
+.plan-prices th,.plan-prices td{text-align:left;padding:.45rem 0;border-bottom:1px solid rgba(15,23,42,.1)}
+.plan-prices td:last-child{text-align:right;font-weight:750;white-space:nowrap}
+.plan-prices th{font-weight:650;color:#52627a}
+</style>
+<div class="grid">
+<article class="card">
+<span class="pill">Your own PC</span>
+<h3>AnyAiCam VMS licence</h3>
+<p>A one-time licence for running AnyAiCam on your own Ubuntu 24.04 PC. Included with every AnyAiCam Ryzen appliance.</p>
+<table class="plan-prices"><tbody>
+<tr><th>Up to 8 cameras</th><td>$49.99 one-time</td></tr>
+<tr><th>Up to 16 cameras</th><td>$79.99 one-time</td></tr>
+<tr><th>Up to 32 cameras</th><td>$129.99 one-time</td></tr>
+<tr><th>Up to 64 cameras</th><td>$199.99 one-time</td></tr>
+</tbody></table>
+</article>
+<article class="card">
+<span class="pill">Hardware</span>
+<h3>AnyAiCam appliances</h3>
+<p>AnyAiCam Starter $1,249.99 · Professional $1,749.99 · Enterprise with Face Access $2,249.99. Each arrives with AnyAiCam installed and a licence included.</p>
+<a class="button" href="edge-appliance.html#appliances">Compare appliances</a>
 </article>
 <article class="card">
 <span class="pill">Coming soon</span>
@@ -196,51 +304,22 @@ header.stage-header nav.stage-nav a:focus {
 </div>
 </div>
 </section>
-<section class="section" id="plan-pricing">
-<div class="wrap">
-<div class="eyebrow">AnyAiCam pricing</div>
-<h2>Plans by number of cameras</h2>
-<style>
-.plan-prices{width:100%;border-collapse:collapse;margin-top:.6rem;font-variant-numeric:tabular-nums}
-.plan-prices th,.plan-prices td{text-align:left;padding:.45rem 0;border-bottom:1px solid rgba(15,23,42,.1)}
-.plan-prices td:last-child{text-align:right;font-weight:750;white-space:nowrap}
-.plan-prices th{font-weight:650;color:#52627a}
-</style>
-<div class="grid">
-<article class="card">
-<span class="pill">Local</span>
-<h3>Local plan</h3>
-<table class="plan-prices"><tbody>
-<tr><th>Up to 8 cameras</th><td>$14.99/month</td></tr>
-<tr><th>Up to 16 cameras</th><td>$24.99/month</td></tr>
-<tr><th>Up to 32 cameras</th><td>$39.99/month</td></tr>
-<tr><th>Up to 64 cameras</th><td>$69.99/month</td></tr>
-</tbody></table>
-</article>
-<article class="card">
-<span class="pill">Hybrid</span>
-<h3>Hybrid plan</h3>
-<table class="plan-prices"><tbody>
-<tr><th>Up to 8 cameras</th><td>$24.99/month</td></tr>
-<tr><th>Up to 16 cameras</th><td>$39.99/month</td></tr>
-<tr><th>Up to 32 cameras</th><td>$69.99/month</td></tr>
-<tr><th>Up to 64 cameras</th><td>$99.99/month</td></tr>
-</tbody></table>
-</article>
-<article class="card">
-<span class="pill">Your own PC</span>
-<h3>AnyAiCam VMS licence</h3>
-<p>A one-time licence for running AnyAiCam on your own Ubuntu 24.04 PC. Included with every AnyAiCam Ryzen appliance.</p>
-<table class="plan-prices"><tbody>
-<tr><th>Up to 8 cameras</th><td>$49.99 one-time</td></tr>
-<tr><th>Up to 16 cameras</th><td>$79.99 one-time</td></tr>
-<tr><th>Up to 32 cameras</th><td>$129.99 one-time</td></tr>
-<tr><th>Up to 64 cameras</th><td>$199.99 one-time</td></tr>
-</tbody></table>
-</article>
-</div>
-</div>
-</section>
+<script>
+(function(){
+  const plan=document.getElementById('v2-plan'),qty=document.getElementById('v2-cameras'),out=document.getElementById('v2-total');
+  if(!plan||!qty||!out)return;
+  const money=v=>v.toLocaleString('en-US',{style:'currency',currency:'USD'});
+  function clamp(){let n=Math.round(Number(qty.value));if(!Number.isFinite(n)||n<1)n=1;if(n>64)n=64;return n}
+  function render(fix){const n=clamp();if(fix)qty.value=n;const price=Number(plan.selectedOptions[0].dataset.price);
+    out.textContent=n+' × '+money(price)+'/month = '+money(Math.round(price*100*n)/100)+'/month';}
+  plan.addEventListener('change',()=>render(false));
+  qty.addEventListener('input',()=>render(false));
+  qty.addEventListener('change',()=>render(true));
+  document.getElementById('v2-minus').addEventListener('click',()=>{qty.value=Math.max(1,clamp()-1);render(true)});
+  document.getElementById('v2-plus').addEventListener('click',()=>{qty.value=Math.min(64,clamp()+1);render(true)});
+  render(true);
+})();
+</script>
 </main>
 <footer class="aic-unified-footer" id="about">
   <div class="aic-footer-grid">

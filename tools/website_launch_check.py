@@ -24,10 +24,18 @@ WEBSITE = website_release.WEBSITE
 APPLIANCES = {"Starter": "$1,249.99", "Professional": "$1,749.99", "Enterprise": "$2,249.99"}
 RELAY = "$149.99"
 PLAN_TABLES = {  # plans.html, in page order
-    "Local plan": ["$14.99/month", "$24.99/month", "$39.99/month", "$69.99/month"],
-    "Hybrid plan": ["$24.99/month", "$39.99/month", "$69.99/month", "$99.99/month"],
     "AnyAiCam VMS licence": ["$49.99 one-time", "$79.99 one-time", "$129.99 one-time", "$199.99 one-time"],
 }
+# Billing-v2 (2026-10-05, locked): per-camera monthly plans, 1-64 cameras per account.
+V2_PLANS = {"basic_local": ("Basic Local", "9.99"), "ai_local": ("AI Local", "14.99"), "hybrid": ("Hybrid", "24.99")}
+V2_MIN_CAMERAS, V2_MAX_CAMERAS = 1, 64
+# The old fixed-capacity subscriptions (8/16/32/64 cameras) are legacy-only: never offered on the website.
+LEGACY_TIER_PRICE = re.compile(r"(?<!× )\$(?:14|24|39|69|99)\.99/month")  # "N × $14.99/month" is a per-camera estimate
+# The one Windows installer still offered (signed 0.1.3); every other 0.1.3 or GitHub release reference is stale.
+WINDOWS_ALLOWED = ("https://github.com/alexmata25/AnyAICam/releases/download/v0.1.3/AnyAiCam-VMS-Setup-0.1.3-ec5272f.exe",
+                   "AnyAiCam VMS for Windows 0.1.3", "Windows 0.1.3 · Signed installer")
+COMPANY_PHONE = "(346) 554-4699"
+OLD_PHONE = re.compile(r"\(832\) 510-8240|\+?1?8325108240")
 TIERS = ["Up to 8 cameras", "Up to 16 cameras", "Up to 32 cameras", "Up to 64 cameras"]
 # Pages that sell AnyAiCam appliances (Videoloft pages have their own catalogue).
 APPLIANCE_PAGES = {name: list(APPLIANCES) for name in ("index.html", "hardware.html", "build-your-system.html", "edge-appliance.html", "vms.html")}
@@ -79,6 +87,13 @@ def check_stale(website: Path, fail):
     for path in sorted(served_files(website)):
         text = path.read_text(encoding="utf-8", errors="replace")
         rel = path.relative_to(website).as_posix()
+        for allowed in WINDOWS_ALLOWED:  # same length, so line numbers stay right
+            text = text.replace(allowed, "x" * len(allowed))
+        if path.suffix == ".html":
+            for match in OLD_PHONE.finditer(text):
+                fail(f"{rel}:{text.count(chr(10), 0, match.start()) + 1}: old company phone number {match.group(0)!r} (use {COMPANY_PHONE})")
+            for match in LEGACY_TIER_PRICE.finditer(visible_text(text)):
+                fail(f"{rel}: legacy fixed-capacity subscription price {match.group(0)!r} offered")
         for pattern, label in STALE:
             for match in pattern.finditer(text):
                 line = text.count("\n", 0, match.start()) + 1
@@ -119,6 +134,7 @@ def check_prices(website: Path, fail):
         rows = re.findall(r"<tr><th>([^<]+)</th><td>([^<]+)</td></tr>", card.group(0))
         if rows != list(zip(TIERS, prices)):
             fail(f"plans.html: '{title}' prices {rows} != authoritative {list(zip(TIERS, prices))}")
+    check_v2_plans(plans, fail)
     for name in LICENCE_PAGES:
         text = visible_text((website / name).read_text(encoding="utf-8"))
         if "one-time licence" not in text:
@@ -126,6 +142,31 @@ def check_prices(website: Path, fail):
         for match in re.finditer(r"licen[cs]e\b[^$]{0,80}?\$([\d,]+\.\d\d)", text, re.I):
             if f"${match.group(1)} one-time" not in PLAN_TABLES["AnyAiCam VMS licence"]:
                 fail(f"{name}: licence next to an unexpected price ${match.group(1)}")
+
+
+def check_v2_plans(plans: str, fail):
+    """plans.html shows each Billing-v2 plan at its locked per-camera price,
+    the estimator uses the same prices and the 1-64 range, and the plan is
+    chosen in My subscription (the website never names a Stripe Price)."""
+    for key, (name, price) in V2_PLANS.items():
+        card = re.search(rf'<article\b[^>]*data-plan="{key}"[^>]*>.*?</article>', plans, re.S)
+        if not card:
+            fail(f"plans.html: Billing-v2 plan card {name} missing")
+            continue
+        attr = re.search(r'data-plan-price="([^"]+)"', card.group(0))
+        text = visible_text(card.group(0))
+        if not attr or attr.group(1) != price or f"<h3>{name}</h3>" not in card.group(0) or f"${price} per camera / month" not in text:
+            fail(f"plans.html: {name} must show ${price} per camera / month")
+        option = re.search(rf'<option value="{key}" data-price="([^"]+)"', plans)
+        if not option or option.group(1) != price:
+            fail(f"plans.html: estimator price for {name} must be {price}")
+    quantity = re.search(r'<input id="v2-cameras"[^>]*>', plans)
+    if not quantity or f'min="{V2_MIN_CAMERAS}"' not in quantity.group(0) or f'max="{V2_MAX_CAMERAS}"' not in quantity.group(0):
+        fail(f"plans.html: camera quantity must allow {V2_MIN_CAMERAS}-{V2_MAX_CAMERAS}")
+    if "subscription-portal" not in plans or "customer-register" not in plans:
+        fail("plans.html: plans must lead to Create account / Sign in -> My subscription")
+    if re.search(r"price_[A-Za-z0-9]{8,}", plans):
+        fail("plans.html: a Stripe Price ID appears in the page")
 
 
 def check_release(website: Path, fail):
@@ -138,10 +179,13 @@ def check_release(website: Path, fail):
         for phrase in ("Sign in to download", "Available now", "download the installer", "SHA-256 "):
             if phrase in outside and not (name == "vms-linux.html" and phrase == "SHA-256 "):
                 fail(f"{name}: release wording outside the release blocks: {phrase!r}")
-        if state == "pending" and re.search(r"\b\d+\.\d+\.\d+\b", visible_text(source)):
+        linux_only = re.sub(r'<article class="card" id="windows-download">.*?</article>', " ", source, flags=re.S)
+        if state == "pending" and re.search(r"\b\d+\.\d+\.\d+\b", visible_text(linux_only)):
             fail(f"{name}: names a release version while the release is pending")
     for path in website.glob("*.html"):
         source = re.sub(r"<(script|style)\b.*?</\1>", " ", path.read_text(encoding="utf-8"), flags=re.S | re.I)
+        # The signed Windows 0.1.3 installer is genuinely available (2026-10-05); only its card may say so.
+        source = re.sub(r'<article class="card" id="windows-download">.*?</article>', " ", source, flags=re.S)
         # Each paragraph, list item or cell on its own: a nearby "Coming soon" label must not excuse a claim.
         blocks = [visible_text(m.group(2)) for m in re.finditer(r"<(p|li|td|small)\b[^>]*>(.*?)</\1>", source, re.S | re.I)]
         for sentence in (s for block in blocks for s in re.split(r"(?<=[.!?])\s", block)):
