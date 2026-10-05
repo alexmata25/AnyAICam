@@ -106,10 +106,14 @@ def test_an_entitlement_read_failure_denies(cloud_db, monkeypatch):
     assert _entitled(cloud_db, "talk_down") is False
 
 
-def test_an_appliance_runtime_does_not_enforce_billing_it_does_not_hold(monkeypatch):
+@pytest.mark.real_entitlements
+def test_an_appliance_without_a_signed_snapshot_is_denied(monkeypatch):
+    # The appliance decides from the cloud's signed snapshot
+    # (test_appliance_feature_entitlements.py); with none, nothing paid runs.
     import feature_entitlements
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
-    assert feature_entitlements.allowed("cust-unknown", "talk_down") is True
+    assert feature_entitlements.allowed("cust-unknown", "talk_down") is False
+    assert feature_entitlements.allowed("cust-unknown", "voice_call") is False
 
 
 # ------------------------------------------------------------ customer routes
@@ -163,6 +167,47 @@ def test_the_talk_audio_socket_closes_once_the_entitlement_is_gone(customer_clie
         with customer_client.websocket_connect("/api/customer/talk/sessions/talk-1/audio"):
             pass
     assert closed.value.code == 4403
+
+
+def test_an_open_talk_session_ends_when_the_entitlement_ends(customer_client, cloud_db, monkeypatch):
+    """Revalidated while talking (talk_audio_relay.ENTITLEMENT_RECHECK_SECONDS):
+    a plan cancelled mid-session stops the audio and closes the socket."""
+    from datetime import datetime, timedelta
+    import talk_audio_relay
+    frames = []
+
+    class FakeCameraSpeaker:
+        def __init__(self, camera, sample_rate, session_id=None):
+            self.error = None
+        def start(self):
+            return True
+        def send_pcm16(self, frame):
+            frames.append(frame)
+        def stop(self):
+            pass
+    monkeypatch.setattr(talk_audio_relay, "_LocalIsapiTalkRelay", FakeCameraSpeaker)
+    monkeypatch.setattr(talk_audio_relay, "ENTITLEMENT_RECHECK_SECONDS", 0)
+    _plan(cloud_db, "ai_local")
+    with override_target(sqlite_path=str(cloud_db)):
+        with connection() as db:
+            db.execute("UPDATE cameras SET talk_down_supported=1 WHERE id='cam-1'")
+            db.execute("INSERT INTO customer_talk_sessions(id,customer_id,site_id,camera_id,user_id,requested_by,role,state,"
+                       "requested_at,ended_at,expires_at) VALUES('talk-2','cust-1','site-1','cam-1',NULL,'owner@example.test',"
+                       "'customer_owner','requested',?,NULL,?)",
+                       (datetime.now().isoformat(), (datetime.now() + timedelta(minutes=5)).isoformat()))
+        with customer_client.websocket_connect("/api/customer/talk/sessions/talk-2/audio") as socket:
+            assert socket.receive_json() == {"type": "ready"}
+            socket.send_bytes(bytes(320))
+            _plan(cloud_db, "ai_local", status="cancelled")  # the plan ends mid-session
+            socket.send_bytes(bytes(320))
+            message = socket.receive_json()
+            assert message["type"] == "error" and message["reason"] == "not_entitled"
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+    assert closed.value.code == 4403
+    assert len(frames) == 1  # only audio sent while entitled reached the camera
+    rows = _cloud_rows(cloud_db, "SELECT state FROM customer_talk_sessions WHERE id='talk-2'")
+    assert rows[0]["state"] != "requested"
 
 
 def test_alarm_talk_down_cannot_be_switched_on_without_talk_down(customer_client, cloud_db):

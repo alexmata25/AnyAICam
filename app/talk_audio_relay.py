@@ -92,7 +92,19 @@ TALK_ERROR_MESSAGES = {
     "camera_talk_unavailable": "The camera did not accept the talk request.",
     "no_camera_credentials": "This camera has no stored login, so talk cannot connect.",
     "unknown_camera": "The appliance does not recognise this camera yet.",
+    "not_entitled": "Talk Down isn't active on this account. Check My subscription.",
 }
+
+# Talk Down / Voice Call are paid (feature_entitlements): checked when the
+# audio socket opens and again this often while it stays open, so a plan or
+# add-on that ends mid-session stops the audio within this interval.
+ENTITLEMENT_RECHECK_SECONDS = 15
+
+
+def _talk_entitled(customer_id: str | None) -> bool:
+    import feature_entitlements
+    return (feature_entitlements.allowed(customer_id, feature_entitlements.TALK_DOWN)
+            or feature_entitlements.allowed(customer_id, feature_entitlements.VOICE_CALL))
 
 
 def is_camera_auth_error(text: str | None) -> bool:
@@ -869,9 +881,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
 
         # The entitlement is checked again here, not only when the session
         # started: an add-on or plan that ended since then stops the audio.
-        import feature_entitlements
-        if not (feature_entitlements.allowed(identity.get("customer_id"), feature_entitlements.TALK_DOWN)
-                or feature_entitlements.allowed(identity.get("customer_id"), feature_entitlements.VOICE_CALL)):
+        if not await asyncio.to_thread(_talk_entitled, identity.get("customer_id")):
             await websocket.close(code=4403)
             return
 
@@ -983,6 +993,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
         # now calls _end_relay() directly, removing this session from
         # _active_relays before this loop ever notices).
         end_reason = "session_ended_externally"
+        entitlement_checked_at = time.monotonic()
 
         try:
             while True:
@@ -990,6 +1001,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
 
                 if relay is None:
                     break
+
 
                 if (
                     time.monotonic() - relay["created_at"]
@@ -1006,6 +1018,21 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                 except asyncio.TimeoutError:
                     end_reason = "idle_timeout"
                     break
+
+                # Revalidated while talking, before a frame is forwarded: an
+                # entitlement that ends mid-session stops the audio within
+                # this interval.
+                if time.monotonic() - entitlement_checked_at >= ENTITLEMENT_RECHECK_SECONDS:
+                    entitlement_checked_at = time.monotonic()
+                    if not await asyncio.to_thread(_talk_entitled, identity.get("customer_id")):
+                        end_reason = "not_entitled"
+                        try:
+                            await websocket.send_text(json.dumps({"type": "error", "reason": "not_entitled",
+                                                                  "message": TALK_ERROR_MESSAGES["not_entitled"]}))
+                            await websocket.close(code=4403, reason="not_entitled")
+                        except Exception:
+                            pass
+                        break
 
                 if local_relay is not None:
                     local_relay.send_pcm16(frame)

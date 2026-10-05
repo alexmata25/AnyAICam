@@ -174,6 +174,12 @@ def speak_alarm_talkdowns(camera_id: str, fired: list, event_ids: list, *, provi
             if alarm.get("analytic_type") == "intrusion_alarm" and alarm.get("talkdown_text")]
     if not jobs:
         return 0
+    # Talk Down is paid (feature_entitlements): on an appliance this is its
+    # signed entitlement snapshot, so a stale talk-down switch never speaks.
+    import feature_entitlements
+    if not feature_entitlements.allowed(str(jobs[0][0].get("customer_id") or "") or None, feature_entitlements.TALK_DOWN):
+        logger.info("intrusion_alarm.talkdown_not_entitled camera_id=%s", camera_id)
+        return 0
 
     def _speak(alarm, event_id):
         try:

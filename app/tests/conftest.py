@@ -228,3 +228,25 @@ def stripe_follows_events(monkeypatch):
             return _original(event)
         monkeypatch.setattr(module, name, follow)
     return now
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_entitlements: run appliance_entitlements.feature_allowed for real")
+
+
+@pytest.fixture(autouse=True)
+def _appliance_entitlements(request, monkeypatch, tmp_path):
+    """An appliance (the default edge role) runs Talk Down / Voice Call only
+    with a valid signed entitlement snapshot (appliance_entitlements.py).
+    Its cache lives in each test's own directory, and tests not about
+    entitlements see an entitled appliance; tests marked real_entitlements
+    get the real check."""
+    try:
+        import appliance_entitlements
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(appliance_entitlements, "STATE_FILE", tmp_path / "feature_entitlements.json")
+    if request.node.get_closest_marker("real_entitlements") is None:
+        monkeypatch.setattr(appliance_entitlements, "feature_allowed", lambda feature, customer_id=None: True)
+    yield

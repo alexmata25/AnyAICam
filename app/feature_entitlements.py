@@ -11,15 +11,22 @@ customer_entitled() is the one answer, from the same sources billing writes:
 A cancelled, refunded or suspended plan or add-on no longer counts, because
 billing marks it so. Any error reading entitlements denies (fail closed).
 
-Enforced where billing data lives: the cloud (and the combined single-host
-runtime). An appliance holds no billing tables; the cloud controls what it is
-sent instead -- Voice Call entrance cameras and the automatic alarm
-talk-down switch are only sent for an entitled account (appliance_cloud.py).
+Where it is decided (allowed()), by runtime role:
+  * cloud / combined -- from billing, as above;
+  * edge (an appliance) -- from the signed entitlement snapshot the cloud
+    sends with each configuration sync (appliance_entitlements.py); no
+    valid snapshot means no paid feature;
+  * anything else (an unrecognized role, or one that cannot be read) --
+    denied.
+The cloud still only sends Voice Call entrance cameras and the automatic
+alarm talk-down switch to an entitled account (appliance_cloud.py), as a
+second layer.
 """
 from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("anyaicam.feature_entitlements")
 
@@ -32,15 +39,21 @@ NOT_ENTITLED_DETAIL = {
 }
 
 
-def enforcement_applies() -> bool:
+def runtime_role() -> str:
+    """The configured role, or "" when it cannot be read (denies)."""
     role = os.environ.get("ANYAICAM_RUNTIME_ROLE")
     if role is None:
         try:
             from cloud_config import settings
             role = settings.runtime_role
         except Exception:
-            role = "edge"
-    return str(role).strip().lower() in ("cloud", "combined")
+            return ""
+    return str(role or "").strip().lower()
+
+
+def enforcement_applies() -> bool:
+    """True where billing is read directly (cloud / combined)."""
+    return runtime_role() in ("cloud", "combined")
 
 
 def customer_entitled(customer_id: str | None, feature: str) -> bool:
@@ -59,12 +72,53 @@ def customer_entitled(customer_id: str | None, feature: str) -> bool:
 
 
 def allowed(customer_id: str | None, feature: str) -> bool:
-    """True where enforcement does not apply (an appliance), else the entitlement."""
-    return (not enforcement_applies()) or customer_entitled(customer_id, feature)
+    role = runtime_role()
+    if role in ("cloud", "combined"):
+        return customer_entitled(customer_id, feature)
+    if role == "edge":
+        import appliance_entitlements
+        return appliance_entitlements.feature_allowed(feature, customer_id)
+    logger.warning("feature_entitlements.unknown_runtime_role role=%r feature=%s", role, feature)
+    return False
 
 
 def require(customer_id: str | None, feature: str) -> None:
-    """HTTP 403 when the account is not entitled (cloud/combined only)."""
+    """HTTP 403 when this runtime may not run the feature for the account."""
     if not allowed(customer_id, feature):
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail=NOT_ENTITLED_DETAIL[feature])
+
+
+DEFAULT_SNAPSHOT_TTL_HOURS = 24
+
+
+def snapshot_ttl() -> timedelta:
+    """How long an appliance may keep using a snapshot without a fresh one
+    (cloud outage): ANYAICAM_ENTITLEMENT_SNAPSHOT_TTL_HOURS, 1-168, default 24."""
+    try:
+        hours = int(os.environ.get("ANYAICAM_ENTITLEMENT_SNAPSHOT_TTL_HOURS", DEFAULT_SNAPSHOT_TTL_HOURS))
+    except ValueError:
+        hours = DEFAULT_SNAPSHOT_TTL_HOURS
+    return timedelta(hours=min(168, max(1, hours)))
+
+
+def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
+    """The signed entitlement snapshot for one appliance (cloud side; sent
+    with its configuration -- see appliance_entitlements.py). Only the paid
+    runtime features the appliance runs, each decided from billing for the
+    appliance's own customer."""
+    import appliance_identity
+    from partner_db import connection
+    customer_id = appliance.get("customer_id")
+    now = now or datetime.now(timezone.utc)
+    body = {
+        "type": "anyaicam.feature_entitlements", "version": 1,
+        "appliance_id": str(appliance.get("id") or ""), "cloud_id": str(appliance.get("cloud_id") or ""),
+        "customer_id": str(customer_id or ""),
+        "features": {TALK_DOWN: customer_entitled(customer_id, TALK_DOWN),
+                     VOICE_CALL: customer_entitled(customer_id, VOICE_CALL)},
+        "issued_at": now.isoformat(), "expires_at": (now + snapshot_ttl()).isoformat(),
+    }
+    with connection() as db:
+        key = appliance_identity.ensure_signing_key(db)
+    return {**body, "signature": appliance_identity.sign_body(body, key_id=key["key_id"], private_key_b64=key["private_key_b64"])}

@@ -446,6 +446,12 @@ def _speak_call_ended_on_appliance(camera_id: str, event_id: str) -> dict:
 CALL_ENDED_DELAY_SECONDS = 0.8
 
 
+def _talk_entitled() -> bool:
+    import feature_entitlements
+    return (feature_entitlements.allowed(None, feature_entitlements.TALK_DOWN)
+            or feature_entitlements.allowed(None, feature_entitlements.VOICE_CALL))
+
+
 async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=None) -> None:
     try:
         message = json.loads(raw_message)
@@ -481,6 +487,11 @@ async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=No
         if not isinstance(camera_id, str):
             return
         was_running = session_id in _sessions
+        # The cloud checked billing before sending "start"; this appliance
+        # also checks its own signed entitlement snapshot (feature_entitlements).
+        if not was_running and not await asyncio.to_thread(_talk_entitled):
+            await _reply(send, {"type": "error", "session_id": session_id, "reason": "not_entitled"})
+            return
         if _camera_number_for(camera_id, camera_map) is None and _camera_map_refresher is not None:
             fresh = await asyncio.to_thread(_camera_map_refresher)
             if fresh:

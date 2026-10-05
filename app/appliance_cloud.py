@@ -844,7 +844,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # docstring for the "database is locked" this avoids).
         if product_mode_audit:
             audit(product_mode_audit['actor'],product_mode_audit['action'],product_mode_audit['entity_type'],product_mode_audit['entity_id'],product_mode_audit['details'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
+        # Paid runtime features (2026-10-05): what this appliance may run
+        # itself, signed so the cached copy cannot be edited into a grant
+        # (feature_entitlements.appliance_snapshot / appliance_entitlements).
+        import feature_entitlements
+        import appliance_identity as _identity_keys
+        entitlement_snapshot=feature_entitlements.appliance_snapshot(appliance)
+        with connection() as db:
+            signing_public_keys=_identity_keys.active_public_keys(db)
+        return {'feature_entitlements':entitlement_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-

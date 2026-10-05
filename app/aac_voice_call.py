@@ -625,6 +625,9 @@ def handle_edge_person_detected(
     listening window: the cloud creates the one authoritative session
     when the event arrives (ingest_edge_visitor_event()). Never touches
     door/relay code. Never raises for "not configured"/"cooling down"."""
+    import feature_entitlements
+    if not feature_entitlements.allowed(customer_id, feature_entitlements.VOICE_CALL):
+        return {"triggered": False, "skipped_reason": "not_entitled"}
     if not store.is_entrance_camera(customer_id, camera_id):
         return {"triggered": False, "skipped_reason": "not_entrance_camera"}
     camera = row("SELECT id,site_id FROM cameras WHERE id=? AND customer_id=?", (camera_id, customer_id))

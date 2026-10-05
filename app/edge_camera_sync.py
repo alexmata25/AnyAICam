@@ -349,6 +349,13 @@ def sync_provisioned_cameras() -> dict:
     # VMS license, kept so it keeps applying offline.
     import vms_capacity
     vms_capacity.persist_capacity(response.get("usable_camera_capacity"))
+    # Paid runtime features (2026-10-05, appliance_entitlements.py): the
+    # cloud's signed snapshot, verified and cached so it keeps applying
+    # offline until it expires. An unreachable cloud never reaches here, so
+    # an outage leaves the cached snapshot (and the VMS) as they were.
+    if RUNTIME_ROLE == "edge":
+        import appliance_entitlements
+        appliance_entitlements.store_snapshot(response.get("feature_entitlements"), response.get("signing_public_keys"))
 
     from partner_db import connection
     now = datetime.now().isoformat()
