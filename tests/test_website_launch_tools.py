@@ -207,3 +207,19 @@ def test_the_aac_feature_tour_pairs_each_feature_with_its_real_screenshot():
     for _, image in rows:
         assert (ROOT / "website" / "app-screens" / image).is_file()
     assert page.count("vms-smart-alerts.webp") == 2  # one feature row: the image and its full-size link
+
+
+def test_the_homepage_sells_anyaicam_and_videoloft_has_its_own_page():
+    index = (ROOT / "website" / "index.html").read_text(encoding="utf-8")
+    videoloft = (ROOT / "website" / "videoloft.html").read_text(encoding="utf-8")
+    for section in ('id="videoloft-demo"', 'id="software-bridge"', 'id="buy-cloud-storage"', 'id="adapter-product"',
+                    'id="ai-video-showcase"', 'id="service-scope"', "Videoloft: IP Camera CCTV App."):
+        assert section not in index and section in videoloft
+    assert '<a href="videoloft.html">Videoloft Cloud</a>' in index
+    assert 'id="anyaicam-features"' in index and index.count('class="aic-feature-card"') == 6
+    assert 'href="build-your-system.html">Build Your System</a>' in index and 'href="aac-features.html"' in index
+    # Old "Cloud Account Setup" links (index.html#services) still land on the Videoloft content.
+    assert 'id="services"' in index and "location.replace('videoloft.html#services')" in index
+    assert 'id="services"' in videoloft
+    # The page keeps the Videoloft side's own navigation.
+    assert '<a href="how-it-works.html">How It Works</a>' in videoloft and '<a href="cloud-setup-wizard.html">Get Started</a>' in videoloft

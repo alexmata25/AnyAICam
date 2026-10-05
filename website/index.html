@@ -533,6 +533,24 @@
 </style>
 
 
+<style id="aic-home-feature-showcase">
+.aic-home-features{background:#f7fbff;border-bottom:1px solid #d9e6f4;padding:3.5rem 1rem}
+.aic-home-features-inner{width:min(1180px,100%);margin:0 auto}
+.aic-home-features .eyebrow{text-align:center}
+.aic-home-features h2{text-align:center;margin:.35rem 0 .6rem;color:#071032}
+.aic-home-features-lead{max-width:760px;margin:0 auto 2rem;text-align:center;color:#52627a;font-size:1.05rem;line-height:1.7}
+.aic-feature-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1.4rem}
+.aic-feature-card{background:#fff;border:1px solid #d9e4f2;border-radius:16px;overflow:hidden;box-shadow:0 14px 34px rgba(11,43,79,.08);display:flex;flex-direction:column}
+.aic-feature-shot{display:block;background:#0f1f2e;aspect-ratio:16/10}
+.aic-feature-shot img{display:block;width:100%;height:100%;object-fit:contain}
+.aic-feature-body{padding:1rem 1.15rem 1.2rem}
+.aic-feature-body h3{margin:0 0 .35rem;font-size:1.15rem;color:#071032}
+.aic-feature-body p{margin:0;color:#52627a;line-height:1.6;font-size:.95rem}
+.aic-home-features-cta{display:flex;flex-wrap:wrap;gap:.8rem;justify-content:center;margin-top:2rem}
+.aic-home-features-cta .button.on-light{background:#fff;color:#0b2b4f;border:2px solid #0b2b4f;box-shadow:none}
+@media(max-width:980px){.aic-feature-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:640px){.aic-feature-grid{grid-template-columns:1fr}.aic-home-features{padding:2.6rem 1rem}.aic-home-features-cta .button{width:100%;justify-content:center;text-align:center}}
+</style>
 <style id="aic-product-visuals-r1">
 .aic-product-media{margin:0 0 1rem;border:1px solid #d9e4f2;border-radius:16px;overflow:hidden;background:#fff;box-shadow:0 12px 30px rgba(7,16,50,.08)}
 .aic-product-media img{display:block;width:100%;height:280px;object-fit:contain;background:#fff;padding:1rem;box-sizing:border-box}
@@ -583,7 +601,7 @@
 <a href="vms.html">AnyAiCam VMS</a>
 <a href="vms.html#linux-download">AnyAiCam for Linux</a>
 <a href="build-your-system.html">Build Your System</a>
-<a href="#videoloft-cloud">Videoloft Cloud</a>
+<a href="videoloft.html">Videoloft Cloud</a>
 <a href="/camera-compatibility-check.html">Camera Readiness</a>
 <a href="hardware.html">Hardware</a>
 <a href="vms-support.html">VMS Support</a>
@@ -634,30 +652,12 @@
 <strong>Modular AI Analytics</strong>
 </div>
 </div>
-<div class="hero-actions"><a class="button primary" href="edge-appliance.html#appliances">Buy a Ryzen appliance</a><a class="button secondary" href="vms.html#linux-download">AnyAiCam for Linux</a><a class="button secondary" href="/software.html">Download Free Videoloft Software</a><a class="button secondary" href="#choose-system">Choose My Camera System</a></div><p class="hero-reassurance" style="margin:1rem 0 0;color:#52627a;font-size:.95rem;font-weight:700;"><!--release:home-linux-note state=published version=1.2.3 filename=anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz sha256=e32c4898f74b5135ecfe6191299cfad826951af1b94b5bf9a1fff98be2ebfaed url=https://anyaicam.com/downloads/anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz size=35258116-->AnyAiCam Ryzen appliances from $1,249.99, or run AnyAiCam on your own Ubuntu 24.04 PC.<!--/release:home-linux-note--> Windows version coming soon.</p>
+<div class="hero-actions"><a class="button primary" href="build-your-system.html">Build Your System</a><a class="button secondary" href="aac-features.html">Explore AAC Features</a><a class="button secondary" href="edge-appliance.html#appliances">Buy a Ryzen appliance</a><a class="button secondary" href="vms.html#linux-download">AnyAiCam for Linux</a></div><p class="hero-reassurance" style="margin:1rem 0 0;color:#52627a;font-size:.95rem;font-weight:700;"><!--release:home-linux-note state=published version=1.2.3 filename=anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz sha256=e32c4898f74b5135ecfe6191299cfad826951af1b94b5bf9a1fff98be2ebfaed url=https://anyaicam.com/downloads/anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz size=35258116-->AnyAiCam Ryzen appliances from $1,249.99, or run AnyAiCam on your own Ubuntu 24.04 PC.<!--/release:home-linux-note--> Windows version coming soon.</p>
 </div>
 <figure class="home-app-shot" style="position:relative;z-index:1;margin:0;min-width:0;align-self:center;"><a href="app-screens/vms-live-camera.webp" target="_blank" rel="noopener" aria-label="Open the AnyAiCam VMS Live View screenshot full size"><img src="app-screens/vms-live-camera.webp" alt="The real AnyAiCam VMS Live View: a driveway camera shown full size, with the Live, Events, Smart alerts, Playback, Dashboard, Analytics and Investigate menu" width="1600" height="1000" decoding="async" fetchpriority="high" style="display:block;width:100%;height:auto;aspect-ratio:16/10;border-radius:16px;border:1px solid #d9e4f2;box-shadow:0 24px 55px rgba(7,16,50,.24);background:#0f1f2e;"></a><figcaption style="margin-top:.7rem;color:#d5dff8;font-size:.95rem;line-height:1.55;">The AnyAiCam VMS Live View, running locally on your AnyAiCam system. Optional cloud services extend it; they do not replace it.</figcaption></figure>
 </section>
-<section aria-labelledby="videoloft-demo-title" id="videoloft-demo" style="padding:3.5rem 1rem;background:#f7fbff;border-bottom:1px solid #d9e6f4;">
-  <div style="width:min(1120px,100%);margin:0 auto;">
-    <div style="text-align:center;max-width:780px;margin:0 auto 1.6rem;">
-      <p class="eyebrow">VIDEOLOFT CLOUD VMS DEMO</p>
-      <h2 id="videoloft-demo-title" style="margin:.4rem 0 .75rem;color:#0b1332;font-size:clamp(2rem,4vw,3rem);">See the cloud video experience in action.</h2>
-      <p style="margin:0;color:#52627a;font-size:1.05rem;line-height:1.7;">Watch the Videoloft cloud VMS demo, then continue below to explore AnyAiCam VMS, AI analytics, edge appliances and hybrid options.</p>
-    </div>
-    <div style="position:relative;width:min(960px,100%);margin:0 auto;padding-top:56.25%;border-radius:18px;overflow:hidden;background:#071032;box-shadow:0 22px 48px rgba(7,16,50,.18);">
-      <iframe
-        src="https://www.youtube.com/embed/Xa0Od-JFnYs"
-        title="Videoloft Demo: The All-In-One Cloud VMS for Any Security System"
-        loading="lazy"
-        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-        allowfullscreen
-        style="position:absolute;inset:0;width:100%;height:100%;border:0;">
-      </iframe>
-    </div>
-  </div>
-</section>
 
+<section class="aic-home-features" id="anyaicam-features" aria-labelledby="anyaicam-features-title"><div class="aic-home-features-inner"><p class="eyebrow">INSIDE ANYAICAM VMS</p><h2 id="anyaicam-features-title">See what the software does.</h2><p class="aic-home-features-lead">Real screens from the AnyAiCam app. Watch live, find what happened and get alerts that matter, all running on your own AnyAiCam appliance.</p><div class="aic-feature-grid"><article class="aic-feature-card"><a class="aic-feature-shot" href="aac-features.html#feature-tour" aria-label="See Smart Alerts in the AAC Features tour"><img src="app-screens/vms-smart-alerts.webp" alt="AnyAiCam Smart Alerts inbox: What needs your attention, with people, vehicles, security and system filters" width="1600" height="689" loading="lazy" decoding="async"></a><div class="aic-feature-body"><h3>Smart Alerts</h3><p>What needs your attention, in one inbox: save or handle alerts and filter by people, vehicles, security or system.</p></div></article><article class="aic-feature-card"><a class="aic-feature-shot" href="aac-features.html#feature-tour" aria-label="See Playback in the AAC Features tour"><img src="app-screens/vms-playback-timeline.webp" alt="AnyAiCam Playback timeline with an event clip playing from the recordings list" width="1600" height="1222" loading="lazy" decoding="async"></a><div class="aic-feature-body"><h3>Playback</h3><p>Go back through the day on a timeline that marks people, vehicles and motion, and play any event clip.</p></div></article><article class="aic-feature-card"><a class="aic-feature-shot" href="aac-features.html#feature-tour" aria-label="See Events in the AAC Features tour"><img src="app-screens/vms-events.webp?v=20261005" alt="AnyAiCam Events list: time, camera, thumbnail, type, confidence and live view or playback links" width="1600" height="744" loading="lazy" decoding="async"></a><div class="aic-feature-body"><h3>Events</h3><p>Every detection in one list, with a thumbnail, type and confidence, one tap from live view or playback.</p></div></article><article class="aic-feature-card"><a class="aic-feature-shot" href="aac-features.html#feature-tour" aria-label="See Dashboard in the AAC Features tour"><img src="app-screens/vms-dashboard-security.webp" alt="AnyAiCam Dashboard with the security mode and today&rsquo;s activity" width="1600" height="450" loading="lazy" decoding="async"></a><div class="aic-feature-body"><h3>Dashboard</h3><p>Your security mode, today&rsquo;s events, people, vehicles and alerts, and how many cameras are online.</p></div></article><article class="aic-feature-card"><a class="aic-feature-shot" href="aac-features.html#feature-tour" aria-label="See License Plate Recognition in the AAC Features tour"><img src="app-screens/vms-license-plates.webp?v=20261005" alt="AnyAiCam License Plates: plates read per camera with vehicle and clip (plates blurred)" width="1600" height="744" loading="lazy" decoding="async"></a><div class="aic-feature-body"><h3>License Plate Recognition</h3><p>Analytics module: every plate read, with the camera, time, vehicle and its clip. (Plates blurred here for privacy.)</p></div></article><article class="aic-feature-card"><a class="aic-feature-shot" href="aac-features.html#feature-tour" aria-label="See People Counting in the AAC Features tour"><img src="app-screens/vms-people-counting.webp?v=20261005" alt="AnyAiCam People Counting: entries, exits, a per-day chart and totals by camera" width="1600" height="747" loading="lazy" decoding="async"></a><div class="aic-feature-body"><h3>People Counting</h3><p>Analytics module: entries, exits and daily trends, with totals by camera.</p></div></article></div><div class="aic-home-features-cta"><a class="button primary" href="aac-features.html">Explore all AAC Features</a><a class="button secondary on-light" href="build-your-system.html">Build Your System</a></div></div></section>
 <section class="aic-home-access" id="aic-vms-hardware" aria-labelledby="aic-vms-hardware-title" style="background:#f7fbff;">
   <div class="aic-home-access-inner">
     <div class="aic-home-access-head">
@@ -709,103 +709,8 @@
     </div>
   </div>
 </section>
-<section class="learn-hub" id="ai-video-showcase"><div class="learn-hub-inner"><div class="learn-hub-head"><p class="eyebrow">SEE WHAT YOUR CAMERAS CAN DO</p><h2>Cloud recording plus practical AI tools.</h2><p>Watch real examples of smart motion, people counting, license plate recognition and PPE detection. Then start with the cameras you already own.</p></div><div class="learn-category" id="phase-2-video-links">
-<div class="learn-grid">
-<article class="learn-card">
-<div style="position:relative;width:100%;padding-top:56.25%;margin-bottom:1rem;border-radius:12px;overflow:hidden;background:#071032;">
-<iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="" loading="lazy" src="https://www.youtube.com/embed/aTBdazIvs40?enablejsapi=1" style="position:absolute;inset:0;width:100%;height:100%;border:0;" title="Smart Motion Video Analytics Demo">
-</iframe>
-</div>
-<h4>Smart Motion</h4>
-<p>See how people, vehicle, and animal events can be found faster than reviewing ordinary motion clips.</p>
-<a class="learn-action" href="https://www.youtube.com/watch?v=aTBdazIvs40" rel="noopener noreferrer" target="_blank">Watch on YouTube →</a>
-</article>
-<article class="learn-card">
-<div style="position:relative;width:100%;padding-top:56.25%;margin-bottom:1rem;border-radius:12px;overflow:hidden;background:#071032;">
-<iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="" loading="lazy" src="https://www.youtube.com/embed/KzRgPfao3Ao?enablejsapi=1" style="position:absolute;inset:0;width:100%;height:100%;border:0;" title="People Counting Video Analytics Demo">
-</iframe>
-</div>
-<h4>People Counting</h4>
-<p>See occupancy, foot traffic, and customer-flow reporting for stores, offices, and public spaces.</p>
-<a class="learn-action" href="https://www.youtube.com/watch?v=KzRgPfao3Ao" rel="noopener noreferrer" target="_blank">Watch on YouTube →</a>
-</article>
-<article class="learn-card">
-<div style="position:relative;width:100%;padding-top:56.25%;margin-bottom:1rem;border-radius:12px;overflow:hidden;background:#071032;">
-<iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="" loading="lazy" src="https://www.youtube.com/embed/ojrcFBDryzY?enablejsapi=1&amp;start=8" style="position:absolute;inset:0;width:100%;height:100%;border:0;" title="License Plate Recognition Video Analytics Demo">
-</iframe>
-</div>
-<h4>License Plate Recognition</h4>
-<p>See plate capture and search for parking areas, gated properties, and access-control use cases.</p>
-<a class="learn-action" href="https://www.youtube.com/watch?v=ojrcFBDryzY&amp;t=8s" rel="noopener noreferrer" target="_blank">Watch on YouTube →</a>
-</article>
-<article class="learn-card">
-<div style="position:relative;width:100%;padding-top:56.25%;margin-bottom:1rem;border-radius:12px;overflow:hidden;background:#071032;">
-<iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="" loading="lazy" src="https://www.youtube.com/embed/XRAyA-EYmF0" style="position:absolute;inset:0;width:100%;height:100%;border:0;" title="PPE Detection Video Analytics Demo">
-</iframe>
-</div>
-<h4>PPE Detection</h4>
-<p>See hard-hat, vest, and safety-equipment monitoring for industrial and construction sites.</p>
-<a class="learn-action" href="https://youtu.be/XRAyA-EYmF0" rel="noopener noreferrer" target="_blank">Watch on YouTube →</a>
-</article>
-</div>
-</div><div class="learn-hub-cta"><a class="button primary" href="/software-trial.html">Start My Free 30-Day AI Software Trial</a><a class="button secondary dark" href="/camera-compatibility-check.html" style="background:#071032; border:2px solid #23c7d5; color:#fff; text-align:center;">Check Camera Compatibility</a></div></div></section><section class="services-band" id="software-bridge" style="background:#f7fbff; padding:3rem 1rem;">
-<div style="max-width:1300px; margin:0 auto; background:#fff; border:1px solid #d9e6f4; border-radius:12px; box-shadow:0 18px 45px rgba(13,39,75,0.08); padding:3rem 2rem; text-align:center;">
-<p class="eyebrow" style="color:#1677c8; font-weight:700; text-transform:uppercase; letter-spacing:1px; font-size:0.85rem;">Free Option Available</p>
-<h2 style="color:#0b2b4f; font-size:2rem; margin:0.5rem 0 1rem;">Try Cloud Recording Free—No Adapter Purchase Required</h2>
-<div style="text-align:center; margin:1.5rem 0;">
-<img alt="ANY AI CAM Software Bridge" decoding="async" loading="lazy" src="IconOnly_Transparent.png" style="max-width:120px; height:auto; display:inline-block;"/>
-</div>
-<p style="color:#444; font-size:1.05rem; line-height:1.7; max-width:700px; margin:0 auto 1.5rem;">Use the <strong>free Windows Software Bridge</strong> to test cloud recording with compatible cameras for 30 days without purchasing adapter hardware. If you decide not to continue after the trial, there is no adapter purchase left behind.</p>
-<div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; margin:2rem 0; text-align:left;">
-<div style="background:#fff; border-radius:10px; padding:1.25rem; box-shadow:0 2px 8px rgba(0,0,0,0.06);">
-<strong style="color:#0b2b4f; display:block; margin-bottom:0.4rem;">✓ Free to Use</strong>
-<span style="color:#555; font-size:0.9rem;">No hardware purchase required. Runs on your existing computer.</span>
-</div>
-<div style="background:#fff; border-radius:10px; padding:1.25rem; box-shadow:0 2px 8px rgba(0,0,0,0.06);">
-<strong style="color:#0b2b4f; display:block; margin-bottom:0.4rem;">✓ Full Cloud Access</strong>
-<span style="color:#555; font-size:0.9rem;">Same cloud recording, playback, and alerts as the hardware adapter.</span>
-</div>
-<div style="background:#fff; border-radius:10px; padding:1.25rem; box-shadow:0 2px 8px rgba(0,0,0,0.06);">
-<strong style="color:#0b2b4f; display:block; margin-bottom:0.4rem;">✓ Easy Setup</strong>
-<span style="color:#555; font-size:0.9rem;">Our team helps you install and configure the software remotely.</span>
-</div>
-</div>
-<div style="display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:0.75rem; width:100%; margin:0 auto;">
-<a class="button primary" href="/software.html" style="font-size:1.05rem; padding:0.85rem 2rem; margin:0; text-align:center;">See Free Software Trial Requirements</a>
-<a class="button secondary dark" href="/software-trial.html" style="font-size:1.05rem; padding:0.85rem 2rem; margin:0; background:#071032; border:2px solid #23c7d5; color:#fff; text-align:center;">Start Free Software Setup</a>
-</div>
-<p style="margin-top:0.75rem; color:#888; font-size:0.85rem;">Already have an adapter? The wizard handles both options.</p>
-</div>
-</section><section class="services-band" id="services">
-<div class="section-heading">
-<p class="eyebrow">WHAT YOU GET</p>
-<h2>The footage you need, when you need it.</h2>
-<p>Your existing compatible cameras can record to the cloud, show live video remotely, send useful alerts and make important footage easier to find and share.</p>
-</div>
-<div class="service-row">
-<article>
-<span class="line-icon cloud-lock"></span>
-<h3>Cloud Video Backup</h3>
-<p>Keep recorded video in secure cloud storage so footage is protected beyond the local recorder.</p>
-</article>
-<article>
-<span class="line-icon mobile"></span>
-<h3>Live View Anywhere</h3>
-<p>View connected cameras from your phone, tablet, or computer after your account is activated.</p>
-</article>
-<article>
-<span class="line-icon brain"></span>
-<h3>Smart Motion Search</h3>
-<p>Use people and vehicle detection to find important moments faster than reviewing normal footage.</p>
-</article>
-<article>
-<span class="line-icon building"></span>
-<h3>Multi-Site Ready</h3>
-<p>Manage cloud access for offices, stores, warehouses, restaurants, and other business locations.</p>
-</article>
-</div>
-</section><section aria-labelledby="choose-path-title" class="trust-banner" id="choose-system" style="background:#0b1332;padding:3rem 1rem;border-bottom:1px solid rgba(255,255,255,.08);">
-<div style="max-width:1120px;margin:0 auto;">
+<section aria-labelledby="choose-path-title" class="trust-banner" id="choose-system" style="background:#0b1332;padding:3rem 1rem;border-bottom:1px solid rgba(255,255,255,.08);">
+<div style="max-width:1120px;margin:0 auto;" id="services">
 <p class="eyebrow" style="color:#68d7df;text-align:center;">TWO CLEAR PRODUCT PATHS</p>
 <h2 id="choose-path-title" style="color:#fff;text-align:center;margin:.35rem 0 .7rem;">How do you want to run your cameras?</h2>
 <p style="max-width:760px;margin:0 auto 1.6rem;color:#d5dff8;text-align:center;line-height:1.7;">Choose AnyAiCam for local or hybrid operation on your own edge appliance. Choose Videoloft when you prefer a cloud-focused adapter service without an AnyAiCam appliance.</p>
@@ -814,31 +719,30 @@
 <span style="display:inline-block;background:#cc3b96;color:#fff;border-radius:999px;padding:.35rem .7rem;font-size:.78rem;font-weight:900;letter-spacing:.04em;text-transform:uppercase;">Primary / Recommended</span>
 <h3 style="font-size:1.5rem;margin:1rem 0 .35rem;">AnyAiCam VMS</h3>
 <p style="font-weight:800;color:#1677c8;">Local / Hybrid AI Video</p>
-<ul style="line-height:1.75;padding-left:1.2rem;"><li>AnyAiCam Starter (MINISFORUM AI X1-255 · Ryzen 7 255) for standard VMS starting point</li><li>AnyAiCam Professional (MINISFORUM AI X1 · Ryzen AI 9 HX 470) for additional VMS/analytics headroom</li><li>AnyAiCam Enterprise appliance only for AAC Face Access</li><li>Local-first recording and playback</li><li>Continues operating during internet outages</li><li>Optional hybrid storage (cloud overflow coming soon)</li><li>Live, Playback, Events, Smart Alerts and Investigate</li><li>Modular licensed AI analytics</li></ul>
+<ul style="line-height:1.75;padding-left:1.2rem;"><li>AnyAiCam Starter (MINISFORUM AI X1-255 · Ryzen 7 255) for standard VMS starting point</li><li>AnyAiCam Professional (MINISFORUM AI X1 · Ryzen AI 9 HX 470) for additional VMS/analytics headroom</li><li>AnyAiCam Enterprise appliance only for AAC Face Access</li><li>Local-first recording and playback</li><li>Continues operating during internet outages</li><li>Hybrid plan adds 14-day cloud event retention (cloud overflow coming soon)</li><li>Live, Playback, Events, Smart Alerts and Investigate</li><li>Modular licensed AI analytics</li></ul>
 <a class="button primary" href="edge-appliance.html#appliances" style="display:flex;text-align:center;justify-content:center;">Choose your Ryzen appliance</a><a href="vms.html#linux-download" style="display:block;margin-top:.7rem;text-align:center;font-weight:850;color:#6be4ed;">Run AnyAiCam on Linux →</a><a href="build-your-system.html" style="display:block;margin-top:.7rem;text-align:center;font-weight:850;color:#6be4ed;">Build Your AnyAiCam System →</a><a href="vms.html" style="display:block;margin-top:.45rem;text-align:center;font-weight:850;color:#6be4ed;">Learn how AnyAiCam VMS works →</a><a href="face-access.html" style="display:block;margin-top:.45rem;text-align:center;font-weight:850;color:#6be4ed;">Explore AAC Facial Recognition →</a>
-<small style="display:block;margin-top:.8rem;color:#667085;">Final appliance models and production prices are still being validated.</small>
 </article>
 <article id="videoloft-cloud" style="background:#fff;border:1px solid #cfd9ea;border-radius:18px;padding:1.6rem;color:#0b1332;">
 <span style="display:inline-block;background:#e9eef7;color:#33415c;border-radius:999px;padding:.35rem .7rem;font-size:.78rem;font-weight:900;letter-spacing:.04em;text-transform:uppercase;">Cloud Alternative</span>
 <h3 style="font-size:1.5rem;margin:1rem 0 .35rem;">Videoloft Cloud</h3>
 <p style="font-weight:800;color:#1677c8;">Cloud Camera Recording</p>
 <ul style="line-height:1.75;padding-left:1.2rem;"><li>Cloud-focused video recording</li><li>Videoloft adapter or Windows software bridge</li><li>No AnyAiCam appliance required</li><li>Remote viewing, playback and supported cloud analytics</li><li>Existing Videoloft pricing and activation flow</li></ul>
-<a class="button secondary dark" href="/cloud-setup-wizard.html" style="display:flex;text-align:center;justify-content:center;background:#071032;border:2px solid #23c7d5;color:#fff;">Explore Videoloft Cloud</a>
+<a class="button secondary dark" href="videoloft.html" style="display:flex;text-align:center;justify-content:center;background:#071032;border:2px solid #23c7d5;color:#fff;">Explore Videoloft Cloud</a><a href="/cloud-setup-wizard.html" style="display:block;margin-top:.7rem;text-align:center;font-weight:850;color:#1677c8;">Start Videoloft setup →</a>
 </article>
 </div>
 </div>
 </section><section class="request-section" id="request" style="background:#f4f8fc; padding:3rem 1rem; display:flex; justify-content:center; align-items:center; box-sizing:border-box;">
 <div class="request-copy" style="width:100%; max-width:1120px; margin:0 auto; background:#fff; border:1px solid #d9e4f2; border-radius:14px; padding:3rem; box-shadow:0 12px 35px rgba(11,43,79,0.08); box-sizing:border-box;">
 <p class="eyebrow">BUILD YOUR ANYAICAM SYSTEM</p>
-<h2>Start with your camera count. We will size for today and future growth.</h2>
-<p>Tell us about your cameras, recording preference, retention, analytics and expected growth. During this first phase, our team will review the requirements before recommending an appliance.</p>
-<ul><li>Keep compatible existing IP cameras</li><li>Choose local-first or optional hybrid recording</li><li>Plan retention and analytics by camera</li><li>Compare a Current Fit and Growth Ready appliance</li></ul>
+<h2>Choose your system, cameras and plan. See your price, then check out.</h2>
+<p>Pick an AnyAiCam appliance or your own Ubuntu 24.04 PC, choose 1 to 64 cameras and a monthly plan, and see your one-time and monthly costs before you continue to checkout.</p>
+<ul><li>Keep compatible existing IP cameras</li><li>Basic Local, AI Local or Hybrid: one plan for every licensed camera</li><li>One-time hardware or licence costs shown separately from the monthly plan</li><li>Continue to checkout with your AnyAiCam account</li></ul>
 <div style="text-align:center; margin-top:2rem;">
-<a class="button primary" href="build-your-system.html" style="font-size:1.15rem; padding:1rem 2.5rem;">Start My AnyAiCam System Plan</a>
+<a class="button primary" href="build-your-system.html" style="font-size:1.15rem; padding:1rem 2.5rem;">Build Your System</a>
 <div style="margin-top:.85rem;">
-<a href="signin.html" style="font-weight:800;color:#0b2b4f;text-decoration:none;">Already have an account? Open dashboard preview →</a>
+<a href="signin.html" style="font-weight:800;color:#0b2b4f;text-decoration:none;">Already have an account? Sign in →</a>
 </div>
-<p style="margin-top:1rem; color:#666; font-size:0.9rem;">Prefer cloud-only service? Use the separate Videoloft Cloud path above.</p>
+<p style="margin-top:1rem; color:#666; font-size:0.9rem;">Prefer cloud-only service? See <a href="videoloft.html" style="font-weight:800;color:#0b2b4f;">Videoloft Cloud</a>.</p>
 </div>
 </div>
 </section><section class="aic-readiness-wrap" style="max-width:1180px;margin:1.5rem auto 0;padding:0 1rem;">
@@ -850,103 +754,6 @@
 <p class="aic-readiness-mobile-copy">You will usually need the administrator login once during setup.</p>
 </div>
 <a class="button primary aic-readiness-button" href="/camera-compatibility-check.html">Check Camera Readiness</a>
-</div>
-</section><section class="services-band" id="service-scope" style="margin-top:2rem;">
-<div class="section-heading">
-<p class="eyebrow">What ANY AI CAM Does</p>
-<h2>Local installation. Remote camera-to-cloud activation.</h2>
-<p>We do not travel to install cameras. We help customers choose compatible equipment, recover authorized access, verify network visibility, and connect supported cameras or recorders to Videoloft.</p>
-</div>
-<div class="service-row">
-<article>
-<h3>Use Existing Cameras</h3>
-<p>Keep compatible IP cameras or recorder systems instead of replacing everything.</p>
-</article>
-<article>
-<h3>Buy and Install Locally</h3>
-<p>Purchase compatible cameras and PoE equipment, then install them yourself or hire a technician in your city.</p>
-</article>
-<article>
-<h3>Authorized Recovery</h3>
-<p>We help identify the approved reset process. Physical resets must be completed by the customer, manufacturer, or local technician.</p>
-</article>
-<article>
-<h3>Remote Videoloft Setup</h3>
-<p>After valid credentials are available, we can help connect supported devices and verify cloud viewing and recording.</p>
-</article>
-</div>
-<p class="process-note"><strong>Not included:</strong> onsite installation, cabling, ladder work, physical camera resets, or bypassing device security.</p>
-</section><section aria-labelledby="buy-cloud-storage-title" class="adapter-preview-section" id="buy-cloud-storage">
-<div class="adapter-preview-card">
-<div class="adapter-preview-copy">
-<p class="eyebrow">Cloud Storage Plans</p>
-<h2 id="buy-cloud-storage-title">Buy Cloud Storage</h2>
-<p>
-                        Purchase cloud recording for your existing cameras and choose the storage duration,
-                        billing preference, and optional AI features that fit your site.
-                    </p>
-<p>
-                        This is the simplest way to get cloud recording for your system. Cloud storage is
-                        billed monthly by Videoloft directly to the customer. New activations include a
-                        30-day free trial before the first payment.
-                    </p>
-<p class="adapter-count-note">
-                        Flexible per-camera plans with optional AI features including Smart Motion,
-                        People Counting, and License Plate Recognition.
-                    </p>
-</div>
-<div class="adapter-preview-media">
-<img alt="Cloud Storage Pricing" decoding="async" loading="lazy" src="Virtual-Cloud-Adapter.webp"/>
-<span>Cloud Storage Plans</span>
-</div>
-<div style="grid-column:1 / -1; display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:0.75rem; width:100%;">
-<a class="button primary" href="/cloud-setup-wizard.html" style="margin:0; text-align:center;">Configure &amp; Buy Cloud Storage</a>
-<a class="button secondary dark" href="/cloud-storage-pricing.html" style="margin:0; background:#071032; border:2px solid #23c7d5; color:#fff; text-align:center;">View Pricing Plans</a>
-</div>
-</div>
-</section><section aria-labelledby="app-section-title" class="app-section">
-<div class="app-card">
-<div class="app-icon-wrap">
-<img alt="CCTV Connect app icon" decoding="async" loading="lazy" src="Videoloft App Logo.jpg" style="width:80px; height:80px;"/>
-</div>
-<div class="app-copy">
-<p class="eyebrow">Mobile App Access</p>
-<h2 id="app-section-title">Videoloft: IP Camera CCTV App.</h2>
-<p>
-                        Customers use the Videoloft IP Camera CCTV App for cloud camera access after
-                        their account is created and onboarding is complete. The app helps
-                        customers view live video, check recorded footage, and stay
-                        connected to their cameras from their phone once the system is
-                        activated.
-                    </p>
-</div>
-</div>
-</section><section aria-labelledby="adapter-preview-title" class="adapter-preview-section" id="adapter-product">
-<div class="adapter-preview-card">
-<div class="adapter-preview-copy">
-<p class="eyebrow">The Videoloft Cloud Adapter is the dedicated hardware option for customers who want cloud recording to keep running without relying on a laptop or desktop computer.</p>
-<h2 id="adapter-preview-title">The Always-On Option: Videoloft Cloud Adapter</h2>
-<p>It stays connected as long as it has power and network access, making it the better fit for businesses, permanent installations and customers who do not want to leave a Windows PC running.</p>
-<p>
-                        Customers can order the Videoloft Cloud Adapter and submit the
-                        cloud storage plan details the same day. ANY AI CAM handles the
-                        adapter hardware order, then uses the same request details to
-                        prepare the cloud account and recording plan.
-                    </p>
-<p class="adapter-count-note">
-                        8-channel Cloud Adapter hardware: $349. A 16-channel adapter
-                        hardware option is available at $399. Cloud recording is set up
-                        from the same order request and billed after activation.
-                    </p>
-</div>
-<div class="adapter-preview-media">
-<img alt="Videoloft Cloud Adapter Mini" decoding="async" loading="lazy" src="videoloft adapter.jpg"/>
-<span>Cloud Adapter Mini</span>
-</div>
-<div style="grid-column:1 / -1; display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:0.75rem; width:100%;">
-<a class="button secondary dark" href="/adapters.html" style="margin:0; background:#071032; border:2px solid #23c7d5; color:#fff; text-align:center;">Compare Adapter Options</a>
-<a class="button primary" href="/cloud-setup-wizard.html" style="margin:0; text-align:center;">Order Adapter Hardware</a>
-</div>
 </div>
 </section></main>
 
@@ -1045,6 +852,7 @@
         }
       })();
     </script>
+<script>if(location.hash==='#services')location.replace('videoloft.html#services');</script>
 <script src="script.js"></script>
 <script>
 
