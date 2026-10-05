@@ -186,3 +186,11 @@ def test_the_launch_check_catches_each_kind_of_launch_defect(site, page, old, ne
     (site / page).write_text(text.replace(old, new, 1), encoding="utf-8")
     failures = launch.run(site)[0]
     assert any(expected in failure for failure in failures), failures
+
+
+def test_the_homepage_shows_the_real_vms_live_view_not_a_mock_panel():
+    index = (ROOT / "website" / "index.html").read_text(encoding="utf-8")
+    assert 'src="app-screens/vms-live-camera.webp"' in index
+    assert (ROOT / "website" / "app-screens" / "vms-live-camera.webp").is_file()
+    for mock in ("Your cameras. Your local system.", "Local system online", "Search with licensed AI"):
+        assert mock not in index
