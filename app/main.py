@@ -46034,7 +46034,15 @@ PORTAL_LOGIN_DESTINATION = "/partner.html"
 # literal absolute external URL, deliberately not read from an env
 # var: this is the one production marketing domain, not a per-
 # deployment setting.
-CUSTOMER_LOGOUT_DESTINATION = "https://anyaicam.com/"
+# Same-origin on purpose (2026-10-05): every page sends
+# Content-Security-Policy form-action 'self' (cloud_security.py), and
+# browsers apply form-action to the redirect after a form POST. The
+# earlier external https://anyaicam.com/ target was therefore blocked
+# by the browser after the session had already ended: the customer
+# stayed on the signed-in page, clicked Log out again and fell into the
+# stale-session path. The customer sign-in says "You've been signed
+# out" and links to anyaicam.com.
+CUSTOMER_LOGOUT_DESTINATION = "/customer-login.html?signed_out=1"
 
 
 def logout_destination(legacy_role: str | None, portal_role: str | None) -> str:

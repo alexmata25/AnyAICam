@@ -187,3 +187,36 @@ def test_sign_in_pages_refuse_auth_flow_next_values_with_the_same_list(page):
     # Every next= the page honors goes through the same check.
     assert html.count("anyaicamAuthFlowPath(") >= 2
     assert re.search(r"&&!anyaicamAuthFlowPath\((wanted|n)\)\)\?", html)
+
+
+# ------------------------------------------------------------ 7. the browser actually follows the logout redirect
+
+def _form_action_sources(csp):
+    directive = next(part.strip() for part in csp.split(";") if part.strip().startswith("form-action"))
+    return directive.split()[1:]
+
+
+@pytest.mark.parametrize("path", ["/logout", "/partner-logout"])
+@pytest.mark.parametrize("role,extra", [("customer_owner", {"customer_id": "cust-1"}), ("customer_viewer", {"customer_id": "cust-1"}),
+                                        ("partner_owner", {"partner_id": "partner-1"}), ("administrator", {"partner_id": "partner-1"})])
+def test_every_logout_redirect_is_allowed_by_the_pages_own_form_action_policy(http_client, db_path, path, role, extra):
+    """Found on portal-staging 2026-10-05: the customer Log out form POSTed
+    /logout, the server ended the session and answered 303 to the external
+    https://anyaicam.com/, and the browser refused to follow it because
+    every page sends CSP form-action 'self'. The customer stayed on a page
+    that still looked signed in. Each logout destination must stay within
+    the policy the logout form was submitted under."""
+    page = http_client.get("/customer-login.html")
+    assert _form_action_sources(page.headers["content-security-policy"]) == ["'self'"]  # policy unchanged
+    token = _seed_partner_session(db_path, email=f"{role}@example.test", role=role, **extra)
+    response = http_client.post(path, cookies={partner_portal.SESSION_COOKIE: token}, headers=_csrf_headers(http_client))
+    location = response.headers["location"]
+    assert response.status_code == 303
+    assert location.startswith("/") and not location.startswith("//"), location
+    assert not location.startswith("/login")
+
+
+def test_the_customer_sign_in_says_signed_out_after_a_logout():
+    html = (APP / "customer-login.html").read_text(encoding="utf-8")
+    assert '<p id="signed-out" role="status" hidden' in html and "You've been signed out." in html
+    assert "get('signed_out')==='1'" in html

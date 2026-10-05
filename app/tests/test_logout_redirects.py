@@ -60,7 +60,7 @@ def test_customer_portal_role_goes_to_the_external_marketing_homepage(portal_rol
     # A real customer_owner/customer_viewer identity logs all the way
     # out to the public marketing site -- not back to any sign-in page
     # inside this app. See logout_destination()'s own docstring.
-    assert main.logout_destination(None, portal_role) == "https://anyaicam.com/"
+    assert main.logout_destination(None, portal_role) == "/customer-login.html?signed_out=1"
     assert main.logout_destination(None, portal_role) == main.CUSTOMER_LOGOUT_DESTINATION
 
 
@@ -80,7 +80,7 @@ def test_legacy_customer_role_never_goes_to_portal_login(legacy_role):
     # store must still never be sent to the blue portal login -- and,
     # like the real Partner Portal customer identity, goes all the way
     # out to the external marketing homepage now, not a local page.
-    assert main.logout_destination(legacy_role, None) == "https://anyaicam.com/"
+    assert main.logout_destination(legacy_role, None) == "/customer-login.html?signed_out=1"
 
 
 def test_no_identity_at_all_defaults_to_customer_login_not_portal():
@@ -96,7 +96,7 @@ def test_customer_portal_identity_wins_even_if_legacy_side_looks_like_admin():
     # must still fail toward never leaking a customer to the portal
     # login) -- the customer signal on either side always wins, sending
     # them to the external homepage same as any other customer logout.
-    assert main.logout_destination("administrator", "customer_owner") == "https://anyaicam.com/"
+    assert main.logout_destination("administrator", "customer_owner") == "/customer-login.html?signed_out=1"
 
 
 # =============================================================== real HTTP: POST /logout
@@ -137,16 +137,16 @@ def _admin_session_cookie(admin_id="admin-1", role="administrator"):
 
 
 @pytest.mark.parametrize("role", ["customer_owner", "customer_viewer"])
-def test_customer_logout_redirects_to_the_external_homepage_and_destroys_the_session(http_client, db_path, role):
-    """The exact behavior this task confirmed as intended: customer_owner
-    and customer_viewer both log all the way out (server-side session
-    revoked, not just the cookie dropped client-side) and land on the
-    public https://anyaicam.com/ homepage, never a sign-in page inside
-    this app."""
+def test_customer_logout_lands_on_the_signed_out_customer_sign_in_and_destroys_the_session(http_client, db_path, role):
+    """customer_owner and customer_viewer both log all the way out
+    (server-side session revoked, not just the cookie dropped client-side)
+    and land on the customer sign-in with "You've been signed out"
+    (2026-10-05: the earlier external https://anyaicam.com/ redirect was
+    blocked by the browser under CSP form-action 'self')."""
     token = _seed_partner_session(db_path, email=f"{role}@example.test", role=role, customer_id="cust-1")
     response = http_client.post("/logout", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 303
-    assert response.headers["location"] == "https://anyaicam.com/"
+    assert response.headers["location"] == "/customer-login.html?signed_out=1"
     assert response.headers["location"] == main.CUSTOMER_LOGOUT_DESTINATION
     set_cookie = response.headers.get("set-cookie", "")
     assert partner_portal.SESSION_COOKIE in set_cookie  # the real cookie is actually being cleared
@@ -235,16 +235,12 @@ def test_portal_login_page_reachable_unauthenticated_no_bounce(http_client):
     assert response.status_code == 200
 
 
-def test_customer_logout_destination_is_external_not_a_local_hop(http_client, db_path):
-    # Supersedes the old "single hop" check for the customer case: the
-    # destination is now https://anyaicam.com/, a page this app does
-    # not and should not serve itself -- the only thing to verify here
-    # is that the redirect target really is that absolute external URL
-    # (already asserted in detail above), not something this app could
-    # attempt to GET against its own TestClient.
+def test_customer_logout_destination_is_a_single_same_origin_hop(http_client, db_path):
     token = _seed_partner_session(db_path, email="owner@example.test", role="customer_owner", customer_id="cust-1")
     logout_response = http_client.post("/logout", cookies={partner_portal.SESSION_COOKIE: token})
-    assert logout_response.headers["location"].startswith("https://anyaicam.com/")
+    assert logout_response.headers["location"] == main.CUSTOMER_LOGOUT_DESTINATION
+    landing = http_client.get(logout_response.headers["location"])
+    assert landing.status_code == 200 and 'id="signed-out"' in landing.text
 
 
 def test_logout_then_get_portal_login_is_a_single_hop(http_client, db_path):
