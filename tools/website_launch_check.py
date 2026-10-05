@@ -25,7 +25,8 @@ WEBSITE = website_release.WEBSITE
 
 APPLIANCES = {"Starter": "$1,249.99", "Professional": "$1,749.99", "Enterprise": "$2,249.99"}
 # Entry-level home appliance (2026-10-05), shown on the homepage only so far.
-RESIDENTIAL = ("AnyAiCam Residential VMS", "$949.99")
+RESIDENTIAL = ("AnyAiCam Residential VMS — Ryzen 5", "$949.99")
+RESIDENTIAL_PAGES = ["index.html", "hardware.html", "edge-appliance.html", "plans.html", "vms.html", "build-your-system.html"]
 RELAY = "$149.99"
 PLAN_TABLES = {  # plans.html, in page order
     "AnyAiCam VMS licence": ["$49.99 one-time", "$79.99 one-time", "$129.99 one-time", "$199.99 one-time"],
@@ -123,7 +124,7 @@ def check_prices(website: Path, fail):
             if price not in text:
                 fail(f"{name}: AnyAiCam {tier} price {price} missing")
             for match in re.finditer(rf"\b{tier}\b[^$]{{0,70}}?\$([\d,]+\.\d\d)", text):
-                if f"${match.group(1)}" not in APPLIANCES.values() and f"${match.group(1)}" != RELAY:
+                if f"${match.group(1)}" not in (*APPLIANCES.values(), RELAY, RESIDENTIAL[1]):
                     fail(f"{name}: {tier} next to an unexpected price ${match.group(1)}")
     for name in RELAY_PAGES:
         text = visible_text((website / name).read_text(encoding="utf-8"))
@@ -132,9 +133,11 @@ def check_prices(website: Path, fail):
         for match in re.finditer(r"(?:Numato|relay)[^$]{0,60}?\$([\d,]+\.\d\d)", text, re.I):
             if f"${match.group(1)}" != RELAY:
                 fail(f"{name}: relay next to an unexpected price ${match.group(1)}")
-    home = visible_text((website / "index.html").read_text(encoding="utf-8"))
-    if f"{RESIDENTIAL[0]} · Ryzen 5 residential appliance · {RESIDENTIAL[1]}" not in home:
-        fail(f"index.html: {RESIDENTIAL[0]} must show {RESIDENTIAL[1]}")
+    for name in RESIDENTIAL_PAGES:
+        text = visible_text((website / name).read_text(encoding="utf-8"))
+        shown = re.findall(rf"{re.escape(RESIDENTIAL[0])}[^$]{{0,60}}?\$([\d,]+\.\d\d)", text)
+        if not shown or any(f"${p}" != RESIDENTIAL[1] for p in shown):
+            fail(f"{name}: {RESIDENTIAL[0]} must show {RESIDENTIAL[1]} (found {shown})")
     plans = (website / "plans.html").read_text(encoding="utf-8")
     for title, prices in PLAN_TABLES.items():
         card = re.search(rf"<h3>{re.escape(title)}</h3>.*?</table>", plans, re.S)

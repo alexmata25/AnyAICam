@@ -175,8 +175,9 @@ def test_mixed_pending_and_published_blocks_fail_the_check(site):
     ("build-your-system.html", "const PLAN_PRICE=", "/* price_1AbCdEfGhIjKl */const PLAN_PRICE=", "Stripe Price ID"),
     ("vms-features.html", "<h2>How camera licenses work</h2>", "<h2>Entitlements follow the camera slot</h2>", "per-slot entitlement"),
     ("vms.html", "One plan covers every licensed camera", "Features can be licensed per slot. One plan covers every licensed camera", "per-slot entitlement"),
-    ("index.html", "Ryzen 5 residential appliance · <strong>$949.99</strong>", "Ryzen 5 residential appliance · <strong>$899.99</strong>", "Residential VMS must show $949.99"),
-    ("build-your-system.html", "name:'AnyAiCam Residential VMS',price:949.99}", "name:'AnyAiCam Residential VMS',price:899.99}", "Residential VMS price must be $949.99"),
+    ("index.html", "AnyAiCam Residential VMS — Ryzen 5 · <strong>$949.99</strong>", "AnyAiCam Residential VMS — Ryzen 5 · <strong>$899.99</strong>", "must show $949.99"),
+    ("plans.html", "AnyAiCam Residential VMS — Ryzen 5 $949.99", "AnyAiCam Residential VMS — Ryzen 5 $999.99", "must show $949.99"),
+    ("build-your-system.html", "name:'AnyAiCam Residential VMS — Ryzen 5',price:949.99}", "name:'AnyAiCam Residential VMS — Ryzen 5',price:899.99}", "Ryzen 5 price must be $949.99"),
     ("vms.html", "github.com", "github.com", None),
 ])
 def test_the_launch_check_catches_each_kind_of_launch_defect(site, page, old, new, expected):
