@@ -21,6 +21,23 @@ def initialized_db(db_path):
         yield
 
 
+@pytest.fixture(autouse=True)
+def policy_coupons(monkeypatch):
+    """Stripe answers Friends & Family coupon reads as the policy configures
+    them (friends_family.verify_coupon_percent); nothing else is stubbed."""
+    import main
+    from conftest import policy_coupon
+    previous = main.stripe_api_get
+
+    def get(path):
+        if path.startswith("/v1/coupons/"):
+            coupon = policy_coupon(path.split("/")[3].split("?")[0])
+            if coupon is not None:
+                return coupon
+        return previous(path)
+    monkeypatch.setattr(main, "stripe_api_get", get)
+
+
 def seed_customer(db_path, *, customer_id="cust-v2", email="v2@example.test"):
     with override_target(sqlite_path=str(db_path)):
         with sqlite3.connect(db_path) as db:

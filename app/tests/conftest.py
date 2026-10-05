@@ -94,6 +94,27 @@ def _ai_activities_end_within_their_test(request, monkeypatch):
         module.ai_activities.reset()
 
 
+def policy_coupon(coupon_id: str) -> dict | None:
+    """Stripe's answer for a Friends & Family coupon configured exactly as
+    pricing_catalog's policy says, or None for an unknown coupon id."""
+    import os
+    import pricing_catalog as pc
+    for discount_class, env_var in pc.FRIENDS_FAMILY_COUPON_ENV.items():
+        if os.environ.get(env_var, "").strip() == coupon_id:
+            return {"id": coupon_id, "percent_off": pc.FRIENDS_FAMILY_PERCENT_OFF[discount_class], "valid": True}
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _fresh_coupon_verification(monkeypatch):
+    """friends_family caches verified coupons per process; every test starts empty."""
+    try:
+        import friends_family
+    except Exception:
+        return
+    monkeypatch.setattr(friends_family, "_VERIFIED_COUPONS", {})
+
+
 @pytest.fixture()
 def fake_stripe_prices(monkeypatch):
     """Answers main.stripe_api_get('/v1/prices/<id>') with the catalog amount
@@ -105,6 +126,16 @@ def fake_stripe_prices(monkeypatch):
     overrides = {}
 
     def _get(path):
+        if path.startswith("/v1/coupons/"):
+            # A Friends & Family coupon configured as the policy says (tests
+            # that want a mismatch override it by coupon id).
+            coupon_id = path.split("/")[3].split("?")[0]
+            if coupon_id in overrides:
+                return overrides[coupon_id]
+            coupon = policy_coupon(coupon_id)
+            if coupon is None:
+                raise AssertionError(f"unexpected Stripe coupon lookup: {coupon_id}")
+            return coupon
         price_id = path.rsplit("/", 1)[-1]
         if price_id in overrides:
             return overrides[price_id]

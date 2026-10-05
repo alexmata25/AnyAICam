@@ -178,7 +178,43 @@ def checkout_discount(customer_id: str, discount_class: str) -> dict:
     coupon = os.environ.get(env_var, "").strip()
     if not coupon:
         raise RuntimeError(f"COUPON_REQUIRED: {env_var} is not configured.")
+    verify_coupon_percent(coupon, discount_class)
     return {"coupon": coupon, "allow_promotion_codes": False, "friends_family": True}
+
+
+# Coupons whose Stripe percentage was verified against the policy in this
+# process (coupon id, discount class, expected percent) -- same idea as
+# main._VERIFIED_STRIPE_PRICES.
+_VERIFIED_COUPONS: dict = {}
+
+
+def verify_coupon_percent(coupon_id: str, discount_class: str) -> None:
+    """The configured Stripe coupon must take exactly the policy's percentage
+    (pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF: 50% base plan, 25%
+    analytics) and no fixed amount. Read from Stripe; a mismatch, an invalid
+    coupon or an unreadable one raises RuntimeError, which every checkout
+    turns into a 503 -- never a wrong discount."""
+    expected = pricing_catalog.friends_family_percent(discount_class)
+    key = (coupon_id, discount_class, expected)
+    if _VERIFIED_COUPONS.get(key):
+        return
+    import main
+    from urllib.parse import quote
+    try:
+        coupon = main.stripe_api_get(f"/v1/coupons/{quote(coupon_id, safe='')}")
+    except Exception as error:
+        raise RuntimeError("COUPON_UNVERIFIED: the Friends & Family coupon could not be read from Stripe.") from error
+    try:
+        percent = float(coupon.get("percent_off")) if coupon.get("percent_off") is not None else None
+    except (TypeError, ValueError):
+        percent = None
+    if coupon.get("valid") is False or coupon.get("amount_off") or percent is None or abs(percent - float(expected)) > 1e-9:
+        main.structured_log("friends_family.coupon_mismatch", level="error", coupon_id=coupon_id, discount_class=discount_class,
+                            expected_percent=expected, actual_percent=coupon.get("percent_off"),
+                            amount_off=coupon.get("amount_off"), valid=coupon.get("valid"))
+        raise RuntimeError("COUPON_MISMATCH: the Friends & Family coupon does not match the approved discount, "
+                           "so checkout is paused. Please contact AnyAiCam support.")
+    _VERIFIED_COUPONS[key] = True
 
 
 def apply_to_checkout_fields(fields: list, customer_id: str, discount_class: str) -> dict:

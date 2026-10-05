@@ -61,6 +61,9 @@ def stripe_subscriptions(monkeypatch):
     def get(path):
         if path.startswith("/v1/subscriptions?"):
             return {"data": list(state["made"].values())}
+        if path.startswith("/v1/coupons/"):
+            from conftest import policy_coupon
+            return policy_coupon(path.split("/")[3].split("?")[0]) or {}
         if path.startswith("/v1/payment_methods?"):
             return {"data": [{"id": "pm_saved_card"}]}
         return checkout_get(path)

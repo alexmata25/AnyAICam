@@ -42,7 +42,8 @@ def stripe_coupon(monkeypatch):
             if state["fail"]:
                 raise OSError("Stripe unreachable")
             if path.startswith("/v1/coupons/"):
-                coupon = {"id": path.split("/")[3].split("?")[0], "valid": True, "percent_off": 50}
+                from conftest import policy_coupon
+                coupon = dict(policy_coupon(path.split("/")[3].split("?")[0]) or {"valid": True, "percent_off": 50})
                 if state["applies_to"] is not None:
                     coupon["applies_to"] = {"products": list(state["applies_to"])}
                 return coupon

@@ -53,7 +53,9 @@ def shop(site, monkeypatch):
         return real_post(path, fields, idempotency_key=idempotency_key)
     monkeypatch.setattr(main, "stripe_api_post", _recording)
     sessions = {}
-    monkeypatch.setattr(main, "stripe_api_get", lambda path: sessions.get(path.rsplit("/", 1)[-1], {}))
+    from conftest import policy_coupon  # Friends & Family coupons as the policy configures them
+    monkeypatch.setattr(main, "stripe_api_get", lambda path: (policy_coupon(path.split("/")[3].split("?")[0]) or {})
+                        if path.startswith("/v1/coupons/") else sessions.get(path.rsplit("/", 1)[-1], {}))
     return client, captured, mail, keys, sessions
 
 
