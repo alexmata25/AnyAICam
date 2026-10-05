@@ -297,11 +297,63 @@ def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_li
     return kind, subject, text, html
 
 
+# Outbox key for the Build Your System order confirmation: one per account,
+# in purchase_notifications' provisioning_notifications table.
+ORDER_CONFIRMATION_KEY = "build-order-confirmed:"
+# An attempt still 'pending' this long after its last update was
+# interrupted (crash or restart mid-send) and may be retried.
+ORDER_CONFIRMATION_STALE_SECONDS = 300
+
+
+def _order_confirmation_attempts(customer_id: str) -> list:
+    from partner_db import rows
+    return rows("SELECT * FROM provisioning_notifications WHERE stripe_event_id=? ORDER BY created_at",
+                (ORDER_CONFIRMATION_KEY + customer_id,))
+
+
+def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) -> dict:
+    """The Build Your System order-confirmation email for this account: at
+    most one successful send ever, whatever its wording (hardware or
+    software). A failed or interrupted send stays in the outbox as
+    'failed'/'pending' and is retried by retry_order_confirmation_
+    notifications() -- a transient email-provider failure never suppresses
+    it. Once setup is finished the confirmation is out of date, so an
+    unsent attempt is closed ('superseded') instead of retried."""
+    import purchase_notifications as pn
+    attempts = _order_confirmation_attempts(customer_id)
+    if any(attempt["status"] == "sent" for attempt in attempts):
+        return {"status": "skipped", "reason": "already sent"}
+    if not billing.has_camera_plan(customer_id):
+        return {"status": "ignored", "reason": "no paid plan yet"}
+    progress = billing.build_progress(customer_id)
+    if not progress or progress["state"] != billing.BUILD_PAID:
+        if attempts:
+            from partner_db import connection
+            with connection() as db:
+                db.execute("UPDATE provisioning_notifications SET status='superseded',updated_at=? "
+                           "WHERE stripe_event_id=? AND status IN ('pending','failed')",
+                           (pn._now(), ORDER_CONFIRMATION_KEY + customer_id))
+        return {"status": "ignored", "reason": "no Build Your System order awaiting setup"}
+    customer = pn._customer_row(customer_id) or {}
+    payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
+    plan_line = (f"AnyAiCam {payload['display_name']} subscription for {_cameras(int(payload['camera_quantity']))}"
+                 if payload else "AnyAiCam subscription")
+    kind, subject, text, html = _order_email(pn._first_name(customer.get("name")), progress,
+                                             hardware_delivery(customer_id, progress), plan_line)
+    if attempts:
+        # Retry the same outbox row, never a second one under another type.
+        kind = attempts[0]["notification_type"]
+    return pn._send_once(event_id=ORDER_CONFIRMATION_KEY + customer_id, notification_type=kind, customer_id=customer_id,
+                         recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
+                         metadata={"build_system_order": True}, test_mode=test_mode)
+
+
 def notify_order_confirmed(event: dict) -> dict:
-    """Once per account, after Stripe's verified webhook granted the plan
-    for a Build Your System order: the order-confirmation email (hardware
-    or software wording). Never raises -- an email problem must not fail
-    the webhook step. Purchases made on My subscription (no Build Your
+    """Webhook hook: after Stripe's verified webhook granted the plan for a
+    Build Your System order, send the order confirmation. Never raises --
+    an email problem must not fail the webhook step or touch the payment
+    or entitlement; a failed send is retried from the outbox by the
+    billing worker. Purchases made on My subscription (no Build Your
     System order) are unchanged and get no new email."""
     try:
         obj = ((event or {}).get("data") or {}).get("object") or {}
@@ -309,28 +361,29 @@ def notify_order_confirmed(event: dict) -> dict:
         customer_id = str(metadata.get("anyaicam_customer_id") or "")
         if str(metadata.get("anyaicam_billing_version") or "") != "2" or not customer_id:
             return {"status": "ignored", "reason": "not a billing v2 event for an account"}
-        if not billing.has_camera_plan(customer_id):
-            return {"status": "ignored", "reason": "no paid plan yet"}
-        progress = billing.build_progress(customer_id)
-        if not progress or progress["state"] != billing.BUILD_PAID:
-            return {"status": "ignored", "reason": "no Build Your System order awaiting setup"}
-        import purchase_notifications as pn
         import stripe_mode
-        customer = pn._customer_row(customer_id) or {}
-        payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
-        plan_line = (f"AnyAiCam {payload['display_name']} subscription for {_cameras(int(payload['camera_quantity']))}"
-                     if payload else "AnyAiCam subscription")
-        kind, subject, text, html = _order_email(pn._first_name(customer.get("name")), progress,
-                                                 hardware_delivery(customer_id, progress), plan_line)
-        token = pn._TEST_MODE.set(stripe_mode.is_test_mode(event=event))
-        try:
-            return pn._send_once(event_id=f"build-order-confirmed:{customer_id}", notification_type=kind, customer_id=customer_id,
-                                 recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
-                                 metadata={"build_system_order": True})
-        finally:
-            pn._TEST_MODE.reset(token)
+        return send_order_confirmation(customer_id, test_mode=stripe_mode.is_test_mode(event=event))
     except Exception as error:
         return {"status": "error", "reason": type(error).__name__}
+
+
+def retry_order_confirmation_notifications(limit: int = 50) -> int:
+    """Billing-worker pass: resend order confirmations whose send failed or
+    was interrupted. Returns how many were delivered now."""
+    from datetime import datetime, timedelta
+    from partner_db import rows
+    stale_before = (datetime.now() - timedelta(seconds=ORDER_CONFIRMATION_STALE_SECONDS)).isoformat()
+    sent = 0
+    for pending in rows("SELECT DISTINCT stripe_event_id FROM provisioning_notifications WHERE stripe_event_id LIKE ? "
+                        "AND (status='failed' OR (status='pending' AND updated_at<?)) LIMIT ?",
+                        (ORDER_CONFIRMATION_KEY + "%", stale_before, limit)):
+        customer_id = str(pending["stripe_event_id"])[len(ORDER_CONFIRMATION_KEY):]
+        try:
+            if send_order_confirmation(customer_id).get("status") == "sent":
+                sent += 1
+        except Exception:
+            continue
+    return sent
 
 
 def register_order_funnel_routes(app: FastAPI) -> None:

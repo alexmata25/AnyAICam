@@ -115095,6 +115095,9 @@ async def _billing_grace_worker() -> None:
             # Failed-renewal emails that could not be sent yet (outbox retry).
             from purchase_notifications import retry_payment_failed_notifications
             await asyncio.to_thread(retry_payment_failed_notifications)
+            # Build Your System order confirmations not delivered yet (same outbox).
+            from order_funnel import retry_order_confirmation_notifications
+            await asyncio.to_thread(retry_order_confirmation_notifications)
         except asyncio.CancelledError:
             raise
         except Exception as error:
