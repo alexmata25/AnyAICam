@@ -108,3 +108,33 @@ def test_legacy_event_media_is_unchanged(conn):
     conn.commit()
     _clip(conn, "legacy", 3)
     assert _expired(conn) == {"legacy"}
+
+
+# ------------------------------------------------------------ host readiness (no AWS call)
+
+def test_readiness_lists_everything_a_cloud_host_still_needs(monkeypatch):
+    monkeypatch.setattr(rrs, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(rrs, "RETENTION_SWEEP_ENABLED", False)
+    for name in ("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN", "ANYAICAM_RECORDING_S3_BUCKET", "AWS_REGION", "AWS_DEFAULT_REGION"):
+        monkeypatch.delenv(name, raising=False)
+    result = rrs.readiness()
+    assert result["ready"] is False
+    joined = " ".join(result["missing"])
+    for needed in ("ANYAICAM_RUNTIME_ROLE", "ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED=true", "ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN",
+                   "ANYAICAM_RECORDING_S3_BUCKET", "AWS_REGION"):
+        assert needed in joined
+
+
+def test_readiness_is_satisfied_by_complete_configuration(monkeypatch):
+    pytest.importorskip("boto3")
+    monkeypatch.setattr(rrs, "RUNTIME_ROLE", "cloud")
+    monkeypatch.setattr(rrs, "RETENTION_SWEEP_ENABLED", True)
+    monkeypatch.setenv("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN", "arn:aws:iam::880690594006:role/anyaicam-recording-lifecycle")
+    monkeypatch.setenv("ANYAICAM_RECORDING_S3_BUCKET", "example-bucket")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    assert rrs.readiness() == {"ready": True, "missing": []}
+
+
+def test_a_malformed_role_arn_is_not_accepted(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN", "anyaicam-recording-lifecycle")
+    assert any("ROLE_ARN" in item for item in rrs.readiness()["missing"])

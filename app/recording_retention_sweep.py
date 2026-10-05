@@ -202,7 +202,38 @@ def run_retention_sweep_tick(now: datetime | None = None) -> dict:
     return {"checked": len(candidates), "deleted": deleted}
 
 
+def readiness() -> dict:
+    """Whether this host is configured to actually enforce cloud retention
+    (Hybrid's 14-day event retention included) -- configuration only, no
+    AWS call. Everything listed in "missing" must be set on the cloud host;
+    see docs/hybrid-event-retention-staging-checklist.md."""
+    import re
+    missing = []
+    if RUNTIME_ROLE not in {"cloud", "combined"}:
+        missing.append("ANYAICAM_RUNTIME_ROLE=cloud (or combined)")
+    if not RETENTION_SWEEP_ENABLED:
+        missing.append("ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED=true")
+    role_arn = os.environ.get("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN", "").strip()
+    if not re.fullmatch(r"arn:aws:iam::\d{12}:role/[\w+=,.@/-]+", role_arn):
+        missing.append("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN (the delete-only IAM role)")
+    if not os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip():
+        missing.append("ANYAICAM_RECORDING_S3_BUCKET")
+    if not os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip():
+        missing.append("AWS_REGION (or AWS_DEFAULT_REGION)")
+    try:
+        import boto3  # noqa: F401
+    except ImportError:
+        missing.append("boto3 installed in the image")
+    return {"ready": not missing, "missing": missing}
+
+
 async def recording_retention_sweep_worker() -> None:
+    ready = readiness()
+    recording_retention_sweep_state["readiness"] = ready
+    if RUNTIME_ROLE in {"cloud", "combined"} and not ready["ready"]:
+        # Retention is a customer promise (Hybrid: 14-day cloud events): say
+        # loudly that this host is not enforcing it, and why.
+        logger.warning("recording_retention.not_enforced missing=%s", "; ".join(ready["missing"]))
     if RUNTIME_ROLE not in {"cloud", "combined"} or not RETENTION_SWEEP_ENABLED:
         recording_retention_sweep_state["worker_status"] = "disabled"
         while True:
@@ -220,3 +251,15 @@ async def recording_retention_sweep_worker() -> None:
             recording_retention_sweep_state["last_error"] = str(error)
             logger.warning("recording_retention.worker_iteration_failed error=%s", error)
         await asyncio.sleep(RETENTION_SWEEP_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    # Staging/production check, no AWS call: python -m recording_retention_sweep --check
+    import json
+    import sys
+    if sys.argv[1:] == ["--check"]:
+        result = readiness()
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0 if result["ready"] else 1)
+    print("usage: python -m recording_retention_sweep --check")
+    raise SystemExit(2)
