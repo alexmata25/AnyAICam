@@ -167,16 +167,16 @@ def test_new_customer_build_system_to_setup_end_to_end(shop, db_path):
     # The verified webhook grants the plan; the customer is handed to setup.
     assert _pay(db_path, customer_id)["status"] == "entitlement_updated"
     done = client.get("/order-complete?session_id=cs_test_abcdefgh").text
-    assert "Your AnyAiCam system is ready to set up." in done
-    assert '<a class="submit" id="order-setup" href="/customer/setup">Set Up My System</a>' in done
-    assert "AnyAiCam Hybrid</span><span>8 licensed cameras" in done and 'id="order-hardware-reminder"' in done
+    # An appliance was ordered: setup waits for delivery (test_hardware_delivery_flow.py).
+    assert "Your AnyAiCam system is being prepared." in done and 'id="order-setup"' not in done
+    assert "AnyAiCam Hybrid</span><span>8 licensed cameras" in done
     assert _capacity(db_path, customer_id) == 8
     setup = client.get("/customer/setup")
     assert setup.status_code == 200 and 'id="purchase-progress-banner"' not in setup.text
-    # In the VMS before setup finishes: the next step stays visible.
+    # In the VMS before setup finishes: the order status stays visible.
     dashboard = client.get("/dashboard")
     if dashboard.status_code == 200:
-        assert "Payment complete</strong> — Set up your AnyAiCam system." in dashboard.text
+        assert "Order confirmed</strong> — Your AnyAiCam system is being prepared." in dashboard.text
     _activate_appliance(db_path, customer_id)
     assert 'id="purchase-progress-banner"' not in client.get("/subscription-portal").text
     assert _one(db_path, "SELECT state FROM build_system_intents")["state"] == "setup_complete"

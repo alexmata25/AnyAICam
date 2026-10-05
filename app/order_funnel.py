@@ -159,6 +159,180 @@ def _session_state(customer_id: str, session_id: str) -> str:
     return "not_paid"
 
 
+# Hardware delivery (owner requirement 2026-10-05). After payment, a
+# customer who bought an AnyAiCam appliance cannot set up yet: the
+# appliance has to be prepared and delivered first. Their state is read
+# from durable records -- the Build Your System selection, the paid plan,
+# hardware_orders.fulfillment_status (hardware_fulfillment.py) -- so it
+# survives closing the browser, signing out and coming back days later
+# from another device. A customer on their own PC (or with no hardware)
+# can download the installer and set up straight away.
+APPLIANCE_PREFIX = "AIC-APPLIANCE-"
+HARDWARE_ARRANGING = "arranging"    # appliance chosen; its order is completed by phone, none recorded yet
+HARDWARE_PREPARING = "preparing"    # recorded hardware order, not shipped yet
+HARDWARE_SHIPPED = "shipped"
+HARDWARE_READY = "ready"            # delivered
+
+
+def hardware_delivery(customer_id: str, progress: dict | None = None) -> dict | None:
+    """Where the customer's appliance is, or None when there is nothing to
+    wait for (own PC, software only). Refunded, disputed or cancelled
+    hardware orders do not count."""
+    from partner_db import rows
+    orders = rows("SELECT * FROM hardware_orders WHERE customer_id=? AND sku LIKE ? AND status='paid' "
+                  "AND COALESCE(fulfillment_status,'') NOT IN ('cancelled') ORDER BY created_at DESC",
+                  (customer_id, APPLIANCE_PREFIX + "%"))
+    if not (progress or {}).get("appliance") and not orders:
+        return None
+    if not orders:
+        return {"state": HARDWARE_ARRANGING, "order": None}
+    order = orders[0]
+    status = str(order.get("fulfillment_status") or "")
+    state = HARDWARE_READY if status == "delivered" else HARDWARE_SHIPPED if status == "shipped" else HARDWARE_PREPARING
+    return {"state": state, "order": order}
+
+
+def _appliance_name(progress: dict, delivery: dict) -> str:
+    order = delivery.get("order") or {}
+    if order.get("product_name"):
+        return str(order["product_name"])
+    item = _hardware().get(progress.get("appliance") or "")
+    return item["name"] if item else "AnyAiCam appliance"
+
+
+def _shipment_lines(order: dict | None) -> str:
+    """Carrier and tracking only when AnyAiCam recorded them; never invented."""
+    if not order:
+        return ""
+    parts = []
+    if order.get("carrier"):
+        parts.append(f"Carrier: {escape(str(order['carrier']))}")
+    if order.get("tracking_number"):
+        parts.append(f"Tracking number: {escape(str(order['tracking_number']))}")
+    link = str(order.get("tracking_link") or "")
+    if link.startswith("https://"):
+        parts.append(f'<a href="{escape(link, quote=True)}" rel="noopener noreferrer" target="_blank">Track your shipment</a>')
+    return f'<p class="note" id="order-tracking">{"<br>".join(parts)}</p>' if parts else ""
+
+
+def _hardware_status_body(progress: dict, delivery: dict, summary: str) -> str:
+    state, order = delivery["state"], delivery.get("order")
+    name = escape(_appliance_name(progress, delivery))
+    early = ('<a class="ghost" id="order-setup-early" href="/customer/setup">Already received your appliance? Start setup</a>')
+    if state == HARDWARE_READY:
+        return ('<p class="notice ok" role="status">Your appliance has been delivered</p>'
+                '<h2 id="order-ready">Your AnyAiCam system is ready to set up.</h2>' + summary +
+                f"<p>Plug in your {name}, then we'll walk you through activating it and adding your cameras.</p>"
+                '<a class="submit" id="order-setup" href="/customer/setup">Start Setup</a>')
+    if state == HARDWARE_SHIPPED:
+        return ('<p class="notice ok" role="status">Order confirmed · Shipped</p>'
+                '<h2 id="order-preparing">Your AnyAiCam system is on its way.</h2>' + summary + _shipment_lines(order) +
+                f"<p>When your {name} arrives, sign in to your AnyAiCam account and we'll walk you through setting up "
+                'your appliance and cameras.</p>'
+                '<a class="submit" id="order-setup" href="/customer/setup">My appliance has arrived — Start Setup</a>')
+    if state == HARDWARE_PREPARING:
+        from hardware_fulfillment import PREPARATION_TIMEFRAME_TEXT, generate_order_number
+        status = (f'<p class="note" id="order-status">Order {escape(generate_order_number(order["id"]))}: {name} · being prepared. '
+                  f'{escape(PREPARATION_TIMEFRAME_TEXT)}</p>')
+    else:
+        status = (f'<p class="note" id="order-status">Your {name} is ordered with AnyAiCam by phone. '
+                  f"If you haven't spoken with us yet, call {SALES_PHONE}.</p>")
+    return ('<p class="notice ok" role="status">Payment complete · Order confirmed</p>'
+            '<h2 id="order-preparing">Your AnyAiCam system is being prepared.</h2>' + summary + status +
+            "<p>We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account "
+            "and we'll walk you through setting up your appliance and cameras.</p>"
+            "<p class=\"note\">You don't need to set up any cameras yet. You can close this page; your order is saved to your account.</p>"
+            + early)
+
+
+def _software_body(progress: dict, summary: str) -> str:
+    try:
+        import customer_downloads
+        installer = customer_downloads.latest_vms_installer()
+    except Exception:
+        installer = None
+    if installer:
+        download = ('<a class="submit" id="order-download" href="/api/customer/downloads/vms-installer" download>Download AnyAiCam</a>'
+                    '<p class="note">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk).</p>')
+    else:
+        download = ('<p class="note" id="order-download-pending">The AnyAiCam installer download will appear here and on '
+                    'My subscription as soon as it is published.</p>')
+    own_pc = bool(progress.get("own_pc"))
+    steps = ('<ol class="note" id="order-steps"><li>Download AnyAiCam and install it on your PC.</li>'
+             '<li>Sign in to your AnyAiCam account.</li><li>Start setup: link your PC, then discover and add your cameras.</li></ol>'
+             if own_pc else
+             '<ol class="note" id="order-steps"><li>Connect your AnyAiCam system.</li><li>Start setup: discover and add your cameras.</li></ol>')
+    return ('<p class="notice ok" role="status">Payment complete</p><h2 id="order-ready">Your AnyAiCam system is ready to set up.</h2>'
+            + summary + steps + download +
+            '<a class="submit" id="order-setup" href="/customer/setup" style="margin-top:10px">Set Up My System</a>')
+
+
+def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_line: str) -> tuple[str, str, str, str]:
+    """(notification type, subject, text, html) for the Build Your System
+    order confirmation."""
+    import purchase_notifications as pn
+    sign_in = pn._sign_in_link()
+    if delivery:
+        name = _appliance_name(progress, delivery)
+        phone = (f"Your {name} is ordered with AnyAiCam by phone. If you haven't spoken with us yet, call {SALES_PHONE}."
+                 if delivery["state"] == HARDWARE_ARRANGING else f"Your {name} is being prepared.")
+        paragraphs = [
+            f"Your payment is confirmed and your {plan_line} is active.",
+            f"Your AnyAiCam system is being prepared. {phone}",
+            "You don't need to set up any cameras yet.",
+            "We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account "
+            "and we'll walk you through setting up your appliance and cameras.",
+        ]
+        kind, subject = "hardware_order_confirmation", "Your AnyAiCam order is confirmed"
+    else:
+        paragraphs = [
+            f"Your payment is confirmed and your {plan_line} is active.",
+            "Sign in to your AnyAiCam account to download AnyAiCam (for your own PC) and start setup: "
+            "link your system, then discover and add your cameras.",
+        ]
+        kind, subject = "account_ready", "Your AnyAiCam subscription is active"
+    text = f"Hi {first_name},\n\n" + "\n\n".join(paragraphs) + f"\n\nSign in: {sign_in}\n\n{pn._SUPPORT_FOOTER_TEXT}"
+    html = (f"<p>Hi {escape(first_name)},</p>" + "".join(f"<p>{escape(p)}</p>" for p in paragraphs)
+            + f'<p><a href="{escape(sign_in, quote=True)}">Sign in to AnyAiCam</a></p>{pn._SUPPORT_FOOTER_HTML}')
+    return kind, subject, text, html
+
+
+def notify_order_confirmed(event: dict) -> dict:
+    """Once per account, after Stripe's verified webhook granted the plan
+    for a Build Your System order: the order-confirmation email (hardware
+    or software wording). Never raises -- an email problem must not fail
+    the webhook step. Purchases made on My subscription (no Build Your
+    System order) are unchanged and get no new email."""
+    try:
+        obj = ((event or {}).get("data") or {}).get("object") or {}
+        metadata = obj.get("metadata") or {}
+        customer_id = str(metadata.get("anyaicam_customer_id") or "")
+        if str(metadata.get("anyaicam_billing_version") or "") != "2" or not customer_id:
+            return {"status": "ignored", "reason": "not a billing v2 event for an account"}
+        if not billing.has_camera_plan(customer_id):
+            return {"status": "ignored", "reason": "no paid plan yet"}
+        progress = billing.build_progress(customer_id)
+        if not progress or progress["state"] != billing.BUILD_PAID:
+            return {"status": "ignored", "reason": "no Build Your System order awaiting setup"}
+        import purchase_notifications as pn
+        import stripe_mode
+        customer = pn._customer_row(customer_id) or {}
+        payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
+        plan_line = (f"AnyAiCam {payload['display_name']} subscription for {_cameras(int(payload['camera_quantity']))}"
+                     if payload else "AnyAiCam subscription")
+        kind, subject, text, html = _order_email(pn._first_name(customer.get("name")), progress,
+                                                 hardware_delivery(customer_id, progress), plan_line)
+        token = pn._TEST_MODE.set(stripe_mode.is_test_mode(event=event))
+        try:
+            return pn._send_once(event_id=f"build-order-confirmed:{customer_id}", notification_type=kind, customer_id=customer_id,
+                                 recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
+                                 metadata={"build_system_order": True})
+        finally:
+            pn._TEST_MODE.reset(token)
+    except Exception as error:
+        return {"status": "error", "reason": type(error).__name__}
+
+
 def register_order_funnel_routes(app: FastAPI) -> None:
     @app.get(billing.ORDER_SUMMARY_PATH, response_class=HTMLResponse)
     def order_summary(request: Request):
@@ -217,15 +391,12 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             entitlement = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
             summary = (f'<div class="order-line"><span>AnyAiCam {escape(entitlement["display_name"])}</span>'
                        f'<span>{_cameras(int(entitlement["camera_quantity"]))}</span></div>') if entitlement else ""
-            hardware = ""
-            if progress.get("appliance") or progress.get("relays"):
-                hardware = (f'<p class="note" id="order-hardware-reminder">Your hardware is arranged with AnyAiCam by phone at {SALES_PHONE}. '
-                            'Start setup when your appliance arrives.</p>')
             if billing._setup_needed(customer_id):
-                body = ('<p class="notice ok" role="status">Payment complete</p><h2 id="order-ready">Your AnyAiCam system is ready to set up.</h2>'
-                        + summary + hardware +
-                        '<p>Next, connect your AnyAiCam appliance and add your cameras.</p>'
-                        '<a class="submit" id="order-setup" href="/customer/setup">Set Up My System</a>')
+                delivery = hardware_delivery(customer_id, progress)
+                body = _hardware_status_body(progress, delivery, summary) if delivery else _software_body(progress, summary)
+                if progress.get("relays") and not delivery:
+                    body += (f'<p class="note" id="order-relay-reminder">Your relay modules are arranged with AnyAiCam by phone at '
+                             f'{SALES_PHONE}.</p>')
             else:
                 body = ('<h2>Your AnyAiCam plan is active</h2>' + summary +
                         '<a class="submit" href="/customer-account">Open AnyAiCam</a>')

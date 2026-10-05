@@ -319,6 +319,14 @@ def purchase_progress_banner(customer_id: str, path: str = "") -> str:
                 f'<a href="{ORDER_SUMMARY_PATH}">Continue checkout</a></div>')
     if path.rstrip("/") == "/customer/setup":
         return ""
+    import order_funnel
+    delivery = order_funnel.hardware_delivery(customer_id, progress)
+    if delivery and delivery["state"] != order_funnel.HARDWARE_READY:
+        # Hardware still on its way (2026-10-05): not a setup prompt yet.
+        status = "has shipped" if delivery["state"] == order_funnel.HARDWARE_SHIPPED else "is being prepared"
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
+                f'<strong>Order confirmed</strong> — Your AnyAiCam system {status}. '
+                f'<a href="{ORDER_COMPLETE_PATH}">View order status</a></div>')
     return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
             '<strong>Payment complete</strong> — Set up your AnyAiCam system. '
             '<a href="/customer/setup">Continue to setup</a></div>')

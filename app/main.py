@@ -115112,6 +115112,10 @@ def _stripe_webhook_steps() -> list:
     def camera_plan_v2(event):
         from per_camera_billing import sync_from_stripe_event
         sync_from_stripe_event(event)
+        # Build Your System order confirmation (2026-10-05): sent once, only
+        # after the plan exists; never raises.
+        from order_funnel import notify_order_confirmed
+        notify_order_confirmed(event)
 
     def hardware(event):
         from hardware_orders import sync_hardware_order_from_stripe_event

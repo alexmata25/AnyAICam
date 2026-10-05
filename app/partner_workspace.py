@@ -535,6 +535,15 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             progress=per_camera_billing.build_progress(customer['id'])
             if progress and progress['state']==per_camera_billing.BUILD_PENDING:
                 return RedirectResponse(per_camera_billing.ORDER_SUMMARY_PATH,status_code=303)
+        # A paid Build Your System order whose appliance has not been
+        # delivered yet returns to its order status, not to setup.
+        if identity['role']=='customer_owner' and not activated:
+            import per_camera_billing, order_funnel
+            progress=per_camera_billing.build_progress(customer['id'])
+            if progress and progress['state']==per_camera_billing.BUILD_PAID:
+                delivery=order_funnel.hardware_delivery(customer['id'],progress)
+                if delivery and delivery['state']!=order_funnel.HARDWARE_READY:
+                    return RedirectResponse(per_camera_billing.ORDER_COMPLETE_PATH,status_code=303)
         if identity['role']=='customer_owner' and not (activated and (cameras or licensed_slots>0)):
             return RedirectResponse('/customer/setup',status_code=303)
 
