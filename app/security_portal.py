@@ -128,6 +128,10 @@ def register_security_routes(app: FastAPI, page_shell) -> None:
         settings = payload.get('settings')
         if not isinstance(settings, dict):
             raise HTTPException(status_code=400, detail='settings must be an object.')
+        if settings.get('talkdown_on_alarm'):
+            # Automatic talk-down on an alarm is Talk Down (feature_entitlements).
+            import feature_entitlements
+            feature_entitlements.require(identity['customer_id'], feature_entitlements.TALK_DOWN)
         with connection() as db:
             site = _customer_site(db, identity['customer_id'], payload.get('site_id'))
             valid = {camera['id'] for camera in _site_cameras(db, identity['customer_id'], site['id'])}

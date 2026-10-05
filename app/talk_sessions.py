@@ -127,6 +127,13 @@ def register_talk_session_routes(app: FastAPI) -> None:
     @app.post('/api/customer/cameras/{camera_id}/talk/start')
     def start_talk_session(request: Request, camera_id: str) -> dict:
         identity = _customer_identity(request)
+        # Two-way audio is Talk Down (plan-included or bought); answering an
+        # AAC Voice Call uses the same channel, so a Voice Call entitlement
+        # also allows it. Enforced on the cloud (feature_entitlements).
+        import feature_entitlements
+        if not (feature_entitlements.allowed(identity.get('customer_id'), feature_entitlements.TALK_DOWN)
+                or feature_entitlements.allowed(identity.get('customer_id'), feature_entitlements.VOICE_CALL)):
+            raise HTTPException(status_code=403, detail=feature_entitlements.NOT_ENTITLED_DETAIL[feature_entitlements.TALK_DOWN])
         now = datetime.now()
         with connection() as db:
             _sweep_expired_sessions(db, now)

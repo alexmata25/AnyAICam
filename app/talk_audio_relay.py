@@ -867,6 +867,14 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
             await websocket.close(code=4404)
             return
 
+        # The entitlement is checked again here, not only when the session
+        # started: an add-on or plan that ended since then stops the audio.
+        import feature_entitlements
+        if not (feature_entitlements.allowed(identity.get("customer_id"), feature_entitlements.TALK_DOWN)
+                or feature_entitlements.allowed(identity.get("customer_id"), feature_entitlements.VOICE_CALL)):
+            await websocket.close(code=4403)
+            return
+
         try:
             with connection() as db:
                 camera = _authorized_talk_camera(

@@ -147,6 +147,13 @@ def _security_config(appliance: dict) -> dict:
             (appliance['id'],appliance['customer_id']),
         ).fetchall()]
         states=[security_modes.get_state(db,site['customer_id'],site['site_id']) for site in sites]
+    # Automatic alarm talk-down is Talk Down: the appliance is only told to
+    # speak for an entitled account, so an ended plan or add-on switches it
+    # off at the next sync (feature_entitlements).
+    import feature_entitlements
+    if states and not feature_entitlements.allowed(appliance.get('customer_id'),feature_entitlements.TALK_DOWN):
+        for state in states:
+            state['settings']=dict(state.get('settings') or {},talkdown_on_alarm=False)
     return {'sites':[{key:state[key] for key in ('customer_id','site_id','mode','changed_at','settings')} for state in states]}
 
 
@@ -713,6 +720,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 (appliance['customer_id'],appliance['id'],appliance['customer_id']),
             ),
         }
+        # AAC Voice Call is a paid feature (feature_entitlements): without the
+        # entitlement the appliance gets no entrance cameras, so it greets no
+        # visitor and raises no call; an ended entitlement clears them at the
+        # next sync. The customer's saved configuration is kept.
+        import feature_entitlements
+        if not feature_entitlements.allowed(appliance.get('customer_id'),feature_entitlements.VOICE_CALL):
+            aac_voice_call_config={'entrance_cameras':[],'site_greetings':[]}
         # security (2026-09-28): the cloud-owned Arm Stay/Away/Disarm state
         # and security settings for every site this appliance has cameras
         # at. The edge mirrors it (edge_camera_sync._reconcile_security) and

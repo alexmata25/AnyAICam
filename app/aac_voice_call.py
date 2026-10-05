@@ -408,6 +408,8 @@ def trigger_visitor_event(
     camera should participate" is enforced here, at the one choke
     point every trigger (simulated today, appliance-sourced once Phase
     2 exists) must pass through."""
+    import feature_entitlements
+    feature_entitlements.require(customer_id, feature_entitlements.VOICE_CALL)
     camera = _authorized_camera(customer_id, camera_id)
     if not store.is_entrance_camera(customer_id, camera_id):
         raise HTTPException(status_code=400, detail="This camera is not configured as an AAC Voice Call entrance camera.")
@@ -503,6 +505,9 @@ def handle_person_detected(
     window" happens here; door authorization is never touched by this
     function or anything it calls (aac_voice_call_greeting.speak() has
     no relay_control dependency at all)."""
+    import feature_entitlements
+    if not feature_entitlements.allowed(customer_id, feature_entitlements.VOICE_CALL):
+        return {"triggered": False, "skipped_reason": "not_entitled"}
     if not store.is_entrance_camera(customer_id, camera_id):
         return {"triggered": False, "skipped_reason": "not_entrance_camera"}
     if not store.check_and_stamp_cooldown(customer_id=customer_id, camera_id=camera_id, cooldown_seconds=cooldown_seconds):
@@ -725,6 +730,11 @@ def ingest_edge_visitor_event(
     existing = store.get_event_by_trigger_detection(customer_id=customer_id, detection_event_id=detection_event_id)
     if existing:
         return {"status": "duplicate", "event_id": existing["id"]}
+    import feature_entitlements
+    if not feature_entitlements.allowed(customer_id, feature_entitlements.VOICE_CALL):
+        # A detection only: no call, no homeowner notification (an appliance
+        # that had not yet synced its entrance cameras away).
+        return {"status": "skipped", "skipped_reason": "not_entitled"}
     if not store.is_entrance_camera(customer_id, camera_id):
         return {"status": "skipped", "skipped_reason": "not_entrance_camera"}
     camera = row("SELECT id,site_id,name FROM cameras WHERE id=? AND customer_id=?", (camera_id, customer_id))
@@ -1126,6 +1136,9 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         identity = _customer_identity(request)
         if identity["role"] != "customer_owner":
             raise HTTPException(status_code=403, detail="Only the account owner can configure entrance cameras.")
+        if enabled:  # turning a camera off is always allowed
+            import feature_entitlements
+            feature_entitlements.require(identity["customer_id"], feature_entitlements.VOICE_CALL)
         camera = _authorized_camera(identity["customer_id"], camera_id)
         store.set_entrance_camera(customer_id=identity["customer_id"], camera_id=camera["id"], enabled=enabled, configured_by=identity.get("email"))
         return {"message": f"{camera['name'] or camera_id} {'enabled' if enabled else 'disabled'} as an AAC Voice Call entrance camera.", "camera_id": camera_id, "enabled": enabled}
@@ -1224,6 +1237,8 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
     @app.post("/api/customer/aac/voice-call/events/{event_id}/answer")
     def answer_event(request: Request, event_id: str, payload: AnswerPayload = None) -> dict:
         identity = _customer_identity(request)
+        import feature_entitlements
+        feature_entitlements.require(identity["customer_id"], feature_entitlements.VOICE_CALL)
         event = _authorized_event(identity, event_id)
         # partner_identity()'s signed session token carries email/role/
         # customer_id only -- never a partner_users.id -- so the real row
