@@ -206,8 +206,12 @@ def test_an_open_talk_session_ends_when_the_entitlement_ends(customer_client, cl
                 socket.receive_json()
     assert closed.value.code == 4403
     assert len(frames) == 1  # only audio sent while entitled reached the camera
-    rows = _cloud_rows(cloud_db, "SELECT state FROM customer_talk_sessions WHERE id='talk-2'")
-    assert rows[0]["state"] != "requested"
+    # The server ends the session row just after closing the socket.
+    import time
+    deadline = time.monotonic() + 10
+    while _cloud_rows(cloud_db, "SELECT state FROM customer_talk_sessions WHERE id='talk-2'")[0]["state"] == "requested":
+        assert time.monotonic() < deadline, "the session was never ended"
+        time.sleep(0.05)
 
 
 def test_alarm_talk_down_cannot_be_switched_on_without_talk_down(customer_client, cloud_db):
