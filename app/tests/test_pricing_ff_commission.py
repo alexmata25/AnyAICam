@@ -662,7 +662,7 @@ def test_my_subscription_shows_catalog_prices_and_included_features(portal, db_p
     assert "Local 8 cameras &middot; 8 licensed camera slots &middot; $14.99/mo" in html
     assert "Secure Edge, Smart Motion, AACO" in html
     assert "$24.99/mo · Includes: People Counting, LPR, PPE" in html
-    assert "<span>Talk Down (includes AAC Voice Call)<br><span class=\"health-detail\">$4.99/mo per site</span>" in html
+    assert "<span>Talk Down / two-way audio and AAC Voice Call<br><span class=\"health-detail\">$4.99/mo per site</span>" in html
 
 
 # ================================================================ one-time VMS software license

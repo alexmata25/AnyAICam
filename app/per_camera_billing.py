@@ -682,47 +682,25 @@ def _complete_matching_attempt(subscription_id: str, plan_key: str, quantity: in
 
 
 def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
+    """Optional analytics (subscription_offers: one section, no analytic
+    sold twice, nothing the plan includes offered) and the separate premium
+    Face Access product (unchanged)."""
     import pricing_catalog
     import analytics_entitlements as analytics
-    from customer_analytics_panel import ANALYTIC_LABELS
+    import subscription_offers
     held = set(analytics.active_addon_keys(customer_id))
     active_features = set(analytics.get_active_analytics_for_customer(customer_id))
-    aliases = {
-        "ai_essentials": ("Advanced People Counting", "Advanced people-counting rules and reports"),
-        "ai_professional": ("Advanced People Counting + PPE", "Advanced people-counting rules and PPE detection"),
-        "vehicle_intelligence": ("LPR / Vehicle Intelligence", "License Plate Recognition and vehicle matching"),
-        "advanced_analytics": ("Advanced Analytics", "LPR, advanced people counting, and PPE"),
-        "talk_down": ("Talk Down / two-way audio", "Supported cameras and sites"),
-    }
     site_count = max(1, len(__import__("partner_db").rows("SELECT id FROM sites WHERE customer_id=?", (customer_id,))))
     door_count = analytics.door_count_for_customer(customer_id)
     face_size = analytics.face_access_size_for_customer(customer_id)
     face_held = any(key.startswith("face_access_") or key == "facial_recognition" for key in held) or "facial_recognition" in active_features
-    rendered = []
-    for key, label, analytic_keys, env_var in analytics.ANALYTICS_CATALOG:
-        if key == "facial_recognition" or key.startswith("face_access_"):
-            continue
-        price_id = os.environ.get(env_var, "").strip()
-        is_active = key in held or key in active_features or (key == "advanced_analytics" and {"people_counting", "lpr", "ppe"} <= active_features)
-        if key == "talk_down" and plan_key in {"ai_local", "hybrid"} and not is_active:
-            continue
-        item = analytics.checkout_item(key, customer_id)
-        if is_active:
-            action = '<span class="pill">Active</span>'
-        elif not price_id or not item["sellable"]:
-            action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
-        elif is_owner:
-            quantity = site_count if item["unit"] == "per_site" else 1
-            action = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(key, quote=True)}" data-quantity="{quantity}">Add</button>'
-        else:
-            action = '<span class="health-detail">Not purchased</span>'
-        display, description = aliases.get(key, (label, ", ".join(ANALYTIC_LABELS[k][0] for k in analytic_keys if k in ANALYTIC_LABELS)))
-        catalog_item = pricing_catalog.find_addon(key)
-        price = (f"${catalog_item['monthly_cents'] / 100:.2f}/mo" if catalog_item and catalog_item["monthly_cents"] is not None else "")
-        if key == "talk_down":
-            description = f"{site_count} sites" if site_count > 1 else description
-        details = " · ".join(value for value in (price, description) if value)
-        rendered.append(f'<div class="health-row"><span>{escape(display)}<br><span class="health-detail">{escape(details)}</span></span>{action}</div>')
+    optional = subscription_offers.analytics_rows_html(customer_id, plan_key, is_owner, site_count)
+    rendered = ['<h3 style="margin:10px 0 4px">Optional analytics</h3>'
+                '<p class="health-detail" id="optional-analytics-note">People Counting (advanced rules and reports), License Plate '
+                'Recognition and PPE detection are not part of any plan. Each package lists exactly what it adds; a package '
+                'is never offered for analytics you already have.</p>',
+                optional or '<p class="health-detail">No optional analytics are available for purchase yet.</p>']
+    face_rows = []
     for tier in pricing_catalog.face_access_tiers():
         key = f"face_access_{tier['size']}"
         is_active = key in held or key in active_features or (key == "face_access_small" and "facial_recognition" in active_features)
@@ -742,12 +720,15 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
             action = '<button class="ghost-button addon-buy-button" data-addon-key="' + escape(key, quote=True) + '" data-quantity="1">Add</button>'
         else:
             action = '<span class="health-detail">Not purchased</span>'
-        rendered.append(f'<div class="health-row"><span>Face Access / Facial Recognition — {escape(tier["size"].title())}<br><span class="health-detail">{price} · {detail}</span></span>{action}</div>')
+        face_rows.append(f'<div class="health-row"><span>Face Access / Facial Recognition — {escape(tier["size"].title())}<br><span class="health-detail">{price} · {detail}</span></span>{action}</div>')
     if "enterprise" == face_size and not face_held:
-        rendered.append('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">More than 500 enrolled people: custom pricing</span></span><span class="health-detail">Contact AnyAiCam</span></div>')
-    if not rendered:
-        rendered.append('<p class="health-detail">No premium analytics add-ons are available for purchase yet.</p>')
-    rendered.append('<p class="health-detail">LPR / Vehicle Intelligence, Face Access, advanced people counting, PPE, and other available premium analytics remain separately licensed. Advanced Line Crossing is not sold separately today; existing Smart Motion and line-crossing behavior are unchanged. A separate Advanced Line Crossing entitlement may be offered in the future.</p>')
+        face_rows.append('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">More than 500 enrolled people: custom pricing</span></span><span class="health-detail">Contact AnyAiCam</span></div>')
+    if face_rows:
+        rendered.append('<h3 style="margin:14px 0 4px">Premium: Face Access</h3>'
+                        '<p class="health-detail">Door access by face, a separate product billed per door; not part of any plan.</p>')
+        rendered += face_rows
+    rendered.append('<p class="health-detail">Advanced Line Crossing is not sold separately today; existing Smart Motion and line-crossing '
+                    'behavior are unchanged.</p>')
     return "".join(rendered)
 
 
@@ -809,7 +790,17 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         if payload["cloud_event_storage"]:
             retention += f" · {payload['cloud_event_retention_days']}-day cloud EVENT retention"
         current_html = f'<div class="health-row"><span>Licensed cameras</span><span>{payload["camera_quantity"]}</span></div><div class="health-row"><span>Retention</span><span>{retention}</span></div>'
-    feature_html = "".join(f'<div class="health-row"><span>{escape(item["label"])}</span><span class="pill">Included</span></div>' for item in features)
+    # What the plan includes, from PLANS (subscription_offers, 2026-10-05):
+    # features, retention, cloud EVENT retention, the VMS license. Without a
+    # plan, the three plans side by side.
+    import subscription_offers
+    included_plan = plan_key if payload else (deferred["plan_key"] if deferred and deferred["plan_key"] in PLANS else None)
+    if included_plan:
+        included_title = f"Included with {escape(PLANS[included_plan]['display_name'])}"
+        feature_html = subscription_offers.plan_inclusions_html(included_plan, payload)
+    else:
+        included_title = "Compare plans"
+        feature_html = subscription_offers.plan_comparison_html()
     actions = []
     if is_owner and payload and payload.get("status") in {"active", "suspended"}:
         actions.append('<button class="ghost-button" id="v2-cancel-plan">Cancel at period end</button>')
@@ -852,8 +843,17 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
     addons = _addon_portal_rows(customer_id, plan_key, is_owner)
     vms_capacity = customer_entitlements.vms_license_capacity(customer_id)
-    license_card = f'<div class="health-row"><span>VMS license</span><span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>' if payload else (
-        f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>' if vms_capacity else '')
+    owned_license = max((int(e["camera_slot_quantity"] or 0) for e in customer_entitlements.get_entitlements_for_customer(customer_id)
+                         if e["product"] == "vms_license" and e["status"] == "active"), default=0)
+    license_card = ""
+    if owned_license:  # the one-time license an own-PC customer bought: theirs to keep
+        license_card += (f'<div class="health-row"><span>One-time VMS software license (yours to keep)</span>'
+                         f'<span class="pill">Up to {_camera_count(owned_license)}</span></div>')
+    if payload:
+        license_card += (f'<div class="health-row"><span>VMS software license for your plan</span>'
+                         f'<span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>')
+    elif vms_capacity and not owned_license:
+        license_card += f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>'
     setup_next = ""
     if is_owner and is_active and _setup_needed(customer_id):
         # Purchase comes first, then setup (2026-10-05): once the plan is
@@ -875,8 +875,8 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     {activating}{setup_next}
     <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{billing_note}{action_html}</section>
     {friends_family.customer_panel_html()}
-    <section class="panel" style="margin-top:14px"><h2>Included with {escape(payload['display_name']) if payload else 'your selected plan'}</h2>{feature_html or '<p class="health-detail">Included features will appear here after you select a plan.</p>'}</section>
-    <section class="panel" style="margin-top:14px"><h2>Premium Add-ons</h2><p class="health-detail">Advanced analytics are licensed separately from Basic Local, AI Local, and Hybrid.</p>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
+    <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
+    <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
     <section class="panel" style="margin-top:14px"><h2>Software license</h2>{license_card or '<p class="health-detail">The stand-alone software license remains a separate one-time purchase for local ownership.</p>'}</section>
     {picker}{change}'''
     scripts = f'''<script>

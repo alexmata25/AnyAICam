@@ -104608,8 +104608,22 @@ def _customer_subscription_portal_page(identity: dict, request: Request | None =
             if face_access_held or addon_key != f"face_access_{face_size}":
                 continue
         quantity = site_count if item["unit"] == "per_site" else door_count if item["unit"] == "per_door" else 1
+        # Analytics packages (2026-10-05, subscription_offers): customer names,
+        # no unpriced placeholder unless held, never an Add for analytics the
+        # account already has through another package.
+        import subscription_offers
+        is_package = addon_key in subscription_offers.PACKAGE_NAMES
+        if is_package:
+            label = subscription_offers.PACKAGE_NAMES[addon_key]
+        if not is_active and not addon_key.startswith("face_access_") and addon_key != "facial_recognition":
+            _addon = pricing_catalog.find_addon(addon_key)
+            if not _addon or _addon["monthly_cents"] is None:
+                continue
+        offer = subscription_offers.addon_offer(customer_id, addon_key) if is_package and not is_active else {"state": ""}
         if is_active:
             status_html = '<span class="pill">Active</span>'
+        elif offer["state"] in ("covered", "overlaps"):
+            status_html = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(offer["reason"])}</span>'
         elif price_id and not item["sellable"] and addon_key.startswith("face_access_") and item["unavailable_reason"]:
             # Say what the customer needs to do (e.g. set up a door first).
             status_html = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(item["unavailable_reason"])}</span>'
@@ -114114,6 +114128,20 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
             _v2_plan = None
         if _v2_plan and _v2_plan.get("status") == "active" and _v2_plan.get("plan_key") in {"ai_local", "hybrid"}:
             raise HTTPException(status_code=409, detail="Talk Down is included with your plan on supported cameras.")
+    # Never sell an analytic twice (2026-10-05, subscription_offers): a
+    # package whose analytics the plan includes or another active package
+    # already grants is refused, as on My subscription.
+    if any(item[0] == addon_key for item in ANALYTICS_CATALOG) and not addon_key.startswith("face_access_") and addon_key != "facial_recognition":
+        import subscription_offers
+        try:
+            import per_camera_billing as _pcb
+            _v2_current = _pcb.entitlement_for_customer(identity["customer_id"])
+        except Exception:
+            _v2_current = None
+        _plan_key = _v2_current.get("plan_key") if _v2_current and _v2_current.get("status") in ("active", "suspended") else None
+        _offer = subscription_offers.addon_offer(identity["customer_id"], addon_key, _plan_key)
+        if _offer["state"] in ("included", "covered", "overlaps"):
+            raise HTTPException(status_code=409, detail=_offer["reason"])
     catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == addon_key), None)
     if not catalog_entry:
         raise HTTPException(status_code=400, detail="Unknown analytics add-on.")

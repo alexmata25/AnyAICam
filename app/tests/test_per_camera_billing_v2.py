@@ -156,9 +156,9 @@ def test_v2_my_subscription_shows_plan_and_does_not_offer_included_talk_down(db_
     html = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
     assert "AI Local" in html and "$14.99 per camera/month" in html and "$89.94 monthly base total" in html
     assert "7-day local retention" in html
-    assert "Talk Down / two-way audio on supported cameras" in html
+    assert "Talk Down / two-way audio and AAC Voice Call on supported cameras" in html
     assert 'data-addon-key="talk_down"' not in html
-    assert "Premium Add-ons" in html and "Advanced People Counting" in html
+    assert "Add-ons" in html and "People Counting (advanced rules and reports)" in html
     assert 'id="friends-family-panel"' in html
     assert "Advanced Line Crossing is not sold separately today" in html
     assert "existing Smart Motion and line-crossing behavior are unchanged" in html
@@ -282,7 +282,7 @@ def test_included_talk_down_never_becomes_a_separate_discounted_addon(
     offered = 'data-addon-key="talk_down"' in html
     assert offered is has_separate_talk_down_add_action
     if plan_key in {"ai_local", "hybrid"}:
-        assert "Talk Down / two-way audio on supported cameras" in html
+        assert "Talk Down / two-way audio and AAC Voice Call on supported cameras" in html
 
 
 def test_basic_local_does_not_start_or_consume_v2_commission_window(db_path, monkeypatch):
