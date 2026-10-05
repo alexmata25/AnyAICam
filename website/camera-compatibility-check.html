@@ -4,8 +4,8 @@
 <head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1" name="viewport"/>
-<title>Camera Compatibility &amp; Readiness Check | ANY AI CAM</title>
-<meta content="Request a free system assessment for an existing analog, IP, or hybrid camera system and determine the best path to AI cloud recording." name="description"/>
+<title>Camera Readiness Check | ANY AI CAM</title>
+<meta content="Already have cameras? Check whether your existing cameras, network and storage are ready for AnyAiCam VMS, or check your system for Videoloft cloud recording." name="description"/>
 <link href="https://anyaicam.com/camera-compatibility-check.html" rel="canonical"/>
 <link href="/favicon.png" rel="icon" type="image/png"/>
 <meta content="website" property="og:type"/>
@@ -371,6 +371,13 @@
   }
 </style>
 <style id="assessment-service-styles">
+.readiness-checklist{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:1rem}
+.readiness-checklist li{background:#fff;border:1px solid #d9e4f2;border-radius:16px;padding:1.2rem 1.25rem;box-shadow:0 10px 26px rgba(11,43,79,.06)}
+.readiness-checklist strong{display:block;color:#071032;font-size:1.05rem;margin-bottom:.4rem}.readiness-checklist span{color:#4d5872;line-height:1.6;font-size:.95rem}
+.readiness-cta{display:flex;flex-wrap:wrap;gap:.8rem;justify-content:center;margin-top:1.6rem}
+.readiness-cta .readiness-outline{background:#fff;color:#0b2b4f;border:2px solid #0b2b4f;box-shadow:none}
+.readiness-note{text-align:center;margin:1rem 0 0}.readiness-note a{font-weight:800;color:#16778b}
+.readiness-hero-actions{display:flex;flex-wrap:wrap;gap:.7rem;margin-top:1.2rem}
 .assessment-overview{padding:3.5rem 1rem;background:#f4f8fc;border-bottom:1px solid #dce7f3}
 .assessment-overview-inner,.assessment-trust-inner{max-width:1120px;margin:0 auto}
 .assessment-overview-inner>div:first-child{max-width:760px;margin:0 auto 1.6rem;text-align:center}
@@ -440,13 +447,26 @@
 <main>
 <section class="portal-hero support-hero camera-readiness-hero">
 <div>
-<p class="eyebrow">FREE SYSTEM ASSESSMENT</p>
-<h1>Connect your existing analog, IP, or hybrid camera system to AI cloud recording.</h1>
-<p>Tell us what you already have. ANY AI CAM will help identify your analog, IP, or hybrid system and determine the best path to AI cloud recording—without pushing unnecessary replacement equipment.</p>
+<p class="eyebrow">CAMERA READINESS CHECK</p>
+<h1>Already have cameras? Check whether your current system is ready for AnyAiCam.</h1>
+<p>AnyAiCam VMS is designed to work with compatible existing IP cameras, so you may not need to replace your whole camera system. Check your cameras, network and storage before you buy. It is free.</p>
+<div class="readiness-hero-actions"><a class="button primary" href="#anyaicam-readiness">See what we check</a><a class="button secondary" href="#videoloft-check">Videoloft cloud check</a></div>
 <div class="aic-readiness-scope" style="margin-top:1rem;padding:1rem;border-left:5px solid #5fc4d1;background:#eefaff;border-radius:8px;color:#0b2b4f;">
 <strong>This check does not reset or bypass camera passwords.</strong>
-<p style="margin:.45rem 0 0;">Videoloft normally requires valid administrator credentials. When credentials are missing, use the manufacturer-approved recovery process or hire a local technician for any required physical reset.</p>
+<p style="margin:.45rem 0 0;">Setup normally requires valid administrator credentials, for AnyAiCam and for Videoloft. When credentials are missing, use the manufacturer-approved recovery process or hire a local technician for any required physical reset.</p>
 </div></div>
+</section>
+<section aria-labelledby="anyaicam-readiness-title" class="assessment-overview" id="anyaicam-readiness">
+<div class="assessment-overview-inner">
+<div>
+<p class="eyebrow">FOR ANYAICAM VMS</p>
+<h2 id="anyaicam-readiness-title">What we check before you buy.</h2>
+<p>A quick look at your cameras, network and storage tells us what can stay and what AnyAiCam setup fits your site. It is free and it is not a subscription.</p>
+</div>
+<ul class="readiness-checklist"><li><strong>Your cameras</strong><span>AnyAiCam works with compatible IP (network) cameras that share a standard video stream, usually through ONVIF or RTSP. If your cameras connect through an NVR, we check whether it can share their streams. Many brands work; we confirm your models before you buy.</span></li><li><strong>Resolution</strong><span>Most systems use 2MP to 8MP cameras. Higher resolution and frame rate look sharper, but need more storage and processing.</span></li><li><strong>Network and power</strong><span>Cameras should be on the same local network as your AnyAiCam appliance or PC. Wired Ethernet, often with a PoE switch that powers the cameras, is the most reliable choice.</span></li><li><strong>Camera access</strong><span>You will usually need each camera&rsquo;s administrator username and password once during setup. We never reset or bypass passwords.</span></li><li><strong>Processing capacity</strong><span>How many cameras one appliance or PC runs well depends on the hardware, camera resolution, stream settings and the analytics you use. Your plan can license up to 64 cameras; we help you size the hardware for your actual workload.</span></li><li><strong>Storage</strong><span>Recording storage depends on the number of cameras, their bitrate, motion or continuous recording, and how many days you keep. Build Your System shows a rough guide.</span></li><li><strong>Heavier analytics</strong><span>License Plate Recognition, People Counting and PPE detection need more processing than recording and basic motion alerts, so they can lower how many cameras one appliance handles.</span></li></ul>
+<div class="readiness-cta"><a class="button primary" href="build-your-system.html">Build Your System</a><a class="button readiness-outline" href="vms-contact.html">Ask us to review your cameras</a></div>
+<p class="readiness-note">Using Videoloft cloud recording instead? <a href="#videoloft-check">Use the Videoloft cloud check below.</a></p>
+</div>
 </section>
 <section aria-labelledby="assessment-overview-title" class="assessment-overview">
 <div class="assessment-overview-inner">
@@ -457,19 +477,19 @@
 </div>
 <ol class="assessment-steps">
 <li><strong>Identify</strong><span>Tell us the camera, NVR, or DVR brand and model—or ask for help locating it.</span></li>
-<li><strong>Evaluate</strong><span>We determine whether the system is IP, analog, ONVIF-capable, and likely cloud-compatible.</span></li>
+<li><strong>Evaluate</strong><span>We determine whether the system is IP, analog or ONVIF-capable, and whether AnyAiCam VMS or Videoloft cloud fits it.</span></li>
 <li><strong>Recommend</strong><span>We explain what can stay, what may need replacing, and whether local installation work is required.</span></li>
-<li><strong>Connect</strong><span>For supported systems, we help activate and verify Videoloft cloud viewing and recording.</span></li>
+<li><strong>Connect</strong><span>For supported systems, we help you set up AnyAiCam VMS or activate Videoloft cloud viewing and recording.</span></li>
 </ol>
 </div>
-</section><section aria-labelledby="checkHeading" class="camera-check-shell">
+</section><section aria-labelledby="checkHeading" class="camera-check-shell" id="videoloft-check">
 <div class="camera-check-layout">
 <article class="camera-check-tool">
 <div class="camera-check-intro">
 <div>
-<p class="eyebrow">Quick Brand Check</p>
-<h2 id="checkHeading">Tell us about your existing system.</h2>
-<p>No download is required. This page does not scan your network, ask for camera passwords, or store camera credentials.</p>
+<p class="eyebrow">Videoloft Cloud Check</p>
+<h2 id="checkHeading">Check your system for Videoloft cloud recording.</h2>
+<p>This quick brand check is for Videoloft cloud recording. For AnyAiCam VMS, see the checklist above or ask us to review your cameras. No download is required. This page does not scan your network, ask for camera passwords, or store camera credentials.</p>
 <p><strong>Analog, IP, and hybrid systems are supported.</strong> Compatibility and connection method can depend on the recorder brand and model, so we review the system before activation.</p>
 </div>
 </div>
@@ -545,7 +565,7 @@
 <div class="camera-results-heading">
 <div>
 <p class="eyebrow">Compatibility Result</p>
-<h2 id="resultsHeading">Your camera check</h2>
+<h2 id="resultsHeading">Your Videoloft camera check</h2>
 </div>
 </div>
 <div class="camera-results-table-wrap">
@@ -589,9 +609,9 @@
 </section>
 <section aria-labelledby="compatibilityGuideHeading" class="camera-education">
 <div class="section-heading">
-<p class="eyebrow">Compatibility Guide</p>
-<h2 id="compatibilityGuideHeading">See how existing camera systems connect.</h2>
-<p>Use the visual guides and brand examples below, then complete the interactive readiness check above.</p>
+<p class="eyebrow">Videoloft Compatibility Guide</p>
+<h2 id="compatibilityGuideHeading">See how existing camera systems connect to Videoloft cloud.</h2>
+<p>Use the visual guides and brand examples below, then complete the Videoloft cloud check above.</p>
 </div>
 <section class="cloud-flow-section" id="direct-camera">
 <div class="section-heading">

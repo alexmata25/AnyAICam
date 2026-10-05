@@ -223,3 +223,15 @@ def test_the_homepage_sells_anyaicam_and_videoloft_has_its_own_page():
     assert 'id="services"' in videoloft
     # The page keeps the Videoloft side's own navigation.
     assert '<a href="how-it-works.html">How It Works</a>' in videoloft and '<a href="cloud-setup-wizard.html">Get Started</a>' in videoloft
+
+
+def test_camera_readiness_is_an_anyaicam_pre_purchase_check_and_keeps_the_videoloft_check():
+    page = (ROOT / "website" / "camera-compatibility-check.html").read_text(encoding="utf-8")
+    assert "Already have cameras? Check whether your current system is ready for AnyAiCam." in page
+    assert 'id="anyaicam-readiness"' in page and 'id="videoloft-check"' in page
+    # No unbenchmarked appliance-capacity claims.
+    assert not re.search(r"64 cameras with (?:all|every)|all analytics|every analytic", page, re.I)
+    # The existing interactive check and its Videoloft order path are unchanged.
+    assert '<script src="/camera-compatibility-check.js"' in page and 'href="/cloud-setup-wizard.html" id="continueOrderButton"' in page
+    index = (ROOT / "website" / "index.html").read_text(encoding="utf-8")
+    assert "Check whether your current system is ready for AnyAiCam." in index and 'href="/camera-compatibility-check.html"' in index
