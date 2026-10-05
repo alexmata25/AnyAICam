@@ -140,47 +140,55 @@ def _plan_label(product: str) -> str:
 # ---------------------------------------------------------- idempotency
 
 
-def _existing_notification(event_id: str, notification_type: str) -> Optional[dict]:
-    return row(
-        "SELECT * FROM provisioning_notifications WHERE stripe_event_id=? AND notification_type=?",
-        (event_id, notification_type),
-    )
+def _existing_notification(event_id: str, notification_type: str, db=None) -> Optional[dict]:
+    sql, params = "SELECT * FROM provisioning_notifications WHERE stripe_event_id=? AND notification_type=?", (event_id, notification_type)
+    if db is not None:
+        found = db.execute(sql, params).fetchone()
+        return dict(found) if found else None
+    return row(sql, params)
 
 
 def _record_attempt(
     *, event_id: str, notification_type: str, customer_id: Optional[str], recipient_email: str, subject: str,
+    db=None,
 ) -> dict:
     """Creates (or reuses, if a prior failed attempt already exists) the
     tracking row for this (event, type) pair, in 'pending' status, before
     actually calling the email backend -- so a crash between "decided to
     send" and "actually sent" still leaves a retryable 'pending'/'failed'
-    row rather than silently losing the attempt."""
-    existing = _existing_notification(event_id, notification_type)
+    row rather than silently losing the attempt. With db, inside the
+    caller's transaction."""
+    if db is None:
+        with connection() as own:
+            return _record_attempt(event_id=event_id, notification_type=notification_type, customer_id=customer_id,
+                                   recipient_email=recipient_email, subject=subject, db=own)
+    existing = _existing_notification(event_id, notification_type, db)
     now = _now()
-    with connection() as db:
-        if existing:
-            notification_id = existing["id"]
-            db.execute(
-                "UPDATE provisioning_notifications SET customer_id=?,recipient_email=?,subject=?,updated_at=? WHERE id=?",
-                (customer_id, recipient_email, subject, now, notification_id),
-            )
-        else:
-            notification_id = uuid.uuid4().hex
-            db.execute(
-                "INSERT INTO provisioning_notifications(id,stripe_event_id,notification_type,customer_id,"
-                "recipient_email,subject,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (notification_id, event_id, notification_type, customer_id, recipient_email, subject, "pending", now, now),
-            )
-    return row("SELECT * FROM provisioning_notifications WHERE id=?", (notification_id,))
-
-
-def _mark_result(notification_id: str, *, status: str, error_detail: Optional[str] = None) -> None:
-    now = _now()
-    with connection() as db:
+    if existing:
+        notification_id = existing["id"]
         db.execute(
-            "UPDATE provisioning_notifications SET status=?,error_detail=?,updated_at=?,sent_at=? WHERE id=?",
-            (status, error_detail, now, now if status == "sent" else None, notification_id),
+            "UPDATE provisioning_notifications SET customer_id=?,recipient_email=?,subject=?,updated_at=? WHERE id=?",
+            (customer_id, recipient_email, subject, now, notification_id),
         )
+    else:
+        notification_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO provisioning_notifications(id,stripe_event_id,notification_type,customer_id,"
+            "recipient_email,subject,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (notification_id, event_id, notification_type, customer_id, recipient_email, subject, "pending", now, now),
+        )
+    return dict(db.execute("SELECT * FROM provisioning_notifications WHERE id=?", (notification_id,)).fetchone())
+
+
+def _mark_result(notification_id: str, *, status: str, error_detail: Optional[str] = None, db=None) -> None:
+    if db is None:
+        with connection() as own:
+            return _mark_result(notification_id, status=status, error_detail=error_detail, db=own)
+    now = _now()
+    db.execute(
+        "UPDATE provisioning_notifications SET status=?,error_detail=?,updated_at=?,sent_at=? WHERE id=?",
+        (status, error_detail, now, now if status == "sent" else None, notification_id),
+    )
 
 
 # Stripe test mode (2026-09-28): set per webhook event by
@@ -192,14 +200,16 @@ _TEST_MODE: contextvars.ContextVar = contextvars.ContextVar("anyaicam_stripe_tes
 def _send_once(
     *, event_id: str, notification_type: str, customer_id: Optional[str], recipient_email: str,
     subject: str, text: str, html: Optional[str] = None, metadata: Optional[dict] = None,
-    test_mode: Optional[bool] = None,
+    test_mode: Optional[bool] = None, db=None,
 ) -> dict:
     """The one place that actually calls the email backend for a
     provisioning notification. Idempotent per (event_id, notification_
     type): a prior 'sent' row short-circuits to a no-op skip; a missing
     or 'failed' row attempts (or retries) the send, and email failure
     here is recorded but NEVER raised -- the caller (the webhook route)
-    must be able to keep processing/return 200 to Stripe regardless."""
+    must be able to keep processing/return 200 to Stripe regardless.
+    With db, the outbox row is read and written inside the caller's
+    transaction (notify_hardware_shipped holds the order meanwhile)."""
     if not recipient_email:
         return {"status": "skipped", "reason": "no recipient email available"}
     if test_mode is None:
@@ -209,7 +219,7 @@ def _send_once(
     if test_mode:
         subject, text, html = stripe_mode.decorate_email(subject, text, html)
         metadata = dict(metadata or {}, stripe_test_mode=True)
-    existing = _existing_notification(event_id, notification_type)
+    existing = _existing_notification(event_id, notification_type, db)
     if existing and existing["status"] == "sent":
         return {"status": "skipped", "reason": "already sent", "notification_id": existing["id"]}
 
@@ -218,14 +228,14 @@ def _send_once(
         html = email_layout.wrap(html, preheader=subject)
     tracking = _record_attempt(
         event_id=event_id, notification_type=notification_type, customer_id=customer_id,
-        recipient_email=recipient_email, subject=subject,
+        recipient_email=recipient_email, subject=subject, db=db,
     )
     try:
         get_email_service().send(notification_type, recipient_email, subject, text, html=html, metadata=metadata or {})
     except Exception as exc:
-        _mark_result(tracking["id"], status="failed", error_detail=str(exc)[:500])
+        _mark_result(tracking["id"], status="failed", error_detail=str(exc)[:500], db=db)
         return {"status": "failed", "notification_id": tracking["id"], "error": str(exc)[:500]}
-    _mark_result(tracking["id"], status="sent")
+    _mark_result(tracking["id"], status="sent", db=db)
     return {"status": "sent", "notification_id": tracking["id"]}
 
 
@@ -829,23 +839,40 @@ def retry_payment_failed_notifications(limit: int = 50) -> int:
 
 
 def notify_hardware_shipped(order_id: str) -> dict:
-    order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
-    if not order:
-        return {"status": "ignored", "reason": "unknown order"}
-    # Only from the authoritative state (2026-10-05): a refunded, disputed or
-    # cancelled order, or one not recorded as shipped, is never emailed.
-    if order.get("status") != "paid" or order.get("fulfillment_status") not in ("shipped", "delivered"):
-        return {"status": "ignored", "reason": "order is not a paid, shipped order"}
-    customer = _customer_row(order["customer_id"]) if order.get("customer_id") else None
-    first_name = _first_name(customer.get("name")) if customer else "there"
-    recipient = (customer.get("email") if customer else None) or ""
-    subject, text, html = _hardware_shipped_email(first_name, order)
-    return _send_once(
-        test_mode=stripe_mode.is_test_mode(order=order),
-        event_id=f"hardware-shipped:{order_id}", notification_type="hardware_shipped",
-        customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
-        metadata={"order_id": order_id},
-    )
+    """Only from the authoritative state (2026-10-05): a refunded, disputed
+    or cancelled order, or one not recorded as shipped, is never emailed.
+
+    The decision, the send-once claim and the dispatch happen in one
+    transaction that holds the order (SQLite: the database write lock;
+    PostgreSQL: the order row), so a refund, dispute or cancellation -- each
+    an UPDATE of this order -- is applied either before the decision (no
+    email) or after the email was handed to the provider, never in between
+    (Codex review of 51d1346). Two concurrent calls send one email. The
+    lock is held for the one send (SMTP's own timeout bounds it); a webhook
+    that cannot wait that long fails and is retried by Stripe."""
+    from database_backend import backend
+    with connection() as db:
+        if backend() == "sqlite":
+            db.execute("BEGIN IMMEDIATE")
+            found = db.execute("SELECT * FROM hardware_orders WHERE id=?", (order_id,)).fetchone()
+        else:
+            found = db.execute("SELECT * FROM hardware_orders WHERE id=? FOR UPDATE", (order_id,)).fetchone()
+        if not found:
+            return {"status": "ignored", "reason": "unknown order"}
+        order = dict(found)
+        if order.get("status") != "paid" or order.get("fulfillment_status") not in ("shipped", "delivered"):
+            return {"status": "ignored", "reason": "order is not a paid, shipped order"}
+        customer = db.execute("SELECT * FROM customers WHERE id=?", (order["customer_id"],)).fetchone() if order.get("customer_id") else None
+        customer = dict(customer) if customer else None
+        first_name = _first_name(customer.get("name")) if customer else "there"
+        recipient = (customer.get("email") if customer else None) or ""
+        subject, text, html = _hardware_shipped_email(first_name, order)
+        return _send_once(
+            test_mode=stripe_mode.is_test_mode(order=order),
+            event_id=f"hardware-shipped:{order_id}", notification_type="hardware_shipped",
+            customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
+            metadata={"order_id": order_id}, db=db,
+        )
 
 
 def notify_hardware_cancellation(order_id: str) -> dict:
