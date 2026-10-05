@@ -163,6 +163,18 @@ def test_mixed_pending_and_published_blocks_fail_the_check(site):
     ("vms.html", "AnyAiCam 1.2.3 for Windows is coming soon.", "Download the Free AnyAiCam VMS. AnyAiCam 1.2.3 for Windows is coming soon.", "free VMS"),
     ("videoloft-partner-referral-wizard.html", "location.replace('sales-partner-login.html')",
      "location.href='referral-entry.html'", "broken link referral-entry.html"),
+    ("build-your-system.html", "AI Local — $14.99 per camera / month", "AI Local — $15.99 per camera / month", "plan AI Local"),
+    ("build-your-system.html", "hybrid:24.99}", "hybrid:29.99}", "monthly calculation prices"),
+    ("build-your-system.html", "price:1749.99}", "price:1799.99}", "Professional appliance price"),
+    ("build-your-system.html", "RELAY_PRICE=149.99", "RELAY_PRICE=129.99", "relay price"),
+    ("build-your-system.html", "[16,79.99]", "[16,69.99]", "VMS licence prices"),
+    ("build-your-system.html", 'min="1" max="64"', 'min="1" max="128"', "1-64"),
+    ("build-your-system.html", 'id="sumOneTime"', 'id="sumOnce"', "separately"),
+    ("build-your-system.html", ">Continue to Checkout</button>", ">Finish System Plan</button>", "Continue to Checkout"),
+    ("build-your-system.html", "customer-register", "customer-signup", "Sign in / Create account"),
+    ("build-your-system.html", "const PLAN_PRICE=", "/* price_1AbCdEfGhIjKl */const PLAN_PRICE=", "Stripe Price ID"),
+    ("vms-features.html", "<h2>How camera licenses work</h2>", "<h2>Entitlements follow the camera slot</h2>", "per-slot entitlement"),
+    ("vms.html", "One plan covers every licensed camera", "Features can be licensed per slot. One plan covers every licensed camera", "per-slot entitlement"),
     ("vms.html", "github.com", "github.com", None),
 ])
 def test_the_launch_check_catches_each_kind_of_launch_defect(site, page, old, new, expected):

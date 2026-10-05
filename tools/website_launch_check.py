@@ -6,7 +6,9 @@ Fails on: superseded releases, installers and checksums; old, sandbox or
 wrong AnyAiCam prices; a VMS licence not shown as one-time; "staging",
 "sandbox", draft, candidate or internal roadmap wording; "free VMS" claims;
 Windows VMS availability claims; download wording while the release is pending; release
-blocks that disagree; broken local links and anchors.
+blocks that disagree; broken local links and anchors; a Build Your System
+funnel that disagrees with Billing-v2 or does not lead to checkout; legacy
+per-slot entitlement wording.
 """
 from __future__ import annotations
 
@@ -51,6 +53,9 @@ STALE = [
     (re.compile(r"\$0\.5[0-3](?!\d)"), "sandbox price"),
     (re.compile(r"\bstag(?:ing|ed)\b", re.I), "'staging' wording"),
     (re.compile(r"\bsandbox\b", re.I), "'sandbox' wording"),
+    # Billing-v2 is one account-level plan x licensed cameras; features are not licensed per slot.
+    (re.compile(r"camera slot represents|Entitlements follow the camera slot|licen[cs]ed per (?:camera )?slot|\bSlot 0\d\b", re.I),
+     "legacy per-slot entitlement wording"),
 ] + [(re.compile(re.escape(p)), "superseded installer checksum") for p in website_release.SUPERSEDED_SHA256_PREFIXES] \
   + [(re.compile(re.escape(p)), "superseded installer build") for p in website_release.SUPERSEDED_FILENAME_PARTS if not p.startswith("-")]
 DRAFT = re.compile(r"\b(draft|candidate|subject to (?:final )?(?:AnyAiCam )?validation|before launch|lorem ipsum|TBD|TODO"
@@ -135,6 +140,7 @@ def check_prices(website: Path, fail):
         if rows != list(zip(TIERS, prices)):
             fail(f"plans.html: '{title}' prices {rows} != authoritative {list(zip(TIERS, prices))}")
     check_v2_plans(plans, fail)
+    check_build_system((website / "build-your-system.html").read_text(encoding="utf-8"), fail)
     for name in LICENCE_PAGES:
         text = visible_text((website / name).read_text(encoding="utf-8"))
         if "one-time licence" not in text:
@@ -167,6 +173,42 @@ def check_v2_plans(plans: str, fail):
         fail("plans.html: plans must lead to Create account / Sign in -> My subscription")
     if re.search(r"price_[A-Za-z0-9]{8,}", plans):
         fail("plans.html: a Stripe Price ID appears in the page")
+
+
+def check_build_system(page: str, fail):
+    """build-your-system.html sells the Billing-v2 plans at the locked prices,
+    1-64 cameras, keeps one-time hardware/licence prices separate from the
+    monthly plan, and ends with Continue to Checkout -> sign in or create an
+    account -> My subscription, without naming a Stripe Price."""
+    name = "build-your-system.html"
+    text = visible_text(page)
+    for key, (plan, price) in V2_PLANS.items():
+        if not re.search(rf'<input type="radio" name="subscription_plan" value="{key}"', page) or f"{plan} — ${price} per camera / month" not in text:
+            fail(f"{name}: plan {plan} must be offered at ${price} per camera / month")
+    prices = re.search(r"const PLAN_PRICE=\{([^}]*)\}", page)
+    expected = ",".join(f"{key}:{price}" for key, (_, price) in V2_PLANS.items())
+    if not prices or prices.group(1) != expected:
+        fail(f"{name}: monthly calculation prices must be {expected}")
+    for tier, price in APPLIANCES.items():
+        amount = price.strip("$").replace(",", "")
+        if not re.search(rf"name:'AnyAiCam {tier}[^']*',price:{re.escape(amount)}\}}", page):
+            fail(f"{name}: one-time {tier} appliance price must be {price}")
+    if f"RELAY_PRICE={RELAY.strip('$')}" not in page:
+        fail(f"{name}: one-time relay price must be {RELAY}")
+    licence = ",".join(f"[{cap},{p.split()[0].strip('$')}]" for cap, p in zip((8, 16, 32, 64), PLAN_TABLES["AnyAiCam VMS licence"]))
+    if f"LICENCE=[{licence}]" not in page:
+        fail(f"{name}: one-time VMS licence prices must match plans.html")
+    quantity = re.search(r'<input name="camera_count"[^>]*>', page)
+    if not quantity or f'min="{V2_MIN_CAMERAS}"' not in quantity.group(0) or f'max="{V2_MAX_CAMERAS}"' not in quantity.group(0):
+        fail(f"{name}: camera quantity must allow {V2_MIN_CAMERAS}-{V2_MAX_CAMERAS}")
+    if 'id="sumOneTime"' not in page or 'id="sumMonthly"' not in page:
+        fail(f"{name}: one-time and monthly costs must be shown separately")
+    if ">Continue to Checkout</button>" not in page:
+        fail(f"{name}: the final step must be Continue to Checkout")
+    if "customer-login.html?next=" not in page or "/subscription-portal" not in page or "customer-register" not in page:
+        fail(f"{name}: checkout must lead to Sign in / Create account -> My subscription")
+    if re.search(r"price_[A-Za-z0-9]{8,}", page):
+        fail(f"{name}: a Stripe Price ID appears in the page")
 
 
 def check_release(website: Path, fail):
