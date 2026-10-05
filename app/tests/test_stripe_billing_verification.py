@@ -22,7 +22,11 @@ from test_stripe_billing_launch import (  # noqa: F401 -- fixtures and helpers
     HYBRID_8, LOCAL_8, OWNER_A, _checkout, _cookie, _deliver, _plan, _sub_event, _subscription, env,
 )
 from test_stripe_billing_policies import NOW, _capacity, _customer, _invoice, _sweep
-from test_stripe_billing_remediation import _at_once, _buy, _count
+# _buy drives the legacy fixed-capacity checkout, so this file needs the same
+# test-only switch test_stripe_billing_remediation.py applies to every test
+# that uses it: new legacy purchases are off in production since e6209a7
+# (billing v2 only; that default is covered by test_legacy_checkout_guard.py).
+from test_stripe_billing_remediation import _at_once, _buy, _count, _legacy_new_purchases_switched_on  # noqa: F401 -- autouse
 
 
 def _sql(env, statement):

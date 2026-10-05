@@ -68,6 +68,29 @@ def _customer_retention_days(db, customer_id: str) -> int | None:
     return int(plan["retention_days"])
 
 
+def _event_media_retention_days(db, customer_id: str) -> int | None:
+    """Cloud EVENT clips/thumbnails (2026-10-05, after Codex review of
+    453bd1c): the retention the customer's cloud-event entitlement
+    promises. A billing v2 Hybrid account has no legacy plans row, so the
+    legacy lookup alone never expired its media. Order: an explicit RDM
+    override (7/14/30, event_media_policy.cloud_policy_for_customer), else
+    the v2 entitlement's cloud_event_retention_days (kept after the plan
+    ends, so media of a cancelled Hybrid plan still expires), else the
+    legacy plan exactly as before."""
+    try:
+        import event_media_policy
+        override = event_media_policy.cloud_policy_for_customer(db, customer_id).get("retention_days")
+        if override in event_media_policy.MOTION_RETENTION_DAYS:
+            return int(override)
+        import per_camera_billing
+        v2 = per_camera_billing.entitlement_for_customer(customer_id)
+        if v2 and v2.get("cloud_event_retention_days"):
+            return int(v2["cloud_event_retention_days"])
+    except Exception:
+        logger.exception("recording_retention.event_media_policy_unavailable customer_id=%s", customer_id)
+    return _customer_retention_days(db, customer_id)
+
+
 def _expired_candidates(db, now: datetime) -> list[dict]:
     """Every available recording whose customer has a real, on-file
     retention_days AND whose own started_at is older than that many
@@ -89,7 +112,10 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
     rows = list(db.execute("SELECT id, customer_id, s3_key, started_at, 'recording' AS kind FROM recordings WHERE status='available'").fetchall())
     rows += list(db.execute("SELECT id, customer_id, s3_key, started_at, 'event_media' AS kind FROM detection_event_media WHERE source_media_id IS NULL").fetchall())
     for row in rows:
-        retention_days = _customer_retention_days(db, row["customer_id"])
+        if row["kind"] == "event_media":
+            retention_days = _event_media_retention_days(db, row["customer_id"])
+        else:  # continuous recordings: the legacy plan, unchanged
+            retention_days = _customer_retention_days(db, row["customer_id"])
         if retention_days is None:
             continue
         try:
