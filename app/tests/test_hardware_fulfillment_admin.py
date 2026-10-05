@@ -199,3 +199,42 @@ def test_the_operator_page_escapes_customer_data(order, db_path):
     html = client.get("/admin/hardware-orders", cookies=_admin_cookie(db_path)).text
     assert "<script>alert('x')</script>" not in html and "&lt;script&gt;" in html
     assert f'data-order="{order_id}" data-status="preparing"' in html
+
+
+# ------------------------------------------------------------ atomicity (Codex review of 41d2af4)
+
+def test_a_transition_whose_audit_record_cannot_be_written_is_rolled_back(order, db_path, outbox):
+    client, _, order_id = order
+    admin = _admin_cookie(db_path)
+    _step(client, order_id, admin, status="preparing")
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TRIGGER block_shipped_audit BEFORE INSERT ON audit_logs WHEN NEW.action='hardware_order.shipped' "
+                 "BEGIN SELECT RAISE(ABORT, 'audit store unavailable'); END")
+    conn.commit()
+    conn.close()
+    with pytest.raises(Exception):
+        client.post(f"/api/admin/hardware-orders/{order_id}/fulfillment", cookies=admin,
+                    json={"status": "shipped", "carrier": "UPS", "tracking_number": "1Z999"})
+    state = sqlite3.connect(db_path).execute("SELECT fulfillment_status,carrier,shipped_at FROM hardware_orders WHERE id=?",
+                                             (order_id,)).fetchone()
+    assert state == ("preparing", None, None)  # no shipping transition without its audit record
+    assert outbox["sent"] == []
+
+
+@pytest.mark.parametrize("change", [("status", "refunded"), ("status", "disputed"), ("fulfillment_status", "cancelled")])
+def test_a_repeated_shipped_request_never_emails_an_invalid_order(order, db_path, outbox, change):
+    client, _, order_id = order
+    admin = _admin_cookie(db_path)
+    _step(client, order_id, admin, status="preparing")
+    outbox["down"] = True  # the first shipping email fails, leaving a retryable outbox row
+    assert _step(client, order_id, admin, status="shipped", carrier="UPS", tracking_number="1Z999").json()["status"] == "applied"
+    conn = sqlite3.connect(db_path)
+    conn.execute(f"UPDATE hardware_orders SET {change[0]}=? WHERE id=?", (change[1], order_id))
+    conn.commit()
+    conn.close()
+    outbox["down"] = False
+    assert _step(client, order_id, admin, status="shipped", carrier="UPS", tracking_number="1Z999").status_code == 409
+    import purchase_notifications
+    with override_target(sqlite_path=str(db_path)):
+        assert purchase_notifications.notify_hardware_shipped(order_id)["status"] == "ignored"
+    assert outbox["sent"] == []

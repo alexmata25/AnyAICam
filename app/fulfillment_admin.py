@@ -23,6 +23,7 @@ nothing let an operator move an online order through it).
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from html import escape
@@ -32,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from partner_db import audit, connection, row, rows
+from partner_db import connection, row, rows
 
 OPERATOR_STEPS = {
     # target: states it may be applied from ('unfulfilled' is the table's
@@ -91,20 +92,27 @@ def apply_step(order_id: str, payload: FulfillmentRequest, actor: dict) -> dict:
             raise HTTPException(status_code=400, detail="Enter the carrier and a tracking number (letters, numbers, spaces and dashes).")
         link = tracking_link(carrier, tracking_number)
     current = str(order.get("fulfillment_status") or "")
+    # Checked before anything else, the repeat path included: a refunded,
+    # disputed or cancelled order is never moved and never emailed.
+    if order.get("status") != "paid" or current == "cancelled":
+        raise HTTPException(status_code=409, detail=f"This order is {order.get('status') if order.get('status') != 'paid' else 'cancelled'}; "
+                                                    "it cannot be fulfilled.")
     if current == target:
         if target == "shipped":
             if (order.get("carrier"), order.get("tracking_number")) != (carrier, tracking_number):
                 raise HTTPException(status_code=409, detail="This order is already shipped with different tracking details.")
             # Repeating the step retries a shipping email that failed; the
-            # send-once outbox never sends a second one.
+            # send-once outbox never sends a second one (and notify_hardware_
+            # shipped re-checks the order is still paid and shipped).
             from purchase_notifications import notify_hardware_shipped
             notify_hardware_shipped(order_id)
         return {"status": "unchanged", "order": order}
-    if order.get("status") != "paid":
-        raise HTTPException(status_code=409, detail=f"This order is {order.get('status')}; it cannot be fulfilled.")
     allowed = OPERATOR_STEPS[target]
     placeholders = ",".join("?" * len(allowed))
     now = datetime.now().isoformat()
+    details = {"from": current or "paid", "to": target, **({"carrier": carrier} if carrier else {})}
+    # The transition and its audit record are one transaction: both are
+    # written, or neither is.
     with connection() as db:
         if target == "shipped":
             changed = db.execute(
@@ -117,13 +125,16 @@ def apply_step(order_id: str, payload: FulfillmentRequest, actor: dict) -> dict:
                 f"UPDATE hardware_orders SET fulfillment_status=?,updated_at=?{stamp} WHERE id=? AND status='paid' "
                 f"AND fulfillment_status IN ({placeholders})",
                 (target, now, *((now,) if stamp else ()), order_id, *allowed)).rowcount
+        if changed == 1:
+            db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
+                       "VALUES(?,?,?,?,?,?,?)",
+                       (actor.get("email", ""), actor.get("role", ""), f"hardware_order.{target}", "hardware_order", order_id,
+                        json.dumps(details), now))
     if changed != 1:
         latest = _order(order_id)
         if latest.get("fulfillment_status") == target:  # a concurrent request applied it first
             return {"status": "unchanged", "order": latest}
         raise HTTPException(status_code=409, detail=f"Cannot move this order from '{current or 'paid'}' to '{target}'.")
-    audit({"email": actor.get("email", ""), "role": actor.get("role", "")}, f"hardware_order.{target}", "hardware_order", order_id,
-          {"from": current or "paid", "to": target, **({"carrier": carrier} if carrier else {})})
     if target == "shipped":
         from purchase_notifications import notify_hardware_shipped
         notify_hardware_shipped(order_id)  # send-once per order

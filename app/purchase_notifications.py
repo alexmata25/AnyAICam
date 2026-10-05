@@ -832,6 +832,10 @@ def notify_hardware_shipped(order_id: str) -> dict:
     order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
     if not order:
         return {"status": "ignored", "reason": "unknown order"}
+    # Only from the authoritative state (2026-10-05): a refunded, disputed or
+    # cancelled order, or one not recorded as shipped, is never emailed.
+    if order.get("status") != "paid" or order.get("fulfillment_status") not in ("shipped", "delivered"):
+        return {"status": "ignored", "reason": "order is not a paid, shipped order"}
     customer = _customer_row(order["customer_id"]) if order.get("customer_id") else None
     first_name = _first_name(customer.get("name")) if customer else "there"
     recipient = (customer.get("email") if customer else None) or ""
