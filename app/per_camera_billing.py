@@ -254,13 +254,29 @@ def has_camera_plan(customer_id: str) -> bool:
                     "AND status IN ('active','suspended') LIMIT 1", (customer_id,)))
 
 
+def deferred_storage_plan(customer_id: str) -> dict | None:
+    """An appliance order's storage plan recorded by the verified webhook,
+    starting at activation (build_orders.py)."""
+    try:
+        return row("SELECT * FROM deferred_storage_plans WHERE customer_id=?", (customer_id,))
+    except Exception:  # table not migrated yet
+        return None
+
+
+def order_paid(customer_id: str) -> bool:
+    """Checkout is done: a camera plan, or a paid appliance order whose
+    storage plan starts at activation. Both come only from verified
+    Stripe webhooks."""
+    return has_camera_plan(customer_id) or deferred_storage_plan(customer_id) is not None
+
+
 def save_build_selection(customer_id: str, selection: dict) -> None:
     """Keep a validated Build Your System selection on the account until it
     is paid for. A selection with a plan replaces the saved one (a fresh
     website hand-off); saving creates nothing in Stripe. An account that
     already has a camera plan, or whose purchase is past checkout, is left
     alone."""
-    if not customer_id or not selection.get("plan") or has_camera_plan(customer_id):
+    if not customer_id or not selection.get("plan") or order_paid(customer_id):
         return
     existing = row("SELECT state FROM build_system_intents WHERE customer_id=?", (customer_id,))
     if existing and existing["state"] != BUILD_PENDING:
@@ -289,7 +305,7 @@ def build_progress(customer_id: str) -> dict | None:
     if not intent or intent["state"] == BUILD_DONE:
         return None
     state = intent["state"]
-    if state == BUILD_PENDING and has_camera_plan(customer_id):
+    if state == BUILD_PENDING and order_paid(customer_id):
         state = BUILD_PAID
     if state == BUILD_PAID and not _setup_needed(customer_id):
         state = BUILD_DONE
@@ -310,6 +326,13 @@ def purchase_progress_banner(customer_id: str, path: str = "") -> str:
     """The notice on every customer VMS page while a Build Your System
     purchase is unfinished: back to the order summary until paid, then to
     setup (not repeated on the setup page itself)."""
+    deferred = deferred_storage_plan(customer_id)
+    if deferred and deferred["state"] == "payment_failed":
+        # The appliance is activated but its storage plan's first payment was
+        # refused (build_orders.py): shown until the customer retries.
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
+                '<strong>Storage plan not started</strong> — Your payment method was declined. '
+                f'<a href="{ORDER_COMPLETE_PATH}">Update payment and retry</a></div>')
     progress = build_progress(customer_id)
     if not progress:
         return ""
@@ -772,6 +795,12 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     features = payload["included_features"] if payload else []
     plan_summary = "No per-camera plan selected yet. Choose a plan and licensed camera count to continue."
     current_html = ""
+    # Ordered with an appliance: paid at activation, never offered again here.
+    deferred = None if payload else deferred_storage_plan(customer_id)
+    if deferred and deferred["state"] != "superseded" and deferred["plan_key"] in PLANS:
+        plan_summary = (f"{escape(PLANS[deferred['plan_key']]['display_name'])} · "
+                        f"{_camera_count(deferred['camera_quantity'], 'licensed camera')} · ordered with your appliance. "
+                        "Your storage plan starts when you activate the appliance.")
     if payload:
         plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
                         f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
@@ -803,7 +832,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         # refuse a second one anyway).
         activating = ('<section class="panel" id="v2-activating"><h2>Payment received</h2>'
                       '<p class="health-detail" role="status">Your plan is being activated. This page refreshes automatically.</p></section>')
-    elif is_owner and not payload:
+    elif is_owner and not payload and not deferred:
         if payment_outcome == "cancelled":
             selection_note += '<p class="health-detail" id="v2-checkout-cancelled">Checkout was cancelled. No payment was taken.</p>'
         options = "".join(f'<option value="{key}"{" selected" if key == selected_plan else ""}>{escape(plan["display_name"])} · ${plan["monthly_cents_per_camera"] / 100:.2f} per camera/month</option>' for key, plan in PLANS.items())
@@ -1020,6 +1049,9 @@ def register_routes(app: FastAPI) -> None:
                 "SELECT id FROM customer_entitlements WHERE customer_id=? AND product IN ('camera_slots_local','camera_slots_hybrid') "
                 "AND status IN ('active','suspended') LIMIT 1", (customer_id,)):
             raise HTTPException(status_code=409, detail="This account already has a camera plan. Use its plan-change action instead.")
+        if deferred_storage_plan(customer_id):
+            # Paid with the appliance order; it starts at activation (build_orders.py).
+            raise HTTPException(status_code=409, detail="Your storage plan was ordered with your appliance and starts when you activate it.")
         import main
         if not main.PUBLIC_BASE_URL:
             raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")

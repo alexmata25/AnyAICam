@@ -14,7 +14,8 @@ from datetime import datetime, timedelta
 import pytest
 
 from database_backend import override_target
-from test_hardware_delivery_flow import (APPLIANCE, OWN_PC, _event, _hardware_order, _notify, _paid,  # noqa: F401
+from test_hardware_delivery_flow import (APPLIANCE, OWN_PC, _event, _hardware_order, _notify,  # noqa: F401
+                                         _paid_with_plan as _paid,
                                          db_path, license_portal, package, portal, shop, site, storage)
 from test_hybrid_build_system_flow import _activate_appliance
 

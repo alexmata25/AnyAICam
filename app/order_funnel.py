@@ -28,7 +28,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 import per_camera_billing as billing
 
 WEBSITE_BUILD_URL = "https://anyaicam.com/build-your-system.html"
-SALES_PHONE = "(346) 554-4699"
+# Technical support only -- hardware is ordered online (owner decision 2026-10-05).
+SUPPORT_PHONE = "(346) 554-4699"
 SESSION_ID = re.compile(r"cs_(test|live)_[A-Za-z0-9]{8,200}")
 NO_STORE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 
@@ -86,35 +87,46 @@ def _identity(request: Request, next_path: str):
 
 
 def _order_lines(selection: dict) -> tuple[str, str]:
-    """Summary rows and the hardware notes, all priced from the server catalog."""
+    """Summary rows and notes, all priced from the server catalog
+    (build_orders.order_quote): what is charged today, the monthly plan,
+    and when the plan starts (owner decisions 2026-10-05)."""
+    import build_orders
+    quote = build_orders.order_quote(selection)
     plan = billing.PLANS[selection["plan"]]
-    quantity = int(selection.get("cameras") or billing.MIN_CAMERA_QUANTITY)
+    quantity = quote["cameras"]
     unit = int(plan["monthly_cents_per_camera"])
     retention = f"{plan['local_retention_days']}-day local recording retention"
     if plan.get("cloud_event_storage"):
         retention += f" · {plan['cloud_event_retention_days']}-day cloud event retention"
+    line_ids = {build_orders.RELAY_SKU: "order-relays"}
     lines = (f'<div class="order-line" id="order-plan"><span>AnyAiCam {escape(plan["display_name"])}</span><span>{_cameras(quantity)}</span></div>'
-             f'<div class="order-line"><span>{_money(unit)} per camera/month</span><span>{retention}</span></div>'
-             f'<div class="order-line"><span>AnyAiCam VMS software license</span><span>Included · {quantity} camera{"" if quantity == 1 else "s"}</span></div>'
-             f'<div class="order-line order-total" id="order-monthly"><span>Monthly subscription</span><span>{_money(unit * quantity)}/month</span></div>')
-    notes = []
-    catalog = _hardware()
-    if selection.get("appliance") in catalog:
-        item = catalog[selection["appliance"]]
-        notes.append(f'<li id="order-appliance">{escape(item["name"])} appliance · {_money(item["cents"])} one-time</li>')
-    if selection.get("relays"):
-        relay = catalog.get("AIC-RELAY-NUMATO-3CH")
-        if relay:
-            notes.append(f'<li id="order-relays">{escape(relay["name"])} × {int(selection["relays"])} · {_money(relay["cents"])} each, one-time</li>')
-    hardware = ""
-    if notes:
-        hardware = (f'<div class="notice warn" id="order-hardware"><strong>Hardware you selected</strong><ul style="margin:6px 0">{"".join(notes)}</ul>'
-                    f'Hardware is arranged with AnyAiCam by phone, not in this online checkout: call {SALES_PHONE}. '
-                    'Your subscription can start now; setup continues when your appliance arrives.</div>')
-    elif selection.get("own_pc"):
-        hardware = ('<p class="note" id="order-own-pc">Runs on your own Ubuntu 24.04 PC. The AnyAiCam VMS software license is '
-                    'included with this subscription; there is no separate license charge.</p>')
-    return lines, hardware
+             f'<div class="order-line"><span>{_money(unit)} per camera/month</span><span>{retention}</span></div>')
+    for line in quote["one_time"]:
+        line_id = line_ids.get(line["sku"]) or ("order-appliance" if line["sku"].startswith(APPLIANCE_PREFIX) else "order-license")
+        count = f" × {line['quantity']}" if line["quantity"] > 1 else ""
+        lines += (f'<div class="order-line" id="{line_id}"><span>{escape(line["name"])}{count}</span>'
+                  f'<span>{_money(line["cents"] * line["quantity"])} one-time</span></div>')
+    if quote["kind"] == build_orders.APPLIANCE_ORDER:
+        lines += ('<div class="order-line"><span>AnyAiCam VMS software license</span><span>Included with your appliance</span></div>')
+    elif quote["kind"] == build_orders.PLAN_ORDER:
+        lines += (f'<div class="order-line"><span>AnyAiCam VMS software license</span>'
+                  f'<span>Included · {quantity} camera{"" if quantity == 1 else "s"}</span></div>')
+    lines += (f'<div class="order-line" id="order-monthly"><span>Monthly subscription</span><span>{_money(unit * quantity)}/month</span></div>'
+              f'<div class="order-line order-total" id="order-today"><span>Due today</span><span>{_money(quote["due_today_cents"])}</span></div>')
+    if quote["kind"] == build_orders.APPLIANCE_ORDER:
+        from hardware_fulfillment import PREPARATION_TIMEFRAME_TEXT
+        notes = ('<p class="note" id="order-plan-start">Your hardware is charged today. Your monthly subscription starts when you '
+                 'activate your appliance, not before. Stripe saves your card securely at checkout so the subscription can '
+                 'start then without asking for it again.</p>'
+                 f'<p class="note" id="order-shipping">{escape(PREPARATION_TIMEFRAME_TEXT)} We prepare and test your appliance before it ships.</p>')
+    elif quote["kind"] == build_orders.OWN_PC_ORDER:
+        notes = ('<p class="note" id="order-plan-start">Your one-time VMS software license and your first month are charged today; '
+                 'your monthly subscription starts today.</p>'
+                 '<p class="note" id="order-own-pc">Runs on your own Ubuntu 24.04 PC. The license is yours to keep; the '
+                 'monthly subscription is separate.</p>')
+    else:
+        notes = '<p class="note" id="order-plan-start">Your monthly subscription starts today.</p>'
+    return lines, notes
 
 
 def _chooser(selection: dict) -> str:
@@ -135,8 +147,9 @@ CHECKOUT_SCRIPT = ("const csrf=()=>{const m=document.cookie.split('; ').find(x=>
                    "let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='\"'&&v[v.length-1]==='\"'?v.slice(1,-1):v};"
                    "try{sessionStorage.removeItem('orderActivation')}catch(e){}const pay=document.getElementById('order-checkout');if(pay)pay.onclick=async()=>{const msg=document.getElementById('order-message');"
                    "if(pay.disabled)return;pay.disabled=true;pay.textContent='Opening secure checkout…';msg.textContent='';let r,b={};"
-                   "try{r=await fetch('/api/v2/customer/subscription/checkout',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},"
-                   "body:JSON.stringify({plan_key:pay.dataset.plan,camera_quantity:Number(pay.dataset.cameras),flow:'order'})});b=await r.json().catch(()=>({}))}"
+                   # The order is the account's saved selection: the request carries no product or price.
+                   "try{r=await fetch('/api/v2/customer/build-order/checkout',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},"
+                   "body:'{}'});b=await r.json().catch(()=>({}))}"
                    "catch(e){r=null}if(r&&r.ok&&b.checkout_url){location.href=b.checkout_url;return}"
                    "pay.disabled=false;pay.textContent='Proceed to Secure Checkout';"
                    "msg.textContent=(b&&b.detail&&typeof b.detail==='string')?b.detail:'Secure checkout could not be opened. Please try again.'};")
@@ -168,7 +181,7 @@ def _session_state(customer_id: str, session_id: str) -> str:
 # from another device. A customer on their own PC (or with no hardware)
 # can download the installer and set up straight away.
 APPLIANCE_PREFIX = "AIC-APPLIANCE-"
-HARDWARE_ARRANGING = "arranging"    # appliance chosen; its order is completed by phone, none recorded yet
+HARDWARE_ARRANGING = "arranging"    # appliance chosen, its paid order not recorded yet (webhook still confirming)
 HARDWARE_PREPARING = "preparing"    # recorded hardware order, not shipped yet
 HARDWARE_SHIPPED = "shipped"
 HARDWARE_READY = "ready"            # delivered
@@ -215,34 +228,36 @@ def _shipment_lines(order: dict | None) -> str:
     return f'<p class="note" id="order-tracking">{"<br>".join(parts)}</p>' if parts else ""
 
 
+STORAGE_STARTS_AT_ACTIVATION = ('<p class="note" id="order-storage-start">Your monthly subscription starts when you activate '
+                                'your appliance, using the card you paid with. Nothing is charged for it before then.</p>')
+
+
 def _hardware_status_body(progress: dict, delivery: dict, summary: str) -> str:
     state, order = delivery["state"], delivery.get("order")
     name = escape(_appliance_name(progress, delivery))
-    early = ('<a class="ghost" id="order-setup-early" href="/customer/setup">Already received your appliance? Start setup</a>')
     if state == HARDWARE_READY:
         return ('<p class="notice ok" role="status">Your appliance has been delivered</p>'
                 '<h2 id="order-ready">Your AnyAiCam system is ready to set up.</h2>' + summary +
                 f"<p>Plug in your {name}, then we'll walk you through activating it and adding your cameras.</p>"
+                + STORAGE_STARTS_AT_ACTIVATION +
                 '<a class="submit" id="order-setup" href="/customer/setup">Start Setup</a>')
     if state == HARDWARE_SHIPPED:
         return ('<p class="notice ok" role="status">Order confirmed · Shipped</p>'
                 '<h2 id="order-preparing">Your AnyAiCam system is on its way.</h2>' + summary + _shipment_lines(order) +
                 f"<p>When your {name} arrives, sign in to your AnyAiCam account and we'll walk you through setting up "
-                'your appliance and cameras.</p>'
+                'your appliance and cameras.</p>' + STORAGE_STARTS_AT_ACTIVATION +
                 '<a class="submit" id="order-setup" href="/customer/setup">My appliance has arrived — Start Setup</a>')
     if state == HARDWARE_PREPARING:
         from hardware_fulfillment import PREPARATION_TIMEFRAME_TEXT, generate_order_number
         status = (f'<p class="note" id="order-status">Order {escape(generate_order_number(order["id"]))}: {name} · being prepared. '
                   f'{escape(PREPARATION_TIMEFRAME_TEXT)}</p>')
     else:
-        status = (f'<p class="note" id="order-status">Your {name} is ordered with AnyAiCam by phone. '
-                  f"If you haven't spoken with us yet, call {SALES_PHONE}.</p>")
+        status = f'<p class="note" id="order-status">Your {name} order is being confirmed.</p>'
     return ('<p class="notice ok" role="status">Payment complete · Order confirmed</p>'
             '<h2 id="order-preparing">Your AnyAiCam system is being prepared.</h2>' + summary + status +
             "<p>We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account "
-            "and we'll walk you through setting up your appliance and cameras.</p>"
-            "<p class=\"note\">You don't need to set up any cameras yet. You can close this page; your order is saved to your account.</p>"
-            + early)
+            "and we'll walk you through setting up your appliance and cameras.</p>" + STORAGE_STARTS_AT_ACTIVATION +
+            "<p class=\"note\">You don't need to set up any cameras yet. You can close this page; your order is saved to your account.</p>")
 
 
 def _software_body(progress: dict, summary: str) -> str:
@@ -274,14 +289,13 @@ def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_li
     sign_in = pn._sign_in_link()
     if delivery:
         name = _appliance_name(progress, delivery)
-        phone = (f"Your {name} is ordered with AnyAiCam by phone. If you haven't spoken with us yet, call {SALES_PHONE}."
-                 if delivery["state"] == HARDWARE_ARRANGING else f"Your {name} is being prepared.")
         paragraphs = [
-            f"Your payment is confirmed and your {plan_line} is active.",
-            f"Your AnyAiCam system is being prepared. {phone}",
+            f"Your payment for your {name} is confirmed, and your AnyAiCam system is being prepared.",
             "You don't need to set up any cameras yet.",
             "We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account "
             "and we'll walk you through setting up your appliance and cameras.",
+            f"Your {plan_line} starts when you activate your appliance, using the card you paid with. "
+            "Nothing is charged for it before then.",
         ]
         kind, subject = "hardware_order_confirmation", "Your AnyAiCam order is confirmed"
     else:
@@ -290,11 +304,25 @@ def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_li
             "Sign in to your AnyAiCam account to download AnyAiCam (for your own PC) and start setup: "
             "link your system, then discover and add your cameras.",
         ]
+        if progress.get("own_pc"):
+            paragraphs.insert(1, "Your one-time AnyAiCam VMS software license is on your account.")
         kind, subject = "account_ready", "Your AnyAiCam subscription is active"
     text = f"Hi {first_name},\n\n" + "\n\n".join(paragraphs) + f"\n\nSign in: {sign_in}\n\n{pn._SUPPORT_FOOTER_TEXT}"
     html = (f"<p>Hi {escape(first_name)},</p>" + "".join(f"<p>{escape(p)}</p>" for p in paragraphs)
             + f'<p><a href="{escape(sign_in, quote=True)}">Sign in to AnyAiCam</a></p>{pn._SUPPORT_FOOTER_HTML}')
     return kind, subject, text, html
+
+
+def _ordered_plan(customer_id: str) -> tuple[str | None, int]:
+    """(plan name, cameras) of the paid plan, or of the storage plan an
+    appliance order starts at activation."""
+    payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
+    if payload:
+        return payload["display_name"], int(payload["camera_quantity"])
+    deferred = billing.deferred_storage_plan(customer_id)
+    if deferred and deferred["plan_key"] in billing.PLANS:
+        return billing.PLANS[deferred["plan_key"]]["display_name"], int(deferred["camera_quantity"])
+    return None, 0
 
 
 # Outbox key for the Build Your System order confirmation: one per account,
@@ -323,8 +351,8 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
     attempts = _order_confirmation_attempts(customer_id)
     if any(attempt["status"] == "sent" for attempt in attempts):
         return {"status": "skipped", "reason": "already sent"}
-    if not billing.has_camera_plan(customer_id):
-        return {"status": "ignored", "reason": "no paid plan yet"}
+    if not billing.order_paid(customer_id):
+        return {"status": "ignored", "reason": "no paid order yet"}
     progress = billing.build_progress(customer_id)
     if not progress or progress["state"] != billing.BUILD_PAID:
         if attempts:
@@ -335,9 +363,8 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
                            (pn._now(), ORDER_CONFIRMATION_KEY + customer_id))
         return {"status": "ignored", "reason": "no Build Your System order awaiting setup"}
     customer = pn._customer_row(customer_id) or {}
-    payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
-    plan_line = (f"AnyAiCam {payload['display_name']} subscription for {_cameras(int(payload['camera_quantity']))}"
-                 if payload else "AnyAiCam subscription")
+    plan_name, plan_cameras = _ordered_plan(customer_id)
+    plan_line = (f"AnyAiCam {plan_name} subscription for {_cameras(plan_cameras)}" if plan_name else "AnyAiCam subscription")
     kind, subject, text, html = _order_email(pn._first_name(customer.get("name")), progress,
                                              hardware_delivery(customer_id, progress), plan_line)
     if attempts:
@@ -396,7 +423,7 @@ def register_order_funnel_routes(app: FastAPI) -> None:
         if refusal:
             return refusal
         customer_id = identity["customer_id"]
-        if billing.has_camera_plan(customer_id):
+        if billing.order_paid(customer_id):
             progress = billing.build_progress(customer_id)
             if progress and progress["state"] == billing.BUILD_PAID:
                 return RedirectResponse(billing.ORDER_COMPLETE_PATH, status_code=303)
@@ -422,8 +449,8 @@ def register_order_funnel_routes(app: FastAPI) -> None:
         lines, hardware = _order_lines(selection)
         quantity = int(selection.get("cameras") or billing.MIN_CAMERA_QUANTITY)
         body = ('<h2>Order summary</h2>' + notice + lines + hardware +
-                '<p class="note">Billed monthly. Stripe shows the final amount, including any discount or tax, before you pay. '
-                'Cancel any time from My subscription.</p>'
+                '<p class="note">Stripe shows the final amount, including any discount or tax, before you pay. '
+                'Cancel the monthly subscription any time from My subscription.</p>'
                 f'<button class="submit" id="order-checkout" type="button" data-plan="{escape(selection["plan"], quote=True)}" '
                 f'data-cameras="{quantity}">Proceed to Secure Checkout</button>'
                 '<p id="order-message" class="note" role="status" aria-live="polite"></p>'
@@ -440,20 +467,37 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             return refusal
         customer_id = identity["customer_id"]
         progress = billing.build_progress(customer_id) or {}
-        if billing.has_camera_plan(customer_id):
-            entitlement = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
-            summary = (f'<div class="order-line"><span>AnyAiCam {escape(entitlement["display_name"])}</span>'
-                       f'<span>{_cameras(int(entitlement["camera_quantity"]))}</span></div>') if entitlement else ""
+        if billing.order_paid(customer_id):
+            plan_name, plan_cameras = _ordered_plan(customer_id)
+            summary = (f'<div class="order-line"><span>AnyAiCam {escape(plan_name)}</span>'
+                       f'<span>{_cameras(plan_cameras)}</span></div>') if plan_name else ""
+            deferred = billing.deferred_storage_plan(customer_id)
+            script = ""
             if billing._setup_needed(customer_id):
                 delivery = hardware_delivery(customer_id, progress)
                 body = _hardware_status_body(progress, delivery, summary) if delivery else _software_body(progress, summary)
-                if progress.get("relays") and not delivery:
-                    body += (f'<p class="note" id="order-relay-reminder">Your relay modules are arranged with AnyAiCam by phone at '
-                             f'{SALES_PHONE}.</p>')
+            elif deferred and deferred["state"] == "payment_failed":
+                # Activated, but the storage plan's first payment was refused.
+                body = ('<p class="notice warn" role="status">Storage plan not started</p>'
+                        '<h2 id="order-storage-failed">Your payment method was declined.</h2>' + summary +
+                        '<p>Your appliance is activated. To start your monthly subscription, update your payment method in '
+                        '<a href="/subscription-portal">My subscription</a> (Manage billing), then try again.</p>'
+                        '<button class="submit" id="order-storage-retry" type="button">Try again</button>'
+                        '<p id="order-message" class="note" role="status" aria-live="polite"></p>')
+                script = ("const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';"
+                          "let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='\"'&&v[v.length-1]==='\"'?v.slice(1,-1):v};"
+                          "const b=document.getElementById('order-storage-retry');b.onclick=async()=>{b.disabled=true;"
+                          "const r=await fetch('/api/v2/customer/storage/start',{method:'POST',headers:{'X-CSRF-Token':csrf()}});"
+                          "const d=await r.json().catch(()=>({}));document.getElementById('order-message').textContent=d.message||d.detail||'';"
+                          "if(r.ok)setTimeout(()=>location.reload(),1500);else b.disabled=false};")
+            elif deferred and deferred["state"] not in ("started", "superseded") and not billing.has_camera_plan(customer_id):
+                body = ('<h2 id="order-storage-starting">Your storage plan is starting.</h2>' + summary +
+                        '<p>Your appliance is activated. Your monthly subscription is being set up with the card you paid with; '
+                        'this usually takes a moment.</p><a class="submit" href="/customer-account">Open AnyAiCam</a>')
             else:
                 body = ('<h2>Your AnyAiCam plan is active</h2>' + summary +
                         '<a class="submit" href="/customer-account">Open AnyAiCam</a>')
-            return HTMLResponse(_page("Order complete", body), headers=NO_STORE)
+            return HTMLResponse(_page("Your order", body, script=script), headers=NO_STORE)
         if not session_id:
             return RedirectResponse(billing.ORDER_SUMMARY_PATH, status_code=303)
         state = _session_state(customer_id, session_id)
@@ -471,7 +515,7 @@ def register_order_funnel_routes(app: FastAPI) -> None:
                   "if(n<20){try{sessionStorage.setItem('orderActivation',String(n+1))}catch(e){}setTimeout(()=>location.reload(),3000)}"
                   "else{const s=document.getElementById('order-activating');if(s)s.textContent="
                   + json.dumps("Activation is taking longer than usual. Refresh this page in a minute, or contact AnyAiCam support "
-                               f"at {SALES_PHONE} if your plan does not appear.") + "}")
+                               f"at {SUPPORT_PHONE} if your plan does not appear.") + "}")
         return HTMLResponse(_page("Activating your plan", '<h2>Payment received</h2>'
                                   '<p id="order-activating" role="status" aria-live="polite">Activating your AnyAiCam plan… '
                                   'This page updates automatically.</p>', script=script), headers=NO_STORE)

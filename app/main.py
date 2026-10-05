@@ -48810,6 +48810,8 @@ from per_camera_billing import register_routes as register_per_camera_billing_ro
 register_per_camera_billing_routes(app)
 from order_funnel import register_order_funnel_routes
 register_order_funnel_routes(app)
+from build_orders import register_build_order_routes
+register_build_order_routes(app)
 from plan_changes import register_plan_change_routes, register_plan_management_routes
 register_plan_change_routes(app)
 register_plan_management_routes(app)
@@ -115098,6 +115100,10 @@ async def _billing_grace_worker() -> None:
             # Build Your System order confirmations not delivered yet (same outbox).
             from order_funnel import retry_order_confirmation_notifications
             await asyncio.to_thread(retry_order_confirmation_notifications)
+            # Appliance storage plans whose start at activation has not
+            # happened yet or failed transiently (build_orders.py).
+            from build_orders import retry_storage_starts
+            await asyncio.to_thread(retry_storage_starts)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -115124,6 +115130,13 @@ def _stripe_webhook_steps() -> list:
         from hardware_orders import sync_hardware_order_from_stripe_event
         sync_hardware_order_from_stripe_event(event)
 
+    def build_orders(event):
+        # Build Your System orders paid online (2026-10-05): appliance and
+        # relay orders plus the storage plan awaiting activation, or the
+        # own-PC VMS license. Before sales_commissions, which reads orders.
+        from build_orders import sync_from_stripe_event
+        sync_from_stripe_event(event)
+
     def analytics(event):
         from analytics_entitlements import sync_analytics_from_stripe_event
         sync_analytics_from_stripe_event(event)
@@ -115146,6 +115159,7 @@ def _stripe_webhook_steps() -> list:
         ("camera_slot_entitlements", entitlements),
         ("camera_plan_v2_entitlements", camera_plan_v2),
         ("hardware_orders", hardware),
+        ("build_orders", build_orders),
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),
         ("billing_status", billing),

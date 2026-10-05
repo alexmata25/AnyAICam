@@ -30,12 +30,18 @@ VERIFY_LINK = re.compile(r"/customer/verify-email\?token=[A-Za-z0-9_\-]+(&next=[
 WEBSITE_QUERY = "plan=hybrid&cameras=8&appliance=AIC-APPLIANCE-RYZEN-STARTER&relays=2"
 
 
+HW_PRICES = {"ANYAICAM_STRIPE_PRICE_RYZEN_STARTER": "price_hw_starter", "ANYAICAM_STRIPE_PRICE_RYZEN_ENTERPRISE": "price_hw_pro",
+             "ANYAICAM_STRIPE_PRICE_RYZEN_AAC_FACIAL": "price_hw_aac", "ANYAICAM_STRIPE_PRICE_RELAY_NUMATO_3CH": "price_hw_relay"}
+
+
 @pytest.fixture()
 def shop(site, monkeypatch):
     import main
     import per_camera_billing as billing
     for plan_key, price_id in PRICES.items():
         monkeypatch.setenv(billing.PRICE_ENV[plan_key], price_id)
+    for env_var, price_id in HW_PRICES.items():  # VMS license prices come from license_portal
+        monkeypatch.setenv(env_var, price_id)
     monkeypatch.setattr(main, "require_stripe_price_matches_catalog", lambda price_id, cents, interval: None)
     client, captured, mail = site
     keys = []
@@ -63,7 +69,8 @@ def _customer_id(db_path, email):
 
 
 def _checkouts(captured):
-    return [fields for fields in captured if fields.get("mode") == "subscription"]
+    """Checkout Sessions created: subscription (plan, own PC) or payment (appliance)."""
+    return [fields for fields in captured if fields.get("mode") in ("subscription", "payment")]
 
 
 def _order(client, query=""):
@@ -95,8 +102,28 @@ def _new_customer(client, mail, email, query=WEBSITE_QUERY):
     return page, link, verified, wanted, _destination(login)
 
 
-def _checkout(client, plan="hybrid", cameras=8):
-    return client.post("/api/v2/customer/subscription/checkout", json={"plan_key": plan, "camera_quantity": cameras, "flow": "order"})
+def _checkout(client, plan=None, cameras=None):
+    """Proceed to Secure Checkout: the order is the account's saved
+    selection, so the request carries nothing (plan/cameras are ignored)."""
+    return client.post("/api/v2/customer/build-order/checkout", json={})
+
+
+def _paid_checkout_event(captured, customer_id, session_id="cs_test_order0001", event_id=None):
+    """The verified checkout.session.completed for the latest checkout, as Stripe sends it."""
+    fields = _checkouts(captured)[-1]
+    metadata = {key[len("metadata["):-1]: value for key, value in fields.items() if key.startswith("metadata[")}
+    return {"id": event_id or f"evt_{session_id}", "type": "checkout.session.completed", "livemode": False,
+            "data": {"object": {"id": session_id, "mode": fields["mode"], "payment_status": "paid", "status": "complete",
+                                "customer": fields.get("customer"), "payment_intent": f"pi_{session_id}",
+                                "subscription": f"sub_{session_id}" if fields["mode"] == "subscription" else None,
+                                "metadata": metadata}}}
+
+
+def _record_build_order(db_path, event):
+    """The build_orders webhook step for a verified, paid checkout."""
+    import build_orders
+    with override_target(sqlite_path=str(db_path)):
+        return build_orders.sync_from_stripe_event(event)
 
 
 def _pay(db_path, customer_id, plan_key="hybrid", quantity=8, sub_id="sub_build", status="active"):
@@ -146,38 +173,68 @@ def test_new_customer_build_system_to_setup_end_to_end(shop, db_path):
     assert order.status_code == 200
     assert _summary(order.text) == ("Hybrid", 8, "$199.92")
     assert '<nav class="nav"' not in order.text and "mobile-nav" not in order.text  # outside the VMS shell
-    assert "AnyAiCam Starter appliance · $1,249.99 one-time" in order.text and "× 2" in order.text
-    assert "not in this online checkout" in order.text
+    # Hardware is bought online, priced from the server catalog; the plan starts at activation.
+    assert 'id="order-appliance"><span>AnyAiCam Starter appliance</span><span>$1,249.99 one-time</span>' in order.text
+    assert 'id="order-relays"><span>Numato 3-Channel Relay Module × 2</span><span>$299.98 one-time</span>' in order.text
+    assert 'id="order-today"><span>Due today</span><span>$1,549.97</span>' in order.text
+    assert "starts when you activate your appliance" in order.text
+    assert "by phone" not in order.text and "(346)" not in order.text
     customer_id = _customer_id(db_path, "new@example.test")
     assert _checkouts(captured) == [] and _capacity(db_path, customer_id) == 0  # nothing bought yet
-    # Proceed to Secure Checkout: the backend creates the session from server prices.
+    # Proceed to Secure Checkout: the backend builds the session from the saved order and server prices.
     response = _checkout(client)
     assert response.status_code == 200, response.text
     assert response.json()["checkout_url"].startswith("https://checkout.stripe.test/")
     fields = _checkouts(captured)[-1]
-    assert fields["line_items[0][price]"] == PRICES["hybrid"] and fields["line_items[0][quantity]"] == "8"
+    assert fields["mode"] == "payment" and fields["payment_intent_data[setup_future_usage]"] == "off_session"
+    assert fields["line_items[0][price]"] == "price_hw_starter" and fields["line_items[0][quantity]"] == "1"
+    assert fields["line_items[1][price]"] == "price_hw_relay" and fields["line_items[1][quantity]"] == "2"
+    assert PRICES["hybrid"] not in fields.values()  # no recurring charge at checkout
     assert fields["success_url"] == "https://app.example.test/order-complete?session_id={CHECKOUT_SESSION_ID}"
     assert fields["cancel_url"] == "https://app.example.test/order-summary?checkout=cancelled"
-    assert _capacity(db_path, customer_id) == 0  # no entitlement before the webhook
     # Stripe returns before the webhook: activating, no second checkout offered.
-    sessions["cs_test_abcdefgh"] = {"status": "complete", "payment_status": "paid", "metadata": {"anyaicam_customer_id": customer_id}}
-    waiting = client.get("/order-complete?session_id=cs_test_abcdefgh")
+    sessions["cs_test_order0001"] = {"status": "complete", "payment_status": "paid", "metadata": {"anyaicam_customer_id": customer_id}}
+    waiting = client.get("/order-complete?session_id=cs_test_order0001")
     assert waiting.status_code == 200 and "Activating your AnyAiCam plan" in waiting.text
     assert 'id="order-checkout"' not in waiting.text
-    # The verified webhook grants the plan; the customer is handed to setup.
-    assert _pay(db_path, customer_id)["status"] == "entitlement_updated"
-    done = client.get("/order-complete?session_id=cs_test_abcdefgh").text
-    # An appliance was ordered: setup waits for delivery (test_hardware_delivery_flow.py).
+    # The verified webhook records the hardware orders and the plan waiting for activation.
+    assert _record_build_order(db_path, _paid_checkout_event(captured, customer_id))["status"] == "appliance_order_recorded"
+    done = client.get("/order-complete?session_id=cs_test_order0001").text
     assert "Your AnyAiCam system is being prepared." in done and 'id="order-setup"' not in done
-    assert "AnyAiCam Hybrid</span><span>8 licensed cameras" in done
-    assert _capacity(db_path, customer_id) == 8
+    assert "AnyAiCam Hybrid</span><span>8 licensed cameras" in done and 'id="order-storage-start"' in done
+    assert _capacity(db_path, customer_id) == 0  # the storage plan has not started
     setup = client.get("/customer/setup")
     assert setup.status_code == 200 and 'id="purchase-progress-banner"' not in setup.text
-    # In the VMS before setup finishes: the order status stays visible.
     dashboard = client.get("/dashboard")
     if dashboard.status_code == 200:
         assert "Order confirmed</strong> — Your AnyAiCam system is being prepared." in dashboard.text
-    _activate_appliance(db_path, customer_id)
+    # Delivered, then the customer activates the appliance: the plan starts, once.
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE hardware_orders SET fulfillment_status='delivered' WHERE sku LIKE 'AIC-APPLIANCE-%'")
+    conn.commit()
+    conn.close()
+    assert "Start Setup</a>" in client.get("/order-complete").text
+    import build_orders
+    import main
+    created = []
+
+    def stripe_post(path, fields, idempotency_key=None):
+        assert path == "/v1/subscriptions"
+        created.append((dict(fields), idempotency_key))
+        return {"id": "sub_storage_1", "status": "active"}
+    main.stripe_api_post, real_post = stripe_post, main.stripe_api_post
+    try:
+        _activate_appliance(db_path, customer_id)
+        with override_target(sqlite_path=str(db_path)):
+            assert build_orders.on_appliance_activated(customer_id)["status"] == "started"
+            assert build_orders.on_appliance_activated(customer_id)["status"] == "ignored"
+    finally:
+        main.stripe_api_post = real_post
+    assert len(created) == 1
+    assert created[0][0]["items[0][price]"] == PRICES["hybrid"] and created[0][0]["items[0][quantity]"] == "8"
+    _pay(db_path, customer_id, sub_id="sub_storage_1")  # the verified customer.subscription.created
+    assert _capacity(db_path, customer_id) == 8
     assert 'id="purchase-progress-banner"' not in client.get("/subscription-portal").text
     assert _one(db_path, "SELECT state FROM build_system_intents")["state"] == "setup_complete"
     assert "Your AnyAiCam plan is active" in client.get("/order-complete").text

@@ -1285,6 +1285,19 @@ CREATE TABLE IF NOT EXISTS build_system_intents(
  paid_at TEXT, completed_at TEXT
 );
 '''),
+    # Appliance orders (build_orders.py, owner decision 2026-10-05): the
+    # storage/service plan paid for by the card saved at the appliance
+    # checkout, started on Stripe when the appliance is activated. One row
+    # per account; the state machine and attempt round make the start
+    # idempotent. No prices, no card data -- Stripe ids only. Additive.
+    ('20261005_deferred_storage_plans','''
+CREATE TABLE IF NOT EXISTS deferred_storage_plans(
+ customer_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL, camera_quantity INTEGER NOT NULL,
+ stripe_customer_id TEXT, stripe_payment_method_id TEXT, checkout_session_id TEXT NOT NULL,
+ state TEXT NOT NULL, attempt_round INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+ stripe_subscription_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT
+);
+'''),
 ]
 
 

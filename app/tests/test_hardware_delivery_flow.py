@@ -18,6 +18,7 @@ import pytest
 from database_backend import override_target
 from test_direct_onboarding import _direct_owner, _login, _one, _signed_in  # noqa: F401
 from test_hybrid_build_system_flow import (_activate_appliance, _checkout, _checkouts, _customer_id, _new_customer, _pay,  # noqa: F401
+                                           _paid_checkout_event, _record_build_order,
                                            db_path, license_portal, package, portal, shop, site, storage)
 
 pytestmark = pytest.mark.usefixtures("stripe_follows_events")
@@ -26,7 +27,23 @@ OWN_PC = "plan=ai_local&cameras=5&vms_licence=5"
 APPLIANCE = "plan=hybrid&cameras=8&appliance=AIC-APPLIANCE-RYZEN-STARTER"
 
 
-def _paid(client, mail, db_path, email, query):
+def _paid(client, mail, db_path, email, query, captured):
+    """The real online purchase: Proceed to Secure Checkout, then Stripe's
+    verified webhook. An appliance order starts no plan; an own-PC order's
+    plan starts at checkout (its subscription event applied by billing v2)."""
+    _new_customer(client, mail, email, query)
+    customer_id = _customer_id(db_path, email)
+    assert _checkout(client).status_code == 200
+    _record_build_order(db_path, _paid_checkout_event(captured, customer_id, f"cs_test_{customer_id[:12]}"))
+    if "appliance" not in query:
+        plan, cameras = ("ai_local", 5) if "ai_local" in query else ("hybrid", 8)
+        _pay(db_path, customer_id, plan, cameras, f"sub_{customer_id}")
+    return customer_id
+
+
+def _paid_with_plan(client, mail, db_path, email, query, captured=None):
+    """A paid plan applied directly (billing v2 webhook), for tests about
+    what happens after any paid order -- e.g. email delivery."""
     _new_customer(client, mail, email, query)
     customer_id = _customer_id(db_path, email)
     plan, cameras = ("ai_local", 5) if "ai_local" in query else ("hybrid", 8)
@@ -35,12 +52,19 @@ def _paid(client, mail, db_path, email, query):
 
 
 def _hardware_order(db_path, customer_id, *, fulfillment="preparing", status="paid", **extra):
+    """Set the account's appliance order to a fulfillment state (as
+    hardware_fulfillment / an operator would), creating it if needed."""
     conn = sqlite3.connect(db_path)
-    values = {"id": f"hw-{fulfillment}-{status}", "customer_id": customer_id, "sku": "AIC-APPLIANCE-RYZEN-STARTER",
-              "product_name": "AnyAiCam Starter", "stripe_price_id": "price_hw", "quantity": 1, "amount_cents": 124999,
-              "currency": "usd", "status": status, "fulfillment_status": fulfillment,
-              "created_at": "2026-10-05T10:00:00", "updated_at": "2026-10-05T10:00:00", **extra}
-    conn.execute(f"INSERT INTO hardware_orders({','.join(values)}) VALUES({','.join('?' * len(values))})", tuple(values.values()))
+    existing = conn.execute("SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%'", (customer_id,)).fetchone()
+    if existing:
+        changes = {"status": status, "fulfillment_status": fulfillment, **extra}
+        conn.execute(f"UPDATE hardware_orders SET {','.join(f'{key}=?' for key in changes)} WHERE id=?", (*changes.values(), existing[0]))
+    else:
+        values = {"id": f"hw-{fulfillment}-{status}", "customer_id": customer_id, "sku": "AIC-APPLIANCE-RYZEN-STARTER",
+                  "product_name": "AnyAiCam Starter", "stripe_price_id": "price_hw", "quantity": 1, "amount_cents": 124999,
+                  "currency": "usd", "status": status, "fulfillment_status": fulfillment,
+                  "created_at": "2026-10-05T10:00:00", "updated_at": "2026-10-05T10:00:00", **extra}
+        conn.execute(f"INSERT INTO hardware_orders({','.join(values)}) VALUES({','.join('?' * len(values))})", tuple(values.values()))
     conn.commit()
     conn.close()
 
@@ -72,8 +96,8 @@ def _notify(db_path, event):
 # ------------------------------------------------------------ Path A: own PC / software
 
 def test_own_pc_customer_goes_straight_to_download_and_setup(shop, db_path):
-    client, _, mail, _, _ = shop
-    _paid(client, mail, db_path, "ownpc@example.test", OWN_PC)
+    client, captured, mail, _, _ = shop
+    _paid(client, mail, db_path, "ownpc@example.test", OWN_PC, captured)
     html = client.get("/order-complete").text
     assert "Your AnyAiCam system is ready to set up." in html
     assert "Download AnyAiCam and install it on your PC." in html
@@ -88,8 +112,8 @@ def test_own_pc_customer_goes_straight_to_download_and_setup(shop, db_path):
 
 def test_own_pc_customer_gets_the_real_installer_download_when_published(shop, db_path, monkeypatch):
     import customer_downloads
-    client, _, mail, _, _ = shop
-    _paid(client, mail, db_path, "download@example.test", OWN_PC)
+    client, captured, mail, _, _ = shop
+    _paid(client, mail, db_path, "download@example.test", OWN_PC, captured)
     monkeypatch.setattr(customer_downloads, "latest_vms_installer", lambda: {"version": "1.2.3", "commit": "a" * 40,
                         "filename": "x.tar.gz", "size_bytes": 1, "sha256": "b" * 64, "key": "vms-installer/x.tar.gz"})
     html = client.get("/order-complete").text
@@ -102,15 +126,16 @@ def test_own_pc_customer_gets_the_real_installer_download_when_published(shop, d
 # ------------------------------------------------------------ Path B: appliance -- setup deferred
 
 def test_appliance_customer_is_told_the_system_is_being_prepared_not_sent_to_setup(shop, db_path):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "appliance@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "appliance@example.test", APPLIANCE, captured)
     html = client.get("/order-complete").text
     assert "Your AnyAiCam system is being prepared." in html
     assert "We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account" in html
     assert "You don't need to set up any cameras yet." in html
     assert 'id="order-setup"' not in html and "Discover" not in html  # no setup/discovery as the next step
-    assert "ordered with AnyAiCam by phone" in html  # no hardware order recorded yet
-    assert '<a class="ghost" id="order-setup-early" href="/customer/setup">Already received your appliance? Start setup</a>' in html
+    assert 'id="order-setup-early"' not in html and "by phone" not in html and "(346)" not in html
+    assert "AnyAiCam Starter · being prepared." in html  # the hardware order the webhook recorded
+    assert "Your monthly subscription starts when you activate your appliance" in html
     # Signing in lands on the order status, not on appliance/camera setup.
     assert client.get("/customer-account").headers["location"] == "/order-complete"
     dashboard = client.get("/dashboard")
@@ -119,12 +144,12 @@ def test_appliance_customer_is_told_the_system_is_being_prepared_not_sent_to_set
         assert '<a href="/order-complete">View order status</a>' in dashboard.text
     with override_target(sqlite_path=str(db_path)):
         import customer_entitlements as ce
-        assert ce.usable_camera_capacity(customer_id) == 8  # paid capacity is already on the account
+        assert ce.usable_camera_capacity(customer_id) == 0  # the storage plan starts at activation
 
 
 def test_a_returning_appliance_customer_days_later_on_another_device_sees_the_same_order(shop, db_path):
     client, captured, mail, _, _ = shop
-    _paid(client, mail, db_path, "later@example.test", APPLIANCE)
+    _paid(client, mail, db_path, "later@example.test", APPLIANCE, captured)
     client.cookies.clear()  # browser closed, new device: nothing client-side
     assert _signed_in(_login(client, "later@example.test", customer_only=True))
     landing = client.get("/customer-account")
@@ -132,12 +157,13 @@ def test_a_returning_appliance_customer_days_later_on_another_device_sees_the_sa
     assert "Your AnyAiCam system is being prepared." in client.get("/order-complete").text
     # Never back through Build Your System or Stripe once paid.
     again = client.get("/order-summary")
-    assert _checkouts(captured) == [] and again.status_code == 303 and again.headers["location"] == "/order-complete"
+    assert len(_checkouts(captured)) == 1 and again.status_code == 303 and again.headers["location"] == "/order-complete"
+    assert _checkout(client).status_code == 409 and len(_checkouts(captured)) == 1
 
 
 def test_a_recorded_hardware_order_shows_its_number_and_preparation_time(shop, db_path):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "prep@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "prep@example.test", APPLIANCE, captured)
     _hardware_order(db_path, customer_id, fulfillment="preparing")
     html = client.get("/order-complete").text
     assert 'id="order-status">Order ' in html and "AnyAiCam Starter · being prepared." in html
@@ -145,8 +171,8 @@ def test_a_recorded_hardware_order_shows_its_number_and_preparation_time(shop, d
 
 
 def test_shipped_shows_only_recorded_tracking_and_offers_start_setup_for_arrival(shop, db_path):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "ship@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "ship@example.test", APPLIANCE, captured)
     _hardware_order(db_path, customer_id, fulfillment="shipped", carrier="UPS", tracking_number="1Z999",
                     tracking_link="https://www.ups.com/track?tracknum=1Z999", shipped_at="2026-10-06T09:00:00")
     html = client.get("/order-complete").text
@@ -159,16 +185,16 @@ def test_shipped_shows_only_recorded_tracking_and_offers_start_setup_for_arrival
 
 
 def test_no_tracking_is_invented_and_unsafe_links_are_dropped(shop, db_path):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "notrack@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "notrack@example.test", APPLIANCE, captured)
     _hardware_order(db_path, customer_id, fulfillment="shipped", tracking_link="javascript:alert(1)")
     html = client.get("/order-complete").text
     assert 'id="order-tracking"' not in html and "javascript:" not in html
 
 
 def test_delivered_hardware_is_ready_for_setup(shop, db_path):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "delivered@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "delivered@example.test", APPLIANCE, captured)
     _hardware_order(db_path, customer_id, fulfillment="delivered")
     html = client.get("/order-complete").text
     assert "Your AnyAiCam system is ready to set up." in html
@@ -178,18 +204,21 @@ def test_delivered_hardware_is_ready_for_setup(shop, db_path):
 
 @pytest.mark.parametrize("status,fulfillment", [("refunded", "preparing"), ("disputed", "shipped"), ("paid", "cancelled")])
 def test_refunded_disputed_or_cancelled_hardware_orders_do_not_count(shop, db_path, status, fulfillment):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "void@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "void@example.test", APPLIANCE, captured)
     _hardware_order(db_path, customer_id, fulfillment=fulfillment, status=status)
     html = client.get("/order-complete").text
-    assert "ordered with AnyAiCam by phone" in html and "on its way" not in html
+    assert "order is being confirmed" in html and "on its way" not in html and 'id="order-setup"' not in html
 
 
 def test_setup_complete_ends_the_order_notices(shop, db_path):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "active@example.test", APPLIANCE)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "active@example.test", APPLIANCE, captured)
     _hardware_order(db_path, customer_id, fulfillment="delivered")
     _activate_appliance(db_path, customer_id)
+    # Activated, the storage plan not started on Stripe yet: said so, not "active".
+    assert "Your storage plan is starting." in client.get("/order-complete").text
+    _pay(db_path, customer_id, "hybrid", 8, "sub_active")  # the plan Stripe started, as its webhook applies it
     assert "Your AnyAiCam plan is active" in client.get("/order-complete").text
     for path in ("/dashboard", "/subscription-portal"):
         assert 'id="purchase-progress-banner"' not in client.get(path).text
@@ -197,7 +226,7 @@ def test_setup_complete_ends_the_order_notices(shop, db_path):
 
 
 def test_an_unpaid_appliance_order_still_resumes_checkout_not_the_order_status(shop, db_path):
-    client, _, mail, _, _ = shop
+    client, captured, mail, _, _ = shop
     _new_customer(client, mail, "unpaid@example.test", APPLIANCE)
     assert client.get("/customer-account").headers["location"] == "/order-summary"
     assert client.get("/order-complete").headers["location"] == "/order-summary"
@@ -206,27 +235,29 @@ def test_an_unpaid_appliance_order_still_resumes_checkout_not_the_order_status(s
 # ------------------------------------------------------------ order-confirmation email
 
 def test_appliance_order_confirmation_email_is_sent_once_after_payment(shop, db_path, outbox):
-    client, _, mail, _, _ = shop
+    client, captured, mail, _, _ = shop
     _new_customer(client, mail, "mail-hw@example.test", APPLIANCE)
     customer_id = _customer_id(db_path, "mail-hw@example.test")
-    assert _notify(db_path, _event(customer_id))["status"] == "ignored" and outbox == []  # nothing before the plan exists
-    _pay(db_path, customer_id, "hybrid", 8, "sub_mail_hw")
-    assert _notify(db_path, _event(customer_id))["status"] == "sent"
+    assert _notify(db_path, _event(customer_id))["status"] == "ignored" and outbox == []  # nothing before payment
+    assert _checkout(client).status_code == 200
+    _record_build_order(db_path, _paid_checkout_event(captured, customer_id))  # the verified webhook sends it
+    assert len(outbox) == 1
     assert _notify(db_path, _event(customer_id, "evt_build_2"))["status"] == "skipped"  # once per account
     assert len(outbox) == 1
     email = outbox[0]
     assert email["type"] == "hardware_order_confirmation" and email["to"] == "mail-hw@example.test"
     assert "Your AnyAiCam order is confirmed" in email["subject"]
-    for line in ("Your payment is confirmed and your AnyAiCam Hybrid subscription for 8 licensed cameras is active.",
-                 "Your AnyAiCam system is being prepared.", "You don't need to set up any cameras yet.",
-                 "We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account"):
+    for line in ("Your payment for your AnyAiCam Starter is confirmed, and your AnyAiCam system is being prepared.",
+                 "You don't need to set up any cameras yet.",
+                 "We'll email you when your system ships. When your package arrives, sign in to your AnyAiCam account",
+                 "Your AnyAiCam Hybrid subscription for 8 licensed cameras starts when you activate your appliance"):
         assert line in email["text"]
-    assert "racking" not in email["text"]  # no tracking invented
+    assert "racking" not in email["text"] and "by phone" not in email["text"]  # no tracking invented, no phone ordering
 
 
 def test_own_pc_order_confirmation_email_points_to_download_and_setup(shop, db_path, outbox):
-    client, _, mail, _, _ = shop
-    customer_id = _paid(client, mail, db_path, "mail-sw@example.test", OWN_PC)
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "mail-sw@example.test", OWN_PC, captured)
     assert _notify(db_path, _event(customer_id))["status"] == "sent"
     email = outbox[0]
     assert email["type"] == "account_ready" and "Your AnyAiCam subscription is active" in email["subject"]
@@ -234,7 +265,7 @@ def test_own_pc_order_confirmation_email_points_to_download_and_setup(shop, db_p
 
 
 def test_purchases_without_a_build_system_order_get_no_new_email(shop, db_path, outbox):
-    client, _, mail, _, _ = shop
+    client, captured, mail, _, _ = shop
     _direct_owner(client, mail, "portal-buyer@example.test")
     customer_id = _customer_id(db_path, "portal-buyer@example.test")
     _pay(db_path, customer_id, "ai_local", 2, "sub_portal_buyer")
@@ -259,12 +290,18 @@ def test_the_v2_webhook_step_sends_the_confirmation_after_granting_the_plan(monk
     assert calls == ["grant", "notify"]
 
 
-# ------------------------------------------------------------ billing start (reported, unchanged)
+# ------------------------------------------------------------ billing start (owner decision 2026-10-05)
 
-def test_the_subscription_still_starts_at_checkout_payment(shop, db_path):
+def test_an_appliance_checkout_charges_hardware_only_and_an_own_pc_checkout_starts_the_plan(shop, db_path):
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, "billing-start@example.test", APPLIANCE)
     assert _checkout(client).status_code == 200
-    fields = _checkouts(captured)[-1]
-    assert fields["mode"] == "subscription"
-    assert not any("trial" in key or "billing_cycle_anchor" in key for key in fields)
+    appliance = _checkouts(captured)[-1]
+    assert appliance["mode"] == "payment"  # one-time hardware; no subscription created at checkout
+    assert not any(key.startswith("subscription_data") for key in appliance)
+    client.cookies.clear()
+    _new_customer(client, mail, "billing-start-pc@example.test", OWN_PC)
+    assert _checkout(client).status_code == 200
+    own_pc = _checkouts(captured)[-1]
+    assert own_pc["mode"] == "subscription"  # the plan starts the day of checkout
+    assert not any("trial" in key or "billing_cycle_anchor" in key for key in own_pc)

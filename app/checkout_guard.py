@@ -240,6 +240,8 @@ def _provisioned(event_id: str, session: dict | None = None) -> bool:
     required = PROVISIONING_STEPS
     if ((session or {}).get("metadata") or {}).get("anyaicam_billing_version") == "2":
         required = (*required, "camera_plan_v2_entitlements")
+    if ((session or {}).get("metadata") or {}).get("anyaicam_build_order"):
+        required = (*required, "build_orders")  # Build Your System orders (build_orders.py)
     return all(step in done for step in required)
 
 

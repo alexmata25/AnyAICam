@@ -516,6 +516,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             except ActivationConflict as error:
                 raise HTTPException(status_code=409,detail=str(error)) from error
         audit({'email':cloud_id,'role':'appliance'},'appliance.activated','appliance',appliance['id']); logger.info('Appliance activated cloud_id=%s',cloud_id)
+        # An appliance bought online starts its storage plan now, with the card
+        # saved at checkout (build_orders.py). Never fails the activation: a
+        # start that cannot complete is retried by the billing worker.
+        from build_orders import on_appliance_activated
+        on_appliance_activated(appliance.get('customer_id'))
         return {'appliance_id':appliance['id'],'cloud_id':cloud_id,'credential':credential,'credential_id':credential_id,'partner_id':appliance.get('partner_id'),'customer_id':appliance['customer_id'],'site_id':appliance['site_id'],'message':'Store this permanent credential securely; it will not be shown again.'}
 
     @app.post('/api/appliance/heartbeat')
