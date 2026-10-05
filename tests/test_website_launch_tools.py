@@ -194,3 +194,16 @@ def test_the_homepage_shows_the_real_vms_live_view_not_a_mock_panel():
     assert (ROOT / "website" / "app-screens" / "vms-live-camera.webp").is_file()
     for mock in ("Your cameras. Your local system.", "Local system online", "Search with licensed AI"):
         assert mock not in index
+
+
+def test_the_aac_feature_tour_pairs_each_feature_with_its_real_screenshot():
+    import re
+    page = (ROOT / "website" / "aac-features.html").read_text(encoding="utf-8")
+    rows = re.findall(r'<div class="feature-row[^"]*"><div class="feature-copy">.*?<h3>(.*?)</h3>.*?<img src="app-screens/([^"]+)"', page)
+    assert rows == [("Live view", "vms-live-camera.webp"), ("Playback", "vms-playback-timeline.webp"), ("Events", "vms-events.webp"),
+                    ("Smart Alerts", "vms-smart-alerts.webp"), ("License Plate Recognition", "vms-license-plates.webp"),
+                    ("People Counting", "vms-people-counting.webp"), ("AACO — AnyAiCam Operator", "aaco-person-events.webp"),
+                    ("AAC VC — Visitor Call", "visitor-call-email-phone.webp"), ("AAC Secure Edge", "secure-edge-arm-disarm.webp")]
+    for _, image in rows:
+        assert (ROOT / "website" / "app-screens" / image).is_file()
+    assert page.count("vms-smart-alerts.webp") == 2  # one feature row: the image and its full-size link
