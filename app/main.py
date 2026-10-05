@@ -48812,6 +48812,8 @@ from order_funnel import register_order_funnel_routes
 register_order_funnel_routes(app)
 from build_orders import register_build_order_routes
 register_build_order_routes(app)
+from fulfillment_admin import register_fulfillment_admin_routes
+register_fulfillment_admin_routes(app, page_shell)
 from plan_changes import register_plan_change_routes, register_plan_management_routes
 register_plan_change_routes(app)
 register_plan_management_routes(app)
