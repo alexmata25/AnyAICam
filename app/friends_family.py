@@ -117,6 +117,45 @@ def decide(request_id: str, *, approve: bool, decided_by: str, note: str = "") -
     return row("SELECT * FROM friends_family_requests WHERE id=?", (request_id,))
 
 
+class CouponScopeError(Exception):
+    """A Friends & Family coupon could not be shown to apply only to the
+    eligible items of a Checkout that also contains excluded items."""
+
+
+def _price_product(price_id: str) -> str:
+    import main
+    from urllib.parse import quote
+    product = main.stripe_api_get(f"/v1/prices/{quote(price_id, safe='')}").get("product")
+    return str((product.get("id") if isinstance(product, dict) else product) or "")
+
+
+def verify_coupon_scope(coupon_id: str, *, eligible_price_ids: list, excluded_price_ids: list) -> None:
+    """A Checkout that mixes discount-eligible items (the recurring plan) and
+    excluded ones (the one-time VMS license, hardware, Face Access) may carry
+    a Friends & Family coupon only if Stripe restricts that coupon
+    (applies_to.products) to the eligible items' Products and to none of the
+    excluded ones -- otherwise Stripe would discount the whole order. Read
+    from Stripe, never assumed; anything else raises CouponScopeError so the
+    caller refuses the checkout (fail closed)."""
+    import main
+    from urllib.parse import quote
+    try:
+        coupon = main.stripe_api_get(f"/v1/coupons/{quote(coupon_id, safe='')}?expand[]=applies_to")
+        eligible = {_price_product(price) for price in eligible_price_ids}
+        excluded = {_price_product(price) for price in excluded_price_ids}
+    except Exception as error:
+        raise CouponScopeError("the coupon or prices could not be read from Stripe") from error
+    allowed = {str(item) for item in ((coupon.get("applies_to") or {}).get("products") or [])}
+    if coupon.get("valid") is False:
+        raise CouponScopeError("the coupon is no longer valid")
+    if not allowed:
+        raise CouponScopeError("the coupon applies to every product")
+    if "" in eligible or not eligible <= allowed:
+        raise CouponScopeError("the coupon does not apply to the eligible plan")
+    if excluded & allowed:
+        raise CouponScopeError("the coupon also applies to an excluded product")
+
+
 class CheckoutHeld(Exception):
     """Raised while a Friends & Family request is pending: the price is not
     settled yet, so no Checkout Session may be created."""

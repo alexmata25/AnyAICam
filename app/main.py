@@ -114140,7 +114140,7 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
             _v2_current = None
         _plan_key = _v2_current.get("plan_key") if _v2_current and _v2_current.get("status") in ("active", "suspended") else None
         _offer = subscription_offers.addon_offer(identity["customer_id"], addon_key, _plan_key)
-        if _offer["state"] in ("included", "covered", "overlaps"):
+        if _offer["state"] not in ("available", "active"):
             raise HTTPException(status_code=409, detail=_offer["reason"])
     catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == addon_key), None)
     if not catalog_entry:

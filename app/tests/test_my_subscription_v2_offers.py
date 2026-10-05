@@ -84,7 +84,7 @@ def test_basic_local_shows_its_own_inclusions_and_no_ai(db_path, monkeypatch, pr
     for label in ("Local VMS", "Local recording", "Local playback", "Basic motion and events", "Camera management",
                   "Local recording retention: 2 days standard"):
         assert label in included
-    for absent in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio and AAC Voice Call on supported cameras"):
+    for absent in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio on supported cameras"):
         assert absent not in included
     assert not any(label.startswith("Cloud EVENT") for label in included)
     html = _page(db_path)
@@ -95,7 +95,7 @@ def test_ai_local_shows_its_core_ai_features_as_included(db_path, monkeypatch, p
     _plan(db_path, monkeypatch, "ai_local")
     included = _included(_page(db_path))
     for label in ("Person and vehicle detection", "Smart Motion", "AI event search and filters", "Intelligent notifications",
-                  "Core AACO video and event retrieval", "Talk Down / two-way audio and AAC Voice Call on supported cameras",
+                  "Core AACO video and event retrieval", "Talk Down / two-way audio on supported cameras",
                   "Local recording retention: 7 days standard"):
         assert label in included
     assert not any(label.startswith("Cloud EVENT") for label in included)
@@ -104,7 +104,7 @@ def test_ai_local_shows_its_core_ai_features_as_included(db_path, monkeypatch, p
 def test_hybrid_shows_ai_features_plus_cloud_event_retention(db_path, monkeypatch, prices):
     _plan(db_path, monkeypatch, "hybrid")
     included = _included(_page(db_path))
-    for label in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio and AAC Voice Call on supported cameras",
+    for label in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio on supported cameras",
                   "Hybrid cloud services", "Remote cloud services",
                   "Cloud EVENT retention: 14 days (event clips, not continuous recording)", "Local recording retention: 7 days standard"):
         assert label in included
@@ -126,7 +126,7 @@ def test_the_inclusion_lists_match_feature_gating(db_path, monkeypatch, prices):
         _plan(db_path, monkeypatch, plan_key)
         with override_target(sqlite_path=str(db_path)), connection() as db:
             assert analytics.account_wide_feature_active(db, "cust-v2", "talk_down") is talk_down
-            assert analytics.account_wide_feature_active(db, "cust-v2", "voice_call") is talk_down
+            assert analytics.account_wide_feature_active(db, "cust-v2", "voice_call") is False  # never from a plan
             for premium in ("people_counting", "lpr", "ppe"):
                 assert analytics.account_wide_feature_active(db, "cust-v2", premium) is False
 
@@ -138,7 +138,7 @@ def test_ai_local_and_hybrid_never_show_talk_down_as_an_add(db_path, monkeypatch
         _plan(db_path, monkeypatch, plan_key)
         html = _page(db_path)
         assert 'data-addon-key="talk_down"' not in html and 'data-addon-row="talk_down"' not in html
-        assert _offer(db_path, "talk_down", plan_key)["state"] == "included"
+        assert _offer(db_path, "talk_down", plan_key)["state"] == "plan_overlap"  # the add-on also carries AAC Voice Call
 
 
 def test_basic_local_can_still_add_talk_down(db_path, monkeypatch, prices):
@@ -189,7 +189,11 @@ def test_the_api_refuses_an_overlapping_package(db_path, monkeypatch, owner_clie
     _hold(db_path, "ai_essentials")  # People Counting
     response = _buy(client, "ai_professional")  # People Counting + PPE
     assert response.status_code == 409 and "which you already have" in response.json()["detail"]
+    assert "Contact AnyAiCam Support to upgrade your analytics package." in response.json()["detail"]
     assert not [c for c in calls if c[0] == "/v1/checkout/sessions"]
+    rows = _addon_rows(_page(db_path))
+    assert "Contact AnyAiCam Support to upgrade your analytics package." in rows["ai_professional"]
+    assert "data-addon-key" not in rows["ai_professional"]
 
 
 def test_face_access_stays_a_separate_premium_product(db_path, monkeypatch, prices):
@@ -207,7 +211,7 @@ def test_an_earlier_talk_down_add_on_on_ai_local_stays_active_and_is_explained(d
     _plan(db_path, monkeypatch, "ai_local")
     _hold(db_path, "talk_down")
     rows = _addon_rows(_page(db_path))
-    assert "Active (earlier add-on). Talk Down is now included with your plan." in rows["talk_down"]
+    assert "Active (earlier add-on, including AAC Voice Call). Talk Down itself is now included with your plan." in rows["talk_down"]
     import analytics_entitlements as analytics
     with override_target(sqlite_path=str(db_path)):
         assert "talk_down" in analytics.active_addon_keys("cust-v2")  # nothing cancelled

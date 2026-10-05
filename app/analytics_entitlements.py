@@ -322,10 +322,17 @@ def account_wide_feature_active(db, customer_id: str, feature_key: str) -> bool:
     if v2 and v2.get("status") == "active":
         plan = per_camera_billing.PLANS.get(v2.get("plan_key"), {})
         included = set(plan.get("features") or [])
+        # AAC Voice Call is NOT part of ordinary Talk Down (owner decision
+        # 2026-10-05): no plan grants it; it comes only from a package that
+        # grants voice_call itself (the add-on loop below), so an account that
+        # already holds one keeps it.
         v2_feature = {"smart_motion": "smart_motion", "talk_down": "supported_talk_down",
-                      "voice_call": "supported_talk_down", "aaco": "core_aaco_retrieval"}.get(feature_key)
-        if v2_feature:
-            return v2_feature in included
+                      "aaco": "core_aaco_retrieval"}.get(feature_key)
+        if v2_feature and v2_feature in included:
+            return True
+        # Not in the plan: Talk Down bought as an add-on (Basic Local) is
+        # honoured by the add-on loop below; Smart Motion and AACO stay
+        # plan-only exactly as before (next check).
         # Do not fall through to the legacy Local/Hybrid global feature set:
         # Basic Local must not inherit Smart Motion or AACO from that model.
         if feature_key in _catalog.INCLUDED_FEATURE_KEYS:

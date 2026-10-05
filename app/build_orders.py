@@ -171,8 +171,28 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
             fields += [("line_items[1][price]", license_price), ("line_items[1][quantity]", "1"),
                        ("metadata[anyaicam_vms_license_price_id]", license_price),
                        ("metadata[anyaicam_vms_license_capacity]", str(license_line["capacity"]))]
+            # The one-time license is never discounted (Friends & Family: 50%
+            # of the recurring plan only). A session-level coupon would cover
+            # every line, so the coupon must be verified on Stripe as limited
+            # to the plan's Product; otherwise checkout is refused (fail
+            # closed). Promotion codes cannot be scoped the same way, so this
+            # mixed order does not accept them.
+            discount = friends_family.checkout_discount(customer_id, "base")
+            if discount["coupon"]:
+                try:
+                    friends_family.verify_coupon_scope(discount["coupon"], eligible_price_ids=[plan_price],
+                                                       excluded_price_ids=[license_price])
+                except friends_family.CouponScopeError as error:
+                    logger.error("build_order.friends_family_coupon_scope customer_id=%s reason=%s", customer_id, error)
+                    raise HTTPException(status_code=503, detail="Your Friends & Family pricing can't be applied to this order "
+                                                                "safely right now, so checkout is paused. Please contact AnyAiCam support.")
+                fields.append(("discounts[0][coupon]", discount["coupon"]))
+            else:
+                fields.append(("allow_promotion_codes", "false"))
+            fields.append(("metadata[anyaicam_friends_family]", "approved" if discount["friends_family"] else "none"))
+        else:
+            friends_family.apply_to_checkout_fields(fields, customer_id, "base")
         primary_price, primary_quantity = plan_price, cameras
-        friends_family.apply_to_checkout_fields(fields, customer_id, "base")
     fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=email)))
     return fields, primary_price, primary_quantity
 
@@ -190,6 +210,8 @@ def create_checkout(identity: dict) -> dict:
         fields, price_id, quantity = _checkout_fields(customer_id, identity.get("email"), progress)
     except friends_family.CheckoutHeld as held:
         raise HTTPException(status_code=409, detail=str(held))
+    except RuntimeError as missing:  # approved, but the coupon is not configured: never charge full price silently
+        raise HTTPException(status_code=503, detail=str(missing))
     session = checkout_guard.create_session(customer_id, "base", price_id=price_id, quantity=quantity, fields=fields)
     if not session.get("id") or not session.get("url"):
         raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")

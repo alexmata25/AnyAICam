@@ -6,8 +6,9 @@ Read from the authoritative sources, never invented:
   retention fields. Feature gating already follows them
   (analytics_entitlements.account_wide_feature_active): AI Local and Hybrid
   include person/vehicle detection, Smart Motion, AI event search,
-  intelligent notifications, core AACO and supported Talk Down (with AAC
-  Voice Call); Hybrid adds cloud services and 14-day cloud EVENT retention.
+  intelligent notifications, core AACO and ordinary supported Talk Down;
+  Hybrid adds cloud services and 14-day cloud EVENT retention. AAC Voice
+  Call is NOT included with any plan (owner decision 2026-10-05).
 * Advanced analytics -- People Counting (advanced rules and reports), LPR and
   PPE are not part of any plan in the code: only the analytics packages in
   pricing_catalog.ADDONS grant them. They are shown as ONE optional section,
@@ -43,12 +44,12 @@ PACKAGE_NAMES = {
 }
 # Plan features shown with customer wording (keys from per_camera_billing.FEATURE_LABELS).
 PLAN_FEATURE_WORDING = {
-    "supported_talk_down": "Talk Down / two-way audio and AAC Voice Call on supported cameras",
     "remote_viewing_where_supported": "Remote viewing where supported",
 }
 # Features a plan's gating treats as included (analytics_entitlements.account_wide_feature_active).
-V2_INCLUDED_GRANTS = {"talk_down": "supported_talk_down", "voice_call": "supported_talk_down",
-                      "smart_motion": "smart_motion", "aaco": "core_aaco_retrieval"}
+# voice_call is deliberately absent: ordinary Talk Down does not include AAC Voice Call.
+V2_INCLUDED_GRANTS = {"talk_down": "supported_talk_down", "smart_motion": "smart_motion", "aaco": "core_aaco_retrieval"}
+UPGRADE_GUIDANCE = "Contact AnyAiCam Support to upgrade your analytics package."
 
 
 def plan_included_grants(plan_key: str | None) -> set:
@@ -60,15 +61,26 @@ def plan_included_grants(plan_key: str | None) -> set:
 
 def addon_offer(customer_id: str, addon_key: str, plan_key: str | None = None) -> dict:
     """Whether this package may be offered/sold to this account now:
-    'active' (held), 'included' (the plan includes all it grants), 'covered'
-    (other active packages already grant all of it), or 'available'."""
+    'active' (held); 'included' (the plan includes all it grants);
+    'plan_overlap' (the plan includes part of it -- e.g. the Talk Down
+    add-on on AI Local/Hybrid, which also carries AAC Voice Call: selling it
+    would charge again for the included Talk Down); 'covered' (other active
+    packages already grant all of it); 'overlaps' (they grant part of it);
+    or 'available'. Every state but 'available' is refused at checkout."""
     import analytics_entitlements as analytics
     held = set(analytics.active_addon_keys(customer_id))
     if addon_key in held:
         return {"state": "active"}
     grants = set(analytics._grants_for(addon_key))
-    if grants and grants <= plan_included_grants(plan_key):
+    in_plan = grants & plan_included_grants(plan_key)
+    if grants and in_plan == grants:
         return {"state": "included", "reason": "Included with your plan."}
+    if in_plan:
+        if addon_key == "talk_down":
+            reason = "Talk Down is included with your plan. AAC Voice Call is not sold on its own yet."
+        else:
+            reason = "Part of this package is already included with your plan, so it can't be added."
+        return {"state": "plan_overlap", "reason": reason}
     already = {grant for grant in grants if analytics.feature_granted_by_other_addon(customer_id, grant, excluding=addon_key)}
     if grants and already == grants:
         holder = next((key for key in held if grants <= set(analytics._grants_for(key))), None)
@@ -77,7 +89,7 @@ def addon_offer(customer_id: str, addon_key: str, plan_key: str | None = None) -
     if already:
         # Buying it would charge again for analytics the account already has.
         names = ", ".join(sorted(ANALYTICS_FEATURE_LABELS.get(grant, grant) for grant in already))
-        return {"state": "overlaps", "reason": f"Includes {names}, which you already have. To switch packages, contact AnyAiCam support."}
+        return {"state": "overlaps", "reason": f"Includes {names}, which you already have. {UPGRADE_GUIDANCE}"}
     return {"state": "available"}
 
 
@@ -155,7 +167,7 @@ def analytics_rows_html(customer_id: str, plan_key: str | None, is_owner: bool, 
         if not is_active and (not addon or addon["monthly_cents"] is None):
             continue  # no approved price (e.g. Cloud Overflow): not shown as something to buy
         offer = {"state": "active"} if is_active else addon_offer(customer_id, key, plan_key)
-        if offer["state"] == "included":
+        if offer["state"] in ("included", "plan_overlap"):
             continue  # shown under "Included with your plan", never as an Add
         name = PACKAGE_NAMES.get(key, _label)
         adds = [ANALYTICS_FEATURE_LABELS.get(g) for g in grants if g in ANALYTICS_FEATURE_LABELS]
@@ -166,8 +178,8 @@ def analytics_rows_html(customer_id: str, plan_key: str | None, is_owner: bool, 
         if offer["state"] == "active":
             included_now = key == "talk_down" and "talk_down" in plan_included_grants(plan_key)
             action = ('<span class="pill">Active</span>' if not included_now else
-                      '<span class="health-detail" style="max-width:300px;text-align:right">Active (earlier add-on). Talk Down is '
-                      'now included with your plan.</span>')
+                      '<span class="health-detail" style="max-width:300px;text-align:right">Active (earlier add-on, including AAC '
+                      'Voice Call). Talk Down itself is now included with your plan.</span>')
         elif offer["state"] in ("covered", "overlaps"):
             action = f'<span class="health-detail" style="max-width:300px;text-align:right">{escape(offer["reason"])}</span>'
         elif not os.environ.get(env_var, "").strip() or not analytics.checkout_item(key, customer_id)["sellable"]:
