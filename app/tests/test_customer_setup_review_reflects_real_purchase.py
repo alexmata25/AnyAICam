@@ -218,6 +218,34 @@ def test_review_reports_no_purchases_yet_without_manufacturing_defaults(http_cli
     assert "None purchased" in body
 
 
+def test_a_customer_without_a_plan_is_sent_to_the_billing_v2_plans(http_client, db_path):
+    """Billing v2 (owner decision 2026-10-05): new camera plans are chosen on
+    My subscription; setup never offers the legacy fixed-capacity tiers."""
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    body = _setup_page(http_client).text
+    assert '<div id="camera-plan-purchase">' in body  # visible
+    assert '<a class="action-button" href="/subscription-portal">Choose a camera plan</a>' in body
+    assert 'id="camera-tier-select"' not in body and 'id="buy-camera-plan"' not in body
+
+
+def test_a_billing_v2_customer_sees_the_per_camera_plan_and_no_purchase_prompt(http_client, db_path, monkeypatch):
+    import per_camera_billing as billing
+    import stripe_state
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    monkeypatch.setenv(billing.PRICE_ENV["ai_local"], "price_v2_ai_local")
+    monkeypatch.setattr(stripe_state, "subscription_payment_reversal", lambda _subscription: None)
+    with override_target(sqlite_path=db_path):
+        billing._upsert_current({"id": "sub_v2", "customer": "cus_v2", "status": "active",
+                                 "metadata": {"anyaicam_customer_id": "cust-1"},
+                                 "items": {"data": [{"id": "si", "quantity": 6, "price": {"id": "price_v2_ai_local"}}]}})
+    body = _setup_page(http_client).text
+    assert "Camera plan: AI Local &middot; 6 licensed cameras" in body
+    assert '<div id="camera-plan-purchase" hidden>' in body
+    assert "No camera-slot plan purchased yet" not in body
+
+
 # ------------------------------------------------ Step 5: placeholder camera
 
 

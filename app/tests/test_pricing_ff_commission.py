@@ -11,6 +11,17 @@ import pricing_catalog as pc
 from database_backend import override_target
 
 
+@pytest.fixture(autouse=True)
+def _legacy_new_purchases_switched_on(monkeypatch):
+    """These tests drive the legacy fixed-capacity checkout to exercise the
+    machinery it shares with grandfathered accounts (one payable session,
+    canonical Stripe customer, price guard, F&F coupons, webhook grant).
+    In production new legacy purchases are off (billing v2, 2026-10-05);
+    that default is covered by test_legacy_checkout_guard.py."""
+    import main
+    monkeypatch.setattr(main, "LEGACY_CAMERA_SLOT_NEW_PURCHASES", True)
+
+
 # Billing reads Stripe's current state and applies nothing without it (Codex
 # audit of 3f5b9c4, finding 9): these tests get a Stripe that follows their
 # own events (conftest.stripe_follows_events).

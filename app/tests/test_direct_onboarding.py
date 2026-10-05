@@ -186,7 +186,12 @@ def test_a_direct_customer_is_a_house_customer_with_no_partner_or_salesperson(si
 
 # ------------------------------------------------------------------ 3-6. purchase, entitlement, download
 
-def test_direct_owner_buys_local_gets_entitlement_and_downloads_the_installer(site, db_path, storage, package):
+def test_direct_owner_buys_local_gets_entitlement_and_downloads_the_installer(site, db_path, storage, package, monkeypatch):
+    # Exercises the legacy purchase -> entitlement -> installer download path
+    # (still used by grandfathered accounts); new legacy purchases are off in
+    # production (billing v2, 2026-10-05; test_legacy_checkout_guard.py).
+    import main
+    monkeypatch.setattr(main, "LEGACY_CAMERA_SLOT_NEW_PURCHASES", True)
     client, captured, mail = site
     email = _direct_owner(client, mail)
     customer_id = _one(db_path, "SELECT id FROM customers WHERE email=?", (email,))["id"]

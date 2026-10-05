@@ -113812,6 +113812,14 @@ def create_stripe_checkout(
     }
 
 
+# Billing v2 (owner decision 2026-10-05): new customers buy per-camera plans
+# only. The legacy fixed-capacity checkout below stays in the code for the
+# machinery it shares with grandfathered accounts (one payable session,
+# canonical Stripe customer, price guard, F&F coupons, webhook grant) and is
+# exercised by its own tests, but it never starts a NEW legacy purchase.
+LEGACY_CAMERA_SLOT_NEW_PURCHASES = False
+
+
 @app.post("/api/customer/camera-slots/checkout")
 def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Request) -> dict:
     """Provisioning Phase 8: the customer-facing checkout that was
@@ -113877,6 +113885,16 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         _current = "Hybrid" if "camera_slots_hybrid" in _active_base else "Local"
         _how = " Use Upgrade to Hybrid on My subscription." if (_current == "Local" and plan_type == "hybrid") else ""
         raise HTTPException(status_code=409, detail=f"Your account already has an active {_current} plan.{_how}")
+    # Billing v2 (owner decision 2026-10-05): every NEW camera plan is a
+    # per-camera plan. Legacy plan holders were refused just above and keep
+    # their own paths (Local -> Hybrid upgrade, billing portal, renewals).
+    # A per-camera account can never add a parallel legacy subscription.
+    import per_camera_billing as _v2
+    _v2_plan = _v2.entitlement_for_customer(customer_id)
+    if _v2_plan and _v2_plan.get("status") in ("active", "suspended"):
+        raise HTTPException(status_code=409, detail="Your account already has a per-camera plan. Change it on My subscription.")
+    if not LEGACY_CAMERA_SLOT_NEW_PURCHASES:
+        raise HTTPException(status_code=409, detail="New camera plans are per-camera: choose Basic Local, AI Local or Hybrid and your camera count on My subscription.")
     stripe_mode = "payment" if billing_type == "one_time" else "subscription"
     import pricing_catalog
     _catalog_plan = pricing_catalog.find_base_plan(plan_type, tier_label)

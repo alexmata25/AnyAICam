@@ -32,6 +32,17 @@ from test_stripe_billing_launch import (  # noqa: F401 -- fixtures and helpers
 )
 from test_stripe_billing_policies import NOW, PERIOD_END, _capacity, _customer, _dispute, _invoice, _refund, _sweep
 
+
+@pytest.fixture(autouse=True)
+def _legacy_new_purchases_switched_on(monkeypatch):
+    """These tests drive the legacy fixed-capacity checkout to exercise the
+    machinery it shares with grandfathered accounts (one payable session,
+    canonical Stripe customer, price guard, F&F coupons, webhook grant).
+    In production new legacy purchases are off (billing v2, 2026-10-05);
+    that default is covered by test_legacy_checkout_guard.py."""
+    import main
+    monkeypatch.setattr(main, "LEGACY_CAMERA_SLOT_NEW_PURCHASES", True)
+
 OWNER_B = ("b@example.test", "customer_owner", "cust-B")
 
 
