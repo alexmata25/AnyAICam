@@ -47226,6 +47226,9 @@ NAV_ITEMS = [
 
 
     ("investigate", "/investigate", "⌕", "Investigate"),
+    # AACO (2026-10-05): the existing full workspace (aaco_web.py), customer
+    # roles only, hidden when the account turned AACO off -- see page_shell().
+    ("aaco", "/aaco", "✧", "AACO"),
 
 
 
@@ -47801,7 +47804,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "analytics", "investigate", "dashboard", "security", "aac",
+            "live", "events", "alerts", "playback", "analytics", "investigate", "dashboard", "security", "aac", "aaco",
 
 
 
@@ -48088,6 +48091,17 @@ def _facial_view_permitted(shell_user: dict | None, shell_role: str) -> bool:
     return partner_db_allowed({**identity, "role": shell_role}, "facial.view")
 
 
+def _aaco_enabled_for(user) -> bool:
+    """Whether AACO's navigation entries appear for this customer: the
+    account's own AACO on/off setting. A settings read failure keeps them,
+    the same as the floating Ask AACO button below."""
+    try:
+        import aaco_settings
+        return bool(aaco_settings.load((user or {}).get("customer_id")).get("enabled", True))
+    except Exception:
+        return True
+
+
 def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
@@ -48193,6 +48207,9 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         # authenticates through partner_identity() alone, so a legacy
         # local admin saw the link and got a bare 401 (admin pass 2026-09-26).
         and (item[0] != "aac" or (shell_has_partner_identity and _facial_view_permitted(shell_user, shell_role)))
+        # AACO: /aaco serves customer identities only, and follows the
+        # account's own AACO on/off setting (aaco_settings).
+        and (item[0] != "aaco" or (shell_role in CUSTOMER_PORTAL_ROLES and _aaco_enabled_for(shell_user)))
 
 
 
@@ -48394,6 +48411,10 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         if (shell_has_partner_identity and _facial_view_permitted(shell_user, shell_role)
                 and _face_access_active((shell_user or {}).get("customer_id"))):
             mobile_items.insert(5, ("aac", "/aac/people", "People"))
+        # AACO on the phone (2026-10-05): right after Investigate, same
+        # visibility rule as the sidebar entry.
+        if _aaco_enabled_for(shell_user):
+            mobile_items.insert(5, ("aaco", "/aaco", "AACO"))
 
 
 
