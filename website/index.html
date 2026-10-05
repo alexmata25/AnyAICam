@@ -533,6 +533,27 @@
 </style>
 
 
+<style id="aic-residential-vms">
+.aic-residential-callout{display:inline-flex;align-items:center;gap:.55rem;margin:0 0 1rem;padding:.45rem .9rem .45rem .5rem;border-radius:999px;background:rgba(104,215,223,.12);border:1px solid rgba(104,215,223,.45);color:#e8f7ff;font-weight:800;text-decoration:none;font-size:.95rem}
+.aic-residential-callout span{background:#cc3b96;color:#fff;border-radius:999px;padding:.2rem .6rem;font-size:.75rem;letter-spacing:.04em;text-transform:uppercase}
+.aic-residential-callout:hover{border-color:#68d7df}
+.aic-residential{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:2rem;align-items:center;background:#fff;border:3px solid #68d7df;border-radius:20px;padding:1.8rem;margin:0 0 1.8rem;box-shadow:0 18px 44px rgba(11,43,79,.10)}
+.aic-residential-media{background:linear-gradient(160deg,#eef8fb,#f7fbff);border-radius:16px;display:grid;place-items:center;padding:1.2rem}
+.aic-residential-media img{display:block;width:100%;max-width:440px;height:auto}
+.aic-residential-badges{display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:.7rem}
+.aic-residential-badges span{display:inline-block;border-radius:999px;padding:.32rem .75rem;font-size:.78rem;font-weight:900;letter-spacing:.04em;text-transform:uppercase}
+.aic-residential-badges .badge-res{background:#cc3b96;color:#fff}.aic-residential-badges .badge-new{background:#e6f7f9;color:#0b5560}
+.aic-residential h3{font-size:clamp(1.5rem,3vw,2rem);line-height:1.15;margin:0 0 .45rem;color:#071032}
+.aic-residential .aic-res-model{margin:0 0 .8rem;color:#52627a;font-weight:700}
+.aic-residential .aic-res-model strong{color:#071032;font-size:1.25rem}
+.aic-residential p{color:#33415c;line-height:1.65}
+.aic-residential ul{margin:.3rem 0 .9rem;padding-left:1.2rem;line-height:1.75;color:#33415c}
+.aic-residential .aic-res-note{font-size:.9rem;color:#52627a;margin:.2rem 0 1rem}
+.aic-residential .aic-res-cta{display:flex;flex-wrap:wrap;gap:.8rem;align-items:center}
+.aic-residential .aic-res-cta a.tel{font-weight:800;color:#0b2b4f;text-decoration:none}
+.aic-residential .aic-res-cta .aic-res-outline{background:#fff;color:#0b2b4f;border:2px solid #0b2b4f;box-shadow:none}
+@media(max-width:820px){.aic-residential{grid-template-columns:1fr;padding:1.2rem;gap:1.2rem}.aic-residential .aic-res-cta .button{width:100%;justify-content:center;text-align:center}}
+</style>
 <style id="aic-home-feature-showcase">
 .aic-home-features{background:#f7fbff;border-bottom:1px solid #d9e6f4;padding:3.5rem 1rem}
 .aic-home-features-inner{width:min(1180px,100%);margin:0 auto}
@@ -652,7 +673,7 @@
 <strong>Modular AI Analytics</strong>
 </div>
 </div>
-<div class="hero-actions"><a class="button primary" href="build-your-system.html">Build Your System</a><a class="button secondary" href="aac-features.html">Explore AAC Features</a><a class="button secondary" href="edge-appliance.html#appliances">Buy a Ryzen appliance</a><a class="button secondary" href="vms.html#linux-download">AnyAiCam for Linux</a></div><p class="hero-reassurance" style="margin:1rem 0 0;color:#52627a;font-size:.95rem;font-weight:700;"><!--release:home-linux-note state=published version=1.2.3 filename=anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz sha256=e32c4898f74b5135ecfe6191299cfad826951af1b94b5bf9a1fff98be2ebfaed url=https://anyaicam.com/downloads/anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz size=35258116-->AnyAiCam Ryzen appliances from $1,249.99, or run AnyAiCam on your own Ubuntu 24.04 PC.<!--/release:home-linux-note--> Windows version coming soon.</p>
+<a class="aic-residential-callout" href="#residential-vms"><span>New</span>Residential VMS for homes · $949.99 →</a><div class="hero-actions"><a class="button primary" href="build-your-system.html">Build Your System</a><a class="button secondary" href="aac-features.html">Explore AAC Features</a><a class="button secondary" href="edge-appliance.html#appliances">Buy a Ryzen appliance</a><a class="button secondary" href="vms.html#linux-download">AnyAiCam for Linux</a></div><p class="hero-reassurance" style="margin:1rem 0 0;color:#52627a;font-size:.95rem;font-weight:700;"><!--release:home-linux-note state=published version=1.2.3 filename=anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz sha256=e32c4898f74b5135ecfe6191299cfad826951af1b94b5bf9a1fff98be2ebfaed url=https://anyaicam.com/downloads/anyaicam-appliance-installer-1.2.3-vms-38a9a7a2592d.tar.gz size=35258116-->AnyAiCam appliances from $949.99, or run AnyAiCam on your own Ubuntu 24.04 PC.<!--/release:home-linux-note--> Windows version coming soon.</p>
 </div>
 <figure class="home-app-shot" style="position:relative;z-index:1;margin:0;min-width:0;align-self:center;"><a href="app-screens/vms-live-camera.webp" target="_blank" rel="noopener" aria-label="Open the AnyAiCam VMS Live View screenshot full size"><img src="app-screens/vms-live-camera.webp" alt="The real AnyAiCam VMS Live View: a driveway camera shown full size, with the Live, Events, Smart alerts, Playback, Dashboard, Analytics and Investigate menu" width="1600" height="1000" decoding="async" fetchpriority="high" style="display:block;width:100%;height:auto;aspect-ratio:16/10;border-radius:16px;border:1px solid #d9e4f2;box-shadow:0 24px 55px rgba(7,16,50,.24);background:#0f1f2e;"></a><figcaption style="margin-top:.7rem;color:#d5dff8;font-size:.95rem;line-height:1.55;">The AnyAiCam VMS Live View, running locally on your AnyAiCam system. Optional cloud services extend it; they do not replace it.</figcaption></figure>
 </section>
@@ -663,8 +684,26 @@
     <div class="aic-home-access-head">
       <p class="eyebrow">ANYAICAM VMS EDGE APPLIANCES</p>
       <h2 id="aic-vms-hardware-title">Choose the Edge class that matches the job.</h2>
-      <p>VMS-only customers should not pay for the dedicated facial-recognition appliance. Use the AnyAiCam Starter (MINISFORUM AI X1-255 · Ryzen 7 255) as the standard VMS appliance, choose the AnyAiCam Professional (MINISFORUM AI X1 · Ryzen AI 9 HX 470) when the site needs more compute headroom, and use the separate AnyAiCam Enterprise appliance only when AAC Face Access is part of the system.</p>
+      <p>For homes, start with the new AnyAiCam Residential VMS. For businesses, VMS-only customers should not pay for the dedicated facial-recognition appliance. Use the AnyAiCam Starter (MINISFORUM AI X1-255 · Ryzen 7 255) as the standard VMS appliance, choose the AnyAiCam Professional (MINISFORUM AI X1 · Ryzen AI 9 HX 470) when the site needs more compute headroom, and use the separate AnyAiCam Enterprise appliance only when AAC Face Access is part of the system.</p>
     </div>
+    <article class="aic-residential" id="residential-vms" aria-labelledby="residential-vms-title">
+      <div class="aic-residential-media"><img src="aac-vms-residential-ryzen5.webp" alt="AnyAiCam Residential VMS: compact Ryzen 5 residential appliance" width="960" height="720" loading="lazy" decoding="async"></div>
+      <div>
+        <div class="aic-residential-badges"><span class="badge-res">Residential VMS</span><span class="badge-new">New · For homes</span></div>
+        <h3 id="residential-vms-title">Professional AI Security, Built for the Home</h3>
+        <p class="aic-res-model">AnyAiCam Residential VMS · Ryzen 5 residential appliance · <strong>$949.99</strong></p>
+        <p>Our entry-level AnyAiCam appliance, made for homes. It runs the same AnyAiCam VMS (live view, recording, playback, events and smart alerts) on a compact Ryzen 5 appliance in your home.</p>
+        <p style="margin:0"><strong>Designed for a typical home setup:</strong></p>
+        <ul>
+          <li>Front-door facial recognition for a small household</li>
+          <li>Optional Kwikset / Z-Wave smart-lock unlock</li>
+          <li>License plate recognition for your driveway</li>
+          <li>Intrusion and line-crossing alerts on your other cameras</li>
+        </ul>
+        <p class="aic-res-note">Plus your monthly AnyAiCam plan, priced per camera. Final camera and analytics capacity will be confirmed after hardware certification; we help you size your home system before you buy.</p>
+        <div class="aic-res-cta"><a class="button primary" href="build-your-system.html?system=residential">Build Your Home System</a><a class="button aic-res-outline" href="vms-contact.html">Ask About Residential</a><a class="tel" href="tel:+13465544699">or call (346) 554-4699</a></div>
+      </div>
+    </article>
     <div class="aic-access-grid">
       <article class="aic-access-card">
         <img src="aac-vms-edge-x1-255-ryzen7.jpg" alt="AnyAiCam Starter (MINISFORUM AI X1-255 · Ryzen 7 255) AnyAiCam VMS Edge appliance" loading="lazy">

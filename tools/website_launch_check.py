@@ -24,6 +24,8 @@ import website_release  # noqa: E402
 WEBSITE = website_release.WEBSITE
 
 APPLIANCES = {"Starter": "$1,249.99", "Professional": "$1,749.99", "Enterprise": "$2,249.99"}
+# Entry-level home appliance (2026-10-05), shown on the homepage only so far.
+RESIDENTIAL = ("AnyAiCam Residential VMS", "$949.99")
 RELAY = "$149.99"
 PLAN_TABLES = {  # plans.html, in page order
     "AnyAiCam VMS licence": ["$49.99 one-time", "$79.99 one-time", "$129.99 one-time", "$199.99 one-time"],
@@ -130,6 +132,9 @@ def check_prices(website: Path, fail):
         for match in re.finditer(r"(?:Numato|relay)[^$]{0,60}?\$([\d,]+\.\d\d)", text, re.I):
             if f"${match.group(1)}" != RELAY:
                 fail(f"{name}: relay next to an unexpected price ${match.group(1)}")
+    home = visible_text((website / "index.html").read_text(encoding="utf-8"))
+    if f"{RESIDENTIAL[0]} · Ryzen 5 residential appliance · {RESIDENTIAL[1]}" not in home:
+        fail(f"index.html: {RESIDENTIAL[0]} must show {RESIDENTIAL[1]}")
     plans = (website / "plans.html").read_text(encoding="utf-8")
     for title, prices in PLAN_TABLES.items():
         card = re.search(rf"<h3>{re.escape(title)}</h3>.*?</table>", plans, re.S)
@@ -193,6 +198,8 @@ def check_build_system(page: str, fail):
         amount = price.strip("$").replace(",", "")
         if not re.search(rf"name:'AnyAiCam {tier}[^']*',price:{re.escape(amount)}\}}", page):
             fail(f"{name}: one-time {tier} appliance price must be {price}")
+    if f"name:'{RESIDENTIAL[0]}',price:{RESIDENTIAL[1].strip('$')}}}" not in page:
+        fail(f"{name}: one-time {RESIDENTIAL[0]} price must be {RESIDENTIAL[1]}")
     if f"RELAY_PRICE={RELAY.strip('$')}" not in page:
         fail(f"{name}: one-time relay price must be {RELAY}")
     licence = ",".join(f"[{cap},{p.split()[0].strip('$')}]" for cap, p in zip((8, 16, 32, 64), PLAN_TABLES["AnyAiCam VMS licence"]))

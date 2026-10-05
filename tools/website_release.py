@@ -113,8 +113,8 @@ BLOCKS = {
     },
     "index.html": {
         "home-linux-note": (
-            'AnyAiCam Ryzen appliances from $1,249.99. AnyAiCam for your own Ubuntu 24.04 PC: release finalizing.',
-            'AnyAiCam Ryzen appliances from $1,249.99, or run AnyAiCam on your own Ubuntu 24.04 PC.',
+            'AnyAiCam appliances from $949.99. AnyAiCam for your own Ubuntu 24.04 PC: release finalizing.',
+            'AnyAiCam appliances from $949.99, or run AnyAiCam on your own Ubuntu 24.04 PC.',
         ),
     },
 }
