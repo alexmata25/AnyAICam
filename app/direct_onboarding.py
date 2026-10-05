@@ -28,16 +28,19 @@ unchanged.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
 from datetime import datetime, timedelta
 from html import escape
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from appliance_protocol import RateLimiter
+from per_camera_billing import purchase_intent_next
 from partner_db import audit, connection, password_hash
 
 logger = logging.getLogger("anyaicam.direct_onboarding")
@@ -146,16 +149,20 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         email = str(payload.get("email", "")).strip().lower()
+        # A Build Your System selection travels in the confirmation link,
+        # re-validated there and again on sign-in (plan/cameras only).
+        next_path = purchase_intent_next(payload.get("next"))
+        next_query = f"&next={quote(next_path, safe='')}" if next_path else ""
         from email_service import get_email_service
         if raw:
-            link = f"{_base(request)}/customer/verify-email?token={raw}"
+            link = f"{_base(request)}/customer/verify-email?token={raw}{next_query}"
             subject = "Confirm your AnyAiCam account"
             text = (f"Confirm your email address to finish creating your AnyAiCam account:\n{link}\n\n"
                     f"This link works once and expires in {VERIFY_TTL_HOURS} hours. If you didn't ask for this, ignore this email.")
         else:
             subject = "Your AnyAiCam account"
             text = ("Someone tried to create an AnyAiCam account with this email address, which already has one. "
-                    f"Sign in or reset your password instead: {_base(request)}/customer-login.html\n\n"
+                    f"Sign in or reset your password instead: {_base(request)}/customer-login.html{'?' + next_query[1:] if next_query else ''}\n\n"
                     "If this wasn't you, no action is needed.")
         try:
             result = get_email_service().send("email_verification", email, subject, text)
@@ -169,7 +176,7 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
         return {"message": GENERIC_SENT}
 
     @app.get("/customer/verify-email", response_class=HTMLResponse)
-    def verify_email(request: Request, token: str = ""):
+    def verify_email(request: Request, token: str = "", next: str = ""):
         client_ip = request.client.host if request.client else "unknown"
         if not _verify_limiter.allow(client_ip):
             return HTMLResponse(_page("Please wait", "Too many attempts. Please wait a few minutes and try again."), status_code=429)
@@ -181,13 +188,32 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         audit({"email": created["email"], "role": "customer_owner"}, "direct_signup.verified", "customer", created["customer_id"],
               {"channel": DIRECT_CHANNEL})
-        return HTMLResponse(_page("Your account is ready", "Sign in, then choose Local or Hybrid on My subscription.",
-                                  link=("/customer-login.html", "Sign in")),
+        next_path = purchase_intent_next(next)
+        if next_path and "?" in next_path:
+            # Kept on the new account, so the selection survives even if the
+            # customer signs in later from another device.
+            from urllib.parse import parse_qs, urlsplit
+            from per_camera_billing import save_build_selection, selection_from_query
+            try:
+                save_build_selection(created["customer_id"], selection_from_query(parse_qs(urlsplit(next_path).query)))
+            except Exception:
+                logger.exception("direct_signup.selection_not_saved")
+        if next_path:
+            ready = _page("Your account is ready", "Sign in to review your order and continue to secure checkout.",
+                          link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and continue"))
+        else:
+            ready = _page("Your account is ready", "Sign in, then choose a plan and camera count on My subscription.",
+                          link=("/customer-login.html", "Sign in"))
+        return HTMLResponse(ready,
                             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
     @app.get("/customer-signup", response_class=HTMLResponse)
-    def signup_page(request: Request):
-        form = ('<h2>Create your AnyAiCam account</h2><p>Buy directly from AnyAiCam. We\'ll email you a link to confirm your address.</p>'
+    def signup_page(request: Request, next: str = ""):
+        next_path = purchase_intent_next(next)
+        sign_in = f"/customer-login.html?next={quote(next_path, safe='')}" if next_path else "/customer-login.html"
+        carried = ('<p id="signup-selection">Your Build Your System selection is saved. After you confirm your email and sign in, '
+                   'your order summary will be ready for secure checkout.</p>') if next_path and "?" in next_path else ""
+        form = ('<h2>Create your AnyAiCam account</h2><p>Buy directly from AnyAiCam. We\'ll email you a link to confirm your address.</p>' + carried +
                 '<form id="signup-form"><label>Name<input id="s-name" autocomplete="name" required></label>'
                 '<label>Email<input id="s-email" type="email" autocomplete="email" required></label>'
                 f'<label>Password<input id="s-password" type="password" minlength="{MIN_PASSWORD_LENGTH}" autocomplete="new-password" required></label>'
@@ -197,14 +223,15 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                 '<p style="margin:0;color:#4b5873;font-size:13px">By creating an account you agree to the AnyAiCam '
                 '<a href="https://anyaicam.com/terms.html" target="_blank" rel="noopener">Terms of Service</a> and '
                 '<a href="https://anyaicam.com/privacy-policy.html" target="_blank" rel="noopener">Privacy Policy</a>.</p></form>'
-                '<p style="font-size:14px">Already have an account? <a href="/customer-login.html">Sign in</a></p>'
+                f'<p style="font-size:14px">Already have an account? <a href="{escape(sign_in, quote=True)}">Sign in</a></p>'
                 '<p style="font-size:14px">Working with an installer? <a href="/customer-register">Request an account through your installer</a>.</p>')
-        script = ("const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';"
+        script = (f"const signupNext={json.dumps(next_path or '')};"
+                  "const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';"
                   "let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='\"'&&v[v.length-1]==='\"'?v.slice(1,-1):v};"
                   "document.getElementById('signup-form').addEventListener('submit',async e=>{e.preventDefault();const msg=document.getElementById('message'),btn=e.target.querySelector('button');btn.disabled=true;"
                   "const r=await fetch('/api/customer/direct-signup',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({"
                   "name:document.getElementById('s-name').value,email:document.getElementById('s-email').value,password:document.getElementById('s-password').value,"
-                  "confirm_password:document.getElementById('s-confirm').value})}),b=await r.json().catch(()=>({}));msg.style.display='block';"
+                  "confirm_password:document.getElementById('s-confirm').value,next:signupNext||undefined})}),b=await r.json().catch(()=>({}));msg.style.display='block';"
                   "msg.textContent=b.message||b.detail||'Something went wrong. Please try again.';"
                   "if(r.ok){msg.style.background='#e7f6ec';msg.style.color='#14532d';e.target.querySelectorAll('input').forEach(i=>i.disabled=true)}else btn.disabled=false});")
         return HTMLResponse(_page(None, None, body=form, script=script))

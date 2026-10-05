@@ -1272,6 +1272,19 @@ CREATE TABLE IF NOT EXISTS camera_plan_change_attempts_v2(
  UNIQUE(stripe_subscription_id,open_slot)
 );
 '''),
+    # Build Your System purchase progress (2026-10-05, per_camera_billing.
+    # build_progress): the validated plan/camera/hardware selection a
+    # customer brought from the website, kept per account so leaving My subscription
+    # never loses it. pending_checkout -> paid_setup_pending -> setup_complete.
+    # No prices, no Stripe IDs, no Checkout Session. Additive.
+    ('20261005_build_system_intents','''
+CREATE TABLE IF NOT EXISTS build_system_intents(
+ customer_id TEXT PRIMARY KEY, plan_key TEXT, camera_quantity INTEGER,
+ appliance_sku TEXT, relay_modules INTEGER, own_pc INTEGER NOT NULL DEFAULT 0,
+ state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ paid_at TEXT, completed_at TEXT
+);
+'''),
 ]
 
 

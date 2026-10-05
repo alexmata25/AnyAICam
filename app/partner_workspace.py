@@ -528,6 +528,13 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # they land on this dashboard instead, which now shows their
         # licensed-but-undiscovered slots honestly rather than hiding
         # them or redirecting away.
+        # An unpaid Build Your System purchase resumes on its order summary
+        # (website-first purchase, then setup), with the saved selection.
+        if identity['role']=='customer_owner' and not licensed_slots:
+            import per_camera_billing
+            progress=per_camera_billing.build_progress(customer['id'])
+            if progress and progress['state']==per_camera_billing.BUILD_PENDING:
+                return RedirectResponse(per_camera_billing.ORDER_SUMMARY_PATH,status_code=303)
         if identity['role']=='customer_owner' and not (activated and (cameras or licensed_slots>0)):
             return RedirectResponse('/customer/setup',status_code=303)
 

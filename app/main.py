@@ -41896,6 +41896,11 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     "/investigate",
     "/analytics",
     "/subscription-portal",
+    # Build Your System order pages (order_funnel.py, 2026-10-05): signed
+    # out -> the customer sign-in, which offers Create an account with the
+    # same next=.
+    "/order-summary",
+    "/order-complete",
     # /aaco (app/aaco_web.py) is the same shape bug as every other entry
     # above: a bare, cloud-only, customer-facing nav path that
     # authentication_middleware had no way to distinguish from an
@@ -48599,6 +48604,15 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         RUNTIME_ROLE == "cloud" and shell_role in {"customer_owner", "customer_viewer"}
     ):
         content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
+    # An unfinished Build Your System purchase follows the owner across the
+    # VMS (2026-10-05): Continue checkout until paid, then Continue to setup.
+    if shell_has_partner_identity and shell_role == "customer_owner":
+        try:
+            import per_camera_billing
+            content = per_camera_billing.purchase_progress_banner(
+                (shell_user or {}).get("customer_id"), request.url.path if request is not None else "") + content
+        except Exception:
+            application_logger.exception("purchase progress banner failed")
 
     # 2026-09-19: the persistent floating AACO assistant is injected
     # HERE, once, in the one shared shell every normal customer page
@@ -48786,6 +48800,8 @@ from customer_billing import register_customer_billing_routes
 register_customer_billing_routes(app)
 from per_camera_billing import register_routes as register_per_camera_billing_routes
 register_per_camera_billing_routes(app)
+from order_funnel import register_order_funnel_routes
+register_order_funnel_routes(app)
 from plan_changes import register_plan_change_routes, register_plan_management_routes
 register_plan_change_routes(app)
 register_plan_management_routes(app)
@@ -104346,7 +104362,7 @@ def _installer_steps_html(mode: str | None, filename: str = "", sha256: str = ""
     )
 
 
-def _customer_subscription_portal_page(identity: dict) -> str:
+def _customer_subscription_portal_page(identity: dict, request: Request | None = None) -> str:
     """The real-customer branch of GET /subscription-portal -- see that
     route's own comment for why this exists as a separate function
     entirely rather than a branch threaded through the ~1400-line legacy
@@ -104359,8 +104375,15 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS, product_mode_for_customer
     import per_camera_billing as _per_camera_billing
     _v2_entitlement = _per_camera_billing.entitlement_for_customer(identity["customer_id"])
+    # ?plan=&cameras= only pre-fill the picker or the change form (2026-10-05);
+    # malformed values are dropped and checkout re-validates both. Prices and
+    # Stripe Price IDs never come from the browser.
+    _query = request.query_params if request is not None else {}
+    _selection = {key: value for key, value in _per_camera_billing.selection_from_query(_query).items()
+                  if key in ("plan", "cameras")}
+    _payment_outcome = _query.get("camera_plan_payment") or ""
     if _v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended"):
-        return _per_camera_billing.customer_portal_page(identity, _v2_entitlement)
+        return _per_camera_billing.customer_portal_page(identity, _v2_entitlement, _selection, _payment_outcome)
     # New purchases are billing v2 only (owner decision 2026-10-05): a
     # customer with no active/suspended camera plan -- v2 or legacy -- gets
     # the per-camera plan picker, never the legacy fixed-capacity chooser.
@@ -104369,7 +104392,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                     if e["product"] in ("camera_slots_local", "camera_slots_hybrid")
                     and e["status"] in ("active", "suspended")]
     if not _legacy_plan:
-        return _per_camera_billing.customer_portal_page(identity, None)
+        return _per_camera_billing.customer_portal_page(identity, None, _selection, _payment_outcome)
     from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
 
     customer_id = identity["customer_id"]
@@ -104769,7 +104792,18 @@ def subscription_portal_page(request: Request) -> str:
     from partner_portal import partner_identity
     _subscription_identity = partner_identity(request)
     if _subscription_identity and _subscription_identity.get("role") in CUSTOMER_PORTAL_ROLES:
-        return _customer_subscription_portal_page(_subscription_identity)
+        # A new purchase handed over by Build Your System (older website links
+        # point here) belongs on the website-first order summary, outside the
+        # VMS, until it is paid for (owner decision 2026-10-05). Existing plan
+        # holders keep managing their plan here.
+        import per_camera_billing as _per_camera_billing
+        _handoff = _per_camera_billing.selection_from_query(request.query_params)
+        if (_subscription_identity.get("role") == "customer_owner" and _handoff.get("plan")
+                and not request.query_params.get("camera_plan_payment")
+                and not _per_camera_billing.has_camera_plan(_subscription_identity["customer_id"])):
+            return RedirectResponse(f"{_per_camera_billing.ORDER_SUMMARY_PATH}?{_per_camera_billing.selection_query(_handoff)}",
+                                    status_code=303)
+        return _customer_subscription_portal_page(_subscription_identity, request)
 
 
 

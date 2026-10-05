@@ -355,6 +355,7 @@ def test_cloud_customer_nav_path_prefixes_defined_and_matches_the_customer_nav()
         # remaining customer sidebar pages (2026-09-30)
         "/aac/people", "/phone-connect", "/mobile-devices", "/mobile-app", "/help",
         "/settings",  # Settings and its sub-pages, e.g. /settings/system (2026-10-03)
+        "/order-summary", "/order-complete",  # Build Your System order pages (2026-10-05)
     }
 
 

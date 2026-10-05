@@ -14,7 +14,8 @@ import sys
 import uuid
 from datetime import datetime
 from html import escape
-from typing import Optional
+from typing import Literal, Optional
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, conint
@@ -73,6 +74,10 @@ FEATURE_LABELS = {
 class CheckoutRequest(BaseModel):
     plan_key: str
     camera_quantity: conint(strict=True, ge=MIN_CAMERA_QUANTITY, le=MAX_CAMERA_QUANTITY)
+    # Where Stripe returns the customer: My subscription (existing
+    # customers) or the website-first order pages (Build Your System). A
+    # fixed choice, never a URL.
+    flow: Literal["subscription", "order"] = "subscription"
 
     class Config:
         extra = "forbid"
@@ -143,6 +148,191 @@ def public_catalog() -> dict:
             for key, plan in PLANS.items()
         ],
     }
+
+
+# Build Your System purchase intent (owner decision 2026-10-05: website-
+# first purchase). The website's Build Your System hands a new customer to
+# the AnyAiCam order summary (/order-summary?plan=&cameras=&appliance=&
+# vms_licence=&relays=), directly or through account creation, email
+# verification and sign-in as a next= value. Only the logical selection
+# travels and is stored: a known plan key, a whole camera count 1-64, a
+# catalog hardware SKU, a relay count, and whether the customer runs their
+# own PC. Prices and Stripe Price IDs are never read from the browser; the
+# order summary prices everything from PLANS / the hardware catalog and
+# checkout resolves the Stripe Price server-side.
+ORDER_SUMMARY_PATH = "/order-summary"
+ORDER_COMPLETE_PATH = "/order-complete"
+PURCHASE_INTENT_PATH = "/subscription-portal"
+_INTENT_PATHS = (ORDER_SUMMARY_PATH, PURCHASE_INTENT_PATH)
+MAX_RELAY_MODULES = 16
+
+
+def _whole_number(value, low: int, high: int) -> int | None:
+    if (isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 3 and value[0] != "0"
+            and low <= int(value) <= high):
+        return int(value)
+    return None
+
+
+def _appliance_skus() -> dict:
+    try:
+        import hardware_orders
+        return {sku: name for sku, product, name, _cents, _env in hardware_orders.HARDWARE_CATALOG if sku.startswith("AIC-APPLIANCE-")}
+    except Exception:
+        return {}
+
+
+def purchase_selection(plan, cameras, appliance=None, relays=None, vms_licence=None) -> dict:
+    """The valid part of a Build Your System selection; anything malformed is
+    dropped so the page falls back to its defaults."""
+    selection = {}
+    if isinstance(plan, str) and plan in PLANS:
+        selection["plan"] = plan
+    quantity = _whole_number(cameras, MIN_CAMERA_QUANTITY, MAX_CAMERA_QUANTITY)
+    if quantity:
+        selection["cameras"] = quantity
+    if isinstance(appliance, str) and appliance in _appliance_skus():
+        selection["appliance"] = appliance
+    relay_count = _whole_number(relays, 1, MAX_RELAY_MODULES)
+    if relay_count:
+        selection["relays"] = relay_count
+    if "appliance" not in selection and _whole_number(vms_licence, MIN_CAMERA_QUANTITY, MAX_CAMERA_QUANTITY):
+        selection["own_pc"] = 1
+    return selection
+
+
+def _single(query, key):
+    values = query.getlist(key) if hasattr(query, "getlist") else (query.get(key) or [])
+    return values[0] if len(values) == 1 else None
+
+
+def selection_from_query(query) -> dict:
+    """purchase_selection() for a request's query (or a parse_qs dict); a
+    repeated parameter counts as malformed."""
+    return purchase_selection(_single(query, "plan"), _single(query, "cameras"), _single(query, "appliance"),
+                              _single(query, "relays"), _single(query, "vms_licence"))
+
+
+def selection_query(selection: dict) -> str:
+    pairs = [("plan", selection.get("plan")), ("cameras", selection.get("cameras")), ("appliance", selection.get("appliance")),
+             ("relays", selection.get("relays")), ("vms_licence", selection.get("cameras") if selection.get("own_pc") else None)]
+    return urlencode([(key, value) for key, value in pairs if value])
+
+
+def purchase_intent_next(raw) -> str | None:
+    """A next= value that may be carried through direct signup, email
+    verification and sign-in: only the order summary (or the older My
+    subscription handoff), rebuilt from its valid selection. Anything else
+    (another path, another host, an auth route, encoded tricks) is None."""
+    if not isinstance(raw, str) or not raw or len(raw) > 512:
+        return None
+    if "\\" in raw or any(ord(ch) <= 32 or ord(ch) == 127 for ch in raw):
+        return None
+    parts = urlsplit(raw)
+    if parts.scheme or parts.netloc or parts.fragment or parts.path not in _INTENT_PATHS:
+        return None
+    query = selection_query(selection_from_query(parse_qs(parts.query)))
+    return ORDER_SUMMARY_PATH + ("?" + query if query else "")
+
+
+def _setup_needed(customer_id: str) -> bool:
+    """No activated appliance yet: the same test /customer-account uses
+    before sending an owner to /customer/setup."""
+    return not row("SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated' LIMIT 1", (customer_id,))
+
+
+BUILD_PENDING = "pending_checkout"
+BUILD_PAID = "paid_setup_pending"
+BUILD_DONE = "setup_complete"
+
+
+def has_camera_plan(customer_id: str) -> bool:
+    entitlement = entitlement_for_customer(customer_id)
+    if entitlement and entitlement.get("status") in ("active", "suspended"):
+        return True
+    return bool(row("SELECT id FROM customer_entitlements WHERE customer_id=? AND product IN ('camera_slots_local','camera_slots_hybrid') "
+                    "AND status IN ('active','suspended') LIMIT 1", (customer_id,)))
+
+
+def save_build_selection(customer_id: str, selection: dict) -> None:
+    """Keep a validated Build Your System selection on the account until it
+    is paid for. A selection with a plan replaces the saved one (a fresh
+    website hand-off); saving creates nothing in Stripe. An account that
+    already has a camera plan, or whose purchase is past checkout, is left
+    alone."""
+    if not customer_id or not selection.get("plan") or has_camera_plan(customer_id):
+        return
+    existing = row("SELECT state FROM build_system_intents WHERE customer_id=?", (customer_id,))
+    if existing and existing["state"] != BUILD_PENDING:
+        return
+    now = _now()
+    values = (selection["plan"], selection.get("cameras") or MIN_CAMERA_QUANTITY, selection.get("appliance"),
+              selection.get("relays"), 1 if selection.get("own_pc") else 0)
+    with connection() as db:
+        db.execute("INSERT INTO build_system_intents(customer_id,plan_key,camera_quantity,appliance_sku,relay_modules,own_pc,state,"
+                   "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(customer_id) DO UPDATE SET plan_key=excluded.plan_key,"
+                   "camera_quantity=excluded.camera_quantity,appliance_sku=excluded.appliance_sku,relay_modules=excluded.relay_modules,"
+                   "own_pc=excluded.own_pc,updated_at=excluded.updated_at", (customer_id, *values, BUILD_PENDING, now, now))
+
+
+def build_progress(customer_id: str) -> dict | None:
+    """The account's unfinished Build Your System purchase, or None. The
+    state follows the authoritative records: an active/suspended camera
+    plan (granted only by the verified Stripe webhook) means checkout is
+    done; an activated appliance means setup is."""
+    if not customer_id:
+        return None
+    try:
+        intent = row("SELECT * FROM build_system_intents WHERE customer_id=?", (customer_id,))
+    except Exception:  # table not migrated yet: no purchase in progress
+        return None
+    if not intent or intent["state"] == BUILD_DONE:
+        return None
+    state = intent["state"]
+    if state == BUILD_PENDING and has_camera_plan(customer_id):
+        state = BUILD_PAID
+    if state == BUILD_PAID and not _setup_needed(customer_id):
+        state = BUILD_DONE
+    if state != intent["state"]:
+        stamp = "paid_at" if state == BUILD_PAID else "completed_at"
+        with connection() as db:
+            db.execute(f"UPDATE build_system_intents SET state=?,{stamp}=?,updated_at=? WHERE customer_id=? AND state=?",
+                       (state, _now(), _now(), customer_id, intent["state"]))
+    if state == BUILD_DONE:
+        return None
+    selection = {"plan": intent["plan_key"] if intent["plan_key"] in PLANS else None, "cameras": intent["camera_quantity"],
+                 "appliance": intent["appliance_sku"] if intent["appliance_sku"] in _appliance_skus() else None,
+                 "relays": intent["relay_modules"], "own_pc": intent["own_pc"]}
+    return {"state": state, **{key: value for key, value in selection.items() if value}}
+
+
+def purchase_progress_banner(customer_id: str, path: str = "") -> str:
+    """The notice on every customer VMS page while a Build Your System
+    purchase is unfinished: back to the order summary until paid, then to
+    setup (not repeated on the setup page itself)."""
+    progress = build_progress(customer_id)
+    if not progress:
+        return ""
+    if progress["state"] == BUILD_PENDING:
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
+                '<strong>Setup incomplete</strong> — Complete your subscription to activate your cameras. '
+                f'<a href="{ORDER_SUMMARY_PATH}">Continue checkout</a></div>')
+    if path.rstrip("/") == "/customer/setup":
+        return ""
+    return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
+            '<strong>Payment complete</strong> — Set up your AnyAiCam system. '
+            '<a href="/customer/setup">Continue to setup</a></div>')
+
+
+def _return_urls(base: str, flow: str, plan_key: str, quantity: int) -> list:
+    """Stripe's success/cancel destinations: fixed AnyAiCam pages built from
+    the server-validated plan and quantity, never from the browser."""
+    if flow == "order":
+        return [("success_url", f"{base}{ORDER_COMPLETE_PATH}?session_id={{CHECKOUT_SESSION_ID}}"),
+                ("cancel_url", f"{base}{ORDER_SUMMARY_PATH}?checkout=cancelled")]
+    return [("success_url", f"{base}/subscription-portal?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+            # A cancelled checkout returns to the same selection.
+            ("cancel_url", f"{base}/subscription-portal?camera_plan_payment=cancelled&" + urlencode({"plan": plan_key, "cameras": quantity}))]
 
 
 def _table_exists_query(customer_id: str) -> dict | None:
@@ -543,7 +733,8 @@ def _camera_count(quantity, noun: str = "camera") -> str:
     return f"{int(quantity)} {noun}{'' if int(quantity) == 1 else 's'}"
 
 
-def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
+def customer_portal_page(identity: dict, entitlement: dict | None, selection: dict | None = None,
+                         payment_outcome: str = "") -> str:
     """The v2 My Subscription panel. Legacy accounts stay on the legacy
     renderer; v2 customers see their exact quantity, plan entitlements and
     separately licensed premium analytics."""
@@ -589,18 +780,36 @@ def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
         actions.append('<button class="ghost-button" id="manage-billing-button">Manage billing</button>')
     action_html = f'<div class="plan-actions">{"".join(actions)}</div><p id="v2-message" class="health-detail" role="status"></p>' if actions else '<p id="v2-message" class="health-detail" role="status"></p>'
     picker = ""
-    if is_owner and not payload:
-        options = "".join(f'<option value="{key}">{escape(plan["display_name"])} · ${plan["monthly_cents_per_camera"] / 100:.2f} per camera/month</option>' for key, plan in PLANS.items())
-        picker = ('<section class="panel" id="v2-checkout"><h2>Choose a per-camera plan</h2>'
+    selection = selection or {}
+    selected_plan = selection.get("plan")
+    selected_quantity = selection.get("cameras")
+    selection_note = ""
+    if selection:
+        chosen = [escape(PLANS[selected_plan]["display_name"])] if selected_plan else []
+        chosen += [_camera_count(selected_quantity)] if selected_quantity else []
+        selection_note = f'<p class="health-detail" id="v2-selection-note">Selected in Build Your System: {" · ".join(chosen)}.</p>'
+    activating = ""
+    if is_owner and not payload and payment_outcome == "success":
+        # Stripe returned before its webhook activated the plan: say so and
+        # refresh, rather than offering checkout again (checkout_guard would
+        # refuse a second one anyway).
+        activating = ('<section class="panel" id="v2-activating"><h2>Payment received</h2>'
+                      '<p class="health-detail" role="status">Your plan is being activated. This page refreshes automatically.</p></section>')
+    elif is_owner and not payload:
+        if payment_outcome == "cancelled":
+            selection_note += '<p class="health-detail" id="v2-checkout-cancelled">Checkout was cancelled. No payment was taken.</p>'
+        options = "".join(f'<option value="{key}"{" selected" if key == selected_plan else ""}>{escape(plan["display_name"])} · ${plan["monthly_cents_per_camera"] / 100:.2f} per camera/month</option>' for key, plan in PLANS.items())
+        picker = ('<section class="panel" id="v2-checkout"><h2>Choose a per-camera plan</h2>' + selection_note +
                   '<label>Plan <select id="v2-plan-key">' + options + '</select></label> '
-                  '<label>Cameras <input id="v2-quantity" type="number" min="1" max="64" value="1"></label> '
+                  f'<label>Cameras <input id="v2-quantity" type="number" min="1" max="64" value="{selected_quantity or 1}"></label> '
                   '<p id="v2-total" class="health-detail"></p><button class="action-button" id="v2-checkout-button">Continue to secure checkout</button></section>')
     change = ""
     if is_owner and payload and is_active:
-        options = "".join(f'<option value="{key}" {"selected" if key == plan_key else ""}>{escape(plan["display_name"])}</option>' for key, plan in PLANS.items())
-        change = ('<section class="panel" style="margin-top:14px"><h2>Change plan or camera count</h2>'
+        change_plan = selected_plan or plan_key
+        options = "".join(f'<option value="{key}" {"selected" if key == change_plan else ""}>{escape(plan["display_name"])}</option>' for key, plan in PLANS.items())
+        change = ('<section class="panel" style="margin-top:14px" id="v2-change"><h2>Change plan or camera count</h2>' + selection_note +
                   f'<label>Plan <select id="v2-change-plan">{options}</select></label> '
-                  f'<label>Licensed cameras <input id="v2-change-quantity" type="number" min="1" max="64" value="{payload["camera_quantity"]}"></label> '
+                  f'<label>Licensed cameras <input id="v2-change-quantity" type="number" min="1" max="64" value="{selected_quantity or payload["camera_quantity"]}"></label> '
                   '<p id="v2-change-total" class="health-detail"></p><button class="action-button" id="v2-change-button">Review change</button>'
                   '<p class="health-detail">Increases and upgrades take effect after payment succeeds. Decreases and downgrades take effect at the next renewal.</p></section>')
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
@@ -608,7 +817,25 @@ def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
     vms_capacity = customer_entitlements.vms_license_capacity(customer_id)
     license_card = f'<div class="health-row"><span>VMS license</span><span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>' if payload else (
         f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>' if vms_capacity else '')
+    setup_next = ""
+    if is_owner and is_active and _setup_needed(customer_id):
+        # Purchase comes first, then setup (2026-10-05): once the plan is
+        # active and no appliance is activated yet, setup is the next step.
+        setup_next = ('<section class="panel" id="v2-setup-next"><h2>Payment complete — Set up your AnyAiCam system</h2>'
+                      '<p class="health-detail">Your plan is active. Connect your AnyAiCam appliance and add your cameras to start recording.</p>'
+                      '<a class="action-button" href="/customer/setup">Continue to setup</a></section>')
+    if selection and (picker or change):
+        scripts_focus = "const v2Focus=document.getElementById('v2-checkout')||document.getElementById('v2-change');if(v2Focus)v2Focus.scrollIntoView({block:'start'});"
+    else:
+        scripts_focus = ""
+    if activating:
+        scripts_focus += ("let v2Tries=0;try{v2Tries=Number(sessionStorage.getItem('v2ActivationTries')||0)}catch(e){}"
+                          "if(v2Tries<10){try{sessionStorage.setItem('v2ActivationTries',String(v2Tries+1))}catch(e){}setTimeout(()=>location.reload(),3000)}"
+                          "else{const s=document.querySelector('#v2-activating p');if(s)s.textContent='Activation is taking longer than usual. Refresh this page in a minute, or contact AnyAiCam support if your plan does not appear.'}")
+    else:
+        scripts_focus += "try{sessionStorage.removeItem('v2ActivationTries')}catch(e){}"
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
+    {activating}{setup_next}
     <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{billing_note}{action_html}</section>
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px"><h2>Included with {escape(payload['display_name']) if payload else 'your selected plan'}</h2>{feature_html or '<p class="health-detail">Included features will appear here after you select a plan.</p>'}</section>
@@ -627,6 +854,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None) -> str:
     document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;const response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}}),data=await response.json();if(!response.ok){{button.disabled=false;message.textContent=data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
     const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=async()=>{{const response=await fetch('/api/customer/billing-portal',{{method:'POST'}}),data=await response.json();if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}};
     document.querySelectorAll('time[data-local-date]').forEach(t=>{{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {{dateStyle:'medium'}})}});
+    {scripts_focus}
     </script>'''
     return main.page_shell("My subscription", "subscription-portal", content, scripts)
 
@@ -798,8 +1026,7 @@ def register_routes(app: FastAPI) -> None:
         import checkout_guard
         fields = [
             ("mode", "subscription"),
-            ("success_url", f"{main.PUBLIC_BASE_URL}/subscription-portal?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
-            ("cancel_url", f"{main.PUBLIC_BASE_URL}/subscription-portal?camera_plan_payment=cancelled"),
+            *_return_urls(main.PUBLIC_BASE_URL, payload.flow, plan_key, payload.camera_quantity),
             ("client_reference_id", customer_id), ("line_items[0][price]", price_id),
             ("line_items[0][quantity]", str(int(payload.camera_quantity))),
             ("metadata[anyaicam_customer_id]", customer_id), ("metadata[anyaicam_stripe_price_id]", price_id),
