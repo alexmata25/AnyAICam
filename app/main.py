@@ -41979,6 +41979,15 @@ PUBLIC_PATH_PREFIXES = (
 
     "/logout",
 
+    # Every sign-out and the partner sign-in page must be reachable with an
+    # expired, revoked or missing session (2026-10-05): otherwise the
+    # fallback below sent a second logout click, an expired session or a
+    # stale tab to /login?next=/partner-logout -- the local emergency
+    # recovery sign-in -- instead of the normal sign-in.
+    "/partner-logout",
+
+    "/partner-login",
+
     "/partner.html",
 
     "/customer-forgot-password",
@@ -42408,6 +42417,14 @@ async def authentication_middleware(request: Request, call_next):
     ):
         return RedirectResponse(f"/partner.html?next={next_url}", status_code=303)
 
+    # Cloud portal (2026-10-05): every remaining protected path is staff
+    # (partner/admin/technician) -- customers were routed above -- so an
+    # expired or missing session goes to the normal portal sign-in. The
+    # local emergency recovery sign-in (/login) stays directly reachable but
+    # is never an automatic destination there. On an edge appliance /login
+    # is the local sign-in and stays the fallback.
+    if RUNTIME_ROLE == "cloud":
+        return RedirectResponse(f"/partner.html?next={next_url}", status_code=303)
     return RedirectResponse(f"/login?next={next_url}", status_code=303)
 
 
@@ -46067,6 +46084,29 @@ def logout_destination(legacy_role: str | None, portal_role: str | None) -> str:
 
 def logout(request: Request):
     return perform_logout(request)
+
+
+@app.get("/logout")
+@app.get("/partner-logout")
+def logout_page_visit(request: Request):
+    """A GET never signs anyone out (sign-out is POST only, so a link or an
+    image cannot end a session); a bookmark, back button or stale redirect
+    to a logout URL just goes to the right page instead of the recovery
+    sign-in: home for a signed-in person, the customer sign-in otherwise."""
+    from partner_portal import partner_identity, destination_for_role
+    try:
+        portal_identity = partner_identity(request)
+    except Exception:
+        portal_identity = None
+    if portal_identity and portal_identity.get("role"):
+        destination = destination_for_role(portal_identity["role"])
+    elif authenticated_user(request):
+        destination = "/"
+    else:
+        destination = CUSTOMER_LOGIN_DESTINATION
+    response = RedirectResponse(destination, status_code=303)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def perform_logout(request: Request):

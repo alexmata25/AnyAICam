@@ -36,6 +36,19 @@ def destination_for_role(role: str) -> str:
     return role_destination(role)
 
 
+# Sign-in, sign-out and account-recovery routes are never a post-sign-in
+# destination (2026-10-05): a crafted ?next= pointing at one bounced a person
+# who had just signed in into another authentication flow -- e.g. next=/login,
+# the local emergency recovery sign-in. Same list as the sign-in pages' JS.
+AUTH_FLOW_PATHS = ('/login', '/logout', '/partner-logout', '/partner-login', '/customer-login.html', '/partner.html', '/change-password', '/customer-signup', '/customer-register', '/forgot-password', '/reset-password', '/customer-forgot-password', '/customer-reset-password', '/accept-invite', '/accept-invitation')
+
+
+def is_auth_flow_path(path) -> bool:
+    from urllib.parse import unquote
+    bare = unquote(str(path).split('?', 1)[0].split('#', 1)[0]).rstrip('/') or '/'
+    return any(bare == p or bare.startswith(p + '/') for p in AUTH_FLOW_PATHS)
+
+
 def _token(email: str, role: str, partner_id=None, customer_id=None, session_id=None, ttl_hours: int | None = None) -> str:
     if ttl_hours is None:
         from appliance_identity import get_ttl_config
@@ -268,7 +281,8 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         # protocol-relative), and whitespace/control characters have no
         # place in a same-origin path either.
         if not(isinstance(next_path,str) and next_path.startswith('/') and not next_path.startswith('//')
-               and '\\' not in next_path and not any(ch.isspace() or ord(ch)<32 for ch in next_path)):
+               and '\\' not in next_path and not any(ch.isspace() or ord(ch)<32 for ch in next_path)
+               and not is_auth_flow_path(next_path)):
             next_path=None
         if user and user.get('must_change_password'):
             destination='/change-password'

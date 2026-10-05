@@ -152,12 +152,14 @@ def test_customer_prefixed_paths_unaffected_by_this_fix_on_either_role(http_clie
         assert response.headers["location"].startswith("/customer-login.html?next="), role
 
 
-def test_unrecognized_paths_still_fall_back_to_login_even_on_cloud(http_client, monkeypatch):
+def test_unrecognized_paths_go_to_the_portal_sign_in_on_cloud_and_login_on_edge(http_client, monkeypatch):
     # Deliberately NOT in either CLOUD_CUSTOMER_NAV_PATH_PREFIXES or
-    # CLOUD_PARTNER_NAV_PATH_PREFIXES -- an unauthenticated visit to a
-    # genuinely unrecognized/legacy path must keep going to /login
-    # regardless of role. Proves the fix is a narrow widening, not a
-    # blanket default flip.
+    # CLOUD_PARTNER_NAV_PATH_PREFIXES. Owner decision 2026-10-05: on the
+    # cloud portal the local emergency recovery sign-in (/login) is never
+    # an automatic destination, so an unauthenticated visit to an
+    # unrecognized (staff/legacy) path goes to the normal portal sign-in;
+    # on an edge appliance /login is the local sign-in and stays the
+    # fallback (test_logout_recovery_routing.py).
     #
     # /admin-portal itself moved OUT of this test (2026-09-20): it is
     # not a "staff-only" path distinct from the Partner Portal -- it is
@@ -172,6 +174,10 @@ def test_unrecognized_paths_still_fall_back_to_login_even_on_cloud(http_client, 
     # test_unauthenticated_partner_path_redirects_to_partner_login_not_
     # emergency_recovery in test_website_partner_session_nav_links.py.
     monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    response = http_client.get("/some-genuinely-unrecognized-legacy-path")
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/partner.html?next=")
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
     response = http_client.get("/some-genuinely-unrecognized-legacy-path")
     assert response.status_code == 303
     assert response.headers["location"].startswith("/login?next=")
@@ -485,5 +491,7 @@ def test_partner_and_admin_signed_out_redirects_are_unchanged_by_the_settings_en
     for path in ("/partner", "/partner-quotes", "/admin-portal"):
         response = http_client.get(path)
         assert response.status_code == 303 and response.headers["location"].startswith("/partner.html?next="), path
-    # A path that only starts with the same letters is not a Settings page.
-    assert http_client.get("/settingsx").headers["location"].startswith("/login?next=")
+    # A path that only starts with the same letters is not a (customer)
+    # Settings page; on the cloud it goes to the portal sign-in, never to
+    # the customer sign-in and never to the recovery sign-in.
+    assert http_client.get("/settingsx").headers["location"].startswith("/partner.html?next=")
