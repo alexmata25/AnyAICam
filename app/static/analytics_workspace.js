@@ -202,6 +202,7 @@
   // it is shown again. A failed refresh keeps the table and the next tick
   // tries again. Other analytics pages do not poll.
   const LPR_REFRESH_MS=5000;
+  const LPR_CATCH_UP_PAGES=10;  // a refresh reads at most this many newer pages to reach what is shown
   let refreshTimer=null,refreshing=false;
   const rowFor=id=>[...results.querySelectorAll('.aw-lpr-row')].find(r=>r.dataset.event===id);
   function placeRow(e){
@@ -220,10 +221,11 @@
     if(summary!==shownSummary){shownSummary=summary;renderSummary(body.summary||{})}
     const shown=results.querySelectorAll('.aw-lpr-row').length;
     const fresh=body.events.filter(e=>!state.items.has(e.event_id));
-    if(!shown||(fresh.length&&fresh.length===body.events.length&&body.next_before)){
-      // Nothing listed yet (no reads, or an earlier error), or a whole page
-      // of new reads: show this page as a fresh load would.
-      if(!shown&&!body.events.length){
+    if(!shown){
+      // Nothing listed yet (no reads, or an earlier error): show this page
+      // as a fresh load would. Rows already listed -- including pages added
+      // by "Load more" and an open clip -- are never replaced.
+      if(!body.events.length){
         const note=results.querySelector('.aw-empty');
         if(!note||note.textContent!==emptyText())results.innerHTML=LPR_HEAD+`<div class="aw-empty">${esc(emptyText())}</div>`;
         return;
@@ -251,11 +253,29 @@
     const q=eventsQuery();if(q===null)return;
     const startedUnder=generation;refreshing=true;
     try{
-      const r=await fetch(`/api/customer/analytics/${key}/events?${q}`,{credentials:'same-origin'});
-      if(!r.ok)return;
-      const body=await r.json();
-      if(startedUnder!==generation||state.loading||!body||!Array.isArray(body.events))return;
-      mergeLatest(body);
+      const page=async before=>{
+        const pq=new URLSearchParams(q);if(before)pq.set('before',before);
+        const r=await fetch(`/api/customer/analytics/${key}/events?${pq}`,{credentials:'same-origin'});
+        if(!r.ok)return null;
+        const b=await r.json();
+        return b&&Array.isArray(b.events)?b:null;
+      };
+      const body=await page(null);
+      if(!body)return;
+      // A whole page of new reads: read the following (older) pages until one
+      // reaches a read already shown, so no read between them is skipped.
+      let cursor=body.next_before,pages=1;
+      const events=[...body.events];
+      while(results.querySelector('.aw-lpr-row')&&cursor&&pages<LPR_CATCH_UP_PAGES
+            &&events.length&&events.every(e=>!state.items.has(e.event_id))){
+        const next=await page(cursor);
+        if(!next||startedUnder!==generation)return;
+        events.push(...next.events.filter(e=>!events.some(x=>x.event_id===e.event_id)));
+        cursor=next.next_before;pages++;
+        if(next.events.some(e=>state.items.has(e.event_id)))break;
+      }
+      if(startedUnder!==generation||state.loading)return;
+      mergeLatest({...body,events});
     }catch(error){/* offline or busy: keep what is shown */}
     finally{refreshing=false}
   }

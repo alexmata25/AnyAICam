@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from test_analytics_workspace_browser import ASSETS, ORIGIN, SNAPSHOT, pages, playwright_instance  # noqa: F401
+from test_analytics_workspace_browser import ASSETS, ORIGIN, SNAPSHOT, pages, playwright_instance, webm  # noqa: F401
 from test_lpr_table_browser import lpr_page  # noqa: F401
 
 REFRESH_MS = 5000
@@ -20,7 +20,7 @@ NOW_MS = int(time.time() * 1000)
 
 
 def _read(event_id, minutes_ago, plate, *, has_clip=True):
-    return {"event_id": event_id, "camera_id": "cam-1", "event_type": "plate", "timestamp_ms": NOW_MS - minutes_ago * 60000,
+    return {"event_id": event_id, "camera_id": "cam-1", "event_type": "plate", "timestamp_ms": int(NOW_MS - minutes_ago * 60000),
             "confidence": 0.93, "has_clip": has_clip, "has_thumbnail": True,
             "details": {"plate": plate, "has_plate_image": False, "vehicle_type": "Car", "vehicle_color": "Blue",
                         "vehicle_make": None, "vehicle_model": None}}
@@ -29,21 +29,30 @@ def _read(event_id, minutes_ago, plate, *, has_clip=True):
 class Server:
     """The mocked events API: what it returns now, and every request it got."""
 
-    def __init__(self):
+    def __init__(self, page_size=None):
         self.events = [_read("p-2", 10, "BBB222"), _read("p-1", 30, "AAA111")]
         self.fail = False
         self.calls = []
+        self.page_size = page_size  # None: everything on one page
 
     def respond(self, route, url):
-        self.calls.append(parse_qs(urlsplit(url).query))
+        query = parse_qs(urlsplit(url).query)
+        self.calls.append(query)
         if self.fail:
             return route.fulfill(status=503, content_type="application/json", body=json.dumps({"detail": "busy"}))
         events = sorted(self.events, key=lambda e: e["timestamp_ms"], reverse=True)
+        total = len(events)
+        if "before" in query:  # like the real API: strictly older than the cursor
+            events = [e for e in events if e["timestamp_ms"] < int(query["before"][0])]
+        next_before = None
+        if self.page_size and len(events) > self.page_size:
+            events = events[:self.page_size]
+            next_before = str(events[-1]["timestamp_ms"])
         return route.fulfill(status=200, content_type="application/json", body=json.dumps(
-            {"events": events, "summary": {"total": len(events)}, "next_before": None, "enabled_camera_ids": ["cam-1"]}))
+            {"events": events, "summary": {"total": total}, "next_before": next_before, "enabled_camera_ids": ["cam-1"]}))
 
 
-def _open(playwright_instance, html, server, path="/analytics/lpr"):  # noqa: F811
+def _open(playwright_instance, html, server, path="/analytics/lpr", clip=None):  # noqa: F811
     try:
         browser = playwright_instance.chromium.launch()
     except Exception as error:
@@ -65,6 +74,10 @@ def _open(playwright_instance, html, server, path="/analytics/lpr"):  # noqa: F8
             return server.respond(route, url)
         if tail.endswith("/thumbnail") or tail.endswith("/plate-image"):
             return route.fulfill(status=200, content_type="image/jpeg", body=SNAPSHOT)
+        if clip is not None and tail.endswith("/media/url"):
+            return route.fulfill(status=200, content_type="application/json", body=json.dumps({"url": "/clips/clip.webm"}))
+        if clip is not None and tail.startswith("/clips/"):
+            return route.fulfill(status=200, content_type="video/webm", body=clip)
         return route.fulfill(status=404, body="")
 
     page.route("**/*", handle)
@@ -280,3 +293,71 @@ def test_other_analytics_workspaces_do_not_poll(playwright_instance, pages):  # 
         assert len(server.calls) == 1
     finally:
         browser.close()
+
+
+def _timestamps(page):
+    return page.evaluate("[...document.querySelectorAll('.aw-lpr-row')].map(r => r.dataset.event)")
+
+
+def test_a_whole_page_of_new_reads_keeps_loaded_pages_and_an_open_clip(playwright_instance, lpr_page, webm):  # noqa: F811
+    """Codex review of b7c7b72: a refreshed first page made entirely of new
+    reads (with more pages behind it) replaced the table, dropping the rows
+    "Load more" had added and closing a clip open on one of them."""
+    server = Server(page_size=3)
+    server.events = [_read(f"old-{n}", 10 * n, f"OLD{n:03d}") for n in range(1, 10)]  # 9 reads: three pages
+    browser, page = _open(playwright_instance, lpr_page, server, clip=webm)
+    try:
+        _until(page, lambda: _event_ids(page) == ["old-1", "old-2", "old-3"], what="the first page")
+        page.click("#aw-more")  # "Load more"
+        _until(page, lambda: len(_event_ids(page)) == 6, what="the second page")
+        assert page.is_visible("#aw-more"), "a third page remains"
+        older = page.locator('.aw-lpr-row[data-event="old-5"]')
+        older.locator(".aw-lpr-open").click()  # play a clip of an older, "Load more" row
+        _until(page, lambda: page.evaluate("""() => {
+            const row = document.querySelector('.aw-lpr-row[data-event="old-5"]');
+            return row.getAttribute('aria-expanded') === 'true' && row.nextElementSibling.classList.contains('inline-media-card');
+        }"""), what="the open clip")
+        card = page.evaluate_handle("document.querySelector('.inline-media-card')")
+
+        # More new reads than one page: the refreshed first page is all new and has a cursor.
+        server.events += [_read(f"new-{n}", -n / 60, f"NEW{n:03d}") for n in range(1, 5)]  # newest is new-4
+        page.clock.run_for(REFRESH_MS)
+        _until(page, lambda: len(_event_ids(page)) == 10, what="the new reads")
+        _settle(page)
+
+        ids = _event_ids(page)
+        assert ids == ["new-4", "new-3", "new-2", "new-1", "old-1", "old-2", "old-3", "old-4", "old-5", "old-6"]
+        assert len(ids) == len(set(ids))
+        stamps = page.evaluate("[...document.querySelectorAll('.aw-lpr-row')].map(r => r.querySelector('[data-label=\"Time\"]').innerText)")
+        assert len(stamps) == 10
+        # The open clip is the same element, still under the same read.
+        assert page.evaluate("""card => {
+            const row = document.querySelector('.aw-lpr-row[data-event="old-5"]');
+            return card.isConnected && row.getAttribute('aria-expanded') === 'true' && row.nextElementSibling === card;
+        }""", card)
+        assert page.evaluate("document.querySelectorAll('.inline-media-card').length") == 1
+        # Pagination is where it was: "Load more" brings the third page, once.
+        assert page.is_visible("#aw-more")
+        page.click("#aw-more")
+        _until(page, lambda: len(_event_ids(page)) == 13, what="the third page")
+        ids = _event_ids(page)
+        assert ids[-3:] == ["old-7", "old-8", "old-9"] and len(ids) == len(set(ids))
+        assert page.is_hidden("#aw-more")
+        assert page.evaluate("""() => document.querySelector('.aw-lpr-row[data-event="old-5"]').nextElementSibling
+                                    === document.querySelector('.inline-media-card')""")
+    finally:
+        browser.close()
+
+
+def test_catching_up_reads_only_until_it_reaches_what_is_shown(lpr):
+    """The refresh reads further pages only while every read on them is new."""
+    page, server = lpr
+    server.page_size = 2
+    server.events += [_read(f"new-{n}", -n / 60, f"NEW{n:03d}") for n in range(1, 4)]  # 3 new reads
+    base = len(server.calls)
+    page.clock.run_for(REFRESH_MS)
+    _until(page, lambda: len(_event_ids(page)) == 5, what="the new reads")
+    _settle(page)
+    assert _event_ids(page) == ["new-3", "new-2", "new-1", "p-2", "p-1"]
+    assert len(server.calls) - base == 2  # page one (all new), then page two (reaches p-2): stop
+    assert "before" in server.calls[-1] and "before" not in server.calls[-2]
