@@ -161,6 +161,91 @@ class RollbackSafetyTests(unittest.TestCase):
                         calls.index("systemctl stop anyaicam-vms.service"))
         self.assertEqual(calls[-1], "systemctl start anyaicam-vms.service")
 
+    # --restore-database (Codex re-review, 2026-10-06): the backup sits in the
+    # service-owned recordings area, so its inputs are checked and copied to a
+    # root-only folder before anything changes, and restored only from there.
+    manifest = rp.RollbackPointTests.manifest
+
+    def db_backup(self):
+        (self.recordings / "partner_portal.db").write_text("database after upgrade")
+        backup = rp.from_bash(self.manifest()["ROLLBACK_DATABASE_BACKUP"])
+        self.assertEqual(backup.read_text(), "online-backup")
+        return backup
+
+    def assert_refused_with_nothing_changed(self, result):
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not safe to restore from; nothing was changed", result.stderr)
+        calls = self.calls()
+        self.assertFalse([c for c in calls if c.startswith(("systemctl stop", "systemctl start", "docker tag"))], calls)
+        self.assert_new_release_untouched()
+        self.assertEqual(self.env_file.read_text(), self.env_text)
+        self.assertEqual(self.marker.read_text(), self.marker_text)
+        self.assertEqual((self.recordings / "partner_portal.db").read_text(), "database after upgrade")
+        self.assertFalse([p for p in self.recordings.iterdir() if p.name.startswith("partner_portal-before-rollback-")])
+
+    def test_a_symlinked_database_backup_is_refused_before_the_vms_is_stopped(self):
+        victim = self.tmp / "victim.db"
+        victim.write_text("root-only data")
+        for suffix in ("", "-wal", "-shm"):
+            with self.subTest(suffix or "main"):
+                self.setUp()
+                backup = self.db_backup()
+                target = Path(str(backup) + suffix)
+                if target.exists():
+                    target.unlink()
+                os.symlink(victim, target)
+                self.assert_refused_with_nothing_changed(self.rollback("--restore-database"))
+                self.assertEqual(victim.read_text(), "root-only data")
+
+    def test_a_hard_linked_database_backup_is_refused(self):
+        os.link(self.db_backup(), self.tmp / "second-name")
+        self.assert_refused_with_nothing_changed(self.rollback("--restore-database"))
+
+    def test_a_group_or_other_writable_database_backup_is_refused(self):
+        self.db_backup().chmod(0o666)
+        self.assert_refused_with_nothing_changed(self.rollback("--restore-database"))
+
+    @unittest.skipUnless(AS_ROOT, "needs root to give the backup another owner")
+    def test_a_database_backup_owned_by_another_user_is_refused(self):
+        os.chown(self.db_backup(), 12345, 12345)
+        self.assert_refused_with_nothing_changed(self.rollback("--restore-database"))
+
+    def test_a_valid_database_wal_and_shm_are_staged_and_restored(self):
+        backup = self.db_backup()
+        backup.chmod(0o640)
+        Path(str(backup) + "-wal").write_text("wal pages")
+        Path(str(backup) + "-shm").write_text("shm index")
+        result = self.rollback("--restore-database")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = self.recordings / "partner_portal.db"
+        self.assertEqual(current.read_text(), "online-backup")
+        self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o640)  # owner and mode as the backup had them
+        self.assertEqual(Path(str(current) + "-wal").read_text(), "wal pages")
+        self.assertEqual(Path(str(current) + "-shm").read_text(), "shm index")
+        [kept] = [p for p in self.recordings.iterdir() if p.name.startswith("partner_portal-before-rollback-") and p.suffix == ".db"]
+        self.assertEqual(kept.read_text(), "database after upgrade")
+
+    def test_replacing_the_backup_after_it_was_staged_cannot_change_the_restore(self):
+        backup = self.db_backup()
+        victim = self.tmp / "victim.db"
+        victim.write_text("root-only data")
+        swaps = self.bin / "systemctl"
+        swaps.write_text(SYSTEMCTL_STUB.replace('exit 0\n', textwrap.dedent('''\
+            if [[ "$1" == "stop" ]]; then
+              rm -f "$FAKE_DB_BACKUP"; printf 'swapped after staging' > "$FAKE_DB_BACKUP"
+              ln -s "$FAKE_VICTIM" "$FAKE_DB_BACKUP-wal"; ln -s "$FAKE_VICTIM" "$FAKE_DB_BACKUP-shm"
+            fi
+            exit 0
+            '''), 1), newline="\n")
+        result = self.rollback("--restore-database", FAKE_DB_BACKUP=rp.bash_path(backup), FAKE_VICTIM=rp.bash_path(victim))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(Path(str(backup)).read_text(), "swapped after staging")  # the swap happened...
+        current = self.recordings / "partner_portal.db"
+        self.assertEqual(current.read_text(), "online-backup")                   # ...after the copy was taken
+        self.assertFalse(os.path.lexists(str(current) + "-wal"))
+        self.assertFalse(os.path.lexists(str(current) + "-shm"))
+        self.assertEqual(victim.read_text(), "root-only data")
+
 
 @unittest.skipUnless(BASH and AS_ROOT, "needs Linux as root (real file ownership)")
 class LegacyAgentTreeTests(unittest.TestCase):
@@ -249,6 +334,60 @@ class LegacyAgentTreeTests(unittest.TestCase):
         self.assertIn("symbolic link", result.stderr)
         self.assertTrue(self.root.is_symlink())
 
+    # Codex re-review (2026-10-06): the move-aside is a change, so it comes
+    # after every check that can refuse the install, storage included.
+    LATER_STEPS = ("docker_setup", "provision_users_dirs", "deploy_vms", "install_rollback_tool", "install_agent",
+                   "install_mediamtx", "install_webrtc_firewall", "systemd_setup", "disable_system_suspend",
+                   "identity_provision", "provision_update_signing_key", "provision_entitlement_signing_keys",
+                   "stamp_release")
+
+    def run_install(self, free_gb):
+        """The real run_install() and storage_preflight(); the checks before
+        them pass, and every later step only records the agent tree's owner
+        when it runs."""
+        self.config = self.tmp / "etc-anyaicam"
+        self.config.mkdir(exist_ok=True)
+        (self.config / "agent.env").write_text("KEEP=1\n")
+        steps = "\n".join(f'{step}() {{ echo "STEP {step} $(stat -c %u "$AGENT_INSTALL_ROOT")" >> "{self.log}"; }}'
+                          for step in self.LATER_STEPS)
+        script = textwrap.dedent(f'''\
+            source ./install.sh
+            AGENT_INSTALL_ROOT="{self.root}"; CONFIG_DIR="{self.config}"
+            load_release_metadata() {{ :; }}; verify_installer_payload() {{ :; }}; preflight_checks() {{ :; }}
+            webrtc_port_preflight() {{ :; }}; vms_http_port_preflight() {{ :; }}; select_product_mode() {{ :; }}
+            detect_install_state() {{ INSTALL_STATE=existing; }}
+            free_gb_root() {{ echo {free_gb}; }}; total_gb_root() {{ echo 500; }}
+            ''') + steps + "\nrun_install --repair\n"
+        env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}")
+        return subprocess.run([BASH, "-c", script], cwd=ROOT, text=True, capture_output=True, env=env)
+
+    def test_a_refused_storage_preflight_leaves_a_legacy_tree_and_the_watcher_untouched(self):
+        self.legacy_tree()
+        before = sorted((str(p.relative_to(self.root)), os.lstat(p).st_uid) for p in self.root.rglob("*"))
+        result = self.run_install(free_gb=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("free storage detected", result.stderr)
+        self.assertEqual(os.lstat(self.root).st_uid, 65534)
+        self.assertEqual(sorted((str(p.relative_to(self.root)), os.lstat(p).st_uid) for p in self.root.rglob("*")), before)
+        self.assertEqual(self.quarantines(), [])
+        log = self.log.read_text() if self.log.exists() else ""
+        self.assertNotIn("systemctl", log)  # the watcher was neither stopped nor touched
+        self.assertNotIn("STEP", log)
+        self.assertEqual((self.config / "agent.env").read_text(), "KEEP=1\n")
+
+    def test_an_accepted_install_secures_a_legacy_tree_before_any_later_step(self):
+        self.legacy_tree()
+        result = self.run_install(free_gb=400)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.quarantines()), 1)
+        lines = self.log.read_text().splitlines()
+        steps = [line for line in lines if line.startswith("STEP ")]
+        self.assertEqual([line.split()[1] for line in steps], list(self.LATER_STEPS))
+        self.assertTrue(all(line.split()[2] == "0" for line in steps), steps)  # root-owned before docker_setup on
+        self.assertLess(lines.index("systemctl stop anyaicam-privileged-watcher.path anyaicam-privileged-watcher.service"),
+                        lines.index(steps[0]))
+        self.assertEqual((self.config / "agent.env").read_text(), "KEEP=1\n")
+
 
 class OrderTests(unittest.TestCase):
     def test_the_agent_tree_is_secured_before_any_other_step(self):
@@ -256,10 +395,14 @@ class OrderTests(unittest.TestCase):
         body = install.split("run_install() {", 1)[1]
         steps = [line.strip() for line in body.splitlines() if line.strip() and not line.strip().startswith(("#", "log ", "if ", "fi", "local ", "for ", "case ", "esac", "done", "mode=", "--", "*)", '[[ "$arg"'))]
         secure = steps.index("secure_agent_install_root")
-        # Right after the read-only root/OS and port checks: a refused port must
-        # leave the machine untouched, and nothing before it changes anything.
-        self.assertEqual(steps[secure - 3:secure], ["preflight_checks", "webrtc_port_preflight", "vms_http_port_preflight"])
-        for later in ("detect_install_state", "provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"", "install_agent \"$INSTALL_STATE\"",
+        # After every check that can refuse the install, so a refusal leaves
+        # the machine untouched; immediately before the first changing step.
+        for check in ("preflight_checks", "webrtc_port_preflight", "vms_http_port_preflight", "detect_install_state",
+                      "select_product_mode"):
+            self.assertLess(steps.index(check), secure, check)
+        self.assertEqual(steps[secure - 1], 'storage_preflight "$INSTALL_STATE"')
+        self.assertEqual(steps[secure + 1], "docker_setup")
+        for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"", "install_agent \"$INSTALL_STATE\"",
                       "systemd_setup", "provision_update_signing_key", "provision_entitlement_signing_keys"):
             self.assertGreater(steps.index(later), secure, later)
 

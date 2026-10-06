@@ -423,6 +423,43 @@ def write_agent_file(path: Path, data: bytes, *, mode: int, owner: str) -> None:
     safe_replace(path.parent, path.name, data, mode=mode, owner=_named_owner(owner))
 
 
+# A database backup can be far larger than _MAX_SMALL_FILE; it is streamed,
+# so this only bounds disk use, never memory.
+_MAX_STAGED_FILE = 1 << 40
+
+
+def stage_untrusted_file(source: Path, dest: Path) -> bool:
+    """Copies `source` -- a file in a folder a less-privileged user controls,
+    e.g. a database backup in the VMS recordings area -- to `dest`, a new
+    file in a folder only the caller may write (rollback.sh, 2026-10-06).
+    The source passes _open_untrusted() (never a symlink, a hard link, a
+    non-regular or a group/other-writable file) and must be owned by root or
+    the anyaicam user. The copy keeps its owner and mode, so restoring it
+    later is what restoring the original was. False when `source` is absent."""
+    if not os.path.lexists(source):
+        return False
+    parent = os.lstat(dest.parent)
+    if not statmod.S_ISDIR(parent.st_mode) or (_posix() and (parent.st_uid != os.geteuid() or parent.st_mode & 0o022)):
+        raise ValueError(f"{dest.parent} is not a folder only this process may write")
+    handle, info = _open_untrusted(source, expected_uid=None)
+    with handle:
+        if _posix():
+            allowed = {0, _agent_uid(), os.geteuid()}  # geteuid(): non-root test runs only
+            if info.st_uid not in allowed:
+                raise Failure("rejected", "bad_staging", f"{source.name} is owned by uid {info.st_uid}, not root or anyaicam")
+        descriptor = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(descriptor, "wb") as out:
+            for chunk in _read_chunks(handle, source, _MAX_STAGED_FILE):
+                out.write(chunk)
+            out.flush()
+            if _posix():
+                if os.geteuid() == 0:
+                    os.fchown(out.fileno(), info.st_uid, info.st_gid)
+                os.fchmod(out.fileno(), statmod.S_IMODE(info.st_mode))
+    return True
+
+
 def update_env_file(path: Path, *, defaults: Optional[dict] = None, overrides: Optional[dict] = None,
                     remove=(), template: Optional[bytes] = None, mode: int = 0o640, owner: str = "anyaicam") -> None:
     """KEY=value file edit, as the shell's '^KEY=' tests did: `defaults` are
@@ -464,7 +501,9 @@ def agent_file_main(stream=None) -> int:
       check -- the path is safe to read (with 'require_existing') or to
                replace: never a directory or other non-file; an existing
                file must pass the same checks a read does.
-      read  -- writes the file's bytes to stdout; exit 3 when absent."""
+      read  -- writes the file's bytes to stdout; exit 3 when absent.
+      stage -- 'source P' copied to the new file 'path P' through
+               stage_untrusted_file(); exit 3 when the source is absent."""
     stream = stream or sys.stdin.buffer
     request = {"default": {}, "override": {}, "remove": [], "if_missing": False}
     content = b""
@@ -518,6 +557,8 @@ def agent_file_main(stream=None) -> int:
             sys.stdout.buffer.write(data)
             sys.stdout.buffer.flush()
             return 0
+        if op == "stage":
+            return 0 if stage_untrusted_file(Path(request["source"]), path) else 3
         if op == "update_env":
             template = read_untrusted(Path(request["template"]), max_bytes=_MAX_SMALL_FILE, expected_uid=None) \
                 if request.get("template") else None

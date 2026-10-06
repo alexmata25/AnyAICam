@@ -161,10 +161,6 @@ run_install() {
     preflight_checks
     webrtc_port_preflight
     vms_http_port_preflight
-    # The first change the installer makes: after the read-only checks above
-    # (so a refused port leaves the machine untouched), before anything else
-    # may run code from the agent tree (see 07-install-agent.sh).
-    secure_agent_install_root
     detect_install_state
     if [[ "$mode" == "install" && "$INSTALL_STATE" == "partial" ]]; then
         log "Partial installation detected -- treating as repair, never silently as clean."
@@ -172,6 +168,11 @@ run_install() {
     fi
     select_product_mode
     storage_preflight "$INSTALL_STATE"
+    # After every check above that can refuse the install (so a refusal --
+    # ports, product mode, disk space -- leaves the machine untouched), and
+    # before any step that may run code from the agent tree (see
+    # 07-install-agent.sh).
+    secure_agent_install_root
     docker_setup
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"

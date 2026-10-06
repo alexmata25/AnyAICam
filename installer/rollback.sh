@@ -115,7 +115,8 @@ docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1 || die "Rollback image $R
 trusted_file "$ROLLBACK_CODE_ARCHIVE" "Rollback code archive"
 gzip -t "$ROLLBACK_CODE_ARCHIVE" || die "Rollback code archive is corrupt: $ROLLBACK_CODE_ARCHIVE"
 if [[ "$restore_database" == "1" ]]; then
-    [[ -f "$ROLLBACK_DATABASE_BACKUP" ]] || die "No database backup in this rollback point (--restore-database impossible)."
+    [[ -n "$ROLLBACK_DATABASE_BACKUP" && "$ROLLBACK_DATABASE_BACKUP" != "none" ]] \
+        || die "No database backup in this rollback point (--restore-database impossible)."
 fi
 if [[ -n "$ROLLBACK_MARKER" && "$ROLLBACK_MARKER" != "none" ]]; then
     trusted_file "$ROLLBACK_MARKER" "Saved release record"
@@ -130,6 +131,31 @@ printf 'op check\npath %s\nrequire_existing\n' "$VMS_ENV_FILE" | agent_file \
     || die "$VMS_ENV_FILE is not safe to update; nothing was changed."
 printf 'op check\npath %s\n' "$VMS_RELEASE_MARKER" | agent_file \
     || die "$VMS_RELEASE_MARKER cannot be written safely; nothing was changed."
+
+# The database backup (and its -wal/-shm) sits in the recordings area the
+# service user owns, so it could be swapped for a symlink or another file
+# before the restore. With --restore-database each is checked (never a
+# symlink, hard link or non-file; owned by root or anyaicam; not group/
+# other-writable) and copied now into a folder only root can write; the
+# restore later reads only those copies.
+db_stage=""
+if [[ "$restore_database" == "1" ]]; then
+    db_stage="$(mktemp -d)"
+    chmod 0700 "$db_stage"
+    trap 'rm -rf "$db_stage"' EXIT
+    for suffix in "" "-wal" "-shm"; do
+        stage_status=0
+        printf 'op stage\nsource %s\npath %s\n' "$ROLLBACK_DATABASE_BACKUP$suffix" "$db_stage/db$suffix" | agent_file \
+            || stage_status=$?
+        if [[ "$stage_status" == "3" && -n "$suffix" ]]; then
+            continue  # no -wal/-shm with this backup
+        elif [[ "$stage_status" == "3" ]]; then
+            die "No database backup in this rollback point (--restore-database impossible)."
+        elif [[ "$stage_status" != "0" ]]; then
+            die "The database backup $ROLLBACK_DATABASE_BACKUP$suffix is not safe to restore from; nothing was changed."
+        fi
+    done
+fi
 
 running="$(sed -n 's/^ANYAICAM_BUILD_ID=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1)"
 # Running the rollback build already (re-applying the same point, e.g. to add
@@ -153,7 +179,7 @@ snapshot="$(mktemp -d)"
 chmod 0700 "$staging" "$snapshot"
 mutating=0
 finished=0
-cleanup() { rm -rf "$staging" "$record" "$snapshot"; }
+cleanup() { rm -rf "$staging" "$record" "$snapshot" ${db_stage:+"$db_stage"}; }
 trap cleanup EXIT
 
 # Same exclusions as deploy_vms(): persistent state and secrets stay put.
@@ -304,8 +330,10 @@ if [[ "$restore_database" == "1" ]]; then
     for suffix in "" "-wal" "-shm"; do
         if [[ -f "$current$suffix" ]]; then mv "$current$suffix" "$kept$suffix"; fi
     done
-    cp -p "$ROLLBACK_DATABASE_BACKUP" "$current"
-    if [[ -f "$ROLLBACK_DATABASE_BACKUP-wal" ]]; then cp -p "$ROLLBACK_DATABASE_BACKUP-wal" "$current-wal"; fi
+    # Only from the checked copies taken before the VMS was stopped.
+    for suffix in "" "-wal" "-shm"; do
+        if [[ -f "$db_stage/db$suffix" ]]; then cp -p "$db_stage/db$suffix" "$current$suffix"; fi
+    done
     log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept as $kept."
 fi
 systemctl start "$VMS_SERVICE"
