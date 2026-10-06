@@ -645,6 +645,7 @@ NAV_ASSETS = """<style>
 .mobile-analytics-sheet a:active,.mobile-analytics-sheet a[aria-current="page"]{background:rgba(67,209,204,.14);color:#a7faf4}
 @media(min-width:761px){.mobile-analytics-sheet,.mobile-analytics-sheet:not([hidden]){display:none}}
 @media(max-width:760px){.mobile-nav{grid-template-columns:repeat(5,1fr)!important}.mobile-nav a,.mobile-analytics-toggle{font-size:12px;padding:10px 2px}}
+@media(max-width:760px){main.content{padding-bottom:var(--mobile-nav-clearance,92px)}}
 </style><script>(function(){
   const wrap=document.querySelector('[data-nav-flyout]');
   if(wrap){
@@ -679,5 +680,19 @@ NAV_ASSETS = """<style>
     mToggle.addEventListener('click',e=>{e.stopPropagation();setOpen(sheet.hidden)});
     document.addEventListener('click',e=>{if(!sheet.hidden&&!sheet.contains(e.target))setOpen(false)});
     document.addEventListener('keydown',e=>{if(e.key==='Escape')setOpen(false)});
+  }
+  // The fixed phone bottom bar wraps to two rows here, and its height (with
+  // the device's safe area below it) varies: the page keeps that much space
+  // free at the bottom, so its last control -- e.g. "Load more" -- always
+  // scrolls clear of the bar. Never less than the shell's 92 px.
+  const bar=document.querySelector('.mobile-nav'),content=document.querySelector('main.content');
+  if(bar&&content){
+    const clear=()=>{
+      const shown=getComputedStyle(bar).display!=='none';
+      if(shown)content.style.setProperty('--mobile-nav-clearance',Math.max(92,Math.ceil(innerHeight-bar.getBoundingClientRect().top+16))+'px');
+      else content.style.removeProperty('--mobile-nav-clearance');
+    };
+    clear();addEventListener('resize',clear);addEventListener('orientationchange',clear);
+    if(window.ResizeObserver)new ResizeObserver(clear).observe(bar);
   }
 })();</script>"""
