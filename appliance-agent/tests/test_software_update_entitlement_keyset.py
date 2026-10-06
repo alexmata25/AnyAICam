@@ -178,13 +178,186 @@ class RefusalTests(KeysetTestCase):
         self.assert_refused(result, expected_anchor=self.existing)
         self.assertIn("trust_anchor_write_failed", result["error"])
 
-    def test_a_missing_trust_anchor_directory_stops_the_update(self):
+    def test_an_unsafe_destination_stops_the_update_with_nothing_changed(self):
+        self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A, "cloud-2": KEY_B}))
+
+        def refuse(target, data, **kwargs):
+            raise ar.TrustAnchorError("trust_anchor_unsafe", f"{target.parent} is writable by group or others")
+        with mock.patch.object(ar, "install_trust_anchor", refuse):
+            result = self.applier().apply_staged()
+        self.assert_refused(result, expected_anchor=self.existing)
+        self.assertIn("trust_anchor_unsafe", result["error"])
+
+
+class MissingDirectoryTests(KeysetTestCase):
+    def test_a_missing_trust_anchor_directory_is_created_and_the_keyset_installed(self):
         self.paths.entitlement_keys = self.tmp / "no-such-dir" / "entitlement_signing_keys.json"
         self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A}))
         result = self.applier().apply_staged()
-        self.assertEqual(result["state"], "install_failed")
-        self.assertIn("trust_anchor_unsafe", result["error"])
-        self.assertFalse(self.paths.entitlement_keys.exists())
+        self.assertEqual(result["state"], "healthy", result.get("error"))
+        self.assertEqual(self.paths.entitlement_keys.read_bytes(), keyset(**{"cloud-1": KEY_A}))
+
+
+# ---------------------------------------------------------------- install_trust_anchor()
+# The one routine the applier and installer step 13 use (Codex re-review of
+# b22828b). A simulated POSIX host: lstat results are supplied per path, and
+# the directory creation and the atomic write are recorded, so every rule is
+# exercised on any test machine.
+
+def _stat(kind, mode, uid=0, nlink=1):
+    from types import SimpleNamespace
+    return SimpleNamespace(st_mode=kind | mode, st_uid=uid, st_nlink=nlink)
+
+
+SAFE_DIR = _stat(stat.S_IFDIR, 0o755)
+SAFE_FILE = _stat(stat.S_IFREG, 0o644)
+TARGET = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
+
+
+class SimulatedHost:
+    def __init__(self, directory=SAFE_DIR, target=None, write_error=None):
+        self.entries = {TARGET.parent: directory, TARGET: target}
+        self.writes, self.created, self.write_error = [], [], write_error
+
+    def lstat(self, path):
+        entry = self.entries.get(Path(path))
+        if entry is None:
+            raise FileNotFoundError(path)
+        return entry
+
+    def make_dir(self, directory, posix):
+        self.created.append((directory, posix))
+        self.entries[directory] = SAFE_DIR
+
+    def write(self, directory, name, data, *, mode, owner):
+        if self.write_error:
+            raise self.write_error
+        self.writes.append((directory, name, data, mode, owner))
+
+    def install(self):
+        ar.install_trust_anchor(TARGET, b"keyset", posix=True, lstat=self.lstat, write=self.write, make_dir=self.make_dir)
+
+
+def _refused(host, fragment):
+    import pytest
+    with pytest.raises(ar.TrustAnchorError) as raised:
+        host.install()
+    assert raised.value.code == "trust_anchor_unsafe" and fragment in str(raised.value)
+    assert host.writes == []
+
+
+def test_a_symlinked_directory_is_refused():
+    _refused(SimulatedHost(directory=_stat(stat.S_IFLNK, 0o777)), "symbolic link")
+
+
+def test_a_directory_that_is_not_a_directory_is_refused():
+    _refused(SimulatedHost(directory=_stat(stat.S_IFREG, 0o644)), "not a directory")
+
+
+def test_a_directory_not_owned_by_root_is_refused():
+    _refused(SimulatedHost(directory=_stat(stat.S_IFDIR, 0o755, uid=1000)), "owned by uid 1000")
+
+
+def test_a_group_writable_directory_is_refused():
+    _refused(SimulatedHost(directory=_stat(stat.S_IFDIR, 0o775)), "writable by group or others")
+
+
+def test_an_others_writable_directory_is_refused():
+    _refused(SimulatedHost(directory=_stat(stat.S_IFDIR, 0o757)), "writable by group or others")
+    _refused(SimulatedHost(directory=_stat(stat.S_IFDIR, 0o1777)), "writable by group or others")
+
+
+def test_a_symlinked_destination_is_refused():
+    _refused(SimulatedHost(target=_stat(stat.S_IFLNK, 0o777)), "symbolic link")
+
+
+def test_a_destination_that_is_not_a_regular_file_is_refused():
+    _refused(SimulatedHost(target=_stat(stat.S_IFDIR, 0o755)), "not a regular file")
+
+
+def test_a_destination_not_owned_by_root_is_refused():
+    _refused(SimulatedHost(target=_stat(stat.S_IFREG, 0o644, uid=1000)), "owned by uid 1000")
+
+
+def test_a_group_or_others_writable_destination_is_refused():
+    _refused(SimulatedHost(target=_stat(stat.S_IFREG, 0o664)), "writable by group or others")
+    _refused(SimulatedHost(target=_stat(stat.S_IFREG, 0o646)), "writable by group or others")
+
+
+def test_a_hard_linked_destination_is_refused():
+    _refused(SimulatedHost(target=_stat(stat.S_IFREG, 0o644, nlink=2)), "hard link")
+
+
+def test_a_missing_directory_is_created_root_owned_and_the_keyset_written_0644():
+    host = SimulatedHost(directory=None)
+    host.install()
+    assert host.created == [(TARGET.parent, True)]
+    assert host.writes == [(TARGET.parent, TARGET.name, b"keyset", 0o644, (0, 0))]
+
+
+def test_a_safe_existing_keyset_is_replaced_root_owned_0644():
+    host = SimulatedHost(target=SAFE_FILE)
+    host.install()
+    assert host.writes == [(TARGET.parent, TARGET.name, b"keyset", 0o644, (0, 0))]
+    host = SimulatedHost(directory=_stat(stat.S_IFDIR, 0o700), target=_stat(stat.S_IFREG, 0o444))
+    host.install()  # stricter modes are fine
+    assert len(host.writes) == 1
+
+
+def test_a_failed_write_is_reported_and_nothing_is_claimed():
+    import pytest
+    host = SimulatedHost(target=SAFE_FILE, write_error=OSError("disk full"))
+    with pytest.raises(ar.TrustAnchorError) as raised:
+        host.install()
+    assert raised.value.code == "trust_anchor_write_failed"
+
+
+def test_a_directory_that_cannot_be_created_is_refused():
+    import pytest
+
+    def cannot(directory, posix):
+        raise FileExistsError(directory)  # e.g. something was planted there meanwhile
+    host = SimulatedHost(directory=None)
+    with pytest.raises(ar.TrustAnchorError) as raised:
+        ar.install_trust_anchor(TARGET, b"keyset", posix=True, lstat=host.lstat, write=host.write, make_dir=cannot)
+    assert raised.value.code == "trust_anchor_unsafe" and host.writes == []
+
+
+def test_the_real_write_is_the_symlink_safe_atomic_replace(tmp_path):
+    """On a real filesystem (ownership checks off, as on a development host):
+    creates the directory, writes, replaces, and never writes through a
+    symlink planted at the destination."""
+    import pytest
+    target = tmp_path / "anchor" / "entitlement_signing_keys.json"
+    ar.install_trust_anchor(target, b"first", posix=False)
+    assert target.read_bytes() == b"first"
+    ar.install_trust_anchor(target, b"second", posix=False)
+    assert target.read_bytes() == b"second"
+    assert [p.name for p in target.parent.iterdir()] == [target.name]  # no temp files left behind
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"attacker")
+    target.unlink()
+    try:
+        os.symlink(outside, target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable here")
+    with pytest.raises(ar.TrustAnchorError, match="symbolic link"):
+        ar.install_trust_anchor(target, b"third", posix=False)
+    assert outside.read_bytes() == b"attacker"
+
+
+def test_a_real_symlinked_directory_is_refused(tmp_path):
+    import pytest
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        os.symlink(real, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable here")
+    with pytest.raises(ar.TrustAnchorError, match="symbolic link"):
+        ar.install_trust_anchor(link / "entitlement_signing_keys.json", b"x", posix=False)
+    assert list(real.iterdir()) == []
 
 
 class FixedPathTests(KeysetTestCase):

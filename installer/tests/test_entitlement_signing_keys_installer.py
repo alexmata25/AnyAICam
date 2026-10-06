@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -138,59 +139,80 @@ class BuilderTests(unittest.TestCase):
         self.assertIn('package / "payload/keys/entitlement-signing-public-keys.json"', source)
 
 
+def to_bash(path) -> str:
+    text = Path(path).as_posix()
+    return "/" + text[0].lower() + text[2:] if os.name == "nt" and text[1:2] == ":" else text
+
+
+# A successful install needs a root-owned destination: on a POSIX host that
+# means running as root (the refusals are tested everywhere).
+CAN_INSTALL_HERE = os.name != "posix" or os.geteuid() == 0
+
+
 @unittest.skipUnless(BASH, "bash is required")
 class KeysetProvisioningTests(unittest.TestCase):
-    """13-entitlement-signing-keys.sh with `install` stubbed to record owner/mode."""
+    """13-entitlement-signing-keys.sh run for real: the packaged keyset is
+    installed by the Software Update applier's install_trust_anchor()
+    (shipped in the package under payload/agent/system), with python3 pointed
+    at this test interpreter and the fixed destination re-pointed into a
+    temporary directory after sourcing (never through the environment)."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.bin = self.tmp / "bin"
-        self.bin.mkdir()
-        stub = self.bin / "install"
-        stub.write_text(textwrap.dedent('''\
-            #!/usr/bin/env bash
-            echo "install $*" >> "$STUB_LOG"
-            args=("$@"); last="${args[-1]}"
-            if [[ "$1" == "-d" ]]; then for a in "$@"; do [[ "$a" == /* || "$a" == ?:* ]] && mkdir -p "$a"; done; exit 0; fi
-            cp "${args[-2]}" "$last"
-            '''), newline="\n")
-        stub.chmod(0o755)
         self.payload = self.tmp / "payload"
         (self.payload / "keys").mkdir(parents=True)
-        self.log = self.tmp / "stub.log"
+        agent = REPO / "appliance-agent"
+        shutil.copytree(agent / "system", self.payload / "agent" / "system")
+        shutil.copytree(agent / "anyaicam_agent", self.payload / "agent" / "anyaicam_agent")
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        shim = self.bin / "python3"
+        shim.write_text(f'#!/usr/bin/env bash\nexec "{to_bash(sys.executable)}" "$@"\n', newline="\n")
+        shim.chmod(0o755)
         self.anchor = self.tmp / "etc-anyaicam-update" / "entitlement_signing_keys.json"
 
     def bash_path(self, path):
-        text = Path(path).as_posix()
-        return "/" + text[0].lower() + text[2:] if os.name == "nt" and text[1:2] == ":" else text
+        return to_bash(path)
 
     def run_step(self, keys_bytes, sha):
         if keys_bytes is not None:
             (self.payload / "keys" / "entitlement-signing-public-keys.json").write_bytes(keys_bytes)
-        # The step's destination is fixed; this harness re-points the shell
-        # variables after sourcing so the test never writes the real /etc.
-        anchor_dir = self.bash_path(self.anchor.parent)
-        script = (f'set -e; log(){{ echo "$*"; }}; PAYLOAD_DIR="{self.bash_path(self.payload)}"; '
+        anchor_dir = to_bash(self.anchor.parent)
+        script = (f'set -e; log(){{ echo "$*"; }}; PAYLOAD_DIR="{to_bash(self.payload)}"; '
                   f'ENTITLEMENT_SIGNING_KEYS_SHA256="{sha}"; '
-                  f'source "{self.bash_path(INSTALLER / "13-entitlement-signing-keys.sh")}"; '
+                  f'source "{to_bash(INSTALLER / "13-entitlement-signing-keys.sh")}"; '
                   f'ENTITLEMENT_KEYS_DIR="{anchor_dir}"; ENTITLEMENT_KEYS_FILE="{anchor_dir}/entitlement_signing_keys.json"; '
                   f'provision_entitlement_signing_keys')
-        env = dict(os.environ, PATH=self.bash_path(self.bin) + os.pathsep + os.environ.get("PATH", ""), STUB_LOG=str(self.log))
+        env = dict(os.environ, PATH=to_bash(self.bin) + os.pathsep + os.environ.get("PATH", ""))
         return subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env)
 
-    def keyset(self):
-        return (json.dumps({"keys": {"k1": PUBLIC}}, sort_keys=True, indent=2) + "\n").encode()
+    @staticmethod
+    def keyset(**keys):
+        keys = keys or {"k1": PUBLIC}
+        return (json.dumps({"keys": dict(sorted(keys.items()))}, sort_keys=True, indent=2) + "\n").encode()
 
-    def test_the_keyset_is_installed_root_owned(self):
-        data = self.keyset()
-        result = self.run_step(data, hashlib.sha256(data).hexdigest())
+    def run_keyset(self, data):
+        return self.run_step(data, hashlib.sha256(data).hexdigest())
+
+    @unittest.skipUnless(CAN_INSTALL_HERE, "installing needs a root-owned destination (run as root)")
+    def test_a_missing_directory_is_created_and_the_keyset_installed(self):
+        result = self.run_keyset(self.keyset())
         self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.log.read_text()
-        self.assertIn("install -m 0644 -o root -g root", log)
-        self.assertIn("entitlement_signing_keys.json", log)
-        self.assertIn("-d -m 0755 -o root -g root", log)
-        self.assertEqual(self.anchor.read_bytes(), data)
+        self.assertEqual(self.anchor.read_bytes(), self.keyset())
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.stat(self.anchor.parent).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(self.anchor).st_mode), 0o644)
+            self.assertEqual((os.stat(self.anchor).st_uid, os.stat(self.anchor.parent).st_uid), (0, 0))
+
+    @unittest.skipUnless(CAN_INSTALL_HERE, "installing needs a root-owned destination (run as root)")
+    def test_an_existing_keyset_is_replaced(self):
+        self.assertEqual(self.run_keyset(self.keyset()).returncode, 0)
+        rotated = self.keyset(k1=PUBLIC, k2=SECOND)
+        result = self.run_keyset(rotated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.anchor.read_bytes(), rotated)
+        self.assertEqual(sorted(p.name for p in self.anchor.parent.iterdir()), [self.anchor.name])  # no temp files left
 
     def test_a_keyset_that_does_not_match_release_env_is_refused(self):
         result = self.run_step(self.keyset(), "0" * 64)
@@ -200,10 +222,20 @@ class KeysetProvisioningTests(unittest.TestCase):
 
     def test_private_key_material_is_refused(self):
         data = b'{"keys": {"k1": "%s"}, "private_key_b64": "AAAA"}' % PUBLIC.encode()
-        result = self.run_step(data, hashlib.sha256(data).hexdigest())
+        result = self.run_keyset(data)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("private key", result.stderr)
         self.assertFalse(self.anchor.exists())
+
+    def test_a_non_canonical_or_malformed_keyset_is_refused_by_the_shared_validation(self):
+        for label, data in {"not canonical": json.dumps({"keys": {"k1": PUBLIC}}).encode(),
+                            "short key": self.keyset(k1="AAAA"),
+                            "extra field": (json.dumps({"keys": {"k1": PUBLIC}, "x": 1}, sort_keys=True, indent=2) + "\n").encode()}.items():
+            with self.subTest(label):
+                result = self.run_keyset(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("was not installed", result.stderr)
+                self.assertFalse(self.anchor.exists())
 
     def test_a_named_keyset_missing_from_the_package_is_refused(self):
         result = self.run_step(None, "a" * 64)
@@ -214,13 +246,43 @@ class KeysetProvisioningTests(unittest.TestCase):
         none = self.run_step(None, "")
         self.assertEqual(none.returncode, 0, none.stderr)
         self.assertIn("Talk Down and AAC Voice Call stay unavailable", none.stdout)
-        self.assertFalse(self.anchor.exists())
-        self.anchor.parent.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(self.anchor.parent.exists())  # nothing created when nothing is installed
+        self.anchor.parent.mkdir(parents=True)
         self.anchor.write_bytes(self.keyset())
         kept = self.run_step(None, "")
         self.assertEqual(kept.returncode, 0, kept.stderr)
         self.assertIn("left unchanged", kept.stdout)
         self.assertEqual(self.anchor.read_bytes(), self.keyset())
+
+    def test_an_unsafe_destination_is_refused_and_left_alone(self):
+        """Refusals come from install_trust_anchor() itself (its full rule set
+        is unit-tested in appliance-agent/tests/test_software_update_
+        entitlement_keyset.py); here, the real step with a real unsafe state."""
+        outside = self.tmp / "outside.json"
+        outside.write_bytes(b"attacker")
+        self.anchor.parent.mkdir(parents=True)
+        try:
+            os.symlink(outside, self.anchor)
+        except (OSError, NotImplementedError):
+            self.anchor.write_bytes(b"not root-owned")  # no symlinks here: a file the destination check must refuse
+            if os.name != "posix" or os.geteuid() == 0:
+                self.skipTest("symlinks unavailable and ownership cannot be made unsafe here")
+        result = self.run_keyset(self.keyset())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not installed", result.stderr)
+        self.assertEqual(outside.read_bytes(), b"attacker")
+
+    def test_a_symlinked_directory_is_refused(self):
+        real = self.tmp / "real-dir"
+        real.mkdir()
+        try:
+            os.symlink(real, self.anchor.parent, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable here")
+        result = self.run_keyset(self.keyset())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symbolic link", result.stderr)
+        self.assertEqual(list(real.iterdir()), [])
 
 
 @unittest.skipUnless(BASH, "bash is required")
@@ -230,9 +292,9 @@ class FixedPathTests(unittest.TestCase):
     def test_the_environment_cannot_redirect_the_step(self):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
-        script = (f'source "{KeysetProvisioningTests.bash_path(None, INSTALLER / "13-entitlement-signing-keys.sh")}"; '
+        script = (f'source "{to_bash(INSTALLER / "13-entitlement-signing-keys.sh")}"; '
                   'echo "$ENTITLEMENT_KEYS_DIR|$ENTITLEMENT_KEYS_FILE"')
-        redirect = KeysetProvisioningTests.bash_path(None, tmp / "attacker")
+        redirect = to_bash(tmp / "attacker")
         env = dict(os.environ, ANYAICAM_UPDATE_KEY_DIR=redirect, ENTITLEMENT_KEYS_DIR=redirect,
                    ENTITLEMENT_KEYS_FILE=redirect + "/keys.json")
         result = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env)
@@ -240,19 +302,18 @@ class FixedPathTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "/etc/anyaicam-update|/etc/anyaicam-update/entitlement_signing_keys.json")
 
     def test_the_step_installs_only_to_the_fixed_path(self):
-        """A log-only `install` stub: the destination it is given is the fixed
-        path even with the redirecting environment set."""
+        """A python3 stub records the destination install_trust_anchor() would be
+        given: the fixed path, even with the redirecting environment set."""
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
-        bin_dir, payload, log = tmp / "bin", tmp / "payload", tmp / "install.log"
+        bin_dir, payload, log = tmp / "bin", tmp / "payload", tmp / "python3.log"
         bin_dir.mkdir()
         (payload / "keys").mkdir(parents=True)
-        data = (json.dumps({"keys": {"k1": PUBLIC}}, sort_keys=True, indent=2) + "\n").encode()
+        data = KeysetProvisioningTests.keyset()
         (payload / "keys" / "entitlement-signing-public-keys.json").write_bytes(data)
-        stub = bin_dir / "install"
-        stub.write_text('#!/usr/bin/env bash\necho "install $*" >> "$STUB_LOG"\n', newline="\n")
+        stub = bin_dir / "python3"
+        stub.write_text('#!/usr/bin/env bash\necho "$@" >> "$STUB_LOG"\ncat >/dev/null\n', newline="\n")
         stub.chmod(0o755)
-        to_bash = lambda path: KeysetProvisioningTests.bash_path(None, path)  # noqa: E731
         script = (f'set -e; log(){{ echo "$*"; }}; PAYLOAD_DIR="{to_bash(payload)}"; '
                   f'ENTITLEMENT_SIGNING_KEYS_SHA256="{hashlib.sha256(data).hexdigest()}"; '
                   f'source "{to_bash(INSTALLER / "13-entitlement-signing-keys.sh")}"; provision_entitlement_signing_keys')
@@ -260,11 +321,18 @@ class FixedPathTests(unittest.TestCase):
                    ANYAICAM_UPDATE_KEY_DIR=to_bash(tmp / "attacker"), ENTITLEMENT_KEYS_DIR=to_bash(tmp / "attacker"))
         result = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = log.read_text().splitlines()
-        self.assertEqual(calls[0], "install -d -m 0755 -o root -g root /etc/anyaicam-update")
-        self.assertTrue(calls[-1].startswith("install -m 0644 -o root -g root "))
-        self.assertTrue(calls[-1].endswith(" /etc/anyaicam-update/entitlement_signing_keys.json"))
+        argv = log.read_text().split()
+        self.assertEqual(argv[0], "-")
+        self.assertEqual(argv[2], "/etc/anyaicam-update/entitlement_signing_keys.json")
+        self.assertTrue(argv[3].endswith("/payload/agent/system"))
         self.assertNotIn("attacker", log.read_text())
+
+    def test_the_step_uses_the_applier_routine_not_its_own(self):
+        step = _text(INSTALLER / "13-entitlement-signing-keys.sh")
+        self.assertIn("apply_release.install_trust_anchor(Path(sys.argv[2]), data)", step)
+        self.assertIn("apply_release.release_checks.validate_entitlement_keyset(data)", step)
+        code = "\n".join(line for line in step.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"(^|\s)install\s+-", "the step must not write with its own install(1) calls")
 
 
 @unittest.skipUnless(BASH, "bash is required")

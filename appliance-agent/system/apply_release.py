@@ -191,7 +191,7 @@ def _agent_uid() -> Optional[int]:
 
 # ---------------------------------------------------------------- file safety
 
-def ownership_problem(info, *, expected_uid: Optional[int]) -> str:
+def ownership_problem(info, *, expected_uid: Optional[int], posix: Optional[bool] = None) -> str:
     """'' when a stat result is a single-link regular file or a directory,
     owned by expected_uid and not writable by group or others; otherwise
     what is wrong. expected_uid=None skips only the owner comparison (hosts
@@ -202,7 +202,7 @@ def ownership_problem(info, *, expected_uid: Optional[int]) -> str:
         return "has more than one hard link"
     if expected_uid is not None and info.st_uid != expected_uid:
         return f"is owned by uid {info.st_uid}, expected {expected_uid}"
-    if _posix() and info.st_mode & 0o022:
+    if (_posix() if posix is None else posix) and info.st_mode & 0o022:
         return "is writable by group or others"
     return ""
 
@@ -230,6 +230,86 @@ def safe_replace(directory: Path, name: str, data: bytes, *, mode: int = 0o644, 
         except OSError:
             pass
         raise
+
+
+class TrustAnchorError(Exception):
+    """A trust anchor could not be installed safely. `code` is
+    'trust_anchor_unsafe' (the destination is not safe to write) or
+    'trust_anchor_write_failed' (the write itself failed)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _make_root_dir(directory: Path, posix: bool) -> None:
+    os.mkdir(directory, 0o755)  # fails rather than following anything planted there
+    if posix:
+        os.chown(directory, 0, 0, follow_symlinks=False)
+        os.chmod(directory, 0o755, follow_symlinks=False)
+
+
+def install_trust_anchor(target: Path, data: bytes, *, posix: Optional[bool] = None, lstat=os.lstat,
+                         write=None, make_dir=None) -> None:
+    """Installs `data` as a root-owned trust anchor at `target`: the one
+    routine for both the Software Update applier and installer step 13
+    (installer/13-entitlement-signing-keys.sh), with the same rules the VMS
+    (app/appliance_entitlements.py) and validate.sh enforce.
+
+    Refused, before anything is written (TrustAnchorError
+    'trust_anchor_unsafe'):
+      * the directory is a symlink, not a directory, not owned by root, or
+        writable by group or others;
+      * an existing destination is a symlink, not a regular file, hard-linked,
+        not owned by root, or writable by group or others.
+    A missing directory is created root:root 0755. The keyset is written
+    root:root 0644 through safe_replace(): a random O_CREAT|O_EXCL|O_NOFOLLOW
+    temp file in that root-owned directory, then an atomic rename -- never
+    through a symlink. Any failure leaves the previous anchor (or none) in
+    place, so paid features fail closed. posix/lstat/write/make_dir exist for
+    tests on hosts without POSIX ownership."""
+    posix = _posix() if posix is None else posix
+    root_uid = 0 if posix else None
+    directory = target.parent
+
+    def unsafe(message: str) -> TrustAnchorError:
+        return TrustAnchorError("trust_anchor_unsafe", message)
+
+    try:
+        info = lstat(directory)
+    except FileNotFoundError:
+        try:
+            (make_dir or _make_root_dir)(directory, posix)
+            info = lstat(directory)
+        except OSError as error:
+            raise unsafe(f"{directory} could not be created safely: {error}") from error
+    except OSError as error:
+        raise unsafe(f"{directory} cannot be inspected: {error}") from error
+    if statmod.S_ISLNK(info.st_mode):
+        raise unsafe(f"{directory} is a symbolic link")
+    if not statmod.S_ISDIR(info.st_mode):
+        raise unsafe(f"{directory} is not a directory")
+    problem = ownership_problem(info, expected_uid=root_uid, posix=posix)
+    if problem:
+        raise unsafe(f"{directory} {problem}")
+    try:
+        existing = lstat(target)
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise unsafe(f"{target} cannot be inspected: {error}") from error
+    if existing is not None:
+        if statmod.S_ISLNK(existing.st_mode):
+            raise unsafe(f"{target} is a symbolic link")
+        if not statmod.S_ISREG(existing.st_mode):
+            raise unsafe(f"{target} is not a regular file")
+        problem = ownership_problem(existing, expected_uid=root_uid, posix=posix)
+        if problem:
+            raise unsafe(f"{target} {problem}")
+    try:
+        (write or safe_replace)(directory, target.name, data, mode=0o644, owner=(0, 0) if posix else None)
+    except OSError as error:
+        raise TrustAnchorError("trust_anchor_write_failed", f"writing {target} failed: {error}") from error
 
 
 def read_untrusted(path: Path, *, max_bytes: int, expected_uid: Optional[int], dir_fd: Optional[int] = None) -> bytes:
@@ -696,21 +776,10 @@ class Applier:
         carries none."""
         if self.entitlement_keyset is None:
             return "unchanged"
-        target = self.paths.entitlement_keys
-        directory = target.parent
         try:
-            info = os.lstat(directory)
-        except OSError as error:
-            raise Failure("install_failed", "trust_anchor_unsafe", f"{directory} is missing ({error})") from error
-        if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISDIR(info.st_mode):
-            raise Failure("install_failed", "trust_anchor_unsafe", f"{directory} is not a real directory")
-        problem = ownership_problem(info, expected_uid=0 if _posix() else None)
-        if problem:
-            raise Failure("install_failed", "trust_anchor_unsafe", f"{directory} {problem}")
-        try:
-            safe_replace(directory, target.name, self.entitlement_keyset, mode=0o644, owner=(0, 0) if _posix() else None)
-        except OSError as error:
-            raise Failure("install_failed", "trust_anchor_write_failed", f"installing the entitlement keyset failed: {error}") from error
+            install_trust_anchor(self.paths.entitlement_keys, self.entitlement_keyset)
+        except TrustAnchorError as error:
+            raise Failure("install_failed", error.code, f"installing the entitlement keyset failed: {error}") from error
         return "updated"
 
     # ------------------------------------------------------------------ activate (downtime)

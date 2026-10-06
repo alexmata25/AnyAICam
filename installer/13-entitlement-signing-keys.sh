@@ -13,6 +13,15 @@
 #
 # A release without a keyset leaves an existing one unchanged; an appliance
 # that has none runs the VMS normally but denies every paid feature.
+#
+# The write itself is the Software Update applier's install_trust_anchor()
+# (appliance-agent/system/apply_release.py, shipped in this package): one
+# hardened routine for both paths. It refuses a symlinked, non-root or
+# group/other-writable directory or destination, creates a missing directory
+# root:root 0755, validates the keyset (canonical, public keys only) and
+# replaces it root:root 0644 by temp file + atomic rename, never through a
+# symlink. Any refusal or error stops the install with the previous keyset
+# (or none) in place -- paid features fail closed.
 
 # Fixed: the exact path the VMS (app/appliance_entitlements.py) and the
 # Software Update applier use. Deliberately not taken from the environment.
@@ -21,7 +30,6 @@ ENTITLEMENT_KEYS_FILE="$ENTITLEMENT_KEYS_DIR/entitlement_signing_keys.json"
 
 provision_entitlement_signing_keys() {
     local keys_src="$PAYLOAD_DIR/keys/entitlement-signing-public-keys.json"
-    install -d -m 0755 -o root -g root "$ENTITLEMENT_KEYS_DIR"
     if [[ -z "${ENTITLEMENT_SIGNING_KEYS_SHA256:-}" ]]; then
         if [[ -f "$ENTITLEMENT_KEYS_FILE" ]]; then
             log "This release provisions no entitlement-signing keyset; the existing one is left unchanged."
@@ -42,6 +50,21 @@ provision_entitlement_signing_keys() {
         echo "[ERROR] The packaged entitlement-signing keyset contains a key container or private key material; refusing to install it." >&2
         return 1
     fi
-    install -m 0644 -o root -g root "$keys_src" "$ENTITLEMENT_KEYS_FILE"
+    python3 - "$keys_src" "$ENTITLEMENT_KEYS_FILE" "$PAYLOAD_DIR/agent/system" <<'PYEOF' || {
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+import apply_release
+data = Path(sys.argv[1]).read_bytes()
+try:
+    apply_release.release_checks.validate_entitlement_keyset(data)
+    apply_release.install_trust_anchor(Path(sys.argv[2]), data)
+except (apply_release.release_checks.ReleaseCheckError, apply_release.TrustAnchorError) as error:
+    print(f"[ERROR] {error}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+        echo "[ERROR] The entitlement-signing keyset was not installed; paid features stay unavailable until this is fixed." >&2
+        return 1
+    }
     log "Provisioned the entitlement-signing public keyset at $ENTITLEMENT_KEYS_FILE (sha256 ${ENTITLEMENT_SIGNING_KEYS_SHA256:0:12}...)."
 }
