@@ -472,6 +472,89 @@ class RollbackSafetyTests(unittest.TestCase):
               touch "$STUB_LOG.started"
             ''') + textwrap.indent(textwrap.dedent(then), "  ") + "  exit 1\nfi\nexit 0\n", 1), newline="\n")
 
+    def exdev_rollback(self, suffix, failure=None):
+        """Force EXDEV only while an original moves from the private keep dir
+        back into recordings. Optional failures target copy or atomic replace.
+        """
+        hooks = self.tmp / "exdev-hook"
+        hooks.mkdir(exist_ok=True)
+        hook = textwrap.dedent('''
+            import errno, os, shutil
+            _rename = os.rename
+            _copyfileobj = shutil.copyfileobj
+            def _fd_path(fd):
+                try: return os.readlink(f"/proc/self/fd/{fd}")
+                except OSError: return ""
+            def _matches(name):
+                return name == "partner_portal.db" + os.environ["FAKE_EXDEV_SUFFIX"]
+            def _forced_rename(src, dst, *args, **kwargs):
+                sfd, dfd = kwargs.get("src_dir_fd"), kwargs.get("dst_dir_fd")
+                if sfd is not None and dfd is not None and src == dst and _matches(src):
+                    source_dir, dest_dir = _fd_path(sfd), _fd_path(dfd)
+                    if "replaced-database-" in source_dir and dest_dir == os.environ["FAKE_RECORDINGS"]:
+                        raise OSError(errno.EXDEV, "forced EXDEV for rollback test")
+                if (os.environ.get("FAKE_EXDEV_FAILURE") == "replace" and sfd is not None and dfd == sfd
+                        and os.path.exists(os.environ["FAKE_START_MARKER"])
+                        and str(src).startswith(".partner_portal.db") and _matches(dst)):
+                    raise OSError(errno.EIO, "forced atomic replacement failure")
+                return _rename(src, dst, *args, **kwargs)
+            def _forced_copy(src, dst, *args, **kwargs):
+                source = _fd_path(src.fileno())
+                if (os.environ.get("FAKE_EXDEV_FAILURE") == "copy" and "replaced-database-" in source
+                        and _matches(os.path.basename(source))):
+                    raise OSError(errno.EIO, "forced cross-filesystem copy failure")
+                return _copyfileobj(src, dst, *args, **kwargs)
+            os.rename = _forced_rename
+            shutil.copyfileobj = _forced_copy
+            ''')
+        (hooks / "sitecustomize.py").write_text(hook, newline="\n")
+        (self.bin / "systemctl").write_text(SYSTEMCTL_STUB.replace(
+            'exit 0\n', '[[ "$1" == "start" && ! -f "$STUB_LOG.started" ]] && { touch "$STUB_LOG.started"; exit 1; }\nexit 0\n'),
+            newline="\n")
+        return self.rollback(
+            "--restore-database", PYTHONPATH=str(hooks), FAKE_EXDEV_SUFFIX=suffix,
+            FAKE_EXDEV_FAILURE=failure or "", FAKE_RECORDINGS=str(self.recordings),
+            FAKE_START_MARKER=str(self.log) + ".started")
+
+    def test_forced_exdev_recovery_atomically_restores_each_existing_db_file(self):
+        for suffix in ("", "-wal", "-shm"):
+            with self.subTest(suffix or "database"):
+                self.setUp()
+                self.database_set()
+                result = self.exdev_rollback(suffix)
+                self.assertNotEqual(result.returncode, 0)  # first start is deliberately failed
+                self.assertIn("previous release was put back and the VMS restarted", result.stderr)
+                self.assert_files(self.ORIGINAL)
+                self.assertEqual(self.keep_dirs(), [])
+                self.assertEqual(self.temps(), [])
+                self.assertEqual(self.calls().count("systemctl start anyaicam-vms.service"), 2)
+
+    def test_forced_exdev_copy_failure_preserves_saved_original_and_stops_vms(self):
+        for suffix in ("", "-wal", "-shm"):
+            with self.subTest(suffix or "database"):
+                self.setUp()
+                self.database_set()
+                result = self.exdev_rollback(suffix, "copy")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Could not restore", result.stderr)
+                self.assertIn("was left stopped", result.stderr)
+                self.assertEqual(self.calls().count("systemctl start anyaicam-vms.service"), 1)
+                self.assertEqual(self.saved_original(suffix).read_text(), self.ORIGINAL[suffix])
+                self.assertEqual(self.temps(), [])
+
+    def test_forced_exdev_replace_failure_preserves_saved_original_and_stops_vms(self):
+        for suffix in ("", "-wal", "-shm"):
+            with self.subTest(suffix or "database"):
+                self.setUp()
+                self.database_set()
+                result = self.exdev_rollback(suffix, "replace")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Could not restore", result.stderr)
+                self.assertIn("was left stopped", result.stderr)
+                self.assertEqual(self.calls().count("systemctl start anyaicam-vms.service"), 1)
+                self.assertEqual(self.saved_original(suffix).read_text(), self.ORIGINAL[suffix])
+                self.assertEqual(self.temps(), [])
+
     def test_a_saved_original_that_is_gone_or_replaced_leaves_the_current_files_untouched(self):
         for suffix in ("", "-wal", "-shm"):
             for tamper in ("deleted", "symlink", "folder"):

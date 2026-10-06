@@ -554,43 +554,87 @@ def _open_root_only_dir(path: Path) -> int:
     return descriptor
 
 
-def _copy_between(src_fd: int, dst_fd: int, entry: str) -> None:
-    """`entry` copied from one folder to the same name in another (opened
-    without following a symlink; created exclusively; owner, mode and data
-    kept and synced), then removed from the first. Moves across file
-    systems only; the copy is removed again on any failure."""
+def _copy_between(src_fd: int, dst_fd: int, entry: str, *, replace_existing: bool = False) -> None:
+    """Move a regular file across filesystems without following links.
+
+    Forward preservation creates the keep entry exclusively. During undo the
+    active name already exists, so copy to a unique no-follow temporary entry
+    in the validated destination directory, sync it, then atomically rename it
+    over the current name. The source is removed only after replacement has
+    succeeded; any earlier failure leaves the saved original untouched.
+    """
     with open(os.open(entry, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_fd), "rb") as src:
         info = os.fstat(src.fileno())
         if not statmod.S_ISREG(info.st_mode):
             raise ValueError(f"{entry} is not a regular file")
-        descriptor = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dst_fd)
+
+        temporary = None
+        if replace_existing:
+            descriptor = None
+            for _ in range(8):
+                temporary = f".{entry}.rollback-{secrets.token_hex(16)}"
+                try:
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=dst_fd)
+                    break
+                except FileExistsError:
+                    continue
+            if descriptor is None:
+                raise FileExistsError(f"could not allocate a unique rollback temporary for {entry}")
+        else:
+            descriptor = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=dst_fd)
+
+        source_removed = False
         try:
             with os.fdopen(descriptor, "wb") as out:
                 shutil.copyfileobj(src, out, _READ_CHUNK)
                 out.flush()
+                copied = os.fstat(out.fileno())
+                if not statmod.S_ISREG(copied.st_mode) or copied.st_size != info.st_size:
+                    raise ValueError(f"cross-filesystem copy of {entry} was incomplete")
                 if os.geteuid() == 0:
                     os.fchown(out.fileno(), info.st_uid, info.st_gid)
                 os.fchmod(out.fileno(), statmod.S_IMODE(info.st_mode))
                 os.fsync(out.fileno())
+                copied = os.fstat(out.fileno())
+
+            if replace_existing:
+                named = os.stat(temporary, dir_fd=dst_fd, follow_symlinks=False)
+                if (not statmod.S_ISREG(named.st_mode) or
+                        (named.st_dev, named.st_ino) != (copied.st_dev, copied.st_ino)):
+                    raise ValueError(f"temporary copy of {entry} changed before replacement")
+                os.rename(temporary, entry, src_dir_fd=dst_fd, dst_dir_fd=dst_fd)
+                temporary = None
+            os.fsync(dst_fd)
             os.unlink(entry, dir_fd=src_fd)
+            source_removed = True
+            os.fsync(src_fd)
         except BaseException:
-            try:
-                os.unlink(entry, dir_fd=dst_fd)
-            except OSError:
-                pass
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=dst_fd)
+                except OSError:
+                    pass
+            elif not replace_existing and not source_removed:
+                try:
+                    os.unlink(entry, dir_fd=dst_fd)
+                except OSError:
+                    pass
             raise
 
 
-def _move_between(src_fd: int, dst_fd: int, entry: str) -> None:
-    """One atomic rename of `entry` between two folder descriptors (a copy
-    and unlink only across file systems): never a window in which the
-    entry exists twice, and nothing in between to tamper with."""
+def _move_between(src_fd: int, dst_fd: int, entry: str, *, replace_existing: bool = False) -> None:
+    """Atomically rename between directory descriptors, falling back to a
+    synced copy only across filesystems. Undo may replace an existing active
+    entry; the fallback stages that replacement under a unique no-follow name.
+    """
     try:
         os.rename(entry, entry, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
     except OSError as error:
         if error.errno != errno.EXDEV:
             raise
-        _copy_between(src_fd, dst_fd, entry)
+        _copy_between(src_fd, dst_fd, entry, replace_existing=replace_existing)
 
 
 def _undo_swap(rec_fd: int, keep_fd: int, name: str, moved, placed) -> list:
@@ -621,7 +665,7 @@ def _undo_swap(rec_fd: int, keep_fd: int, name: str, moved, placed) -> list:
             if suffix in moved:
                 if info is not None and statmod.S_ISDIR(info.st_mode):
                     os.rmdir(name + suffix, dir_fd=rec_fd)  # only a folder planted there; rename replaces anything else
-                _move_between(keep_fd, rec_fd, name + suffix)
+                _move_between(keep_fd, rec_fd, name + suffix, replace_existing=True)
                 done.append(f"{label}: original put back")
             elif suffix in placed:
                 if info is not None:
