@@ -457,7 +457,14 @@ def agent_file_main(stream=None) -> int:
     never appear on a command line. Lines: 'op update_env|write|copy',
     'path P', 'mode 0640', 'owner anyaicam|root', and as needed 'template P',
     'source P', 'default K=V', 'override K=V', 'remove K', 'if_missing', and
-    for write 'content' followed by the content itself."""
+    for write 'content' followed by the content itself.
+
+    Read-only ops, so a caller can validate before it changes anything
+    (rollback.sh, 2026-10-06):
+      check -- the path is safe to read (with 'require_existing') or to
+               replace: never a directory or other non-file; an existing
+               file must pass the same checks a read does.
+      read  -- writes the file's bytes to stdout; exit 3 when absent."""
     stream = stream or sys.stdin.buffer
     request = {"default": {}, "override": {}, "remove": [], "if_missing": False}
     content = b""
@@ -480,6 +487,8 @@ def agent_file_main(stream=None) -> int:
             request["remove"].append(rest)
         elif word == "if_missing":
             request["if_missing"] = True
+        elif word == "require_existing":
+            request["require_existing"] = True
         elif word in ("op", "path", "mode", "owner", "template", "source"):
             request[word] = rest
         elif line.strip():
@@ -495,6 +504,20 @@ def agent_file_main(stream=None) -> int:
                 raise ValueError("vanished while checked")
             return 0
         op = request.get("op")
+        if op == "check":
+            if not path.parent.is_dir() or path.parent.is_symlink():
+                raise ValueError(f"{path.parent} is not a real directory")
+            if request.get("require_existing") or (os.path.lexists(path) and not path.is_symlink()):
+                if read_agent_file(path) is None:  # refuses a symlink, hard link, non-file, unsafe mode
+                    raise ValueError("is missing")
+            return 0
+        if op == "read":
+            data = read_agent_file(path)
+            if data is None:
+                return 3
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            return 0
         if op == "update_env":
             template = read_untrusted(Path(request["template"]), max_bytes=_MAX_SMALL_FILE, expected_uid=None) \
                 if request.get("template") else None

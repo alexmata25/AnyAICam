@@ -159,6 +159,8 @@ run_install() {
     log "Verifying this installer package against its own file list..."
     verify_installer_payload || return 1
     preflight_checks
+    # Before anything else may run code from it (see 07-install-agent.sh).
+    secure_agent_install_root
     webrtc_port_preflight
     vms_http_port_preflight
     detect_install_state

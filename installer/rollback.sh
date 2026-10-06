@@ -138,14 +138,31 @@ if [[ "$assume_yes" != "1" ]]; then
 fi
 
 staging="$(mktemp -d)"
-trap 'rm -rf "$staging"' EXIT
+record="$(mktemp)"
+snapshot="$(mktemp -d)"
+chmod 0700 "$staging" "$snapshot"
+mutating=0
+finished=0
+cleanup() { rm -rf "$staging" "$record" "$snapshot"; }
+trap cleanup EXIT
 
-# Prepared and checked before anything changes.
+# Same exclusions as deploy_vms(): persistent state and secrets stay put.
+RSYNC_EXCLUDES=(--exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/'
+    --exclude 'app/static/hls/' --exclude 'app/recordings/' --exclude 'app/auto.key' --exclude 'app/auto.crt')
+
+# ---------------------------------------------------------------- checked before anything changes (2026-10-06)
+# Every file this rollback will write is checked through the same hardened
+# helper that later writes it: an unsafe vms.env (symlink, hard link,
+# group/other-writable, not a file) or an unwritable marker stops here, with
+# the VMS untouched and still running.
+printf 'op check\npath %s\nrequire_existing\n' "$VMS_ENV_FILE" | agent_file \
+    || die "$VMS_ENV_FILE is not safe to update; nothing was changed."
+printf 'op check\npath %s\n' "$VMS_RELEASE_MARKER" | agent_file \
+    || die "$VMS_RELEASE_MARKER cannot be written safely; nothing was changed."
+
 # The installed-release record: the agent reports it to the cloud, and root's
 # copy is what Software Update trusts for its downgrade check -- after a
 # rollback the newer release must be installable again.
-record="$(mktemp)"
-trap 'rm -rf "$staging" "$record"' EXIT
 if [[ -n "$ROLLBACK_MARKER" && "$ROLLBACK_MARKER" != "none" ]]; then
     cp "$ROLLBACK_MARKER" "$record"
 else
@@ -169,15 +186,92 @@ tar -xzf "$ROLLBACK_CODE_ARCHIVE" -C "$staging"
 root_name="$(basename "$VMS_INSTALL_ROOT")"
 [[ -d "$staging/$root_name/app" ]] || die "Rollback code archive does not contain $root_name/app."
 
+# The state this rollback replaces, so a failure part-way can put it back:
+# the application tree, the image the VMS runs, vms.env, the release marker
+# and root's installed-release record -- and whether the VMS was running.
+was_active=0
+systemctl is-active --quiet "$VMS_SERVICE" && was_active=1
+rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$VMS_INSTALL_ROOT/" "$snapshot/tree/"
+previous_image=""
+if docker image inspect "$VMS_IMAGE:latest" >/dev/null 2>&1; then
+    previous_image="$VMS_IMAGE:before-rollback"
+    docker tag "$VMS_IMAGE:latest" "$previous_image" || die "Could not keep the current image; nothing was changed."
+fi
+printf 'op read\npath %s\n' "$VMS_ENV_FILE" | agent_file > "$snapshot/vms.env" \
+    || die "Could not read $VMS_ENV_FILE safely; nothing was changed."
+marker_saved=0
+if printf 'op read\npath %s\n' "$VMS_RELEASE_MARKER" | agent_file > "$snapshot/marker"; then
+    marker_saved=1
+elif [[ "$?" != "3" ]]; then
+    die "Could not read $VMS_RELEASE_MARKER safely; nothing was changed."
+fi
+installed_record="$UPDATE_STATE_DIR/installed_release.json"
+installed_saved=0
+if [[ -f "$installed_record" && ! -L "$installed_record" ]]; then
+    cp -p "$installed_record" "$snapshot/installed_release.json"
+    installed_saved=1
+fi
+db_swapped=0
+
+# Puts back everything recorded above after a failure part-way through, and
+# restarts the VMS if it was running. Best effort, step by step: it reports
+# what it could not restore rather than stopping at the first problem.
+restore_previous() {
+    set +e
+    local problems=()
+    echo "[ERROR] The rollback failed after it began changing the release; putting back the previous state..." >&2
+    systemctl stop "$VMS_SERVICE" >/dev/null 2>&1
+    rsync -a --checksum --delete "${RSYNC_EXCLUDES[@]}" "$snapshot/tree/" "$VMS_INSTALL_ROOT/" || problems+=("application files")
+    if [[ -n "$previous_image" ]]; then
+        docker tag "$previous_image" "$VMS_IMAGE:latest" || problems+=("image $VMS_IMAGE:latest")
+    fi
+    { printf 'op write\npath %s\nmode 0640\nowner anyaicam\ncontent\n' "$VMS_ENV_FILE"; cat "$snapshot/vms.env"; } | agent_file \
+        || problems+=("$VMS_ENV_FILE")
+    if [[ "$marker_saved" == "1" ]]; then
+        { printf 'op write\npath %s\nmode 0644\nowner root\ncontent\n' "$VMS_RELEASE_MARKER"; cat "$snapshot/marker"; } | agent_file \
+            || problems+=("$VMS_RELEASE_MARKER")
+    fi
+    if [[ -d "$UPDATE_STATE_DIR" ]]; then
+        if [[ "$installed_saved" == "1" ]]; then
+            cp -p "$snapshot/installed_release.json" "$installed_record" || problems+=("$installed_record")
+        else
+            rm -f "$installed_record"
+        fi
+    fi
+    if [[ "$db_swapped" == "1" ]]; then
+        local suffix
+        for suffix in "" "-wal" "-shm"; do
+            rm -f "$current$suffix"
+            if [[ -f "$kept$suffix" ]]; then mv "$kept$suffix" "$current$suffix" || problems+=("database $current$suffix"); fi
+        done
+    fi
+    if [[ "$was_active" == "1" ]]; then
+        systemctl start "$VMS_SERVICE" || problems+=("starting $VMS_SERVICE")
+    fi
+    if (( ${#problems[@]} )); then
+        echo "[ERROR] Could not restore: ${problems[*]}. Check: systemctl status $VMS_SERVICE; the previous image is tagged ${previous_image:-(none)}." >&2
+    else
+        echo "[ERROR] The previous release was put back$([[ $was_active == 1 ]] && echo ' and the VMS restarted'); nothing was rolled back." >&2
+    fi
+}
+on_exit() {
+    local status=$?
+    if [[ "$mutating" == "1" && "$finished" != "1" ]]; then
+        restore_previous
+        status=1
+    fi
+    cleanup
+    exit "$status"
+}
+trap on_exit EXIT
+
+# ---------------------------------------------------------------- the change
+mutating=1
 systemctl stop "$VMS_SERVICE"
-# Same exclusions as deploy_vms(): persistent state and secrets stay put.
 # --checksum: the restored files can have the same size and a timestamp
 # within the same second as the current ones, which rsync's default
 # size+mtime check would silently skip.
-rsync -a --checksum --delete \
-    --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
-    --exclude 'app/static/hls/' --exclude 'app/recordings/' --exclude 'app/auto.key' --exclude 'app/auto.crt' \
-    "$staging/$root_name/" "$VMS_INSTALL_ROOT/"
+rsync -a --checksum --delete "${RSYNC_EXCLUDES[@]}" "$staging/$root_name/" "$VMS_INSTALL_ROOT/"
 docker tag "$ROLLBACK_IMAGE" "$VMS_IMAGE:latest"
 
 env_edit=("op update_env" "path $VMS_ENV_FILE" "mode 0640" "owner anyaicam"
@@ -195,17 +289,18 @@ printf '%s\n' "${env_edit[@]}" | agent_file || die "Could not update $VMS_ENV_FI
 if [[ -d "$UPDATE_STATE_DIR" ]]; then
     if [[ -n "$ROLLBACK_VERSION" ]]; then
         if [[ "$non_root_test" == "1" ]]; then
-            cp "$record" "$UPDATE_STATE_DIR/installed_release.json"
+            cp "$record" "$installed_record"
         else
-            install -m 0644 -o root -g root "$record" "$UPDATE_STATE_DIR/installed_release.json"
+            install -m 0644 -o root -g root "$record" "$installed_record"
         fi
     else
-        rm -f "$UPDATE_STATE_DIR/installed_release.json"
+        rm -f "$installed_record"
     fi
 fi
 if [[ "$restore_database" == "1" ]]; then
     current="$VMS_RECORDINGS_DIR/$VMS_DATABASE_NAME"
     kept="$VMS_RECORDINGS_DIR/partner_portal-before-rollback-$(date -u +%Y%m%dT%H%M%SZ).db"
+    db_swapped=1
     for suffix in "" "-wal" "-shm"; do
         if [[ -f "$current$suffix" ]]; then mv "$current$suffix" "$kept$suffix"; fi
     done
@@ -214,6 +309,9 @@ if [[ "$restore_database" == "1" ]]; then
     log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept as $kept."
 fi
 systemctl start "$VMS_SERVICE"
+# The release is now consistently the rollback one; a VMS that then fails
+# validation is reported (exit 3), not reverted.
+finished=1
 
 if [[ "$VALIDATE_SECONDS" == "0" ]]; then
     log "Rollback to $ROLLBACK_COMMIT applied (validation skipped). Check: curl -fsS $VMS_URL/version and /health."
