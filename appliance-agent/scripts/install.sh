@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $EUID -ne 0 ]]; then echo "Run with sudo." >&2; exit 1; fi
+# Root-run code is installed below (the venv, the privileged watcher): never
+# with a group/other-writable umask inherited from the invoking login.
+umask 022
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib-privileged-watcher.sh
 source "$SOURCE_DIR/scripts/lib-privileged-watcher.sh"

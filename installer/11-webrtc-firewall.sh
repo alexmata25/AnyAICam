@@ -23,3 +23,20 @@ install_webrtc_firewall() {
     }
     log "WebRTC media-port restriction active."
 }
+
+# The inverse of install_webrtc_firewall() and of the script's `apply`
+# (2026-10-06, Green: uninstall left the unit, the script and the
+# ANYAICAM-WEBRTC chain behind). Only what `apply` added is removed: its
+# DOCKER-USER jump and its own chain. DOCKER-USER itself belongs to Docker.
+remove_webrtc_firewall() {
+    local ipt="${ANYAICAM_IPTABLES:-iptables}" port="${ANYAICAM_WEBRTC_UDP_PORT:-8189}" chain="ANYAICAM-WEBRTC"
+    local jump=(-p udp -m conntrack --ctorigdstport "$port" --ctdir ORIGINAL -j "$chain")
+    systemctl disable --now anyaicam-webrtc-firewall.service 2>/dev/null || true
+    rm -f "$WEBRTC_FIREWALL_UNIT" "$WEBRTC_FIREWALL_SCRIPT"
+    rm -rf "${WEBRTC_FIREWALL_UNIT}.d"
+    while "$ipt" -w -C DOCKER-USER "${jump[@]}" 2>/dev/null; do
+        "$ipt" -w -D DOCKER-USER "${jump[@]}" || break
+    done
+    "$ipt" -w -F "$chain" 2>/dev/null || true
+    "$ipt" -w -X "$chain" 2>/dev/null || true
+}

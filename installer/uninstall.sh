@@ -6,6 +6,26 @@ INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=install.sh
 source "$INSTALLER_DIR/install.sh"
 
+# Every tag of the VMS image (latest, rollback-*, release-*, before-rollback),
+# never any other image. Untagging the last tag deletes the image.
+remove_vms_images() {
+    local ref
+    docker image ls --format '{{.Repository}}:{{.Tag}}' "$VMS_IMAGE" 2>/dev/null | while read -r ref; do
+        [[ "$ref" == "$VMS_IMAGE:"* && "$ref" != *"<none>"* ]] || continue
+        docker image rm "$ref" >/dev/null 2>&1 || true
+    done
+}
+
+# The quarantined legacy agent trees secure_agent_install_root() moved aside
+# (real directories only; never through a link).
+remove_agent_quarantine() {
+    local dir
+    for dir in "$AGENT_INSTALL_ROOT".untrusted-*; do
+        [[ -d "$dir" && ! -L "$dir" ]] || continue
+        rm -rf -- "$dir"
+    done
+}
+
 run_uninstall() {
     local purge=0
     for arg in "$@"; do
@@ -54,12 +74,21 @@ run_uninstall() {
     rm -rf "$VMS_INSTALL_ROOT.next" "$VMS_INSTALL_ROOT.previous" "$VMS_INSTALL_ROOT.failed"
     rm -f /usr/local/sbin/anyaicam-rollback
     docker image rm anyaicam-vms 2>/dev/null || true
+    # The VMS is gone, so UDP 8189 is no longer published: its restriction goes too.
+    remove_webrtc_firewall
     systemctl daemon-reload
 
     if [[ "$purge" -eq 1 ]]; then
         log "PURGE requested: removing all preserved state."
         rm -rf "$CONFIG_DIR" /var/lib/anyaicam /var/log/anyaicam
         rm -rf /etc/anyaicam-update /var/lib/anyaicam-update
+        # (2026-10-06, Green) What a full purge used to leave behind: the
+        # rollback/release image tags (their rollback points were just
+        # removed above), the inert root-only quarantine copies of a
+        # legacy agent tree, and the suspend/hibernate masks.
+        remove_vms_images
+        remove_agent_quarantine
+        restore_system_suspend
         # Confirmed live: without this, detect_install_state() never
         # reports 0/5 ("clean") again after a purge -- `id -u anyaicam`
         # still succeeds, so the very next install run goes through the

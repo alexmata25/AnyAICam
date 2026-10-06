@@ -38,7 +38,12 @@ reset_fixture() {
 }
 
 make_fake_watcher_payload() {
-    mkdir -p "$SOURCE_PAYLOAD_DIR/system"
+    mkdir -p "$SOURCE_PAYLOAD_DIR/system" "$SOURCE_PAYLOAD_DIR/anyaicam_agent/updater"
+    # Since 2fd4dec install_privileged_watcher() also installs the Software
+    # Update applier and its release checks next to the watcher (root runs
+    # them), and fails closed without them. A complete payload has both.
+    printf '%s\n' '#!/usr/bin/env python3' 'print("fake applier")' > "$SOURCE_PAYLOAD_DIR/system/apply_release.py"
+    printf '%s\n' 'REQUIRED = ()' > "$SOURCE_PAYLOAD_DIR/anyaicam_agent/updater/release_checks.py"
     cat > "$SOURCE_PAYLOAD_DIR/system/privileged_watcher.py" <<'FAKE_WATCHER'
 #!/usr/bin/env python3
 print("fake watcher")
@@ -155,6 +160,8 @@ make_fake_watcher_payload
 install_privileged_watcher "$SOURCE_PAYLOAD_DIR" >/dev/null 2>&1
 assert_eq "watcher script requested as 0700 root:root (least privilege)" "1" "$(grep -c -- '-m 0700 -o root -g root .*privileged_watcher\.py .*watcher\.py' "$INSTALL_CALL_LOG")"
 assert_eq "privileged directory requested as 0700 root:root" "1" "$(grep -c -- '-d -m 0700 -o root -g root .*privileged$' "$INSTALL_CALL_LOG")"
+assert_eq "Software Update applier requested as 0700 root:root" "1" "$(grep -c -- '-m 0700 -o root -g root .*system/apply_release\.py .*privileged/apply_release\.py' "$INSTALL_CALL_LOG")"
+assert_eq "release checks requested as 0600 root:root" "1" "$(grep -c -- '-m 0600 -o root -g root .*release_checks\.py .*anyaicam_release_checks\.py' "$INSTALL_CALL_LOG")"
 # Windows/NTFS cannot represent real POSIX permission bits at all --
 # the same platform gap installer/tests/test_build_release_installer.py's
 # DeterministicTarExecutableBitTests already documents and skips for the
@@ -171,6 +178,12 @@ case "$(uname -s 2>/dev/null)" in
         ;;
 esac
 assert_eq "path unit installed at 0644 (systemd-readable, not group/other-writable)" "1" "$(grep -c -- '-m 0644 .*anyaicam-privileged-watcher\.path' "$INSTALL_CALL_LOG")"
+
+# 3b. A payload missing the Software Update applier still fails closed.
+reset_fixture
+make_fake_watcher_payload
+rm "$SOURCE_PAYLOAD_DIR/system/apply_release.py"
+assert_exit "fails closed without the Software Update applier" 1 install_privileged_watcher "$SOURCE_PAYLOAD_DIR"
 
 # 4. Only the .path unit is enabled/started -- the oneshot .service must
 #    never be enabled for boot directly.

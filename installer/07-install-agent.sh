@@ -45,6 +45,44 @@ secure_agent_install_root() {
     install -d -m 0755 -o root -g root "$root"
 }
 
+# The installed agent source copy (2026-10-06, Green full-lifecycle B-1).
+# The payload is unpacked by whichever login user extracted the release
+# archive, and `sudo install.sh` then copied it with plain `rsync -a`, which
+# kept that user's uid/gid: every file under $AGENT_SOURCE_ROOT stayed owned
+# by the customer's login account, while root runs scripts/install.sh from
+# it, pip-installs it into the root-owned venv and installs the privileged
+# watcher and Software Update applier from it. (06-deploy-vms.sh fixed the
+# same class for the VMS tree on 2026-09-24.)
+#
+# Now: the copy is root-owned (--no-owner/--no-group make root, the
+# receiver, the owner), carries no group/other write bit (--chmod=go-w;
+# execute bits stay), and anything an earlier install already left with
+# the wrong owner or mode -- which rsync skips when unchanged -- is
+# re-owned. The payload must contain no symbolic links (the shipped agent
+# has none, and a link in a root-installed tree could point anywhere). The
+# result is verified, so a failure stops the install instead of leaving an
+# untrusted tree behind.
+deploy_agent_source() {
+    local src="$AGENT_PAYLOAD_DIR" dst="$AGENT_SOURCE_ROOT" link
+    link="$(find "$src" -type l -print -quit 2>/dev/null)"
+    if [[ -n "$link" ]]; then
+        echo "[ERROR] The agent payload contains a symbolic link ($link); refusing to install it." >&2
+        return 1
+    fi
+    if [[ -L "$dst" ]]; then
+        echo "[ERROR] $dst is a symbolic link; refusing to install over it." >&2
+        return 1
+    fi
+    install -d -m 0755 -o root -g root "$dst"
+    rsync -a --no-owner --no-group --chmod=go-w --delete "$src/" "$dst/"
+    find "$dst" -exec chown -h root:root {} +
+    find "$dst" \( -type f -o -type d \) -perm /022 -exec chmod go-w {} +
+    if ! agent_tree_is_root_controlled "$dst"; then
+        echo "[ERROR] $dst is not entirely root-owned and non-writable by others after copying." >&2
+        return 1
+    fi
+}
+
 install_agent() {
     local state="$1"
     log "Installing python3.12-venv prerequisite for the appliance agent..."
@@ -58,8 +96,7 @@ install_agent() {
 
     # Keep an installed source copy so uninstall/repair remains self-contained
     # even if the user deletes the downloaded installer archive afterward.
-    install -d -m 0755 -o root -g root "$AGENT_SOURCE_ROOT"
-    rsync -a --delete "$AGENT_PAYLOAD_DIR/" "$AGENT_SOURCE_ROOT/"
+    deploy_agent_source || return 1
 
     log "Installing appliance-agent control-plane package..."
     bash "$AGENT_SOURCE_ROOT/scripts/install.sh"

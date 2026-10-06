@@ -55,6 +55,13 @@ retry_until_vms_started() {
     done
 }
 
+# Root executes and installs code from the agent tree (scripts, the venv, the
+# privileged watcher and Software Update applier): every entry must be
+# root-owned and not writable by group or others (Green B-1, 2026-10-06).
+agent_tree_trusted() {
+    agent_tree_is_root_controlled "${AGENT_INSTALL_ROOT:-/opt/anyaicam-agent}"
+}
+
 suspend_targets_masked() {
     # `systemctl is-enabled` exits non-zero for a masked unit (it isn't
     # "enabled"), so check() can't wrap it directly -- confirm the actual
@@ -251,6 +258,7 @@ run_validate() {
     check "quarantine directory exists at corrected path ($QUARANTINE_DIR)" test -d "$QUARANTINE_DIR"
     check "quarantine directory is owned by anyaicam" test "$(stat -c %U "$QUARANTINE_DIR" 2>/dev/null)" = "anyaicam"
     check "quarantine directory permissions are protected (0750)" test "$(stat -c %a "$QUARANTINE_DIR" 2>/dev/null)" = "750"
+    check "the agent tree ($AGENT_INSTALL_ROOT) is root-owned and not group/other-writable" agent_tree_trusted
     check "anyaicam-agent.service is enabled" systemctl is-enabled --quiet anyaicam-agent.service
     # Confirmed live on Ryzen (2026-09-11): a stale systemd drop-in
     # (see appliance-agent/scripts/uninstall.sh's own fix/incident

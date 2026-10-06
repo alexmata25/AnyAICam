@@ -42,3 +42,11 @@ disable_system_suspend() {
     systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
     log "Suspend/hibernate disabled at the systemd level."
 }
+
+# The inverse, for `uninstall.sh --purge-all` only (2026-10-06, Green): a
+# full purge returns the machine to an ordinary computer that may sleep.
+# A plain uninstall keeps the masks, like the rest of the preserved state,
+# because the installer cannot tell whether the owner had masked them too.
+restore_system_suspend() {
+    systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null || true
+}
