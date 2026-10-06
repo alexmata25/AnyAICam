@@ -238,6 +238,7 @@ if [[ -f "$installed_record" && ! -L "$installed_record" ]]; then
     installed_saved=1
 fi
 db_swapped=0
+db_broken=0
 
 # Puts back everything recorded above after a failure part-way through, and
 # restarts the VMS if it was running. Best effort, step by step: it reports
@@ -264,11 +265,17 @@ restore_previous() {
             rm -f "$installed_record"
         fi
     fi
-    if [[ "$db_swapped" == "1" ]]; then
-        printf 'op undo_db_restore\npath %s\nkept %s\n' "$current" "$kept_name" | agent_file \
-            || problems+=("database $current (the replaced one is kept as $kept)")
+    local database_ok=1
+    if [[ "$db_broken" == "1" ]]; then
+        database_ok=0
+        problems+=("database $current (see the error above; the original is kept beside it as partner_portal-before-rollback-*)")
+    elif [[ "$db_swapped" == "1" ]]; then
+        { printf 'op undo_db_restore\npath %s\n' "$current"; cat "$snapshot/db-swap"; } | agent_file \
+            || { database_ok=0; problems+=("database $current (the replaced one is kept as $kept)"); }
     fi
-    if [[ "$was_active" == "1" ]]; then
+    if [[ "$was_active" == "1" && "$database_ok" != "1" ]]; then
+        problems+=("$VMS_SERVICE was left stopped: its database is not consistent")
+    elif [[ "$was_active" == "1" ]]; then
         systemctl start "$VMS_SERVICE" || problems+=("starting $VMS_SERVICE")
     fi
     if (( ${#problems[@]} )); then
@@ -322,16 +329,24 @@ if [[ -d "$UPDATE_STATE_DIR" ]]; then
 fi
 if [[ "$restore_database" == "1" ]]; then
     current="$VMS_RECORDINGS_DIR/$VMS_DATABASE_NAME"
-    kept_name="partner_portal-before-rollback-$(date -u +%Y%m%dT%H%M%SZ).db"
-    kept="$VMS_RECORDINGS_DIR/$kept_name"
-    db_swapped=1
     # The service user owns the recordings folder and can plant a symlink at
     # a database name at any moment, so neither mv nor cp touches it: the
-    # helper moves the database aside and writes the checked copies (taken
-    # before the VMS was stopped) through one no-follow handle on the folder,
-    # each as a new temporary file renamed into place.
-    printf 'op restore_db\npath %s\nkept %s\nsource %s\n' "$current" "$kept_name" "$db_stage" | agent_file \
-        || die "Could not restore the database safely."
+    # helper moves the database aside (under a fresh unique name) and writes
+    # the checked copies (taken before the VMS was stopped) through one
+    # no-follow handle on the folder, each as a new temporary file renamed
+    # into place. It is one transaction: on failure it puts back what it
+    # changed itself (exit 4: it could not); on success it prints which files
+    # it moved and placed, so a later failure undoes exactly those.
+    db_status=0
+    printf 'op restore_db\npath %s\nsource %s\n' "$current" "$db_stage" | agent_file > "$snapshot/db-swap" || db_status=$?
+    if [[ "$db_status" == "4" ]]; then
+        db_broken=1
+        die "The database restore failed and the previous database could not be put back."
+    elif [[ "$db_status" != "0" ]]; then
+        die "Could not restore the database safely; the current database was left in place."
+    fi
+    db_swapped=1
+    kept="$VMS_RECORDINGS_DIR/$(sed -n 's/^kept //p' "$snapshot/db-swap")"
     log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept as $kept."
 fi
 systemctl start "$VMS_SERVICE"

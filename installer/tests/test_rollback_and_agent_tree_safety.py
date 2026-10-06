@@ -250,7 +250,11 @@ class RollbackSafetyTests(unittest.TestCase):
     # the recordings folder, so between moving the database aside and writing
     # the restored one it can put a symlink (or a folder) at the name. The race
     # is injected exactly there, whichever way the move is done: rollback.sh's
-    # mv (a PATH wrapper) or the helper's os.rename (a sitecustomize hook).
+    # mv (a PATH wrapper) or the helper's os.rename / os.link+os.unlink (a
+    # sitecustomize hook). The hook also injects, deterministically, the
+    # failures the recovery tests need: kept names that are already taken
+    # (FAKE_KEPT_TOKEN for the first FAKE_KEPT_COLLISIONS random parts) and a
+    # move that fails for one file (FAKE_LINK_FAIL).
     MV_RACE = textwrap.dedent('''\
         #!/usr/bin/env bash
         /bin/mv "$@" || exit $?
@@ -260,30 +264,53 @@ class RollbackSafetyTests(unittest.TestCase):
         if [[ "$FAKE_RACE" == dir ]]; then mkdir "$src"; else ln -s "$FAKE_SENTINEL" "$src"; fi
         ''')
     RENAME_RACE = textwrap.dedent('''\
-        import os
-        _rename = os.rename
-        def _racing_rename(src, dst, *args, **kwargs):
-            _rename(src, dst, *args, **kwargs)
-            suffix = os.environ.get("FAKE_RACE_SUFFIX")
-            if suffix is None or not os.path.basename(str(dst)).startswith("partner_portal-before-rollback-"):
-                return
-            if os.path.basename(str(src)) != "partner_portal.db" + suffix:
+        import errno, os, secrets
+        KEPT = "partner_portal-before-rollback-"
+        _rename, _link, _unlink, _token_hex = os.rename, os.link, os.unlink, secrets.token_hex
+        _moving, _tokens = set(), [0]
+        def _plant(name, dir_fd):
+            if os.environ.get("FAKE_RACE_SUFFIX") is None or name != "partner_portal.db" + os.environ["FAKE_RACE_SUFFIX"]:
                 return
             if os.environ.get("FAKE_RACE") == "dir":
-                os.mkdir(src, 0o755, dir_fd=kwargs.get("src_dir_fd"))
+                os.mkdir(name, 0o755, dir_fd=dir_fd)
             else:
-                os.symlink(os.environ["FAKE_SENTINEL"], src, dir_fd=kwargs.get("src_dir_fd"))
-        os.rename = _racing_rename
+                os.symlink(os.environ["FAKE_SENTINEL"], name, dir_fd=dir_fd)
+        def _racing_rename(src, dst, *args, **kwargs):
+            _rename(src, dst, *args, **kwargs)
+            if os.path.basename(str(dst)).startswith(KEPT):
+                _plant(os.path.basename(str(src)), kwargs.get("src_dir_fd"))
+        def _racing_link(src, dst, *args, **kwargs):
+            name = os.path.basename(str(src))
+            if os.path.basename(str(dst)).startswith(KEPT) and name == "partner_portal.db" + os.environ.get("FAKE_LINK_FAIL", "?"):
+                raise OSError(errno.EIO, "injected failure moving " + name)
+            _link(src, dst, *args, **kwargs)
+            if os.path.basename(str(dst)).startswith(KEPT):
+                _moving.add(name)
+        def _racing_unlink(path, *args, **kwargs):
+            _unlink(path, *args, **kwargs)
+            name = os.path.basename(str(path))
+            if name in _moving:  # the second half of a move aside
+                _moving.discard(name)
+                _plant(name, kwargs.get("dir_fd"))
+        def _colliding_token_hex(*args, **kwargs):
+            _tokens[0] += 1
+            if _tokens[0] <= int(os.environ.get("FAKE_KEPT_COLLISIONS", "0")):
+                return os.environ["FAKE_KEPT_TOKEN"]
+            return _token_hex(*args, **kwargs)
+        os.rename, os.link, os.unlink, secrets.token_hex = _racing_rename, _racing_link, _racing_unlink, _colliding_token_hex
         ''')
 
-    def racing_rollback(self, suffix, kind="symlink", **extra):
+    def hooked_rollback(self, *args, **extra):
         (self.bin / "mv").write_text(self.MV_RACE, newline="\n")
         (self.bin / "mv").chmod(0o755)
         hooks = self.tmp / "race-hook"
         hooks.mkdir(exist_ok=True)
         (hooks / "sitecustomize.py").write_text(self.RENAME_RACE, newline="\n")
-        return self.rollback("--restore-database", FAKE_RACE_SUFFIX=suffix, FAKE_RACE=kind,
-                             FAKE_SENTINEL=rp.bash_path(self.sentinel), PYTHONPATH=str(hooks), **extra)
+        return self.rollback(*args, PYTHONPATH=str(hooks), **extra)
+
+    def racing_rollback(self, suffix, kind="symlink", **extra):
+        return self.hooked_rollback("--restore-database", FAKE_RACE_SUFFIX=suffix, FAKE_RACE=kind,
+                                    FAKE_SENTINEL=rp.bash_path(self.sentinel), **extra)
 
     def database_set(self):
         """The current database with -wal/-shm, and a backup with its own."""
@@ -358,6 +385,138 @@ class RollbackSafetyTests(unittest.TestCase):
         for suffix in ("-wal", "-shm"):
             self.assertEqual((self.recordings / f"partner_portal.db{suffix}").read_text(), f"current {suffix}")
         self.assertEqual(self.temps(), [])
+
+    # Recovery state (Codex re-review 3, 2026-10-06): the swap is marked done
+    # only once it succeeded, the kept name cannot be taken in advance, and a
+    # recovery touches only the files actually moved or placed.
+    TOKEN = "c0111de5"
+    ORIGINAL = {"": "database after upgrade", "-wal": "current -wal", "-shm": "current -shm"}
+    RESTORED = {"": "online-backup", "-wal": "wal pages", "-shm": "shm index"}
+
+    def take_kept_names(self, suffix, kind):
+        """Occupies the kept name for `suffix` for the next two minutes, in the
+        old predictable form and in the new form with the hook's TOKEN."""
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        taken = []
+        for second in range(-2, 120):
+            stamp = (now + datetime.timedelta(seconds=second)).strftime("%Y%m%dT%H%M%SZ")
+            for base in (f"partner_portal-before-rollback-{stamp}.db", f"partner_portal-before-rollback-{stamp}-{self.TOKEN}.db"):
+                path = self.recordings / (base + suffix)
+                if kind == "dir":
+                    path.mkdir()
+                else:
+                    path.write_text("someone else's file")
+                taken.append(path)
+        return taken
+
+    def originals(self):
+        return {s: os.lstat(self.recordings / f"partner_portal.db{s}") for s in self.ORIGINAL}
+
+    def assert_files(self, expected):
+        for suffix, text in expected.items():
+            path = self.recordings / f"partner_portal.db{suffix}"
+            self.assertFalse(path.is_symlink(), suffix)
+            self.assertEqual(path.read_text(), text, suffix)
+
+    def kept_sets(self, taken=()):
+        return sorted(p.name for p in self.recordings.iterdir()
+                      if p.name.startswith("partner_portal-before-rollback-") and p not in taken)
+
+    def assert_left_in_place(self, result, before, taken=(), expected=None):
+        """A failure inside the database step: the original set untouched (same
+        files), nothing kept, the rest of the release put back, VMS running."""
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous release was put back and the VMS restarted", result.stderr)
+        self.assert_files(expected or self.ORIGINAL)
+        for suffix, info in before.items():
+            self.assertEqual(os.lstat(self.recordings / f"partner_portal.db{suffix}").st_ino, info.st_ino, suffix)
+        self.assertEqual(self.kept_sets(taken), [])
+        self.assertEqual(self.temps(), [])
+        self.assertEqual((self.install_root / "app" / "main.py").read_text(), "NEW RELEASE CODE\n")
+        self.assertEqual(self.env_file.read_text(), self.env_text)
+        self.assertEqual(self.calls()[-1], "systemctl start anyaicam-vms.service")
+
+    def test_a_kept_name_already_taken_by_a_file_or_folder_is_never_used(self):
+        for kind in ("file", "dir"):
+            for suffix in ("", "-wal", "-shm"):
+                with self.subTest(f"{kind} at the kept name for {suffix or 'the database'}"):
+                    self.setUp()
+                    self.database_set()
+                    taken = self.take_kept_names(suffix, kind)
+                    result = self.hooked_rollback("--restore-database", FAKE_KEPT_TOKEN=self.TOKEN, FAKE_KEPT_COLLISIONS="2")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assert_files(self.RESTORED)
+                    for path in taken:  # nobody's file or folder was replaced
+                        self.assertTrue(path.is_dir() if kind == "dir" else path.read_text() == "someone else's file", path)
+                    [kept_db] = [n for n in self.kept_sets(taken) if n.endswith(".db")]
+                    for s, text in self.ORIGINAL.items():
+                        self.assertEqual((self.recordings / (kept_db + s)).read_text(), text)
+                    self.assertEqual(self.temps(), [])
+
+    def test_no_free_kept_name_fails_before_the_first_move_with_the_database_untouched(self):
+        self.database_set()
+        taken = self.take_kept_names("", "file")
+        before = self.originals()
+        result = self.hooked_rollback("--restore-database", FAKE_KEPT_TOKEN=self.TOKEN, FAKE_KEPT_COLLISIONS="1000")
+        self.assertIn("the current database was left in place", result.stderr)
+        self.assert_left_in_place(result, before, taken)
+
+    def test_a_non_file_at_a_database_name_fails_before_the_first_move(self):
+        self.database_set()
+        shm = self.recordings / "partner_portal.db-shm"
+        shm.unlink()
+        shm.mkdir()
+        before = {s: os.lstat(self.recordings / f"partner_portal.db{s}") for s in ("", "-wal")}
+        result = self.hooked_rollback("--restore-database")
+        self.assertIn("the current database was left in place", result.stderr)
+        self.assert_left_in_place(result, before, expected={"": self.ORIGINAL[""], "-wal": self.ORIGINAL["-wal"]})
+        self.assertTrue(shm.is_dir())
+
+    def test_a_failure_after_the_database_moved_puts_back_only_what_moved(self):
+        for failing in ("-wal", "-shm"):
+            with self.subTest(f"moving {failing} fails"):
+                self.setUp()
+                self.database_set()
+                before = self.originals()
+                result = self.hooked_rollback("--restore-database", FAKE_LINK_FAIL=failing)
+                self.assertIn("the current database was left in place", result.stderr)
+                self.assert_left_in_place(result, before)
+
+    def test_a_vms_whose_database_cannot_be_put_back_is_not_restarted(self):
+        self.database_set()
+        start_fails = self.bin / "systemctl"
+        start_fails.write_text(SYSTEMCTL_STUB.replace('exit 0\n', textwrap.dedent('''\
+            if [[ "$1" == "start" && ! -f "$STUB_LOG.started" ]]; then
+              touch "$STUB_LOG.started"
+              rm -f "$FAKE_RECORDINGS/partner_portal.db"; mkdir "$FAKE_RECORDINGS/partner_portal.db"
+              echo x > "$FAKE_RECORDINGS/partner_portal.db/not-empty"
+              exit 1
+            fi
+            exit 0
+            '''), 1), newline="\n")
+        result = self.rollback("--restore-database")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Could not restore", result.stderr)
+        self.assertIn("was left stopped", result.stderr)
+        self.assertNotIn("previous release was put back", result.stderr)
+        self.assertEqual(self.calls().count("systemctl start anyaicam-vms.service"), 1)  # only the failed start
+        [kept_db] = [n for n in self.kept_sets() if n.endswith(".db")]
+        self.assertEqual((self.recordings / kept_db).read_text(), "database after upgrade")  # the original is not lost
+        self.assertEqual(self.temps(), [])
+
+    def test_a_normal_database_rollback_keeps_the_original_set_once(self):
+        self.database_set()
+        result = self.hooked_rollback("--restore-database")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_files(self.RESTORED)
+        kept = self.kept_sets()
+        self.assertEqual(len(kept), 3, kept)  # the original database, -wal and -shm, under one fresh name
+        for name in kept:
+            suffix = name[name.index(".db") + 3:]
+            self.assertEqual((self.recordings / name).read_text(), self.ORIGINAL[suffix])
+        self.assertEqual(self.temps(), [])
+        self.assertIn(f"kept as {rp.bash_path(self.recordings)}/{kept[0]}", result.stdout)
 
 
 @unittest.skipUnless(BASH and AS_ROOT, "needs Linux as root (real file ownership)")
