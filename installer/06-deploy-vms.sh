@@ -32,9 +32,7 @@ migrate_legacy_persistent_file() {
     if [[ ! -f "$new" ]]; then
         log "Found legacy $label at $old -- migrating to $new ..."
         mkdir -p "$(dirname "$new")"
-        cp -p "$old" "$new"
-        chmod 0640 "$new"
-        chown anyaicam:anyaicam "$new" 2>/dev/null || true
+        printf 'op copy\nsource %s\npath %s\nmode 0640\nowner anyaicam\n' "$old" "$new" | agent_file
         rm -f "$old"
     elif cmp -s "$old" "$new"; then
         rm -f "$old"
@@ -43,40 +41,62 @@ migrate_legacy_persistent_file() {
     fi
 }
 
+# Root edits files inside folders the anyaicam user owns (/etc/anyaicam).
+# Shell redirection, cp and chown there would follow a symlink that user
+# planted, so every such write goes through the Software Update applier's
+# symlink-safe routines (appliance-agent/system/apply_release.py:
+# agent_file_main): never through a symlink, owner and mode set on the new
+# file itself, atomic rename. Requests travel on stdin, so values -- secrets
+# included -- never appear on a command line.
+_agent_file_helper_dir() {
+    local here candidate
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    for candidate in "${PAYLOAD_DIR:-}/agent/system" "$here/payload/agent/system" "$here/../appliance-agent/system"; do
+        if [[ -f "$candidate/apply_release.py" ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    echo "[ERROR] The installer's file helper (agent/system/apply_release.py) is missing." >&2
+    return 1
+}
+
+agent_file() {
+    local helper
+    helper="$(_agent_file_helper_dir)" || return 1
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import apply_release; sys.exit(apply_release.agent_file_main())' "$helper"
+}
+
 upsert_env_key() {
-    local file="$1" key="$2" value="$3" tmp
-    tmp="$(mktemp)"
-    if [[ -f "$file" ]]; then
-        awk -F= -v key="$key" '$1 != key { print }' "$file" > "$tmp"
-    fi
-    printf '%s=%s\n' "$key" "$value" >> "$tmp"
-    cat "$tmp" > "$file"
-    rm -f "$tmp"
+    local file="$1" key="$2" value="$3"
+    printf 'op update_env\npath %s\nmode 0640\nowner anyaicam\noverride %s=%s\n' "$file" "$key" "$value" | agent_file
 }
 
 ensure_vms_env() {
     mkdir -p "$CONFIG_DIR"
     chmod 0750 "$CONFIG_DIR"
-    if [[ ! -f "$VMS_ENV_FILE" ]]; then
-        if [[ -f "$PAYLOAD_DIR/config/vms.env.template" ]]; then
+    local template=""
+    [[ -f "$PAYLOAD_DIR/config/vms.env.template" ]] && template="$PAYLOAD_DIR/config/vms.env.template"
+    if [[ ! -e "$VMS_ENV_FILE" && ! -L "$VMS_ENV_FILE" ]]; then
+        if [[ -n "$template" ]]; then
             log "Creating VMS environment config from the release template (existing configs are never overwritten)."
-            cp "$PAYLOAD_DIR/config/vms.env.template" "$VMS_ENV_FILE"
         else
             log "Creating minimal VMS environment config (existing configs are never overwritten)."
-            : > "$VMS_ENV_FILE"
         fi
     fi
+    # Every default below is added only when its key is absent; existing
+    # values are never changed. One safe edit (see agent_file above).
+    local -a env_request=("op update_env" "path $VMS_ENV_FILE" "mode 0640" "owner anyaicam")
+    [[ -n "$template" ]] && env_request+=("template $template")
 
-    grep -q '^ANYAICAM_RUNTIME_ROLE=' "$VMS_ENV_FILE" 2>/dev/null || \
-        printf '%s\n' 'ANYAICAM_RUNTIME_ROLE=edge' >> "$VMS_ENV_FILE"
+    env_request+=("default ANYAICAM_RUNTIME_ROLE=edge")
     # Canonical name is ANYAICAM_ENV -- the only variable app/main.py and
     # app/cloud_config.py actually read (DEPLOYMENT_ENV = os.environ.get
     # ("ANYAICAM_ENV", "local")). This installer previously wrote
     # ANYAICAM_ENVIRONMENT here, a different name the app has never read
     # -- every appliance installed that way silently stayed on the
     # "local" default forever, regardless of this line ever running.
-    grep -q '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null || \
-        printf '%s\n' 'ANYAICAM_ENV=production' >> "$VMS_ENV_FILE"
+    env_request+=("default ANYAICAM_ENV=production")
 
     # Live View staging transport (2026-09-13): the existing S3/CloudFront
     # live-relay worker (app/live_relay_uploader.py) already self-gates on
@@ -90,8 +110,7 @@ ensure_vms_env() {
     # cloud-side live_relay_pilot DB flag) is a separate, explicit,
     # per-appliance decision, not something this installer makes for
     # every appliance by default.
-    grep -q '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null || \
-        printf '%s\n' 'ANYAICAM_LIVE_RELAY_ENABLED=false' >> "$VMS_ENV_FILE"
+    env_request+=("default ANYAICAM_LIVE_RELAY_ENABLED=false")
 
     # On-device analytics workers whose code default is off (2026-09-25).
     # Advanced Analytics grants People Counting and LPR per camera from the
@@ -105,8 +124,7 @@ ensure_vms_env() {
     # explicit opt-in (biometric processing), not an installer default.
     local analytics_flag
     for analytics_flag in ANYAICAM_LPR_ENABLED PEOPLE_COUNTING_ENABLED CUSTOMER_ANALYTICS_RULES_ENABLED; do
-        grep -q "^${analytics_flag}=" "$VMS_ENV_FILE" 2>/dev/null || \
-            printf '%s=true\n' "$analytics_flag" >> "$VMS_ENV_FILE"
+        env_request+=("default ${analytics_flag}=true")
     done
 
     # Generated once, per appliance, the first time this file has no
@@ -121,8 +139,7 @@ ensure_vms_env() {
     # other means. Never printed or logged anywhere: the generated value
     # exists only in this command substitution and the file it's
     # redirected into.
-    grep -q '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" 2>/dev/null || \
-        printf 'ANYAICAM_APP_SECRETS=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$VMS_ENV_FILE"
+    env_request+=("default ANYAICAM_APP_SECRETS=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')")
 
     # Camera credential encryption key -- an appliance/installer
     # requirement, not a Samsung-only fix: confirmed live that a fresh
@@ -145,8 +162,8 @@ ensure_vms_env() {
     # bundles the `cryptography` package) has even been built yet. Never
     # printed or logged anywhere: the generated value exists only in this
     # command substitution and the file it's redirected into.
-    grep -q '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" 2>/dev/null || \
-        printf 'ANYAICAM_CAMERA_CREDENTIAL_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_')" >> "$VMS_ENV_FILE"
+    env_request+=("default ANYAICAM_CAMERA_CREDENTIAL_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_')")
+    printf '%s\n' "${env_request[@]}" | agent_file
 
     persist_product_mode
 
@@ -159,8 +176,7 @@ ensure_vms_env() {
     if [[ -n "${RELEASE_VERSION:-}" ]]; then
         upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VERSION" "$RELEASE_VERSION"
     fi
-    chown anyaicam:anyaicam "$VMS_ENV_FILE" 2>/dev/null || true
-    chmod 0640 "$VMS_ENV_FILE"
+    # Owner (anyaicam) and mode (0640) were set by each safe write above.
 }
 
 # The installed VMS software tree must be root-owned: the container

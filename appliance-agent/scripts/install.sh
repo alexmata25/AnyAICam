@@ -15,10 +15,12 @@ install -d -m 0750 -o anyaicam -g anyaicam /etc/anyaicam /var/lib/anyaicam /var/
 python3 -m venv /opt/anyaicam-agent/venv
 /opt/anyaicam-agent/venv/bin/pip install --no-cache-dir "$SOURCE_DIR"
 install -m 0644 "$SOURCE_DIR/systemd/anyaicam-agent.service" /etc/systemd/system/anyaicam-agent.service
-if [[ ! -f /etc/anyaicam/agent.env ]]; then
-  install -m 0600 -o anyaicam -g anyaicam /dev/null /etc/anyaicam/agent.env
-  printf '%s\n' 'ANYAICAM_AGENT_MODE=development' 'ANYAICAM_PORTAL_URL=http://127.0.0.1:8000' > /etc/anyaicam/agent.env
-fi
+# Created only when absent, through the root applier's symlink-safe write
+# (system/apply_release.py agent_file_main): /etc/anyaicam is owned by the
+# anyaicam user, so a plain redirection could be pointed elsewhere.
+printf '%s\n' 'op write' 'path /etc/anyaicam/agent.env' 'mode 0600' 'owner anyaicam' 'if_missing' 'content' \
+  'ANYAICAM_AGENT_MODE=development' 'ANYAICAM_PORTAL_URL=http://127.0.0.1:8000' \
+  | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import apply_release; sys.exit(apply_release.agent_file_main())' "$SOURCE_DIR/system"
 chown -R anyaicam:anyaicam /etc/anyaicam /var/lib/anyaicam /var/log/anyaicam
 systemctl daemon-reload
 systemctl enable anyaicam-agent.service

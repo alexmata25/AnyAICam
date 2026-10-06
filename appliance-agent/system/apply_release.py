@@ -387,6 +387,132 @@ def copy_untrusted(path: Path, writer, *, max_bytes: int, expected_uid: Optional
     return copied
 
 
+# ---------------------------------------------------------------- root writes into agent-owned folders
+# (2026-10-06) The installer (installer/06-deploy-vms.sh, 09-identity.sh),
+# the agent installer and rollback.sh run as root but edit files inside
+# folders the anyaicam user owns (/etc/anyaicam). Shell redirection, cp,
+# chown and sed -i follow a symlink planted there, letting that user make
+# root overwrite -- or hand it -- any file. They use these routines instead,
+# the same ones Software Update uses for vms.env and the release marker.
+
+def _named_owner(name: str) -> Optional[tuple]:
+    """(uid, gid) for 'root' or a system user; None where ownership cannot be
+    set (not root, or no POSIX ownership: tests and development hosts)."""
+    if not _posix() or os.geteuid() != 0:
+        return None
+    if name == "root":
+        return (0, 0)
+    import pwd
+    entry = pwd.getpwnam(name)
+    return (entry.pw_uid, entry.pw_gid)
+
+
+def read_agent_file(path: Path) -> Optional[bytes]:
+    """None when absent; else its bytes, never through a symlink and never a
+    hard link, device, directory or group/other-writable file (Failure)."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return read_untrusted(path, max_bytes=_MAX_SMALL_FILE, expected_uid=None)
+
+
+def write_agent_file(path: Path, data: bytes, *, mode: int, owner: str) -> None:
+    """Replaces `path` atomically through safe_replace(): never written
+    through a symlink; owner and mode are set on the new file itself."""
+    safe_replace(path.parent, path.name, data, mode=mode, owner=_named_owner(owner))
+
+
+def update_env_file(path: Path, *, defaults: Optional[dict] = None, overrides: Optional[dict] = None,
+                    remove=(), template: Optional[bytes] = None, mode: int = 0o640, owner: str = "anyaicam") -> None:
+    """KEY=value file edit, as the shell's '^KEY=' tests did: `defaults` are
+    added only when the key is absent, `overrides` replace every line of
+    their key (once), `remove` drops keys; every other line is kept. A
+    missing file starts from `template` (or empty)."""
+    defaults, overrides, remove = dict(defaults or {}), dict(overrides or {}), set(remove)
+    existing = read_agent_file(path)
+    text = (existing if existing is not None else (template or b"")).decode("utf-8", "replace")
+    output, seen = [], set()
+    for line in text.splitlines():
+        key, sep, _ = line.partition("=")
+        if sep and key in remove:
+            continue
+        if sep and key in overrides:
+            if key not in seen:
+                output.append(f"{key}={overrides[key]}")
+                seen.add(key)
+            continue
+        if sep:
+            seen.add(key)
+        output.append(line)
+    for key, value in list(overrides.items()) + list(defaults.items()):
+        if key not in seen and key not in remove:
+            output.append(f"{key}={value}")
+            seen.add(key)
+    write_agent_file(path, ("\n".join(output) + "\n").encode("utf-8"), mode=mode, owner=owner)
+
+
+def agent_file_main(stream=None) -> int:
+    """Shell entry point: one request on stdin, so values (secrets included)
+    never appear on a command line. Lines: 'op update_env|write|copy',
+    'path P', 'mode 0640', 'owner anyaicam|root', and as needed 'template P',
+    'source P', 'default K=V', 'override K=V', 'remove K', 'if_missing', and
+    for write 'content' followed by the content itself."""
+    stream = stream or sys.stdin.buffer
+    request = {"default": {}, "override": {}, "remove": [], "if_missing": False}
+    content = b""
+    while True:
+        raw = stream.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8").rstrip("\n")
+        word, _, rest = line.partition(" ")
+        if word == "content":
+            content = stream.read()
+            break
+        if word in ("default", "override"):
+            key, sep, value = rest.partition("=")
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                print(f"[ERROR] malformed {word} line", file=sys.stderr)
+                return 2
+            request[word][key] = value
+        elif word == "remove":
+            request["remove"].append(rest)
+        elif word == "if_missing":
+            request["if_missing"] = True
+        elif word in ("op", "path", "mode", "owner", "template", "source"):
+            request[word] = rest
+        elif line.strip():
+            print(f"[ERROR] unknown request line {word!r}", file=sys.stderr)
+            return 2
+    try:
+        path = Path(request["path"])
+        if not path.is_absolute():
+            raise ValueError("path must be absolute")
+        mode, owner = int(request.get("mode", "0640"), 8), request.get("owner", "anyaicam")
+        if request["if_missing"] and (os.path.lexists(path)):
+            if read_agent_file(path) is None:  # also refuses a planted symlink
+                raise ValueError("vanished while checked")
+            return 0
+        op = request.get("op")
+        if op == "update_env":
+            template = read_untrusted(Path(request["template"]), max_bytes=_MAX_SMALL_FILE, expected_uid=None) \
+                if request.get("template") else None
+            update_env_file(path, defaults=request["default"], overrides=request["override"], remove=request["remove"],
+                            template=template, mode=mode, owner=owner)
+        elif op == "write":
+            write_agent_file(path, content, mode=mode, owner=owner)
+        elif op == "copy":
+            write_agent_file(path, read_untrusted(Path(request["source"]), max_bytes=_MAX_SMALL_FILE, expected_uid=None),
+                             mode=mode, owner=owner)
+        else:
+            raise ValueError(f"unknown op {op!r}")
+    except (Failure, OSError, ValueError, KeyError) as error:
+        print(f"[ERROR] {request.get('path', '?')}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def ensure_root_dir(path: Path, mode: int) -> Path:
     """Creates (or checks) a directory only root may write."""
     path.mkdir(parents=True, exist_ok=True)

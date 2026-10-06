@@ -17,8 +17,12 @@ provision_users_dirs() {
     # customer/config data, hls holds regenerable streaming output that
     # still needs a safe home outside the replaceable /opt/anyaicam
     # software directory.
+    # /opt/anyaicam-agent is NOT here: it holds the root-only privileged
+    # applier and must stay root-owned (the agent installer creates it
+    # root:root 0755). Owned by anyaicam, even briefly, that user could swap
+    # what root later runs.
     install -d -m 0750 -o anyaicam -g anyaicam \
-        /opt/anyaicam-agent "$CONFIG_DIR" \
+        "$CONFIG_DIR" \
         /var/lib/anyaicam /var/lib/anyaicam/recordings \
         /var/lib/anyaicam/vms "$VMS_HLS_DIR" "$VMS_RECORDINGS_DIR" \
         "$VMS_DATA_CONFIG_DIR" \

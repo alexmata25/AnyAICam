@@ -39,6 +39,20 @@ VMS_SERVICE="${ANYAICAM_VMS_SERVICE:-anyaicam-vms.service}"
 VMS_URL="${ANYAICAM_VMS_URL:-http://127.0.0.1:8000}"
 VALIDATE_SECONDS="${ANYAICAM_ROLLBACK_VALIDATE_SECONDS:-180}"
 VMS_DATABASE_NAME="partner_portal.db"
+# Root edits vms.env and the release marker inside a folder the anyaicam user
+# owns: through the applier's symlink-safe routines (agent_file_main), never
+# sed -i / cp / redirection there.
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FILE_HELPER_DIR="${ANYAICAM_FILE_HELPER_DIR:-}"
+if [[ -z "$FILE_HELPER_DIR" ]]; then
+    for _candidate in /opt/anyaicam-agent/privileged "$_here/../appliance-agent/system"; do
+        if [[ -f "$_candidate/apply_release.py" ]]; then FILE_HELPER_DIR="$_candidate"; break; fi
+    done
+fi
+agent_file() {
+    [[ -n "$FILE_HELPER_DIR" && -f "$FILE_HELPER_DIR/apply_release.py" ]] || { echo "[ERROR] file helper missing" >&2; return 1; }
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import apply_release; sys.exit(apply_release.agent_file_main())' "$FILE_HELPER_DIR"
+}
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { echo "[ERROR] $*" >&2; exit 1; }
@@ -166,26 +180,18 @@ rsync -a --checksum --delete \
     "$staging/$root_name/" "$VMS_INSTALL_ROOT/"
 docker tag "$ROLLBACK_IMAGE" "$VMS_IMAGE:latest"
 
-set_env_key() {
-    local key="$1" value="$2"
-    if grep -q "^$key=" "$VMS_ENV_FILE"; then
-        sed -i "s/^$key=.*/$key=$value/" "$VMS_ENV_FILE"
-    else
-        printf '%s=%s\n' "$key" "$value" >> "$VMS_ENV_FILE"
-    fi
-}
-set_env_key ANYAICAM_VMS_COMMIT "$ROLLBACK_COMMIT"
-set_env_key ANYAICAM_BUILD_ID "$ROLLBACK_COMMIT"
+env_edit=("op update_env" "path $VMS_ENV_FILE" "mode 0640" "owner anyaicam"
+          "override ANYAICAM_VMS_COMMIT=$ROLLBACK_COMMIT" "override ANYAICAM_BUILD_ID=$ROLLBACK_COMMIT")
 if [[ -n "$ROLLBACK_VERSION" ]]; then
-    set_env_key ANYAICAM_VERSION "$ROLLBACK_VERSION"
+    env_edit+=("override ANYAICAM_VERSION=$ROLLBACK_VERSION")
 else
     # The previous release had no product version: let its code report its own.
-    sed -i '/^ANYAICAM_VERSION=/d' "$VMS_ENV_FILE"
+    env_edit+=("remove ANYAICAM_VERSION")
 fi
+printf '%s\n' "${env_edit[@]}" | agent_file || die "Could not update $VMS_ENV_FILE safely."
 
-[[ -L "$VMS_RELEASE_MARKER" ]] && rm -f "$VMS_RELEASE_MARKER"
-cp "$record" "$VMS_RELEASE_MARKER.rollback-tmp" && mv -f "$VMS_RELEASE_MARKER.rollback-tmp" "$VMS_RELEASE_MARKER"
-chmod 0644 "$VMS_RELEASE_MARKER"
+{ printf 'op write\npath %s\nmode 0644\nowner root\ncontent\n' "$VMS_RELEASE_MARKER"; cat "$record"; } | agent_file \
+    || die "Could not write $VMS_RELEASE_MARKER safely."
 if [[ -d "$UPDATE_STATE_DIR" ]]; then
     if [[ -n "$ROLLBACK_VERSION" ]]; then
         if [[ "$non_root_test" == "1" ]]; then
