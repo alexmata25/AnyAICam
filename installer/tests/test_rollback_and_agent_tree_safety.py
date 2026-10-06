@@ -256,8 +256,10 @@ class OrderTests(unittest.TestCase):
         body = install.split("run_install() {", 1)[1]
         steps = [line.strip() for line in body.splitlines() if line.strip() and not line.strip().startswith(("#", "log ", "if ", "fi", "local ", "for ", "case ", "esac", "done", "mode=", "--", "*)", '[[ "$arg"'))]
         secure = steps.index("secure_agent_install_root")
-        self.assertEqual(steps[secure - 1], "preflight_checks")  # right after the root/OS checks
-        for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"", "install_agent \"$INSTALL_STATE\"",
+        # Right after the read-only root/OS and port checks: a refused port must
+        # leave the machine untouched, and nothing before it changes anything.
+        self.assertEqual(steps[secure - 3:secure], ["preflight_checks", "webrtc_port_preflight", "vms_http_port_preflight"])
+        for later in ("detect_install_state", "provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"", "install_agent \"$INSTALL_STATE\"",
                       "systemd_setup", "provision_update_signing_key", "provision_entitlement_signing_keys"):
             self.assertGreater(steps.index(later), secure, later)
 
