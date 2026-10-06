@@ -98,6 +98,10 @@ IDENTITY_KEYS = ("ANYAICAM_VERSION", "ANYAICAM_BUILD_ID", "ANYAICAM_VMS_COMMIT")
 RELEASE_IDENTITY_STATIC = "static/release-identity.json"   # inside payload/vms/app (release_checks.REQUIRED)
 _STAGED_FILES = ("manifest.json", "manifest.sig", "package.tar.gz", "request.json")
 _MAX_SMALL_FILE = 1024 * 1024
+# Untrusted files are read in pieces of at most this size (2026-10-06): a
+# single read(MAX_UNPACKED_BYTES + 1) allocated ~8 GiB up front and raised
+# MemoryError on appliances with less RAM than that.
+_READ_CHUNK = 1024 * 1024
 _PRINTABLE = re.compile(r"[^\x20-\x7e]")
 
 # Online, integrity-checked SQLite backup inside the running VMS: the same
@@ -312,9 +316,10 @@ def install_trust_anchor(target: Path, data: bytes, *, posix: Optional[bool] = N
         raise TrustAnchorError("trust_anchor_write_failed", f"writing {target} failed: {error}") from error
 
 
-def read_untrusted(path: Path, *, max_bytes: int, expected_uid: Optional[int], dir_fd: Optional[int] = None) -> bytes:
-    """Reads a file a less-privileged user controls: never through a
-    symlink, never a hard link to someone else's file, never a device."""
+def _open_untrusted(path: Path, *, expected_uid: Optional[int], dir_fd: Optional[int] = None):
+    """Opens a file a less-privileged user controls: never through a
+    symlink, never a hard link to someone else's file, never a device or a
+    directory. Returns the open binary handle and its fstat result."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
         if dir_fd is not None:
@@ -325,16 +330,61 @@ def read_untrusted(path: Path, *, max_bytes: int, expected_uid: Optional[int], d
             descriptor = os.open(path, flags)
     except OSError as error:
         raise Failure("rejected", "bad_staging", f"{path.name} cannot be opened safely: {error}") from error
-    with os.fdopen(descriptor, "rb") as handle:
-        problem = ownership_problem(os.fstat(handle.fileno()), expected_uid=expected_uid)
+    handle = os.fdopen(descriptor, "rb")
+    try:
+        info = os.fstat(handle.fileno())
+        problem = ownership_problem(info, expected_uid=expected_uid)
         if problem:
             raise Failure("rejected", "bad_staging", f"{path.name} {problem}")
-        if statmod.S_ISDIR(os.fstat(handle.fileno()).st_mode):
+        if statmod.S_ISDIR(info.st_mode):
             raise Failure("rejected", "bad_staging", f"{path.name} is a directory")
-        data = handle.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise Failure("rejected", "bad_staging", f"{path.name} is unexpectedly large")
-    return data
+    except BaseException:
+        handle.close()
+        raise
+    return handle, info
+
+
+def _read_chunks(handle, path: Path, max_bytes: int):
+    """Yields the file in pieces of at most _READ_CHUNK bytes; Failure as soon
+    as more than max_bytes have been read (the file may grow while it is
+    read) or a read fails. Never asks for more than one piece at a time."""
+    total = 0
+    while True:
+        try:
+            chunk = handle.read(min(_READ_CHUNK, max_bytes + 1 - total))
+        except OSError as error:
+            raise Failure("rejected", "bad_staging", f"{path.name} could not be read: {error}") from error
+        if not chunk:
+            return
+        total += len(chunk)
+        if total > max_bytes:
+            raise Failure("rejected", "bad_staging", f"{path.name} is unexpectedly large")
+        yield chunk
+
+
+def read_untrusted(path: Path, *, max_bytes: int, expected_uid: Optional[int], dir_fd: Optional[int] = None) -> bytes:
+    """Reads a small file a less-privileged user controls (see
+    _open_untrusted): memory grows with the file, never with max_bytes."""
+    handle, info = _open_untrusted(path, expected_uid=expected_uid, dir_fd=dir_fd)
+    with handle:
+        if statmod.S_ISREG(info.st_mode) and info.st_size > max_bytes:
+            raise Failure("rejected", "bad_staging", f"{path.name} is unexpectedly large")
+        return b"".join(_read_chunks(handle, path, max_bytes))
+
+
+def copy_untrusted(path: Path, writer, *, max_bytes: int, expected_uid: Optional[int], dir_fd: Optional[int] = None) -> int:
+    """Streams a file a less-privileged user controls (see _open_untrusted)
+    into `writer`, one piece at a time, enforcing max_bytes: memory stays
+    bounded whatever the file's size. Returns the bytes copied."""
+    handle, info = _open_untrusted(path, expected_uid=expected_uid, dir_fd=dir_fd)
+    copied = 0
+    with handle:
+        if statmod.S_ISREG(info.st_mode) and info.st_size > max_bytes:
+            raise Failure("rejected", "bad_staging", f"{path.name} is unexpectedly large")
+        for chunk in _read_chunks(handle, path, max_bytes):
+            writer.write(chunk)
+            copied += len(chunk)
+    return copied
 
 
 def ensure_root_dir(path: Path, mode: int) -> Path:
@@ -658,10 +708,10 @@ class Applier:
         try:
             for name in _STAGED_FILES:
                 limit = release_checks.MAX_UNPACKED_BYTES if name == "package.tar.gz" else _MAX_SMALL_FILE
-                data = read_untrusted(source / name, max_bytes=limit, expected_uid=self.agent_uid, dir_fd=dir_fd)
                 descriptor = os.open(work / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
                 with os.fdopen(descriptor, "wb") as writer:
-                    writer.write(data)
+                    # Streamed: the package can be gigabytes; it is never held in memory.
+                    copy_untrusted(source / name, writer, max_bytes=limit, expected_uid=self.agent_uid, dir_fd=dir_fd)
         finally:
             if dir_fd is not None:
                 os.close(dir_fd)
