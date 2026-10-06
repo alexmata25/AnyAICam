@@ -121,6 +121,16 @@ if [[ -n "$ROLLBACK_MARKER" && "$ROLLBACK_MARKER" != "none" ]]; then
     trusted_file "$ROLLBACK_MARKER" "Saved release record"
 fi
 
+# ---------------------------------------------------------------- checked before anything changes (2026-10-06)
+# Every file this rollback will write is checked through the same hardened
+# helper that later writes it -- before vms.env is even read: an unsafe
+# vms.env (symlink, hard link, group/other-writable, not a file) or an
+# unwritable marker stops here, with the VMS untouched and still running.
+printf 'op check\npath %s\nrequire_existing\n' "$VMS_ENV_FILE" | agent_file \
+    || die "$VMS_ENV_FILE is not safe to update; nothing was changed."
+printf 'op check\npath %s\n' "$VMS_RELEASE_MARKER" | agent_file \
+    || die "$VMS_RELEASE_MARKER cannot be written safely; nothing was changed."
+
 running="$(sed -n 's/^ANYAICAM_BUILD_ID=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1)"
 # Running the rollback build already (re-applying the same point, e.g. to add
 # --restore-database afterwards) is allowed; any other build is not.
@@ -149,16 +159,6 @@ trap cleanup EXIT
 # Same exclusions as deploy_vms(): persistent state and secrets stay put.
 RSYNC_EXCLUDES=(--exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/'
     --exclude 'app/static/hls/' --exclude 'app/recordings/' --exclude 'app/auto.key' --exclude 'app/auto.crt')
-
-# ---------------------------------------------------------------- checked before anything changes (2026-10-06)
-# Every file this rollback will write is checked through the same hardened
-# helper that later writes it: an unsafe vms.env (symlink, hard link,
-# group/other-writable, not a file) or an unwritable marker stops here, with
-# the VMS untouched and still running.
-printf 'op check\npath %s\nrequire_existing\n' "$VMS_ENV_FILE" | agent_file \
-    || die "$VMS_ENV_FILE is not safe to update; nothing was changed."
-printf 'op check\npath %s\n' "$VMS_RELEASE_MARKER" | agent_file \
-    || die "$VMS_RELEASE_MARKER cannot be written safely; nothing was changed."
 
 # The installed-release record: the agent reports it to the cloud, and root's
 # copy is what Software Update trusts for its downgrade check -- after a
