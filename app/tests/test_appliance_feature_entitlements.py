@@ -24,6 +24,13 @@ from test_runtime_feature_enforcement import PRICES, _addon, _grant, _plan
 
 pytestmark = pytest.mark.real_entitlements
 
+# This appliance's persisted activation identity, as the cloud knows it
+# (_seed_cloud names the appliance's cloud_id "AIC-<appliance id>").
+EDGE_IDENTITY = {**IDENTITY, "cloud_id": f"AIC-{APPLIANCE_ID}"}
+
+import appliance_activation  # noqa: E402
+_REAL_LOAD_IDENTITY = appliance_activation.load_persisted_identity  # captured before any test patches it
+
 
 @pytest.fixture(autouse=True)
 def prices(monkeypatch):
@@ -40,6 +47,7 @@ def appliance(cloud_client, cloud_db, edge_db, edge_env, monkeypatch):
     """A cloud with this appliance's customer, and the appliance's own sync
     wired to the cloud's real configuration endpoint."""
     _seed_cloud(cloud_db)
+    monkeypatch.setattr("appliance_activation.load_persisted_identity", lambda: dict(EDGE_IDENTITY))
     state = {"online": True}
 
     def cloud_get(path, appliance_id, credential):
@@ -165,7 +173,7 @@ def test_a_snapshot_left_stale_by_an_outage_expires_after_its_ttl(appliance, clo
     assert expires - issued == timedelta(hours=feature_entitlements.DEFAULT_SNAPSHOT_TTL_HOURS)
     state = _cached()
     later = expires + timedelta(seconds=1)
-    assert appliance_entitlements.verify(state["snapshot"], state["public_keys"], appliance_id=APPLIANCE_ID, now=later) == "expired"
+    assert appliance_entitlements.verify(state["snapshot"], state["public_keys"], identity=EDGE_IDENTITY, now=later) == "expired"
 
 
 @pytest.mark.parametrize("tamper", [
@@ -301,3 +309,192 @@ def test_the_appliance_refuses_a_talk_start_without_the_snapshot(appliance, clou
     message = json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000})
     asyncio.run(client._handle_message(message, {1: {"camera_id": "cam-1"}}, send))
     assert replies == [{"type": "error", "session_id": "sess-1", "reason": "not_entitled"}]
+
+
+# ------------------------------------------------------------ bound to the persisted identity
+# (Codex review of 1760f0a: verification itself binds the snapshot to the
+# appliance's persisted appliance/cloud/customer identity; no caller can
+# skip it by passing no customer.)
+
+def _write_snapshot(snapshot):
+    state = _cached()
+    state["snapshot"] = snapshot
+    appliance_entitlements.STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _talk_start_reply(monkeypatch):
+    import talk_audio_relay_client as client
+    replies = []
+
+    async def send(text):
+        replies.append(json.loads(text))
+    monkeypatch.setattr(client, "_start_session", lambda *a, **k: False)
+    message = json.dumps({"type": "start", "session_id": "sess-b", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000})
+    asyncio.run(client._handle_message(message, {1: {"camera_id": "cam-1"}}, send))
+    return replies
+
+
+@pytest.mark.parametrize("field,value", [("customer_id", "cust-2"), ("cloud_id", "AIC-OTHER")])
+def test_a_signed_snapshot_for_this_appliance_but_another_customer_or_cloud_id_is_denied(
+        appliance, cloud_db, edge_db, monkeypatch, field, value):
+    import talk_audio_relay_client as client
+    _plan(cloud_db, "basic_local")
+    _addon(cloud_db, "talk_down")
+    _sync(edge_db)
+    assert client._talk_entitled() is True  # correct appliance and customer: allowed
+    _write_snapshot(_resign(_cached()["snapshot"], cloud_db, **{field: value}))  # validly signed by the cloud
+    assert client._talk_entitled() is False  # the appliance's talk relay passes no customer
+    assert _talk_start_reply(monkeypatch) == [{"type": "error", "session_id": "sess-b", "reason": "not_entitled"}]
+    for feature in ("talk_down", "voice_call"):
+        assert appliance_entitlements.feature_allowed(feature) is False
+        assert appliance_entitlements.feature_allowed(feature, None) is False
+        assert appliance_entitlements.feature_allowed(feature, value) is False  # naming the snapshot's customer does not help
+        assert _edge_allows(feature) is False
+
+
+def test_the_correct_identity_is_allowed_when_entitled(appliance, cloud_db, edge_db, monkeypatch):
+    import talk_audio_relay_client as client
+    _plan(cloud_db, "basic_local")
+    _addon(cloud_db, "talk_down")
+    _sync(edge_db)
+    snapshot = _cached()["snapshot"]
+    assert (snapshot["appliance_id"], snapshot["cloud_id"], snapshot["customer_id"]) == (APPLIANCE_ID, f"AIC-{APPLIANCE_ID}", "cust-1")
+    assert client._talk_entitled() is True
+    assert appliance_entitlements.feature_allowed("talk_down", None) is True
+    assert appliance_entitlements.feature_allowed("voice_call", "cust-1") is True
+    started = []
+    monkeypatch.setattr(client, "_start_session", lambda *a, **k: started.append(a) or False)
+    message = json.dumps({"type": "start", "session_id": "sess-c", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000})
+    asyncio.run(client._handle_message(message, {1: {"camera_id": "cam-1"}}, None))
+    assert len(started) == 1  # past the entitlement check, on to the camera
+
+
+@pytest.mark.parametrize("field,value", [("customer_id", "cust-2"), ("cloud_id", "AIC-OTHER"), ("appliance_id", "appl-2")])
+def test_a_persisted_identity_that_does_not_match_the_snapshot_is_denied(appliance, cloud_db, edge_db, monkeypatch, field, value):
+    _plan(cloud_db, "ai_local")
+    _grant(cloud_db, "voice_call")
+    _sync(edge_db)
+    assert _edge_allows("talk_down") and _edge_allows("voice_call")
+    monkeypatch.setattr("appliance_activation.load_persisted_identity", lambda: {**EDGE_IDENTITY, field: value})
+    for feature in ("talk_down", "voice_call"):
+        assert appliance_entitlements.feature_allowed(feature) is False
+        assert appliance_entitlements.feature_allowed(feature, None) is False
+
+
+@pytest.mark.parametrize("persisted", [
+    None,                                                     # missing or unreadable identity file
+    {k: v for k, v in EDGE_IDENTITY.items() if k != "cloud_id"},
+    {k: v for k, v in EDGE_IDENTITY.items() if k != "customer_id"},
+    {**EDGE_IDENTITY, "customer_id": ""},
+    {**EDGE_IDENTITY, "customer_id": 123},
+    {**EDGE_IDENTITY, "cloud_id": None},
+    "not a dict",
+])
+def test_a_missing_or_malformed_persisted_identity_is_denied(appliance, cloud_db, edge_db, monkeypatch, persisted):
+    _plan(cloud_db, "ai_local")
+    _grant(cloud_db, "voice_call")
+    _sync(edge_db)
+    monkeypatch.setattr("appliance_activation.load_persisted_identity", lambda: persisted)
+    for feature in ("talk_down", "voice_call"):
+        assert appliance_entitlements.feature_allowed(feature) is False
+    assert appliance_entitlements.store_snapshot(_cached().get("snapshot")) == "rejected:not_activated"
+
+
+def test_an_unreadable_identity_file_is_denied(appliance, cloud_db, edge_db, monkeypatch, tmp_path):
+    import appliance_activation
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    assert _edge_allows("talk_down")
+    broken = tmp_path / "identity.json"
+    broken.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(appliance_activation, "ACTIVATION_IDENTITY_FILE", broken)
+    monkeypatch.setattr(appliance_activation, "load_persisted_identity", _REAL_LOAD_IDENTITY)  # the real loader
+    assert appliance_activation.load_persisted_identity() is None
+    assert not _edge_allows("talk_down") and not _edge_allows("voice_call")
+
+
+@pytest.mark.parametrize("change", [
+    {"customer_id": None}, {"customer_id": ""}, {"customer_id": 7},
+    {"cloud_id": None}, {"cloud_id": ""}, {"appliance_id": None},
+])
+def test_a_signed_snapshot_with_malformed_identity_is_denied(appliance, cloud_db, edge_db, change):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    _write_snapshot(_resign(_cached()["snapshot"], cloud_db, **change))
+    assert appliance_entitlements.feature_allowed("talk_down") is False
+    assert appliance_entitlements.feature_allowed("talk_down", None) is False
+
+
+@pytest.mark.parametrize("missing", ["customer_id", "cloud_id", "appliance_id"])
+def test_a_signed_snapshot_missing_an_identity_field_is_denied(appliance, cloud_db, edge_db, missing):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    body = {k: v for k, v in _cached()["snapshot"].items() if k not in ("signature", missing)}
+    _write_snapshot(_resign(body, cloud_db))
+    assert appliance_entitlements.feature_allowed("talk_down") is False
+    assert appliance_entitlements.feature_allowed("talk_down", None) is False
+
+
+@pytest.fixture()
+def owner_client(appliance, cloud_db):
+    """The talk routes, signed in as the customer owner (rows seeded by appliance)."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import partner_portal
+    import talk_audio_relay
+    import talk_sessions
+    with override_target(sqlite_path=str(cloud_db)):
+        app = FastAPI()
+        talk_sessions.register_talk_session_routes(app)
+        talk_audio_relay.register_talk_audio_relay_routes(app)
+        with TestClient(app) as client:
+            client.cookies.set(partner_portal.SESSION_COOKIE,
+                               partner_portal._token("owner@example.test", "customer_owner", None, "cust-1", None))
+            yield client
+
+
+def test_an_appliance_talk_session_ends_when_a_sync_revokes_talk_down(appliance, cloud_db, edge_db, owner_client, monkeypatch):
+    """The appliance's own audio socket (edge role) re-checks the cached
+    snapshot while talking; a sync that removes Talk Down stops the audio."""
+    from datetime import datetime as _dt, timedelta as _td
+    import talk_audio_relay
+    from starlette.websockets import WebSocketDisconnect
+    frames = []
+
+    class FakeCameraSpeaker:
+        def __init__(self, camera, sample_rate, session_id=None):
+            self.error = None
+
+        def start(self):
+            return True
+
+        def send_pcm16(self, frame):
+            frames.append(frame)
+
+        def stop(self):
+            pass
+    monkeypatch.setattr(talk_audio_relay, "_LocalIsapiTalkRelay", FakeCameraSpeaker)
+    monkeypatch.setattr(talk_audio_relay, "ENTITLEMENT_RECHECK_SECONDS", 0)
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
+    assert _edge_allows("talk_down")
+    with override_target(sqlite_path=str(cloud_db)):
+        with connection() as db:
+            db.execute("UPDATE cameras SET talk_down_supported=1 WHERE id='cam-1'")
+            db.execute("INSERT INTO customer_talk_sessions(id,customer_id,site_id,camera_id,user_id,requested_by,role,state,"
+                       "requested_at,ended_at,expires_at) VALUES('talk-e','cust-1','site-1','cam-1',NULL,'owner@example.test',"
+                       "'customer_owner','requested',?,NULL,?)",
+                       (_dt.now().isoformat(), (_dt.now() + _td(minutes=5)).isoformat()))
+        with owner_client.websocket_connect("/api/customer/talk/sessions/talk-e/audio") as socket:
+            assert socket.receive_json() == {"type": "ready"}
+            socket.send_bytes(bytes(320))
+            _plan(cloud_db, "ai_local", status="cancelled")
+            _sync(edge_db)  # the next configuration sync carries the revocation
+            socket.send_bytes(bytes(320))
+            message = socket.receive_json()
+            assert message["type"] == "error" and message["reason"] == "not_entitled"
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+    assert closed.value.code == 4403
+    assert len(frames) == 1

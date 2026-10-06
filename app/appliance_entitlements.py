@@ -15,7 +15,10 @@ what this appliance needs, signed with the cloud's Ed25519 identity key
 It is cached on disk so it keeps applying through a cloud outage, and
 re-verified on every use. feature_allowed() is True only for a snapshot that
   * carries a valid signature from a trusted cloud key,
-  * was issued for this appliance (and, when given, this customer),
+  * names exactly this appliance's persisted identity -- appliance_id,
+    cloud_id and customer_id from the activation identity file, checked in
+    verify() itself, so no caller can skip it (a caller that also names a
+    customer must name that same one),
   * is not expired (and not issued in the future beyond clock skew),
   * grants that one feature.
 Anything else -- missing, unreadable, tampered, another appliance's, expired,
@@ -98,20 +101,39 @@ def _trusted_keys(state: dict) -> dict[str, str]:
     return {str(k): str(v) for k, v in keys.items()} if isinstance(keys, dict) else {}
 
 
-def _local_appliance_id() -> str | None:
+# The snapshot must name exactly the identity this appliance was activated
+# with (appliance_activation's persisted identity file).
+BOUND_IDENTITY_FIELDS = ("appliance_id", "cloud_id", "customer_id")
+
+
+def _bound_identity(identity) -> dict[str, str] | None:
+    """The appliance/cloud/customer ids from a persisted identity, or None
+    when any is missing or not a non-empty string."""
+    if not isinstance(identity, dict):
+        return None
+    bound = {field: identity.get(field) for field in BOUND_IDENTITY_FIELDS}
+    if not all(isinstance(value, str) and value.strip() for value in bound.values()):
+        return None
+    return bound
+
+
+def _local_identity() -> dict[str, str] | None:
     try:
         from appliance_activation import load_persisted_identity
-        identity = load_persisted_identity()
-        return str(identity["appliance_id"]) if identity and identity.get("appliance_id") else None
+        return _bound_identity(load_persisted_identity())
     except Exception:
         return None
 
 
-def verify(snapshot, public_keys: dict[str, str], *, appliance_id: str | None, now: datetime | None = None) -> str | None:
-    """None when the snapshot is valid for this appliance right now, else the reason."""
+def verify(snapshot, public_keys: dict[str, str], *, identity, now: datetime | None = None) -> str | None:
+    """None when the snapshot is valid right now for this appliance's
+    persisted identity, else the reason. The snapshot's appliance_id,
+    cloud_id and customer_id must each be present and equal that identity;
+    a missing or malformed persisted identity denies."""
     if not isinstance(snapshot, dict):
         return "missing"
-    if not appliance_id:
+    bound = _bound_identity(identity)
+    if bound is None:
         return "not_activated"
     body = {key: value for key, value in snapshot.items() if key != "signature"}
     try:
@@ -121,8 +143,12 @@ def verify(snapshot, public_keys: dict[str, str], *, appliance_id: str | None, n
         return "bad_signature"
     if body.get("type") != SNAPSHOT_TYPE or body.get("version") != SNAPSHOT_VERSION:
         return "unsupported"
-    if str(body.get("appliance_id") or "") != appliance_id:
-        return "other_appliance"
+    for field, reason in (("appliance_id", "other_appliance"), ("cloud_id", "other_cloud_id"), ("customer_id", "other_customer")):
+        value = body.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return "malformed_identity"
+        if value != bound[field]:
+            return reason
     now = now or datetime.now(timezone.utc)
     issued, expires = _parse_time(body.get("issued_at")), _parse_time(body.get("expires_at"))
     if issued is None or expires is None or issued - CLOCK_SKEW > now:
@@ -146,7 +172,7 @@ def store_snapshot(snapshot, public_keys=None) -> str:
     if snapshot is None:
         _write_state(state)
         return "absent"
-    reason = verify(snapshot, _trusted_keys(state), appliance_id=_local_appliance_id())
+    reason = verify(snapshot, _trusted_keys(state), identity=_local_identity())
     if reason:
         logger.warning("appliance_entitlements.snapshot_rejected reason=%s", reason)
         state.pop("snapshot", None)
@@ -164,11 +190,13 @@ def feature_allowed(feature: str, customer_id: str | None = None) -> bool:
             return False
         state = _read_state()
         snapshot = state.get("snapshot")
-        reason = verify(snapshot, _trusted_keys(state), appliance_id=_local_appliance_id())
+        reason = verify(snapshot, _trusted_keys(state), identity=_local_identity())
         if reason:
             logger.info("appliance_entitlements.denied feature=%s reason=%s", feature, reason)
             return False
-        if customer_id and str(snapshot.get("customer_id") or "") != str(customer_id):
+        # verify() bound the snapshot to this appliance's own customer; a
+        # caller naming a customer must name that same one.
+        if customer_id is not None and str(customer_id) != snapshot["customer_id"]:
             return False
         return snapshot["features"].get(feature) is True
     except Exception:
