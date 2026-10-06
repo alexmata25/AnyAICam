@@ -29,6 +29,14 @@ KEY_A = base64.b64encode(bytes(range(32))).decode()
 KEY_B = base64.b64encode(bytes(range(32, 64))).decode()
 
 
+def generated_private_pem() -> bytes:
+    """A throwaway private key generated for this run (never a literal)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    return Ed25519PrivateKey.generate().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                      serialization.NoEncryption())
+
+
 def keyset(**keys) -> bytes:
     return release_checks.canonical_entitlement_keyset(keys)
 
@@ -125,7 +133,7 @@ class RefusalTests(KeysetTestCase):
 
     def test_private_or_malformed_keysets_are_refused_even_when_their_hash_matches(self):
         bad = {
-            "private PEM": b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==\n-----END PRIVATE KEY-----\n",
+            "private PEM": generated_private_pem(),
             "private field": json.dumps({"keys": {"k": KEY_A}, "private_key_b64": KEY_B}).encode(),
             "extra field": json.dumps({"keys": {"k": KEY_A}, "note": "x"}, sort_keys=True, indent=2).encode() + b"\n",
             "64-byte value": keyset(k=base64.b64encode(bytes(64)).decode()),

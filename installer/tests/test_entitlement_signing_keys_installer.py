@@ -98,7 +98,8 @@ class BuilderTests(unittest.TestCase):
             "public PEM container": private.public_key().public_bytes(serialization.Encoding.PEM,
                                                                       serialization.PublicFormat.SubjectPublicKeyInfo),
             "private field": json.dumps({"keys": {"k1": PUBLIC}, "private_key_b64": "AAAA"}).encode(),
-            "PEM inside the keyset": json.dumps({"keys": {"k1": "-----BEGIN PRIVATE KEY-----"}}).encode(),
+            "PEM inside the keyset": json.dumps({"keys": {"k1": private.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()}}).encode(),
             "extra field": json.dumps({"keys": {"k1": PUBLIC}, "d": PUBLIC}).encode(),
         }
         for label, content in encodings.items():
