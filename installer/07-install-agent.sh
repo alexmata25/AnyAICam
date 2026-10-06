@@ -17,7 +17,18 @@
 agent_tree_is_root_controlled() {
     local root="$1"
     [[ -d "$root" && ! -L "$root" ]] || return 1
-    # Any entry not owned by root, or (not a symlink and) writable by group/others.
+    # Source scripts and the root-only watcher/applier are later consumed as
+    # root, so a root-owned symlink in either tree is not a trust anchor: its
+    # target may remain writable by the service user. Keep system Python/venv
+    # symlinks elsewhere in the agent root valid.
+    local code_tree
+    for code_tree in "$root/source" "$root/privileged"; do
+        if [[ -e "$code_tree" || -L "$code_tree" ]]; then
+            [[ -d "$code_tree" && ! -L "$code_tree" ]] || return 1
+            [[ -z "$(find "$code_tree" -type l -print -quit 2>/dev/null)" ]] || return 1
+        fi
+    done
+    # Any entry not owned by root, or writable by group/others.
     [[ -z "$(find "$root" \( \( ! -user root \) -o \( ! -type l -perm /022 \) \) -print -quit 2>/dev/null)" ]]
 }
 
@@ -75,6 +86,13 @@ deploy_agent_source() {
     fi
     install -d -m 0755 -o root -g root "$dst"
     rsync -a --no-owner --no-group --chmod=go-w --delete "$src/" "$dst/"
+    # Recheck the copied tree, not only the mutable extracted payload. The
+    # scan above and rsync are separate operations; reject a symlink inserted
+    # during that interval before any installed code is executed.
+    if [[ -n "$(find "$dst" -type l -print -quit 2>/dev/null)" ]]; then
+        echo "[ERROR] The copied agent source contains a symbolic link; refusing to execute it." >&2
+        return 1
+    fi
     find "$dst" -exec chown -h root:root {} +
     find "$dst" \( -type f -o -type d \) -perm /022 -exec chmod go-w {} +
     if ! agent_tree_is_root_controlled "$dst"; then

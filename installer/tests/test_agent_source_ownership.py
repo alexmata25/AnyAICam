@@ -11,6 +11,7 @@ These run the real installer functions against temporary folders, as root
 (real ownership), with systemctl/iptables/docker replaced by logging stubs.
 """
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -140,6 +141,51 @@ class AgentSourceOwnershipTests(unittest.TestCase):
         result = self.secure()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.quarantines()), 1)
+
+    def test_root_owned_symlink_in_privileged_tree_is_quarantined(self):
+        """A root-owned link is unsafe when it resolves to service-owned code."""
+        self.agent_root.mkdir()
+        privileged = self.agent_root / "privileged"
+        privileged.mkdir()
+        outside = self.tmp / "customer-owned-watcher.py"
+        outside.write_text("print('customer controlled')\n")
+        os.chown(outside, CUSTOMER_UID, CUSTOMER_UID)
+        os.symlink(outside, privileged / "watcher.py")
+        result = self.secure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.quarantines()), 1)
+        self.assertFalse((privileged / "watcher.py").exists())
+
+    def test_system_python_symlink_outside_code_trees_remains_allowed(self):
+        """Do not quarantine a legitimate venv link to root-owned Python."""
+        self.agent_root.mkdir()
+        python_link = self.agent_root / "venv" / "bin" / "python3"
+        python_link.parent.mkdir(parents=True)
+        os.symlink("/usr/bin/python3", python_link)
+        result = self.secure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.quarantines(), [])
+        self.assertTrue(python_link.is_symlink())
+
+    def test_payload_symlink_inserted_after_scan_is_rejected_after_copy(self):
+        """The destination is checked too; the pre-scan cannot close a race."""
+        outside = self.tmp / "customer-controlled-install.sh"
+        outside.write_text("echo should-not-be-executed\n")
+        os.chown(outside, CUSTOMER_UID, CUSTOMER_UID)
+        wrapper = self.tmp / "bin" / "rsync"
+        wrapper.parent.mkdir(exist_ok=True)
+        payload_file = self.payload / "scripts" / "install.sh"
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            f"rm -f -- {shlex.quote(str(payload_file))}\n"
+            f"ln -s -- {shlex.quote(str(outside))} {shlex.quote(str(payload_file))}\n"
+            "exec /usr/bin/rsync \"$@\"\n"
+        )
+        wrapper.chmod(0o755)
+        result = self.deploy(expect_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("copied agent source contains a symbolic link", result.stderr)
+        self.assertTrue((self.source / "scripts" / "install.sh").is_symlink())
 
     def test_a_symlink_in_the_payload_is_refused(self):
         outside = self.tmp / "outside"
