@@ -164,27 +164,114 @@
     stats.innerHTML=html;
   }
   const EMPTY={smart_motion:'No people, vehicle or motion detections',people_counting:'No entries or exits',lpr:'No license plate reads',ppe:'No PPE checks',facial_recognition:'No faces',line_crossing:'No line crossings',intrusion:'No zone intrusions',loitering:'No loitering'};
+  const emptyText=()=>`${EMPTY[key]||'Nothing'} in this period.`;
+  // The current filters as an events query; null when the chosen site has no cameras.
+  function eventsQuery(){
+    const [start,end]=range(),ids=scope();
+    if(ids!==null&&!ids.length)return null;
+    const q=new URLSearchParams({start_ms:start,end_ms:end,result:state.result,q:state.q});
+    if(ids)q.set('camera_id',ids.join(','));
+    return q;
+  }
+  let generation=0,shownSummary='';  // generation: bumped by every fresh load, so a refresh begun under older filters is dropped
   async function load(append){
     if(state.loading)return;state.loading=true;
-    if(!append){state.before=null;state.items.clear();inline.close();results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">Loading…</div>'}
-    const [start,end]=range(),ids=scope();
-    const q=new URLSearchParams({start_ms:start,end_ms:end,result:state.result,q:state.q});
-    if(state.before)q.set('before',state.before);
+    if(!append){generation++;state.before=null;state.items.clear();inline.close();results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">Loading…</div>'}
+    const q=eventsQuery();
     try{
-      if(ids!==null&&!ids.length){results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">No cameras at this site.</div>';stats.innerHTML='';more.hidden=true;return}
-      if(ids)q.set('camera_id',ids.join(','));
+      if(q===null){results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">No cameras at this site.</div>';stats.innerHTML='';shownSummary='';more.hidden=true;return}
+      if(state.before)q.set('before',state.before);
       const r=await fetch(`/api/customer/analytics/${key}/events?${q}`,{credentials:'same-origin'});
       const body=await r.json().catch(()=>({}));
       if(!r.ok)throw new Error(typeof body.detail==='string'?body.detail:'Analytics could not be loaded.');
-      if(!append)renderSummary(body.summary||{});
+      if(!append){shownSummary=JSON.stringify(body.summary||{});renderSummary(body.summary||{})}
       body.events.forEach(e=>state.items.set(e.event_id,e));
       const offset=append?results.querySelectorAll('.aw-card').length:0;
       const html=body.events.map((e,i)=>LPR?lprRow(e):card(e,offset+i)).join('');
       if(append){results.insertAdjacentHTML('beforeend',html);inline.reattach(results)}
-      else results.innerHTML=(LPR?LPR_HEAD:'')+(html||`<div class="aw-empty">${esc(EMPTY[key]||'Nothing')} in this period.</div>`);
+      else results.innerHTML=(LPR?LPR_HEAD:'')+(html||`<div class="aw-empty">${esc(emptyText())}</div>`);
       state.before=body.next_before;more.hidden=!body.next_before;
     }catch(error){if(!append)results.innerHTML=(LPR?LPR_HEAD:'')+`<div class="aw-empty">${esc(error.message)}</div>`}
     finally{state.loading=false}
+  }
+  // License Plates keep themselves current (2026-10-06): while the page is
+  // visible, plate reads that arrive -- and clips attached to a read after
+  // it -- appear every LPR_REFRESH_MS, using the filters as they are now and
+  // leaving the rows already shown, "Load more" and an open clip alone. One
+  // timer at a time; paused while the tab is hidden, refreshed at once when
+  // it is shown again. A failed refresh keeps the table and the next tick
+  // tries again. Other analytics pages do not poll.
+  const LPR_REFRESH_MS=5000;
+  let refreshTimer=null,refreshing=false;
+  const rowFor=id=>[...results.querySelectorAll('.aw-lpr-row')].find(r=>r.dataset.event===id);
+  function placeRow(e){
+    // Newest first: before the first row that is older. A read older than
+    // everything loaded belongs on a later page while one exists.
+    const rows=[...results.querySelectorAll('.aw-lpr-row')];
+    const newer=rows.find(r=>{const o=state.items.get(r.dataset.event);return o&&o.timestamp_ms<e.timestamp_ms});
+    if(newer){newer.insertAdjacentHTML('beforebegin',lprRow(e));return true}
+    if(state.before)return false;
+    const last=rows[rows.length-1],card=last.nextElementSibling;
+    (card&&card.classList.contains('inline-media-card')?card:last).insertAdjacentHTML('afterend',lprRow(e));
+    return true;
+  }
+  function mergeLatest(body){
+    const summary=JSON.stringify(body.summary||{});
+    if(summary!==shownSummary){shownSummary=summary;renderSummary(body.summary||{})}
+    const shown=results.querySelectorAll('.aw-lpr-row').length;
+    const fresh=body.events.filter(e=>!state.items.has(e.event_id));
+    if(!shown||(fresh.length&&fresh.length===body.events.length&&body.next_before)){
+      // Nothing listed yet (no reads, or an earlier error), or a whole page
+      // of new reads: show this page as a fresh load would.
+      if(!shown&&!body.events.length){
+        const note=results.querySelector('.aw-empty');
+        if(!note||note.textContent!==emptyText())results.innerHTML=LPR_HEAD+`<div class="aw-empty">${esc(emptyText())}</div>`;
+        return;
+      }
+      state.items.clear();body.events.forEach(e=>state.items.set(e.event_id,e));
+      results.innerHTML=LPR_HEAD+body.events.map(lprRow).join('');
+      state.before=body.next_before;more.hidden=!body.next_before;
+      inline.reattach(results);
+      return;
+    }
+    body.events.forEach(e=>{
+      const known=state.items.get(e.event_id);
+      if(!known||JSON.stringify(known)===JSON.stringify(e))return;
+      const row=rowFor(e.event_id);
+      if(row&&row.getAttribute('aria-expanded')==='true')return;  // never disturb an open clip
+      state.items.set(e.event_id,e);
+      if(row)row.outerHTML=lprRow(e);
+    });
+    fresh.forEach(e=>{if(placeRow(e))state.items.set(e.event_id,e)});
+    inline.reattach(results);
+  }
+  async function refresh(){
+    if(!LPR||document.hidden||state.loading||refreshing)return;
+    if(state.range==='custom'&&!(state.from&&state.to&&state.from<=state.to))return;
+    const q=eventsQuery();if(q===null)return;
+    const startedUnder=generation;refreshing=true;
+    try{
+      const r=await fetch(`/api/customer/analytics/${key}/events?${q}`,{credentials:'same-origin'});
+      if(!r.ok)return;
+      const body=await r.json();
+      if(startedUnder!==generation||state.loading||!body||!Array.isArray(body.events))return;
+      mergeLatest(body);
+    }catch(error){/* offline or busy: keep what is shown */}
+    finally{refreshing=false}
+  }
+  function scheduleRefresh(){
+    clearTimeout(refreshTimer);refreshTimer=null;
+    if(!LPR||document.hidden)return;
+    refreshTimer=setTimeout(async()=>{refreshTimer=null;await refresh();if(!refreshTimer)scheduleRefresh()},LPR_REFRESH_MS);
+  }
+  if(LPR){
+    document.addEventListener('visibilitychange',()=>{
+      if(document.hidden){clearTimeout(refreshTimer);refreshTimer=null;return}
+      scheduleRefresh();refresh();
+    });
+    window.addEventListener('pagehide',()=>{clearTimeout(refreshTimer);refreshTimer=null});
+    // Back/forward cache: a restored page resumes, and catches up at once.
+    window.addEventListener('pageshow',ev=>{if(ev.persisted&&!document.hidden){scheduleRefresh();refresh()}});
   }
   function syncUrl(){const q=new URLSearchParams();if(state.camera)q.set('camera',state.camera);history.replaceState(null,'',`/analytics/${config.slug}${q.toString()?'?'+q:''}`)}
   $('aw-camera').addEventListener('change',e=>{state.camera=e.target.value;syncUrl();load(false)});
@@ -205,4 +292,5 @@
   if($('aw-search')){let timer=null;$('aw-search').addEventListener('input',e=>{clearTimeout(timer);timer=setTimeout(()=>{state.q=e.target.value.trim();load(false)},300)})}
   more.addEventListener('click',()=>load(true));
   load(false);
+  scheduleRefresh();
 })();
