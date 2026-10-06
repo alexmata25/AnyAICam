@@ -37,6 +37,12 @@ services:
     # above: this container only ever needs to execute the binary, never
     # write to it.
     - /opt/anyaicam/mediamtx:/opt/anyaicam/mediamtx:ro
+    # Read-only: the root-owned trust anchors the installer provisions
+    # (installer/12-update-signing-key.sh, 13-entitlement-signing-keys.sh).
+    # The VMS verifies paid-feature entitlement snapshots against
+    # entitlement_signing_keys.json here (app/appliance_entitlements.py)
+    # and can never change it.
+    - /etc/anyaicam-update:/etc/anyaicam-update:ro
     restart: unless-stopped
     healthcheck:
       test:

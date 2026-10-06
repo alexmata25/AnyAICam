@@ -6,8 +6,11 @@ depends on it.
 
 The snapshot comes from the real cloud configuration endpoint
 (appliance_cloud.py, billing in the cloud database) and is stored by the real
-edge configuration sync (edge_camera_sync.py).
+edge configuration sync (edge_camera_sync.py). It is trusted only when signed
+by a key in the installer-provisioned keyset (the trust anchor), which these
+tests provision from the cloud's own public keys as a release would.
 """
+import base64
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
@@ -42,13 +45,37 @@ def prices(monkeypatch):
     monkeypatch.delenv("ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS", raising=False)
 
 
+def _cloud_public_keys(cloud_db) -> dict:
+    """The cloud's public signing keys (what GET /api/appliance/signing-keys
+    serves, and what a release packages as the trust anchor)."""
+    import appliance_identity
+    with override_target(sqlite_path=str(cloud_db)):
+        with connection() as db:
+            appliance_identity.ensure_signing_key(db)
+            return appliance_identity.active_public_keys(db)
+
+
+def _provision_anchor(content):
+    """Writes the trust-anchor keyset the installer would install (a dict is
+    written as {"keys": ...}; a string is written as-is)."""
+    path = appliance_entitlements.TRUST_ANCHOR_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content if isinstance(content, str) else json.dumps({"keys": content}), encoding="utf-8")
+
+
 @pytest.fixture()
 def appliance(cloud_client, cloud_db, edge_db, edge_env, monkeypatch):
-    """A cloud with this appliance's customer, and the appliance's own sync
-    wired to the cloud's real configuration endpoint."""
+    """A cloud with this appliance's customer, the appliance's own sync wired
+    to the cloud's real configuration endpoint, and the trust anchor
+    provisioned with the cloud's public keys. (Root ownership of the anchor
+    is checked in production; temp files here are the test user's, so only
+    that file-ownership check is bypassed -- ownership_problem() has its own
+    tests below.)"""
     _seed_cloud(cloud_db)
     monkeypatch.setattr("appliance_activation.load_persisted_identity", lambda: dict(EDGE_IDENTITY))
-    state = {"online": True}
+    monkeypatch.setattr(appliance_entitlements, "_anchor_file_problem", lambda path: "" if path.exists() else f"{path} is missing")
+    _provision_anchor(_cloud_public_keys(cloud_db))
+    state = {"online": True, "rewrite": None}
 
     def cloud_get(path, appliance_id, credential):
         if not state["online"]:
@@ -56,9 +83,11 @@ def appliance(cloud_client, cloud_db, edge_db, edge_env, monkeypatch):
         monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
         try:
             with override_target(sqlite_path=str(cloud_db)):
-                return cloud_client.get(path, headers=_auth_headers()).json()
+                response = cloud_client.get(path, headers=_auth_headers()).json()
         finally:
             monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
+        # An attacker on the sync path (tests set state["rewrite"]).
+        return state["rewrite"](response) if state["rewrite"] else response
 
     monkeypatch.setattr(edge_camera_sync, "_control_plane_get", cloud_get)
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
@@ -173,7 +202,8 @@ def test_a_snapshot_left_stale_by_an_outage_expires_after_its_ttl(appliance, clo
     assert expires - issued == timedelta(hours=feature_entitlements.DEFAULT_SNAPSHOT_TTL_HOURS)
     state = _cached()
     later = expires + timedelta(seconds=1)
-    assert appliance_entitlements.verify(state["snapshot"], state["public_keys"], identity=EDGE_IDENTITY, now=later) == "expired"
+    assert appliance_entitlements.verify(state["snapshot"], appliance_entitlements._trusted_keys(), identity=EDGE_IDENTITY,
+                                         now=later) == "expired"
 
 
 @pytest.mark.parametrize("tamper", [
@@ -218,23 +248,234 @@ def test_an_invalid_snapshot_from_the_cloud_clears_the_previous_grant(appliance,
     assert "snapshot" not in _cached() and not _edge_allows("talk_down")
 
 
-def test_a_pinned_cloud_key_is_the_only_one_trusted(appliance, cloud_db, edge_db, monkeypatch):
+# ------------------------------------------------------------ trust anchor
+# (staging finding on 1f66bcd: with no pinned key, keys delivered by config
+# sync became trusted, so a snapshot signed with an attacker's key and that
+# key supplied through sync turned Talk Down on.)
+
+def _attacker():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    private = Ed25519PrivateKey.generate()
+    return (base64.b64encode(private.private_bytes_raw()).decode(),
+            base64.b64encode(private.public_key().public_bytes_raw()).decode())
+
+
+def _signed_by(body, private_b64, key_id):
+    import appliance_identity
+    body = {k: v for k, v in body.items() if k != "signature"}
+    return {**body, "signature": appliance_identity.sign_body(body, key_id=key_id, private_key_b64=private_b64)}
+
+
+def _forged_body(cloud_db):
+    """An otherwise valid, entitled snapshot body for exactly this appliance's
+    appliance_id, cloud_id and customer_id."""
+    now = datetime.now(timezone.utc)
+    return {"type": "anyaicam.feature_entitlements", "version": 1, "appliance_id": APPLIANCE_ID,
+            "cloud_id": EDGE_IDENTITY["cloud_id"], "customer_id": "cust-1",
+            "features": {"talk_down": True, "voice_call": True},
+            "issued_at": now.isoformat(), "expires_at": (now + timedelta(hours=24)).isoformat()}
+
+
+def _talk_denied_everywhere():
+    import talk_audio_relay_client as client
+    assert client._talk_entitled() is False
+    for feature in ("talk_down", "voice_call"):
+        assert appliance_entitlements.feature_allowed(feature) is False
+        assert _edge_allows(feature) is False
+
+
+def test_greens_attack_an_attacker_key_supplied_by_config_sync_is_never_trusted(appliance, cloud_db, edge_db):
+    """1. no trust anchor; 2. sync supplies attacker key A; 3. a snapshot signed
+    with A; 4. correct appliance/cloud/customer ids; 5. stored and used;
+    6. rejected; 7. Talk Down stays denied."""
+    appliance_entitlements.TRUST_ANCHOR_FILE.unlink()
+    private_a, public_a = _attacker()
+    forged = _signed_by(_forged_body(cloud_db), private_a, "attacker-a")
+    appliance["rewrite"] = lambda response: {**response, "feature_entitlements": forged,
+                                             "signing_public_keys": {"attacker-a": public_a}}
+    assert _sync(edge_db)["status"] != "unreachable"  # the sync itself ran
+    assert "snapshot" not in _cached() and "public_keys" not in _cached()
+    assert appliance_entitlements.store_snapshot(forged) == "rejected:no_trust_anchor"
+    _talk_denied_everywhere()
+
+
+def test_an_attacker_key_from_sync_is_not_trusted_alongside_the_real_anchor(appliance, cloud_db, edge_db):
+    private_a, public_a = _attacker()
+    forged = _signed_by(_forged_body(cloud_db), private_a, "attacker-a")
+    appliance["rewrite"] = lambda response: {**response, "feature_entitlements": forged,
+                                             "signing_public_keys": {**response.get("signing_public_keys", {}), "attacker-a": public_a}}
+    _sync(edge_db)
+    assert "snapshot" not in _cached()
+    _talk_denied_everywhere()
+
+
+def test_an_attacker_key_reusing_the_legitimate_key_id_is_rejected(appliance, cloud_db, edge_db):
+    legit_id = next(iter(_cloud_public_keys(cloud_db)))
+    private_a, public_a = _attacker()
+    forged = _signed_by(_forged_body(cloud_db), private_a, legit_id)  # claims to be the real key
+    appliance["rewrite"] = lambda response: {**response, "feature_entitlements": forged, "signing_public_keys": {legit_id: public_a}}
+    _sync(edge_db)
+    assert "snapshot" not in _cached()
+    _talk_denied_everywhere()
+
+
+def test_sync_cannot_replace_or_override_the_trusted_key(appliance, cloud_db, edge_db):
+    _plan(cloud_db, "basic_local")
+    _addon(cloud_db, "talk_down")
+    anchor_before = appliance_entitlements.TRUST_ANCHOR_FILE.read_bytes()
+    legit_id = next(iter(_cloud_public_keys(cloud_db)))
+    private_a, public_a = _attacker()
+    appliance["rewrite"] = lambda response: {**response, "signing_public_keys": {legit_id: public_a, "attacker-a": public_a}}
+    _sync(edge_db)  # the genuine snapshot still verifies against the real key
+    assert _edge_allows("talk_down") and _edge_allows("voice_call")
+    assert appliance_entitlements.TRUST_ANCHOR_FILE.read_bytes() == anchor_before  # never written by sync
+    assert appliance_entitlements.store_snapshot(_signed_by(_forged_body(cloud_db), private_a, legit_id)) == "rejected:bad_signature"
+    assert appliance_entitlements.store_snapshot(_signed_by(_forged_body(cloud_db), private_a, "attacker-a")) == "rejected:bad_signature"
+    _talk_denied_everywhere()  # the rejected forgery also cleared the cached grant (fail closed)
+
+
+def test_a_key_carried_only_inside_the_snapshot_is_not_trusted(appliance, cloud_db, edge_db):
+    private_a, public_a = _attacker()
+    body = {**_forged_body(cloud_db), "public_key": public_a, "signing_public_keys": {"attacker-a": public_a}}
+    forged = _signed_by(body, private_a, "attacker-a")
+    forged["signature"]["public_key"] = public_a
+    assert appliance_entitlements.store_snapshot(forged) == "rejected:bad_signature"
+    _talk_denied_everywhere()
+
+
+def test_the_old_environment_pin_cannot_supply_a_key(appliance, cloud_db, edge_db, monkeypatch):
+    """ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS lived in vms.env, which the
+    unprivileged anyaicam user can write; it is no longer read."""
+    appliance_entitlements.TRUST_ANCHOR_FILE.unlink()
+    private_a, public_a = _attacker()
+    monkeypatch.setenv("ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS", json.dumps({"attacker-a": public_a}))
+    assert appliance_entitlements.store_snapshot(_signed_by(_forged_body(cloud_db), private_a, "attacker-a")) == "rejected:no_trust_anchor"
+    _talk_denied_everywhere()
+
+
+@pytest.mark.parametrize("anchor", [
+    "{not json",
+    "[]",
+    '{"keys": "abc"}',
+    '{"keys": {"k1": "not base64!"}}',
+    '{"keys": {"k1": "AAAA"}}',                       # base64, but not 32 bytes
+    '{"keys": {"bad id with spaces": "%s"}}' % base64.b64encode(b"\0" * 32).decode(),
+    '{"keys": {"k1": 12345}}',
+])
+def test_a_malformed_trust_anchor_denies(appliance, cloud_db, edge_db, anchor):
     _plan(cloud_db, "ai_local")
     _sync(edge_db)
-    monkeypatch.setenv("ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS", json.dumps(_cached()["public_keys"]))
     assert _edge_allows("talk_down")
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    import base64
-    attacker = Ed25519PrivateKey.generate()
+    _provision_anchor(anchor)
+    _talk_denied_everywhere()
+
+
+def test_one_bad_entry_rejects_the_whole_keyset(appliance, cloud_db, edge_db):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    _provision_anchor({**_cloud_public_keys(cloud_db), "broken": "AAAA"})
+    _talk_denied_everywhere()
+
+
+@pytest.mark.parametrize("anchor", ["", "   ", "{}", '{"keys": {}}'])
+def test_an_empty_trust_anchor_denies(appliance, cloud_db, edge_db, anchor):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    _provision_anchor(anchor)
+    _talk_denied_everywhere()
+
+
+def test_the_trusted_key_and_a_valid_snapshot_are_allowed(appliance, cloud_db, edge_db):
+    import talk_audio_relay_client as client
+    _plan(cloud_db, "basic_local")
+    _addon(cloud_db, "talk_down")
+    _sync(edge_db)
+    assert _cached()["snapshot"]["signature"]["key_id"] in appliance_entitlements._trusted_keys()
+    assert client._talk_entitled() is True
+    assert _edge_allows("talk_down") and _edge_allows("voice_call")
+
+
+def test_the_trusted_key_with_a_wrong_signature_is_denied(appliance, cloud_db, edge_db):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
     state = _cached()
-    attacker_key = base64.b64encode(attacker.public_key().public_bytes_raw()).decode()
-    state["public_keys"] = {"attacker": attacker_key}  # a key planted in the cache is ignored when one is pinned
-    import appliance_identity
-    body = {k: v for k, v in state["snapshot"].items() if k != "signature"}
-    state["snapshot"] = {**body, "signature": appliance_identity.sign_body(
-        body, key_id="attacker", private_key_b64=base64.b64encode(attacker.private_bytes_raw()).decode())}
+    other = _signed_by(state["snapshot"], _attacker()[0], state["snapshot"]["signature"]["key_id"])
+    state["snapshot"]["signature"]["value"] = other["signature"]["value"]  # the trusted key id, someone else's signature
     appliance_entitlements.STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    _talk_denied_everywhere()
+
+
+@pytest.mark.parametrize("field,value", [("customer_id", "cust-2"), ("cloud_id", "AIC-OTHER"), ("appliance_id", "appl-2")])
+def test_the_trusted_key_with_the_wrong_identity_is_denied(appliance, cloud_db, edge_db, field, value):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    state = _cached()
+    state["snapshot"] = _resign(state["snapshot"], cloud_db, **{field: value})  # genuinely signed by the trusted key
+    appliance_entitlements.STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    _talk_denied_everywhere()
+
+
+def test_a_cached_grant_survives_an_outage_only_while_it_verifies_against_the_anchor(appliance, cloud_db, edge_db):
+    _plan(cloud_db, "ai_local")
+    _sync(edge_db)
+    appliance["online"] = False
+    assert _sync(edge_db) == {"status": "unreachable"}
+    assert _edge_allows("talk_down")  # trusted key: the cached grant keeps working offline
+    _provision_anchor({"next-key": _attacker()[1]})  # a release that no longer trusts the signing key
     assert not _edge_allows("talk_down")
+
+
+def test_an_untrusted_cached_grant_is_denied(appliance, cloud_db, edge_db):
+    """A cache written by an older build, holding a forged snapshot and the
+    attacker key it cached from sync, grants nothing; the next store drops
+    those cached keys."""
+    private_a, public_a = _attacker()
+    appliance_entitlements.STATE_FILE.write_text(json.dumps({
+        "public_keys": {"attacker-a": public_a},
+        "snapshot": _signed_by(_forged_body(cloud_db), private_a, "attacker-a")}), encoding="utf-8")
+    _talk_denied_everywhere()
+    appliance_entitlements.store_snapshot(None)
+    assert "public_keys" not in _cached()
+
+
+def test_a_missing_trust_anchor_denies_paid_features_but_not_the_vms(appliance, cloud_db, edge_db, monkeypatch):
+    import aac_voice_call
+    import aac_voice_call_greeting
+    import customer_analytics_rule_worker as worker
+    import vms_capacity
+    _plan(cloud_db, "ai_local")
+    _grant(cloud_db, "voice_call")
+    appliance_entitlements.TRUST_ANCHOR_FILE.unlink()
+    result = _sync(edge_db)
+    assert result["status"] != "unreachable"
+    capacity = vms_capacity.load_capacity()
+    assert capacity is not None and vms_capacity.camera_licensed(1, [1]) == (int(capacity["camera_slot_quantity"]) >= 1)
+    _talk_denied_everywhere()
+    fired = [{"analytic_type": "intrusion_alarm", "talkdown_text": "Leave now", "customer_id": "cust-1"}]
+    assert worker.speak_alarm_talkdowns("cam-1", fired, ["e1"], provider=aac_voice_call_greeting.MockGreetingAudioProvider()) == 0
+    with override_target(sqlite_path=str(edge_db)):
+        greeting = aac_voice_call.handle_edge_person_detected(customer_id="cust-1", camera_id="cam-1", camera_number=1,
+                                                              forward_event=lambda event: pytest.fail("no call"))
+    assert greeting == {"triggered": False, "skipped_reason": "not_entitled"}
+
+
+def test_the_anchor_must_be_root_owned_and_not_writable_by_others():
+    import stat
+    from types import SimpleNamespace as Stat
+    regular = stat.S_IFREG
+    assert appliance_entitlements.ownership_problem(Stat(st_mode=regular | 0o644, st_uid=0)) == ""
+    assert appliance_entitlements.ownership_problem(Stat(st_mode=stat.S_IFDIR | 0o755, st_uid=0)) == ""
+    assert "owned by root" in appliance_entitlements.ownership_problem(Stat(st_mode=regular | 0o644, st_uid=1000))
+    assert "writable" in appliance_entitlements.ownership_problem(Stat(st_mode=regular | 0o664, st_uid=0))
+    assert "writable" in appliance_entitlements.ownership_problem(Stat(st_mode=regular | 0o646, st_uid=0))
+    assert "symbolic link" in appliance_entitlements.ownership_problem(Stat(st_mode=stat.S_IFLNK | 0o777, st_uid=0))
+
+
+def test_the_anchor_path_is_fixed_in_code():
+    import inspect
+    source = inspect.getsource(appliance_entitlements)
+    assert 'TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")' in source
+    assert "ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS" not in source.split('"""', 2)[2]  # never read
 
 
 # ------------------------------------------------------------ runtime role

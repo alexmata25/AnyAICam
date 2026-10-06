@@ -30,16 +30,31 @@ appliance on the next sync (about a minute while online); offline, the last
 snapshot stops granting anything after its TTL (cloud setting
 ANYAICAM_ENTITLEMENT_SNAPSHOT_TTL_HOURS, default 24).
 
-Trusted keys: ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS (JSON {key_id: base64 key})
-pins them for the deployment; without it, the keys the cloud sends over the
-authenticated configuration channel are cached next to the snapshot (so a
-rotated key is picked up at the next sync).
+Trusted keys (2026-10-05, staging finding on 1f66bcd: keys sent by config
+sync could become trusted, so a forged snapshot signed with any key the sync
+response supplied was accepted). The only trust anchor is the keyset the
+installer provisions from the signed release package (installer/
+13-entitlement-signing-keys.sh): TRUST_ANCHOR_FILE, root-owned under
+/etc/anyaicam-update/ (the Software Update trust-anchor directory, outside
+everything the anyaicam user owns), bind-mounted read-only into the VMS
+container. Its path is fixed in code, not taken from the environment.
+  * Keys in a configuration response, inside a snapshot, or in the local
+    cache are never trusted; a sync can neither add nor replace a key.
+  * No keyset, an unreadable/malformed one, or one not safely root-owned:
+    every paid feature is denied (the VMS itself is unaffected).
+  * A cached snapshot is re-verified against the keyset on every use, so one
+    that does not verify grants nothing.
+  * Rotation: the keyset holds several {key_id: public key}; a release
+    adds the next cloud key before the cloud signs with it and drops the old
+    one only after it is retired (docs/entitlement-signing-keys.md).
+The cloud's private signing key never leaves the cloud.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,16 +76,78 @@ def _parse_time(value) -> datetime | None:
     return parsed if parsed.tzinfo else None  # a snapshot always carries UTC
 
 
-def _pinned_keys() -> dict[str, str] | None:
-    raw = os.environ.get("ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS", "").strip()
-    if not raw:
-        return None
+# Installed by the installer, root:root 0644 in a root:root 0755 directory.
+# Deliberately not configurable from the environment: vms.env is writable by
+# the unprivileged anyaicam user.
+TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
+_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def ownership_problem(info) -> str:
+    """Why an lstat() result is not a safe trust-anchor entry, or ""."""
+    import stat
+    if stat.S_ISLNK(info.st_mode):
+        return "is a symbolic link"
+    if info.st_uid != 0:
+        return "is not owned by root"
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return "is writable by group or others"
+    return ""
+
+
+def _anchor_file_problem(path: Path) -> str:
+    """The keyset and its directory must be root-owned, not symlinks, and not
+    writable by anyone else -- or a less-privileged user could swap it. (POSIX
+    only; a Windows development checkout has no such ownership model.)"""
+    if os.name != "posix":
+        return ""
+    for candidate in (path.parent, path):
+        try:
+            problem = ownership_problem(os.lstat(candidate))
+        except OSError:
+            return f"{candidate} is missing"
+        if problem:
+            return f"{candidate} {problem}"
+    return ""
+
+
+def parse_trusted_keyset(raw: str) -> dict[str, str]:
+    """{key_id: base64 Ed25519 public key} from the keyset document
+    {"keys": {...}}. Raises ValueError for anything malformed -- one bad
+    entry rejects the whole keyset rather than trusting part of it."""
+    import base64
+    document = json.loads(raw)
+    keys = document.get("keys") if isinstance(document, dict) else None
+    if not isinstance(keys, dict) or not keys:
+        raise ValueError("the keyset holds no keys")
+    trusted = {}
+    for key_id, value in keys.items():
+        if not isinstance(key_id, str) or not _KEY_ID_PATTERN.match(key_id):
+            raise ValueError("a key id is malformed")
+        if not isinstance(value, str):
+            raise ValueError("a key is not a string")
+        try:
+            raw_key = base64.b64decode(value, validate=True)
+        except ValueError as error:
+            raise ValueError("a key is not base64") from error
+        if len(raw_key) != 32:
+            raise ValueError("a key is not a 32-byte Ed25519 public key")
+        trusted[key_id] = value
+    return trusted
+
+
+def _trusted_keys() -> dict[str, str]:
+    """The provisioned keyset, or {} (trust nothing) when it is missing,
+    unsafe or malformed."""
+    problem = _anchor_file_problem(TRUST_ANCHOR_FILE)
+    if problem:
+        logger.warning("appliance_entitlements.no_trust_anchor problem=%s", problem)
+        return {}
     try:
-        keys = json.loads(raw)
-    except ValueError:
-        logger.error("appliance_entitlements.pinned_keys_unreadable")
-        return {}  # a broken pin trusts nothing rather than everything
-    return {str(k): str(v) for k, v in keys.items()} if isinstance(keys, dict) else {}
+        return parse_trusted_keyset(TRUST_ANCHOR_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        logger.warning("appliance_entitlements.no_trust_anchor problem=%s", error)
+        return {}
 
 
 def _read_state() -> dict:
@@ -91,14 +168,6 @@ def _write_state(state: dict) -> bool:
     except OSError as error:
         logger.warning("appliance_entitlements.persist_failed error=%s", type(error).__name__)
         return False
-
-
-def _trusted_keys(state: dict) -> dict[str, str]:
-    pinned = _pinned_keys()
-    if pinned is not None:
-        return pinned
-    keys = state.get("public_keys")
-    return {str(k): str(v) for k, v in keys.items()} if isinstance(keys, dict) else {}
 
 
 # The snapshot must name exactly the identity this appliance was activated
@@ -132,6 +201,8 @@ def verify(snapshot, public_keys: dict[str, str], *, identity, now: datetime | N
     a missing or malformed persisted identity denies."""
     if not isinstance(snapshot, dict):
         return "missing"
+    if not public_keys:
+        return "no_trust_anchor"
     bound = _bound_identity(identity)
     if bound is None:
         return "not_activated"
@@ -160,19 +231,19 @@ def verify(snapshot, public_keys: dict[str, str], *, identity, now: datetime | N
     return None
 
 
-def store_snapshot(snapshot, public_keys=None) -> str:
+def store_snapshot(snapshot) -> str:
     """Called by each configuration sync. A valid snapshot replaces the cached
     one; an invalid one is not kept and clears the cache (fail closed -- a
     snapshot the cloud just sent that cannot be verified must not leave an
     older grant in force). A configuration with no snapshot at all (an older
-    cloud) leaves the cache to expire on its own. Returns the outcome."""
+    cloud) leaves the cache to expire on its own. Returns the outcome. Keys
+    are never taken from the sync (see the module docstring)."""
     state = _read_state()
-    if isinstance(public_keys, dict) and public_keys:
-        state["public_keys"] = {str(k): str(v) for k, v in public_keys.items()}
+    state.pop("public_keys", None)  # keys an older build cached from sync are never trusted
     if snapshot is None:
         _write_state(state)
         return "absent"
-    reason = verify(snapshot, _trusted_keys(state), identity=_local_identity())
+    reason = verify(snapshot, _trusted_keys(), identity=_local_identity())
     if reason:
         logger.warning("appliance_entitlements.snapshot_rejected reason=%s", reason)
         state.pop("snapshot", None)
@@ -190,7 +261,7 @@ def feature_allowed(feature: str, customer_id: str | None = None) -> bool:
             return False
         state = _read_state()
         snapshot = state.get("snapshot")
-        reason = verify(snapshot, _trusted_keys(state), identity=_local_identity())
+        reason = verify(snapshot, _trusted_keys(), identity=_local_identity())
         if reason:
             logger.info("appliance_entitlements.denied feature=%s reason=%s", feature, reason)
             return False

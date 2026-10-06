@@ -238,15 +238,17 @@ def pytest_configure(config):
 def _appliance_entitlements(request, monkeypatch, tmp_path):
     """An appliance (the default edge role) runs Talk Down / Voice Call only
     with a valid signed entitlement snapshot (appliance_entitlements.py).
-    Its cache lives in each test's own directory, and tests not about
-    entitlements see an entitled appliance; tests marked real_entitlements
-    get the real check."""
+    Its cache and its trust anchor (the installer-provisioned keyset, absent
+    unless a test provisions one) live in each test's own directory, never
+    the machine's /etc. Tests not about entitlements see an entitled
+    appliance; tests marked real_entitlements get the real check."""
     try:
         import appliance_entitlements
     except ImportError:
         yield
         return
     monkeypatch.setattr(appliance_entitlements, "STATE_FILE", tmp_path / "feature_entitlements.json")
+    monkeypatch.setattr(appliance_entitlements, "TRUST_ANCHOR_FILE", tmp_path / "trust-anchor" / "entitlement_signing_keys.json")
     if request.node.get_closest_marker("real_entitlements") is None:
         monkeypatch.setattr(appliance_entitlements, "feature_allowed", lambda feature, customer_id=None: True)
     yield

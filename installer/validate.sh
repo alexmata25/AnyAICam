@@ -201,6 +201,14 @@ update_signing_key_ok() {
     [[ "$(sha256sum "$key" | awk '{print $1}')" == "$UPDATE_SIGNING_KEY_SHA256" ]]
 }
 
+entitlement_signing_keys_ok() {
+    local keys="${ENTITLEMENT_KEYS_FILE:-/etc/anyaicam-update/entitlement_signing_keys.json}"
+    [[ -f "$keys" && ! -L "$keys" ]] || return 1
+    [[ "$(stat -c %U "$keys")" == "root" && "$(stat -c %U "$(dirname "$keys")")" == "root" ]] || return 1
+    [[ "$(stat -c %a "$keys")" == "644" ]] || return 1
+    [[ "$(sha256sum "$keys" | awk '{print $1}')" == "$ENTITLEMENT_SIGNING_KEYS_SHA256" ]]
+}
+
 run_validate() {
     load_release_metadata
     detect_install_state
@@ -218,6 +226,9 @@ run_validate() {
     fi
     if [[ -n "${UPDATE_SIGNING_KEY_SHA256:-}" ]]; then
         check "Software Update signing key is provisioned root-owned" update_signing_key_ok
+    fi
+    if [[ -n "${ENTITLEMENT_SIGNING_KEYS_SHA256:-}" ]]; then
+        check "Entitlement-signing keyset is provisioned root-owned" entitlement_signing_keys_ok
     fi
     # Existence/non-emptiness only -- the actual value is never read, printed,
     # or compared here. Without this key, camera provisioning with ONVIF/RTSP

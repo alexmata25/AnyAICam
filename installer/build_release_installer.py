@@ -63,6 +63,7 @@ INSTALLER_RUNTIME_FILES = (
     "08-systemd-setup.sh",
     "09-identity.sh",
     "12-update-signing-key.sh",
+    "13-entitlement-signing-keys.sh",
     "validate.sh",
     "uninstall.sh",
     "rollback.sh",
@@ -153,6 +154,38 @@ def read_update_signing_public_key(path: str) -> bytes:
         raise SystemExit("--update-signing-public-key is not a SubjectPublicKeyInfo (DER SEQUENCE) key.")
     wrapped = [encoded[index:index + 64] for index in range(0, len(encoded), 64)]
     return ("\n".join(["-----BEGIN PUBLIC KEY-----", *wrapped, "-----END PUBLIC KEY-----"]) + "\n").encode("ascii")
+
+
+ENTITLEMENT_KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def read_entitlement_signing_keys(path: str) -> bytes:
+    """The cloud's entitlement-signing PUBLIC keyset, as served by the cloud's
+    public GET /api/appliance/signing-keys: {"keys": {key_id: base64 Ed25519
+    public key}}. Appliances trust only this keyset (app/appliance_
+    entitlements.py). Anything else -- private key material, a key that is
+    not 32 raw bytes, a malformed id, an empty set -- is refused. Returned in
+    canonical form (sorted, LF) so its SHA-256 is stable."""
+    data = Path(path).read_bytes()
+    if b"PRIVATE" in data.upper():
+        raise SystemExit("--entitlement-signing-public-keys contains private key material; pass public keys only.")
+    try:
+        document = json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise SystemExit(f"--entitlement-signing-public-keys is not JSON: {error}") from error
+    keys = document.get("keys") if isinstance(document, dict) else None
+    if not isinstance(keys, dict) or not keys:
+        raise SystemExit('--entitlement-signing-public-keys must be {"keys": {key_id: base64 public key}} with at least one key.')
+    for key_id, value in keys.items():
+        if not isinstance(key_id, str) or not ENTITLEMENT_KEY_ID_RE.fullmatch(key_id):
+            raise SystemExit(f"--entitlement-signing-public-keys has a malformed key id: {key_id!r}")
+        try:
+            raw = base64.b64decode(value, validate=True) if isinstance(value, str) else b""
+        except ValueError:
+            raw = b""
+        if len(raw) != 32:
+            raise SystemExit(f"--entitlement-signing-public-keys key {key_id!r} is not a 32-byte Ed25519 public key.")
+    return (json.dumps({"keys": dict(sorted(keys.items()))}, sort_keys=True, indent=2) + "\n").encode("ascii")
 
 
 def validate_sha256(value: str, label: str) -> str:
@@ -393,6 +426,13 @@ def main() -> int:
     parser.add_argument("--no-update-signing-key", action="store_true",
                         help="Explicitly build without provisioning an update-signing key "
                              "(Software Update will refuse every release on such installs)")
+    parser.add_argument("--entitlement-signing-public-keys",
+                        help="The cloud's entitlement-signing PUBLIC keyset (JSON from GET /api/appliance/signing-keys, "
+                             "fingerprints checked out of band). Appliances authorize Talk Down / AAC Voice Call only "
+                             "with snapshots signed by these keys.")
+    parser.add_argument("--no-entitlement-signing-keys", action="store_true",
+                        help="Explicitly build an installer that provisions no entitlement keyset: a fresh install "
+                             "denies every paid feature until a release that carries one is installed.")
     parser.add_argument("--output-dir", default="dist")
     args = parser.parse_args()
 
@@ -420,6 +460,16 @@ def main() -> int:
             "accept a Software Update."
         )
     update_key_bytes = read_update_signing_public_key(args.update_signing_public_key) if args.update_signing_public_key else b""
+    if args.entitlement_signing_public_keys and args.no_entitlement_signing_keys:
+        raise SystemExit("--entitlement-signing-public-keys and --no-entitlement-signing-keys are mutually exclusive.")
+    if not args.entitlement_signing_public_keys and not args.no_entitlement_signing_keys:
+        raise SystemExit(
+            "Paid features need a trust anchor: pass --entitlement-signing-public-keys with the cloud's entitlement-"
+            "signing PUBLIC keyset, or --no-entitlement-signing-keys to explicitly build an installer whose fresh "
+            "appliances deny Talk Down and AAC Voice Call."
+        )
+    entitlement_keys_bytes = (read_entitlement_signing_keys(args.entitlement_signing_public_keys)
+                              if args.entitlement_signing_public_keys else b"")
 
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
@@ -489,6 +539,12 @@ def main() -> int:
             key_dest.parent.mkdir(parents=True, exist_ok=True)
             key_dest.write_bytes(update_key_bytes)
             update_key_sha256 = sha256_file(key_dest)
+        entitlement_keys_sha256 = ""
+        if entitlement_keys_bytes:
+            keys_dest = package / "payload/keys/entitlement-signing-public-keys.json"
+            keys_dest.parent.mkdir(parents=True, exist_ok=True)
+            keys_dest.write_bytes(entitlement_keys_bytes)
+            entitlement_keys_sha256 = sha256_file(keys_dest)
 
         mediamtx_included = False
         mediamtx_sha256_value = ""
@@ -539,6 +595,7 @@ def main() -> int:
             f"MEDIAMTX_SHA256={mediamtx_sha256_value}\n"
             f"RELEASE_VERSION={release_version}\n"
             f"UPDATE_SIGNING_KEY_SHA256={update_key_sha256}\n"
+            f"ENTITLEMENT_SIGNING_KEYS_SHA256={entitlement_keys_sha256}\n"
         )
         (package / "release.env").write_text(release_env, encoding="utf-8", newline="\n")
 
@@ -552,6 +609,7 @@ def main() -> int:
             "installer_version": "1.1.0",
             "release_version": release_version,
             "update_signing_key_sha256": update_key_sha256,
+            "entitlement_signing_keys_sha256": entitlement_keys_sha256,
             "installer_source_commit": installer_commit,
             "vms_release_commit": vms_commit,
             "vms_release_source": release_source,

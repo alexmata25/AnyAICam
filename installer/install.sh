@@ -45,6 +45,9 @@ MEDIAMTX_SHA256=""
 # from installers built before these fields existed.
 RELEASE_VERSION=""
 UPDATE_SIGNING_KEY_SHA256=""
+# Paid-feature entitlements (2026-10-05): SHA-256 of the packaged
+# entitlement-signing PUBLIC keyset (empty = none).
+ENTITLEMENT_SIGNING_KEYS_SHA256=""
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
@@ -106,7 +109,11 @@ load_release_metadata() {
         echo "[ERROR] UPDATE_SIGNING_KEY_SHA256 is present but is not a lowercase SHA-256." >&2
         return 1
     fi
-    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256 RELEASE_VERSION UPDATE_SIGNING_KEY_SHA256
+    if [[ -n "${ENTITLEMENT_SIGNING_KEYS_SHA256:-}" && ! "${ENTITLEMENT_SIGNING_KEYS_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "[ERROR] ENTITLEMENT_SIGNING_KEYS_SHA256 is present but is not a lowercase SHA-256." >&2
+        return 1
+    fi
+    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256 RELEASE_VERSION UPDATE_SIGNING_KEY_SHA256 ENTITLEMENT_SIGNING_KEYS_SHA256
 }
 
 # shellcheck source=01-preflight.sh
@@ -134,6 +141,8 @@ source "$INSTALLER_DIR/08-systemd-setup.sh"
 source "$INSTALLER_DIR/09-identity.sh"
 # shellcheck source=12-update-signing-key.sh
 source "$INSTALLER_DIR/12-update-signing-key.sh"
+# shellcheck source=13-entitlement-signing-keys.sh
+source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"
 
 run_install() {
     local mode="install"
@@ -170,6 +179,7 @@ run_install() {
     disable_system_suspend
     identity_provision "$INSTALL_STATE"
     provision_update_signing_key
+    provision_entitlement_signing_keys
     stamp_release
     log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."
 }
