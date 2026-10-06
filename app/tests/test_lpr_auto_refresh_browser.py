@@ -34,10 +34,24 @@ class Server:
         self.fail = False
         self.calls = []
         self.page_size = page_size  # None: everything on one page
+        self.hold = False  # True: requests stay pending until release()
+        self.held = []
 
     def respond(self, route, url):
         query = parse_qs(urlsplit(url).query)
         self.calls.append(query)
+        if self.hold:
+            self.held.append((route, query))
+            return None
+        return self.answer(route, query)
+
+    def release(self):
+        """Answers every pending request with the server's state as it is now."""
+        held, self.held, self.hold = self.held, [], False
+        for route, query in held:
+            self.answer(route, query)
+
+    def answer(self, route, query):
         if self.fail:
             return route.fulfill(status=503, content_type="application/json", body=json.dumps({"detail": "busy"}))
         events = sorted(self.events, key=lambda e: e["timestamp_ms"], reverse=True)
@@ -361,3 +375,75 @@ def test_catching_up_reads_only_until_it_reaches_what_is_shown(lpr):
     assert _event_ids(page) == ["new-3", "new-2", "new-1", "p-2", "p-1"]
     assert len(server.calls) - base == 2  # page one (all new), then page two (reaches p-2): stop
     assert "before" in server.calls[-1] and "before" not in server.calls[-2]
+
+
+# ---------------------------------------------------------------- lifecycle while a refresh is in flight
+# (Codex review of 94e9a2c.)
+
+def test_pagehide_during_a_pending_refresh_stops_polling_and_leaves_the_page_alone(lpr):
+    page, server = lpr
+    server.hold = True
+    page.clock.run_for(REFRESH_MS)  # the automatic refresh starts...
+    _until(page, lambda: len(server.held) == 1, what="the pending refresh")
+    page.evaluate("window.dispatchEvent(new Event('pagehide'))")  # ...and the user leaves meanwhile
+    server.events.append(_read("p-3", 1, "CCC333"))
+    server.release()  # the stale request now completes
+    _settle(page)
+    base = len(server.calls)
+    for _ in range(3):  # well past the next intervals: nothing restarts
+        page.clock.run_for(REFRESH_MS)
+        _settle(page)
+    assert len(server.calls) == base, "polling restarted after pagehide"
+    assert _event_ids(page) == ["p-2", "p-1"], "the departed page was changed"
+
+    # Back/forward-cache restore: one immediate catch-up, then exactly one chain.
+    page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}))")
+    _until(page, lambda: len(server.calls) == base + 1, what="the immediate refresh")
+    _until(page, lambda: _event_ids(page) == ["p-3", "p-2", "p-1"], what="the catch-up")
+    for tick in range(1, 4):
+        page.clock.run_for(REFRESH_MS)
+        _settle(page)
+        assert len(server.calls) == base + 1 + tick, f"expected one refresh per 5 s after restore (tick {tick})"
+
+
+def test_a_page_load_pageshow_is_not_a_restore(lpr):
+    page, server = lpr
+    page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: false}))")
+    _settle(page)
+    base = len(server.calls)
+    for tick in range(1, 3):
+        page.clock.run_for(REFRESH_MS)
+        _settle(page)
+        assert len(server.calls) == base + tick  # still one chain, no extra refresh
+
+
+def test_typing_a_search_makes_a_pending_refresh_stale(lpr):
+    page, server = lpr
+    server.hold = True
+    page.clock.run_for(REFRESH_MS)
+    _until(page, lambda: len(server.held) == 1, what="the pending refresh")
+    assert server.calls[-1].get("q") is None  # the refresh used the old (empty) search
+    page.fill("#aw-search", "BBB")  # typed; its load waits 300 ms
+    server.events.append(_read("p-3", 1, "CCC333"))  # what the old search would now return
+    server.release()
+    _settle(page)
+    assert _event_ids(page) == ["p-2", "p-1"], "a response for the old search was shown"
+    page.clock.run_for(300)
+    _until(page, lambda: server.calls[-1].get("q") == ["BBB"], what="the search load")
+
+
+def test_no_refresh_starts_while_a_typed_search_waits_for_its_debounce(lpr):
+    page, server = lpr
+    page.clock.run_for(REFRESH_MS - 100)
+    _settle(page)
+    base = len(server.calls)
+    page.fill("#aw-search", "BBB")
+    page.clock.run_for(100)  # the refresh tick falls inside the 300 ms debounce
+    _settle(page)
+    assert len(server.calls) == base, "refreshed with the old search while the new one was pending"
+    page.clock.run_for(200)  # the debounce ends: one load, with the new search
+    _until(page, lambda: len(server.calls) == base + 1, what="the search load")
+    assert server.calls[-1].get("q") == ["BBB"]
+    page.clock.run_for(REFRESH_MS)
+    _until(page, lambda: len(server.calls) == base + 2, what="polling with the new search")
+    assert server.calls[-1].get("q") == ["BBB"]

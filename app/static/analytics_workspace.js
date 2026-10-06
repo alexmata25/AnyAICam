@@ -204,6 +204,10 @@
   const LPR_REFRESH_MS=5000;
   const LPR_CATCH_UP_PAGES=10;  // a refresh reads at most this many newer pages to reach what is shown
   let refreshTimer=null,refreshing=false;
+  // Polling lifecycle: false from pagehide until a back/forward-cache restore.
+  // A refresh still in flight then finishes without touching the page and
+  // without scheduling another (it was also made stale by the pagehide).
+  let polling=LPR;
   const rowFor=id=>[...results.querySelectorAll('.aw-lpr-row')].find(r=>r.dataset.event===id);
   function placeRow(e){
     // Newest first: before the first row that is older. A read older than
@@ -248,8 +252,11 @@
     inline.reattach(results);
   }
   async function refresh(){
-    if(!LPR||document.hidden||state.loading||refreshing)return;
+    if(!polling||document.hidden||state.loading||refreshing)return;
     if(state.range==='custom'&&!(state.from&&state.to&&state.from<=state.to))return;
+    // A search typed but not yet applied (its 300 ms debounce): the old
+    // search's results must not be shown meanwhile.
+    const search=$('aw-search');if(search&&search.value.trim()!==state.q)return;
     const q=eventsQuery();if(q===null)return;
     const startedUnder=generation;refreshing=true;
     try{
@@ -274,24 +281,24 @@
         cursor=next.next_before;pages++;
         if(next.events.some(e=>state.items.has(e.event_id)))break;
       }
-      if(startedUnder!==generation||state.loading)return;
+      if(!polling||startedUnder!==generation||state.loading)return;
       mergeLatest({...body,events});
     }catch(error){/* offline or busy: keep what is shown */}
     finally{refreshing=false}
   }
   function scheduleRefresh(){
     clearTimeout(refreshTimer);refreshTimer=null;
-    if(!LPR||document.hidden)return;
-    refreshTimer=setTimeout(async()=>{refreshTimer=null;await refresh();if(!refreshTimer)scheduleRefresh()},LPR_REFRESH_MS);
+    if(!polling||document.hidden)return;
+    refreshTimer=setTimeout(async()=>{refreshTimer=null;await refresh();if(!refreshTimer&&polling)scheduleRefresh()},LPR_REFRESH_MS);
   }
   if(LPR){
     document.addEventListener('visibilitychange',()=>{
-      if(document.hidden){clearTimeout(refreshTimer);refreshTimer=null;return}
+      if(document.hidden||!polling){clearTimeout(refreshTimer);refreshTimer=null;return}
       scheduleRefresh();refresh();
     });
-    window.addEventListener('pagehide',()=>{clearTimeout(refreshTimer);refreshTimer=null});
+    window.addEventListener('pagehide',()=>{polling=false;generation++;clearTimeout(refreshTimer);refreshTimer=null});
     // Back/forward cache: a restored page resumes, and catches up at once.
-    window.addEventListener('pageshow',ev=>{if(ev.persisted&&!document.hidden){scheduleRefresh();refresh()}});
+    window.addEventListener('pageshow',ev=>{if(ev.persisted&&!polling){polling=true;if(!document.hidden){scheduleRefresh();refresh()}}});
   }
   function syncUrl(){const q=new URLSearchParams();if(state.camera)q.set('camera',state.camera);history.replaceState(null,'',`/analytics/${config.slug}${q.toString()?'?'+q:''}`)}
   $('aw-camera').addEventListener('change',e=>{state.camera=e.target.value;syncUrl();load(false)});
@@ -309,7 +316,8 @@
   });
   ['aw-from','aw-to'].forEach(id=>$(id).addEventListener('change',e=>{state[id==='aw-from'?'from':'to']=e.target.value;if(state.from&&state.to&&state.from<=state.to)load(false)}));
   if($('aw-result'))$('aw-result').addEventListener('change',e=>{state.result=e.target.value;load(false)});
-  if($('aw-search')){let timer=null;$('aw-search').addEventListener('input',e=>{clearTimeout(timer);timer=setTimeout(()=>{state.q=e.target.value.trim();load(false)},300)})}
+  // Typing makes any refresh in flight stale at once (it used the old search).
+  if($('aw-search')){let timer=null;$('aw-search').addEventListener('input',e=>{generation++;clearTimeout(timer);timer=setTimeout(()=>{state.q=e.target.value.trim();load(false)},300)})}
   more.addEventListener('click',()=>load(true));
   load(false);
   scheduleRefresh();
