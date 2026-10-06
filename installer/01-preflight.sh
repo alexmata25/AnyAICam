@@ -31,11 +31,13 @@ for entry in entries:
     if rel.startswith("/") or ".." in rel.split("/") or not path.startswith(os.path.normpath(root)):
         bad.append(f"unsafe path {rel!r}"); continue
     try:
+        digest = hashlib.sha256()
         with open(path, "rb") as handle:
-            digest = hashlib.sha256(handle.read()).hexdigest()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
     except OSError:
         bad.append(f"missing {rel}"); continue
-    if digest != entry.get("sha256"):
+    if digest.hexdigest() != entry.get("sha256"):
         bad.append(f"changed {rel}")
 if bad or not entries:
     print("; ".join(bad[:10]) or "empty manifest", file=sys.stderr)
