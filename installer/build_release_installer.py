@@ -159,23 +159,36 @@ def read_update_signing_public_key(path: str) -> bytes:
 ENTITLEMENT_KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-def read_entitlement_signing_keys(path: str) -> bytes:
-    """The cloud's entitlement-signing PUBLIC keyset, as served by the cloud's
-    public GET /api/appliance/signing-keys: {"keys": {key_id: base64 Ed25519
-    public key}}. Appliances trust only this keyset (app/appliance_
-    entitlements.py). Anything else -- private key material, a key that is
-    not 32 raw bytes, a malformed id, an empty set -- is refused. Returned in
-    canonical form (sorted, LF) so its SHA-256 is stable."""
+def canonical_entitlement_keyset(keys: dict) -> bytes:
+    """Byte-identical to anyaicam_agent/updater/release_checks.py and
+    app/entitlement_keyset.py (tests compare them): its SHA-256 is the keyset
+    digest."""
+    return (json.dumps({"keys": dict(sorted(keys.items()))}, sort_keys=True, indent=2) + "\n").encode("ascii")
+
+
+def read_entitlement_signing_keys(path: str, expected_sha256: str) -> bytes:
+    """The cloud's entitlement-signing PUBLIC keyset, {"keys": {key_id: base64
+    Ed25519 public key}} (the shape GET /api/appliance/signing-keys serves).
+    Appliances trust only this keyset (app/appliance_entitlements.py), so it
+    is packaged only when the SHA-256 of its canonical form equals
+    expected_sha256 -- a digest the operator obtained independently on the
+    cloud host (app/entitlement_keyset.py, docs/entitlement-signing-keys.md),
+    never from the same download as the keyset. Length alone cannot tell a
+    32-byte public key from a 32-byte private seed; the digest can. Also
+    refused: key containers or private-key material, unexpected fields, a
+    malformed id, a value that is not 32 raw bytes, an empty set."""
+    expected = validate_sha256(str(expected_sha256 or ""), "--entitlement-signing-keys-sha256")
     data = Path(path).read_bytes()
-    if b"PRIVATE" in data.upper():
-        raise SystemExit("--entitlement-signing-public-keys contains private key material; pass public keys only.")
+    upper = data.upper()
+    if b"PRIVATE" in upper or b"BEGIN" in upper or b"OPENSSH" in upper:
+        raise SystemExit("--entitlement-signing-public-keys contains key-container or private key material; pass public keys only.")
     try:
         document = json.loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError) as error:
         raise SystemExit(f"--entitlement-signing-public-keys is not JSON: {error}") from error
     keys = document.get("keys") if isinstance(document, dict) else None
-    if not isinstance(keys, dict) or not keys:
-        raise SystemExit('--entitlement-signing-public-keys must be {"keys": {key_id: base64 public key}} with at least one key.')
+    if not isinstance(keys, dict) or not keys or set(document) != {"keys"}:
+        raise SystemExit('--entitlement-signing-public-keys must be exactly {"keys": {key_id: base64 public key}} with at least one key.')
     for key_id, value in keys.items():
         if not isinstance(key_id, str) or not ENTITLEMENT_KEY_ID_RE.fullmatch(key_id):
             raise SystemExit(f"--entitlement-signing-public-keys has a malformed key id: {key_id!r}")
@@ -185,7 +198,12 @@ def read_entitlement_signing_keys(path: str) -> bytes:
             raw = b""
         if len(raw) != 32:
             raise SystemExit(f"--entitlement-signing-public-keys key {key_id!r} is not a 32-byte Ed25519 public key.")
-    return (json.dumps({"keys": dict(sorted(keys.items()))}, sort_keys=True, indent=2) + "\n").encode("ascii")
+    canonical = canonical_entitlement_keyset(keys)
+    actual = sha256_bytes(canonical)
+    if actual != expected:
+        raise SystemExit(f"--entitlement-signing-public-keys does not match --entitlement-signing-keys-sha256 "
+                         f"(keyset digest {actual}); refusing to package an unverified trust anchor.")
+    return canonical
 
 
 def validate_sha256(value: str, label: str) -> str:
@@ -430,6 +448,10 @@ def main() -> int:
                         help="The cloud's entitlement-signing PUBLIC keyset (JSON from GET /api/appliance/signing-keys, "
                              "fingerprints checked out of band). Appliances authorize Talk Down / AAC Voice Call only "
                              "with snapshots signed by these keys.")
+    parser.add_argument("--entitlement-signing-keys-sha256",
+                        help="Required with --entitlement-signing-public-keys: the SHA-256 of the canonical keyset, "
+                             "obtained independently on the cloud host (python -m entitlement_keyset). The build "
+                             "fails unless the keyset matches it.")
     parser.add_argument("--no-entitlement-signing-keys", action="store_true",
                         help="Explicitly build an installer that provisions no entitlement keyset: a fresh install "
                              "denies every paid feature until a release that carries one is installed.")
@@ -462,13 +484,19 @@ def main() -> int:
     update_key_bytes = read_update_signing_public_key(args.update_signing_public_key) if args.update_signing_public_key else b""
     if args.entitlement_signing_public_keys and args.no_entitlement_signing_keys:
         raise SystemExit("--entitlement-signing-public-keys and --no-entitlement-signing-keys are mutually exclusive.")
+    if args.entitlement_signing_public_keys and not args.entitlement_signing_keys_sha256:
+        raise SystemExit("--entitlement-signing-public-keys requires --entitlement-signing-keys-sha256: the keyset digest "
+                         "obtained independently on the cloud host (docs/entitlement-signing-keys.md).")
+    if args.entitlement_signing_keys_sha256 and not args.entitlement_signing_public_keys:
+        raise SystemExit("--entitlement-signing-keys-sha256 is only used with --entitlement-signing-public-keys.")
     if not args.entitlement_signing_public_keys and not args.no_entitlement_signing_keys:
         raise SystemExit(
             "Paid features need a trust anchor: pass --entitlement-signing-public-keys with the cloud's entitlement-"
             "signing PUBLIC keyset, or --no-entitlement-signing-keys to explicitly build an installer whose fresh "
             "appliances deny Talk Down and AAC Voice Call."
         )
-    entitlement_keys_bytes = (read_entitlement_signing_keys(args.entitlement_signing_public_keys)
+    entitlement_keys_bytes = (read_entitlement_signing_keys(args.entitlement_signing_public_keys,
+                                                            args.entitlement_signing_keys_sha256)
                               if args.entitlement_signing_public_keys else b"")
 
     script_path = Path(__file__).resolve()

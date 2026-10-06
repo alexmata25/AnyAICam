@@ -32,9 +32,11 @@ ANYAICAM_ENTITLEMENT_SNAPSHOT_TTL_HOURS, default 24).
 
 Trusted keys (2026-10-05, staging finding on 1f66bcd: keys sent by config
 sync could become trusted, so a forged snapshot signed with any key the sync
-response supplied was accepted). The only trust anchor is the keyset the
-installer provisions from the signed release package (installer/
-13-entitlement-signing-keys.sh): TRUST_ANCHOR_FILE, root-owned under
+response supplied was accepted). The only trust anchor is the keyset a
+release provisions -- the installer (installer/13-entitlement-signing-
+keys.sh) or a signed Software Update (appliance-agent/system/
+apply_release.py), each only when it matches the release's recorded digest:
+TRUST_ANCHOR_FILE, root-owned under
 /etc/anyaicam-update/ (the Software Update trust-anchor directory, outside
 everything the anyaicam user owns), bind-mounted read-only into the VMS
 container. Its path is fixed in code, not taken from the environment.

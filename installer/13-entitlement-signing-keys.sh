@@ -14,7 +14,9 @@
 # A release without a keyset leaves an existing one unchanged; an appliance
 # that has none runs the VMS normally but denies every paid feature.
 
-ENTITLEMENT_KEYS_DIR="${ANYAICAM_UPDATE_KEY_DIR:-/etc/anyaicam-update}"
+# Fixed: the exact path the VMS (app/appliance_entitlements.py) and the
+# Software Update applier use. Deliberately not taken from the environment.
+ENTITLEMENT_KEYS_DIR="/etc/anyaicam-update"
 ENTITLEMENT_KEYS_FILE="$ENTITLEMENT_KEYS_DIR/entitlement_signing_keys.json"
 
 provision_entitlement_signing_keys() {
@@ -36,8 +38,8 @@ provision_entitlement_signing_keys() {
         echo "[ERROR] The packaged entitlement-signing keyset does not match release.env; refusing to trust it." >&2
         return 1
     fi
-    if grep -qi 'PRIVATE' "$keys_src"; then
-        echo "[ERROR] The packaged entitlement-signing keyset contains private key material; refusing to install it." >&2
+    if grep -qiE 'PRIVATE|BEGIN|OPENSSH' "$keys_src"; then
+        echo "[ERROR] The packaged entitlement-signing keyset contains a key container or private key material; refusing to install it." >&2
         return 1
     fi
     install -m 0644 -o root -g root "$keys_src" "$ENTITLEMENT_KEYS_FILE"

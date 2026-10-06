@@ -57,8 +57,15 @@ def verify_with(public_pem: bytes):
     return verify
 
 
-def release_files(version: str, build_id: str, *, app_files: dict | None = None, migrations: str = MIGRATIONS_V1) -> dict:
-    """{relative path: bytes} for an installer release package."""
+_UNSET = object()
+
+
+def release_files(version: str, build_id: str, *, app_files: dict | None = None, migrations: str = MIGRATIONS_V1,
+                  entitlement_keyset: bytes | None = None, entitlement_keyset_sha256=_UNSET) -> dict:
+    """{relative path: bytes} for an installer release package. With
+    entitlement_keyset, the package carries the entitlement PUBLIC keyset and
+    release.env names its SHA-256 (or entitlement_keyset_sha256, to test a
+    mismatch; "" to name none)."""
     files = {
         "install.sh": b"#!/usr/bin/env bash\n",
         "validate.sh": b"#!/usr/bin/env bash\n",
@@ -75,6 +82,12 @@ def release_files(version: str, build_id: str, *, app_files: dict | None = None,
                         f"INSTALLER_SOURCE_COMMIT={'e' * 40}\nMEDIAMTX_INCLUDED=false\nMEDIAMTX_SHA256=\n"
                         f"RELEASE_VERSION={version}\nUPDATE_SIGNING_KEY_SHA256=\n").encode(),
     }
+    if entitlement_keyset is not None or entitlement_keyset_sha256 is not _UNSET:
+        if entitlement_keyset is not None:
+            files["payload/keys/entitlement-signing-public-keys.json"] = entitlement_keyset
+        named = (hashlib.sha256(entitlement_keyset).hexdigest() if entitlement_keyset_sha256 is _UNSET
+                 else entitlement_keyset_sha256)
+        files["release.env"] += f"ENTITLEMENT_SIGNING_KEYS_SHA256={named}\n".encode()
     for relative, data in (app_files or {}).items():
         files[f"payload/vms/app/{relative}"] = data if isinstance(data, bytes) else data.encode()
     listing = [{"path": path, "sha256": hashlib.sha256(data).hexdigest(), "mode": "0o644", "size": len(data)}

@@ -201,11 +201,25 @@ update_signing_key_ok() {
     [[ "$(sha256sum "$key" | awk '{print $1}')" == "$UPDATE_SIGNING_KEY_SHA256" ]]
 }
 
+# The same rules app/appliance_entitlements.py applies at runtime: the
+# directory and the keyset are real (not symlinks), root-owned and not
+# writable by group or others; the keyset is the one this release names.
+# ENTITLEMENT_KEYS_FILE is fixed by 13-entitlement-signing-keys.sh.
+trust_anchor_entry_ok() {
+    local path="$1" kind="$2"
+    [[ ! -L "$path" ]] || return 1
+    if [[ "$kind" == "dir" ]]; then [[ -d "$path" ]] || return 1; else [[ -f "$path" ]] || return 1; fi
+    [[ "$(stat -c %U "$path")" == "root" ]] || return 1
+    local mode
+    mode="$(stat -c %a "$path")"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 8#022) == 0 ))
+}
+
 entitlement_signing_keys_ok() {
-    local keys="${ENTITLEMENT_KEYS_FILE:-/etc/anyaicam-update/entitlement_signing_keys.json}"
-    [[ -f "$keys" && ! -L "$keys" ]] || return 1
-    [[ "$(stat -c %U "$keys")" == "root" && "$(stat -c %U "$(dirname "$keys")")" == "root" ]] || return 1
-    [[ "$(stat -c %a "$keys")" == "644" ]] || return 1
+    local keys="$ENTITLEMENT_KEYS_FILE"
+    trust_anchor_entry_ok "$(dirname "$keys")" dir || return 1
+    trust_anchor_entry_ok "$keys" file || return 1
     [[ "$(sha256sum "$keys" | awk '{print $1}')" == "$ENTITLEMENT_SIGNING_KEYS_SHA256" ]]
 }
 

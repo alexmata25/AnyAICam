@@ -33,9 +33,14 @@ Sequence (each failure is reported; nothing claims success early):
           newer than the installed release, release.env version/build,
           artifact-files.json hashes, safe archive members, free disk,
           additive-only migrations, nothing unexpected in the live tree
+          and the entitlement PUBLIC keyset the release may carry (named in
+          release.env, canonical, public-only)
   stage the new application as /opt/anyaicam.next (live tree untouched)
   build the new image, back up the database, tag the current image --
           all while the current release keeps running
+  install that keyset root:root 0644 at the fixed trust-anchor path the
+          VMS reads (atomic, never through a symlink); a failure stops the
+          update here with nothing changed
   ---- downtime ----
   stop the VMS; rename /opt/anyaicam -> /opt/anyaicam.previous and
   /opt/anyaicam.next -> /opt/anyaicam (directory renames, never a copy into
@@ -116,6 +121,9 @@ class Paths:
     root_state: Path = Path("/var/lib/anyaicam-update")             # root-owned 0755
     live: Path = Path("/opt/anyaicam")
     trusted_key: Path = Path("/etc/anyaicam-update/trusted_signing_key.pem")
+    # Paid-feature trust anchor (2026-10-05): fixed, the path the VMS reads
+    # (app/appliance_entitlements.py TRUST_ANCHOR_FILE).
+    entitlement_keys: Path = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
     vms_env: Path = Path("/etc/anyaicam/vms.env")                   # in an agent-owned directory
     release_marker: Path = Path("/etc/anyaicam/vms_release.json")   # in an agent-owned directory
     recordings: Path = Path("/var/lib/anyaicam/vms/recordings")     # where the database backups are
@@ -453,6 +461,7 @@ class Applier:
     def _apply(self, update_id: str) -> dict:
         started = self.now()
         self.rollback_image, self.database_backup, self.previous_env, self.previous_marker = "", "", None, None
+        self.entitlement_keyset = None
         previous = self._installed_release()
         record = {"update_id": update_id, "from_version": previous.get("version", ""),
                   "from_build_id": previous.get("build_id", ""), "to_version": "", "to_build_id": "",
@@ -482,6 +491,7 @@ class Applier:
             progress("preflight")
             self._stage_next(release_root)
             self._prepare_before_downtime(manifest, previous)
+            record["entitlement_keyset"] = self._install_entitlement_keyset()
             progress("installing")
             downtime_started = True
             self._activate(manifest)
@@ -614,7 +624,11 @@ class Applier:
             release_checks.check_free_space(self.paths.work, needed, disk_usage=self.disk_usage)
             release_checks.check_free_space(self.paths.live.parent, needed, disk_usage=self.disk_usage)
             release_root = release_checks.safe_extract(package, work / "release")
-            release_checks.verify_release_tree(release_root, manifest)
+            env = release_checks.verify_release_tree(release_root, manifest)
+            # The entitlement PUBLIC keyset, if the release carries one: bound
+            # to this signature through the package hash, release.env and
+            # artifact-files.json, and validated here before anything changes.
+            self.entitlement_keyset = release_checks.release_entitlement_keyset(release_root, env)
             payload = release_root / "payload" / "vms"
             identity = json.loads((payload / "app" / RELEASE_IDENTITY_STATIC).read_text(encoding="utf-8"))
             if identity.get("build_id") != manifest.build_id or identity.get("version") != manifest.version:
@@ -671,6 +685,33 @@ class Applier:
         self.rollback_image = rollback_tag
         self.previous_env = self._read_identity_env()
         self.previous_marker = self._read_marker_for_rollback()
+
+    def _install_entitlement_keyset(self) -> str:
+        """Installs the verified keyset root:root 0644 at the fixed trust-anchor
+        path (temp file + atomic rename, never through a symlink), before any
+        downtime: a failure here stops the update with the running release
+        and the existing keyset untouched, so paid features stay as they were
+        (or denied, never granted). Kept if a later step rolls back: it is the
+        signed release's own public keyset. 'unchanged' when the release
+        carries none."""
+        if self.entitlement_keyset is None:
+            return "unchanged"
+        target = self.paths.entitlement_keys
+        directory = target.parent
+        try:
+            info = os.lstat(directory)
+        except OSError as error:
+            raise Failure("install_failed", "trust_anchor_unsafe", f"{directory} is missing ({error})") from error
+        if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISDIR(info.st_mode):
+            raise Failure("install_failed", "trust_anchor_unsafe", f"{directory} is not a real directory")
+        problem = ownership_problem(info, expected_uid=0 if _posix() else None)
+        if problem:
+            raise Failure("install_failed", "trust_anchor_unsafe", f"{directory} {problem}")
+        try:
+            safe_replace(directory, target.name, self.entitlement_keyset, mode=0o644, owner=(0, 0) if _posix() else None)
+        except OSError as error:
+            raise Failure("install_failed", "trust_anchor_write_failed", f"installing the entitlement keyset failed: {error}") from error
+        return "updated"
 
     # ------------------------------------------------------------------ activate (downtime)
     def _systemctl(self, action: str) -> tuple:

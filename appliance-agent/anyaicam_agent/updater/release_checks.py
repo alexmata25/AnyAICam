@@ -58,6 +58,15 @@ REQUIRED_RELEASE_FILES = (
 )
 
 
+# Paid-feature entitlement trust anchor (2026-10-05): the cloud's
+# entitlement-signing PUBLIC keyset a release may carry, and where the root
+# applier installs it (the path app/appliance_entitlements.py reads).
+ENTITLEMENT_KEYSET_PATH = "payload/keys/entitlement-signing-public-keys.json"
+ENTITLEMENT_KEYSET_ENV = "ENTITLEMENT_SIGNING_KEYS_SHA256"
+_ENTITLEMENT_KEY_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
 class ReleaseCheckError(Exception):
     """A release failed a check. `code` is a short stable reason the UI and
     the update ledger can show; the message is for logs."""
@@ -390,3 +399,64 @@ def ensure_regular_file(path: PathLike) -> Path:
 
 def iter_files(root: PathLike) -> Iterable[Path]:
     return (path for path in Path(root).rglob("*") if path.is_file())
+
+
+# ------------------------------------------------------------------ entitlement trust anchor
+
+def canonical_entitlement_keyset(keys: dict) -> bytes:
+    """The one canonical form of a keyset: {"keys": {...}} sorted, indented 2,
+    LF-terminated. Its SHA-256 is the keyset digest operators verify, the
+    builder records in release.env and the applier checks. Must stay
+    byte-identical to installer/build_release_installer.py and
+    app/entitlement_keyset.py (tests compare them)."""
+    return (json.dumps({"keys": dict(sorted(keys.items()))}, sort_keys=True, indent=2) + "\n").encode("ascii")
+
+
+def validate_entitlement_keyset(data: bytes) -> dict:
+    """{key_id: base64 Ed25519 public key} from a packaged keyset, or
+    ReleaseCheckError. Public keys only, in canonical form: anything that
+    looks like a key container or private material, an unexpected field, a
+    malformed id, or a value that is not 32 raw bytes is refused."""
+    import base64
+    upper = data.upper()
+    if b"PRIVATE" in upper or b"BEGIN" in upper or b"OPENSSH" in upper:
+        raise ReleaseCheckError("bad_keyset", "the entitlement keyset contains key-container or private-key material")
+    try:
+        document = json.loads(data.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ReleaseCheckError("bad_keyset", f"the entitlement keyset is not JSON: {error}") from error
+    if not isinstance(document, dict) or set(document) != {"keys"} or not isinstance(document["keys"], dict) or not document["keys"]:
+        raise ReleaseCheckError("bad_keyset", 'the entitlement keyset must be exactly {"keys": {key_id: public key}} with a key')
+    for key_id, value in document["keys"].items():
+        if not _ENTITLEMENT_KEY_ID.match(key_id):
+            raise ReleaseCheckError("bad_keyset", f"the entitlement keyset has a malformed key id {key_id!r}")
+        try:
+            raw = base64.b64decode(value, validate=True) if isinstance(value, str) else b""
+        except ValueError:
+            raw = b""
+        if len(raw) != 32:
+            raise ReleaseCheckError("bad_keyset", f"entitlement key {key_id!r} is not a 32-byte Ed25519 public key")
+    if canonical_entitlement_keyset(document["keys"]) != data:
+        raise ReleaseCheckError("bad_keyset", "the entitlement keyset is not in canonical form")
+    return dict(document["keys"])
+
+
+def release_entitlement_keyset(release_root: PathLike, env: dict) -> Optional[bytes]:
+    """The verified keyset bytes a release carries, None when it carries none.
+    release.env (covered by the signed package hash) must name the keyset's
+    SHA-256 exactly when the keyset is present."""
+    path = Path(release_root) / ENTITLEMENT_KEYSET_PATH
+    expected = str(env.get(ENTITLEMENT_KEYSET_ENV) or "")
+    if not expected:
+        if path.exists() or path.is_symlink():
+            raise ReleaseCheckError("bad_keyset", "the release carries an entitlement keyset that release.env does not name")
+        return None
+    if not _SHA256.match(expected):
+        raise ReleaseCheckError("bad_keyset", f"release.env {ENTITLEMENT_KEYSET_ENV} is not a lowercase SHA-256")
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseCheckError("bad_keyset", "release.env names an entitlement keyset the release does not contain")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ReleaseCheckError("bad_keyset", "the entitlement keyset does not match release.env")
+    validate_entitlement_keyset(data)
+    return data
