@@ -265,11 +265,8 @@ restore_previous() {
         fi
     fi
     if [[ "$db_swapped" == "1" ]]; then
-        local suffix
-        for suffix in "" "-wal" "-shm"; do
-            rm -f "$current$suffix"
-            if [[ -f "$kept$suffix" ]]; then mv "$kept$suffix" "$current$suffix" || problems+=("database $current$suffix"); fi
-        done
+        printf 'op undo_db_restore\npath %s\nkept %s\n' "$current" "$kept_name" | agent_file \
+            || problems+=("database $current (the replaced one is kept as $kept)")
     fi
     if [[ "$was_active" == "1" ]]; then
         systemctl start "$VMS_SERVICE" || problems+=("starting $VMS_SERVICE")
@@ -325,15 +322,16 @@ if [[ -d "$UPDATE_STATE_DIR" ]]; then
 fi
 if [[ "$restore_database" == "1" ]]; then
     current="$VMS_RECORDINGS_DIR/$VMS_DATABASE_NAME"
-    kept="$VMS_RECORDINGS_DIR/partner_portal-before-rollback-$(date -u +%Y%m%dT%H%M%SZ).db"
+    kept_name="partner_portal-before-rollback-$(date -u +%Y%m%dT%H%M%SZ).db"
+    kept="$VMS_RECORDINGS_DIR/$kept_name"
     db_swapped=1
-    for suffix in "" "-wal" "-shm"; do
-        if [[ -f "$current$suffix" ]]; then mv "$current$suffix" "$kept$suffix"; fi
-    done
-    # Only from the checked copies taken before the VMS was stopped.
-    for suffix in "" "-wal" "-shm"; do
-        if [[ -f "$db_stage/db$suffix" ]]; then cp -p "$db_stage/db$suffix" "$current$suffix"; fi
-    done
+    # The service user owns the recordings folder and can plant a symlink at
+    # a database name at any moment, so neither mv nor cp touches it: the
+    # helper moves the database aside and writes the checked copies (taken
+    # before the VMS was stopped) through one no-follow handle on the folder,
+    # each as a new temporary file renamed into place.
+    printf 'op restore_db\npath %s\nkept %s\nsource %s\n' "$current" "$kept_name" "$db_stage" | agent_file \
+        || die "Could not restore the database safely."
     log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept as $kept."
 fi
 systemctl start "$VMS_SERVICE"

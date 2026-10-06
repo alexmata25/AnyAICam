@@ -246,6 +246,119 @@ class RollbackSafetyTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(str(current) + "-shm"))
         self.assertEqual(victim.read_text(), "root-only data")
 
+    # The destination (Codex re-review 2, 2026-10-06): the service user owns
+    # the recordings folder, so between moving the database aside and writing
+    # the restored one it can put a symlink (or a folder) at the name. The race
+    # is injected exactly there, whichever way the move is done: rollback.sh's
+    # mv (a PATH wrapper) or the helper's os.rename (a sitecustomize hook).
+    MV_RACE = textwrap.dedent('''\
+        #!/usr/bin/env bash
+        /bin/mv "$@" || exit $?
+        src="${@: -2:1}"; dst="${@: -1}"
+        [[ "$(basename "$dst")" == partner_portal-before-rollback-* && -n "${FAKE_RACE_SUFFIX+x}" ]] || exit 0
+        [[ "$(basename "$src")" == "partner_portal.db$FAKE_RACE_SUFFIX" ]] || exit 0
+        if [[ "$FAKE_RACE" == dir ]]; then mkdir "$src"; else ln -s "$FAKE_SENTINEL" "$src"; fi
+        ''')
+    RENAME_RACE = textwrap.dedent('''\
+        import os
+        _rename = os.rename
+        def _racing_rename(src, dst, *args, **kwargs):
+            _rename(src, dst, *args, **kwargs)
+            suffix = os.environ.get("FAKE_RACE_SUFFIX")
+            if suffix is None or not os.path.basename(str(dst)).startswith("partner_portal-before-rollback-"):
+                return
+            if os.path.basename(str(src)) != "partner_portal.db" + suffix:
+                return
+            if os.environ.get("FAKE_RACE") == "dir":
+                os.mkdir(src, 0o755, dir_fd=kwargs.get("src_dir_fd"))
+            else:
+                os.symlink(os.environ["FAKE_SENTINEL"], src, dir_fd=kwargs.get("src_dir_fd"))
+        os.rename = _racing_rename
+        ''')
+
+    def racing_rollback(self, suffix, kind="symlink", **extra):
+        (self.bin / "mv").write_text(self.MV_RACE, newline="\n")
+        (self.bin / "mv").chmod(0o755)
+        hooks = self.tmp / "race-hook"
+        hooks.mkdir(exist_ok=True)
+        (hooks / "sitecustomize.py").write_text(self.RENAME_RACE, newline="\n")
+        return self.rollback("--restore-database", FAKE_RACE_SUFFIX=suffix, FAKE_RACE=kind,
+                             FAKE_SENTINEL=rp.bash_path(self.sentinel), PYTHONPATH=str(hooks), **extra)
+
+    def database_set(self):
+        """The current database with -wal/-shm, and a backup with its own."""
+        backup = self.db_backup()
+        backup.chmod(0o640)
+        for suffix, text in (("-wal", "wal pages"), ("-shm", "shm index")):
+            Path(str(backup) + suffix).write_text(text)
+            (self.recordings / f"partner_portal.db{suffix}").write_text(f"current {suffix}")
+        self.sentinel = self.tmp / "sentinel"
+        self.sentinel.write_text("protected root-owned file")
+        self.sentinel.chmod(0o600)
+        return backup
+
+    def temps(self):
+        return [p.name for p in self.recordings.iterdir() if ".rollback-" in p.name]
+
+    def test_a_symlink_planted_after_the_move_aside_is_replaced_not_written_through(self):
+        expected = {"": "online-backup", "-wal": "wal pages", "-shm": "shm index"}
+        for suffix in expected:
+            with self.subTest(suffix or "main"):
+                self.setUp()
+                backup = self.database_set()
+                result = self.racing_rollback(suffix)
+                self.assertEqual(self.sentinel.read_text(), "protected root-owned file")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for name_suffix, text in expected.items():
+                    restored = self.recordings / f"partner_portal.db{name_suffix}"
+                    self.assertFalse(restored.is_symlink(), name_suffix)
+                    self.assertEqual(restored.read_text(), text)
+                    info = os.lstat(restored)
+                    source = os.lstat(str(backup) + name_suffix)
+                    self.assertEqual((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)),
+                                     (source.st_uid, source.st_gid, stat.S_IMODE(source.st_mode)))
+                self.assertEqual(self.temps(), [])
+
+    def test_a_folder_planted_after_the_move_aside_fails_closed_and_the_previous_database_is_put_back(self):
+        for suffix in ("", "-wal", "-shm"):
+            with self.subTest(suffix or "main"):
+                self.setUp()
+                self.database_set()
+                result = self.racing_rollback(suffix, kind="dir")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("previous release was put back", result.stderr)
+                self.assertEqual((self.recordings / "partner_portal.db").read_text(), "database after upgrade")
+                for name_suffix in ("-wal", "-shm"):
+                    self.assertEqual((self.recordings / f"partner_portal.db{name_suffix}").read_text(), f"current {name_suffix}")
+                self.assertFalse([p for p in self.recordings.iterdir() if p.name.startswith("partner_portal-before-rollback-")])
+                self.assertEqual(self.temps(), [])
+                self.assertEqual((self.install_root / "app" / "main.py").read_text(), "NEW RELEASE CODE\n")
+                self.assertEqual(self.env_file.read_text(), self.env_text)
+                self.assertEqual(self.calls()[-1], "systemctl start anyaicam-vms.service")
+                self.assertEqual(self.sentinel.read_text(), "protected root-owned file")
+
+    def test_symlinks_planted_before_a_recovery_are_replaced_not_written_through(self):
+        self.database_set()
+        start_fails = self.bin / "systemctl"
+        start_fails.write_text(SYSTEMCTL_STUB.replace('exit 0\n', textwrap.dedent('''\
+            if [[ "$1" == "start" && ! -f "$STUB_LOG.started" ]]; then
+              touch "$STUB_LOG.started"
+              for s in "" -wal -shm; do rm -f "$FAKE_RECORDINGS/partner_portal.db$s"; ln -s "$FAKE_SENTINEL" "$FAKE_RECORDINGS/partner_portal.db$s"; done
+              exit 1
+            fi
+            exit 0
+            '''), 1), newline="\n")
+        result = self.rollback("--restore-database", FAKE_SENTINEL=rp.bash_path(self.sentinel))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous release was put back", result.stderr)
+        self.assertEqual(self.sentinel.read_text(), "protected root-owned file")
+        current = self.recordings / "partner_portal.db"
+        self.assertFalse(current.is_symlink())
+        self.assertEqual(current.read_text(), "database after upgrade")
+        for suffix in ("-wal", "-shm"):
+            self.assertEqual((self.recordings / f"partner_portal.db{suffix}").read_text(), f"current {suffix}")
+        self.assertEqual(self.temps(), [])
+
 
 @unittest.skipUnless(BASH and AS_ROOT, "needs Linux as root (real file ownership)")
 class LegacyAgentTreeTests(unittest.TestCase):

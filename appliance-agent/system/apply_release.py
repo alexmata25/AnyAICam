@@ -460,6 +460,132 @@ def stage_untrusted_file(source: Path, dest: Path) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- database restore (rollback.sh, 2026-10-06)
+# The recordings folder belongs to the service user, who can create or swap
+# names in it at any moment -- e.g. a symlink where the database was just
+# moved aside. Every operation here goes through one descriptor of that
+# folder, opened without following a symlink anywhere on its path, and only
+# creates (O_EXCL|O_NOFOLLOW), renames or unlinks names in it: rename and
+# unlink act on a symlink itself, never on what it points to.
+
+_DB_SUFFIXES = ("", "-wal", "-shm")
+
+
+def _plain_name(name: str) -> str:
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"{name!r} is not a plain file name")
+    return name
+
+
+def _open_dir_nofollow(path: Path) -> int:
+    """A descriptor for directory `path`, opened one component at a time from
+    / without following a symlink, so no folder on the way can redirect it."""
+    if not path.is_absolute():
+        raise ValueError("path must be absolute")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(_plain_name(part), flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _place_in_dir(dir_fd: int, name: str, source: Path) -> None:
+    """Writes `source` (a root-only staged copy) as `name` in the folder:
+    a new temporary file created there exclusively, never through a
+    symlink, given the source's owner and mode, synced, then renamed over
+    `name` -- which replaces whatever the name is (a planted symlink
+    included) and never writes through it. The temporary file is removed
+    on any failure."""
+    with open(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as src:
+        info = os.fstat(src.fileno())
+        if not statmod.S_ISREG(info.st_mode):
+            raise ValueError(f"{source} is not a regular file")
+        temp = f".{name}.rollback-{secrets.token_hex(8)}"
+        descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+        try:
+            with os.fdopen(descriptor, "wb") as out:
+                shutil.copyfileobj(src, out, _READ_CHUNK)
+                out.flush()
+                if os.geteuid() == 0:
+                    os.fchown(out.fileno(), info.st_uid, info.st_gid)
+                os.fchmod(out.fileno(), statmod.S_IMODE(info.st_mode))
+                os.fsync(out.fileno())
+            os.rename(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(temp, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+
+
+def restore_database_files(database: Path, kept: str, staged: Path) -> None:
+    """rollback.sh --restore-database: moves the current database and its
+    -wal/-shm aside to `kept` (+suffix) in the same folder, then writes each
+    staged copy (`staged`/db, db-wal, db-shm, root-only) in its place. A
+    symlink found at a database name is removed, never followed or kept."""
+    name, kept = _plain_name(database.name), _plain_name(kept)
+    dir_fd = _open_dir_nofollow(database.parent)
+    try:
+        for suffix in _DB_SUFFIXES:
+            try:
+                info = os.lstat(name + suffix, dir_fd=dir_fd)
+            except FileNotFoundError:
+                continue
+            if statmod.S_ISREG(info.st_mode):
+                os.rename(name + suffix, kept + suffix, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            elif statmod.S_ISLNK(info.st_mode):
+                os.unlink(name + suffix, dir_fd=dir_fd)
+            else:
+                raise ValueError(f"{name + suffix} is not a regular file")
+        for suffix in _DB_SUFFIXES:
+            source = staged / ("db" + suffix)
+            if os.path.lexists(source):
+                _place_in_dir(dir_fd, name + suffix, source)
+    finally:
+        os.close(dir_fd)
+
+
+def undo_database_restore(database: Path, kept: str) -> None:
+    """Puts back what restore_database_files() moved aside: removes whatever
+    is at each database name (a file, a symlink or an empty folder planted
+    there) and renames the kept regular file back. Every suffix is tried;
+    ValueError lists what could not be put back."""
+    name, kept = _plain_name(database.name), _plain_name(kept)
+    dir_fd = _open_dir_nofollow(database.parent)
+    problems = []
+    try:
+        for suffix in _DB_SUFFIXES:
+            try:
+                try:
+                    info = os.lstat(name + suffix, dir_fd=dir_fd)
+                    if statmod.S_ISDIR(info.st_mode):
+                        os.rmdir(name + suffix, dir_fd=dir_fd)
+                    else:
+                        os.unlink(name + suffix, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+                try:
+                    info = os.lstat(kept + suffix, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                if not statmod.S_ISREG(info.st_mode):
+                    raise ValueError(f"{kept + suffix} is no longer a regular file")
+                os.rename(kept + suffix, name + suffix, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except (OSError, ValueError) as error:
+                problems.append(f"{name + suffix}: {error}")
+    finally:
+        os.close(dir_fd)
+    if problems:
+        raise ValueError("; ".join(problems))
+
+
 def update_env_file(path: Path, *, defaults: Optional[dict] = None, overrides: Optional[dict] = None,
                     remove=(), template: Optional[bytes] = None, mode: int = 0o640, owner: str = "anyaicam") -> None:
     """KEY=value file edit, as the shell's '^KEY=' tests did: `defaults` are
@@ -503,7 +629,9 @@ def agent_file_main(stream=None) -> int:
                file must pass the same checks a read does.
       read  -- writes the file's bytes to stdout; exit 3 when absent.
       stage -- 'source P' copied to the new file 'path P' through
-               stage_untrusted_file(); exit 3 when the source is absent."""
+               stage_untrusted_file(); exit 3 when the source is absent.
+    Database restore ('path' is the database, 'kept' the name it is moved
+    aside to, 'source' the staged folder): restore_db, undo_db_restore."""
     stream = stream or sys.stdin.buffer
     request = {"default": {}, "override": {}, "remove": [], "if_missing": False}
     content = b""
@@ -528,7 +656,7 @@ def agent_file_main(stream=None) -> int:
             request["if_missing"] = True
         elif word == "require_existing":
             request["require_existing"] = True
-        elif word in ("op", "path", "mode", "owner", "template", "source"):
+        elif word in ("op", "path", "mode", "owner", "template", "source", "kept"):
             request[word] = rest
         elif line.strip():
             print(f"[ERROR] unknown request line {word!r}", file=sys.stderr)
@@ -559,6 +687,12 @@ def agent_file_main(stream=None) -> int:
             return 0
         if op == "stage":
             return 0 if stage_untrusted_file(Path(request["source"]), path) else 3
+        if op == "restore_db":
+            restore_database_files(path, request["kept"], Path(request["source"]))
+            return 0
+        if op == "undo_db_restore":
+            undo_database_restore(path, request["kept"])
+            return 0
         if op == "update_env":
             template = read_untrusted(Path(request["template"]), max_bytes=_MAX_SMALL_FILE, expected_uid=None) \
                 if request.get("template") else None
