@@ -222,7 +222,7 @@ class RollbackSafetyTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o640)  # owner and mode as the backup had them
         self.assertEqual(Path(str(current) + "-wal").read_text(), "wal pages")
         self.assertEqual(Path(str(current) + "-shm").read_text(), "shm index")
-        [kept] = [p for p in self.recordings.iterdir() if p.name.startswith("partner_portal-before-rollback-") and p.suffix == ".db"]
+        [kept] = self.rollback_dir.glob("replaced-database-*/partner_portal.db")  # root only, not in recordings
         self.assertEqual(kept.read_text(), "database after upgrade")
 
     def test_replacing_the_backup_after_it_was_staged_cannot_change_the_restore(self):
@@ -251,10 +251,10 @@ class RollbackSafetyTests(unittest.TestCase):
     # the restored one it can put a symlink (or a folder) at the name. The race
     # is injected exactly there, whichever way the move is done: rollback.sh's
     # mv (a PATH wrapper) or the helper's os.rename / os.link+os.unlink (a
-    # sitecustomize hook). The hook also injects, deterministically, the
-    # failures the recovery tests need: kept names that are already taken
-    # (FAKE_KEPT_TOKEN for the first FAKE_KEPT_COLLISIONS random parts) and a
-    # move that fails for one file (FAKE_LINK_FAIL).
+    # sitecustomize hook). The hook also injects, deterministically, what the
+    # original-preservation tests need: the service user (uid 65534) trying to
+    # replace the saved original the moment it is moved aside (FAKE_TAMPER),
+    # and a move aside that fails for one file (FAKE_MOVE_FAIL).
     MV_RACE = textwrap.dedent('''\
         #!/usr/bin/env bash
         /bin/mv "$@" || exit $?
@@ -264,40 +264,74 @@ class RollbackSafetyTests(unittest.TestCase):
         if [[ "$FAKE_RACE" == dir ]]; then mkdir "$src"; else ln -s "$FAKE_SENTINEL" "$src"; fi
         ''')
     RENAME_RACE = textwrap.dedent('''\
-        import errno, os, secrets
-        KEPT = "partner_portal-before-rollback-"
-        _rename, _link, _unlink, _token_hex = os.rename, os.link, os.unlink, secrets.token_hex
-        _moving, _tokens = set(), [0]
+        import errno, os
+        KEPT, DB = "partner_portal-before-rollback-", "partner_portal.db"
+        _rename, _link, _unlink = os.rename, os.link, os.unlink
+        _moving = set()
+        def _is_recordings(fd):
+            try:
+                here, rec = os.fstat(fd), os.stat(os.environ["FAKE_RECORDINGS"])
+            except (KeyError, OSError, TypeError):
+                return False
+            return (here.st_dev, here.st_ino) == (rec.st_dev, rec.st_ino)
+        def _wanted(var, name):
+            return os.environ.get(var) is not None and name == DB + os.environ[var]
         def _plant(name, dir_fd):
-            if os.environ.get("FAKE_RACE_SUFFIX") is None or name != "partner_portal.db" + os.environ["FAKE_RACE_SUFFIX"]:
+            if not _wanted("FAKE_RACE_SUFFIX", name):
                 return
             if os.environ.get("FAKE_RACE") == "dir":
                 os.mkdir(name, 0o755, dir_fd=dir_fd)
             else:
                 os.symlink(os.environ["FAKE_SENTINEL"], name, dir_fd=dir_fd)
-        def _racing_rename(src, dst, *args, **kwargs):
-            _rename(src, dst, *args, **kwargs)
-            if os.path.basename(str(dst)).startswith(KEPT):
-                _plant(os.path.basename(str(src)), kwargs.get("src_dir_fd"))
-        def _racing_link(src, dst, *args, **kwargs):
-            name = os.path.basename(str(src))
-            if os.path.basename(str(dst)).startswith(KEPT) and name == "partner_portal.db" + os.environ.get("FAKE_LINK_FAIL", "?"):
+        def _tamper(saved, dir_fd, name):
+            """As the service user: replace the saved original with other content."""
+            if not _wanted("FAKE_TAMPER", name):
+                return
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.setgid(65534)
+                    os.setuid(65534)
+                    try:
+                        _unlink(saved, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+                    fd = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dir_fd)
+                    os.write(fd, b"tampered")
+                    os.close(fd)
+                except BaseException:
+                    pass
+                os._exit(0)
+            os.waitpid(pid, 0)
+        def _fail(name):
+            if _wanted("FAKE_MOVE_FAIL", name):
                 raise OSError(errno.EIO, "injected failure moving " + name)
+        def _racing_rename(src, dst, *args, **kwargs):
+            s, d = os.path.basename(str(src)), os.path.basename(str(dst))
+            sfd, dfd = kwargs.get("src_dir_fd"), kwargs.get("dst_dir_fd")
+            aside = s.startswith(DB) and (d.startswith(KEPT) or (sfd != dfd and _is_recordings(sfd)))
+            if aside:
+                _fail(s)
+            _rename(src, dst, *args, **kwargs)
+            if aside:
+                _tamper(d, dfd, s)
+                _plant(s, sfd)
+        def _racing_link(src, dst, *args, **kwargs):
+            s, d = os.path.basename(str(src)), os.path.basename(str(dst))
+            aside = d.startswith(KEPT)
+            if aside:
+                _fail(s)
             _link(src, dst, *args, **kwargs)
-            if os.path.basename(str(dst)).startswith(KEPT):
-                _moving.add(name)
+            if aside:
+                _tamper(d, kwargs.get("dst_dir_fd"), s)
+                _moving.add(s)
         def _racing_unlink(path, *args, **kwargs):
             _unlink(path, *args, **kwargs)
             name = os.path.basename(str(path))
-            if name in _moving:  # the second half of a move aside
+            if name in _moving:  # the second half of a link + unlink move
                 _moving.discard(name)
                 _plant(name, kwargs.get("dir_fd"))
-        def _colliding_token_hex(*args, **kwargs):
-            _tokens[0] += 1
-            if _tokens[0] <= int(os.environ.get("FAKE_KEPT_COLLISIONS", "0")):
-                return os.environ["FAKE_KEPT_TOKEN"]
-            return _token_hex(*args, **kwargs)
-        os.rename, os.link, os.unlink, secrets.token_hex = _racing_rename, _racing_link, _racing_unlink, _colliding_token_hex
+        os.rename, os.link, os.unlink = _racing_rename, _racing_link, _racing_unlink
         ''')
 
     def hooked_rollback(self, *args, **extra):
@@ -386,32 +420,23 @@ class RollbackSafetyTests(unittest.TestCase):
             self.assertEqual((self.recordings / f"partner_portal.db{suffix}").read_text(), f"current {suffix}")
         self.assertEqual(self.temps(), [])
 
-    # Recovery state (Codex re-review 3, 2026-10-06): the swap is marked done
-    # only once it succeeded, the kept name cannot be taken in advance, and a
-    # recovery touches only the files actually moved or placed.
-    TOKEN = "c0111de5"
+    # Original preservation (Codex re-reviews 3 and 4, 2026-10-06): the swap
+    # is marked done only once it succeeded; the replaced originals are moved
+    # by one rename each into a new root-only folder beside the rollback
+    # points, never kept where the service user can touch them; a recovery
+    # first checks every saved original and touches nothing if one is not
+    # intact, then puts back only the files actually moved or placed.
     ORIGINAL = {"": "database after upgrade", "-wal": "current -wal", "-shm": "current -shm"}
     RESTORED = {"": "online-backup", "-wal": "wal pages", "-shm": "shm index"}
 
-    def take_kept_names(self, suffix, kind):
-        """Occupies the kept name for `suffix` for the next two minutes, in the
-        old predictable form and in the new form with the hook's TOKEN."""
-        import datetime
-        now = datetime.datetime.now(datetime.timezone.utc)
-        taken = []
-        for second in range(-2, 120):
-            stamp = (now + datetime.timedelta(seconds=second)).strftime("%Y%m%dT%H%M%SZ")
-            for base in (f"partner_portal-before-rollback-{stamp}.db", f"partner_portal-before-rollback-{stamp}-{self.TOKEN}.db"):
-                path = self.recordings / (base + suffix)
-                if kind == "dir":
-                    path.mkdir()
-                else:
-                    path.write_text("someone else's file")
-                taken.append(path)
-        return taken
+    def keep_dirs(self):
+        return sorted(self.rollback_dir.glob("replaced-database-*"))
 
-    def originals(self):
-        return {s: os.lstat(self.recordings / f"partner_portal.db{s}") for s in self.ORIGINAL}
+    def saved_original(self, suffix):
+        """Wherever this or an older version kept the replaced file."""
+        [saved] = (list(self.rollback_dir.glob(f"replaced-database-*/partner_portal.db{suffix}"))
+                   + list(self.recordings.glob(f"partner_portal-before-rollback-*.db{suffix}")))
+        return saved
 
     def assert_files(self, expected):
         for suffix, text in expected.items():
@@ -419,11 +444,15 @@ class RollbackSafetyTests(unittest.TestCase):
             self.assertFalse(path.is_symlink(), suffix)
             self.assertEqual(path.read_text(), text, suffix)
 
-    def kept_sets(self, taken=()):
-        return sorted(p.name for p in self.recordings.iterdir()
-                      if p.name.startswith("partner_portal-before-rollback-") and p not in taken)
+    def assert_recordings_clean(self):
+        """Nothing kept and no temporary file in the service user's folder."""
+        self.assertEqual([p.name for p in self.recordings.iterdir()
+                          if "before-rollback" in p.name or ".rollback-" in p.name], [])
 
-    def assert_left_in_place(self, result, before, taken=(), expected=None):
+    def originals(self):
+        return {s: os.lstat(self.recordings / f"partner_portal.db{s}") for s in self.ORIGINAL}
+
+    def assert_left_in_place(self, result, before, expected=None):
         """A failure inside the database step: the original set untouched (same
         files), nothing kept, the rest of the release put back, VMS running."""
         self.assertNotEqual(result.returncode, 0)
@@ -431,36 +460,80 @@ class RollbackSafetyTests(unittest.TestCase):
         self.assert_files(expected or self.ORIGINAL)
         for suffix, info in before.items():
             self.assertEqual(os.lstat(self.recordings / f"partner_portal.db{suffix}").st_ino, info.st_ino, suffix)
-        self.assertEqual(self.kept_sets(taken), [])
-        self.assertEqual(self.temps(), [])
+        self.assert_recordings_clean()
+        self.assertEqual(self.keep_dirs(), [])
         self.assertEqual((self.install_root / "app" / "main.py").read_text(), "NEW RELEASE CODE\n")
         self.assertEqual(self.env_file.read_text(), self.env_text)
         self.assertEqual(self.calls()[-1], "systemctl start anyaicam-vms.service")
 
-    def test_a_kept_name_already_taken_by_a_file_or_folder_is_never_used(self):
-        for kind in ("file", "dir"):
-            for suffix in ("", "-wal", "-shm"):
-                with self.subTest(f"{kind} at the kept name for {suffix or 'the database'}"):
+    def fail_first_start(self, then=""):
+        (self.bin / "systemctl").write_text(SYSTEMCTL_STUB.replace('exit 0\n', textwrap.dedent('''\
+            if [[ "$1" == "start" && ! -f "$STUB_LOG.started" ]]; then
+              touch "$STUB_LOG.started"
+            ''') + textwrap.indent(textwrap.dedent(then), "  ") + "  exit 1\nfi\nexit 0\n", 1), newline="\n")
+
+    def test_a_saved_original_that_is_gone_or_replaced_leaves_the_current_files_untouched(self):
+        for suffix in ("", "-wal", "-shm"):
+            for tamper in ("deleted", "symlink", "folder"):
+                with self.subTest(f"saved {suffix or 'database'} {tamper}"):
                     self.setUp()
                     self.database_set()
-                    taken = self.take_kept_names(suffix, kind)
-                    result = self.hooked_rollback("--restore-database", FAKE_KEPT_TOKEN=self.TOKEN, FAKE_KEPT_COLLISIONS="2")
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assert_files(self.RESTORED)
-                    for path in taken:  # nobody's file or folder was replaced
-                        self.assertTrue(path.is_dir() if kind == "dir" else path.read_text() == "someone else's file", path)
-                    [kept_db] = [n for n in self.kept_sets(taken) if n.endswith(".db")]
-                    for s, text in self.ORIGINAL.items():
-                        self.assertEqual((self.recordings / (kept_db + s)).read_text(), text)
-                    self.assertEqual(self.temps(), [])
+                    self.fail_first_start('''\
+                        for f in "$ANYAICAM_ROLLBACK_DIR"/replaced-database-*/partner_portal.db$FAKE_SAVED \\
+                                 "$FAKE_RECORDINGS"/partner_portal-before-rollback-*.db$FAKE_SAVED; do
+                          [[ -e "$f" ]] || continue
+                          rm -f "$f"
+                          case "$FAKE_TAMPER_KIND" in symlink) ln -s "$FAKE_SENTINEL" "$f" ;; folder) mkdir "$f" ;; esac
+                        done
+                        ''')
+                    result = self.rollback("--restore-database", FAKE_SAVED=suffix, FAKE_TAMPER_KIND=tamper,
+                                           FAKE_SENTINEL=rp.bash_path(self.sentinel))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Could not restore", result.stderr)
+                    self.assertIn("nothing was put back and the current files were left as they are", result.stderr)
+                    self.assertIn("was left stopped", result.stderr)
+                    self.assertEqual(self.calls().count("systemctl start anyaicam-vms.service"), 1)  # only the failed one
+                    self.assert_files(self.RESTORED)  # the current files, all three, as they were
+                    self.assertEqual(self.sentinel.read_text(), "protected root-owned file")
 
-    def test_no_free_kept_name_fails_before_the_first_move_with_the_database_untouched(self):
+    def test_the_service_user_cannot_replace_the_saved_original_while_it_is_moved(self):
+        for suffix in ("", "-wal", "-shm"):
+            with self.subTest(suffix or "database"):
+                self.setUp()
+                self.database_set()
+                os.chown(self.recordings, 65534, 65534)  # as on an appliance: the service user's folder
+                result = self.hooked_rollback("--restore-database", FAKE_TAMPER=suffix)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for s, text in self.ORIGINAL.items():
+                    self.assertEqual(self.saved_original(s).read_text(), text, s)  # nothing lost or replaced
+                self.assert_files(self.RESTORED)
+                self.assert_recordings_clean()
+
+    def test_a_failure_after_the_database_moved_puts_back_only_what_moved(self):
+        for failing in ("-wal", "-shm"):
+            with self.subTest(f"moving {failing} fails"):
+                self.setUp()
+                self.database_set()
+                before = self.originals()
+                result = self.hooked_rollback("--restore-database", FAKE_MOVE_FAIL=failing)
+                self.assertIn("the current database was left in place", result.stderr)
+                self.assert_left_in_place(result, before)
+
+    def test_a_recovery_puts_back_only_the_files_that_had_an_original(self):
         self.database_set()
-        taken = self.take_kept_names("", "file")
-        before = self.originals()
-        result = self.hooked_rollback("--restore-database", FAKE_KEPT_TOKEN=self.TOKEN, FAKE_KEPT_COLLISIONS="1000")
-        self.assertIn("the current database was left in place", result.stderr)
-        self.assert_left_in_place(result, before, taken)
+        for suffix in ("-wal", "-shm"):
+            (self.recordings / f"partner_portal.db{suffix}").unlink()  # only the database itself exists
+        self.fail_first_start()
+        result = self.rollback("--restore-database")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous release was put back and the VMS restarted", result.stderr)
+        self.assertIn("db: original put back", result.stderr)
+        self.assertIn("wal: restored copy removed (there was no original)", result.stderr)
+        self.assert_files({"": self.ORIGINAL[""]})
+        for suffix in ("-wal", "-shm"):  # the backup's -wal/-shm must not sit beside the original database
+            self.assertFalse(os.path.lexists(self.recordings / f"partner_portal.db{suffix}"))
+        self.assertEqual(self.keep_dirs(), [])
+        self.assert_recordings_clean()
 
     def test_a_non_file_at_a_database_name_fails_before_the_first_move(self):
         self.database_set()
@@ -473,50 +546,35 @@ class RollbackSafetyTests(unittest.TestCase):
         self.assert_left_in_place(result, before, expected={"": self.ORIGINAL[""], "-wal": self.ORIGINAL["-wal"]})
         self.assertTrue(shm.is_dir())
 
-    def test_a_failure_after_the_database_moved_puts_back_only_what_moved(self):
-        for failing in ("-wal", "-shm"):
-            with self.subTest(f"moving {failing} fails"):
-                self.setUp()
-                self.database_set()
-                before = self.originals()
-                result = self.hooked_rollback("--restore-database", FAKE_LINK_FAIL=failing)
-                self.assertIn("the current database was left in place", result.stderr)
-                self.assert_left_in_place(result, before)
-
     def test_a_vms_whose_database_cannot_be_put_back_is_not_restarted(self):
         self.database_set()
-        start_fails = self.bin / "systemctl"
-        start_fails.write_text(SYSTEMCTL_STUB.replace('exit 0\n', textwrap.dedent('''\
-            if [[ "$1" == "start" && ! -f "$STUB_LOG.started" ]]; then
-              touch "$STUB_LOG.started"
-              rm -f "$FAKE_RECORDINGS/partner_portal.db"; mkdir "$FAKE_RECORDINGS/partner_portal.db"
-              echo x > "$FAKE_RECORDINGS/partner_portal.db/not-empty"
-              exit 1
-            fi
-            exit 0
-            '''), 1), newline="\n")
+        self.fail_first_start('''\
+            rm -f "$FAKE_RECORDINGS/partner_portal.db"; mkdir "$FAKE_RECORDINGS/partner_portal.db"
+            echo x > "$FAKE_RECORDINGS/partner_portal.db/not-empty"
+            ''')
         result = self.rollback("--restore-database")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Could not restore", result.stderr)
         self.assertIn("was left stopped", result.stderr)
         self.assertNotIn("previous release was put back", result.stderr)
         self.assertEqual(self.calls().count("systemctl start anyaicam-vms.service"), 1)  # only the failed start
-        [kept_db] = [n for n in self.kept_sets() if n.endswith(".db")]
-        self.assertEqual((self.recordings / kept_db).read_text(), "database after upgrade")  # the original is not lost
-        self.assertEqual(self.temps(), [])
+        self.assertEqual(self.saved_original("").read_text(), "database after upgrade")  # the original is not lost
+        self.assert_recordings_clean()
 
-    def test_a_normal_database_rollback_keeps_the_original_set_once(self):
+    def test_a_normal_database_rollback_keeps_the_original_set_root_only(self):
         self.database_set()
         result = self.hooked_rollback("--restore-database")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_files(self.RESTORED)
-        kept = self.kept_sets()
-        self.assertEqual(len(kept), 3, kept)  # the original database, -wal and -shm, under one fresh name
-        for name in kept:
-            suffix = name[name.index(".db") + 3:]
-            self.assertEqual((self.recordings / name).read_text(), self.ORIGINAL[suffix])
-        self.assertEqual(self.temps(), [])
-        self.assertIn(f"kept as {rp.bash_path(self.recordings)}/{kept[0]}", result.stdout)
+        [keep] = self.keep_dirs()
+        info = os.lstat(keep)
+        self.assertEqual((info.st_uid, stat.S_IMODE(info.st_mode)), (os.geteuid(), 0o700))
+        self.assertEqual(sorted(p.name for p in keep.iterdir()),
+                         ["partner_portal.db", "partner_portal.db-shm", "partner_portal.db-wal"])
+        for suffix, text in self.ORIGINAL.items():
+            self.assertEqual((keep / f"partner_portal.db{suffix}").read_text(), text)
+        self.assert_recordings_clean()
+        self.assertIn(f"kept (root only) in {rp.bash_path(keep)}", result.stdout)
 
 
 @unittest.skipUnless(BASH and AS_ROOT, "needs Linux as root (real file ownership)")

@@ -65,6 +65,7 @@ carried into the new tree; any other unexpected entry stops the update.
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import re
@@ -533,19 +534,6 @@ class DatabaseInconsistent(Exception):
     the original database set nor the restored one."""
 
 
-def _unique_kept_name(dir_fd: int, name: str) -> str:
-    """A name to move the current database (+ -wal/-shm) aside to: dated, with
-    a random part so it cannot be predicted and taken in advance, and free for
-    every suffix. The move itself is exclusive too (os.link fails on an
-    existing name), so a name taken after this check is never overwritten."""
-    stem = name[:-3] if name.endswith(".db") else name
-    for _ in range(16):
-        kept = f"{stem}-before-rollback-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(4)}.db"
-        if not any(_lexists_at(dir_fd, kept + suffix) for suffix in _DB_SUFFIXES):
-            return kept
-    raise ValueError("no free name to keep the current database under")
-
-
 def _lexists_at(dir_fd: int, name: str) -> bool:
     try:
         os.lstat(name, dir_fd=dir_fd)
@@ -554,103 +542,167 @@ def _lexists_at(dir_fd: int, name: str) -> bool:
     return True
 
 
-def _undo_swap(dir_fd: int, name: str, kept: Optional[str], moved, placed) -> None:
-    """Puts back exactly what a swap changed, file by file: a name is cleared
-    only when the swap placed a file there or holds its original (a file,
-    symlink or empty folder found there is removed), and only a moved
-    original is renamed back. ValueError lists what could not be put back."""
-    problems = []
-    for suffix in _DB_SUFFIXES:
-        if suffix not in moved and suffix not in placed:
-            continue
+def _open_root_only_dir(path: Path) -> int:
+    """A no-follow descriptor (see _open_dir_nofollow()) of a folder only this
+    process's user can enter: where the replaced originals are kept, out of
+    the service user's reach for the whole transaction and after it."""
+    descriptor = _open_dir_nofollow(path)
+    info = os.fstat(descriptor)
+    if _posix() and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
+        os.close(descriptor)
+        raise ValueError(f"{path} is not a folder only this process may use")
+    return descriptor
+
+
+def _copy_between(src_fd: int, dst_fd: int, entry: str) -> None:
+    """`entry` copied from one folder to the same name in another (opened
+    without following a symlink; created exclusively; owner, mode and data
+    kept and synced), then removed from the first. Moves across file
+    systems only; the copy is removed again on any failure."""
+    with open(os.open(entry, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_fd), "rb") as src:
+        info = os.fstat(src.fileno())
+        if not statmod.S_ISREG(info.st_mode):
+            raise ValueError(f"{entry} is not a regular file")
+        descriptor = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dst_fd)
         try:
+            with os.fdopen(descriptor, "wb") as out:
+                shutil.copyfileobj(src, out, _READ_CHUNK)
+                out.flush()
+                if os.geteuid() == 0:
+                    os.fchown(out.fileno(), info.st_uid, info.st_gid)
+                os.fchmod(out.fileno(), statmod.S_IMODE(info.st_mode))
+                os.fsync(out.fileno())
+            os.unlink(entry, dir_fd=src_fd)
+        except BaseException:
             try:
-                info = os.lstat(name + suffix, dir_fd=dir_fd)
-                if statmod.S_ISDIR(info.st_mode):
-                    os.rmdir(name + suffix, dir_fd=dir_fd)
-                else:
-                    os.unlink(name + suffix, dir_fd=dir_fd)
-            except FileNotFoundError:
+                os.unlink(entry, dir_fd=dst_fd)
+            except OSError:
                 pass
-            if suffix in moved:
-                info = os.lstat(kept + suffix, dir_fd=dir_fd)
-                if not statmod.S_ISREG(info.st_mode):
-                    raise ValueError(f"{kept + suffix} is no longer a regular file")
-                os.rename(kept + suffix, name + suffix, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        except (OSError, ValueError) as error:
-            problems.append(f"{name + suffix}: {error}")
-    if problems:
-        raise ValueError("; ".join(problems))
-
-
-def restore_database_files(database: Path, staged: Path) -> dict:
-    """rollback.sh --restore-database, as one transaction: moves the current
-    database and its -wal/-shm aside under a fresh unique name in the same
-    folder, then writes each staged copy (`staged`/db, db-wal, db-shm,
-    root-only) in its place. Everything is checked before the first move (a
-    non-file at a database name stops it with nothing changed); a symlink at
-    a database name is removed, never followed or kept. On any failure the
-    files actually moved or placed so far are put back before it returns
-    (DatabaseInconsistent when that fails). Returns the record undo needs:
-    {'kept': name, 'moved': [...], 'placed': [...]} (suffixes)."""
-    name = _plain_name(database.name)
-    dir_fd = _open_dir_nofollow(database.parent)
-    kept, moved, placed = None, [], []
-    try:
-        originals, links = [], []
-        for suffix in _DB_SUFFIXES:
-            try:
-                info = os.lstat(name + suffix, dir_fd=dir_fd)
-            except FileNotFoundError:
-                continue
-            if statmod.S_ISREG(info.st_mode):
-                originals.append(suffix)
-            elif statmod.S_ISLNK(info.st_mode):
-                links.append(suffix)
-            else:
-                raise ValueError(f"{name + suffix} is not a regular file; nothing was changed")
-        sources = [suffix for suffix in _DB_SUFFIXES if os.path.lexists(staged / ("db" + suffix))]
-        kept = _unique_kept_name(dir_fd, name)
-        try:
-            for suffix in originals:
-                # link + unlink: a move that never replaces an existing name.
-                os.link(name + suffix, kept + suffix, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
-                try:
-                    os.unlink(name + suffix, dir_fd=dir_fd)
-                except BaseException:
-                    os.unlink(kept + suffix, dir_fd=dir_fd)
-                    raise
-                moved.append(suffix)
-            for suffix in links:
-                try:
-                    os.unlink(name + suffix, dir_fd=dir_fd)
-                except FileNotFoundError:
-                    pass
-            for suffix in sources:
-                _place_in_dir(dir_fd, name + suffix, staged / ("db" + suffix))
-                placed.append(suffix)
-        except BaseException as error:
-            try:
-                _undo_swap(dir_fd, name, kept, moved, placed)
-            except ValueError as undo_error:
-                raise DatabaseInconsistent(f"{error}; and could not put the database back: {undo_error}") from error
             raise
+
+
+def _move_between(src_fd: int, dst_fd: int, entry: str) -> None:
+    """One atomic rename of `entry` between two folder descriptors (a copy
+    and unlink only across file systems): never a window in which the
+    entry exists twice, and nothing in between to tamper with."""
+    try:
+        os.rename(entry, entry, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        _copy_between(src_fd, dst_fd, entry)
+
+
+def _undo_swap(rec_fd: int, keep_fd: int, name: str, moved, placed) -> list:
+    """Puts back exactly what a swap changed. First every saved original
+    (in the root-only keep folder) must still be a regular file; if one is
+    not, nothing is touched. Then each moved original is renamed back over
+    the current file, and a file the swap placed with no original is
+    removed. Returns one status line per file; ValueError carries them
+    when something could not be put back."""
+    invalid = []
+    for suffix in moved:
+        try:
+            with open(os.open(name + suffix, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=keep_fd), "rb") as saved:
+                if not statmod.S_ISREG(os.fstat(saved.fileno()).st_mode):
+                    raise ValueError("is not a regular file")
+        except (OSError, ValueError) as error:
+            invalid.append(f"{_DB_LABELS[suffix]}: saved original {error}")
+    if invalid:
+        raise ValueError("nothing was put back and the current files were left as they are: " + "; ".join(invalid))
+    done, problems = [], []
+    for suffix in _DB_SUFFIXES:
+        label = _DB_LABELS[suffix]
+        try:
+            try:
+                info = os.lstat(name + suffix, dir_fd=rec_fd)
+            except FileNotFoundError:
+                info = None
+            if suffix in moved:
+                if info is not None and statmod.S_ISDIR(info.st_mode):
+                    os.rmdir(name + suffix, dir_fd=rec_fd)  # only a folder planted there; rename replaces anything else
+                _move_between(keep_fd, rec_fd, name + suffix)
+                done.append(f"{label}: original put back")
+            elif suffix in placed:
+                if info is not None:
+                    (os.rmdir if statmod.S_ISDIR(info.st_mode) else os.unlink)(name + suffix, dir_fd=rec_fd)
+                done.append(f"{label}: restored copy removed (there was no original)")
+        except (OSError, ValueError) as error:
+            problems.append(f"{label}: NOT put back: {error}")
+    if problems:
+        raise ValueError("; ".join(done + problems))
+    return done
+
+
+def restore_database_files(database: Path, staged: Path, keep: Path) -> dict:
+    """rollback.sh --restore-database, as one transaction: moves the current
+    database and its -wal/-shm out of the recordings folder (which the
+    service user controls) into `keep`, an empty folder only root can enter,
+    each by one rename; then writes each staged copy (`staged`/db, db-wal,
+    db-shm, root-only) in its place. Everything is checked before the first
+    move (a non-file at a database name stops it with nothing changed); a
+    symlink at a database name is removed, never followed or kept. On any
+    failure what was moved or placed so far is put back before it returns
+    (DatabaseInconsistent when that fails). Returns the record undo needs."""
+    name = _plain_name(database.name)
+    rec_fd = _open_dir_nofollow(database.parent)
+    moved, placed = [], []
+    try:
+        keep_fd = _open_root_only_dir(keep)
+        try:
+            originals, links = [], []
+            for suffix in _DB_SUFFIXES:
+                try:
+                    info = os.lstat(name + suffix, dir_fd=rec_fd)
+                except FileNotFoundError:
+                    continue
+                if statmod.S_ISREG(info.st_mode):
+                    originals.append(suffix)
+                elif statmod.S_ISLNK(info.st_mode):
+                    links.append(suffix)
+                else:
+                    raise ValueError(f"{name + suffix} is not a regular file; nothing was changed")
+                if _lexists_at(keep_fd, name + suffix):
+                    raise ValueError(f"{keep} already holds {name + suffix}; nothing was changed")
+            sources = [suffix for suffix in _DB_SUFFIXES if os.path.lexists(staged / ("db" + suffix))]
+            try:
+                for suffix in originals:
+                    _move_between(rec_fd, keep_fd, name + suffix)
+                    moved.append(suffix)
+                for suffix in links:
+                    try:
+                        os.unlink(name + suffix, dir_fd=rec_fd)
+                    except FileNotFoundError:
+                        pass
+                for suffix in sources:
+                    _place_in_dir(rec_fd, name + suffix, staged / ("db" + suffix))
+                    placed.append(suffix)
+            except BaseException as error:
+                try:
+                    _undo_swap(rec_fd, keep_fd, name, moved, placed)
+                except ValueError as undo_error:
+                    raise DatabaseInconsistent(f"{error}; and could not put the database back: {undo_error}") from error
+                raise
+        finally:
+            os.close(keep_fd)
     finally:
-        os.close(dir_fd)
-    return {"kept": kept, "moved": moved, "placed": placed}
+        os.close(rec_fd)
+    return {"keep": str(keep), "moved": moved, "placed": placed}
 
 
-def undo_database_restore(database: Path, kept: str, moved, placed) -> None:
+def undo_database_restore(database: Path, keep: Path, moved, placed) -> list:
     """Puts back a completed restore_database_files() from its record (see
     _undo_swap()): only the files that swap actually moved or placed."""
     name = _plain_name(database.name)
-    if moved:
-        kept = _plain_name(kept)
-    dir_fd = _open_dir_nofollow(database.parent)
+    rec_fd = _open_dir_nofollow(database.parent)
     try:
-        _undo_swap(dir_fd, name, kept, moved, placed)
+        keep_fd = _open_root_only_dir(keep)
+        try:
+            return _undo_swap(rec_fd, keep_fd, name, moved, placed)
+        finally:
+            os.close(keep_fd)
     finally:
-        os.close(dir_fd)
+        os.close(rec_fd)
 
 
 def update_env_file(path: Path, *, defaults: Optional[dict] = None, overrides: Optional[dict] = None,
@@ -698,10 +750,12 @@ def agent_file_main(stream=None) -> int:
       stage -- 'source P' copied to the new file 'path P' through
                stage_untrusted_file(); exit 3 when the source is absent.
     Database restore ('path' is the database):
-      restore_db      -- 'source' the staged folder; prints its record
-                         ('kept N', 'moved db|wal|shm', 'placed ...' lines);
-                         exit 4 when a failure could not be undone.
-      undo_db_restore -- that record as request lines."""
+      restore_db      -- 'source' the staged folder, 'keep' an empty root-only
+                         folder for the originals; prints its record ('keep P',
+                         'moved db|wal|shm', 'placed ...' lines); exit 4 when a
+                         failure could not be undone.
+      undo_db_restore -- that record as request lines; prints one status line
+                         per file."""
     stream = stream or sys.stdin.buffer
     request = {"default": {}, "override": {}, "remove": [], "if_missing": False, "moved": [], "placed": []}
     suffix_of = {label: suffix for suffix, label in _DB_LABELS.items()}
@@ -732,7 +786,7 @@ def agent_file_main(stream=None) -> int:
                 print(f"[ERROR] malformed {word} line", file=sys.stderr)
                 return 2
             request[word].append(suffix_of[rest])
-        elif word in ("op", "path", "mode", "owner", "template", "source", "kept"):
+        elif word in ("op", "path", "mode", "owner", "template", "source", "keep"):
             request[word] = rest
         elif line.strip():
             print(f"[ERROR] unknown request line {word!r}", file=sys.stderr)
@@ -765,17 +819,18 @@ def agent_file_main(stream=None) -> int:
             return 0 if stage_untrusted_file(Path(request["source"]), path) else 3
         if op == "restore_db":
             try:
-                record = restore_database_files(path, Path(request["source"]))
+                record = restore_database_files(path, Path(request["source"]), Path(request["keep"]))
             except DatabaseInconsistent as error:
                 print(f"[ERROR] {path}: {error}", file=sys.stderr)
                 return 4
-            lines = [f"kept {record['kept']}"] + [f"{word} {_DB_LABELS[suffix]}" for word in ("moved", "placed")
+            lines = [f"keep {record['keep']}"] + [f"{word} {_DB_LABELS[suffix]}" for word in ("moved", "placed")
                                                   for suffix in record[word]]
             sys.stdout.write("\n".join(lines) + "\n")
             sys.stdout.flush()
             return 0
         if op == "undo_db_restore":
-            undo_database_restore(path, request.get("kept", ""), request["moved"], request["placed"])
+            for status in undo_database_restore(path, Path(request["keep"]), request["moved"], request["placed"]):
+                print(status)
             return 0
         if op == "update_env":
             template = read_untrusted(Path(request["template"]), max_bytes=_MAX_SMALL_FILE, expected_uid=None) \

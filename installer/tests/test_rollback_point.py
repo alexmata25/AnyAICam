@@ -189,8 +189,11 @@ deploy_vms clean
         result = subprocess.run([BASH, "./rollback.sh", "--yes", "--restore-database"], cwd=ROOT, text=True, capture_output=True, env=self.env(**paths))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.recordings / "partner_portal.db").read_text(), "online-backup")
-        kept = [p for p in self.recordings.iterdir() if p.name.startswith("partner_portal-before-rollback-")]
-        self.assertEqual([p.read_text() for p in kept], ["database after upgrade"])  # replaced, never deleted
+        # Replaced, never deleted -- and kept root-only beside the rollback
+        # points, not in the service user's recordings folder (2026-10-06).
+        kept = list(self.rollback_dir.glob("replaced-database-*/partner_portal.db"))
+        self.assertEqual([p.read_text() for p in kept], ["database after upgrade"])
+        self.assertFalse([p for p in self.recordings.iterdir() if "before-rollback" in p.name])
 
     def test_rollback_sh_refuses_a_missing_or_incomplete_rollback_point(self):
         env = self.env(ANYAICAM_ROLLBACK_ALLOW_NON_ROOT="1")

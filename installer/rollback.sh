@@ -14,8 +14,8 @@
 # (build, version and the installed-release record) and KEEPS the current
 # database (recordings, events and settings made since the upgrade stay).
 # --restore-database also puts back the database copy taken at upgrade time;
-# the current database is first saved beside it
-# (partner_portal-before-rollback-<time>.db), never deleted.
+# the current database (with its -wal/-shm) is first moved, root-only, to
+# ROLLBACK_DIR/replaced-database-<time>-<random>/, never deleted.
 #
 # A rollback point belongs to the release that replaced it (UPGRADE_TO_COMMIT).
 # If the appliance runs a different build now -- for example an in-app update
@@ -239,6 +239,7 @@ if [[ -f "$installed_record" && ! -L "$installed_record" ]]; then
 fi
 db_swapped=0
 db_broken=0
+keep_dir=""
 
 # Puts back everything recorded above after a failure part-way through, and
 # restarts the VMS if it was running. Best effort, step by step: it reports
@@ -268,10 +269,14 @@ restore_previous() {
     local database_ok=1
     if [[ "$db_broken" == "1" ]]; then
         database_ok=0
-        problems+=("database $current (see the error above; the original is kept beside it as partner_portal-before-rollback-*)")
+        problems+=("database $current (see the error above; the originals that were moved are in $keep_dir)")
     elif [[ "$db_swapped" == "1" ]]; then
-        { printf 'op undo_db_restore\npath %s\n' "$current"; cat "$snapshot/db-swap"; } | agent_file \
-            || { database_ok=0; problems+=("database $current (the replaced one is kept as $kept)"); }
+        if { printf 'op undo_db_restore\npath %s\n' "$current"; cat "$snapshot/db-swap"; } | agent_file >&2; then
+            rmdir "$keep_dir" 2>/dev/null
+        else
+            database_ok=0
+            problems+=("database $current (the originals that were moved are in $keep_dir)")
+        fi
     fi
     if [[ "$was_active" == "1" && "$database_ok" != "1" ]]; then
         problems+=("$VMS_SERVICE was left stopped: its database is not consistent")
@@ -329,25 +334,31 @@ if [[ -d "$UPDATE_STATE_DIR" ]]; then
 fi
 if [[ "$restore_database" == "1" ]]; then
     current="$VMS_RECORDINGS_DIR/$VMS_DATABASE_NAME"
-    # The service user owns the recordings folder and can plant a symlink at
-    # a database name at any moment, so neither mv nor cp touches it: the
-    # helper moves the database aside (under a fresh unique name) and writes
-    # the checked copies (taken before the VMS was stopped) through one
-    # no-follow handle on the folder, each as a new temporary file renamed
-    # into place. It is one transaction: on failure it puts back what it
-    # changed itself (exit 4: it could not); on success it prints which files
-    # it moved and placed, so a later failure undoes exactly those.
+    # The service user owns the recordings folder and can plant or swap names
+    # in it at any moment, so neither mv nor cp touches it, and the replaced
+    # database is not kept there: the helper moves the current database,
+    # -wal and -shm by one rename each into keep_dir -- a new folder only
+    # root can enter, beside the rollback points -- and writes the checked
+    # copies (taken before the VMS was stopped) through one no-follow handle
+    # on the recordings folder, each as a new temporary file renamed into
+    # place. It is one transaction: on failure it puts back what it changed
+    # itself (exit 4: it could not); on success it prints which files it
+    # moved and placed, so a later failure undoes exactly those.
+    keep_dir="$(mktemp -d "$ROLLBACK_DIR/replaced-database-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" \
+        || die "Could not create a folder for the replaced database; the current database was left in place."
+    chmod 0700 "$keep_dir"
     db_status=0
-    printf 'op restore_db\npath %s\nsource %s\n' "$current" "$db_stage" | agent_file > "$snapshot/db-swap" || db_status=$?
+    printf 'op restore_db\npath %s\nsource %s\nkeep %s\n' "$current" "$db_stage" "$keep_dir" | agent_file > "$snapshot/db-swap" \
+        || db_status=$?
     if [[ "$db_status" == "4" ]]; then
         db_broken=1
         die "The database restore failed and the previous database could not be put back."
     elif [[ "$db_status" != "0" ]]; then
+        rmdir "$keep_dir" 2>/dev/null || true
         die "Could not restore the database safely; the current database was left in place."
     fi
     db_swapped=1
-    kept="$VMS_RECORDINGS_DIR/$(sed -n 's/^kept //p' "$snapshot/db-swap")"
-    log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept as $kept."
+    log "Database restored from $ROLLBACK_DATABASE_BACKUP; the database it replaced is kept (root only) in $keep_dir."
 fi
 systemctl start "$VMS_SERVICE"
 # The release is now consistently the rollback one; a VMS that then fails
