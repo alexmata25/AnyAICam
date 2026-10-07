@@ -62,9 +62,27 @@ foreach ($directory in @('config', 'database', 'recordings', 'hls', 'logs', 'med
 # The data folder holds the app secrets (config\vms.env), the account database
 # and recordings: only the service (LocalSystem) and administrators may read it.
 # ProgramData's default would let every local user read and create files here.
-& icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
 $environmentFile = Join-Path $DataRoot 'config\vms.env'
+# Repair (2026-10-07): the unreleased 1.3.0 candidates ran the restriction
+# below with /T, which on a reinstall left every existing file with an EMPTY
+# permission list -- unreadable even by the service and administrators. Such an
+# install is recognised by an unreadable vms.env: take ownership for
+# Administrators and make every item inherit from the folder again. Healthy
+# installs (and 0.1.3, whose files only inherit) skip this.
+if (Test-Path -LiteralPath $environmentFile) {
+    $readable = $true
+    try { [void][IO.File]::ReadAllBytes($environmentFile) } catch { $readable = $false }
+    if (-not $readable) {
+        & takeown.exe /F $DataRoot /R /A /D Y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not take ownership of $DataRoot to repair its permissions (takeown exit $LASTEXITCODE)." }
+        & icacls.exe $DataRoot /reset /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not repair permissions under $DataRoot (icacls exit $LASTEXITCODE)." }
+    }
+}
+# The root only (never /T): its inheritable SYSTEM/Administrators entries flow
+# to every existing and future file and folder, which keep inheritance on.
+& icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
 $values = [ordered]@{}
 if (Test-Path -LiteralPath $environmentFile) {
     foreach ($line in Get-Content -LiteralPath $environmentFile) {

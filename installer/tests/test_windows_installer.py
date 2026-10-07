@@ -121,6 +121,25 @@ class RuntimeScriptTests(unittest.TestCase):
         self.assertIn("icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'", self.text)
         self.assertIn("if ($LASTEXITCODE -ne 0) { throw \"Could not restrict access", self.text)
 
+    def test_restriction_touches_only_the_root_so_reinstalls_keep_files_readable(self):
+        # 2026-10-07: with /T a reinstall left every existing file with an empty
+        # permission list (second Sandbox run). Only the root is set; the
+        # (OI)(CI) entries reach existing and new items by inheritance.
+        restrict = [line for line in self.text.splitlines()
+                    if line.startswith("& icacls.exe $DataRoot /inheritance:r")]
+        self.assertEqual(restrict, ["& icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null"])
+        self.assertNotIn("/inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T", self.text)
+
+    def test_damaged_install_is_repaired_before_vms_env_is_read(self):
+        repair = self.text.index("[IO.File]::ReadAllBytes($environmentFile)")
+        self.assertLess(repair, self.text.index("& takeown.exe /F $DataRoot /R /A /D Y"))
+        self.assertLess(self.text.index("& takeown.exe /F $DataRoot /R /A /D Y"), self.text.index("& icacls.exe $DataRoot /reset /T /C /Q"))
+        self.assertLess(self.text.index("& icacls.exe $DataRoot /reset /T /C /Q"), self.text.index("& icacls.exe $DataRoot /inheritance:r"))
+        self.assertLess(self.text.index("& icacls.exe $DataRoot /inheritance:r"), self.text.index("foreach ($line in Get-Content -LiteralPath $environmentFile)"))
+        self.assertIn("if (-not $readable) {", self.text)  # healthy installs skip the repair
+        for failure in ("(takeown exit $LASTEXITCODE)", "Could not repair permissions under $DataRoot (icacls exit $LASTEXITCODE)"):
+            self.assertIn(failure, self.text)  # a failed repair stops setup
+
     def test_secrets_are_generated_once_and_kept(self):
         self.assertIn("if (-not $values.Contains('ANYAICAM_APP_SECRETS'))", self.text)
         self.assertIn("if (-not $values.Contains('ANYAICAM_CAMERA_CREDENTIAL_KEY'))", self.text)
@@ -197,6 +216,17 @@ class VcRuntimeTests(unittest.TestCase):
         self.assertLess(runtime.index("requirements-windows.txt"), preflight)
         self.assertLess(preflight, runtime.index("firewall.ps1"))
         self.assertIn("if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam runtime preflight failed", runtime)
+
+    def test_a_failed_post_install_step_fails_the_exit_code(self):
+        # Inno ends with 0 after an exception in ssPostInstall (second Sandbox run).
+        self.assertIn("const PostInstallFailedExitCode = 20;", self.iss)
+        self.assertIn("function GetCustomSetupExitCode(): Integer;", self.iss)
+        steps = self.iss.split("procedure CurStepChanged", 1)[1]
+        self.assertIn("if CurStep = ssPostInstall then\n  try\n", steps)
+        handler = steps.split("  except\n", 1)[1]
+        self.assertIn("PostInstallFailed := True;", handler)
+        self.assertIn("RaiseException(GetExceptionMessage);", handler)  # still shown to the user
+        self.assertLess(steps.index("'start', 'Starting"), steps.index("  except\n"))
 
     def test_failures_reach_the_setup_log(self):
         self.assertIn("ExecAndLogOutput(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode, nil)", self.iss)

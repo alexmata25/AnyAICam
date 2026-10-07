@@ -101,9 +101,48 @@ Check 'service restarts itself after a crash' {
 
 # ---------------------------------------------------------------- upgrade over itself, then uninstall
 $secretsBefore = (Get-Content (Join-Path $data 'config\vms.env') | Where-Object { $_.StartsWith('ANYAICAM_APP_SECRETS=') })
-$repair = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-reinstall.log') + '"') -Wait -PassThru
-Check 'reinstall over itself exit code 0' { $repair.ExitCode -eq 0 }
-Check 'reinstall keeps data and secrets' { if (-not (WaitHealthy 180)) { throw 'not healthy after reinstall' }; $after = (Get-Content (Join-Path $data 'config\vms.env') | Where-Object { $_.StartsWith('ANYAICAM_APP_SECRETS=') }); if ($after -ne $secretsBefore) { throw 'ANYAICAM_APP_SECRETS changed' }; 'secrets unchanged' }
+# 2026-10-07: the second Sandbox run found a reinstall left every existing data
+# file with an empty permission list (icacls /T), so setup could not read
+# vms.env and stopped -- yet exited 0. Every data file must stay readable by
+# Administrators and carry only the inherited SYSTEM/Administrators entries.
+$dataFiles = @('config\vms.env', 'database\partner_portal.db', 'logs\AnyAiCamVMS.err.log') | ForEach-Object { Join-Path $data $_ }
+function DataFilesHealthy {
+    foreach ($file in $dataFiles) {
+        try { [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite').Close() } catch { throw "cannot read $file`: $($_.Exception.Message)" }
+        $acl = Get-Acl -LiteralPath $file
+        if (-not $acl.Access) { throw "$file has no permission entries" }
+        foreach ($rule in $acl.Access) {
+            $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            if (-not $rule.IsInherited) { throw "$file has an explicit entry for $sid" }
+            if ($sid -notin 'S-1-5-18', 'S-1-5-32-544') { throw "$file grants $sid" }
+        }
+    }
+    'vms.env, database and service log readable; inherited SYSTEM/Administrators only'
+}
+function Reinstall([string]$Log) {
+    Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results $Log) + '"') -Wait -PassThru
+}
+function SecretsKept {
+    if (-not (WaitHealthy 180)) { throw 'not healthy after reinstall' }
+    $after = (Get-Content (Join-Path $data 'config\vms.env') | Where-Object { $_.StartsWith('ANYAICAM_APP_SECRETS=') })
+    if ($after -ne $secretsBefore) { throw 'ANYAICAM_APP_SECRETS changed' }
+    'healthy, secrets unchanged'
+}
+
+$repair = Reinstall 'setup-reinstall.log'
+Check 'reinstall over itself exit code 0' { if ($repair.ExitCode -ne 0) { throw "exit $($repair.ExitCode)" }; 'exit 0' }
+Check 'reinstall keeps data and secrets' { SecretsKept }
+Check 'reinstall keeps data files readable with inherited permissions' { DataFilesHealthy }
+
+# An install damaged by an earlier 1.3.0 candidate: vms.env (Administrators-
+# owned) and the database (SYSTEM-owned) with empty permission lists.
+foreach ($file in $dataFiles[0..1]) { & icacls.exe $file /inheritance:r /Q | Out-Null }
+Check 'simulated damage: vms.env unreadable before the repair reinstall' { try { [void][IO.File]::ReadAllBytes($dataFiles[0]); throw 'still readable' } catch [UnauthorizedAccessException] { 'access denied, as an old candidate left it' } }
+$repair2 = Reinstall 'setup-repair-reinstall.log'
+Check 'repair reinstall exit code 0' { if ($repair2.ExitCode -ne 0) { throw "exit $($repair2.ExitCode)" }; 'exit 0' }
+Check 'repair reinstall keeps data and secrets' { SecretsKept }
+Check 'repair reinstall restores readable, inherited permissions' { DataFilesHealthy }
+
 $uninstaller = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
 $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-uninstall.log') + '"') -Wait -PassThru
 Check 'uninstall exit code 0' { $uninstall.ExitCode -eq 0 }
@@ -114,6 +153,20 @@ Check 'uninstall keeps customer data' { Test-Path (Join-Path $data 'database\par
 # The service logs (kept after uninstall) for diagnosis. The data folder is
 # SYSTEM/Administrators-only, so copy in backup mode.
 & robocopy.exe (Join-Path $data 'logs') (Join-Path $results 'service-logs') *.log /B /R:0 /W:0 /NP /NJH /NJS | Out-Null
+
+# A setup step that fails must fail the setup's exit code (not 0) and leave no
+# service. Forced here by putting a folder where vms.env belongs; vms.env is
+# restored afterwards.
+$envFile = $dataFiles[0]
+$envBackup = Join-Path $env:TEMP 'vms.env.validation-backup'
+Copy-Item -LiteralPath $envFile -Destination $envBackup -Force
+Remove-Item -LiteralPath $envFile -Force
+New-Item -ItemType Directory -Path $envFile | Out-Null
+$broken = Reinstall 'setup-forced-failure.log'
+Check 'a failing setup step gives a nonzero exit code (20)' { if ($broken.ExitCode -ne 20) { throw "exit $($broken.ExitCode)" }; 'exit 20' }
+Check 'a failing setup leaves no service behind' { if (Get-Service AnyAiCamVMS -ErrorAction SilentlyContinue) { throw 'service installed' }; 'no service' }
+Remove-Item -LiteralPath $envFile -Recurse -Force
+Copy-Item -LiteralPath $envBackup -Destination $envFile -Force
 
 $failed = @($checks | Where-Object { -not $_.ok }).Count
 $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
