@@ -13,7 +13,8 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
                              LocalVmsStatusReader,atomic_write_json,
                              auto_bind_discovered_cameras,
                              reconcile_cloud_cameras,redact_discovery_for_cloud)
-from .config import AgentConfig,load_credential
+from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential
+from .headless_claim import HeadlessClaim
 from .discovery import scan
 from .metrics import collect
 from .lan_addresses import publish as publish_lan_addresses
@@ -40,6 +41,7 @@ ACTIVATION_POLL_INTERVAL_SECONDS = 10
 
 class ApplianceAgent:
     def __init__(self,config):
+        self.headless_claim_factory=HeadlessClaim.for_config
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
         # RDM-2 Group 2A/2B/2F/2G: restart_signal is the real wrapper
         # (Group 2B) around this same agent's own stop_event -- exactly
@@ -507,15 +509,34 @@ class ApplianceAgent:
         to active the moment `anyaicam-setup` completes, without
         depending on that restart succeeding or racing it.
         """
-        if self.client.credential: return
+        if self.client.credential:
+            # A headless claim's state (it holds the spent proof) is removed
+            # once the appliance is active, even if the restart queued by
+            # enrollment came before the claim could clear it itself.
+            state=load_claim_state(self.config)
+            if state and state.get('headless'): clear_claim_state(self.config)
+            return
         self.log.info('Appliance is not activated yet; waiting for anyaicam-setup (interactive or --claim) to complete...')
+        # Headless label claim (2026-10-07, headless_claim.py): an appliance
+        # imaged for a label claim also opens and completes its own claim
+        # while it waits, so the customer needs no terminal. Ineligible
+        # appliances (no label file, no cloud portal) only wait, as before.
+        headless=self.headless_claim_factory(self.config,self.log)
+        next_step=0.0
         while not self.stop_event.is_set():
             credential=load_credential(self.config)
             if credential and credential.get('credential'):
                 self.client.appliance_id=credential.get('appliance_id'); self.client.credential=credential.get('credential')
                 self.log.info('Appliance activation detected; resuming normal operation cloud_id=%s',self.config.cloud_id)
                 return
-            self.stop_event.wait(ACTIVATION_POLL_INTERVAL_SECONDS)
+            wait=ACTIVATION_POLL_INTERVAL_SECONDS
+            if headless is not None:
+                now=time.monotonic()
+                if now>=next_step:
+                    next_step=now+headless.step()
+                    continue  # re-check for the credential the step may just have written
+                wait=max(0.5,min(wait,next_step-now))
+            self.stop_event.wait(wait)
     def run(self):
         self._await_activation()
         if self.stop_event.is_set():

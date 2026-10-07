@@ -150,10 +150,14 @@ run_install() {
         case "$arg" in
             --repair) mode="repair" ;;
             --product-mode=*) ANYAICAM_PRODUCT_MODE="${arg#*=}" ;;
+            --portal-url=*) ANYAICAM_INSTALL_PORTAL_URL="${arg#*=}" ;;
             *) echo "Unknown argument: $arg" >&2; return 2 ;;
         esac
     done
 
+    if [[ -n "${ANYAICAM_INSTALL_PORTAL_URL:-}" ]]; then
+        validate_install_portal_url "$ANYAICAM_INSTALL_PORTAL_URL" || return 2
+    fi
     load_release_metadata
     log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode, VMS=$VMS_RELEASE_COMMIT)"
     log "Verifying this installer package against its own file list..."
@@ -183,6 +187,8 @@ run_install() {
     systemd_setup
     disable_system_suspend
     identity_provision "$INSTALL_STATE"
+    claim_label_provision
+    cloud_portal_provision
     provision_update_signing_key
     provision_entitlement_signing_keys
     stamp_release

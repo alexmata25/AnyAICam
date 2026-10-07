@@ -96,6 +96,11 @@ class AgentConfig:
     # appliance_claims.py's DEVICE_ID_PATTERN comment).
     @property
     def installer_identity_file(self): return Path(self.config_dir)/'appliance_identity.json'
+    # Headless label claim (2026-10-07): written by installer/09-identity.sh
+    # when the unit is imaged -- only the verifier (sha256) of the claim code
+    # printed on the unit's label, never the code itself.
+    @property
+    def label_claim_file(self): return Path(self.config_dir)/'label_claim.json'
     # WireGuard direct remote connectivity (docs/wireguard-remote-
     # connectivity-plan.md Sec 6): private key + assigned tunnel address
     # + gateway public key/endpoint -- provisioned trust material, same

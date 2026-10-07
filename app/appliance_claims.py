@@ -81,6 +81,7 @@ plan doc's originally path/query-based endpoint shapes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -204,6 +205,76 @@ def _seconds_until(moment: str) -> int:
         return max(0, int((datetime.fromisoformat(str(moment)) - _now()).total_seconds()))
     except (TypeError, ValueError):
         return 0
+
+
+# Headless label claim (2026-10-07). A shipped appliance has no screen to
+# show claim_code on, so installer/09-identity.sh mints a second code when
+# the unit is imaged and it is printed on the unit's label (text and QR).
+# The appliance never keeps that code: it keeps only its verifier,
+# sha256(LABEL_VERIFIER_PREFIX + code), sends it with claim/begin, and the
+# cloud stores only password_hash(verifier). A customer types or scans the
+# label code in the portal; the cloud recomputes the verifier and matches
+# it against pending claims. Possession of the box and its label is what
+# proves the right to claim it -- the same model as a router's or camera's
+# printed setup code. 12 Crockford base32 characters = 60 bits; together
+# with claim_portal_limiter and the requirement that the appliance itself
+# is online with a pending claim, guessing one is not practical, and a
+# leaked database holds only PBKDF2 hashes of a 60-bit secret's digest.
+LABEL_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'  # Crockford base32: no I, L, O, U
+LABEL_LENGTH = 12
+LABEL_VERIFIER_PREFIX = 'anyaicam-label-claim-v1:'
+LABEL_VERIFIER_PATTERN = re.compile(r'^[0-9a-f]{64}$')
+_LABEL_LOOKALIKES = str.maketrans({'O': '0', 'I': '1', 'L': '1'})
+
+
+def normalize_label_code(text: str) -> str | None:
+    """The canonical 12-character form of a label code as a person may
+    type it (any case, spaces or dashes, O for 0, I or L for 1), or None."""
+    code = re.sub(r'[\s-]', '', str(text or '')).upper().translate(_LABEL_LOOKALIKES)
+    if len(code) != LABEL_LENGTH or any(ch not in LABEL_ALPHABET for ch in code):
+        return None
+    return code
+
+
+def label_verifier(code: str) -> str:
+    """What the appliance sends for its label code (installer/09-identity.sh
+    computes the same value with sha256sum)."""
+    return hashlib.sha256((LABEL_VERIFIER_PREFIX + code).encode('ascii')).hexdigest()
+
+
+def _label_verifier_from(payload: dict) -> str | None:
+    """claim/begin's optional label_verifier: absent for an appliance claimed
+    from its own terminal, a 64-hex sha256 otherwise."""
+    value = payload.get('label_verifier')
+    if value is None or value == '':
+        return None
+    value = str(value).strip().lower()
+    if not LABEL_VERIFIER_PATTERN.match(value):
+        raise HTTPException(status_code=400, detail='label_verifier must be a 64-character hex SHA-256.')
+    return value
+
+
+def _find_claim_by_label(label_code: str) -> dict | None:
+    """Same bounded scan as _find_claim_by_code(), over pending claims whose
+    appliance sent a label verifier."""
+    code = normalize_label_code(label_code)
+    if not code:
+        return None
+    verifier = label_verifier(code)
+    now_text = _now().isoformat()
+    for candidate in rows("SELECT * FROM appliance_claims WHERE status='pending' AND expires_at>? AND label_verifier_hash IS NOT NULL", (now_text,)):
+        if verify_password(verifier, candidate['label_verifier_hash']):
+            return candidate
+    return None
+
+
+def _find_claim_for_portal(payload: dict) -> dict | None:
+    """A portal request names the appliance by its label code (label_code)
+    or by the code its own terminal showed (claim_code)."""
+    if str(payload.get('label_code', '') or '').strip():
+        return _find_claim_by_label(str(payload['label_code']))
+    claim_code = str(payload.get('claim_code', '')).strip()
+    return _find_claim_by_code(claim_code) if claim_code else None
 
 
 def _generate_claim_code() -> str:
@@ -378,6 +449,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             raise HTTPException(status_code=400, detail='device_id must be a valid UUIDv4.')
         device_id = _normalize_device_id(device_id)
         device_secret = _device_secret(payload)
+        verifier = _label_verifier_from(payload)
         existing_appliance = row('SELECT id FROM appliances WHERE cloud_id=?', (device_id.upper(),))
         if existing_appliance:
             raise HTTPException(status_code=409, detail='This device is already provisioned. Use the existing activation flow.')
@@ -396,6 +468,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             with connection() as db:
                 db.execute("UPDATE appliance_claims SET claim_code_hash=? WHERE id=? AND status='pending'",
                            (password_hash(claim_code), resumable['id']))
+                if verifier:
+                    db.execute("UPDATE appliance_claims SET label_verifier_hash=? WHERE id=? AND status='pending'",
+                               (password_hash(verifier), resumable['id']))
             logger.info('Claim session resumed with a new code claim_id=%s', resumable['id'])
             return {
                 'claim_session_id': resumable['claim_session_id'],
@@ -412,8 +487,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         expires_at = (now + timedelta(minutes=CLAIM_SESSION_TTL_MINUTES)).isoformat()
         with connection() as db:
             db.execute(
-                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash) VALUES(?,?,?,?,?,?,?,?)',
-                (claim_id, device_id, claim_session_id, password_hash(claim_code), 'pending', expires_at, now.isoformat(), password_hash(device_secret)),
+                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash,label_verifier_hash) VALUES(?,?,?,?,?,?,?,?,?)',
+                (claim_id, device_id, claim_session_id, password_hash(claim_code), 'pending', expires_at, now.isoformat(), password_hash(device_secret),
+                 password_hash(verifier) if verifier else None),
             )
         # Never log the session id: it is a bearer value for this claim.
         logger.info('Claim session opened claim_id=%s', claim_id)
@@ -480,8 +556,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         _require_self_link_permission(identity)
         if not claim_portal_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
             raise HTTPException(status_code=429, detail='Claim lookup rate exceeded.')
-        claim_code = str(payload.get('claim_code', '')).strip()
-        claim = _find_claim_by_code(claim_code)
+        claim = _find_claim_for_portal(payload)
         if not claim:
             raise HTTPException(status_code=404, detail='Claim code not found or expired.')
         return {'device_id': claim['device_id'], 'expires_at': claim['expires_at']}
@@ -492,13 +567,12 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         _require_self_link_permission(identity)
         if not claim_portal_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
             raise HTTPException(status_code=429, detail='Claim confirmation rate exceeded.')
-        claim_code = str(payload.get('claim_code', '')).strip()
         site_id = str(payload.get('site_id', '')).strip()
-        if not claim_code:
-            raise HTTPException(status_code=400, detail='claim_code is required.')
+        if not str(payload.get('claim_code', '') or '').strip() and not str(payload.get('label_code', '') or '').strip():
+            raise HTTPException(status_code=400, detail='claim_code or label_code is required.')
         if not site_id:
             raise HTTPException(status_code=400, detail='site_id is required.')
-        claim = _find_claim_by_code(claim_code)
+        claim = _find_claim_for_portal(payload)
         if not claim:
             raise HTTPException(status_code=404, detail='Claim code not found or expired.')
         site = row('SELECT id FROM sites WHERE id=? AND customer_id=?', (site_id, identity['customer_id']))
@@ -692,8 +766,8 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         content = f'''<header class="topbar"><div><p class="eyebrow">Add an appliance</p><h1>Claim an appliance</h1></div></header>
         <section class="panel">
           <div id="claim-step-code">
-            <p>Enter the claim code shown on the appliance during setup.</p>
-            <label>Claim code<input id="claim-code-input" maxlength="16" autocapitalize="characters" placeholder="ABCD1234"></label>
+            <p>Plug the appliance into power and your network, wait a few minutes for it to start, then enter the claim code printed on its label (or scan the label's QR code with your phone).</p>
+            <label>Claim code<input id="claim-code-input" maxlength="20" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX"></label>
             <button class="action-button" id="claim-lookup-button">Look up</button>
             <p id="claim-lookup-message" class="health-detail"></p>
           </div>
@@ -709,11 +783,19 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           </div>
         </section>'''
         scripts = '''<script>
+        // A label code is 12 characters (dashes/spaces ignored); the code an
+        // appliance's own terminal shows is 8. Sent in the POST body only.
+        function claimBody(){
+          const raw=document.getElementById('claim-code-input').value.trim().toUpperCase(),compact=raw.replace(/[\\s-]/g,'');
+          return compact.length===12?{label_code:compact}:{claim_code:raw};
+        }
+        // From the label QR via /claim (kept in this tab only, never in a URL).
+        try{const saved=sessionStorage.getItem('anyaicam.claimLabel');if(saved){sessionStorage.removeItem('anyaicam.claimLabel');document.getElementById('claim-code-input').value=saved}}catch(e){}
         document.getElementById('claim-lookup-button').onclick=async()=>{
-          const code=document.getElementById('claim-code-input').value.trim().toUpperCase(),message=document.getElementById('claim-lookup-message');
+          const message=document.getElementById('claim-lookup-message');
           message.textContent='';
-          const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim_code:code})}),body=await response.json();
-          if(!response.ok){message.textContent=body.detail||'Claim code not found or expired.';return}
+          const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(claimBody())}),body=await response.json();
+          if(!response.ok){message.textContent=response.status===404?'No appliance is waiting with that code. Check the code, and that the appliance is plugged into power and your network (it can take a few minutes to start).':(body.detail||'Claim code not found or expired.');return}
           // A readable name, not the raw device UUID (2026-10-02).
           document.getElementById('claim-device-id').textContent='AnyAiCam appliance (ID ending '+String(body.device_id||'').replace(/-/g,'').slice(-6).toUpperCase()+')';
           document.getElementById('claim-step-code').hidden=true;
@@ -726,10 +808,10 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           document.getElementById('claim-confirm-message').textContent='';
         };
         document.getElementById('claim-confirm-button').onclick=async()=>{
-          const code=document.getElementById('claim-code-input').value.trim().toUpperCase(),siteId=document.getElementById('claim-site-select').value,message=document.getElementById('claim-confirm-message'),button=document.getElementById('claim-confirm-button');
+          const siteId=document.getElementById('claim-site-select').value,message=document.getElementById('claim-confirm-message'),button=document.getElementById('claim-confirm-button');
           if(!siteId){message.textContent='Select a site first.';return}
           button.disabled=true;
-          const response=await fetch('/api/portal/claims/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim_code:code,site_id:siteId})}),body=await response.json();
+          const response=await fetch('/api/portal/claims/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign(claimBody(),{site_id:siteId}))}),body=await response.json();
           if(!response.ok){button.disabled=false;message.textContent=body.detail||'Could not confirm the claim.';return}
           document.getElementById('claim-step-confirm').hidden=true;
           document.getElementById('claim-step-done').hidden=false;
@@ -737,3 +819,25 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         };
         </script>'''
         return shell('Claim appliance', 'users', content, scripts)
+
+    # The label's QR code opens /claim#label=XXXX-XXXX-XXXX. The code is in
+    # the fragment, which browsers never send to a server (so it is in no
+    # access log), but a fragment does not survive the sign-in redirect --
+    # so this public page moves it into this tab's sessionStorage, removes
+    # it from the address bar and history, and continues to the claim page
+    # (through sign-in if needed), which picks it up. Typed by hand,
+    # app.anyaicam.com/claim simply leads to the claim page.
+    @app.get('/claim', response_class=HTMLResponse)
+    def claim_label_entry():
+        page = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Claim your AnyAiCam appliance</title></head><body>
+<p>Opening AnyAiCam&hellip; <a href="/customer/claim-appliance">Continue</a></p>
+<script>
+(function(){
+  var match=/(?:^|[#&])label=([0-9A-Za-z -]{12,20})(?:&|$)/.exec(location.hash||'');
+  if(match){try{sessionStorage.setItem('anyaicam.claimLabel',decodeURIComponent(match[1]).toUpperCase())}catch(e){}}
+  try{history.replaceState(null,'',location.pathname)}catch(e){}
+  location.replace('/customer/claim-appliance');
+})();
+</script></body></html>'''
+        return HTMLResponse(page, headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})

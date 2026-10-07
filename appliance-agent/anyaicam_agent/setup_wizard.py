@@ -44,7 +44,7 @@ def qr_payload():
     return input('Cloud ID: ').strip(),getpass.getpass('Activation token: ').strip()
 
 
-def _finish_enrollment(config:AgentConfig,activated:dict) -> None:
+def _finish_enrollment(config:AgentConfig,activated:dict,ask_discovery:bool=True) -> None:
     """Everything after a successful activation -- identical regardless
     of whether `activated` came from the interactive admin-driven flow
     (POST /api/appliance/activate) or the non-interactive claim flow
@@ -147,6 +147,11 @@ def _finish_enrollment(config:AgentConfig,activated:dict) -> None:
         if status!='completed': print(f'WARNING: could not queue a VMS restart automatically ({error}); restart the anyaicam-vms container manually to apply the new cloud URL.')
     except OSError as error:
         print(f'WARNING: could not update the VMS environment file ({error}); set ANYAICAM_CLOUD_URL={config.portal_url} in it manually and restart anyaicam-vms.')
+    # A headless claim (headless_claim.py) never asks: cameras are added
+    # from the AnyAiCam portal.
+    if not ask_discovery:
+        print('Configuration saved securely.')
+        return
     try:
         answer=input('Run camera discovery now? [Y/n]: ')
     except EOFError:  # no terminal (a script or service): never a traceback after a successful claim

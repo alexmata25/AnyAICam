@@ -751,7 +751,7 @@ class LegacyAgentTreeTests(unittest.TestCase):
     # after every check that can refuse the install, storage included.
     LATER_STEPS = ("docker_setup", "provision_users_dirs", "deploy_vms", "install_rollback_tool", "install_agent",
                    "install_mediamtx", "install_webrtc_firewall", "systemd_setup", "disable_system_suspend",
-                   "identity_provision", "provision_update_signing_key", "provision_entitlement_signing_keys",
+                   "identity_provision", "claim_label_provision", "cloud_portal_provision", "provision_update_signing_key", "provision_entitlement_signing_keys",
                    "stamp_release")
 
     def run_install(self, free_gb):

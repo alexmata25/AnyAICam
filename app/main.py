@@ -42231,7 +42231,7 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
-    if path in {"/favicon.ico", "/manifest.webmanifest", "/offline", "/mobile-push-sw.js", "/api/mobile/push/config", "/api/mobile/push/firebase-config.js"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
+    if path in {"/favicon.ico", "/manifest.webmanifest", "/offline", "/claim", "/mobile-push-sw.js", "/api/mobile/push/config", "/api/mobile/push/firebase-config.js"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
 
 
 

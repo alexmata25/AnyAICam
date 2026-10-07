@@ -1642,6 +1642,9 @@ def apply_migrations():
             # secret only the claiming appliance holds; resume, status and
             # complete all require it (appliance_claims.py).
             ('device_secret_hash','TEXT'),
+            # Headless label claim (2026-10-07): hash of the verifier of the
+            # claim code printed on the appliance's label (appliance_claims.py).
+            ('label_verifier_hash','TEXT'),
         ):
             if name not in claim_columns: db.execute(f'ALTER TABLE appliance_claims ADD COLUMN {name} {definition}')
 
