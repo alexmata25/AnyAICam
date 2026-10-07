@@ -26,6 +26,11 @@ $pathContent = $pathContent | ForEach-Object { if ($_ -eq '#import site') { 'imp
 if ($LASTEXITCODE -ne 0) { throw 'Private pip bootstrap failed.' }
 & $python -m pip install --no-index --find-links $WheelRoot --disable-pip-version-check --no-warn-script-location -r (Join-Path $InstallRoot 'installer\requirements-windows.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
+# The VMS imports cv2/ultralytics/torch at startup; their DLLs need the Visual
+# C++ runtime the setup installs first. Stop here, before any service exists,
+# if anything fails to load (the setup log has the preflight's output).
+& $python (Join-Path $InstallRoot 'installer\runtime-preflight.py')
+if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam runtime preflight failed: the bundled Python cannot load the VMS packages.' }
 
 $ffmpegRoot = Join-Path $InstallRoot 'runtime\tools\ffmpeg'
 if (-not (Test-Path (Join-Path $ffmpegRoot 'ffmpeg.exe'))) {

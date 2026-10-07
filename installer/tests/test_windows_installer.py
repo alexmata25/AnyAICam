@@ -2,11 +2,14 @@
 that run on any machine. They never install anything, change a firewall or
 start a service; a clean Windows machine (Windows Sandbox) is the place for that.
 """
+import importlib.util
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 WIN = ROOT / "installer" / "windows"
@@ -135,7 +138,8 @@ class PinTests(unittest.TestCase):
         deps = read("DEPENDENCIES.md")
         pinned = dict(re.findall(r"'([A-Za-z0-9_.\-]+\.(?:zip|py|exe))'\s*=\s*'([0-9a-f]{64})'", build))
         self.assertEqual(set(pinned), {"python-3.12.10-embed-amd64.zip", "get-pip.py", "WinSW-x64.exe",
-                                       "ffmpeg-8.1.2-essentials_build.zip", "mediamtx_v1.21.0_windows_amd64.zip"})
+                                       "ffmpeg-8.1.2-essentials_build.zip", "mediamtx_v1.21.0_windows_amd64.zip",
+                                       "vc_redist.x64-14.44.35211.exe"})
         for name, digest in pinned.items():
             self.assertIn(digest, deps, name)
 
@@ -153,6 +157,84 @@ class PinTests(unittest.TestCase):
             self.assertIn(name, names, name)
         for line in lock:
             self.assertRegex(line, r"^[0-9a-f]{64}  \S+\.whl$")
+
+
+class VcRuntimeTests(unittest.TestCase):
+    """2026-10-07: a clean Windows has no Visual C++ runtime, so torch's DLLs
+    failed to load and the service crash-looped (first Sandbox run)."""
+
+    REDIST = "vc_redist.x64-14.44.35211.exe"
+
+    def setUp(self):
+        self.iss = read("AnyAiCam-VMS.iss")
+        self.build = read("build.ps1")
+
+    def test_redistributable_is_bundled_offline_and_signature_checked(self):
+        self.assertIn(f'Source: "vendor\\{self.REDIST}"; DestDir: "{{tmp}}"; Flags: deleteafterinstall', self.iss)
+        self.assertNotRegex(self.iss.lower(), r"https?://(?!127\.0\.0\.1)")
+        self.assertIn(f"Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor '{self.REDIST}')", self.build)
+        self.assertIn("'^CN=Microsoft Corporation,'", self.build)
+        # The hash check loop runs before the signature check.
+        self.assertLess(self.build.index("Vendor checksum failed"), self.build.index("Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor"))
+
+    def test_quiet_install_accepts_only_microsofts_success_codes(self):
+        code = self.iss.split("procedure InstallVcRuntime;", 1)[1].split("function NeedRestart", 1)[0]
+        self.assertIn(f"ExpandConstant('{{tmp}}\\{self.REDIST}'), '/install /quiet /norestart'", code)
+        self.assertIn("0, 1638: ;", code)
+        self.assertIn("3010: VcRuntimeNeedsRestart := True;", code)
+        self.assertIn("else\n    RaiseException('Installing the Microsoft Visual C++ runtime failed", code)
+        self.assertIn("Result := VcRuntimeNeedsRestart;", self.iss)
+
+    def test_order_is_vc_runtime_then_python_runtime_then_service(self):
+        steps = self.iss.split("procedure CurStepChanged", 1)[1]
+        order = [steps.index(s) for s in ("InstallVcRuntime;", "ExpandConstant('{app}\\installer\\install-runtime.ps1')","'install', 'Installing the AnyAiCam Windows service", "'start', 'Starting")]
+        self.assertEqual(order, sorted(order))
+
+    def test_preflight_runs_after_packages_and_before_firewall(self):
+        runtime = read("install-runtime.ps1")
+        self.assertIn('Source: "runtime-preflight.py"; DestDir: "{app}\\installer"', self.iss)
+        preflight = runtime.index("installer\\runtime-preflight.py')")
+        self.assertLess(runtime.index("requirements-windows.txt"), preflight)
+        self.assertLess(preflight, runtime.index("firewall.ps1"))
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam runtime preflight failed", runtime)
+
+    def test_failures_reach_the_setup_log(self):
+        self.assertIn("ExecAndLogOutput(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode, nil)", self.iss)
+
+
+class PreflightTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("runtime_preflight", WIN / "runtime-preflight.py")
+        self.preflight = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.preflight)
+
+    def test_covers_what_main_imports_at_startup(self):
+        self.assertTrue({"torch", "cv2", "ultralytics", "fastapi", "uvicorn"} <= set(self.preflight.REQUIRED_MODULES))
+
+    def test_passes_when_everything_loads(self):
+        self.assertEqual(self.preflight.check(("json", "sqlite3")), [])
+
+    def test_reports_each_module_that_fails(self):
+        failures = self.preflight.check(("json", "anyaicam_missing_module_xyz"))
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0].startswith("anyaicam_missing_module_xyz: ModuleNotFoundError"))
+
+    def test_a_dll_load_error_is_a_failure_not_a_crash(self):
+        def broken(name):
+            raise OSError("[WinError 126] The specified module could not be found. Error loading c10.dll")
+        with mock.patch.object(self.preflight.importlib, "import_module", broken):
+            failures = self.preflight.check(("torch",))
+        self.assertEqual(failures, ["torch: OSError: [WinError 126] The specified module could not be found. Error loading c10.dll"])
+
+    def test_exits_nonzero_and_names_the_failure(self):
+        script = ("import importlib.util,sys;"
+                  f"s=importlib.util.spec_from_file_location('p',r'{WIN / 'runtime-preflight.py'}');"
+                  "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+                  "m.REQUIRED_MODULES=('anyaicam_missing_module_xyz',);sys.exit(m.main())")
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("AnyAiCam runtime preflight FAILED", result.stdout)
+        self.assertIn("anyaicam_missing_module_xyz", result.stdout)
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is required")

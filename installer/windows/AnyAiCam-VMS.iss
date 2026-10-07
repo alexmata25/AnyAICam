@@ -49,6 +49,7 @@ Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignorever
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
 Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
@@ -56,6 +57,10 @@ Source: "vendor\get-pip.py"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\wheels\*"; DestDir: "{tmp}\wheels"; Flags: deleteafterinstall recursesubdirs createallsubdirs
 Source: "vendor\ffmpeg-8.1.2-essentials_build.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\mediamtx_v1.21.0_windows_amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; Microsoft Visual C++ 2015-2022 runtime (x64): torch/cv2 DLLs need it and a
+; clean Windows does not have it. Installed before the Python runtime; left in
+; place on uninstall (a shared system component other programs may use).
+Source: "vendor\vc_redist.x64-14.44.35211.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 [Icons]
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
@@ -71,12 +76,38 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -N
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+var VcRuntimeNeedsRestart: Boolean;
+
 procedure ExecRequired(const FileName, Parameters, Description: String);
 var ResultCode: Integer;
 begin
   WizardForm.StatusLabel.Caption := Description;
-  if (not Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+  // Output goes to the setup log, so a failure there can be diagnosed.
+  if (not ExecAndLogOutput(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode, nil)) or (ResultCode <> 0) then
     RaiseException(Description + ' failed with exit code ' + IntToStr(ResultCode) + '.');
+end;
+
+// Microsoft's documented results: 0 installed, 1638 this or a newer version is
+// already installed, 3010 installed but Windows must restart to finish. Any
+// other result is a real failure and stops the setup before the service exists.
+procedure InstallVcRuntime;
+var ResultCode: Integer;
+begin
+  WizardForm.StatusLabel.Caption := 'Installing the Microsoft Visual C++ runtime...';
+  if not Exec(ExpandConstant('{tmp}\vc_redist.x64-14.44.35211.exe'), '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    RaiseException('Could not start the Microsoft Visual C++ runtime installer: ' + SysErrorMessage(ResultCode));
+  Log('Microsoft Visual C++ runtime installer exit code: ' + IntToStr(ResultCode));
+  case ResultCode of
+    0, 1638: ;
+    3010: VcRuntimeNeedsRestart := True;
+  else
+    RaiseException('Installing the Microsoft Visual C++ runtime failed with exit code ' + IntToStr(ResultCode) + '.');
+  end;
+end;
+
+function NeedRestart(): Boolean;
+begin
+  Result := VcRuntimeNeedsRestart;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -98,6 +129,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    // Order matters: VC++ runtime, then the Python runtime and its preflight
+    // (install-runtime.ps1), and only then the service.
+    InstallVcRuntime;
     ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -AppVersion "{#AppVersion}"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');

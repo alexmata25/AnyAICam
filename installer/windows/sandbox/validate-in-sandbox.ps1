@@ -36,6 +36,18 @@ $expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+)-') 
 # ---------------------------------------------------------------- install
 $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru
 Check 'silent install exit code 0' { if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
+# 2026-10-07: the first Sandbox run found torch's DLLs need the Visual C++
+# runtime, which a clean Windows lacks; setup now installs it and preflights.
+$installLog = Get-Content (Join-Path $results 'setup-install.log') -ErrorAction SilentlyContinue
+Check 'Visual C++ runtime installer succeeded (setup log)' { $line = $installLog | Where-Object { $_ -match 'Visual C\+\+ runtime installer exit code: (\d+)' } | Select-Object -Last 1; if (-not $line) { throw 'no exit code in setup log' }; $code = [int]([regex]::Match($line, 'exit code: (\d+)').Groups[1].Value); if ($code -notin 0, 1638, 3010) { throw "exit $code" }; "exit $code" }
+Check 'Visual C++ x64 runtime registered' { $r = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction Stop; if ($r.Installed -ne 1) { throw 'Installed is not 1' }; "version $($r.Version)" }
+Check 'setup ran the runtime preflight and it passed (setup log)' { $line = $installLog | Where-Object { $_ -match 'AnyAiCam runtime preflight passed' } | Select-Object -First 1; if (-not $line) { throw 'no preflight pass line in setup log' }; $line.Substring($line.IndexOf('AnyAiCam runtime')) }
+Check 'bundled Python loads torch, cv2, ultralytics (preflight)' {
+    $python = Join-Path $env:ProgramFiles 'AnyAiCam\runtime\python\python.exe'
+    $out = & $python (Join-Path $env:ProgramFiles 'AnyAiCam\installer\runtime-preflight.py') 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE`: $out" }
+    $out.Trim()
+}
 $service = Get-Service -Name AnyAiCamVMS -ErrorAction SilentlyContinue
 Check 'service installed, automatic start' { if (-not $service) { throw 'no AnyAiCamVMS service' }; if ($service.StartType -ne 'Automatic') { throw "StartType $($service.StartType)" }; "StartType $($service.StartType)" }
 Check 'service running' { (Get-Service AnyAiCamVMS).Status -eq 'Running' }
@@ -98,6 +110,10 @@ Check 'uninstall exit code 0' { $uninstall.ExitCode -eq 0 }
 Check 'uninstall removes the service' { -not (Get-Service AnyAiCamVMS -ErrorAction SilentlyContinue) }
 Check 'uninstall removes the firewall rules' { @(Get-NetFirewallRule -Group 'AnyAiCam VMS' -ErrorAction SilentlyContinue).Count -eq 0 }
 Check 'uninstall keeps customer data' { Test-Path (Join-Path $data 'database\partner_portal.db') }
+
+# The service logs (kept after uninstall) for diagnosis. The data folder is
+# SYSTEM/Administrators-only, so copy in backup mode.
+& robocopy.exe (Join-Path $data 'logs') (Join-Path $results 'service-logs') *.log /B /R:0 /W:0 /NP /NJH /NJS | Out-Null
 
 $failed = @($checks | Where-Object { -not $_.ok }).Count
 $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')

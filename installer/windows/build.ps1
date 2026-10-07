@@ -22,12 +22,17 @@ $pinned = [ordered]@{
     'WinSW-x64.exe'                         = '05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da'
     'ffmpeg-8.1.2-essentials_build.zip'     = 'db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec'
     'mediamtx_v1.21.0_windows_amd64.zip'    = '8a58a9b8c25ee99a96c23dc0a17f39ace3072c01d2e148329073c64ddf83493d'
+    'vc_redist.x64-14.44.35211.exe'         = 'cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b'
 }
 foreach ($file in $pinned.Keys) {
     $path = Join-Path $vendor $file
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing vendor file: $file" }
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() -ne $pinned[$file]) { throw "Vendor checksum failed: $file" }
 }
+# The Visual C++ runtime installer runs elevated on customer machines: besides
+# its pin it must carry Microsoft's valid Authenticode signature.
+$vcRedist = Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor 'vc_redist.x64-14.44.35211.exe')
+if ($vcRedist.Status -ne 'Valid' -or $vcRedist.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { throw 'vc_redist.x64-14.44.35211.exe is not validly signed by Microsoft Corporation.' }
 $wheelRoot = Join-Path $vendor 'wheels'
 foreach ($line in Get-Content (Join-Path $PSScriptRoot 'wheels.lock.sha256')) {
     $parts = $line -split '  ', 2
