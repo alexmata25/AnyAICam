@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
+import runtime_paths
 
 
 def _bool(name, default=False):
@@ -89,7 +90,7 @@ class Settings:
     database_url: str = os.getenv("ANYAICAM_DATABASE_URL", "")
     sqlite_path: str = os.getenv(
         "ANYAICAM_PARTNER_DB",
-        "/app/recordings/partner_portal.db",
+        runtime_paths.recordings_default("partner_portal.db"),
     )
     public_portal_url: str = os.getenv(
         "ANYAICAM_PUBLIC_PORTAL_URL",
@@ -170,7 +171,7 @@ class Settings:
     storage_backend: str = os.getenv("ANYAICAM_STORAGE_BACKEND", "local").lower()
     local_storage_root: str = os.getenv(
         "ANYAICAM_LOCAL_STORAGE_ROOT",
-        "/app/recordings/storage",
+        runtime_paths.recordings_default("storage"),
     )
     s3_endpoint: str = os.getenv("ANYAICAM_S3_ENDPOINT", "")
     s3_bucket: str = os.getenv("ANYAICAM_S3_BUCKET", "")
@@ -178,7 +179,7 @@ class Settings:
     email_backend: str = os.getenv("ANYAICAM_EMAIL_BACKEND", "preview").lower()
     email_preview_dir: str = os.getenv(
         "ANYAICAM_EMAIL_PREVIEW_DIR",
-        "/app/recordings/email-preview",
+        runtime_paths.recordings_default("email-preview"),
     )
     smtp_host: str = os.getenv("ANYAICAM_SMTP_HOST", "")
     smtp_port: int = _int("ANYAICAM_SMTP_PORT", 587)
@@ -198,7 +199,7 @@ class Settings:
     sms_backend: str = os.getenv("ANYAICAM_SMS_BACKEND", "preview").lower()
     sms_preview_dir: str = os.getenv(
         "ANYAICAM_SMS_PREVIEW_DIR",
-        "/app/recordings/sms-preview",
+        runtime_paths.recordings_default("sms-preview"),
     )
     twilio_account_sid: str = os.getenv("ANYAICAM_TWILIO_ACCOUNT_SID", "")
     twilio_auth_token: str = os.getenv("ANYAICAM_TWILIO_AUTH_TOKEN", "")

@@ -11,8 +11,9 @@ from html import escape
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+import runtime_paths
 
-DATA_FILE = Path('/app/recordings/account_management.json')
+DATA_FILE = runtime_paths.recordings_path('account_management.json')
 
 
 class Site(BaseModel):

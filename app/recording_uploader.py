@@ -88,6 +88,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import runtime_paths
 
 try:
     import boto3
@@ -157,7 +158,7 @@ AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "
 # RECORDINGS_FOLDER is intentionally hardcoded, matching main.py's own
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
 # start_recording() actually writes, not be independently configurable.
-RECORDINGS_FOLDER = Path("/app/recordings")
+RECORDINGS_FOLDER = runtime_paths.RECORDINGS_ROOT
 # The same file main.py's store_motion_event() already writes to
 # (MotionEventModel JSON lines: id/camera/start_time/end_time/...),
 # read-only here -- never written or modified by this module.

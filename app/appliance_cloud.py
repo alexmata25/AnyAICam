@@ -22,6 +22,7 @@ from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
 from event_media_policy import allows_event_media
 import product_mode
+import runtime_paths
 
 try:
     import boto3
@@ -51,7 +52,7 @@ LIVE_RELAY_ENABLED=os.getenv('ANYAICAM_LIVE_RELAY_ENABLED','false').strip().lowe
 LIVE_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_LIVE_UPLOAD_ROLE_ARN','').strip()
 LIVE_RELAY_S3_BUCKET=os.getenv('ANYAICAM_S3_BUCKET','').strip()
 LIVE_RELAY_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).strip()
-live_manifest_store=LiveManifestStore(Path(os.getenv('ANYAICAM_LIVE_MANIFEST_FILE','/app/recordings/live_manifest.json')))
+live_manifest_store=LiveManifestStore(Path(os.getenv('ANYAICAM_LIVE_MANIFEST_FILE',runtime_paths.recordings_default('live_manifest.json'))))
 # R1 (recording-pipeline roadmap): independent flag/role/bucket from live
 # relay, deliberately not defaulted to the live bucket/role -- see
 # docs/r1-recording-iam.md (its "designed, not yet applied" framing is

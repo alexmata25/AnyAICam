@@ -7,8 +7,9 @@ from typing import Callable
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
+import runtime_paths
 
-RECORDINGS_FOLDER = Path("/app/recordings")
+RECORDINGS_FOLDER = runtime_paths.RECORDINGS_ROOT
 ENROLLMENTS_FILE = RECORDINGS_FOLDER / "mobile_push_enrollments.json"
 
 

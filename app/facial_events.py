@@ -52,10 +52,11 @@ import facial_people
 import facial_recognition
 import relay_control
 from database_backend import backend
+import runtime_paths
 
 logger = logging.getLogger("anyaicam.facial_events")
 
-AAC_THUMBNAIL_FOLDER = Path(os.environ.get("ANYAICAM_AAC_THUMBNAIL_FOLDER", "/app/recordings/aac_faces/events"))
+AAC_THUMBNAIL_FOLDER = Path(os.environ.get("ANYAICAM_AAC_THUMBNAIL_FOLDER", runtime_paths.recordings_default("aac_faces", "events")))
 
 ANALYTIC_KEY = "facial_recognition"
 

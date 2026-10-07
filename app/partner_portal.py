@@ -17,6 +17,7 @@ from partner_db import authenticate_detailed, audit, allowed, connection, create
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
+import runtime_paths
 
 SESSION_COOKIE = 'anyaicam_partner_session'
 SESSION_SECRETS = ([os.getenv('ANYAICAM_PORTAL_SECRET')] if os.getenv('ANYAICAM_PORTAL_SECRET') else settings.app_secrets) or [secrets.token_hex(32)]
@@ -26,7 +27,7 @@ try:
     PORTAL_ACCOUNTS = json.loads(os.getenv('ANYAICAM_PARTNER_ACCOUNTS', '{}'))
 except json.JSONDecodeError:
     PORTAL_ACCOUNTS = {}
-QUOTES_FILE = Path('/app/recordings/partner_quotes.json')
+QUOTES_FILE = runtime_paths.recordings_path('partner_quotes.json')
 PARTNER_ROLES = {'administrator', 'partner_owner', 'salesperson', 'technician'}
 AUTH_ROLES = PARTNER_ROLES | {'customer_owner', 'customer_viewer'}
 CUSTOMER_LOGIN_ROLES = {'customer_owner','customer_viewer','administrator'}

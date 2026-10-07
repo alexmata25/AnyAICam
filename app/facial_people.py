@@ -37,8 +37,9 @@ import json
 import os
 import secrets
 from pathlib import Path
+import runtime_paths
 
-AAC_FACES_FOLDER = Path(os.environ.get("ANYAICAM_AAC_FACES_FOLDER", "/app/recordings/aac_faces"))
+AAC_FACES_FOLDER = Path(os.environ.get("ANYAICAM_AAC_FACES_FOLDER", runtime_paths.recordings_default("aac_faces")))
 
 VALID_WATCHLIST_CLASSIFICATIONS = frozenset({"alert", "allow"})
 VALID_PERSON_STATUSES = frozenset({"active", "disabled"})

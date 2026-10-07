@@ -2,8 +2,9 @@ import json
 import math
 from copy import deepcopy
 from pathlib import Path
+import runtime_paths
 
-CONFIG_FILE = Path('/app/recordings/pricing_config.json')
+CONFIG_FILE = runtime_paths.recordings_path('pricing_config.json')
 
 DEFAULT_PRICING = {
     'version': 2,

@@ -17,9 +17,10 @@ from appliance_protocol import encrypt_camera_credentials
 from partner_db import audit, authorize_appliance_tenant, authorize_customer_tenant, connection, password_hash, require_permission, row, rows, verify_password
 from email_service import get_email_service
 from provisioning_service import get_provisioning_backend, ProvisioningBackendUnavailable
+import runtime_paths
 
-CUSTOMERS_FILE = Path('/app/recordings/partner_customers.json')
-ACCOUNT_FILE = Path('/app/recordings/account_management.json')
+CUSTOMERS_FILE = runtime_paths.recordings_path('partner_customers.json')
+ACCOUNT_FILE = runtime_paths.recordings_path('account_management.json')
 STATUSES = {'active', 'pending_installation', 'trial', 'suspended', 'cancelled'}
 
 

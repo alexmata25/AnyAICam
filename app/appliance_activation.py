@@ -44,8 +44,9 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+import runtime_paths
 
-ACTIVATION_IDENTITY_FILE = Path(os.getenv("ANYAICAM_APPLIANCE_IDENTITY_FILE", "/app/recordings/appliance_identity.json"))
+ACTIVATION_IDENTITY_FILE = Path(os.getenv("ANYAICAM_APPLIANCE_IDENTITY_FILE", runtime_paths.recordings_default("appliance_identity.json")))
 
 _REQUIRED_FIELDS = {"appliance_id", "cloud_id", "credential", "customer_id", "site_id", "partner_id", "activated_at", "activation_version"}
 

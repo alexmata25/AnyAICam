@@ -65,6 +65,7 @@ from datetime import datetime
 from pathlib import Path
 
 import product_mode
+import runtime_paths
 
 logger = logging.getLogger("anyaicam.analytics_sync")
 
@@ -102,7 +103,7 @@ SYNC_STATE_FILE = Path(os.environ.get("ANYAICAM_ANALYTICS_SYNC_STATE_FILE", "/op
 # where save_yolo_events()/append_analytics_event() actually write, not be
 # independently configurable. Still overridable via env var purely for
 # tests, matching every other file-location constant in this codebase.
-RECORDINGS_FOLDER = Path("/app/recordings")
+RECORDINGS_FOLDER = runtime_paths.RECORDINGS_ROOT
 ANALYTICS_EVENTS_FILE = Path(os.environ.get("ANYAICAM_ANALYTICS_EVENTS_FILE", str(RECORDINGS_FOLDER / "analytics_events.json")))
 SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_ANALYTICS_SYNC_SCAN_SECONDS", "30.0")))
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_ANALYTICS_SYNC_CONFIG_REFRESH_SECONDS", "300.0")))

@@ -9,8 +9,9 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from database_backend import backend,connect as database_connect,target_key as database_target_key
+import runtime_paths
 
-DB_FILE = Path(os.getenv('ANYAICAM_PARTNER_DB', '/app/recordings/partner_portal.db'))
+DB_FILE = Path(os.getenv('ANYAICAM_PARTNER_DB', runtime_paths.recordings_default('partner_portal.db')))
 REAL_SOURCE = 'real'
 DEMO_SOURCE = 'demo'
 

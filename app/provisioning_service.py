@@ -98,6 +98,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
+import runtime_paths
 
 
 class ProvisioningBackendUnavailable(Exception):
@@ -137,7 +138,7 @@ class MockProvisioningBackend(ProvisioningBackend):
 
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path) if path is not None else Path(
-            os.environ.get("ANYAICAM_MOCK_PROVISIONING_PATH", "/app/recordings/mock_aws_provisioning.json")
+            os.environ.get("ANYAICAM_MOCK_PROVISIONING_PATH", runtime_paths.recordings_default("mock_aws_provisioning.json"))
         )
         self._lock = threading.Lock()
 

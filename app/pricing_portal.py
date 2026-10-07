@@ -8,9 +8,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from pricing_config import calculate_quote, load_pricing, public_pricing, save_pricing
+import runtime_paths
 
-ACCOUNT_FILE = Path('/app/recordings/account_management.json')
-QUOTES_FILE = Path('/app/recordings/customer_quotes.json')
+ACCOUNT_FILE = runtime_paths.recordings_path('account_management.json')
+QUOTES_FILE = runtime_paths.recordings_path('customer_quotes.json')
 
 
 def _read(path: Path, fallback):

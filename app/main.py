@@ -89,6 +89,7 @@ import os
 
 
 import re
+import runtime_paths
 
 
 ANALYTICS_FEATURES = [
@@ -550,7 +551,7 @@ except ImportError:
 
 
 
-STATIC_FOLDER = Path("/app/static")
+STATIC_FOLDER = runtime_paths.STATIC_ROOT
 
 HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).parent / "static" / "hls") if os.name == "nt" else "/app/static/hls"))
 
@@ -565,7 +566,7 @@ HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
 
 
 
-RECORDINGS_FOLDER = Path("/app/recordings")
+RECORDINGS_FOLDER = runtime_paths.RECORDINGS_ROOT
 
 
 
@@ -41819,7 +41820,7 @@ if cloud_settings.deployed:
 
 
 
-app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_FOLDER)), name="static")
 
 
 
@@ -41831,7 +41832,7 @@ app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 # Only recorded media, never the app data that shares /app/recordings
 # (recordings_guard.py, 2026-10-01 security fix).
 from recordings_guard import RecordingsStaticFiles
-app.mount("/recordings", RecordingsStaticFiles(directory="/app/recordings"), name="recordings")
+app.mount("/recordings", RecordingsStaticFiles(directory=str(RECORDINGS_FOLDER)), name="recordings")
 
 
 
