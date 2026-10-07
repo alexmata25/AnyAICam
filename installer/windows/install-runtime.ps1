@@ -7,7 +7,10 @@ param(
     [Parameter(Mandatory=$true)][string]$WheelRoot,
     [Parameter(Mandatory=$true)][string]$FFmpegArchive,
     [Parameter(Mandatory=$true)][string]$MediaMtxArchive,
-    [Parameter(Mandatory=$true)][string]$AppVersion
+    [Parameter(Mandatory=$true)][string]$AppVersion,
+    # Setup's /PortalUrl=https://... (empty: keep the saved one, else the
+    # AnyAiCam cloud); checked by cloud-link.ps1 before anything is written.
+    [string]$PortalUrl = ''
 )
 $ErrorActionPreference = 'Stop'
 $pythonRoot = Join-Path $InstallRoot 'runtime\python'
@@ -31,6 +34,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
 # if anything fails to load (the setup log has the preflight's output).
 & $python (Join-Path $InstallRoot 'installer\runtime-preflight.py')
 if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam runtime preflight failed: the bundled Python cannot load the VMS packages.' }
+# The cloud agent (2026-10-07) must load too, before its service exists.
+& $python -c "import sys; sys.path.insert(0, sys.argv[1]); import anyaicam_agent.service, anyaicam_agent.windows; print('AnyAiCam agent preflight passed')" (Join-Path $InstallRoot 'agent')
+if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam agent preflight failed: the bundled Python cannot load the cloud agent.' }
 
 $ffmpegRoot = Join-Path $InstallRoot 'runtime\tools\ffmpeg'
 if (-not (Test-Path (Join-Path $ffmpegRoot 'ffmpeg.exe'))) {
@@ -115,6 +121,10 @@ $values['ANYAICAM_VERSION'] = $AppVersion
 $content = @('# Managed by the AnyAiCam Windows installer. Persistent across repair and uninstall.')
 $content += $values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
 [IO.File]::WriteAllLines($environmentFile, $content, [Text.UTF8Encoding]::new($false))
+
+# Cloud linking (2026-10-07): appliance identity, claim code, cloud portal
+# and installed release for the agent service (see cloud-link.ps1).
+& (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
 
 # Local-network access to the VMS and live view (see firewall.ps1).
 & (Join-Path $InstallRoot 'installer\firewall.ps1') -Apply -InstallRoot $InstallRoot

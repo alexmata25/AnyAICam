@@ -8,6 +8,7 @@ import urllib.request
 from pathlib import Path
 
 from .config import load_wireguard_identity
+from . import windows
 
 # Local recording storage management (2026-09-17): the VMS app (a
 # separate, containerized process from this agent) publishes its own
@@ -19,6 +20,7 @@ VMS_LOCAL_URL = os.environ.get("ANYAICAM_VMS_LOCAL_URL", "http://127.0.0.1:8000"
 
 
 def _cpu_percent(sample=.15):
+    if windows.IS_WINDOWS: return windows.cpu_percent(sample)
     def read():
         values=[int(item) for item in Path('/proc/stat').read_text().splitlines()[0].split()[1:]]; return sum(values),values[3]+values[4]
     try:
@@ -27,6 +29,7 @@ def _cpu_percent(sample=.15):
 
 
 def _memory_percent():
+    if windows.IS_WINDOWS: return windows.memory_percent()
     try:
         values={line.split(':')[0]:int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines()}; return round(100*(1-values.get('MemAvailable',0)/max(1,values['MemTotal'])),1)
     except (OSError,ValueError,KeyError): return 0.0
@@ -109,4 +112,4 @@ def collect(config,cameras):
     # Software Update (2026-10-03): the installed VMS release ('1.2.0+<build12>')
     # from the root-written release marker, not the agent's fixed placeholder.
     from .updater.owner_update import installed_release_label
-    return {'software_version':installed_release_label(config),'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),**local_storage_state(config),**wireguard_state(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}
+    return {'software_version':installed_release_label(config),'uptime_seconds':windows.uptime_seconds() if windows.IS_WINDOWS else int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),**local_storage_state(config),**wireguard_state(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}

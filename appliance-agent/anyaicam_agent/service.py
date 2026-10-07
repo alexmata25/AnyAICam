@@ -28,6 +28,7 @@ from .updater.restart import make_restart_signal
 from .updater.s3_source import make_manifest_source
 from .updater.owner_update import OwnerUpdate, installed_release
 from .updater.apply_results import ResultRelay
+from . import windows
 
 # How often run()'s pre-activation wait re-checks for a real credential.
 # Deliberately a short, fixed interval, not config.checkin_seconds (a
@@ -74,6 +75,10 @@ class ApplianceAgent:
         self.available_update=None  # what the periodic check found; applied only by an owner-confirmed action
         self._next_entitlement_check_at=0.0
     def resolve_update_state(self):
+        # Windows (windows.py): no Linux release channel and no root applier;
+        # updates arrive as a new signed setup. The same applies to the
+        # periodic check and the result relay below.
+        if windows.IS_WINDOWS: return
         # RDM-2 Groups 2A/2E: runs once at startup, before any command
         # processing -- per UpdateStateMachine.resume_if_pending()'s own
         # documented call-order requirement (resume_if_pending() first,
@@ -113,6 +118,7 @@ class ApplianceAgent:
         marker={'type':action_type,'command_id':str(payload.get('update_id') or uuid.uuid4().hex),'requested_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
         atomic_write_json(self.config.pending_actions_dir/f'{action_type}.json',marker)
     def relay_update_results(self):
+        if windows.IS_WINDOWS: return
         try:
             self.result_relay.poll()
         except Exception:
@@ -151,6 +157,7 @@ class ApplianceAgent:
             self.queue.put(key,'POST',path,sanitize(payload))
             self.log.warning('Queued offline update result report update_id=%s state=%s error=%s',result.update_id,result.state.value,error)
     def check_for_source_update(self):
+        if windows.IS_WINDOWS: return
         # RDM-2 Group 2G: the periodic PULL path, on its own slow cadence
         # (config.update_check_interval_seconds, default 900s). Since
         # 2026-10-02 it only CHECKS (UpdateStateMachine.check_available());
@@ -470,7 +477,9 @@ class ApplianceAgent:
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
     def publish_lan_addresses(self):
         """Host LAN addresses for WebRTC ICE (see lan_addresses.py) --
-        best-effort, never allowed to break the agent cycle."""
+        best-effort, never allowed to break the agent cycle. Not on Windows:
+        the VMS runs natively there and MediaMTX sees the PC's own addresses."""
+        if windows.IS_WINDOWS: return
         try: publish_lan_addresses(self.config.state_dir)
         except Exception: self.log.debug('LAN address publish failed', exc_info=True)
     def cycle(self):

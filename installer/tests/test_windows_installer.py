@@ -190,7 +190,11 @@ class VcRuntimeTests(unittest.TestCase):
 
     def test_redistributable_is_bundled_offline_and_signature_checked(self):
         self.assertIn(f'Source: "vendor\\{self.REDIST}"; DestDir: "{{tmp}}"; Flags: deleteafterinstall', self.iss)
-        self.assertNotRegex(self.iss.lower(), r"https?://(?!127\.0\.0\.1)")
+        # Offline: nothing is downloaded during a customer install.
+        for download in ("downloadtemporaryfile", "createdownloadpage", "idpadd", "invoke-webrequest", "bitsadmin"):
+            self.assertNotIn(download, self.iss.lower())
+        files = self.iss.split("[Files]", 1)[1].split("\n[", 1)[0]
+        self.assertNotRegex(files.lower(), r"https?://")
         self.assertIn(f"Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor '{self.REDIST}')", self.build)
         self.assertIn("'^CN=Microsoft Corporation,'", self.build)
         # The hash check loop runs before the signature check.
@@ -265,6 +269,72 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("AnyAiCam runtime preflight FAILED", result.stdout)
         self.assertIn("anyaicam_missing_module_xyz", result.stdout)
+
+
+class CloudAgentServiceTests(unittest.TestCase):
+    """2026-10-07: the cloud agent (appliance-agent) runs as AnyAiCamAgent next
+    to AnyAiCamVMS and links the PC with the installer's claim code."""
+
+    def setUp(self):
+        self.iss = read("AnyAiCam-VMS.iss")
+        self.runtime = read("install-runtime.ps1")
+
+    def test_agent_package_and_service_files_are_shipped(self):
+        self.assertIn('Source: "..\\..\\appliance-agent\\anyaicam_agent\\*"; DestDir: "{app}\\agent\\anyaicam_agent"; Excludes: "__pycache__\\*"', self.iss)
+        for line in ('Source: "agent-main.py"; DestDir: "{app}\\agent"', 'Source: "agent-launcher.ps1"; DestDir: "{app}\\service"',
+                     'Source: "AnyAiCamAgent.xml"; DestDir: "{app}\\service"', 'Source: "cloud-link.ps1"; DestDir: "{app}\\installer"',
+                     'Source: "vendor\\WinSW-x64.exe"; DestDir: "{app}\\service"; DestName: "AnyAiCamAgent.exe"'):
+            self.assertIn(line, self.iss)
+        self.assertIn('Type: filesandordirs; Name: "{app}\\agent"', self.iss.split("[InstallDelete]", 1)[1].split("[Files]", 1)[0])
+        for folder in ("agent", "label"):
+            self.assertIn(f'Name: "{{commonappdata}}\\AnyAiCam\\{folder}"; Flags: uninsneveruninstall', self.iss)
+
+    def test_agent_service_starts_after_the_vms_and_is_removed_before_it(self):
+        steps = self.iss.split("procedure CurStepChanged", 1)[1]
+        order = [steps.index(s) for s in ("'start', 'Starting the AnyAiCam Windows service", "AnyAiCamAgent.exe'), 'install'", "AnyAiCamAgent.exe'), 'start'")]
+        self.assertEqual(order, sorted(order))
+        self.assertLess(steps.index("AnyAiCamAgent.exe'), 'start'"), steps.index("  except\n"))  # a failure still exits 20
+        prepare = self.iss.split("function PrepareToInstall", 1)[1].split("end;\n\n", 1)[0]
+        self.assertLess(prepare.index("AnyAiCamAgent.exe"), prepare.index("AnyAiCamVMS.exe"))
+        uninstall = self.iss.split("[UninstallRun]", 1)[1].split("[UninstallDelete]", 1)[0]
+        self.assertLess(uninstall.index('AnyAiCamAgent.exe"; Parameters: "uninstall"'), uninstall.index('AnyAiCamVMS.exe"; Parameters: "stop"'))
+
+    def test_agent_service_definition(self):
+        xml = read("AnyAiCamAgent.xml")
+        self.assertIn("<startmode>Automatic</startmode>", xml)
+        self.assertIn('<onfailure action="restart"', xml)
+        self.assertIn('agent-launcher.ps1', xml)
+        # No dependency on AnyAiCamVMS: restarting the VMS on the cloud's
+        # request would otherwise stop the agent that asked for it.
+        self.assertNotIn("<depend>", xml)
+
+    def test_launcher_uses_the_vms_folders_and_its_own_python(self):
+        launcher = read("agent-launcher.ps1")
+        for line in ("$env:ANYAICAM_CONFIG_DIR = $config", "$env:ANYAICAM_STATE_DIR = Join-Path $dataRoot 'agent'",
+                     "$env:ANYAICAM_VMS_RECORDINGS_PATH = Join-Path $dataRoot 'recordings'", "$env:ANYAICAM_VMS_HLS_PATH = Join-Path $dataRoot 'hls'",
+                     "$env:ANYAICAM_VMS_RELEASE_MARKER = Join-Path $config 'vms_release.json'",
+                     "& (Join-Path $installRoot 'runtime\\python\\python.exe') (Join-Path $installRoot 'agent\\agent-main.py')"):
+            self.assertIn(line, launcher)
+        self.assertIn("@('ANYAICAM_PORTAL_URL', 'ANYAICAM_AGENT_MODE')", launcher)  # only these keys from agent.env
+
+    def test_cloud_link_and_agent_preflight_run_before_any_service(self):
+        self.assertIn("-PortalUrl \"' + ExpandConstant('{param:PortalUrl|}') + '\"'", self.iss)
+        agent_preflight = self.runtime.index("import anyaicam_agent.service, anyaicam_agent.windows")
+        self.assertLess(self.runtime.index("installer\\runtime-preflight.py')"), agent_preflight)
+        self.assertIn("throw 'AnyAiCam agent preflight failed", self.runtime)
+        cloud_link = self.runtime.index("installer\\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl")
+        self.assertLess(self.runtime.index("[IO.File]::WriteAllLines($environmentFile"), cloud_link)
+        self.assertLess(cloud_link, self.runtime.index("installer\\firewall.ps1') -Apply"))
+
+    def test_claim_code_is_shown_but_never_logged(self):
+        code = self.iss.split("// ------------------------------------------------------------ claim code", 1)[1]
+        self.assertNotIn("Log(", code)
+        self.assertIn("WizardForm.FinishedLabel.Caption", code)
+        self.assertIn('Filename: "{code:ClaimLink}"; Description: "Link this computer to my AnyAiCam account"; Flags: postinstall shellexec skipifsilent; Check: HasClaimLink', self.iss)
+        self.assertIn("-Verb RunAs -ArgumentList '{commonappdata}\\AnyAiCam\\label\\claim-label.txt'", self.iss)
+        link = read("cloud-link.ps1")
+        for statement in ("Write-Host", "Write-Output $code", "Write-Verbose"):
+            self.assertNotIn(statement, link)
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is required")

@@ -9,9 +9,12 @@ import uuid
 from pathlib import Path
 from xml.etree import ElementTree
 
+from . import windows
+
 
 def local_networks(configured=None):
     if configured: return [ipaddress.ip_network(item,strict=False) for item in configured]
+    if windows.IS_WINDOWS: return windows.private_networks()
     try:
         result=subprocess.run(['ip','-j','-4','addr','show','scope','global'],capture_output=True,text=True,timeout=5,check=True); data=json.loads(result.stdout); networks=[]
         for interface in data:
@@ -23,6 +26,7 @@ def local_networks(configured=None):
 
 
 def arp_table():
+    if windows.IS_WINDOWS: return windows.arp_table()
     output={}
     try:
         for line in Path('/proc/net/arp').read_text().splitlines()[1:]:

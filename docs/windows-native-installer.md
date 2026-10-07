@@ -50,7 +50,7 @@ workstation (which also runs the old 0.1.3 service on port 8000). In Sandbox:
 
 ## Not in this branch
 
-* The appliance agent / cloud claim on Windows (the agent uses systemd and a
-  root helper; needs a Windows service adapter — next slice).
+* The appliance agent / cloud claim on Windows — added by the cloud-linking
+  slice, see `docs/windows-cloud-linking.md`.
 * Authenticode signing (owner's Azure Artifact Signing sign-in; `build.ps1 -AzureSign`).
 * Publishing an `.exe` through the customer download catalog (Ubuntu `.tar.gz` only today).

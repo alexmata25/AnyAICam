@@ -16,6 +16,7 @@ from .discovery import scan
 from .portal import PortalClient,PortalError
 from .reenrollment import ReenrollmentError,coordinated_reenroll,first_enroll
 from .wireguard import enroll_wireguard
+from . import windows
 
 
 def _upsert_vms_env_key(config:AgentConfig,key:str,value:str) -> None:
@@ -80,6 +81,10 @@ def _finish_enrollment(config:AgentConfig,activated:dict,ask_discovery:bool=True
     depends on this restart succeeding, so failing enrollment over it
     would reject a genuinely successful activation for no reason."""
     def restart_service():
+        # Windows: the restart would run at once (no watcher in between) and
+        # could cut off the vms.env update and VMS restart below; the running
+        # service picks up the new credential itself (_await_activation).
+        if windows.IS_WINDOWS: return
         status,_,error=_queue_privileged_action(config,'restart_agent',{'confirmed':True})
         if status!='completed':
             print(f'WARNING: could not queue an anyaicam-agent restart automatically ({error}); the service will pick up the new credential on its own within about 10 seconds -- no manual action needed.')

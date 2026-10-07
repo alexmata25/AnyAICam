@@ -14,6 +14,12 @@ and ACLs there never touches the host.
    `results\report.json` and the setup logs; `results\DONE` appears at the end.
 4. Close the Sandbox window.
 
+Cloud linking (2026-10-07) is checked against `test-cloud.py`, a disposable
+cloud started inside the Sandbox (the installed app's real claim and appliance
+routes, fresh database, HTTPS with a throwaway CA). The setup is run with
+`/PortalUrl=https://cloud.anyaicam.test:8443`, and `app.anyaicam.com` is pointed
+at the Sandbox itself, so the production cloud is never contacted.
+
 Not covered automatically (needs a person / a camera): adding a real camera,
 live view in a browser on another device, a recording and its playback, and a
 reboot of the Sandbox VM.

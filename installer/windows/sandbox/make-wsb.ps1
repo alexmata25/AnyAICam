@@ -15,6 +15,8 @@ $root = New-Item -ItemType Directory -Path $Folder
 foreach ($sub in 'setup', 'results', 'scripts') { New-Item -ItemType Directory -Path (Join-Path $root.FullName $sub) | Out-Null }
 Copy-Item -LiteralPath $setupFile.FullName -Destination (Join-Path $root.FullName 'setup')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'validate-in-sandbox.ps1') -Destination (Join-Path $root.FullName 'scripts')
+# The disposable test cloud the cloud-linking checks claim against (never production).
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'test-cloud.py') -Destination (Join-Path $root.FullName 'scripts')
 $escape = { param($s) [Security.SecurityElement]::Escape($s) }
 $wsb = @"
 <Configuration>

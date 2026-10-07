@@ -13,6 +13,7 @@ from pathlib import Path
 from .camera_binding import atomic_write_json
 from .discovery import scan
 from .metrics import _cpu_percent, _memory_percent, disk_summary
+from . import windows
 
 ALLOWED={'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay','reboot_appliance','restart_vms'}
 
@@ -82,6 +83,9 @@ def _queue_privileged_action(config,action_type,payload):
     # confirmation-required command's own local re-check pattern.
     if not isinstance(payload,dict) or not payload.get('confirmed'):
         return 'failed',{},'Confirmation is required for this action.'
+    # Windows (2026-10-07): no root watcher exists; the agent service runs
+    # its fixed allowlist itself and refuses the rest (windows.py).
+    if windows.IS_WINDOWS: return windows.run_privileged_action(action_type)
     marker_id=uuid.uuid4().hex
     marker={'type':action_type,'command_id':marker_id,'requested_at':datetime.now(timezone.utc).isoformat()}
     try:
@@ -232,11 +236,15 @@ def execute(command,payload,config,stop_event=None,*,state_machine=None,update_r
     if command=='start_live_relay': return _set_relay_command(config,payload,True)
     if command=='stop_live_relay': return _set_relay_command(config,payload,False)
     if command=='restart_service':
+        # Windows: a clean exit would leave the service stopped (WinSW
+        # restarts only after a failure), so restart it through WinSW.
+        if windows.IS_WINDOWS: return windows.run_privileged_action('restart_agent')
         if stop_event: stop_event.set()
         return 'completed',{'restart_requested':True},''
     if command=='reboot_appliance': return _queue_privileged_action(config,'reboot',payload)
     if command=='restart_vms': return _queue_privileged_action(config,'restart_vms',payload)
     if command=='install_update':
+        if windows.IS_WINDOWS: return 'failed',{},windows.UPDATES_UNSUPPORTED
         # RDM-2 Group 2C: the startup/update interlock is checked BEFORE
         # any payload parsing -- cheaper, and it means a malformed
         # payload delivered while an interlock condition is active
