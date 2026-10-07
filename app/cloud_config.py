@@ -222,6 +222,18 @@ class Settings:
     def staging(self):
         return self.environment == "staging"
 
+    def shows_staging_banner(self, host):
+        """The STAGING ENVIRONMENT page banner (2026-10-07). The staging
+        deployment also answers on STAGING_SECONDARY_PUBLIC_HOST, the
+        address customers sign in at, and the banner must not appear there;
+        under any other host (portal-staging) it stays. Only the banner
+        follows the request host -- the environment, and everything it
+        drives (Stripe mode, database, trusted hosts), stays staging."""
+        if not self.staging:
+            return False
+        name = (host or "").strip().lower().split(":", 1)[0].rstrip(".")
+        return name != STAGING_SECONDARY_PUBLIC_HOST
+
     @property
     def deployed(self):
         return self.environment in {"staging", "production"}

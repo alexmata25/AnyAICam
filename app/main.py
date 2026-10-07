@@ -48585,7 +48585,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
                          f'<button type="submit" aria-label="Log out {escape(_email or _who, quote=True)} ({escape(_role_label, quote=True)})">'
                          f'Log out<span class="mobile-identity">{escape(_email or _who)} · {escape(_role_label)}</span></button></form>')
         mobile = mobile + mobile_logout
-    if cloud_settings.staging:
+    if cloud_settings.shows_staging_banner(request.headers.get("host") if request else None):
 
 
 
