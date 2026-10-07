@@ -297,7 +297,17 @@ class CloudAgentServiceTests(unittest.TestCase):
         prepare = self.iss.split("function PrepareToInstall", 1)[1].split("end;\n\n", 1)[0]
         self.assertLess(prepare.index("AnyAiCamAgent.exe"), prepare.index("AnyAiCamVMS.exe"))
         uninstall = self.iss.split("[UninstallRun]", 1)[1].split("[UninstallDelete]", 1)[0]
-        self.assertLess(uninstall.index('AnyAiCamAgent.exe"; Parameters: "uninstall"'), uninstall.index('AnyAiCamVMS.exe"; Parameters: "stop"'))
+        self.assertLess(uninstall.index('AnyAiCamAgent.exe"; Parameters: "uninstall"'), uninstall.index('AnyAiCamVMS.exe"; Parameters: "stopwait"'))
+
+    def test_services_are_stopped_with_stopwait_before_their_files_are_replaced(self):
+        # WinSW `stop` returns before the service stops; the 1.3.0-4a90e4c
+        # Sandbox reinstall aborted (exit 5) replacing a running AnyAiCamAgent.exe.
+        prepare = self.iss.split("function PrepareToInstall", 1)[1].split("end;\n\n", 1)[0]
+        uninstall = self.iss.split("[UninstallRun]", 1)[1].split("[UninstallDelete]", 1)[0]
+        self.assertEqual(prepare.count("'stopwait'"), 2)
+        self.assertNotIn("'stop'", prepare)
+        self.assertEqual(uninstall.count('Parameters: "stopwait"'), 2)
+        self.assertNotIn('Parameters: "stop"', uninstall)
 
     def test_agent_service_definition(self):
         xml = read("AnyAiCamAgent.xml")

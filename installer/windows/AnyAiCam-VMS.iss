@@ -85,9 +85,9 @@ Name: "{group}\Show AnyAiCam claim code"; Filename: "{sys}\WindowsPowerShell\v1.
 Filename: "{code:ClaimLink}"; Description: "Link this computer to my AnyAiCam account"; Flags: postinstall shellexec skipifsilent; Check: HasClaimLink
 Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: postinstall shellexec skipifsilent unchecked
 [UninstallRun]
-Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamAgent"
+Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamAgent"
 Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamAgent"
-Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVMS"
+Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVMS"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -Command ""Start-Sleep -Seconds 3"""; Flags: runhidden waituntilterminated; RunOnceId: "WaitForAnyAiCamVMS"
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamVMS"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\firewall.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAnyAiCamFirewall"
@@ -139,16 +139,20 @@ begin
   // The agent talks to the VMS: stop and remove it first. (No service
   // dependency: the agent restarts the VMS on request, and stopping a
   // service stops its dependents -- the agent itself.)
+  // `stopwait`, not `stop`: WinSW's `stop` returns before the service has
+  // stopped, and a still-running wrapper cannot be replaced -- the Sandbox
+  // reinstall of 1.3.0-4a90e4c aborted on AnyAiCamAgent.exe (exit 5).
   ServiceExecutable := ExpandConstant('{app}\service\AnyAiCamAgent.exe');
   if FileExists(ServiceExecutable) then
   begin
-    Exec(ServiceExecutable, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ServiceExecutable, 'stopwait', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(2000);
     Exec(ServiceExecutable, 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
   ServiceExecutable := ExpandConstant('{app}\service\AnyAiCamVMS.exe');
   if FileExists(ServiceExecutable) then
   begin
-    Exec(ServiceExecutable, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ServiceExecutable, 'stopwait', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(3000);
     Exec(ServiceExecutable, 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;

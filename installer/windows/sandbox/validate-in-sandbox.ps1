@@ -300,9 +300,13 @@ Copy-Item -LiteralPath $envBackup -Destination $envFile -Force
 $credential = [string](Get-Content -Raw (Join-Path $agentState 'credential.json') | ConvertFrom-Json).credential
 if ($testCloud -and -not $testCloud.HasExited) { Stop-Process -Id $testCloud.Id -Force }
 Check 'no claim code or credential in any log' {
+    # (PowerShell reads a comma inside a method call as an argument
+    # separator, so each search term is computed first.)
+    $secrets = @($claimCode, ($claimCode -replace '-', ''), $credential) | Where-Object { $_ }
+    if (@($secrets).Count -lt 3) { throw 'claim code or credential unknown; nothing to search for' }
     $leaks = Get-ChildItem $results -Recurse -File | Where-Object { $_.Extension -in '.log', '.txt', '.json' } | Where-Object {
         $text = [IO.File]::ReadAllText($_.FullName)
-        $text.Contains($claimCode) -or $text.Contains($claimCode -replace '-', '') -or ($credential -and $text.Contains($credential))
+        @($secrets | Where-Object { $text.Contains($_) }).Count -gt 0
     }
     if ($leaks) { throw "found in $($leaks.Name -join ', ')" }
     "$(@(Get-ChildItem $results -Recurse -File).Count) files checked"
