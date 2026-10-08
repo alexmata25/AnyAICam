@@ -8,6 +8,8 @@ test_customer_setup_cloud_id_field.py."""
 import re
 import sqlite3
 
+import pytest
+
 from test_customer_setup_cloud_id_field import (  # noqa: F401  (pytest fixtures)
     _owner_cookie, _seed_appliance, _seed_tenant, db_path, http_client, partner_portal,
 )
@@ -123,6 +125,7 @@ def test_a_valid_newly_claimed_appliance_is_selected_and_advances_once_ready(htt
 
 def test_an_empty_appliance_parameter_is_the_same_as_none(http_client, db_path):
     conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
     _saved_draft(conn, "appl-new", step=5)
     assert _page(http_client, "?appliance=") == ("5", ["appl-new"])
 
@@ -136,10 +139,32 @@ def test_without_appliance_parameter_behaviour_is_unchanged(http_client, db_path
     _make_ready(conn, "appl-old")
     assert _page(http_client, "?step=4") == ("4", ["appl-old"])
     _saved_draft(conn, "appl-new", step=5)  # the saved draft still wins without the parameter
+    assert _page(http_client, "") == ("3", ["appl-new"])  # ...at its status until it has enrolled
+    _make_ready(conn, "appl-new")
     assert _page(http_client, "") == ("5", ["appl-new"])
 
 
-# ------------------- initial page load: step 4 only for an enrolled appliance
+# ---------- initial page load: past step 3 only for an enrolled appliance
+@pytest.mark.parametrize("saved_step", [5, 6, 7])
+def test_a_saved_later_step_draft_reopens_at_status_until_its_own_appliance_enrolls(http_client, db_path, saved_step):
+    # Codex review of 9734d1d: no ?appliance=, a draft at step 5/6/7, and
+    # another of the customer's appliances enrolled -- the draft's appliance
+    # is what counts.
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")
+    _saved_draft(conn, "appl-new", step=saved_step)
+    assert _page(http_client, "") == ("3", ["appl-new"])
+    _make_ready(conn, "appl-new")
+    assert _page(http_client, "") == (str(saved_step), ["appl-new"])
+
+
+@pytest.mark.parametrize("requested_step", [5, 6, 7])
+def test_a_direct_later_step_url_opens_at_status_until_the_selected_appliance_enrolls(http_client, db_path, requested_step):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")  # the first appliance (selected) is not enrolled
+    assert _page(http_client, f"?step={requested_step}") == ("3", ["appl-old"])
+    _make_ready(conn, "appl-old")
+    assert _page(http_client, f"?step={requested_step}") == (str(requested_step), ["appl-old"])
 def _scan_button(http_client, query):
     body = http_client.get("/customer/setup" + query, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
     button = body[body.index('<button class="action-button" id="start-camera-scan"'):]
@@ -209,6 +234,7 @@ for (const m of html.matchAll(/ id="([^"]+)"/g)) els[m[1]] = stub(m[1]);
 const picker = html.slice(html.indexOf('<select id="customer-appliance">'));
 const chosen = /<option value="([^"]*)" selected/.exec(picker.slice(0, picker.indexOf('</select>')));
 if (els['customer-appliance']) els['customer-appliance'].value = chosen ? chosen[1] : '';
+if (els['start-camera-scan']) els['start-camera-scan'].disabled = html.includes('id="start-camera-scan" disabled');
 const tabs = [...html.matchAll(/class="workspace-tab[^"]*" data-step="([0-9])"/g)].map(m => stub('tab' + m[1], {dataset: {step: m[1]}}));
 const steps = [...html.matchAll(/class="customer-setup-step" data-step="([0-9])"/g)].map(m => stub('step' + m[1], {dataset: {step: m[1]}}));
 const sandbox = {
@@ -238,10 +264,12 @@ const step = () => vm.runInContext('setupStep', sandbox);
     if (act.kind === 'back') { await els['customer-setup-back'].onclick(); }
     if (act.kind === 'tab') { await tabs.find(t => t.dataset.step === String(act.step)).onclick(); }
     if (act.kind === 'scan') { await els['start-camera-scan'].onclick(); }
+    if (act.kind === 'poll') { await vm.runInContext('pollScan()', sandbox); }
     visited.push(step());
   }
   const scanMessage = els['scan-message'] ? els['scan-message'].textContent : null;
-  process.stdout.write(JSON.stringify({nav, posted, toasts, visited, step: step(), scanMessage}));
+  const scanDisabled = els['start-camera-scan'] ? els['start-camera-scan'].disabled : null;
+  process.stdout.write(JSON.stringify({nav, posted, toasts, visited, step: step(), scanMessage, scanDisabled}));
 })().catch(error => { console.error(error); process.exit(1); });
 """
 
@@ -411,3 +439,61 @@ def test_a_refused_scan_shows_why_on_the_page(http_client, db_path, tmp_path):
     out = _run_setup_script(http_client, "?step=4&appliance=appl-new", [{"kind": "scan"}], tmp_path,
                             {"/api/customer/appliances/appl-new/scan": refused})
     assert out["scanMessage"] == refused["body"]["detail"]
+
+
+# ------------- a credential revoked while the page polls a scan (Codex review of 9734d1d)
+def _job_status(http_client, job_id):
+    response = http_client.get(f"/api/customer/camera-scans/{job_id}", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_scan_status_reports_the_appliances_current_readiness(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    job_id = _scan(http_client, "appl-new").json()["job_id"]
+    assert _job_status(http_client, job_id)["appliance_ready"] is True
+    conn.execute("UPDATE appliance_credentials SET revoked_at='2026-10-08T11:00:00' WHERE appliance_id='appl-new'")
+    conn.commit()
+    assert _job_status(http_client, job_id)["appliance_ready"] is False
+    assert _scan(http_client, "appl-new").status_code == 409  # unchanged: no new scan either
+
+
+def test_polling_never_re_enables_the_scan_button_after_the_credential_is_revoked(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    job_id = _scan(http_client, "appl-new").json()["job_id"]
+    conn.execute("UPDATE camera_scan_jobs SET status='complete',progress=100,message='Discovery complete.' WHERE id=?", (job_id,))
+    conn.commit()
+    started = {"/api/customer/appliances/appl-new/scan": _ok({"job_id": job_id, "status": "queued", "progress": 0, "message": "queued"})}
+    status_url = f"/api/customer/camera-scans/{job_id}"
+    # The page was loaded while the appliance was enrolled (page-load readiness: ready).
+    still_enrolled = _run_setup_script(http_client, "?step=4&appliance=appl-new", [{"kind": "scan"}, {"kind": "poll"}], tmp_path,
+                                       {**started, status_url: _ok(_job_status(http_client, job_id))})
+    assert still_enrolled["scanDisabled"] is False  # a finished scan frees the button, as before
+    page_query = "?step=4&appliance=appl-new"
+    body = http_client.get("/customer/setup" + page_query, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    conn.execute("UPDATE appliance_credentials SET revoked_at='2026-10-08T11:00:00' WHERE appliance_id='appl-new'")
+    conn.commit()
+    revoked_status = _job_status(http_client, job_id)  # the server's answer now
+    assert revoked_status["status"] == "complete" and revoked_status["appliance_ready"] is False
+    (tmp_path / "stale").mkdir()
+    out = _run_setup_script_on(body, [{"kind": "scan"}, {"kind": "poll"}], tmp_path / "stale", {**started, status_url: _ok(revoked_status)})
+    assert out["scanDisabled"] is True  # job status alone never re-arms it
+
+
+def _run_setup_script_on(body, acts, tmp_path, responses):
+    """_run_setup_script() for a page body already rendered (here: before the revocation)."""
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    start = body.index("<script>let setupStep=") + len("<script>")
+    (tmp_path / "page.html").write_text(body, encoding="utf-8")
+    (tmp_path / "setup.js").write_text(body[start:body.index("</script>", start)], encoding="utf-8")
+    (tmp_path / "harness.js").write_text(_NODE_HARNESS, encoding="utf-8")
+    result = subprocess.run([node, str(tmp_path / "harness.js"), str(tmp_path / "page.html"), str(tmp_path / "setup.js"),
+                             json.dumps({"acts": acts, "responses": responses})], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
