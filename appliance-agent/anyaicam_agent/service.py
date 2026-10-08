@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import logging.handlers
 import signal
 import threading
@@ -15,6 +16,7 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
                              reconcile_cloud_cameras,redact_discovery_for_cloud)
 from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential
 from .headless_claim import HeadlessClaim
+from .link_server import DEFAULT_PORT as LINK_DEFAULT_PORT, LinkServer
 from .discovery import scan
 from .metrics import collect
 from .lan_addresses import publish as publish_lan_addresses
@@ -42,6 +44,9 @@ ACTIVATION_POLL_INTERVAL_SECONDS = 10
 class ApplianceAgent:
     def __init__(self,config):
         self.headless_claim_factory=HeadlessClaim.for_config
+        # Zero-terminal onboarding (2026-10-08): the headless claim is shared
+        # with the local "AnyAiCam Setup" page (link_server.py).
+        self.headless=None; self.link_server=None
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
         # RDM-2 Group 2A/2B/2F/2G: restart_signal is the real wrapper
         # (Group 2B) around this same agent's own stop_event -- exactly
@@ -521,7 +526,7 @@ class ApplianceAgent:
         # imaged for a label claim also opens and completes its own claim
         # while it waits, so the customer needs no terminal. Ineligible
         # appliances (no label file, no cloud portal) only wait, as before.
-        headless=self.headless_claim_factory(self.config,self.log)
+        headless=self.headless=self.headless_claim_factory(self.config,self.log)
         next_step=0.0
         while not self.stop_event.is_set():
             credential=load_credential(self.config)
@@ -537,7 +542,28 @@ class ApplianceAgent:
                     continue  # re-check for the credential the step may just have written
                 wait=max(0.5,min(wait,next_step-now))
             self.stop_event.wait(wait)
+    def linked(self):
+        credential=load_credential(self.config)
+        return bool(credential and credential.get('credential'))
+    def start_link_server(self):
+        """The appliance's own "AnyAiCam Setup" page (link_server.py) on
+        127.0.0.1 only. ANYAICAM_LINK_PORT=0 turns it off. Never fatal: a
+        busy port only means the page is unavailable."""
+        raw=os.environ.get('ANYAICAM_LINK_PORT',str(LINK_DEFAULT_PORT)).strip()
+        if raw=='0': return None
+        try:
+            port=int(raw)
+            self.link_server=LinkServer(self.config,self.log,headless=lambda:self.headless if self.headless is not None and not self.headless.done else None,linked=self.linked,port=port).start()
+        except (OSError,ValueError) as error:
+            self.log.warning('AnyAiCam Setup page not started (%s)',error)
+            self.link_server=None
+        return self.link_server
     def run(self):
+        self.start_link_server()
+        try: self._run()
+        finally:
+            if self.link_server is not None: self.link_server.stop()
+    def _run(self):
         self._await_activation()
         if self.stop_event.is_set():
             self.log.info('AnyAiCam appliance agent stopped (still waiting for activation)')

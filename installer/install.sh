@@ -143,6 +143,8 @@ source "$INSTALLER_DIR/09-identity.sh"
 source "$INSTALLER_DIR/12-update-signing-key.sh"
 # shellcheck source=13-entitlement-signing-keys.sh
 source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"
+# shellcheck source=14-desktop-setup.sh
+source "$INSTALLER_DIR/14-desktop-setup.sh"
 
 run_install() {
     local mode="install"
@@ -189,10 +191,12 @@ run_install() {
     identity_provision "$INSTALL_STATE"
     claim_label_provision
     cloud_portal_provision
+    desktop_setup_provision
     provision_update_signing_key
     provision_entitlement_signing_keys
     stamp_release
     log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."
+    log "Next: open \"AnyAiCam Setup\" from this computer's applications menu (it also opens by itself at the next sign-in) and choose \"Link this appliance\" to connect it to your AnyAiCam account. No codes to copy."
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

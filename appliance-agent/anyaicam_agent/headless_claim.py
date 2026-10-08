@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
 import time
 from datetime import datetime
 from typing import Callable
@@ -40,6 +41,7 @@ from .config import AgentConfig, clear_claim_state, load_claim_state, save_claim
 from .portal import PortalClient, PortalError
 
 VERIFIER_PATTERN = re.compile(r'^[0-9a-f]{64}$')
+CLAIM_CODE_PATTERN = re.compile(r'^[0-9A-Z]{8}$')  # what claim/begin returns (appliance_claims._generate_claim_code)
 DEVICE_ID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1', '0.0.0.0'}
 
@@ -93,6 +95,11 @@ class HeadlessClaim:
         self.failures = 0
         self.done = False
         self._last_note = None
+        # Zero-terminal onboarding (2026-10-08, link_server.py): the local
+        # setup page asks for a claim code from a different thread than the
+        # service's step loop; one lock keeps them from opening two claims.
+        self._lock = threading.RLock()
+        self._opened_code = None
 
     @classmethod
     def for_config(cls, config: AgentConfig, log, **kwargs):
@@ -133,7 +140,8 @@ class HeadlessClaim:
         if self.done:
             return float(PROVISIONED_RETRY_SECONDS)
         try:
-            return self._step()
+            with self._lock:
+                return self._step()
         except Exception as error:  # never let the claim break the service
             self.log.warning('Headless claim step failed (%s); retrying.', type(error).__name__)
             return self._backoff()
@@ -170,6 +178,7 @@ class HeadlessClaim:
         save_claim_state(self.config, {'device_id': device_id, 'claim_session_id': session['claim_session_id'],
                                        'device_secret': device_secret, 'portal_origin': origin,
                                        'opened_at': datetime.now().isoformat(), 'headless': True})
+        self._opened_code = session.get('claim_code')  # memory only, for link_code()
         self._ok()
         self._note('Waiting for the owner to claim this appliance with the code on its label.')
         return float(PENDING_POLL_SECONDS)
@@ -222,3 +231,51 @@ class HeadlessClaim:
         self._ok()
         self.log.info('Appliance claimed and activated cloud_id=%s', activated.get('cloud_id'))
         return 0.0
+
+    # ---------------------------------------------------------------- local setup page
+    def link_code(self) -> str | None:
+        """A current claim code for this appliance's own claim, for the local
+        setup page (link_server.py) to hand to the owner's browser in a URL
+        fragment -- so nobody has to see, copy or type it. Opens the claim if
+        none is open, otherwise resumes it with the same device secret (the
+        cloud then issues a fresh code for the same session; the old one stops
+        working). None when the cloud cannot be reached, the appliance is
+        already provisioned, or a confirmation is already being redeemed.
+        Never raises; never logs the code."""
+        if self.done:
+            return None
+        try:
+            with self._lock:
+                return self._link_code()
+        except Exception as error:
+            self.log.warning('Could not prepare the account link (%s).', type(error).__name__)
+            return None
+
+    def _link_code(self) -> str | None:
+        origin = portal_origin(self.config.portal_url)
+        device_id = self.device_id
+        state = load_claim_state(self.config)
+        if state and (state.get('portal_origin') != origin or not state.get('device_secret')
+                      or state.get('device_id') != device_id or not state.get('claim_session_id')):
+            clear_claim_state(self.config)
+            state = None
+        if state and state.get('claim_proof'):
+            return None  # already confirmed by the owner; the step loop is finishing it
+        if not state:
+            self._opened_code = None
+            self._begin(device_id, origin)
+            code, self._opened_code = self._opened_code, None
+            return code if CLAIM_CODE_PATTERN.match(str(code or '')) else None
+        try:
+            session = self.client.claim_begin(device_id, state['device_secret'], label_verifier=self.verifier)
+        except PortalError as error:
+            self.log.warning('Could not refresh the claim for the account link (HTTP %s).',
+                             getattr(error, 'status_code', None) or 'unreachable')
+            return None
+        if session.get('claim_session_id') and session['claim_session_id'] != state['claim_session_id']:
+            # The saved claim had expired; the cloud opened a new one for this
+            # same device secret. Follow it so the step loop polls the right one.
+            state['claim_session_id'] = session['claim_session_id']
+            save_claim_state(self.config, state)
+        code = session.get('claim_code')
+        return code if CLAIM_CODE_PATTERN.match(str(code or '')) else None

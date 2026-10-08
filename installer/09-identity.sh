@@ -131,11 +131,31 @@ validate_install_portal_url() {
     fi
 }
 
+# Zero-terminal onboarding (2026-10-08): a customer install links itself to
+# the AnyAiCam cloud from the desktop "AnyAiCam Setup" page, so without
+# --portal-url the agent now points at the AnyAiCam cloud by default -- unless
+# agent.env already names another valid https cloud (kept, e.g. a repair).
+ANYAICAM_DEFAULT_PORTAL_URL="${ANYAICAM_DEFAULT_PORTAL_URL:-https://app.anyaicam.com}"
+
+current_agent_portal_url() {
+    local file="${AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}"
+    [[ -f "$file" && ! -L "$file" ]] || return 0
+    sed -n 's/^ANYAICAM_PORTAL_URL=//p' "$file" | tail -1 | tr -d '"'"'"
+}
+
 cloud_portal_provision() {
-    [[ -n "${ANYAICAM_INSTALL_PORTAL_URL:-}" ]] || return 0
+    local portal="${ANYAICAM_INSTALL_PORTAL_URL:-}" current
+    if [[ -z "$portal" ]]; then
+        current="$(current_agent_portal_url)"
+        if [[ -n "$current" ]] && validate_install_portal_url "$current" >/dev/null 2>&1; then
+            log "Agent cloud portal kept: ${current%/}."
+            return 0
+        fi
+        portal="$ANYAICAM_DEFAULT_PORTAL_URL"
+    fi
     printf 'op update_env\npath %s\nmode 0600\nowner anyaicam\noverride ANYAICAM_PORTAL_URL=%s\noverride ANYAICAM_AGENT_MODE=production\n' \
-        "${AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}" "${ANYAICAM_INSTALL_PORTAL_URL%/}" | agent_file
-    log "Agent cloud portal set to ${ANYAICAM_INSTALL_PORTAL_URL%/} (production)."
+        "${AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}" "${portal%/}" | agent_file
+    log "Agent cloud portal set to ${portal%/} (production)."
 }
 
 stamp_release() {

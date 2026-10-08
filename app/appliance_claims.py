@@ -782,7 +782,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             <p id="claim-confirm-message" class="health-detail"></p>
           </div>
           <div id="claim-step-done" hidden>
-            <p>Claim confirmed. The appliance will finish activating automatically within a few seconds.</p>
+            <p id="claim-done-message">Claim confirmed. The appliance will finish activating automatically within a few seconds.</p>
             <a class="action-button" id="claim-done-continue" href="{back_href}">{back_label}</a>
           </div>
         </section>'''
@@ -790,16 +790,34 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         // A label code is 12 characters (dashes/spaces ignored); the code an
         // appliance's own terminal shows is 8. Sent in the POST body only.
         function claimBody(){
+          if(linkCode)return {claim_code:linkCode};
           const raw=document.getElementById('claim-code-input').value.trim().toUpperCase(),compact=raw.replace(/[\\s-]/g,'');
           return compact.length===12?{label_code:compact}:{claim_code:raw};
         }
         // From the label QR via /claim (kept in this tab only, never in a URL).
         try{const saved=sessionStorage.getItem('anyaicam.claimLabel');if(saved){sessionStorage.removeItem('anyaicam.claimLabel');document.getElementById('claim-code-input').value=saved}}catch(e){}
+        // Zero-terminal onboarding (2026-10-08): the appliance's own "AnyAiCam
+        // Setup" page sent the owner here with its claim code (/claim#code=).
+        // The code stays in this variable -- never shown on the page -- and the
+        // appliance is looked up at once; the owner only chooses the site and
+        // confirms.
+        let linkCode='',claimedDevice='';
+        try{linkCode=sessionStorage.getItem('anyaicam.claimCode')||'';sessionStorage.removeItem('anyaicam.claimCode')}catch(e){}
+        if(!/^[0-9A-Z]{8}$/.test(linkCode))linkCode='';
+        if(linkCode){
+          document.getElementById('claim-code-input').closest('label').hidden=true;
+          document.getElementById('claim-lookup-button').hidden=true;
+          document.getElementById('claim-lookup-message').textContent='Finding your appliance…';
+        }
         document.getElementById('claim-lookup-button').onclick=async()=>{
           const message=document.getElementById('claim-lookup-message');
           message.textContent='';
           const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(claimBody())}),body=await response.json();
+          if(!response.ok&&linkCode){linkCode='';document.getElementById('claim-code-input').closest('label').hidden=false;document.getElementById('claim-lookup-button').hidden=false;message.textContent='This link has expired or was already used. On the appliance, open AnyAiCam Setup and choose “Link this appliance” again.';return}
           if(!response.ok){message.textContent=response.status===404?'No appliance is waiting with that code. Check the code, and that the appliance is plugged into power and your network (it can take a few minutes to start).':(body.detail||'Claim code not found or expired.');return}
+          claimedDevice=String(body.device_id||'').toUpperCase();
+          // A link can be sent by anyone: confirm only one's own appliance.
+          if(linkCode)document.getElementById('claim-confirm-message').textContent='Only confirm if you just chose “Link this appliance” on your own AnyAiCam appliance.';
           // A readable name, not the raw device UUID (2026-10-02).
           document.getElementById('claim-device-id').textContent='AnyAiCam appliance (ID ending '+String(body.device_id||'').replace(/-/g,'').slice(-6).toUpperCase()+')';
           document.getElementById('claim-step-code').hidden=true;
@@ -820,7 +838,22 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           document.getElementById('claim-step-confirm').hidden=true;
           document.getElementById('claim-step-done').hidden=false;
           showToast('Appliance claim confirmed.');
+          waitForAppliance();
         };
+        // The appliance redeems the confirmation itself within seconds; carry on
+        // to Discover cameras once it shows up on the account.
+        async function waitForAppliance(){
+          const continueLink=document.getElementById('claim-done-continue'),note=document.getElementById('claim-done-message');
+          if(!claimedDevice||!continueLink.getAttribute('href').startsWith('/customer/setup'))return;
+          continueLink.hidden=true;note.textContent='Claim confirmed. Waiting for the appliance to finish linking…';
+          for(let i=0;i<60;i++){
+            try{const r=await fetch('/api/customer/setup/status');if(r.ok){const s=await r.json();
+              if((s.appliances||[]).some(a=>String(a.cloud_id||'').toUpperCase()===claimedDevice)){note.textContent='Your appliance is linked. Next: discover your cameras.';continueLink.href='/customer/setup?step=4';continueLink.textContent='Discover cameras';continueLink.hidden=false;return}}}catch(e){}
+            await new Promise(done=>setTimeout(done,3000));
+          }
+          note.textContent='The appliance is taking longer than usual to finish linking. Check that it is powered on and connected, then continue.';continueLink.hidden=false;
+        }
+        if(linkCode)document.getElementById('claim-lookup-button').onclick();
         </script>'''
         return shell('Claim appliance', 'users', content, scripts)
 
@@ -835,13 +868,17 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
     def claim_label_entry():
         page = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer"><title>Claim your AnyAiCam appliance</title></head><body>
-<p>Opening AnyAiCam&hellip; <a href="/customer/claim-appliance">Continue</a></p>
+<p>Opening AnyAiCam&hellip; <a href="/customer/claim-appliance?return=setup">Continue</a></p>
 <script>
 (function(){
-  var match=/(?:^|[#&])label=([0-9A-Za-z -]{12,20})(?:&|$)/.exec(location.hash||'');
+  var hash=location.hash||'';
+  var match=/(?:^|[#&])label=([0-9A-Za-z -]{12,20})(?:&|$)/.exec(hash);
   if(match){try{sessionStorage.setItem('anyaicam.claimLabel',decodeURIComponent(match[1]).toUpperCase())}catch(e){}}
+  // From the appliance's own "AnyAiCam Setup" page (zero-terminal onboarding).
+  var linked=/(?:^|[#&])code=([0-9A-Za-z]{8})(?:&|$)/.exec(hash);
+  if(linked){try{sessionStorage.setItem('anyaicam.claimCode',linked[1].toUpperCase())}catch(e){}}
   try{history.replaceState(null,'',location.pathname)}catch(e){}
-  location.replace('/customer/claim-appliance');
+  location.replace('/customer/claim-appliance?return=setup');
 })();
 </script></body></html>'''
         return HTMLResponse(page, headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})

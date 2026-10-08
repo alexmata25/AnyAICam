@@ -187,7 +187,8 @@ def test_claim_entry_page_is_public_and_keeps_the_code_out_of_urls(client, db_pa
     assert response.headers["referrer-policy"] == "no-referrer"
     body = response.text
     assert "sessionStorage.setItem('anyaicam.claimLabel'" in body
-    assert "history.replaceState" in body and "location.replace('/customer/claim-appliance')" in body
+    # 2026-10-08: continues into setup once the claim is confirmed (return=setup).
+    assert "history.replaceState" in body and "location.replace('/customer/claim-appliance?return=setup')" in body
 
 
 def test_claim_page_prefills_from_session_storage_and_sends_label_code(client, db_path):
