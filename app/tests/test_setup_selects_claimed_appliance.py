@@ -222,7 +222,7 @@ _NODE_HARNESS = r"""
 const fs = require('fs'), vm = require('vm');
 const html = fs.readFileSync(process.argv[2], 'utf8'), src = fs.readFileSync(process.argv[3], 'utf8');
 const action = JSON.parse(process.argv[4]);
-const nav = {href: null, reloaded: false}, posted = [], toasts = [];
+const nav = {href: null, reloaded: false}, posted = [], toasts = [], bodies = [];
 function stub(id, extra) {
   return Object.assign({id, value: '', textContent: '', innerHTML: '', hidden: false, disabled: false, dataset: {}, style: {},
           classList: {toggle() {}, add() {}, remove() {}}, setAttribute() {}, removeAttribute() {},
@@ -235,6 +235,8 @@ const picker = html.slice(html.indexOf('<select id="customer-appliance">'));
 const chosen = /<option value="([^"]*)" selected/.exec(picker.slice(0, picker.indexOf('</select>')));
 if (els['customer-appliance']) els['customer-appliance'].value = chosen ? chosen[1] : '';
 if (els['start-camera-scan']) els['start-camera-scan'].disabled = html.includes('id="start-camera-scan" disabled');
+const session = /id="payment-return"[^>]*data-session-id="([^"]*)"/.exec(html);
+if (session) els['payment-return'].dataset.sessionId = session[1];
 const tabs = [...html.matchAll(/class="workspace-tab[^"]*" data-step="([0-9])"/g)].map(m => stub('tab' + m[1], {dataset: {step: m[1]}}));
 const steps = [...html.matchAll(/class="customer-setup-step" data-step="([0-9])"/g)].map(m => stub('step' + m[1], {dataset: {step: m[1]}}));
 const sandbox = {
@@ -244,6 +246,7 @@ const sandbox = {
   location: {get href() { return nav.href; }, set href(v) { nav.href = v; }, reload() { nav.reloaded = true; }},
   fetch: async (url, opts) => {
     posted.push(url);
+    bodies.push({url, body: opts && opts.body ? JSON.parse(opts.body) : null});
     const r = action.responses[url] || {status: 200, body: {}};
     return {ok: r.status < 400, status: r.status, json: async () => r.body};
   },
@@ -255,6 +258,7 @@ vm.createContext(sandbox);
 vm.runInContext(src, sandbox);
 const step = () => vm.runInContext('setupStep', sandbox);
 (async () => {
+  await new Promise(resolve => setImmediate(resolve));  // the page's own async bootstrap (payment check)
   const visited = [];
   for (const act of action.acts) {
     if (act.kind === 'select') { els['customer-appliance'].value = act.value; await els['customer-appliance'].onchange(); }
@@ -265,11 +269,13 @@ const step = () => vm.runInContext('setupStep', sandbox);
     if (act.kind === 'tab') { await tabs.find(t => t.dataset.step === String(act.step)).onclick(); }
     if (act.kind === 'scan') { await els['start-camera-scan'].onclick(); }
     if (act.kind === 'poll') { await vm.runInContext('pollScan()', sandbox); }
+    if (act.kind === 'review') { if (els['payment-return-review'].hidden) throw new Error('Review button not shown'); await els['payment-return-review'].onclick(); }
     visited.push(step());
   }
   const scanMessage = els['scan-message'] ? els['scan-message'].textContent : null;
   const scanDisabled = els['start-camera-scan'] ? els['start-camera-scan'].disabled : null;
-  process.stdout.write(JSON.stringify({nav, posted, toasts, visited, step: step(), scanMessage, scanDisabled}));
+  const resumeStep = vm.runInContext("typeof resumeStep === 'undefined' ? null : resumeStep", sandbox);
+  process.stdout.write(JSON.stringify({nav, posted, bodies, toasts, visited, step: step(), resumeStep, scanMessage, scanDisabled}));
 })().catch(error => { console.error(error); process.exit(1); });
 """
 
@@ -372,9 +378,9 @@ def test_next_and_tabs_do_not_enter_discovery_before_the_appliance_has_enrolled(
     _make_ready(conn, "appl-old")  # another appliance being ready does not count
     out = _run_setup_script(http_client, "?step=3&appliance=appl-new",
                             [{"kind": "next"}, {"kind": "tab", "step": 4}, {"kind": "tab", "step": 5}, {"kind": "back"}], tmp_path)
-    # Next and the Discover tab stay at its status (3); the Cameras tab is
-    # allowed, but Back from it does not land in discovery either.
-    assert out["visited"] == [3, 3, 5, 3]
+    # Next and every step tab past 3 stay at its status; Back still works.
+    # (Codex review of 901fb70: the Cameras tab used to be let through.)
+    assert out["visited"] == [3, 3, 3, 2]
     assert len(out["toasts"]) == 3 and "finished linking" in out["toasts"][0]
 
 
@@ -497,3 +503,87 @@ def _run_setup_script_on(body, acts, tmp_path, responses):
                              json.dumps({"acts": acts, "responses": responses})], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+# ------- one enrollment gate for steps 4-7; the resume position kept apart (Codex review of 901fb70)
+_TABS_PAST_STATUS = [{"kind": "tab", "step": n} for n in (4, 5, 6, 7)]
+
+
+def test_no_step_tab_past_status_opens_before_the_selected_appliance_enrolls(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")  # another appliance on the account is enrolled
+    out = _run_setup_script(http_client, "?step=3&appliance=appl-new", _TABS_PAST_STATUS, tmp_path)
+    assert out["visited"] == [3, 3, 3, 3]
+    assert len(out["toasts"]) == 4
+
+
+def test_every_step_tab_opens_once_the_selected_appliance_has_enrolled(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    out = _run_setup_script(http_client, "?step=3&appliance=appl-new", _TABS_PAST_STATUS + [{"kind": "tab", "step": 3}], tmp_path)
+    assert out["visited"] == [4, 5, 6, 7, 3]
+    assert out["toasts"] == []
+
+
+def test_next_and_back_before_and_after_enrollment(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")
+    acts = [{"kind": "next"}, {"kind": "back"}, {"kind": "next"}, {"kind": "next"}]
+    assert _run_setup_script(http_client, "?step=3&appliance=appl-new", acts, tmp_path)["visited"] == [3, 2, 3, 3]
+    _make_ready(conn, "appl-new")
+    acts = [{"kind": "next"}, {"kind": "next"}, {"kind": "next"}, {"kind": "back"}, {"kind": "next"}, {"kind": "next"}]
+    assert _run_setup_script(http_client, "?step=3&appliance=appl-new", acts, tmp_path)["visited"] == [4, 5, 6, 5, 6, 7]
+
+
+_PAYMENT_RETURN = "&camera_plan_payment=success&session_id=cs_test_abcdefgh1234"
+_CHECKOUT_RETURN = {"/api/customer/setup/checkout-return?session_id=cs_test_abcdefgh1234":
+                    {"status": 200, "body": {"state": "active", "title": "Payment confirmed.", "message": "Your camera plan is active."}}}
+
+
+def test_the_payment_return_review_button_waits_for_enrollment(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")
+    query = "?step=3&appliance=appl-new" + _PAYMENT_RETURN
+    page = http_client.get("/customer/setup" + query, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    assert 'id="payment-return"' in page and 'id="payment-return-review"' in page  # the banner is still there
+    out = _run_setup_script(http_client, query, [{"kind": "review"}], tmp_path, _CHECKOUT_RETURN)
+    assert out["posted"][0].startswith("/api/customer/setup/checkout-return")  # the payment is still confirmed
+    assert out["visited"] == [3] and "finished linking" in out["toasts"][0]
+    _make_ready(conn, "appl-new")
+    out = _run_setup_script(http_client, query, [{"kind": "review"}], tmp_path, _CHECKOUT_RETURN)
+    assert out["visited"] == [6] and out["toasts"] == []
+
+
+def _save(http_client, body):
+    response = http_client.post("/api/customer/setup/progress", json=body, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("saved_step", [6, 7])
+def test_a_saved_resume_step_survives_while_enrollment_is_pending(http_client, db_path, tmp_path, saved_step):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")  # another appliance on the account is enrolled
+    _saved_draft(conn, "appl-new", step=saved_step)
+    body = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    assert f"let setupStep=3,resumeStep={saved_step}," in body
+    # The customer clicks around while held at status: every save keeps the resume step.
+    out = _run_setup_script(http_client, "", [{"kind": "next"}, {"kind": "tab", "step": 2}, {"kind": "next"}, {"kind": "tab", "step": saved_step}], tmp_path)
+    saves = [b["body"] for b in out["bodies"] if b["url"] == "/api/customer/setup/progress"]
+    assert len(saves) == 4 and all(save["current_step"] == saved_step for save in saves)
+    assert all(save["data"]["appliance_id"] == "appl-new" for save in saves)
+    for save in saves:  # what the browser posted, through the real endpoint
+        _save(http_client, save)
+    assert _page(http_client, "") == ("3", ["appl-new"])  # still pending: status
+    _make_ready(conn, "appl-new")
+    assert _page(http_client, "") == (str(saved_step), ["appl-new"])  # enrolled: resumes where it was
+
+
+def test_without_a_held_step_progress_saves_the_current_step_as_before(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    _saved_draft(conn, "appl-new", step=6)
+    body = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    assert "let setupStep=6,resumeStep=0," in body
+    out = _run_setup_script(http_client, "", [{"kind": "tab", "step": 3}, {"kind": "tab", "step": 4}], tmp_path)
+    saves = [b["body"]["current_step"] for b in out["bodies"] if b["url"] == "/api/customer/setup/progress"]
+    assert saves == [6, 3] and out["visited"] == [3, 4]
