@@ -256,6 +256,20 @@ def _label_verifier_from(payload: dict) -> str | None:
     return value
 
 
+def _clear_label_requested(payload: dict) -> bool:
+    """claim/begin's optional clear_label_verifier (2026-10-08): true from a
+    Windows 1.3.1 agent, which has retired its permanent label code; the
+    claim it resumes stops matching that code. Only the appliance holding
+    the claim's device secret can resume it, so only it can clear it.
+    Absent/false: unchanged behaviour (Linux label claims, older agents)."""
+    value = payload.get('clear_label_verifier')
+    if value is None or value is False:
+        return False
+    if value is True:
+        return True
+    raise HTTPException(status_code=400, detail='clear_label_verifier must be true or absent.')
+
+
 def _find_claim_by_label(label_code: str) -> dict | None:
     """Same bounded scan as _find_claim_by_code(), over pending claims whose
     appliance sent a label verifier."""
@@ -452,6 +466,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         device_id = _normalize_device_id(device_id)
         device_secret = _device_secret(payload)
         verifier = _label_verifier_from(payload)
+        clear_label = _clear_label_requested(payload)
+        if clear_label and verifier:
+            raise HTTPException(status_code=400, detail='label_verifier and clear_label_verifier cannot be combined.')
         existing_appliance = row('SELECT id FROM appliances WHERE cloud_id=?', (device_id.upper(),))
         if existing_appliance:
             raise HTTPException(status_code=409, detail='This device is already provisioned. Use the existing activation flow.')
@@ -473,8 +490,16 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 if verifier:
                     db.execute("UPDATE appliance_claims SET label_verifier_hash=? WHERE id=? AND status='pending'",
                                (password_hash(verifier), resumable['id']))
-            logger.info('Claim session resumed with a new code claim_id=%s', resumable['id'])
-            return {
+                elif clear_label:
+                    # Windows 1.3.1 (2026-10-08): the appliance retired its
+                    # permanent label code; a claim it opened as Windows
+                    # 1.3.0 must stop answering to that code now, not when
+                    # it expires.
+                    db.execute("UPDATE appliance_claims SET label_verifier_hash=NULL WHERE id=? AND status='pending'",
+                               (resumable['id'],))
+            logger.info('Claim session resumed with a new code claim_id=%s%s', resumable['id'],
+                        ' (label verifier cleared)' if clear_label else '')
+            answer = {
                 'claim_session_id': resumable['claim_session_id'],
                 'claim_code': claim_code,
                 'expires_at': resumable['expires_at'],
@@ -482,6 +507,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 'poll_interval_seconds': 5,
                 'resumed': True,
             }
+            if clear_label:
+                answer['label_verifier_cleared'] = True
+            return answer
         claim_id = secrets.token_hex(16)
         claim_session_id = secrets.token_urlsafe(24)
         claim_code = _generate_claim_code()
@@ -495,7 +523,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             )
         # Never log the session id: it is a bearer value for this claim.
         logger.info('Claim session opened claim_id=%s', claim_id)
-        return {
+        answer = {
             'claim_session_id': claim_session_id,
             'claim_code': claim_code,
             'expires_at': expires_at,
@@ -503,6 +531,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             'poll_interval_seconds': 5,
             'resumed': False,
         }
+        if clear_label:
+            answer['label_verifier_cleared'] = True  # (a new claim never has one)
+        return answer
 
     @app.post('/api/appliance/claim/status')
     def claim_status(request: Request, payload: dict) -> dict:
@@ -614,10 +645,17 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             raise HTTPException(status_code=503, detail='Claim confirmation is temporarily unavailable.')
         now = _now()
         proof_expires_at = (now + timedelta(minutes=CLAIM_PROOF_TTL_MINUTES)).isoformat()
+        # 2026-10-08: confirm only while the code that matched still belongs
+        # to the claim -- a label verifier cleared (Windows 1.3.1) or a claim
+        # code replaced (a resumed claim) between the lookup above and this
+        # update must not let the old code through.
+        matched_column = 'label_verifier_hash' if str(payload.get('label_code', '') or '').strip() else 'claim_code_hash'
         with connection() as db:
             changed = db.execute(
-                "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_encrypted=?,proof_expires_at=? WHERE id=? AND status='pending'",
-                (identity['customer_id'], site_id, identity.get('email'), now.isoformat(), password_hash(claim_proof), encrypted_proof, proof_expires_at, claim['id']),
+                "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_encrypted=?,proof_expires_at=? "
+                f"WHERE id=? AND status='pending' AND {matched_column}=?",
+                (identity['customer_id'], site_id, identity.get('email'), now.isoformat(), password_hash(claim_proof), encrypted_proof, proof_expires_at, claim['id'],
+                 claim[matched_column]),
             ).rowcount
         if changed != 1:
             raise HTTPException(status_code=409, detail='Claim is no longer pending (already claimed or expired).')

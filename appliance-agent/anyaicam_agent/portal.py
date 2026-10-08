@@ -69,9 +69,12 @@ class PortalClient:
     # label_verifier (2026-10-07, headless label claim): sha256 of the code
     # printed on this unit's label, so the owner can claim it with that code;
     # omitted for a claim started from the appliance's own terminal.
-    def claim_begin(self,device_id,device_secret,label_verifier=None):
+    def claim_begin(self,device_id,device_secret,label_verifier=None,clear_label_verifier=False):
         payload={'device_id':device_id,'device_secret':device_secret}
         if label_verifier: payload['label_verifier']=label_verifier
+        # Windows 1.3.1 (2026-10-08): the claim this appliance resumes stops
+        # answering to its retired label code (only sent when true).
+        if clear_label_verifier: payload['clear_label_verifier']=True
         return self.request('POST','/api/appliance/claim/begin',payload,authenticated=False)
     def claim_status(self,claim_session_id,device_secret): return self.request('POST','/api/appliance/claim/status',{'claim_session_id':claim_session_id,'device_secret':device_secret},authenticated=False)
     def claim_complete(self,claim_session_id,claim_proof,device_secret): return self.request('POST','/api/appliance/claim/complete',{'claim_session_id':claim_session_id,'claim_proof':claim_proof,'device_secret':device_secret},authenticated=False)

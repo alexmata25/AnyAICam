@@ -252,17 +252,101 @@ class WindowsZeroTerminalTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(self.customer_confirms(self.link_code()), 200)  # a new request works at once
 
-    def test_a_label_claim_left_open_by_1_3_0_is_resumed_and_linked(self):
-        # Windows 1.3.0 kept a label claim open; after the upgrade the agent
-        # resumes it with its own device secret (no new label is sent).
-        secret = 'device-secret-from-1.3.0-xxxxxxxxxxxxxxxx'
-        session = PortalClient(CLOUD).claim_begin(self.device_id, secret, label_verifier='b' * 64)
+    # ---- Codex review of d500a24: a claim Windows 1.3.0 left open kept its
+    # label verifier when 1.3.1 resumed it without one, so the retired code
+    # kept working until the claim expired.
+    LEGACY_SECRET = 'device-secret-from-1.3.0-xxxxxxxxxxxxxxxx'
+
+    @property
+    def LEGACY_CODE(self):
+        # Unique per test: a label lookup scans every pending claim, and the
+        # tests share one cloud database.
+        if not hasattr(self, '_legacy_code'):
+            import secrets as _secrets
+            raw = ''.join(_secrets.choice(appliance_claims.LABEL_ALPHABET) for _ in range(12))
+            self._legacy_code = f'{raw[:4]}-{raw[4:8]}-{raw[8:]}'
+        return self._legacy_code
+
+    def open_legacy_label_claim(self):
+        """What Windows 1.3.0's agent left on the cloud and on disk."""
+        verifier = appliance_claims.label_verifier(appliance_claims.normalize_label_code(self.LEGACY_CODE))
+        session = PortalClient(CLOUD).claim_begin(self.device_id, self.LEGACY_SECRET, label_verifier=verifier)
         save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': session['claim_session_id'],
-                                       'device_secret': secret, 'portal_origin': CLOUD.lower(), 'headless': True})
-        self.run_agent(1)
+                                       'device_secret': self.LEGACY_SECRET, 'portal_origin': CLOUD.lower(), 'headless': True})
+        self.assertEqual(self.label_lookup(), 200)  # the old code works before the upgrade
+        return session
+
+    def label_lookup(self):
+        return _cloud('POST', '/api/portal/claims/lookup', {'label_code': self.LEGACY_CODE}, cookie=self.cookie)[0]
+
+    def test_the_upgrade_retires_a_pending_1_3_0_label_at_the_first_step(self):
+        self.open_legacy_label_claim()
+        self.run_agent(1)  # the agent's first step after the upgrade; no link asked for
+        self.assertEqual(self.label_lookup(), 404)
+        status, _ = _cloud('POST', '/api/portal/claims/confirm', {'label_code': self.LEGACY_CODE, 'site_id': self.site}, cookie=self.cookie)
+        self.assertEqual(status, 404)
+        self.assertEqual([c['label_verifier_hash'] for c in self.pending_claims()], [None])
+        self.assertTrue(load_claim_state(self.config)['label_cleared'])
+        # The same claim then links with a one-time link.
         self.assertEqual(self.customer_confirms(self.link_code()), 200)
         self.run_agent()
         self.assertTrue(self.claim.done)
+        self.assertNotIn(self.LEGACY_CODE.replace('-', ''), '\n'.join(self.log.lines))
+
+    def test_a_label_lookup_in_flight_cannot_confirm_once_the_label_is_cleared(self):
+        self.open_legacy_label_claim()
+        stale = appliance_claims._find_claim_for_portal({'label_code': self.LEGACY_CODE})  # looked up just before
+        self.run_agent(1)
+        with patch.object(appliance_claims, '_find_claim_for_portal', lambda payload: stale):
+            status, _ = _cloud('POST', '/api/portal/claims/confirm', {'label_code': self.LEGACY_CODE, 'site_id': self.site}, cookie=self.cookie)
+        self.assertEqual(status, 409)
+        self.assertEqual(len(self.pending_claims()), 1)  # still pending, not claimed
+
+    def test_a_replaced_claim_code_in_flight_cannot_confirm(self):
+        first = self.link_code()
+        stale = appliance_claims._find_claim_for_portal({'claim_code': first})
+        self.link_code()  # a new request replaces the code
+        with patch.object(appliance_claims, '_find_claim_for_portal', lambda payload: stale):
+            status, _ = _cloud('POST', '/api/portal/claims/confirm', {'claim_code': first, 'site_id': self.site}, cookie=self.cookie)
+        self.assertEqual(status, 409)
+
+    def test_an_expired_legacy_claim_is_dropped_without_opening_another(self):
+        self.open_legacy_label_claim()
+        with connection() as db:
+            db.execute("UPDATE appliance_claims SET expires_at='2000-01-01T00:00:00' WHERE device_id=?", (self.device_id,))
+        self.run_agent(2)
+        self.assertIsNone(load_claim_state(self.config))
+        self.assertEqual(self.pending_claims(), [])
+        self.assertEqual(self.label_lookup(), 404)
+
+    def test_a_fresh_windows_link_never_has_a_label(self):
+        status, body = _cloud('POST', '/api/appliance/claim/begin',
+                              {'device_id': self.device_id, 'device_secret': 'w' * 40, 'clear_label_verifier': True})
+        self.assertEqual((status, body['label_verifier_cleared'], body['resumed']), (200, True, False))
+        self.assertEqual([c['label_verifier_hash'] for c in self.pending_claims()], [None])
+
+    def test_only_the_appliance_that_opened_the_claim_can_clear_its_label(self):
+        self.open_legacy_label_claim()
+        status, _ = _cloud('POST', '/api/appliance/claim/begin',
+                           {'device_id': self.device_id, 'device_secret': 'x' * 40, 'clear_label_verifier': True})
+        self.assertEqual(status, 409)
+        self.assertEqual(self.label_lookup(), 200)
+
+    def test_clear_requests_must_be_well_formed(self):
+        for extra in ({'clear_label_verifier': True, 'label_verifier': 'a' * 64}, {'clear_label_verifier': 'yes'}, {'clear_label_verifier': 1}):
+            status, _ = _cloud('POST', '/api/appliance/claim/begin', {'device_id': self.device_id, 'device_secret': 'w' * 40, **extra})
+            self.assertEqual(status, 400, extra)
+        self.assertEqual(self.pending_claims(), [])
+
+    def test_linux_label_claims_are_unchanged(self):
+        verifier = appliance_claims.label_verifier(appliance_claims.normalize_label_code(self.LEGACY_CODE))
+        client = PortalClient(CLOUD)
+        client.claim_begin(self.device_id, self.LEGACY_SECRET, label_verifier=verifier)
+        resumed = client.claim_begin(self.device_id, self.LEGACY_SECRET, label_verifier=verifier)  # a Linux resume
+        self.assertNotIn('label_verifier_cleared', resumed)
+        self.assertEqual(self.label_lookup(), 200)
+        status, _ = _cloud('POST', '/api/portal/claims/confirm', {'label_code': self.LEGACY_CODE, 'site_id': self.site}, cookie=self.cookie)
+        self.assertEqual(status, 200)
 
     def test_another_accounts_site_is_refused(self):
         code = self.link_code()

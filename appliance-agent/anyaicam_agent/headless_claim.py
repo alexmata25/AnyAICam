@@ -35,6 +35,15 @@ the cloud can then only match the fresh 8-character code link_code() returns,
 which the next request replaces and which dies with the 15-minute claim. The
 step loop still polls and completes a claim that is open, and lets an
 expired one go instead of reopening it. Eligibility drops the label file.
+
+Every claim/begin in on-demand mode also sends clear_label_verifier, and a
+claim Windows 1.3.0 left open (saved without the 'on_demand' marker) is
+resumed with it on the agent's first step after the upgrade -- before any
+link is asked for -- so the cloud stops matching the retired label code at
+once instead of when that claim expires (Codex review of d500a24). The
+cloud confirms with label_verifier_cleared; a cloud that does not
+understand it (before the zero-terminal deploy) is noted once and the claim
+simply expires.
 """
 from __future__ import annotations
 
@@ -150,6 +159,41 @@ class HeadlessClaim:
     def _ok(self) -> None:
         self.failures = 0
 
+    # ---------------------------------------------------------------- label retirement
+    def _claim_begin(self, device_id: str, device_secret: str) -> dict:
+        if self.on_demand:
+            return self.client.claim_begin(device_id, device_secret, label_verifier=None, clear_label_verifier=True)
+        return self.client.claim_begin(device_id, device_secret, label_verifier=self.verifier)
+
+    def _needs_label_clear(self, state: dict) -> bool:
+        """A pending claim saved by Windows 1.3.0 (label mode) whose label
+        this agent has not yet had cleared on the cloud."""
+        return (self.on_demand and not state.get('on_demand') and not state.get('label_cleared')
+                and not state.get('label_clear_unsupported'))
+
+    def _clear_legacy_label(self, state: dict) -> None:
+        """Resume the legacy claim with clear_label_verifier: the cloud stops
+        matching the retired label code and issues a new claim code, which is
+        discarded (nobody is shown it). Never raises."""
+        try:
+            session = self.client.claim_begin(state['device_id'], state['device_secret'], label_verifier=None, clear_label_verifier=True)
+        except PortalError as error:
+            self.log.warning('Could not retire the old claim code with the AnyAiCam cloud (HTTP %s); retrying.',
+                             getattr(error, 'status_code', None) or 'unreachable')
+            return
+        if session.get('claim_session_id') and session['claim_session_id'] != state['claim_session_id']:
+            # The legacy claim had just expired; the cloud opened a new one,
+            # without a label, for this device secret.
+            state['claim_session_id'] = session['claim_session_id']
+            state['on_demand'] = True
+        if session.get('label_verifier_cleared'):
+            state['label_cleared'] = True
+            self.log.info('The old Windows 1.3.0 claim code no longer links this computer.')
+        else:
+            state['label_clear_unsupported'] = True
+            self.log.warning('The AnyAiCam cloud cannot retire the old claim code yet; it stops working when its claim expires (at most 15 minutes).')
+        save_claim_state(self.config, state)
+
     # ---------------------------------------------------------------- the step
     def step(self) -> float:
         """Advance the claim by one action; returns seconds until the next
@@ -183,7 +227,7 @@ class HeadlessClaim:
     def _begin(self, device_id: str, origin: str) -> float:
         device_secret = secrets.token_urlsafe(32)
         try:
-            session = self.client.claim_begin(device_id, device_secret, label_verifier=self.verifier)
+            session = self._claim_begin(device_id, device_secret)
         except PortalError as error:
             status = getattr(error, 'status_code', None)
             if status == 409 and 'already provisioned' in str(error):
@@ -194,9 +238,12 @@ class HeadlessClaim:
                 return float(IN_PROGRESS_RETRY_SECONDS)
             self.log.warning('Could not open a claim with the AnyAiCam cloud (HTTP %s); retrying.', status or 'unreachable')
             return self._backoff()
-        save_claim_state(self.config, {'device_id': device_id, 'claim_session_id': session['claim_session_id'],
-                                       'device_secret': device_secret, 'portal_origin': origin,
-                                       'opened_at': datetime.now().isoformat(), 'headless': True})
+        state = {'device_id': device_id, 'claim_session_id': session['claim_session_id'],
+                 'device_secret': device_secret, 'portal_origin': origin,
+                 'opened_at': datetime.now().isoformat(), 'headless': True}
+        if self.on_demand:
+            state['on_demand'] = True  # opened without a label: nothing to clear
+        save_claim_state(self.config, state)
         self._opened_code = session.get('claim_code')  # memory only, for link_code()
         self._ok()
         self._note('Waiting for the owner to confirm the link in the AnyAiCam portal.' if self.on_demand
@@ -212,6 +259,8 @@ class HeadlessClaim:
             return self._backoff()
         self._ok()
         value = status.get('status')
+        if value == 'pending' and self._needs_label_clear(state):
+            self._clear_legacy_label(state)
         if value == 'claimed' and status.get('claim_proof'):
             state['claim_proof'] = status['claim_proof']
             save_claim_state(self.config, state)  # before redeeming it
@@ -287,11 +336,14 @@ class HeadlessClaim:
             code, self._opened_code = self._opened_code, None
             return code if CLAIM_CODE_PATTERN.match(str(code or '')) else None
         try:
-            session = self.client.claim_begin(device_id, state['device_secret'], label_verifier=self.verifier)
+            session = self._claim_begin(device_id, state['device_secret'])
         except PortalError as error:
             self.log.warning('Could not refresh the claim for the account link (HTTP %s).',
                              getattr(error, 'status_code', None) or 'unreachable')
             return None
+        if self.on_demand and session.get('label_verifier_cleared') and not state.get('label_cleared'):
+            state['label_cleared'] = True
+            save_claim_state(self.config, state)
         if session.get('claim_session_id') and session['claim_session_id'] != state['claim_session_id']:
             # The saved claim had expired; the cloud opened a new one for this
             # same device secret. Follow it so the step loop polls the right one.

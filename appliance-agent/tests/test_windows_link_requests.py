@@ -18,7 +18,8 @@ from anyaicam_agent import service, windows
 from anyaicam_agent.config import load_claim_state, save_claim_state, save_credential
 from anyaicam_agent.headless_claim import ON_DEMAND_IDLE_SECONDS, PENDING_POLL_SECONDS, HeadlessClaim, ineligibility
 from anyaicam_agent.windows_link import REQUEST_MAX_AGE, RESPONSE_MAX_AGE, STARTUP_GRACE, LinkRequests, request_folder
-from test_headless_claim import ACTIVATED, DEVICE_ID, PORTAL, Base
+from anyaicam_agent.portal import PortalClient
+from test_headless_claim import ACTIVATED, DEVICE_ID, PORTAL, Base, FakePortal, _http
 
 NONCE = '0123456789abcdef0123456789abcdef'
 
@@ -32,10 +33,18 @@ class Capture(logging.Handler):
         self.text.append(record.getMessage())
 
 
+class WindowsFakePortal(FakePortal):
+    """FakePortal that also records clear_label_verifier (5th element)."""
+    def claim_begin(self, device_id, device_secret, label_verifier=None, clear_label_verifier=False):
+        self.calls.append(('begin', device_id, device_secret, label_verifier, clear_label_verifier))
+        return self._next(self.begin_answers, 'begin')
+
+
 class OnDemandBase(Base):
     def setUp(self):
         super().setUp()
         (self.folder / 'label_claim.json').unlink()  # Windows: no label
+        self.portal = WindowsFakePortal()
 
     def claim(self, finish=None):
         return HeadlessClaim(self.config, self.log, client=self.portal, on_demand=True,
@@ -70,7 +79,8 @@ class OnDemandClaimTests(OnDemandBase):
     def test_a_link_opens_a_claim_without_any_label(self):
         self.portal.begin_answers = [{'claim_session_id': 'sess-1', 'claim_code': 'AB12CD34'}]
         self.assertEqual(self.claim().link_code(), 'AB12CD34')
-        self.assertEqual(self.portal.calls, [('begin', DEVICE_ID, load_claim_state(self.config)['device_secret'], None)])
+        self.assertEqual(self.portal.calls, [('begin', DEVICE_ID, load_claim_state(self.config)['device_secret'], None, True)])
+        self.assertTrue(load_claim_state(self.config)['on_demand'])
 
     def test_each_link_gets_a_fresh_code_for_the_same_claim(self):
         self.portal.begin_answers = [{'claim_session_id': 'sess-1', 'claim_code': 'AAAA0001'},
@@ -79,7 +89,7 @@ class OnDemandClaimTests(OnDemandBase):
         self.assertEqual(claim.link_code(), 'AAAA0001')
         secret = load_claim_state(self.config)['device_secret']
         self.assertEqual(claim.link_code(), 'BBBB0002')
-        self.assertEqual(self.portal.calls[-1], ('begin', DEVICE_ID, secret, None))  # resumed, still no label
+        self.assertEqual(self.portal.calls[-1], ('begin', DEVICE_ID, secret, None, True))  # resumed, still no label
 
     def test_the_opened_claim_is_polled_and_completed(self):
         self.portal.begin_answers = [{'claim_session_id': 'sess-1', 'claim_code': 'AB12CD34'}]
@@ -102,17 +112,117 @@ class OnDemandClaimTests(OnDemandBase):
         self.assertEqual(claim.step(), ON_DEMAND_IDLE_SECONDS)
         self.assertEqual([c[0] for c in self.portal.calls], ['begin', 'status'])
 
-    def test_a_claim_left_open_by_windows_1_3_0_is_resumed_without_its_label(self):
-        # Upgrade from 1.3.0 (label claim open): the next link resumes it with
-        # the same device secret and sends no label; it expires as usual.
+    # ---- Codex review of d500a24: the label of a claim Windows 1.3.0 left
+    # open must stop working at the agent's first step after the upgrade.
+    def legacy(self, **extra):
         save_claim_state(self.config, {'device_id': DEVICE_ID, 'claim_session_id': 'old', 'device_secret': 'secret-1',
-                                       'portal_origin': PORTAL, 'headless': True})
-        self.portal.status_answers = [{'status': 'pending'}]
+                                       'portal_origin': PORTAL, 'headless': True, **extra})
+
+    def test_first_step_after_the_upgrade_retires_the_legacy_label(self):
+        self.legacy()
+        self.portal.status_answers = [{'status': 'pending'}, {'status': 'pending'}]
+        self.portal.begin_answers = [{'claim_session_id': 'old', 'claim_code': 'DISCARD1', 'label_verifier_cleared': True}]
         claim = self.claim()
-        self.assertEqual(claim.step(), PENDING_POLL_SECONDS)
-        self.portal.begin_answers = [{'claim_session_id': 'old', 'claim_code': 'CCCC0003'}]
-        self.assertEqual(claim.link_code(), 'CCCC0003')
-        self.assertEqual(self.portal.calls[-1], ('begin', DEVICE_ID, 'secret-1', None))
+        self.assertEqual(claim.step(), PENDING_POLL_SECONDS)  # no link asked for
+        self.assertEqual(self.portal.calls, [('status', 'old', 'secret-1'), ('begin', DEVICE_ID, 'secret-1', None, True)])
+        self.assertTrue(load_claim_state(self.config)['label_cleared'])
+        claim.step()
+        self.assertEqual([c[0] for c in self.portal.calls], ['status', 'begin', 'status'])  # once only
+
+    def test_the_resumed_legacy_claim_still_links_with_a_fresh_code(self):
+        self.legacy(label_cleared=True)
+        self.portal.begin_answers = [{'claim_session_id': 'old', 'claim_code': 'CCCC0003', 'label_verifier_cleared': True}]
+        self.assertEqual(self.claim().link_code(), 'CCCC0003')
+        self.assertEqual(self.portal.calls[-1], ('begin', DEVICE_ID, 'secret-1', None, True))
+
+    def test_a_link_asked_for_before_the_first_poll_also_retires_the_label(self):
+        self.legacy()
+        self.portal.begin_answers = [{'claim_session_id': 'old', 'claim_code': 'CCCC0004', 'label_verifier_cleared': True}]
+        self.assertEqual(self.claim().link_code(), 'CCCC0004')
+        self.assertEqual(self.portal.calls, [('begin', DEVICE_ID, 'secret-1', None, True)])
+        self.assertTrue(load_claim_state(self.config)['label_cleared'])
+
+    def test_an_expired_legacy_claim_is_dropped_and_nothing_is_opened(self):
+        self.legacy()
+        self.portal.status_answers = [{'status': 'expired'}]
+        claim = self.claim()
+        self.assertEqual(claim.step(), 0.0)
+        self.assertIsNone(load_claim_state(self.config))
+        self.assertEqual(claim.step(), ON_DEMAND_IDLE_SECONDS)
+        self.assertEqual([c[0] for c in self.portal.calls], ['status'])
+
+    def test_a_legacy_claim_that_expires_meanwhile_is_followed_without_a_label(self):
+        self.legacy()
+        self.portal.status_answers = [{'status': 'pending'}]
+        self.portal.begin_answers = [{'claim_session_id': 'new', 'claim_code': 'DISCARD2', 'label_verifier_cleared': True}]
+        self.claim().step()
+        state = load_claim_state(self.config)
+        self.assertEqual((state['claim_session_id'], state['on_demand'], state['label_cleared']), ('new', True, True))
+
+    def test_a_cloud_that_cannot_retire_it_is_noted_once_and_the_claim_expires(self):
+        self.log.setLevel(logging.DEBUG); self.addCleanup(self.log.setLevel, logging.NOTSET)
+        capture = Capture(); self.log.addHandler(capture); self.addCleanup(self.log.removeHandler, capture)
+        self.legacy()
+        self.portal.status_answers = [{'status': 'pending'}] * 3
+        self.portal.begin_answers = [{'claim_session_id': 'old', 'claim_code': 'DISCARD3'}]  # no label_verifier_cleared
+        claim = self.claim()
+        for _ in range(3):
+            claim.step()
+        self.assertEqual([c[0] for c in self.portal.calls].count('begin'), 1)
+        self.assertTrue(load_claim_state(self.config)['label_clear_unsupported'])
+        self.assertEqual(sum('cannot retire the old claim code' in line for line in capture.text), 1)
+        self.assertFalse(any('DISCARD3' in line for line in capture.text))
+
+    def test_an_unreachable_cloud_retries_the_retirement(self):
+        self.legacy()
+        self.portal.status_answers = [{'status': 'pending'}, {'status': 'pending'}]
+        self.portal.begin_answers = [_http(503, 'down'), {'claim_session_id': 'old', 'claim_code': 'X', 'label_verifier_cleared': True}]
+        claim = self.claim()
+        claim.step()
+        self.assertNotIn('label_cleared', load_claim_state(self.config))
+        claim.step()
+        self.assertTrue(load_claim_state(self.config)['label_cleared'])
+
+    def test_claims_opened_by_1_3_1_are_never_resumed_just_to_clear(self):
+        self.portal.begin_answers = [{'claim_session_id': 'sess-1', 'claim_code': 'AB12CD34', 'label_verifier_cleared': True}]
+        claim = self.claim()
+        claim.link_code()
+        self.portal.status_answers = [{'status': 'pending'}] * 3
+        for _ in range(3):
+            claim.step()
+        self.assertEqual([c[0] for c in self.portal.calls], ['begin', 'status', 'status', 'status'])
+
+    def test_a_confirmed_legacy_claim_is_completed_not_cleared(self):
+        self.legacy()
+        self.portal.status_answers = [{'status': 'claimed', 'claim_proof': 'proof-1'}]
+        self.portal.complete_answers = [ACTIVATED]
+        claim = self.claim()
+        claim.step(); claim.step()
+        self.assertTrue(claim.done)
+        self.assertNotIn('begin', [c[0] for c in self.portal.calls])
+
+
+class LinuxUnchangedTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.portal = WindowsFakePortal()
+
+    def test_the_linux_label_claim_never_asks_to_clear_its_label(self):
+        claim = HeadlessClaim(self.config, self.log, client=self.portal, finish_enrollment=lambda *a, **k: None)
+        self.portal.begin_answers = [{'claim_session_id': 's', 'claim_code': 'AB12CD34'}, {'claim_session_id': 's', 'claim_code': 'AB12CD35'}]
+        claim.step()
+        claim.link_code()
+        self.assertEqual([c[4] for c in self.portal.calls if c[0] == 'begin'], [False, False])
+        self.assertTrue(all(c[3] for c in self.portal.calls if c[0] == 'begin'))  # label verifier sent
+
+    def test_the_portal_client_sends_the_flag_only_when_asked(self):
+        sent = []
+        client = PortalClient(PORTAL)
+        client.request = lambda method, path, payload, authenticated=True: sent.append(payload) or {}
+        client.claim_begin(DEVICE_ID, 's' * 40, label_verifier='a' * 64)
+        client.claim_begin(DEVICE_ID, 's' * 40, clear_label_verifier=True)
+        self.assertNotIn('clear_label_verifier', sent[0])
+        self.assertEqual((sent[1]['clear_label_verifier'], 'label_verifier' in sent[1]), (True, False))
 
 
 # ====================================================================== link requests
