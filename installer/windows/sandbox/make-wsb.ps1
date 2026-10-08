@@ -8,7 +8,10 @@
 param(
     [Parameter(Mandatory=$true)][string]$Setup,
     [Parameter(Mandatory=$true)][string]$Folder,
-    [string]$Previous = ''
+    [string]$Previous = '',
+    # 2026-10-08: plant Windows 1.3.0's leftovers instead of running its
+    # (unsigned) setup, for Smart App Control machines.
+    [switch]$SimulatePrevious
 )
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Folder) { throw "Use a new folder: $Folder exists." }
@@ -22,6 +25,7 @@ if ($Previous) {
     if ($previousFile.Name -notmatch '^AnyAiCam-VMS-Setup-\d+\.\d+\.\d+-[0-9a-f]{7}\.exe$') { throw "Not an AnyAiCam setup name: $($previousFile.Name)" }
     Copy-Item -LiteralPath $previousFile.FullName -Destination (Join-Path $root.FullName 'previous')
 }
+if ($SimulatePrevious) { Set-Content -LiteralPath (Join-Path $root.FullName 'previous\SIMULATE-1.3.0') -Value 'plant Windows 1.3.0 leftovers' }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'validate-in-sandbox.ps1') -Destination (Join-Path $root.FullName 'scripts')
 # The disposable test cloud the cloud-linking checks claim against (never production).
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'test-cloud.py') -Destination (Join-Path $root.FullName 'scripts')

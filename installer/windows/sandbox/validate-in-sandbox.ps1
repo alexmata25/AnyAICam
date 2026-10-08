@@ -68,9 +68,31 @@ function BundledPython([string]$Pattern) {
 # retired and the PC must link with a fresh one-time link instead.
 $previous = Get-ChildItem 'C:\Validation\previous' -Filter 'AnyAiCam-VMS-Setup-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
 $previousLabelCode = ''
+$previousIdentity = ''
+# Simulated upgrade (2026-10-08): C:\Validation\previous\SIMULATE-1.3.0 plants
+# exactly what Windows 1.3.0 (aedecb6) leaves on a PC -- identity, permanent
+# claim code + verifier, "Show AnyAiCam claim code" shortcut -- for a Smart App
+# Control machine, where the unsigned 1.3.0 setup itself cannot run.
+if (Test-Path 'C:\Validation\previous\SIMULATE-1.3.0') {
+    $root = Join-Path $env:ProgramData 'AnyAiCam'
+    New-Item -ItemType Directory -Force (Join-Path $root 'config'), (Join-Path $root 'label') | Out-Null
+    $script:previousIdentity = [guid]::NewGuid().ToString()
+    Set-Content (Join-Path $root 'config\appliance_identity.json') ('{"appliance_id": "' + $script:previousIdentity + '", "installer_version": "1.3.0"}') -Encoding ASCII
+    $script:previousLabelCode = '7K3M-9QX2-H4TB'
+    Set-Content (Join-Path $root 'label\claim-label.txt') @('AnyAiCam claim code for this computer.', "Claim code: $script:previousLabelCode", "QR code: $TestPortal/claim#label=$script:previousLabelCode") -Encoding ASCII
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $verifier = -join ($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes('anyaicam-label-claim-v1:7K3M9QX2H4TB')) | ForEach-Object { $_.ToString('x2') })
+    Set-Content (Join-Path $root 'config\label_claim.json') ('{"version": 1, "verifier": "' + $verifier + '"}') -Encoding ASCII
+    $oldMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\AnyAiCam'
+    New-Item -ItemType Directory -Force $oldMenu | Out-Null
+    Set-Content (Join-Path $oldMenu 'Show AnyAiCam claim code.lnk') 'placeholder' -Encoding ASCII
+    Check 'simulated Windows 1.3.0 leftovers planted (identity, claim code, verifier, shortcut)' { 'planted' }
+}
 if ($previous) {
-    $old = Start-Process -FilePath $previous.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-previous.log') + '"') -Wait -PassThru
-    Check "previous release $($previous.Name) installed (exit 0)" { if ($old.ExitCode -ne 0) { throw "exit $($old.ExitCode)" }; 'exit 0' }
+    $previousError = ''
+    try { $old = Start-Process -FilePath $previous.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-previous.log') + '"') -Wait -PassThru -ErrorAction Stop }
+    catch { $old = $null; $previousError = $_.Exception.Message }
+    Check "previous release $($previous.Name) installed (exit 0)" { if (-not $old) { throw "did not start: $previousError" }; if ($old.ExitCode -ne 0) { throw "exit $($old.ExitCode)" }; 'exit 0' }
     $oldLabel = Join-Path $env:ProgramData 'AnyAiCam\label\claim-label.txt'
     Check 'previous release created its permanent claim code' {
         $line = Get-Content $oldLabel -ErrorAction Stop | Where-Object { $_ -like 'Claim code:*' } | Select-Object -First 1
@@ -186,6 +208,13 @@ $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\A
 . (Join-Path $app 'installer\open-claim-link.ps1')
 $ErrorActionPreference = 'Continue'  # (the helper sets Stop; every check here must run)
 function LinkCodeOf([string]$Link) { if ($Link -cmatch '#code=([0-9A-Z]{8})&link=windows$') { return $Matches[1] }; return '' }
+if ($previousIdentity) {
+    Check 'upgrade keeps the 1.3.0 appliance identity' {
+        $now = [string](Get-Content -Raw (Join-Path $data 'config\appliance_identity.json') | ConvertFrom-Json).appliance_id
+        if ($now -ne $previousIdentity) { throw 'identity changed' }
+        'same appliance_id'
+    }
+}
 Check 'Start menu: "Link this computer to AnyAiCam", no "Show AnyAiCam claim code"' {
     if (-not (Test-Path -LiteralPath (Join-Path $startMenu 'Link this computer to AnyAiCam.lnk'))) { throw 'no Link entry' }
     if (Test-Path -LiteralPath (Join-Path $startMenu 'Show AnyAiCam claim code.lnk')) { throw 'Show claim code entry present' }
