@@ -25,6 +25,16 @@ function the service calls between waits, so it:
 Eligibility (all required, otherwise the service only waits, as before):
 label_claim.json with a valid verifier, the installer identity file with a
 UUIDv4 appliance_id, and a portal_url that is https:// and not local.
+
+On-demand mode (Windows, 2026-10-08, on_demand=True): no label and no
+standing claim. A Windows PC has no printed label, and a label code is
+permanent until the PC is linked, so whoever learned it could claim an
+unlinked PC. Instead a claim is opened only when an administrator of the PC
+asks to link it (windows_link.py -> link_code()), WITHOUT a label verifier:
+the cloud can then only match the fresh 8-character code link_code() returns,
+which the next request replaces and which dies with the 15-minute claim. The
+step loop still polls and completes a claim that is open, and lets an
+expired one go instead of reopening it. Eligibility drops the label file.
 """
 from __future__ import annotations
 
@@ -50,6 +60,7 @@ CLAIMED_RETRY_SECONDS = 2      # proof known: complete right away
 IN_PROGRESS_RETRY_SECONDS = 60  # a claim this unit cannot resume is still open on the cloud
 PROVISIONED_RETRY_SECONDS = 3600  # the cloud already has this unit; a person must re-enroll it
 MAX_BACKOFF_SECONDS = 300
+ON_DEMAND_IDLE_SECONDS = 5      # on-demand mode with no open claim: only the local claim state is read
 
 
 def _read_json(path) -> dict | None:
@@ -65,13 +76,15 @@ def portal_origin(url: str) -> str:
     return f'{parts.scheme.lower()}://{(parts.netloc or "").lower()}'
 
 
-def ineligibility(config: AgentConfig) -> str | None:
-    """Why this appliance cannot claim itself headlessly, or None."""
-    label = _read_json(config.label_claim_file)
-    if not label:
-        return 'no label claim file (this unit was not imaged for a label claim)'
-    if not VERIFIER_PATTERN.match(str(label.get('verifier', ''))):
-        return 'the label claim file has no valid verifier'
+def ineligibility(config: AgentConfig, on_demand: bool = False) -> str | None:
+    """Why this appliance cannot claim itself headlessly, or None. On-demand
+    mode (Windows) needs no label."""
+    if not on_demand:
+        label = _read_json(config.label_claim_file)
+        if not label:
+            return 'no label claim file (this unit was not imaged for a label claim)'
+        if not VERIFIER_PATTERN.match(str(label.get('verifier', ''))):
+            return 'the label claim file has no valid verifier'
     identity = _read_json(config.installer_identity_file)
     if not identity or not DEVICE_ID_PATTERN.match(str(identity.get('appliance_id', '')).strip().lower()):
         return 'the installer identity file has no valid appliance_id'
@@ -83,8 +96,10 @@ def ineligibility(config: AgentConfig) -> str | None:
 
 class HeadlessClaim:
     def __init__(self, config: AgentConfig, log, client: PortalClient | None = None,
-                 finish_enrollment: Callable | None = None, clock: Callable[[], float] = time.time):
+                 finish_enrollment: Callable | None = None, clock: Callable[[], float] = time.time,
+                 on_demand: bool = False):
         self.config = config
+        self.on_demand = on_demand
         self.log = log
         self.client = client or PortalClient(config.portal_url)
         if finish_enrollment is None:
@@ -104,7 +119,7 @@ class HeadlessClaim:
     @classmethod
     def for_config(cls, config: AgentConfig, log, **kwargs):
         """A HeadlessClaim, or None (after logging why) if not eligible."""
-        reason = ineligibility(config)
+        reason = ineligibility(config, on_demand=kwargs.get('on_demand', False))
         if reason:
             log.info('Headless claim not available: %s; waiting for anyaicam-setup instead.', reason)
             return None
@@ -116,7 +131,9 @@ class HeadlessClaim:
         return str(_read_json(self.config.installer_identity_file)['appliance_id']).strip().lower()
 
     @property
-    def verifier(self) -> str:
+    def verifier(self) -> str | None:
+        if self.on_demand:
+            return None  # never a label: only the fresh claim code matches
         return str(_read_json(self.config.label_claim_file)['verifier'])
 
     def _note(self, message: str, *args) -> None:
@@ -159,6 +176,8 @@ class HeadlessClaim:
             return self._complete(state)
         if state:
             return self._poll(state)
+        if self.on_demand:
+            return float(ON_DEMAND_IDLE_SECONDS)  # a claim opens only through link_code()
         return self._begin(device_id, origin)
 
     def _begin(self, device_id: str, origin: str) -> float:
@@ -180,7 +199,8 @@ class HeadlessClaim:
                                        'opened_at': datetime.now().isoformat(), 'headless': True})
         self._opened_code = session.get('claim_code')  # memory only, for link_code()
         self._ok()
-        self._note('Waiting for the owner to claim this appliance with the code on its label.')
+        self._note('Waiting for the owner to confirm the link in the AnyAiCam portal.' if self.on_demand
+                   else 'Waiting for the owner to claim this appliance with the code on its label.')
         return float(PENDING_POLL_SECONDS)
 
     def _poll(self, state: dict) -> float:

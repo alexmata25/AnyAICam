@@ -1,126 +1,135 @@
 # Windows zero-terminal onboarding (2026-10-08)
 
-Branch `feature/windows-zero-terminal-20261008`, from `aedecb6` (Windows cloud
-linking, 53/53 in Windows Sandbox). Local only: not merged with the Linux
-zero-terminal branch, not pushed, built, signed or published.
+Two local branches, neither pushed nor merged into a release branch:
 
-Approved decisions (owner, 2026-10-08): the unsigned Windows setup is not
-promoted as a production-ready release; the Linux-style loopback setup page
-stays disabled on Windows; all existing Windows and Linux work is preserved.
+| Branch | What |
+|---|---|
+| `feature/windows-zero-terminal-20261008` (`b53bc12`, from `aedecb6`) | Windows-only fixes: full build integrity, no elevated browser, no visible / logged claim code, Administrators-only relink. Still uses 1.3.0's permanent label code. |
+| `feature/windows-linux-integration-20261008` (this document) | the above + Green Claude's Linux zero-terminal branch (`035eaa1`, merged unchanged) + the Windows completion: **one-time links instead of the permanent code**, the Windows guard in the agent, and the claim page's Windows link mode. The Windows 1.3.0 successor is built from here. |
+
+Owner decisions (2026-10-08): keep the Linux-style loopback setup page
+disabled on Windows; continue Windows 1.3.0 (the public 1.3.0-aedecb6 download
+stays as it is); preserve all existing Windows and Linux work.
 
 ## Customer experience
 
-1. Run the setup (administrator approval, as before). The last page shows
-   **no claim code**: *Link this computer to my AnyAiCam account* is ticked
-   and the text says there is no code to type.
-2. Finish → the browser of the person who ran the setup (never an elevated
-   browser) opens `https://app.anyaicam.com/claim#label=<code>&link=windows`.
-   `/claim` moves the fragment into the tab and out of the address bar, then
-   sign-in / account creation, then the claim page.
-3. The owner chooses a site and confirms (unchanged: owner sign-in, own-site
-   check, explicit confirmation). The AnyAiCamAgent service completes the link.
-4. Later or again: *Start menu → AnyAiCam → Link this computer to AnyAiCam*.
-   It asks for administrator approval (UAC), then opens the same page in the
-   signed-in user's normal browser. Already linked → "already linked".
-5. A repair / upgrade / reinstall of a linked PC says "This computer is linked"
-   and offers no link.
+1. Run the setup (administrator approval, as before). At the end it asks the
+   AnyAiCam Cloud Agent for a one-time link ("Preparing the link to your
+   AnyAiCam account..."). The last page shows **no code**; *Link this
+   computer to my AnyAiCam account* is ticked.
+2. Finish → the browser of the person who ran the setup (never elevated)
+   opens `https://app.anyaicam.com/claim#code=XXXXXXXX&link=windows`.
+3. Sign in or create an account. The claim page finds the PC by itself
+   (code hidden), says "Your Windows computer (ID ending …)", the owner
+   chooses a site and **confirms** (explicit click, own sites only).
+4. The agent completes the link; the page waits until the PC has enrolled
+   and checked in, then offers **Discover cameras**.
+5. Later or again: *Start menu → AnyAiCam → Link this computer to AnyAiCam*
+   (UAC: an administrator), which opens a new one-time link the same way. A
+   linked PC says so; a PC that is offline says so.
 
-**With today's cloud (`4ffbf35`)** step 3 still shows the code prefilled in
-the claim page's input box and needs a *Look up* click: nothing is typed, but
-the code is visible. Hiding it is the shared cloud change below.
+## The permanent claim code is retired
 
-## Changes
+Windows 1.3.0 created a 12-character code at install that stayed valid until
+the PC was linked (shown on the finish page and by a Start menu entry; kept
+in `label\claim-label.txt`). Anyone who learned it could claim an unlinked PC
+for their own account.
 
-| File | Change |
-|---|---|
-| `installer/windows/source-integrity.ps1` (new) | Build integrity: every repository folder the .iss packages (read from its `Source: "..\..\<folder>\*"` lines -- `app`, `appliance-agent/anyaicam_agent`) and `installer/windows` must be exactly the commit: no change, staged change, deletion, untracked file, or git-ignored file in a packaged folder (the .iss packages whatever is on disk), except what the .iss excludes (`tests\*`, `__pycache__\*`). `installer/windows` is packaged file by file, so only its changes and untracked files count; `vendor/` there may hold only the pinned inputs and locked wheels. |
-| `installer/windows/build.ps1` | Uses it (was `git status --porcelain -- app installer/windows`, which missed the agent and every ignored file). |
-| `installer/windows/AnyAiCam-VMS.iss` | `[Run]`: both finish-page entries `runasoriginaluser`; the link is a `Parameters` value of a hidden PowerShell `Start-Process` with `dontlogparameters` (Inno logs every [Run] `Filename` -- the old entry wrote the code to `%TEMP%\Setup Log*.txt` on every interactive install; silent Sandbox runs skip postinstall entries, so the Sandbox scan could not see it). Link validated to `https://` + `/claim#label=` + `[A-Za-z0-9.:/#=-]` before it reaches the command line. Finish page: no code; linked PCs offer no link. `[Icons]`: *Link this computer to AnyAiCam* replaces *Show AnyAiCam claim code* (removed on upgrade by `[InstallDelete]`). |
-| `installer/windows/open-claim-link.ps1` (new) | The Start menu entry: elevates first (UAC), only then reads the Administrators-only label file, and opens the link through `explorer.exe` so the browser runs un-elevated as the signed-in user. Writes and prints nothing. |
-| `installer/windows/agent-launcher.ps1` | `ANYAICAM_LINK_PORT=0`: the Linux agent's loopback link page stays off on Windows after any future merge (agent.env cannot override it). |
-| `installer/windows/sandbox/*` | New automatic checks (Start menu entries, link helper, agent has no listening socket, confirm through the setup's link) and a by-hand interactive section. |
-
-`cloud-link.ps1`, the agent, the cloud (`app/`) and the claim protocol are
-unchanged.
+Now:
+* **No code at rest.** The setup creates none; an upgrade from 1.3.0 deletes
+  `label\claim-label.txt` and `config\label_claim.json` (`cloud-link.ps1`).
+* **No standing claim.** The agent runs `HeadlessClaim(on_demand=True)` on
+  Windows: it opens a claim only when an administrator asks for a link, and
+  **without a label verifier**, so the cloud can match nothing but the code
+  in that link.
+* **One-time codes.** Every request resumes the same claim with the agent's
+  device secret and gets a fresh 8-character code; the previous code stops
+  working at once (cloud `claim/begin`). A claim lasts 15 minutes and is not
+  reopened by itself after it expires.
+* A label claim left open by 1.3.0 is resumed without its label on the next
+  request and expires within 15 minutes; the old code can no longer be
+  found once it has.
 
 ## Who can link (local threat model)
 
-| Surface | Before (`aedecb6`) | Now |
+| Surface | 1.3.0 (`aedecb6`) | Successor |
 |---|---|---|
-| Finish page | showed the code to whoever sat at the setup | no code; link opens only for the person who ran the (admin-approved) setup |
-| Setup log (`%TEMP%`, user-readable) | the claim link with the code | parameters withheld (`dontlogparameters`) |
-| Start menu | "Show claim code" (Notepad, elevated) | "Link this computer" (elevated; code never displayed) |
-| Local network/port | none | none -- the Linux loopback page is off (`ANYAICAM_LINK_PORT=0`) |
-| Label file | SYSTEM/Administrators only | unchanged |
+| Finish page | showed the permanent code | no code; a one-time link opens for the person who ran the (admin-approved) setup |
+| Setup log (`%TEMP%`, user-readable) | the claim link with the code ([Run] Filename) | nothing: the link is a `dontlogparameters` parameter; the setup's request uses `Exec` (no output logged) |
+| Start menu | "Show claim code" (elevated Notepad) | "Link this computer" (UAC; the code is never displayed) |
+| Local web page / port | none | none: `ANYAICAM_LINK_PORT=0` **and** `start_link_server()` returns before binding on Windows whatever the variable says |
+| Link requests | — | `C:\ProgramData\AnyAiCam\agent\link-requests`, SYSTEM/Administrators-only (inherited); a standard user can neither ask nor read an answer |
+| Code at rest | `label\claim-label.txt` (permanent) | none; an answer file holds a one-time code until the requester reads and deletes it (deleted by the agent after 2 minutes otherwise) |
 
-A standard user cannot obtain the code or start a link without an
-administrator's UAC approval. On the Linux branch, by contrast, anyone signed
-in to the appliance's desktop can link it -- acceptable for a single-purpose
-appliance, not for a shared Windows PC (owner decision 2026-10-08).
+How the link reaches a non-elevated browser:
+* **Setup:** `open-claim-link.ps1 -Prepare` (elevated, from the setup) writes
+  `<status>\n<link>` into the setup's own `{tmp}` with `CreateNew`; the setup
+  reads and deletes it, validates the link (`https://…/claim#code=[0-9A-Z]{8}&link=windows`
+  and a character allow-list) and the finish-page entry opens it with
+  `runasoriginaluser`.
+* **Start menu:** the script, as the signed-in user, starts a copy of itself
+  with UAC and waits; the elevated copy requests the link and writes it into
+  that user's `%TEMP%\anyaicam-link-<random>.txt` with `CreateNew`; the first
+  copy reads, deletes, validates and opens it as itself. If an administrator
+  approved with *their* account (over-the-shoulder UAC) the hand-back file is
+  in their profile and the customer is told to sign in as the administrator.
 
 Residual, documented:
-* The Windows code is the permanent label code (valid until the PC is
-  linked), not Linux's fresh per-click code. Someone who obtained it earlier
-  (an administrator, a backup of ProgramData) could claim an unlinked PC.
-  A fresh-code design needs the agent's `link_code()` (Linux branch) plus an
-  Administrators-only local channel; revisit after the merge.
-* The link is briefly on a process command line (the original user's hidden
-  PowerShell; explorer.exe for the Start menu entry); readable by that user
-  and administrators, and recorded only if the PC audits process command
-  lines (Security log, Administrators-only).
-* Over-the-shoulder UAC (a standard user types an admin's password): the Start
-  menu entry then opens the browser as that administrator.
+* The one-time link is briefly on a process command line (the original
+  user's hidden PowerShell); visible to that user and administrators, and
+  recorded only where process command-line auditing is enabled.
 * Browser extensions in the owner's browser can read the tab, as on Linux.
+* The person who runs the setup gets the link: the setup itself already
+  needs an administrator's approval.
 
-## Shared cloud change -- for Green Claude (not made here)
+## Changes on the integration branch (beyond `b53bc12` and `035eaa1`)
 
-The claim page lives in `app/appliance_claims.py`, which the Linux branch
-(`feature/linux-zero-terminal-onboarding-20261008`, `035eaa1`) rewrote. To
-avoid a conflicting second edit, the Windows branch changes **no** cloud code.
-Requested on top of `035eaa1`:
+| File | Change |
+|---|---|
+| `appliance-agent/tests/conftest.py` | the only merge conflict (add/add): both autouse fixtures kept |
+| `appliance-agent/anyaicam_agent/headless_claim.py` | `on_demand` mode (no label, no standing claim); Linux unchanged |
+| `appliance-agent/anyaicam_agent/windows_link.py` (new) | `LinkRequests`: the Administrators-only request folder (nonce names, plain files only, 2-minute limits, atomic answers, waits up to 20 s for the claim right after the service starts, never logs a code) |
+| `appliance-agent/anyaicam_agent/service.py` | Windows: on-demand factory, `start_link_requests()`, and `start_link_server()` returns `None` before binding |
+| `app/appliance_claims.py` | `/claim` keeps `link=windows`; the claim page's link mode uses Windows words (computer, Start menu) -- **for Green Claude's review** |
+| `installer/windows/cloud-link.ps1` | no claim code; retires 1.3.0's on upgrade |
+| `installer/windows/open-claim-link.ps1` | requests one-time links (Start menu / elevated copy / `-Prepare`) |
+| `installer/windows/AnyAiCam-VMS.iss` | `RequestAccountLink` at the end of interactive installs, `IsAccountLink`, finish page (linked / link ready / link later), no `label` folder |
+| `installer/windows/sandbox/*` | one-time link checks, upgrade mode (`make-wsb.ps1 -Previous <1.3.0 setup>`) |
 
-1. **`/claim`**: when the fragment has `link=windows` next to `label=`, also
-   set `sessionStorage['anyaicam.claimLabelLink']='windows'` (the existing
-   label regex already accepts `label=XXXX-XXXX-XXXX&link=windows`; a cloud
-   without this change keeps today's behaviour, so the setup works with both).
-2. **Claim page, installer link mode** (`claimLabel` + `claimLabelLink`):
-   keep the 12-character code in a JS variable only (never in the input),
-   hide the code input and *Look up*, look the PC up at once, show
-   "Only confirm if you just chose *Link this computer to my AnyAiCam
-   account* on your own computer.", and on failure "This link has expired or
-   was already used. On the computer: Start menu → AnyAiCam → Link this
-   computer to AnyAiCam." In practice: let `linkCode` hold a 12-character label
-   code too and have `claimBody()` send it as `label_code`.
-3. Owner sign-in, site choice, explicit Confirm, the enrollment-readiness wait
-   (`waitForAppliance`) and `?return=setup` → Discover cameras: unchanged
-   (they already work for a label lookup).
-4. Copy: the intro is label/hardware-oriented; add the Windows case.
-5. Tests: `/claim#label=…&link=windows` → code hidden, auto-lookup, explicit
-   confirm, readiness wait; plain `#label=` (printed QR) unchanged unless the
-   owner decides printed labels should also auto-look-up.
-6. Deploy with the Linux cloud part (blue/green, owner approval). Until then
-   production behaves as described above (code visible in the input).
+## Cloud dependency -- for Green Claude
 
-## Before the Windows and Linux branches are combined
+The successor's links need the zero-terminal claim page (`#code=` link mode,
+enrollment wait) from `035eaa1`, plus the small Windows wording change above,
+deployed to the AnyAiCam cloud (blue/green, owner approval). Against today's
+cloud (`4ffbf35`) a `#code=` link lands on the manual claim page with an
+empty code box, so **the successor must not ship before that deploy.** The
+installed 1.3.0-aedecb6 keeps working with today's cloud (label code).
 
-1. `appliance-agent/tests/conftest.py` (add/add, the only textual conflict):
-   keep both autouse fixtures.
-2. Add a code-level Windows guard in `service.start_link_server()` (return
-   before binding when `windows.IS_WINDOWS`), with a test, in addition to
-   `ANYAICAM_LINK_PORT=0`.
-3. Full agent, app and installer suites; Windows Sandbox run (the automatic
-   check "the agent opens no listening port" covers 2).
+Please review in `app/appliance_claims.py` on this branch:
+1. `/claim`: `link=windows` next to `code=` → `sessionStorage['anyaicam.claimLinkSource']='windows'`.
+2. Claim page: `fromWindows` only changes words ("Finding your computer…",
+   "Your Windows computer (ID ending …)", the confirm warning, and the
+   expired-link advice pointing to the Start menu entry). Same hidden code,
+   auto-lookup, explicit confirm and readiness wait as Linux.
+3. The intro still mentions "the last page of the Windows installer" (true
+   for installed 1.3.0-aedecb6 PCs); keep or reword.
 
 ## Tests
 
-* `installer/tests/test_windows_zero_terminal.py` (27): build integrity in a
-  throwaway git repository with the real .iss (edited / untracked / ignored /
-  staged / deleted packaged files fail; excluded and pinned files pass;
-  folders come from the .iss; unknown Excludes stop the build; extra vendor
-  files fail); finish-page entries run as the original user, link never a
-  logged `Filename`, `dontlogparameters`; no code on the finish page or Start
-  menu; linked PC offers no link; link character check; the real .iss compiles
-  (`ISCC /O-`, nothing written); `open-claim-link.ps1` with the real
-  `cloud-link.ps1` output, refusal of malformed links, link state, elevation
-  before reading, un-elevated browser, no output; `ANYAICAM_LINK_PORT=0`.
-* `installer/tests/test_windows_installer.py`: claim code never shown or logged.
+* `appliance-agent/tests/test_windows_link_requests.py` (22): on-demand
+  eligibility, no standing claim, no label sent, fresh code per request,
+  completion, expiry not reopened, 1.3.0 claim resumed; link requests (link
+  only in the fragment, linked, startup wait, unavailable, https only,
+  malformed / old / non-file requests ignored, unread answers deleted, code
+  never logged, thread); service wiring (no LinkServer on Windows even with
+  `ANYAICAM_LINK_PORT=8790`, link requests on Windows only, Linux label claim).
+* `app/tests/test_windows_zero_terminal_e2e.py` (5): real cloud routes under
+  uvicorn + real agent: link with no code and no label, new request kills the
+  old code, expired claim not reopened, 1.3.0 label claim resumed and linked,
+  another account's site refused.
+* `installer/tests/test_windows_zero_terminal.py`: build integrity (from
+  `b53bc12`), finish page / Start menu / log rules, setup link request,
+  `open-claim-link.ps1` against a stand-in agent (fresh link, malformed links
+  refused, linked, timeout, one-time hand-back files), Inno compile.
+* `installer/tests/test_windows_cloud_link.py`: no code created; upgrade
+  retires 1.3.0's code.

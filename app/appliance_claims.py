@@ -824,25 +824,30 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         // The code stays in this variable -- never shown on the page -- and the
         // appliance is looked up at once; the owner only chooses the site and
         // confirms.
-        let linkCode='',claimedDevice='';
+        let linkCode='',claimedDevice='',linkSource='';
         try{linkCode=sessionStorage.getItem('anyaicam.claimCode')||'';sessionStorage.removeItem('anyaicam.claimCode')}catch(e){}
+        // Windows (2026-10-08): the same link mode from the Windows setup or
+        // its Start menu entry (/claim#code=...&link=windows); only the words
+        // differ -- a PC, not an appliance with a setup page.
+        try{linkSource=sessionStorage.getItem('anyaicam.claimLinkSource')||'';sessionStorage.removeItem('anyaicam.claimLinkSource')}catch(e){}
         if(!/^[0-9A-Z]{8}$/.test(linkCode))linkCode='';
+        const fromWindows=Boolean(linkCode)&&linkSource==='windows';
         if(linkCode){
           document.getElementById('claim-code-input').closest('label').hidden=true;
           document.getElementById('claim-lookup-button').hidden=true;
-          document.getElementById('claim-lookup-message').textContent='Finding your appliance…';
+          document.getElementById('claim-lookup-message').textContent=fromWindows?'Finding your computer…':'Finding your appliance…';
         }
         document.getElementById('claim-lookup-button').onclick=async()=>{
           const message=document.getElementById('claim-lookup-message');
           message.textContent='';
           const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(claimBody())}),body=await response.json();
-          if(!response.ok&&linkCode){linkCode='';document.getElementById('claim-code-input').closest('label').hidden=false;document.getElementById('claim-lookup-button').hidden=false;message.textContent='This link has expired or was already used. On the appliance, open AnyAiCam Setup and choose “Link this appliance” again.';return}
+          if(!response.ok&&linkCode){linkCode='';document.getElementById('claim-code-input').closest('label').hidden=false;document.getElementById('claim-lookup-button').hidden=false;message.textContent=fromWindows?'This link has expired or was already used. On the computer, choose Start menu → AnyAiCam → Link this computer to AnyAiCam again.':'This link has expired or was already used. On the appliance, open AnyAiCam Setup and choose “Link this appliance” again.';return}
           if(!response.ok){message.textContent=response.status===404?'No appliance is waiting with that code. Check the code, and that the appliance is plugged into power and your network (it can take a few minutes to start).':(body.detail||'Claim code not found or expired.');return}
           claimedDevice=String(body.device_id||'');
           // A link can be sent by anyone: confirm only one's own appliance.
-          if(linkCode)document.getElementById('claim-confirm-message').textContent='Only confirm if you just chose “Link this appliance” on your own AnyAiCam appliance.';
+          if(linkCode)document.getElementById('claim-confirm-message').textContent=fromWindows?'Only confirm if you just chose to link your own computer to AnyAiCam (at the end of its AnyAiCam setup, or Start menu → AnyAiCam → Link this computer to AnyAiCam).':'Only confirm if you just chose “Link this appliance” on your own AnyAiCam appliance.';
           // A readable name, not the raw device UUID (2026-10-02).
-          document.getElementById('claim-device-id').textContent='AnyAiCam appliance (ID ending '+String(body.device_id||'').replace(/-/g,'').slice(-6).toUpperCase()+')';
+          document.getElementById('claim-device-id').textContent=(fromWindows?'Your Windows computer (ID ending ':'AnyAiCam appliance (ID ending ')+String(body.device_id||'').replace(/-/g,'').slice(-6).toUpperCase()+')';
           document.getElementById('claim-step-code').hidden=true;
           document.getElementById('claim-step-confirm').hidden=false;
         };
@@ -905,6 +910,8 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
   // From the appliance's own "AnyAiCam Setup" page (zero-terminal onboarding).
   var linked=/(?:^|[#&])code=([0-9A-Za-z]{8})(?:&|$)/.exec(hash);
   if(linked){try{sessionStorage.setItem('anyaicam.claimCode',linked[1].toUpperCase())}catch(e){}}
+  // From the Windows setup or its Start menu entry (2026-10-08).
+  if(linked&&/(?:^|[#&])link=windows(?:&|$)/.test(hash)){try{sessionStorage.setItem('anyaicam.claimLinkSource','windows')}catch(e){}}
   try{history.replaceState(null,'',location.pathname)}catch(e){}
   location.replace('/customer/claim-appliance?return=setup');
 })();

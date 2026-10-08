@@ -39,10 +39,10 @@ Name: "{commonappdata}\AnyAiCam\recordings"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\hls"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\logs"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\mediamtx"; Flags: uninsneveruninstall
-; Cloud agent state (credential, offline queue) and the claim code: kept on
-; uninstall like the rest of the data, so a reinstall stays linked.
+; Cloud agent state (credential, offline queue): kept on uninstall like the
+; rest of the data, so a reinstall stays linked. (2026-10-08: no label folder;
+; the permanent claim code is retired, cloud-link.ps1.)
 Name: "{commonappdata}\AnyAiCam\agent"; Flags: uninsneveruninstall
-Name: "{commonappdata}\AnyAiCam\label"; Flags: uninsneveruninstall
 [InstallDelete]
 ; An upgrade replaces the program code completely, so modules removed from the
 ; VMS never linger next to the new ones. Data lives in {commonappdata}\AnyAiCam.
@@ -81,13 +81,15 @@ Source: "vendor\vc_redist.x64-14.44.35211.exe"; DestDir: "{tmp}"; Flags: deletea
 [Icons]
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
-; 2026-10-08: opens the link page without showing the claim code; only an
-; administrator of this PC can (open-claim-link.ps1 elevates before it reads
-; the Administrators-only code file).
+; 2026-10-08: asks the agent for a fresh, one-time account link and opens it
+; without showing any code; only an administrator of this PC can
+; (open-claim-link.ps1 elevates; the agent's request folder is
+; Administrators-only).
 Name: "{group}\Link this computer to AnyAiCam"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\installer\open-claim-link.ps1"""
 [Run]
-; The claim page with this computer's code in the URL fragment (never sent to
-; a server; /claim moves it into the tab and out of the address bar).
+; The claim page with a fresh one-time code in the URL fragment (never sent to
+; a server; /claim moves it into the tab and out of the address bar); the setup
+; asked the agent for it at the end of the install (RequestAccountLink).
 ; runasoriginaluser: the browser opens as the person who started the setup,
 ; never elevated. The link is a PowerShell parameter, not the Filename, so
 ; dontlogparameters keeps the code out of the setup log (Inno logs every
@@ -184,6 +186,59 @@ begin
     Result := 0;
 end;
 
+// ------------------------------------------------------------ account link
+// 2026-10-08: no claim code is ever shown, stored or logged by the setup.
+// At the end of an interactive install the setup (elevated) asks the agent
+// for a fresh, one-time link through open-claim-link.ps1 -Prepare, which
+// writes "<status>\n<link>" into the setup's own temporary folder; it is read
+// and deleted at once and kept only in AccountLink. The finish page's [Run]
+// entry hands it to the browser of the person who ran the setup
+// (runasoriginaluser, dontlogparameters).
+var
+  AccountLink: String;
+  AccountLinkStatus: String;
+
+// https://<cloud>/claim#code=XXXXXXXX&link=windows and nothing else: it is
+// put inside single quotes on a PowerShell command line.
+function IsAccountLink(const Link: String): Boolean;
+var
+  I, Code: Integer;
+begin
+  Result := False;
+  if (Pos('https://', Link) <> 1) or (Length(Link) > 200) then Exit;
+  Code := Pos('/claim#code=', Link);
+  if (Code = 0) or (Length(Link) <> Code + Length('/claim#code=') + 8 + Length('&link=windows') - 1) then Exit;
+  if Copy(Link, Length(Link) - Length('&link=windows') + 1, Length('&link=windows')) <> '&link=windows' then Exit;
+  for I := 1 to Length(Link) do
+    if Pos(Copy(Link, I, 1), 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:/-#=&') = 0 then Exit;
+  Result := True;
+end;
+
+procedure RequestAccountLink;
+var
+  ResultFile: String;
+  Lines: TArrayOfString;
+  ResultCode: Integer;
+begin
+  AccountLink := '';
+  AccountLinkStatus := 'unavailable';
+  ResultFile := ExpandConstant('{tmp}\anyaicam-account-link.txt');
+  DeleteFile(ResultFile);
+  WizardForm.StatusLabel.Caption := 'Preparing the link to your AnyAiCam account...';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{app}\installer\open-claim-link.ps1') + '" -Prepare "' + ResultFile + '"',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then Exit;
+  if LoadStringsFromFile(ResultFile, Lines) and (GetArrayLength(Lines) >= 1) then
+  begin
+    AccountLinkStatus := Trim(Lines[0]);
+    if (AccountLinkStatus = 'ok') and (GetArrayLength(Lines) >= 2) and IsAccountLink(Trim(Lines[1])) then
+      AccountLink := Trim(Lines[1])
+    else if AccountLinkStatus = 'ok' then
+      AccountLinkStatus := 'unavailable';
+  end;
+  DeleteFile(ResultFile);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
@@ -196,6 +251,10 @@ begin
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'start', 'Starting the AnyAiCam cloud agent service...');
+    // Interactive installs only: a silent install opens no browser, so it
+    // asks for no link (and opens no claim).
+    if not WizardSilent then
+      RequestAccountLink;
   except
     PostInstallFailed := True;
     Log('AnyAiCam setup failed; exit code will be ' + IntToStr(PostInstallFailedExitCode) + ': ' + GetExceptionMessage);
@@ -205,42 +264,9 @@ begin
 end;
 
 // ------------------------------------------------------------ claim code
-// cloud-link.ps1 writes the code to an Administrators-only file; setup runs
-// elevated, so it can read it. 2026-10-08: the code is never shown (finish
-// page, Start menu) and never logged; it only travels, in the link's URL
-// fragment, to the browser of the person who ran the setup.
-function ClaimLabelValue(const Prefix: String): String;
-var
-  Lines: TArrayOfString;
-  I: Integer;
-begin
-  Result := '';
-  if LoadStringsFromFile(ExpandConstant('{commonappdata}\AnyAiCam\label\claim-label.txt'), Lines) then
-    for I := 0 to GetArrayLength(Lines) - 1 do
-      if Pos(Prefix, Lines[I]) = 1 then
-      begin
-        Result := Trim(Copy(Lines[I], Length(Prefix) + 1, Length(Lines[I])));
-        Exit;
-      end;
-end;
-
-// The link the finish page opens: the label file's QR link
-// (https://<cloud>/claim#label=XXXX-XXXX-XXXX) plus link=windows, which tells
-// the claim page the owner came from this computer's own setup -- the same
-// link open-claim-link.ps1 builds. It is put inside single quotes on a
-// PowerShell command line, so only these characters are accepted; '' (no
-// link offered) when anything looks wrong.
 function ClaimLink(Param: String): String;
-var
-  Link: String;
-  I: Integer;
 begin
-  Result := '';
-  Link := ClaimLabelValue('QR code:');
-  if (Pos('https://', Link) <> 1) or (Pos('/claim#label=', Link) = 0) or (Length(Link) > 200) then Exit;
-  for I := 1 to Length(Link) do
-    if Pos(Copy(Link, I, 1), 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:/-#=') = 0 then Exit;
-  Result := Link + '&link=windows';
+  Result := AccountLink;
 end;
 
 // Linked once the agent holds its cloud credential (a repair, upgrade or
@@ -252,18 +278,22 @@ end;
 
 function HasClaimLink(): Boolean;
 begin
-  Result := (not PostInstallFailed) and (not IsLinked) and (ClaimLink('') <> '');
+  Result := (not PostInstallFailed) and (not IsLinked) and (AccountLink <> '');
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID <> wpFinished) or PostInstallFailed then Exit;
-  if IsLinked then
+  if IsLinked or (AccountLinkStatus = 'linked') then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
       'This computer is linked to your AnyAiCam account.'
   else if HasClaimLink then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
       'To see this computer''s cameras from anywhere, keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
       'Your browser opens AnyAiCam: sign in (or create an account), choose a site and confirm. There is no code to type.' + #13#10#13#10 +
-      'Later: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).';
+      'Later: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).'
+  else
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'To see this computer''s cameras from anywhere, link it to your AnyAiCam account when this PC is online: ' +
+      'Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).';
 end;

@@ -17,6 +17,7 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
 from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential
 from .headless_claim import HeadlessClaim, ineligibility as headless_ineligibility
 from .link_server import DEFAULT_PORT as LINK_DEFAULT_PORT, LinkServer
+from .windows_link import LinkRequests
 from .discovery import scan
 from .metrics import collect
 from .lan_addresses import publish as publish_lan_addresses
@@ -48,10 +49,13 @@ HEADLESS_RECHECK_SECONDS = 30
 
 class ApplianceAgent:
     def __init__(self,config):
-        self.headless_claim_factory=HeadlessClaim.for_config
+        # Windows (2026-10-08): on-demand claims, no label (headless_claim.py).
+        self.headless_claim_factory=(lambda config,log,**kwargs:HeadlessClaim.for_config(config,log,on_demand=True,**kwargs)) if windows.IS_WINDOWS else HeadlessClaim.for_config
         # Zero-terminal onboarding (2026-10-08): the headless claim is shared
-        # with the local "AnyAiCam Setup" page (link_server.py).
-        self.headless=None; self.link_server=None
+        # with the local "AnyAiCam Setup" page (link_server.py) on Linux and
+        # with the administrators-only link requests (windows_link.py) on
+        # Windows.
+        self.headless=None; self.link_server=None; self.link_requests=None
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
         # RDM-2 Group 2A/2B/2F/2G: restart_signal is the real wrapper
         # (Group 2B) around this same agent's own stop_event -- exactly
@@ -549,7 +553,7 @@ class ApplianceAgent:
                 return
             if headless is None and time.monotonic()>=next_recheck:
                 next_recheck=time.monotonic()+HEADLESS_RECHECK_SECONDS
-                if headless_ineligibility(self.config) is None:
+                if headless_ineligibility(self.config,on_demand=windows.IS_WINDOWS) is None:
                     headless=self.headless=self.headless_claim_factory(self.config,self.log)
                     if headless is not None: self.log.info('Headless claim is now available; opening a claim.')
                     continue
@@ -568,6 +572,12 @@ class ApplianceAgent:
         """The appliance's own "AnyAiCam Setup" page (link_server.py) on
         127.0.0.1 only. ANYAICAM_LINK_PORT=0 turns it off. Never fatal: a
         busy port only means the page is unavailable."""
+        # Never on Windows, whatever ANYAICAM_LINK_PORT says (owner decision
+        # 2026-10-08): the agent runs as LocalSystem on a PC that may have
+        # several users, and anyone signed in could use a loopback page to
+        # link it to their own account. Windows links through
+        # administrators-only requests instead (start_link_requests).
+        if windows.IS_WINDOWS: return None
         raw=os.environ.get('ANYAICAM_LINK_PORT',str(LINK_DEFAULT_PORT)).strip()
         if raw=='0': return None
         try:
@@ -577,11 +587,23 @@ class ApplianceAgent:
             self.log.warning('AnyAiCam Setup page not started (%s)',error)
             self.link_server=None
         return self.link_server
+    def start_link_requests(self):
+        """Windows only: answers account link requests from the setup and
+        the Start menu entry (windows_link.py; Administrators-only folder, no
+        socket). Never fatal."""
+        if not windows.IS_WINDOWS: return None
+        try:
+            self.link_requests=LinkRequests(self.config,self.log,headless=lambda:self.headless if self.headless is not None and not self.headless.done else None,linked=self.linked).start()
+        except OSError as error:
+            self.log.warning('Account link requests not available (%s)',error)
+            self.link_requests=None
+        return self.link_requests
     def run(self):
-        self.start_link_server()
+        self.start_link_server(); self.start_link_requests()
         try: self._run()
         finally:
             if self.link_server is not None: self.link_server.stop()
+            if self.link_requests is not None: self.link_requests.stop()
     def _run(self):
         self._await_activation()
         if self.stop_event.is_set():

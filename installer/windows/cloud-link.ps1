@@ -4,21 +4,15 @@
 # claim_label_provision, cloud_portal_provision, stamp_release), run by
 # install-runtime.ps1 on every install, repair and upgrade:
 #   config\appliance_identity.json  UUIDv4 appliance_id; created once, kept.
-#   label\claim-label.txt           the claim code (12-char Crockford base32,
-#                                   60 bits) in plaintext; created once, kept,
-#                                   so a code already shown or printed stays
-#                                   valid. The data folder is SYSTEM/
-#                                   Administrators-only.
-#   config\label_claim.json         only the verifier the agent sends,
-#                                   sha256("anyaicam-label-claim-v1:"+code),
-#                                   rewritten from the label file every run.
+#   label\claim-label.txt,          RETIRED 2026-10-08 and removed: Windows
+#   config\label_claim.json         1.3.0's permanent claim code and its
+#                                   verifier (see "claim code" below).
 #   config\agent.env                ANYAICAM_PORTAL_URL (-PortalUrl, else the
 #                                   saved one, else https://app.anyaicam.com)
 #                                   and ANYAICAM_AGENT_MODE=production.
 #   config\vms_release.json         the installed release the agent reports.
-# The agent service (headless_claim.py) claims the PC with the verifier once
-# the owner enters the code at <portal>/claim. Never logged: the code or its
-# verifier.
+# The agent service links the PC through a fresh, one-time link an
+# administrator asks for (open-claim-link.ps1 -> windows_link.py).
 param(
     [Parameter(Mandatory=$true)][string]$DataRoot,
     [Parameter(Mandatory=$true)][string]$AppVersion,
@@ -27,7 +21,6 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $DefaultPortalUrl = 'https://app.anyaicam.com'
-$Alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'  # Crockford base32: no I, L, O, U
 $utf8 = [Text.UTF8Encoding]::new($false)
 
 function Test-PortalUrl([string]$Url) {
@@ -36,24 +29,6 @@ function Test-PortalUrl([string]$Url) {
     if ($uri.Scheme -ne 'https' -or -not $uri.Host) { return $false }
     $hostName = $uri.Host.ToLowerInvariant().Trim('[', ']')
     return -not ($hostName -eq 'localhost' -or $hostName -eq '0.0.0.0' -or $hostName -eq '::1' -or $hostName.StartsWith('127.'))
-}
-
-function New-LabelCode {
-    # 12 bytes, each mod 32: 256 is a multiple of 32, so every character is uniform (60 bits).
-    $bytes = New-Object byte[] 12
-    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
-    return -join ($bytes | ForEach-Object { $Alphabet[$_ % 32] })
-}
-
-function Test-LabelCode([string]$Code) { return $Code -cmatch '^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{12}$' }
-
-function Format-LabelCode([string]$Code) { return '{0}-{1}-{2}' -f $Code.Substring(0, 4), $Code.Substring(4, 4), $Code.Substring(8, 4) }
-
-function Get-LabelVerifier([string]$Code) {
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { $hash = $sha.ComputeHash($utf8.GetBytes('anyaicam-label-claim-v1:' + $Code)) } finally { $sha.Dispose() }
-    return -join ($hash | ForEach-Object { $_.ToString('x2') })
 }
 
 function Write-TextFile([string]$Path, [string[]]$Lines) {
@@ -79,7 +54,7 @@ if ($PortalUrl -and -not (Test-PortalUrl $PortalUrl)) {
 }
 $config = Join-Path $DataRoot 'config'
 $labelDir = Join-Path $DataRoot 'label'
-New-Item -ItemType Directory -Force -Path $config, $labelDir | Out-Null
+New-Item -ItemType Directory -Force -Path $config | Out-Null
 
 # ------------------------------------------------------------ identity
 $identityFile = Join-Path $config 'appliance_identity.json'
@@ -103,24 +78,18 @@ $agentEnv['ANYAICAM_AGENT_MODE'] = 'production'
 $portal = $agentEnv['ANYAICAM_PORTAL_URL']
 Write-TextFile $agentEnvFile (@('# Managed by the AnyAiCam Windows installer.') + @($agentEnv.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }))
 
-# ------------------------------------------------------------ claim code
-$labelFile = Join-Path $labelDir 'claim-label.txt'
-$code = ''
-if (Test-Path -LiteralPath $labelFile) {
-    $saved = Get-Content -LiteralPath $labelFile | Where-Object { $_ -like 'Claim code:*' } | Select-Object -First 1
-    if ($saved) { $code = ($saved -replace '^Claim code:\s*', '' -replace '[\s-]', '').ToUpperInvariant() }
+# ------------------------------------------------------------ claim code (retired)
+# Windows 1.3.0 kept a permanent claim code in label\claim-label.txt and its
+# verifier in config\label_claim.json: valid until the PC was linked, so
+# whoever learned it (finish page, Start menu, a backup) could claim an
+# unlinked PC. A Windows PC is now linked only through a fresh, one-time link
+# an administrator asks for, and the agent sends no label (on-demand claims),
+# so an upgrade removes both. A label claim 1.3.0 left open on the cloud
+# expires within 15 minutes and is not reopened.
+foreach ($retired in @((Join-Path $labelDir 'claim-label.txt'), (Join-Path $config 'label_claim.json'))) {
+    if (Test-Path -LiteralPath $retired) { Remove-Item -LiteralPath $retired -Force }
 }
-if (-not (Test-LabelCode $code)) {
-    $code = New-LabelCode
-    Write-TextFile $labelFile @(
-        'AnyAiCam claim code for this computer. Keep private: whoever has it can link this computer to their account.',
-        "Claim code: $(Format-LabelCode $code)",
-        "QR code: $($portal.TrimEnd('/'))/claim#label=$(Format-LabelCode $code)",
-        "Appliance ID: $applianceId",
-        "Created: $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-    )
-}
-Write-TextFile (Join-Path $config 'label_claim.json') @("{`"version`": 1, `"verifier`": `"$(Get-LabelVerifier $code)`"}")
+if ((Test-Path -LiteralPath $labelDir) -and -not (Get-ChildItem -LiteralPath $labelDir -Force)) { Remove-Item -LiteralPath $labelDir -Force }
 
 # ------------------------------------------------------------ installed release
 $release = [ordered]@{ release_version = $AppVersion; installer_version = $AppVersion; vms_release_commit = $SourceCommit; platform = 'windows'; installed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }

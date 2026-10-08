@@ -24,24 +24,30 @@ Not covered automatically (needs a person / a camera): adding a real camera,
 live view in a browser on another device, a recording and its playback, and a
 reboot of the Sandbox VM.
 
+## Upgrade from Windows 1.3.0 (2026-10-08)
+
+`make-wsb.ps1 -Setup <new setup> -Folder <new folder> -Previous <AnyAiCam-VMS-Setup-1.3.0-aedecb6.exe>`
+installs the earlier setup first and validates the new one as an upgrade over
+it: 1.3.0's permanent claim code is removed and cannot link anything, and the
+PC links with one-time links.
+
 ## Interactive linking checks (2026-10-08, by hand)
 
-The automatic run is silent, and a silent setup skips the finish page's
-entries. In a fresh Sandbox, with a standard (non-administrator) user where
-possible:
+The automatic run is silent, and a silent setup asks for no link and skips
+the finish page's entries. In a fresh Sandbox, with a standard
+(non-administrator) user where possible, and the test cloud running:
 
 1. Run the setup by double-click (`/PortalUrl=https://cloud.anyaicam.test:8443`
-   from a command prompt to stay on the test cloud). The last page shows **no
-   claim code**, says "There is no code to type" and has *Link this computer
-   to my AnyAiCam account* ticked.
+   from a command prompt). Near the end: "Preparing the link to your AnyAiCam
+   account...". The last page shows **no code**, says "There is no code to
+   type" and has *Link this computer to my AnyAiCam account* ticked.
 2. Click Finish. The browser opens `/claim` **un-elevated** (Task Manager >
-   Details > *Elevated* column = No) and the address bar ends at `/claim` or
-   the sign-in page (the code is moved out of it).
-3. Search `%TEMP%\Setup Log*.txt` (and the setup's `/LOG=` file, if any) for
-   the code from `C:\ProgramData\AnyAiCam\label\claim-label.txt`: **no match**.
-4. Start menu > AnyAiCam > *Link this computer to AnyAiCam*: a UAC prompt
-   appears; Cancel = nothing opens and no code is shown; Yes = the browser
-   opens the same page un-elevated, as the signed-in user, and the claim page
-   finds the PC (the URL fragment survived explorer.exe).
-5. After linking: the Start menu entry says "already linked"; a repair or
-   reinstall's last page says "This computer is linked".
+   Details > *Elevated* = No); the address bar no longer shows the code.
+3. Search `%TEMP%\Setup Log*.txt` for `#code=` and for the 8-character code:
+   **no match**.
+4. Start menu > AnyAiCam > *Link this computer to AnyAiCam*: UAC appears;
+   Cancel = nothing opens; Yes = the browser opens a new link un-elevated as
+   the signed-in user; the earlier link no longer works.
+5. After linking: the Start menu entry says "already linked"; a repair's last
+   page says "This computer is linked". With the network cable out, the last
+   page says to link later from the Start menu.

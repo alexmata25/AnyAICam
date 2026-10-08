@@ -286,8 +286,8 @@ class CloudAgentServiceTests(unittest.TestCase):
                      'Source: "vendor\\WinSW-x64.exe"; DestDir: "{app}\\service"; DestName: "AnyAiCamAgent.exe"'):
             self.assertIn(line, self.iss)
         self.assertIn('Type: filesandordirs; Name: "{app}\\agent"', self.iss.split("[InstallDelete]", 1)[1].split("[Files]", 1)[0])
-        for folder in ("agent", "label"):
-            self.assertIn(f'Name: "{{commonappdata}}\\AnyAiCam\\{folder}"; Flags: uninsneveruninstall', self.iss)
+        self.assertIn('Name: "{commonappdata}\\AnyAiCam\\agent"; Flags: uninsneveruninstall', self.iss)
+        self.assertNotIn('{commonappdata}\\AnyAiCam\\label"', self.iss)  # 2026-10-08: the claim code is retired
 
     def test_agent_service_starts_after_the_vms_and_is_removed_before_it(self):
         steps = self.iss.split("procedure CurStepChanged", 1)[1]

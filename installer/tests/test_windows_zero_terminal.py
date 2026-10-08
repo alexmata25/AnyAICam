@@ -16,11 +16,14 @@ Nothing here installs anything: the PowerShell tests run the real scripts
 against temporary folders / a temporary git repository, and the Inno test
 only compiles (ISCC /O-, no setup is written).
 """
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -30,7 +33,6 @@ POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
 GIT = shutil.which("git")
 ISCC = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Inno Setup 7" / "ISCC.exe"
 COMMIT = "aedecb6bdaac32aece3ede39510a078fe8bfa9a6"
-CODE = r"[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}"
 
 
 def read(name):
@@ -186,7 +188,7 @@ class InstallerLinkTests(unittest.TestCase):
         self.iss = read("AnyAiCam-VMS.iss")
         self.run = section(self.iss, "Run")
         self.icons = section(self.iss, "Icons")
-        self.code = self.iss.split("// ------------------------------------------------------------ claim code", 1)[1]
+        self.code = self.iss.split("// ------------------------------------------------------------ account link", 1)[1]
 
     def test_every_finish_page_entry_runs_as_the_original_user(self):
         entries = [line for line in self.run.splitlines() if line.startswith("Filename:")]
@@ -204,33 +206,49 @@ class InstallerLinkTests(unittest.TestCase):
         for flag in ("dontlogparameters", "runhidden", "nowait"):
             self.assertIn(flag, link)
         self.assertIn("Check: HasClaimLink", link)
-        # Inno logs every [Run]/[Icons] Filename: the code may never be one.
         for line in (self.run + self.icons).splitlines():
             self.assertNotRegex(line, r'Filename: "\{code:')
 
-    def test_the_finish_page_and_start_menu_never_show_the_code(self):
-        self.assertNotIn("ClaimLabelValue('Claim code:')", self.iss)
-        self.assertNotIn("notepad", self.iss.lower())
+    def test_no_claim_code_is_kept_shown_or_logged_by_the_setup(self):
+        self.assertNotIn("claim-label.txt", self.iss)
+        self.assertNotIn("ClaimLabelValue", self.iss)
+        self.assertNotIn('{commonappdata}\\AnyAiCam\\label"', section(self.iss, "Dirs"))
         self.assertNotIn("Show AnyAiCam claim code", self.icons)
         self.assertIn('Type: files; Name: "{group}\\Show AnyAiCam claim code.lnk"', section(self.iss, "InstallDelete"))
-        finish = self.code.split("procedure CurPageChanged", 1)[1]
-        self.assertNotIn("ClaimLink(", finish)
-        self.assertNotIn("ClaimLabelValue(", finish)
+        claim = self.iss.split("// ------------------------------------------------------------ claim code", 1)[1]
+        finish = claim.split("procedure CurPageChanged", 1)[1]
+        self.assertNotIn("AccountLink +", finish)
         self.assertIn("There is no code to type.", finish)
-        self.assertIn("This computer is linked to your AnyAiCam account.", finish)
-        self.assertNotIn("Log(", self.code)
+        self.assertNotIn("Log(", self.code.split("procedure CurStepChanged", 1)[0])
+        self.assertNotIn("Log(", claim)
 
-    def test_a_linked_pc_offers_no_link(self):
-        has = self.code.split("function HasClaimLink", 1)[1].split("end;", 1)[0]
-        self.assertIn("(not PostInstallFailed) and (not IsLinked) and (ClaimLink('') <> '')", has)
-        self.assertIn("FileExists(ExpandConstant('{commonappdata}\\AnyAiCam\\agent\\credential.json'))", self.code)
+    def test_the_setup_asks_the_agent_for_a_fresh_link_only_when_interactive(self):
+        steps = self.iss.split("procedure CurStepChanged", 1)[1]
+        self.assertLess(steps.index("AnyAiCamAgent.exe'), 'start'"), steps.index("if not WizardSilent then\n      RequestAccountLink;"))
+        self.assertLess(steps.index("RequestAccountLink;"), steps.index("  except\n"))
+        request = self.code.split("procedure RequestAccountLink;", 1)[1].split("\nend;", 1)[0]
+        self.assertIn("-Prepare", request)
+        self.assertIn("ExpandConstant('{tmp}\\anyaicam-account-link.txt')", request)
+        self.assertIn("if not Exec(", request)                  # Exec: no output in the setup log
+        self.assertNotIn("ExecAndLogOutput", request)
+        self.assertNotIn("ExecAndCaptureOutput", request)
+        self.assertEqual(request.count("DeleteFile(ResultFile);"), 2)  # before and right after reading
+        self.assertIn("IsAccountLink(Trim(Lines[1]))", request)
 
-    def test_the_link_is_checked_before_it_reaches_powershell(self):
-        link = self.code.split("function ClaimLink", 1)[1].split("\nend;", 1)[0]
-        self.assertIn("(Pos('https://', Link) <> 1) or (Pos('/claim#label=', Link) = 0)", link)
-        allowed = re.search(r"Pos\(Copy\(Link, I, 1\), '([^']*)'\) = 0", link).group(1)
-        self.assertEqual(set(allowed) - set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), set(".:/-#="))
-        self.assertIn("Result := Link + '&link=windows';", link)
+    def test_a_linked_pc_or_no_link_offers_no_link(self):
+        has = self.iss.split("function HasClaimLink", 1)[1].split("end;", 1)[0]
+        self.assertIn("(not PostInstallFailed) and (not IsLinked) and (AccountLink <> '')", has)
+        finish = self.iss.split("procedure CurPageChanged", 1)[1]
+        self.assertIn("IsLinked or (AccountLinkStatus = 'linked')", finish)
+        self.assertIn("link it to your AnyAiCam account when this PC is online", finish)
+
+    def test_only_a_well_formed_link_reaches_powershell(self):
+        check = self.code.split("function IsAccountLink", 1)[1].split("\nend;", 1)[0]
+        self.assertIn("Pos('https://', Link) <> 1", check)
+        self.assertIn("Pos('/claim#code=', Link)", check)
+        self.assertIn("<> '&link=windows'", check)
+        allowed = re.search(r"Pos\(Copy\(Link, I, 1\), '([^']*)'\) = 0", check).group(1)
+        self.assertEqual(set(allowed) - set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), set(".:/-#=&"))
 
     def test_start_menu_link_entry(self):
         self.assertIn('Name: "{group}\\Link this computer to AnyAiCam"; Filename: "{sys}\\WindowsPowerShell\\v1.0\\powershell.exe"; '
@@ -241,8 +259,11 @@ class InstallerLinkTests(unittest.TestCase):
     def test_no_local_link_page_on_windows(self):
         launcher = read("agent-launcher.ps1")
         self.assertIn("$env:ANYAICAM_LINK_PORT = '0'", launcher)
-        self.assertIn("@('ANYAICAM_PORTAL_URL', 'ANYAICAM_AGENT_MODE')", launcher)  # agent.env cannot turn it on
+        self.assertIn("@('ANYAICAM_PORTAL_URL', 'ANYAICAM_AGENT_MODE')", launcher)
         self.assertLess(launcher.index("$env:ANYAICAM_LINK_PORT = '0'"), launcher.index("& (Join-Path $installRoot 'runtime\\python\\python.exe')"))
+        service = (ROOT / "appliance-agent" / "anyaicam_agent" / "service.py").read_text(encoding="utf-8")
+        server = service.split("def start_link_server", 1)[1]
+        self.assertLess(server.index("if windows.IS_WINDOWS: return None"), server.index("LinkServer("))
 
 
 @unittest.skipUnless(ISCC.is_file(), "Inno Setup 7 is required")
@@ -262,6 +283,9 @@ class InnoCompileTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- open-claim-link.ps1
+LINK = "https://cloud.anyaicam.test:8443/claim#code=AB12CD34&link=windows"
+
+
 @unittest.skipUnless(POWERSHELL, "PowerShell is required")
 class OpenClaimLinkTests(unittest.TestCase):
     SCRIPT = WIN / "open-claim-link.ps1"
@@ -269,64 +293,106 @@ class OpenClaimLinkTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="anyaicam-open-link-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.folder = self.root / "agent" / "link-requests"
 
     def call(self, expression):
         result = ps(f". {quote(self.SCRIPT)}; {expression}")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout.strip()
 
-    def label(self, *lines):
-        path = self.root / "claim-label.txt"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
+    def agent_answers(self, answer):
+        """A stand-in for the agent's windows_link.py: answers the first request."""
+        seen = []
 
-    def test_builds_the_link_from_the_real_cloud_link_output(self):
-        provision = subprocess.run([POWERSHELL, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
-                                    str(WIN / "cloud-link.ps1"), "-DataRoot", str(self.root), "-AppVersion", "1.3.0", "-SourceCommit", COMMIT],
-                                   capture_output=True, text=True, timeout=120)
-        self.assertEqual(provision.returncode, 0, provision.stdout + provision.stderr)
-        label = (self.root / "label" / "claim-label.txt").read_text(encoding="utf-8-sig")
-        code = re.search(r"^Claim code: (" + CODE + ")$", label, re.M).group(1)
-        link = self.call(f"Get-ClaimLink {quote(self.root / 'label' / 'claim-label.txt')}")
-        self.assertEqual(link, f"https://app.anyaicam.com/claim#label={code}&link=windows")
+        def run():
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                requests = list(self.folder.glob("*.request")) if self.folder.is_dir() else []
+                if requests:
+                    nonce = requests[0].name[:-len(".request")]
+                    seen.append(nonce)
+                    if answer is not None:
+                        (self.folder / f"{nonce}.tmp").write_text(json.dumps(answer), encoding="utf-8")
+                        os.replace(self.folder / f"{nonce}.tmp", self.folder / f"{nonce}.response")
+                    return
+                time.sleep(0.05)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, seen
 
-    def test_dot_sourcing_runs_nothing(self):
-        # (the tests rely on it; running it would elevate and open a browser)
-        self.assertEqual(self.call("'loaded'"), "loaded")
+    def request(self, answer, timeout=20):
+        thread, seen = self.agent_answers(answer)
+        out = self.call(f"$r = Request-AccountLink {quote(self.root)} {timeout}; $r.status + '|' + $r.link")
+        thread.join(5)
+        return out, seen
 
-    def test_refuses_anything_but_a_well_formed_https_claim_link(self):
-        for bad in ("http://app.anyaicam.com/claim#label=ABCD-EFGH-JKMN",
-                    "https://app.anyaicam.com/claim#label=ABCD-EFGH-JKMN' ; calc ; '",
-                    "https://app.anyaicam.com/claim#label=ABCD-EFGH-JKMN&x=1",
-                    "https://app.anyaicam.com/other#label=ABCD-EFGH-JKMN",
-                    "https://app.anyaicam.com/claim#label=abcd-efgh-jkmn",
-                    "https://app.anyaicam.com/claim#label=ABCD-EFGH-JKMO",
-                    "https://evil example/claim#label=ABCD-EFGH-JKMN",
-                    "https://user@app.anyaicam.com/claim#label=ABCD-EFGH-JKMN"):
-            path = self.label("Claim code: ABCD-EFGH-JKMN", "QR code: " + bad)
-            self.assertEqual(self.call(f"Get-ClaimLink {quote(path)}"), "", bad)
-        self.assertEqual(self.call(f"Get-ClaimLink {quote(self.root / 'missing.txt')}"), "")
-        self.assertEqual(self.call(f"Get-ClaimLink {quote(self.label('Claim code: ABCD-EFGH-JKMN'))}"), "")
+    def test_a_fresh_link_from_the_agent(self):
+        out, seen = self.request({"status": "ok", "link": LINK})
+        self.assertEqual(out, "ok|" + LINK)
+        self.assertRegex(seen[0], r"^[0-9a-f]{32}$")
+        self.assertEqual(list(self.folder.iterdir()), [])  # request and answer removed
 
-    def test_link_state(self):
-        self.assertEqual(self.call(f"Get-LinkState {quote(self.root)}"), "unlinked")
+    def test_anything_but_a_well_formed_link_is_unavailable(self):
+        for bad in ("http://cloud.anyaicam.test/claim#code=AB12CD34&link=windows",
+                    "https://cloud.anyaicam.test/claim#code=AB12CD34",
+                    "https://cloud.anyaicam.test/claim#code=ab12cd34&link=windows",
+                    "https://cloud.anyaicam.test/claim#label=ABCD-EFGH-JKMN&link=windows",
+                    "https://cloud.anyaicam.test/claim#code=AB12CD34&link=windows' ; calc ; '",
+                    "https://user@cloud.anyaicam.test/claim#code=AB12CD34&link=windows"):
+            out, _ = self.request({"status": "ok", "link": bad})
+            self.assertEqual(out, "unavailable|", bad)
+
+    def test_linked_and_unavailable_answers(self):
+        self.assertEqual(self.request({"status": "linked"})[0], "linked|")
+        self.assertEqual(self.request({"status": "unavailable"})[0], "unavailable|")
+
+    def test_no_answer_is_a_timeout_and_the_request_is_withdrawn(self):
+        out, seen = self.request(None, timeout=2)
+        self.assertEqual(out, "timeout|")
+        self.assertFalse((self.folder / f"{seen[0]}.request").exists())
+
+    def test_a_linked_pc_asks_nothing(self):
         (self.root / "agent").mkdir()
         (self.root / "agent" / "credential.json").write_text("{}")
-        self.assertEqual(self.call(f"Get-LinkState {quote(self.root)}"), "linked")
+        self.assertEqual(self.call(f"$r = Get-AccountLinkResult {quote(self.root)}; $r.status"), "linked")
+        self.assertFalse(self.folder.exists())
 
-    def test_only_an_administrator_reads_the_code_and_the_browser_is_not_elevated(self):
+    def test_results_are_handed_over_once_through_a_new_file(self):
+        path = self.root / "anyaicam-account-link.txt"
+        self.call(f"Write-Result {quote(path)} @{{ status = 'ok'; link = '{LINK}' }}")
+        self.assertEqual(path.read_text(encoding="ascii"), "ok\n" + LINK)
+        result = ps(f". {quote(self.SCRIPT)}; Write-Result {quote(path)} @{{ status = 'ok'; link = 'x' }}")
+        self.assertNotEqual(result.returncode, 0)  # CreateNew: never overwrites
+        self.assertEqual(self.call(f"$r = Read-Result {quote(path)}; $r.status + '|' + $r.link"), "ok|" + LINK)
+        self.assertFalse(path.exists())  # read once, then deleted
+        path.write_text("ok\nhttps://evil.example/claim#code=AB12CD34&link=windows'x", encoding="ascii")
+        self.assertEqual(self.call(f"$r = Read-Result {quote(path)}; $r.status"), "unavailable")
+        self.assertEqual(self.call(f"$r = Read-Result {quote(path)}; $r.status"), "missing")
+
+    def test_dot_sourcing_runs_nothing(self):
+        self.assertEqual(self.call("'loaded'"), "loaded")
+
+    def test_only_an_administrator_asks_and_the_browser_is_never_elevated(self):
         text = self.SCRIPT.read_text(encoding="utf-8")
         main = text.split("function Invoke-OpenClaimLink", 1)[1]
-        self.assertLess(main.index("if (-not (Test-Administrator))"), main.index("Get-ClaimLink"))
-        self.assertIn("-Verb RunAs", main.split("Get-ClaimLink", 1)[0])
-        self.assertIn("Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList $link", main)
-        self.assertNotIn("Start-Process -FilePath $link", text)
-        self.assertLess(main.index("(Get-LinkState $dataRoot) -eq 'linked'"), main.index("Get-ClaimLink"))
+        prepare, rest = main.split("if ($Elevated) {", 1)
+        elevated, start_menu = rest.split("$powershell = ", 1)
+        self.assertIn("if (-not (Test-Administrator) -or (Split-Path -Leaf $Prepare) -ne 'anyaicam-account-link.txt') { exit 1 }", prepare)
+        self.assertIn("if ($Handoff -cnotmatch $NoncePattern) { exit 1 }", elevated)
+        self.assertIn("if (Test-Administrator) { Get-AccountLinkResult $dataRoot } else { @{ status = 'denied'", elevated)
+        # The Start menu copy never reads the request folder itself: it starts
+        # the elevated copy (UAC) and opens what that hands back, as itself.
+        self.assertNotIn("Get-AccountLinkResult", start_menu)
+        self.assertNotIn("Request-AccountLink", start_menu)
+        self.assertLess(start_menu.index("-Verb RunAs"), start_menu.index("Read-Result"))
+        self.assertIn("'ok' { Start-Process -FilePath $result.link; exit 0 }", start_menu)
+        self.assertNotIn("explorer.exe", text)
+        self.assertIn("[IO.FileMode]::CreateNew", text)
 
     def test_never_writes_or_prints_the_code(self):
         text = self.SCRIPT.read_text(encoding="utf-8")
         for statement in ("Write-Host", "Write-Output", "Write-Verbose", "Write-Information", "Out-File", "Set-Content",
-                          "Add-Content", "Start-Transcript", "Show-Message $link", "Show-Message \"$link"):
+                          "Add-Content", "Start-Transcript", "Show-Message $result.link", "Show-Message \"$"):
             self.assertNotIn(statement, text)
 
 
