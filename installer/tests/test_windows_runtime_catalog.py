@@ -90,6 +90,16 @@ class CatalogScriptTests(unittest.TestCase):
         # Opens and closes a catalog-admin context only; nothing is added.
         self.assertEqual(self.call("Use-CatalogAdmin { param($api, $admin) $admin -ne [IntPtr]::Zero }"), "True")
 
+    def test_registers_in_the_code_integrity_catalog_database(self):
+        # Windows Sandbox 2026-10-08: with a NULL subsystem the catalog went to
+        # CatRoot\{127D0A1D-...} and Smart App Control still blocked WinSW;
+        # under DRIVER_ACTION_VERIFY {F750E6C3-...} WinSW ran at once.
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$CodeIntegritySubsystem = [Guid]'F750E6C3-38EE-11D1-85E5-00C04FC295EE'", text)
+        self.assertIn("CryptCATAdminAcquireContext([ref]$admin, $subsystem, 0)", text)
+        self.assertNotIn("CryptCATAdminAcquireContext([ref]$admin, [IntPtr]::Zero", text)
+        self.assertTrue(self.call("Get-InstalledCatalogPath").endswith("\System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\AnyAiCamRuntime.cat"))
+
     def test_dot_sourcing_removes_nothing(self):
         self.assertEqual(self.call("'loaded'"), "loaded")
 

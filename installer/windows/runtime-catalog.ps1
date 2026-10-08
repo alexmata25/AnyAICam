@@ -103,17 +103,27 @@ function Get-CatalogApi {
     return $type.CreateType()
 }
 
+# The catalog database code integrity reads: DRIVER_ACTION_VERIFY
+# {F750E6C3-38EE-11D1-85E5-00C04FC295EE}, where Windows' own catalogs are.
+# Without it (NULL subsystem) a catalog lands in {127D0A1D-...} and Smart
+# App Control keeps blocking its files (Windows Sandbox, 2026-10-08).
+$CodeIntegritySubsystem = [Guid]'F750E6C3-38EE-11D1-85E5-00C04FC295EE'
+
 function Use-CatalogAdmin([scriptblock]$Action) {
     $api = Get-CatalogApi
     $admin = [IntPtr]::Zero
-    if (-not $api::CryptCATAdminAcquireContext([ref]$admin, [IntPtr]::Zero, 0)) {
-        throw "CryptCATAdminAcquireContext failed ($([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
-    }
-    try { & $Action $api $admin } finally { [void]$api::CryptCATAdminReleaseContext($admin, 0) }
+    $subsystem = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+    try {
+        [Runtime.InteropServices.Marshal]::Copy($CodeIntegritySubsystem.ToByteArray(), 0, $subsystem, 16)
+        if (-not $api::CryptCATAdminAcquireContext([ref]$admin, $subsystem, 0)) {
+            throw "CryptCATAdminAcquireContext failed ($([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+        }
+        try { & $Action $api $admin } finally { [void]$api::CryptCATAdminReleaseContext($admin, 0) }
+    } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($subsystem) }
 }
 
 function Get-InstalledCatalogPath {
-    return Join-Path $env:SystemRoot "System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\$CatalogBaseName"
+    return Join-Path $env:SystemRoot "System32\CatRoot\{$($CodeIntegritySubsystem.ToString().ToUpperInvariant())}\$CatalogBaseName"
 }
 
 # Registers the catalog (replacing an earlier AnyAiCam one) only if it carries
