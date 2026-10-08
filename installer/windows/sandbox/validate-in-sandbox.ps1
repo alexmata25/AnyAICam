@@ -130,6 +130,16 @@ Check 'data folder: SYSTEM and Administrators only' {
     $who -join ','
 }
 
+Check 'runtime catalog registered, signed like the setup (Smart App Control)' {
+    $catalog = Join-Path $env:SystemRoot 'System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\AnyAiCamRuntime.cat'
+    if (-not (Test-Path -LiteralPath $catalog)) { throw 'AnyAiCamRuntime.cat not registered' }
+    $signature = Get-AuthenticodeSignature -LiteralPath $catalog
+    if ($signature.Status -ne 'Valid') { throw "catalog signature $($signature.Status)" }
+    $setupSigner = (Get-AuthenticodeSignature -LiteralPath $setup.FullName).SignerCertificate.Subject
+    if ($signature.SignerCertificate.Subject -ne $setupSigner) { throw "catalog signer $($signature.SignerCertificate.Subject)" }
+    "registered; $($signature.SignerCertificate.Subject)"
+}
+
 # ---------------------------------------------------------------- firewall
 $rules = Get-NetFirewallRule -Group 'AnyAiCam VMS' -ErrorAction SilentlyContinue
 Check 'two firewall rules' { if (@($rules).Count -ne 2) { throw "found $(@($rules).Count)" }; ($rules.Name -join ',') }
@@ -370,6 +380,7 @@ $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYS
 Check 'uninstall exit code 0' { $uninstall.ExitCode -eq 0 }
 Check 'uninstall removes the service' { -not (Get-Service AnyAiCamVMS -ErrorAction SilentlyContinue) }
 Check 'uninstall removes the cloud agent service' { -not (Get-Service AnyAiCamAgent -ErrorAction SilentlyContinue) }
+Check 'uninstall removes the runtime catalog' { -not (Test-Path (Join-Path $env:SystemRoot 'System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\AnyAiCamRuntime.cat')) }
 Check 'uninstall keeps the cloud link (credential)' { Test-Path (Join-Path $agentState 'credential.json') }
 Check 'uninstall removes the firewall rules' { @(Get-NetFirewallRule -Group 'AnyAiCam VMS' -ErrorAction SilentlyContinue).Count -eq 0 }
 Check 'uninstall keeps customer data' { Test-Path (Join-Path $data 'database\partner_portal.db') }

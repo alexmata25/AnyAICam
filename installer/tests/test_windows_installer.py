@@ -328,7 +328,7 @@ class CloudAgentServiceTests(unittest.TestCase):
         self.assertIn("@('ANYAICAM_PORTAL_URL', 'ANYAICAM_AGENT_MODE')", launcher)  # only these keys from agent.env
 
     def test_cloud_link_and_agent_preflight_run_before_any_service(self):
-        self.assertIn("-PortalUrl \"' + ExpandConstant('{param:PortalUrl|}') + '\"'", self.iss)
+        self.assertIn("-PortalUrl \"' + ExpandConstant('{param:PortalUrl|}') + '\" -RuntimeCatalog", self.iss)
         agent_preflight = self.runtime.index("import anyaicam_agent.service, anyaicam_agent.windows")
         self.assertLess(self.runtime.index("installer\\runtime-preflight.py')"), agent_preflight)
         self.assertIn("throw 'AnyAiCam agent preflight failed", self.runtime)

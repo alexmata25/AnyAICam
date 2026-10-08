@@ -10,9 +10,15 @@ param(
     [Parameter(Mandatory=$true)][string]$AppVersion,
     # Setup's /PortalUrl=https://... (empty: keep the saved one, else the
     # AnyAiCam cloud); checked by cloud-link.ps1 before anything is written.
-    [string]$PortalUrl = ''
+    [string]$PortalUrl = '',
+    # 2026-10-08: the signed catalog of the runtime's native files
+    # (runtime-catalog.ps1), registered before anything native is loaded, so
+    # Smart App Control lets the bundled runtime run.
+    [Parameter(Mandatory=$true)][string]$RuntimeCatalog
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
+Install-RuntimeCatalog $RuntimeCatalog
 $pythonRoot = Join-Path $InstallRoot 'runtime\python'
 $python = Join-Path $pythonRoot 'python.exe'
 if (-not (Test-Path -LiteralPath $python)) {

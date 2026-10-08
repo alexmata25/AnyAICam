@@ -74,6 +74,33 @@ if ($AzureSign) {
     $compilerArguments += '/DEnableSigning=1'
     $compilerArguments += '/SAnyAiCamSign=' + $signCommand
 }
+# Runtime catalog (2026-10-08, runtime-catalog.ps1): Smart App Control blocks
+# the runtime's unsigned native files (wheels, WinSW, FFmpeg, MediaMTX). One
+# catalog of their hashes, signed with the same certificate, is registered by
+# the setup. Built from exactly the pinned inputs verified above.
+. (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
+$outputDir = Join-Path $PSScriptRoot 'output'
+New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+$catalog = Join-Path $outputDir 'AnyAiCamRuntime.cat'
+$nativeArchives = @($lockedWheels | ForEach-Object { Join-Path $wheelRoot $_ }) + @('python-3.12.10-embed-amd64.zip', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip' | ForEach-Object { Join-Path $vendor $_ })
+$catalogStage = Join-Path $outputDir 'runtime-catalog'
+[void](Export-NativeFiles $catalogStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
+$makeCat = if ($env:ANYAICAM_MAKECAT_PATH) { $env:ANYAICAM_MAKECAT_PATH } else { 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makecat.exe' }
+$catalogued = New-RuntimeCatalog $catalogStage $catalog $makeCat
+Write-Output "Runtime catalog: $catalogued native files."
+if ($Sign) { & $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog }
+if ($AzureSign) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog }
+if ($Sign -or $AzureSign) {
+    if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
+    if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
+    & $signTool verify /pa $catalog | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
+    # Every catalogued file must verify against it.
+    $sample = Get-ChildItem -LiteralPath $catalogStage -Recurse -File | Select-Object -First 1
+    & $signTool verify /pa /c $catalog $sample.FullName | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "A catalogued file does not verify against the runtime catalog: $($sample.Name)" }
+    Write-Output 'Runtime catalog signed and verified.'
+}
 $compilerArguments += "/DAppVersion=$Version"
 $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript
@@ -81,6 +108,8 @@ $compilerArguments += $installerScript
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 if ($Sign -or $AzureSign) {
     $setup = Get-Item (Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe'))
+    # (Inno Setup 7 keeps no signed-uninstaller cache; the installed
+    # unins000.exe is verified by the Windows Sandbox validation.)
     $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)
     foreach ($file in @($setup) + $signedUninstallers) {
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
