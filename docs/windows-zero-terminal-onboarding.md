@@ -33,7 +33,7 @@ the code is visible. Hiding it is the shared cloud change below.
 
 | File | Change |
 |---|---|
-| `installer/windows/source-integrity.ps1` (new) | Build integrity: every repository folder the .iss packages (read from its `Source: "..\..\<folder>\*"` lines -- `app`, `appliance-agent/anyaicam_agent`) and `installer/windows` must be exactly the commit: no change, staged change, deletion, untracked file, or git-ignored file (the .iss packages whatever is on disk), except what the .iss excludes (`tests\*`, `__pycache__\*`) and the SHA-pinned `vendor/`. `vendor/` itself may hold only the pinned inputs and locked wheels. |
+| `installer/windows/source-integrity.ps1` (new) | Build integrity: every repository folder the .iss packages (read from its `Source: "..\..\<folder>\*"` lines -- `app`, `appliance-agent/anyaicam_agent`) and `installer/windows` must be exactly the commit: no change, staged change, deletion, untracked file, or git-ignored file in a packaged folder (the .iss packages whatever is on disk), except what the .iss excludes (`tests\*`, `__pycache__\*`). `installer/windows` is packaged file by file, so only its changes and untracked files count; `vendor/` there may hold only the pinned inputs and locked wheels. |
 | `installer/windows/build.ps1` | Uses it (was `git status --porcelain -- app installer/windows`, which missed the agent and every ignored file). |
 | `installer/windows/AnyAiCam-VMS.iss` | `[Run]`: both finish-page entries `runasoriginaluser`; the link is a `Parameters` value of a hidden PowerShell `Start-Process` with `dontlogparameters` (Inno logs every [Run] `Filename` -- the old entry wrote the code to `%TEMP%\Setup Log*.txt` on every interactive install; silent Sandbox runs skip postinstall entries, so the Sandbox scan could not see it). Link validated to `https://` + `/claim#label=` + `[A-Za-z0-9.:/#=-]` before it reaches the command line. Finish page: no code; linked PCs offer no link. `[Icons]`: *Link this computer to AnyAiCam* replaces *Show AnyAiCam claim code* (removed on upgrade by `[InstallDelete]`). |
 | `installer/windows/open-claim-link.ps1` (new) | The Start menu entry: elevates first (UAC), only then reads the Administrators-only label file, and opens the link through `explorer.exe` so the browser runs un-elevated as the signed-in user. Writes and prints nothing. |
@@ -113,7 +113,7 @@ Requested on top of `035eaa1`:
 
 ## Tests
 
-* `installer/tests/test_windows_zero_terminal.py` (26): build integrity in a
+* `installer/tests/test_windows_zero_terminal.py` (27): build integrity in a
   throwaway git repository with the real .iss (edited / untracked / ignored /
   staged / deleted packaged files fail; excluded and pinned files pass;
   folders come from the .iss; unknown Excludes stop the build; extra vendor

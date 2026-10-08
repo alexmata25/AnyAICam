@@ -123,7 +123,16 @@ class BuildIntegrityTests(unittest.TestCase):
         self.write("app/tests/fixtures/scratch.db")        # app tests are not packaged
         self.write("installer/windows/vendor/get-pip.py")   # pinned by SHA-256 in build.ps1
         self.write("installer/windows/output/AnyAiCam-VMS-Setup-1.3.0-x.exe")
+        # left by the installer tests; installer/windows is packaged file by file
+        self.write("installer/windows/__pycache__/runtime-preflight.cpython-311.pyc")
         self.assertEqual(self.problems(), [])
+
+    def test_a_changed_or_untracked_installer_file_still_fails(self):
+        gitignore = self.repo / "installer/windows/.gitignore"
+        gitignore.write_text(gitignore.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8", newline="\n")
+        self.write("installer/windows/extra.ps1")
+        self.assertEqual(sorted(self.problems()), ["uncommitted change (M): installer/windows/.gitignore",
+                                                   "untracked: installer/windows/extra.ps1"])
 
     def test_an_unpackaged_folder_is_not_checked(self):
         self.write("appliance-agent/tests/test_service.py", "def test(): assert 0\n")

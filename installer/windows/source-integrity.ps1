@@ -12,8 +12,10 @@
 # without editing this file. In each of them, and in installer/windows,
 # every file must be tracked and unchanged; a git-ignored file fails too
 # (the .iss copies whatever is on disk), except where the .iss itself
-# excludes it (Excludes: "tests\*,__pycache__\*") and the vendor/ inputs,
-# which build.ps1 pins by SHA-256 (Get-VendorProblems). Nothing is changed.
+# excludes it (Excludes: "tests\*,__pycache__\*"). installer/windows is
+# packaged file by file plus vendor/, which build.ps1 pins by SHA-256
+# (Get-VendorProblems), so an ignored file there is allowed. Nothing is
+# changed.
 
 function Get-PackagedRepoFolders([string]$IssPath) {
     $folders = [ordered]@{}
@@ -48,7 +50,11 @@ function Get-PackagedSourceProblems([string]$Repo, [string]$IssPath) {
         $code = $entry.Substring(0, 2)
         $path = $entry.Substring(3).Trim('"')
         if ($code -eq '!!') {
-            if ($path -like 'installer/windows/vendor/*' -or $path -like 'installer/windows/output/*' -or $path -like 'installer/windows/.runtime-test/*') { continue }
+            # installer/windows is packaged file by file (each one tracked,
+            # so a change to it fails above) plus the pinned vendor/: an
+            # ignored file there (output/, __pycache__/ from the tests) is
+            # never packaged.
+            if ($path -like 'installer/windows/*') { continue }
             $folder = @($folders.Keys | Where-Object { $path -like "$_/*" }) | Select-Object -First 1
             if ($folder) {
                 # Inno's "<name>\*" excludes a folder of that name at any depth.
