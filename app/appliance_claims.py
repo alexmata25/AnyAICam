@@ -762,12 +762,15 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         if identity.get('role') != 'customer_owner':
             raise HTTPException(status_code=403, detail='Customer owner permission required.')
         sites = rows('SELECT * FROM sites WHERE customer_id=?', (identity['customer_id'],))
+        # 2026-10-08: from /customer/setup Step 2 (?return=setup) the done
+        # step leads back to setup; otherwise to the dashboard.
+        back_href, back_label = ('/customer/setup', 'Continue setup') if request.query_params.get('return') == 'setup' else ('/', 'Go to your dashboard')
         site_options = ''.join(f'<option value="{escape(s["id"],quote=True)}">{escape(s["name"])}</option>' for s in sites) or '<option value="">No sites on this account yet</option>'
         content = f'''<header class="topbar"><div><p class="eyebrow">Add an appliance</p><h1>Claim an appliance</h1></div></header>
         <section class="panel">
           <div id="claim-step-code">
-            <p>Plug the appliance into power and your network, wait a few minutes for it to start, then enter the claim code printed on its label (or scan the label's QR code with your phone).</p>
-            <label>Claim code<input id="claim-code-input" maxlength="20" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX"></label>
+            <p>Enter the claim code your appliance shows while it waits to be linked: on its screen during setup, on the last page of the Windows installer, or the claim code printed on its label (or scan the label's QR code with your phone). A new appliance can take a few minutes to start after it is plugged into power and your network.</p>
+            <label>Claim code<input id="claim-code-input" maxlength="20" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="Claim code"></label>
             <button class="action-button" id="claim-lookup-button">Look up</button>
             <p id="claim-lookup-message" class="health-detail"></p>
           </div>
@@ -780,6 +783,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           </div>
           <div id="claim-step-done" hidden>
             <p>Claim confirmed. The appliance will finish activating automatically within a few seconds.</p>
+            <a class="action-button" id="claim-done-continue" href="{back_href}">{back_label}</a>
           </div>
         </section>'''
         scripts = '''<script>

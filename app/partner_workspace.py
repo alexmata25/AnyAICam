@@ -777,6 +777,16 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header>{payment_banner}<p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>6</strong> of 7 (Customer portion)</p><section class="panel"><nav class="workspace-tabs" id="customer-setup-tabs" aria-label="Setup steps" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto">{setup_tabs}</nav>
         <div class="customer-setup-step" data-step="1"><h2>Welcome to AnyAiCam</h2><p>This setup links your appliance, requests camera discovery from that appliance, and saves your camera and subscription settings.</p><div class="mock-banner">The browser does not scan the local network. Camera discovery runs on the assigned appliance.</div></div>
         <div class="customer-setup-step" data-step="2" hidden><h2>Add appliance</h2>
+        <!-- Claim with a code (2026-10-08): an appliance installed with
+        `anyaicam-setup --claim` (Linux 1.2.4), a labelled appliance and the
+        Windows installer all wait with a claim code; this step only offered
+        "Provision" and Cloud ID + activation token, so a customer could not
+        confirm such a claim from setup (the Samsung waited at "Waiting for a
+        customer to confirm this claim"). Claiming is the existing, tested
+        /customer/claim-appliance flow (lookup, site, confirm); the appliance
+        finishes enrolling by itself -- no Cloud ID, no token, and no second
+        appliance. return=setup brings the customer back here afterwards. -->
+        <div id="claim-appliance-panel" class="panel" style="margin-bottom:14px;border-left:4px solid #47d7ac"><h3 style="margin-top:0">Claim your appliance with its code</h3><p>If your appliance shows a <strong>claim code</strong> &mdash; on its screen while it waits to be linked, on its label, or on the last page of the Windows installer &mdash; enter it here, choose the site, and confirm. The appliance links itself; no Cloud ID or activation token is needed.</p><a class="action-button" id="claim-appliance-link" href="/customer/claim-appliance?return=setup">Enter claim code</a><p class="health-detail" style="margin-top:8px">Have a claim code? Use it instead of provisioning a new appliance below, so the same appliance is not added twice.</p></div>
         <!-- Self-service Cloud ID provisioning bridge (2026-09-12): a
         customer who purchased hardware + a camera-slot plan through the
         storefront and was approved via /customer-registration-requests
@@ -810,6 +820,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         not honored by every browser on username/password-shaped fields. -->
         <input type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;width:1px;height:1px;left:-9999px;opacity:0">
         <input type="password" name="password" autocomplete="current-password" tabindex="-1" aria-hidden="true" style="position:absolute;width:1px;height:1px;left:-9999px;opacity:0">
+        <h3 style="margin:14px 0 6px">Or link with a Cloud ID and activation token</h3>
         <label>Cloud ID<input id="customer-cloud-id" name="cloud-id-not-email" placeholder="AIC-XXXXXXXX" autocomplete="off" data-lpignore="true" data-form-type="other"></label><label>Activation token<input id="customer-activation-token" type="password" name="activation-token-not-account-password" autocomplete="new-password" data-lpignore="true" data-form-type="other"></label><label>Or scan a provisioning QR image<input id="customer-qr-file" type="file" accept="image/*"></label><button class="action-button" id="link-customer-appliance">Link appliance</button><p id="link-message" class="health-detail"></p></div>
         <div class="customer-setup-step" data-step="3" hidden><h2>Appliance status</h2><select id="customer-appliance">{appliance_options}</select><div id="appliance-status" class="panel" style="margin-top:14px"></div></div>
         <div class="customer-setup-step" data-step="4" hidden><h2>Discover cameras</h2><p>The selected appliance performs discovery. This page only submits the job and displays its progress.</p><button class="action-button" id="start-camera-scan">Request appliance scan</button><div class="storage-bar"><span id="scan-progress" style="width:0%"></span></div><p id="scan-message" class="health-detail"></p><div id="scan-results"></div></div>
