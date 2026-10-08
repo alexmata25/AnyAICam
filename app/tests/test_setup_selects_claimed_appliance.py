@@ -128,10 +128,60 @@ def test_an_empty_appliance_parameter_is_the_same_as_none(http_client, db_path):
 
 
 def test_without_appliance_parameter_behaviour_is_unchanged(http_client, db_path):
+    # Selection without ?appliance= is unchanged (first appliance, or the
+    # saved draft's); discovery (step 4) only once THAT appliance has
+    # enrolled (Codex review of d0a00ac).
     conn = _two_appliances(db_path)
+    assert _page(http_client, "?step=4") == ("3", ["appl-old"])
+    _make_ready(conn, "appl-old")
     assert _page(http_client, "?step=4") == ("4", ["appl-old"])
     _saved_draft(conn, "appl-new", step=5)  # the saved draft still wins without the parameter
     assert _page(http_client, "") == ("5", ["appl-new"])
+
+
+# ------------------- initial page load: step 4 only for an enrolled appliance
+def _scan_button(http_client, query):
+    body = http_client.get("/customer/setup" + query, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    button = body[body.index('<button class="action-button" id="start-camera-scan"'):]
+    return button[:button.index(">") + 1], 'id="scan-not-ready"' in body
+
+
+def test_a_direct_step_4_url_shows_status_until_the_selected_appliance_enrolls(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")  # a different appliance being ready does not count
+    assert _page(http_client, "?step=4") == ("3", ["appl-old"])
+    assert _scan_button(http_client, "?step=4") == ('<button class="action-button" id="start-camera-scan" disabled>', True)
+    _make_ready(conn, "appl-old")
+    assert _page(http_client, "?step=4") == ("4", ["appl-old"])
+    assert _scan_button(http_client, "?step=4") == ('<button class="action-button" id="start-camera-scan">', False)
+
+
+def test_a_saved_step_4_draft_shows_status_until_its_appliance_enrolls(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")  # the first appliance is ready; the draft's is not
+    _saved_draft(conn, "appl-new", step=4)
+    assert _page(http_client, "") == ("3", ["appl-new"])
+    assert _scan_button(http_client, "")[1] is True
+    _make_ready(conn, "appl-new")
+    assert _page(http_client, "") == ("4", ["appl-new"])
+    assert _scan_button(http_client, "") == ('<button class="action-button" id="start-camera-scan">', False)
+
+
+def test_a_saved_draft_with_an_explicit_unready_appliance_never_lands_past_its_status(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _saved_draft(conn, "appl-new", step=6)
+    assert _page(http_client, "?appliance=appl-new") == ("3", ["appl-new"])
+    _make_ready(conn, "appl-new")
+    assert _page(http_client, "?appliance=appl-new") == ("6", ["appl-new"])
+
+
+def test_no_appliance_at_all_never_opens_on_discovery(http_client, db_path):
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    conn.execute("INSERT INTO customer_setup_drafts(customer_id,current_step,data_json,updated_at) VALUES('cust-1',4,'{}','2026-10-08')")
+    conn.commit()
+    step = re.search(r"let setupStep=(\d+)", http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text).group(1)
+    assert step == "3"
 
 
 # Review of 9e6740f: after an unselectable ?appliance= link the page's own

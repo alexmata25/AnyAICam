@@ -132,8 +132,16 @@ def test_setup_page_rehydrates_the_saved_step_on_reopen(http_client, db_path):
         ("cust-1", 4, json.dumps({"appliance_id": "appl-1", "scan_job": None}), "2026-08-29T00:00:00"),
     )
     conn.commit()
+    # Step 4 (discovery) is restored only for an enrolled appliance; until
+    # then its status, step 3 (test_setup_selects_claimed_appliance.py).
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
+    assert "let setupStep=3," in response.text
+    conn.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,last_used_at) "
+                 "VALUES('cred-appl-1','appl-1','x','2026-08-29T00:00:00','2026-08-29T00:00:05')")
+    conn.execute("UPDATE appliances SET last_check_in='2026-08-29T00:00:10' WHERE id='appl-1'")
+    conn.commit()
+    response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert "let setupStep=4," in response.text
 
 
