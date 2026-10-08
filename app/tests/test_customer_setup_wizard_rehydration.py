@@ -259,8 +259,12 @@ def test_setup_page_loads_the_latest_scan_on_open_and_on_appliance_change(http_c
     assert "/scans/latest" in body
     assert "showSetup();loadLatestScan();" in body  # called once on page bootstrap
     # On appliance change the choice is saved and the page reloads, so the
-    # bootstrap call above loads that appliance's latest scan.
-    assert "getElementById('customer-appliance').onchange=async()=>{await saveProgress();location.reload()}" in body
+    # bootstrap call above loads that appliance's latest scan. (reloadSetup()
+    # is a plain reload here; after an unselectable ?appliance= link it opens
+    # the chosen appliance instead -- test_setup_selects_claimed_appliance.py.)
+    assert "getElementById('customer-appliance').onchange=async()=>{await saveProgress();reloadSetup(selectedAppliance())}" in body
+    assert "function reloadSetup(applianceId){if(!applianceLinkUnselectable)return location.reload();" in body
+    assert "const applianceLinkUnselectable=false;" in body
 
 
 def test_setup_page_sends_appliance_id_when_provisioning_a_discovered_camera(http_client, db_path):

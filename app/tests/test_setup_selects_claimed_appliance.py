@@ -132,3 +132,116 @@ def test_without_appliance_parameter_behaviour_is_unchanged(http_client, db_path
     assert _page(http_client, "?step=4") == ("4", ["appl-old"])
     _saved_draft(conn, "appl-new", step=5)  # the saved draft still wins without the parameter
     assert _page(http_client, "") == ("5", ["appl-new"])
+
+
+# Review of 9e6740f: after an unselectable ?appliance= link the page's own
+# reloads kept that parameter, so choosing or linking an appliance landed on
+# the same "not on your account" page again. These run the page's REAL setup
+# script under Node (a minimal DOM, fetch returning the endpoint's documented
+# response shape), trigger the customer's action, capture where the browser
+# is sent, then load that URL from the app.
+_NODE_HARNESS = r"""
+const fs = require('fs'), vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8'), action = JSON.parse(process.argv[3]);
+const nav = {href: null, reloaded: false}, posted = [];
+function stub(id) {
+  return {id, value: '', textContent: '', innerHTML: '', hidden: false, disabled: false, dataset: {}, style: {},
+          classList: {toggle() {}, add() {}, remove() {}}, setAttribute() {}, removeAttribute() {},
+          getAttribute() { return ''; }, replaceChildren() {}, append() {}, addEventListener() {},
+          scrollIntoView() {}, querySelectorAll() { return []; }, closest() { return null; }};
+}
+const els = {};
+const sandbox = {
+  document: {getElementById: id => els[id] || (els[id] = stub(id)), querySelectorAll: () => [],
+             querySelector: () => null, createElement: tag => stub(tag)},
+  location: {get href() { return nav.href; }, set href(v) { nav.href = v; }, reload() { nav.reloaded = true; }},
+  fetch: async (url, opts) => { posted.push(url); return {ok: true, status: 200, json: async () => action.responses[url] || {}}; },
+  showToast() {}, confirm: () => true, prompt: () => '', setTimeout: () => 0, encodeURIComponent, JSON, Number, String, Object, Array,
+};
+sandbox.window = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox);
+(async () => {
+  if (action.kind === 'select') { els['customer-appliance'].value = action.value; await els['customer-appliance'].onchange(); }
+  if (action.kind === 'link') { await els['link-customer-appliance'].onclick(); }
+  if (action.kind === 'provision') { await els['provision-appliance-button'].onclick(); }
+  process.stdout.write(JSON.stringify({nav, posted}));
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+
+
+def _run_setup_script(http_client, query, action, tmp_path):
+    import json
+    import os
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if not node:
+        if os.environ.get("ANYAICAM_REQUIRE_JS_TESTS", "").lower() == "true":
+            pytest.fail("node is required (ANYAICAM_REQUIRE_JS_TESTS=true) but not installed")
+        pytest.skip("node not installed in this environment")
+    body = http_client.get("/customer/setup" + query, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    start = body.index("<script>let setupStep=") + len("<script>")
+    script = body[start:body.index("</script>", start)]
+    (tmp_path / "setup.js").write_text(script, encoding="utf-8")
+    (tmp_path / "harness.js").write_text(_NODE_HARNESS, encoding="utf-8")
+    result = subprocess.run([node, str(tmp_path / "harness.js"), str(tmp_path / "setup.js"), json.dumps(action)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_choosing_an_appliance_after_an_unselectable_link_goes_to_that_appliance(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _foreign(conn)
+    _saved_draft(conn, "appl-old", step=5)
+    out = _run_setup_script(http_client, "?step=4&appliance=appl-foreign", {"kind": "select", "value": "appl-new", "responses": {}}, tmp_path)
+    assert out["nav"]["reloaded"] is False  # a reload would keep ?appliance=appl-foreign
+    assert out["posted"][0] == "/api/customer/setup/progress"  # the choice is still saved first
+    url = out["nav"]["href"]
+    assert url == "/customer/setup?step=3&appliance=appl-new"
+    # Follow it: the chosen appliance, not the older/draft one, and not discovery before it has enrolled.
+    assert _page(http_client, url[len("/customer/setup"):]) == ("3", ["appl-new"])
+    page = http_client.get(url, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    assert 'id="appliance-not-found"' not in page
+
+
+def test_linking_an_appliance_after_an_unselectable_link_goes_to_the_linked_one(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")
+    _foreign(conn)
+    _saved_draft(conn, "appl-old", step=6)
+    # The link endpoint's success response (link_customer_appliance) carries the linked appliance's id.
+    linked = {"message": "Appliance linked to customer account.", "appliance_id": "appl-new", "camera_slots_purchased": 0}
+    out = _run_setup_script(http_client, "?appliance=does-not-exist",
+                            {"kind": "link", "responses": {"/api/customer/appliances/link": linked}}, tmp_path)
+    assert out["nav"]["reloaded"] is False
+    url = out["nav"]["href"]
+    assert url == "/customer/setup?step=3&appliance=appl-new"
+    assert _page(http_client, url[len("/customer/setup"):]) == ("3", ["appl-new"])
+    # Once it has enrolled the same page lets the customer on to discovery; not before.
+    assert _page(http_client, "?step=4&appliance=appl-new") == ("3", ["appl-new"])
+    _make_ready(conn, "appl-new")
+    assert _page(http_client, "?step=4&appliance=appl-new") == ("4", ["appl-new"])
+
+
+def test_provisioning_after_an_unselectable_link_goes_to_the_new_appliance(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _foreign(conn)
+    provisioned = {"status": "provisioned", "appliance_id": "appl-new", "cloud_id": "AIC-N", "site_id": "site-1"}
+    out = _run_setup_script(http_client, "?appliance=appl-foreign",
+                            {"kind": "provision", "responses": {"/api/customer/appliances/provision": provisioned}}, tmp_path)
+    assert out["nav"] == {"href": "/customer/setup?step=3&appliance=appl-new", "reloaded": False}
+
+
+def test_a_normal_setup_page_still_just_reloads(http_client, db_path, tmp_path):
+    _two_appliances(db_path)
+    for query in ("", "?step=4", "?step=3&appliance=appl-new"):
+        out = _run_setup_script(http_client, query, {"kind": "select", "value": "appl-old", "responses": {}}, tmp_path)
+        assert out["nav"] == {"href": None, "reloaded": True}, query
+        linked = {"message": "ok", "appliance_id": "appl-new"}
+        out = _run_setup_script(http_client, query, {"kind": "link", "responses": {"/api/customer/appliances/link": linked}}, tmp_path)
+        assert out["nav"] == {"href": None, "reloaded": True}, query
