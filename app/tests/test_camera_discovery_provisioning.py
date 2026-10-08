@@ -62,7 +62,7 @@ def db_path(tmp_path):
     return tmp_path / "test_camera_discovery.db"
 
 
-def _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1", online="online", credential=None):
+def _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1", online="online", credential=None, enrolled=True):
     credential = credential or f"token-{appliance_id}"
     conn.execute("INSERT OR IGNORE INTO partners(id,name,created_at) VALUES('partner-1','Test Partner','2026-01-01')")
     conn.execute(
@@ -84,6 +84,12 @@ def _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1
         "INSERT OR IGNORE INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)",
         (f"cred-{appliance_id}", appliance_id, password_hash(credential), "2026-01-01"),
     )
+    if enrolled:
+        # A real, activated appliance has used that credential and sent a
+        # heartbeat since: camera discovery is refused before that
+        # (appliance_readiness.enrollment_ready, 2026-10-08).
+        conn.execute("UPDATE appliance_credentials SET last_used_at='2026-01-01T00:00:05' WHERE id=?", (f"cred-{appliance_id}",))
+        conn.execute("UPDATE appliances SET last_check_in='2026-01-01T00:00:10' WHERE id=? AND last_check_in IS NULL", (appliance_id,))
     conn.commit()
     return site_id
 

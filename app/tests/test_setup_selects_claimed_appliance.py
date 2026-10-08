@@ -136,41 +136,67 @@ def test_without_appliance_parameter_behaviour_is_unchanged(http_client, db_path
 
 # Review of 9e6740f: after an unselectable ?appliance= link the page's own
 # reloads kept that parameter, so choosing or linking an appliance landed on
-# the same "not on your account" page again. These run the page's REAL setup
-# script under Node (a minimal DOM, fetch returning the endpoint's documented
-# response shape), trigger the customer's action, capture where the browser
-# is sent, then load that URL from the app.
+# the same "not on your account" page again. Review of 6c23573: Next, Back and
+# the step tabs could enter discovery (step 4) before the selected appliance
+# had enrolled. These run the page's REAL setup script under Node against a
+# DOM holding only the elements the rendered page really has (an element the
+# page lacks is null, as in a browser), with the page's real step tabs and
+# appliance picker; fetch returns the endpoint's documented response shape.
+# They perform the customer's action and report where the page went.
 _NODE_HARNESS = r"""
 const fs = require('fs'), vm = require('vm');
-const src = fs.readFileSync(process.argv[2], 'utf8'), action = JSON.parse(process.argv[3]);
-const nav = {href: null, reloaded: false}, posted = [];
-function stub(id) {
-  return {id, value: '', textContent: '', innerHTML: '', hidden: false, disabled: false, dataset: {}, style: {},
+const html = fs.readFileSync(process.argv[2], 'utf8'), src = fs.readFileSync(process.argv[3], 'utf8');
+const action = JSON.parse(process.argv[4]);
+const nav = {href: null, reloaded: false}, posted = [], toasts = [];
+function stub(id, extra) {
+  return Object.assign({id, value: '', textContent: '', innerHTML: '', hidden: false, disabled: false, dataset: {}, style: {},
           classList: {toggle() {}, add() {}, remove() {}}, setAttribute() {}, removeAttribute() {},
           getAttribute() { return ''; }, replaceChildren() {}, append() {}, addEventListener() {},
-          scrollIntoView() {}, querySelectorAll() { return []; }, closest() { return null; }};
+          scrollIntoView() {}, querySelectorAll() { return []; }, closest() { return null; }}, extra || {});
 }
 const els = {};
+for (const m of html.matchAll(/ id="([^"]+)"/g)) els[m[1]] = stub(m[1]);
+const picker = html.slice(html.indexOf('<select id="customer-appliance">'));
+const chosen = /<option value="([^"]*)" selected/.exec(picker.slice(0, picker.indexOf('</select>')));
+if (els['customer-appliance']) els['customer-appliance'].value = chosen ? chosen[1] : '';
+const tabs = [...html.matchAll(/class="workspace-tab[^"]*" data-step="([0-9])"/g)].map(m => stub('tab' + m[1], {dataset: {step: m[1]}}));
+const steps = [...html.matchAll(/class="customer-setup-step" data-step="([0-9])"/g)].map(m => stub('step' + m[1], {dataset: {step: m[1]}}));
 const sandbox = {
-  document: {getElementById: id => els[id] || (els[id] = stub(id)), querySelectorAll: () => [],
+  document: {getElementById: id => els[id] || null,
+             querySelectorAll: sel => sel === '#customer-setup-tabs .workspace-tab' ? tabs : sel === '.customer-setup-step' ? steps : [],
              querySelector: () => null, createElement: tag => stub(tag)},
   location: {get href() { return nav.href; }, set href(v) { nav.href = v; }, reload() { nav.reloaded = true; }},
-  fetch: async (url, opts) => { posted.push(url); return {ok: true, status: 200, json: async () => action.responses[url] || {}}; },
-  showToast() {}, confirm: () => true, prompt: () => '', setTimeout: () => 0, encodeURIComponent, JSON, Number, String, Object, Array,
+  fetch: async (url, opts) => {
+    posted.push(url);
+    const r = action.responses[url] || {status: 200, body: {}};
+    return {ok: r.status < 400, status: r.status, json: async () => r.body};
+  },
+  showToast: message => toasts.push(message), confirm: () => true, prompt: () => '', setTimeout: () => 0,
+  encodeURIComponent, JSON, Number, String, Object, Array, Boolean,
 };
 sandbox.window = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox);
+const step = () => vm.runInContext('setupStep', sandbox);
 (async () => {
-  if (action.kind === 'select') { els['customer-appliance'].value = action.value; await els['customer-appliance'].onchange(); }
-  if (action.kind === 'link') { await els['link-customer-appliance'].onclick(); }
-  if (action.kind === 'provision') { await els['provision-appliance-button'].onclick(); }
-  process.stdout.write(JSON.stringify({nav, posted}));
+  const visited = [];
+  for (const act of action.acts) {
+    if (act.kind === 'select') { els['customer-appliance'].value = act.value; await els['customer-appliance'].onchange(); }
+    if (act.kind === 'link') { await els['link-customer-appliance'].onclick(); }
+    if (act.kind === 'provision') { await els['provision-appliance-button'].onclick(); }
+    if (act.kind === 'next') { await els['customer-setup-next'].onclick(); }
+    if (act.kind === 'back') { await els['customer-setup-back'].onclick(); }
+    if (act.kind === 'tab') { await tabs.find(t => t.dataset.step === String(act.step)).onclick(); }
+    if (act.kind === 'scan') { await els['start-camera-scan'].onclick(); }
+    visited.push(step());
+  }
+  const scanMessage = els['scan-message'] ? els['scan-message'].textContent : null;
+  process.stdout.write(JSON.stringify({nav, posted, toasts, visited, step: step(), scanMessage}));
 })().catch(error => { console.error(error); process.exit(1); });
 """
 
 
-def _run_setup_script(http_client, query, action, tmp_path):
+def _run_setup_script(http_client, query, acts, tmp_path, responses=None):
     import json
     import os
     import shutil
@@ -186,19 +212,25 @@ def _run_setup_script(http_client, query, action, tmp_path):
     body = http_client.get("/customer/setup" + query, cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
     start = body.index("<script>let setupStep=") + len("<script>")
     script = body[start:body.index("</script>", start)]
+    (tmp_path / "page.html").write_text(body, encoding="utf-8")
     (tmp_path / "setup.js").write_text(script, encoding="utf-8")
     (tmp_path / "harness.js").write_text(_NODE_HARNESS, encoding="utf-8")
-    result = subprocess.run([node, str(tmp_path / "harness.js"), str(tmp_path / "setup.js"), json.dumps(action)],
+    action = {"acts": acts, "responses": responses or {}}
+    result = subprocess.run([node, str(tmp_path / "harness.js"), str(tmp_path / "page.html"), str(tmp_path / "setup.js"), json.dumps(action)],
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+def _ok(body):
+    return {"status": 200, "body": body}
 
 
 def test_choosing_an_appliance_after_an_unselectable_link_goes_to_that_appliance(http_client, db_path, tmp_path):
     conn = _two_appliances(db_path)
     _foreign(conn)
     _saved_draft(conn, "appl-old", step=5)
-    out = _run_setup_script(http_client, "?step=4&appliance=appl-foreign", {"kind": "select", "value": "appl-new", "responses": {}}, tmp_path)
+    out = _run_setup_script(http_client, "?step=4&appliance=appl-foreign", [{"kind": "select", "value": "appl-new"}], tmp_path)
     assert out["nav"]["reloaded"] is False  # a reload would keep ?appliance=appl-foreign
     assert out["posted"][0] == "/api/customer/setup/progress"  # the choice is still saved first
     url = out["nav"]["href"]
@@ -216,8 +248,8 @@ def test_linking_an_appliance_after_an_unselectable_link_goes_to_the_linked_one(
     _saved_draft(conn, "appl-old", step=6)
     # The link endpoint's success response (link_customer_appliance) carries the linked appliance's id.
     linked = {"message": "Appliance linked to customer account.", "appliance_id": "appl-new", "camera_slots_purchased": 0}
-    out = _run_setup_script(http_client, "?appliance=does-not-exist",
-                            {"kind": "link", "responses": {"/api/customer/appliances/link": linked}}, tmp_path)
+    out = _run_setup_script(http_client, "?appliance=does-not-exist", [{"kind": "link"}], tmp_path,
+                            {"/api/customer/appliances/link": _ok(linked)})
     assert out["nav"]["reloaded"] is False
     url = out["nav"]["href"]
     assert url == "/customer/setup?step=3&appliance=appl-new"
@@ -229,19 +261,103 @@ def test_linking_an_appliance_after_an_unselectable_link_goes_to_the_linked_one(
 
 
 def test_provisioning_after_an_unselectable_link_goes_to_the_new_appliance(http_client, db_path, tmp_path):
-    conn = _two_appliances(db_path)
-    _foreign(conn)
+    # The Provision button only exists for an account with no appliance yet;
+    # the harness has no element the real page lacks, so this proves it is there.
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    page = http_client.get("/customer/setup?appliance=does-not-exist", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    assert 'id="provision-appliance-button"' in page
     provisioned = {"status": "provisioned", "appliance_id": "appl-new", "cloud_id": "AIC-N", "site_id": "site-1"}
-    out = _run_setup_script(http_client, "?appliance=appl-foreign",
-                            {"kind": "provision", "responses": {"/api/customer/appliances/provision": provisioned}}, tmp_path)
+    out = _run_setup_script(http_client, "?appliance=does-not-exist", [{"kind": "provision"}], tmp_path,
+                            {"/api/customer/appliances/provision": _ok(provisioned)})
+    assert out["posted"] == ["/api/customer/appliances/provision"]
     assert out["nav"] == {"href": "/customer/setup?step=3&appliance=appl-new", "reloaded": False}
+    # What provisioning created; following the URL selects it, at its status.
+    conn.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-new','cust-1','site-1','AIC-N','2026')")
+    conn.commit()
+    assert _page(http_client, "?step=3&appliance=appl-new") == ("3", ["appl-new"])
 
 
 def test_a_normal_setup_page_still_just_reloads(http_client, db_path, tmp_path):
     _two_appliances(db_path)
+    linked = {"message": "ok", "appliance_id": "appl-new"}
     for query in ("", "?step=4", "?step=3&appliance=appl-new"):
-        out = _run_setup_script(http_client, query, {"kind": "select", "value": "appl-old", "responses": {}}, tmp_path)
+        out = _run_setup_script(http_client, query, [{"kind": "select", "value": "appl-old"}], tmp_path)
         assert out["nav"] == {"href": None, "reloaded": True}, query
-        linked = {"message": "ok", "appliance_id": "appl-new"}
-        out = _run_setup_script(http_client, query, {"kind": "link", "responses": {"/api/customer/appliances/link": linked}}, tmp_path)
+        out = _run_setup_script(http_client, query, [{"kind": "link"}], tmp_path, {"/api/customer/appliances/link": _ok(linked)})
         assert out["nav"] == {"href": None, "reloaded": True}, query
+
+
+# ------------------------------------------- discovery only after enrollment
+def test_next_and_tabs_do_not_enter_discovery_before_the_appliance_has_enrolled(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")  # another appliance being ready does not count
+    out = _run_setup_script(http_client, "?step=3&appliance=appl-new",
+                            [{"kind": "next"}, {"kind": "tab", "step": 4}, {"kind": "tab", "step": 5}, {"kind": "back"}], tmp_path)
+    # Next and the Discover tab stay at its status (3); the Cameras tab is
+    # allowed, but Back from it does not land in discovery either.
+    assert out["visited"] == [3, 3, 5, 3]
+    assert len(out["toasts"]) == 3 and "finished linking" in out["toasts"][0]
+
+
+def test_next_and_tabs_enter_discovery_once_the_appliance_has_enrolled(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    out = _run_setup_script(http_client, "?step=3&appliance=appl-new",
+                            [{"kind": "next"}, {"kind": "tab", "step": 3}, {"kind": "tab", "step": 4}, {"kind": "tab", "step": 5}, {"kind": "back"}], tmp_path)
+    assert out["visited"] == [4, 3, 4, 5, 4]
+    assert out["toasts"] == []
+
+
+def test_the_readiness_checked_is_the_selected_appliances(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    # Legacy page (no ?appliance=): the first appliance, appl-old, is selected and not enrolled.
+    out = _run_setup_script(http_client, "?step=3", [{"kind": "next"}], tmp_path)
+    assert out["visited"] == [3]
+
+
+def _scan(http_client, appliance_id):
+    return http_client.post(f"/api/customer/appliances/{appliance_id}/scan", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+
+
+def _scan_jobs(db_path):
+    return sqlite3.connect(db_path).execute("SELECT appliance_id FROM camera_scan_jobs").fetchall()
+
+
+def test_a_direct_scan_request_is_refused_until_that_appliance_has_enrolled(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-old")
+    response = _scan(http_client, "appl-new")
+    assert response.status_code == 409
+    assert "has not finished linking" in response.json()["detail"]
+    assert _scan_jobs(db_path) == []  # nothing queued for the appliance
+    _make_ready(conn, "appl-new")
+    response = _scan(http_client, "appl-new")
+    assert response.status_code == 200 and response.json()["job_id"]
+    assert _scan_jobs(db_path) == [("appl-new",)]
+
+
+def test_a_revoked_credential_is_not_enrollment(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    conn.execute("UPDATE appliance_credentials SET revoked_at='2026-10-08T11:00:00' WHERE appliance_id='appl-new'")
+    conn.commit()
+    assert _scan(http_client, "appl-new").status_code == 409
+
+
+def test_another_accounts_appliance_is_still_not_found_ready_or_not(http_client, db_path):
+    conn = _two_appliances(db_path)
+    _foreign(conn)  # enrolled, but not this customer's
+    assert _scan(http_client, "appl-foreign").status_code == 404
+    assert _scan(http_client, "does-not-exist").status_code == 404
+    assert _scan_jobs(db_path) == []
+
+
+def test_a_refused_scan_shows_why_on_the_page(http_client, db_path, tmp_path):
+    conn = _two_appliances(db_path)
+    _make_ready(conn, "appl-new")
+    refused = {"status": 409, "body": {"detail": "This appliance has not finished linking yet. Camera discovery starts once it has checked in."}}
+    out = _run_setup_script(http_client, "?step=4&appliance=appl-new", [{"kind": "scan"}], tmp_path,
+                            {"/api/customer/appliances/appl-new/scan": refused})
+    assert out["scanMessage"] == refused["body"]["detail"]
