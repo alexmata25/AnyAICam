@@ -90,6 +90,37 @@ technicians; customers are no longer directed to it.
   autostart only while unlinked, menu always, symlink refusal (Linux),
   uninstall, wiring; `test_claim_label_installer.py`: portal default rules.
 
+## Codex re-review fixes (on top of fc50f44)
+
+1. **Fresh install could not link.** `install_agent` restarts the agent before
+   the installer writes the identity, label verifier and cloud portal, so the
+   running agent saw none of them (headless claim ineligible, placeholder
+   portal). Now: `agent_restart_after_provisioning` (09-identity.sh) restarts
+   the agent as the last install step, after everything it needs exists (a
+   failed restart fails the install); and the agent itself re-checks headless
+   eligibility every 30 s while waiting (quietly), so an identity or label
+   written later is picked up without a restart.
+2. **Discovery could target the wrong appliance.** The claim page now carries
+   the claimed appliance's id: `/customer/setup?step=4&appliance=<id>`
+   selects exactly that appliance, only if it belongs to the signed-in
+   customer (the list is customer-scoped); otherwise it is ignored.
+3. **"Linked" was reported before the appliance enrolled.** claim/complete
+   creates the cloud row before the appliance saves its identity (it can still
+   roll back). New `GET /api/portal/claims/enrollment?device_id=` (customer
+   owner, own rate limit) says `ready` only once THAT appliance has used its
+   own non-revoked credential and sent a heartbeat after the credential was
+   issued (`app/appliance_readiness.py`); another account's appliance is
+   always `waiting`. The claim page reports linked and offers Discover cameras
+   only on `ready` (else its status, step 3), and setup step 4+ for
+   `?appliance=` also requires `ready`.
+
+Tests: `app/tests/test_claim_enrollment_readiness.py` (10),
+`test_setup_selects_claimed_appliance.py` (4),
+`installer/tests/test_agent_restart_after_provisioning.py` (4), agent
+`LateProvisioningTests`, and e2e: ready only after the appliance's own
+heartbeat; a local enrollment failure (cloud row exists) is never reported
+linked, and becomes ready after the agent's retry.
+
 ## Not in this change
 
 * Installing the package itself still uses the existing installer command;

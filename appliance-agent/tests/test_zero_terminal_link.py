@@ -265,5 +265,40 @@ class AgentWiringTests(Base):
             self.assertIsNone(agent.start_link_server())  # address in use -> warning only
 
 
+class LateProvisioningTests(Base):
+    """Codex finding 1 on fc50f44: on a fresh install the agent starts before
+    the installer writes its identity / label (the installer now restarts it;
+    this is the agent's own defense): while waiting it checks again, quietly,
+    and opens its claim once it can -- no restart needed."""
+
+    def test_a_label_written_after_start_is_picked_up_while_waiting(self):
+        import time
+        from unittest.mock import patch
+        from anyaicam_agent import service
+        from anyaicam_agent.headless_claim import HeadlessClaim
+        label = self.folder / 'label_claim.json'
+        saved = label.read_text(encoding='utf-8'); label.unlink()
+        capture = Capture(); self.log.addHandler(capture); self.addCleanup(self.log.removeHandler, capture)
+        agent = service.ApplianceAgent(self.config)
+        agent.log = self.log
+        agent.headless_claim_factory = lambda config, log: HeadlessClaim.for_config(config, log, client=self.portal, finish_enrollment=lambda *a, **k: None)
+        self.portal.begin_answers = [{'claim_session_id': 'sess-late', 'claim_code': 'ABCD0001'}]
+        self.portal.status_answers = [{'status': 'pending'}] * 50
+        with patch.object(service, 'HEADLESS_RECHECK_SECONDS', 0.05), patch.object(service, 'ACTIVATION_POLL_INTERVAL_SECONDS', 0.05):
+            worker = threading.Thread(target=agent._await_activation); worker.start()
+            time.sleep(0.4)
+            self.assertIsNone(agent.headless)  # still ineligible: no label yet
+            label.write_text(saved, encoding='utf-8')
+            deadline = time.time() + 5
+            while not any(c[0] == 'begin' for c in self.portal.calls) and time.time() < deadline:
+                time.sleep(0.05)
+            agent.stop_event.set(); worker.join(5)
+        self.assertIsNotNone(agent.headless)
+        self.assertEqual([c for c in self.portal.calls if c[0] == 'begin'][0][3], VERIFIER)
+        self.assertEqual(load_claim_state(self.config)['claim_session_id'], 'sess-late')
+        not_available = [line for line in capture.text if 'Headless claim not available' in line]
+        self.assertEqual(len(not_available), 1, 'the re-checks must not log on every attempt')
+
+
 if __name__ == '__main__':
     unittest.main()

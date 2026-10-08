@@ -228,6 +228,17 @@ class ZeroTerminalOnboardingTests(unittest.TestCase):
         status, _ = _cloud('POST', '/api/portal/claims/confirm', {'claim_code': code, 'site_id': self.site}, cookie=self.cookie)
         return status
 
+    def enrollment(self):
+        status, body = _cloud('GET', f'/api/portal/claims/enrollment?device_id={self.device_id}', cookie=self.cookie)
+        self.assertEqual(status, 200)
+        return body
+
+    def heartbeat(self):
+        """The appliance's normal operation: an authenticated heartbeat with its own credential."""
+        credential = load_credential(self.config)
+        PortalClient(CLOUD, credential['appliance_id'], credential['credential']).request(
+            'POST', '/api/appliance/heartbeat', {'uptime_seconds': 30, 'cpu': 1, 'memory': 1})
+
     def appliances(self):
         with connection() as db:
             return [dict(r) for r in db.execute('SELECT cloud_id, customer_id, site_id FROM appliances WHERE cloud_id=?', (self.device_id.upper(),))]
@@ -254,6 +265,14 @@ class ZeroTerminalOnboardingTests(unittest.TestCase):
         self.assertEqual(self.customer_confirms(code), 200)
         self.run_agent()
         self.assert_enrolled()
+        # Codex finding 3: linked (and discovery) only once THIS appliance runs
+        # with its credential -- enrolled is not yet ready until it checks in.
+        self.assertEqual(self.enrollment()['status'], 'enrolling')
+        self.heartbeat()
+        ready = self.enrollment()
+        self.assertEqual(ready['status'], 'ready')
+        with connection() as db:
+            self.assertEqual(db.execute('SELECT id FROM appliances WHERE cloud_id=?', (self.device_id.upper(),)).fetchone()[0], ready['appliance_id'])
         self.assertFalse(any(code in line for line in self.log.lines), 'the claim code must never be logged')
         self.assertIsNone(load_claim_state(self.config))
 
@@ -321,6 +340,26 @@ class ZeroTerminalOnboardingTests(unittest.TestCase):
         with connection() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM appliance_claims WHERE device_id=?', (self.device_id,)).fetchone()[0], before)
         self.assertEqual(len(self.appliances()), 1)
+
+    def test_a_local_enrollment_failure_is_never_reported_as_linked(self):
+        """Codex finding 3: claim/complete creates the cloud row, but the
+        appliance fails to save its identity and rolls back -- the claim page
+        must keep waiting; the agent retries with the same proof and only then
+        does the appliance become ready."""
+        _, code = self.click_link()
+        self.assertEqual(self.customer_confirms(code), 200)
+        real_finish = self.claim.finish_enrollment
+        self.claim.finish_enrollment = lambda *a, **k: (_ for _ in ()).throw(SystemExit('disk full'))
+        self.run_agent(3)
+        self.assertFalse(self.claim.done)
+        self.assertEqual(len(self.appliances()), 1)             # the cloud row exists ...
+        self.assertEqual(self.enrollment()['status'], 'enrolling')  # ... but it is not linked
+        self.claim.finish_enrollment = real_finish
+        self.claim.failures = 0
+        self.run_agent()
+        self.assert_enrolled()
+        self.heartbeat()
+        self.assertEqual(self.enrollment()['status'], 'ready')
 
     def test_another_customer_cannot_use_a_link_meant_for_a_different_site(self):
         _, code = self.click_link()

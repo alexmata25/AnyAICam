@@ -195,6 +195,7 @@ run_install() {
     provision_update_signing_key
     provision_entitlement_signing_keys
     stamp_release
+    agent_restart_after_provisioning
     log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."
     log "Next: open \"AnyAiCam Setup\" from this computer's applications menu (it also opens by itself at the next sign-in) and choose \"Link this appliance\" to connect it to your AnyAiCam account. No codes to copy."
 }

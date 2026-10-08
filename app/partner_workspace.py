@@ -716,13 +716,24 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         try: draft_data=json.loads(draft['data_json']) if draft else {}
         except (TypeError,ValueError): draft_data={}
         initial_step=max(1,min(7,int(draft['current_step']))) if draft else 1
-        # ?step=N (2026-10-08): the claim page sends a just-linked appliance's
-        # owner straight to Discover cameras (step 4); only once an appliance
-        # exists, so a direct link never skips adding one.
-        requested_step=request.query_params.get('step') or ''
-        if requested_step.isdigit() and appliances: initial_step=max(1,min(7,int(requested_step)))
         initial_appliance_id=str(draft_data.get('appliance_id') or '')
         if not any(a['id']==initial_appliance_id for a in appliances): initial_appliance_id=appliances[0]['id'] if appliances else ''
+        # ?appliance=<id>&step=N (2026-10-08): the claim page sends the owner
+        # of a just-linked appliance here with THAT appliance. It is selected
+        # explicitly -- never "the first one" -- and only if it is one of this
+        # customer's own (`appliances` is scoped to the signed-in customer).
+        # Discovery (step 4 and later) only once it has really enrolled
+        # (appliance_readiness.py); until then its status (step 3). Without
+        # ?appliance= a step only applies once an appliance exists.
+        requested_step=request.query_params.get('step') or ''
+        requested_appliance=request.query_params.get('appliance') or ''
+        chosen=next((a for a in appliances if a['id']==requested_appliance),None)
+        if chosen is not None: initial_appliance_id=chosen['id']
+        if requested_step.isdigit() and appliances:
+            initial_step=max(1,min(7,int(requested_step)))
+            if chosen is not None and initial_step>=4:
+                from appliance_readiness import enrollment_ready
+                if not enrollment_ready(chosen['id']): initial_step=3
         appliance_options=''.join(f'<option value="{a["id"]}" {"selected" if a["id"]==initial_appliance_id else ""}>{escape(a["cloud_id"])} · {escape(a.get("online_status") or "offline")}</option>' for a in appliances)
         # Multi-appliance isolation fix (2026-09-12): `cameras` above is
         # fetched by customer_id alone (shared with the Step 6 review

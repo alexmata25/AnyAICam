@@ -47,8 +47,10 @@ def test_claim_page_uses_the_code_without_ever_showing_it(client, db_path):
 def test_after_confirming_the_page_waits_for_the_appliance_then_goes_to_discovery(client, db_path):
     _seeded_customer(db_path)
     body = _claim_page(client)
-    assert "fetch('/api/customer/setup/status')" in body
-    assert "continueLink.href='/customer/setup?step=4'" in body
+    # Codex finding 3: readiness of THAT appliance, then discovery with it
+    # selected (test_claim_enrollment_readiness.py covers the endpoint).
+    assert "fetch('/api/portal/claims/enrollment?device_id='" in body
+    assert "continueLink.href='/customer/setup?step=4&appliance='+encodeURIComponent(applianceId)" in body
     assert "Discover cameras" in body
     # A failed link asks the customer to use the appliance's page again (no code to type).
     assert "open AnyAiCam Setup and choose “Link this appliance” again" in body

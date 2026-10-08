@@ -158,6 +158,23 @@ cloud_portal_provision() {
     log "Agent cloud portal set to ${portal%/} (production)."
 }
 
+# Zero-terminal onboarding (2026-10-08): install_agent (07-install-agent.sh)
+# restarts the agent BEFORE identity_provision, claim_label_provision and
+# cloud_portal_provision run, so on a fresh install the running agent has no
+# identity, no label verifier and the 127.0.0.1 placeholder portal -- its
+# headless claim is ineligible and the desktop setup page cannot link.
+# systemd reads agent.env only at (re)start, so the agent is restarted once
+# everything it needs exists. A failed restart fails the install loudly.
+agent_restart_after_provisioning() {
+    command -v systemctl >/dev/null 2>&1 || { log "systemctl not available; agent not restarted."; return 0; }
+    systemctl is-enabled --quiet anyaicam-agent.service 2>/dev/null || { log "anyaicam-agent.service not enabled; not restarted."; return 0; }
+    if ! systemctl restart anyaicam-agent.service; then
+        echo "[ERROR] could not restart anyaicam-agent.service after provisioning its identity and cloud portal." >&2
+        return 1
+    fi
+    log "Agent restarted with its identity, claim label and cloud portal."
+}
+
 stamp_release() {
     local record
     record="$(

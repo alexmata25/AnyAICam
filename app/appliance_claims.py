@@ -112,6 +112,8 @@ logger = logging.getLogger('anyaicam.appliance_claims')
 claim_begin_limiter = RateLimiter(10, 300)
 claim_status_limiter = RateLimiter(120, 60)
 claim_portal_limiter = RateLimiter(30, 60)
+# Polled by the claim page while the appliance finishes enrolling (every 3 s).
+claim_enrollment_limiter = RateLimiter(60, 60)
 
 CLAIM_SESSION_TTL_MINUTES = 15
 CLAIM_PROOF_TTL_MINUTES = 5
@@ -561,6 +563,27 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             raise HTTPException(status_code=404, detail='Claim code not found or expired.')
         return {'device_id': claim['device_id'], 'expires_at': claim['expires_at']}
 
+    @app.get('/api/portal/claims/enrollment')
+    def portal_claim_enrollment(request: Request, device_id: str = '') -> dict:
+        """Has the appliance just claimed by this customer really enrolled?
+        (2026-10-08) 'ready' only once THAT appliance has authenticated with
+        its own credential and sent a heartbeat (appliance_readiness.py) --
+        never merely because claim/complete created its row. An appliance of
+        another account, or none, is always 'waiting': this never confirms
+        that someone else's appliance exists."""
+        identity = _customer_owner(request)
+        _require_self_link_permission(identity)
+        if not claim_enrollment_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
+            raise HTTPException(status_code=429, detail='Too many checks; slow down.')
+        device_id = str(device_id or '').strip()
+        if not _valid_device_id(device_id):
+            raise HTTPException(status_code=400, detail='device_id must be a valid UUIDv4.')
+        appliance = row('SELECT id,customer_id FROM appliances WHERE cloud_id=?', (_normalize_device_id(device_id).upper(),))
+        if not appliance or appliance['customer_id'] != identity['customer_id']:
+            return {'status': 'waiting'}
+        from appliance_readiness import enrollment_ready
+        return {'status': 'ready' if enrollment_ready(appliance['id']) else 'enrolling', 'appliance_id': appliance['id']}
+
     @app.post('/api/portal/claims/confirm')
     def portal_claim_confirm(request: Request, payload: dict) -> dict:
         identity = _customer_owner(request)
@@ -815,7 +838,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(claimBody())}),body=await response.json();
           if(!response.ok&&linkCode){linkCode='';document.getElementById('claim-code-input').closest('label').hidden=false;document.getElementById('claim-lookup-button').hidden=false;message.textContent='This link has expired or was already used. On the appliance, open AnyAiCam Setup and choose “Link this appliance” again.';return}
           if(!response.ok){message.textContent=response.status===404?'No appliance is waiting with that code. Check the code, and that the appliance is plugged into power and your network (it can take a few minutes to start).':(body.detail||'Claim code not found or expired.');return}
-          claimedDevice=String(body.device_id||'').toUpperCase();
+          claimedDevice=String(body.device_id||'');
           // A link can be sent by anyone: confirm only one's own appliance.
           if(linkCode)document.getElementById('claim-confirm-message').textContent='Only confirm if you just chose “Link this appliance” on your own AnyAiCam appliance.';
           // A readable name, not the raw device UUID (2026-10-02).
@@ -840,18 +863,23 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           showToast('Appliance claim confirmed.');
           waitForAppliance();
         };
-        // The appliance redeems the confirmation itself within seconds; carry on
-        // to Discover cameras once it shows up on the account.
+        // The appliance redeems the confirmation itself. Linked is reported --
+        // and Discover cameras offered, for exactly this appliance -- only once
+        // the cloud has seen THIS appliance authenticate and check in
+        // (/api/portal/claims/enrollment), not when the claim is confirmed.
         async function waitForAppliance(){
           const continueLink=document.getElementById('claim-done-continue'),note=document.getElementById('claim-done-message');
           if(!claimedDevice||!continueLink.getAttribute('href').startsWith('/customer/setup'))return;
           continueLink.hidden=true;note.textContent='Claim confirmed. Waiting for the appliance to finish linking…';
+          let applianceId='';
           for(let i=0;i<60;i++){
-            try{const r=await fetch('/api/customer/setup/status');if(r.ok){const s=await r.json();
-              if((s.appliances||[]).some(a=>String(a.cloud_id||'').toUpperCase()===claimedDevice)){note.textContent='Your appliance is linked. Next: discover your cameras.';continueLink.href='/customer/setup?step=4';continueLink.textContent='Discover cameras';continueLink.hidden=false;return}}}catch(e){}
+            try{const r=await fetch('/api/portal/claims/enrollment?device_id='+encodeURIComponent(claimedDevice));if(r.ok){const s=await r.json();
+              if(s.appliance_id)applianceId=String(s.appliance_id);
+              if(s.status==='ready'&&applianceId){note.textContent='Your appliance is linked. Next: discover your cameras.';continueLink.href='/customer/setup?step=4&appliance='+encodeURIComponent(applianceId);continueLink.textContent='Discover cameras';continueLink.hidden=false;return}}}catch(e){}
             await new Promise(done=>setTimeout(done,3000));
           }
-          note.textContent='The appliance is taking longer than usual to finish linking. Check that it is powered on and connected, then continue.';continueLink.hidden=false;
+          note.textContent='The appliance has not finished linking yet. Check that it is powered on and connected to the internet; its status is on the next page.';
+          continueLink.href=applianceId?'/customer/setup?step=3&appliance='+encodeURIComponent(applianceId):'/customer/setup';continueLink.textContent='See appliance status';continueLink.hidden=false;
         }
         if(linkCode)document.getElementById('claim-lookup-button').onclick();
         </script>'''

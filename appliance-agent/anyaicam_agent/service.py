@@ -15,7 +15,7 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
                              auto_bind_discovered_cameras,
                              reconcile_cloud_cameras,redact_discovery_for_cloud)
 from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential
-from .headless_claim import HeadlessClaim
+from .headless_claim import HeadlessClaim, ineligibility as headless_ineligibility
 from .link_server import DEFAULT_PORT as LINK_DEFAULT_PORT, LinkServer
 from .discovery import scan
 from .metrics import collect
@@ -39,6 +39,10 @@ from .updater.apply_results import ResultRelay
 # appliance sees the same responsiveness whether the agent is waiting or
 # (as it used to, before this fix) crash-looping.
 ACTIVATION_POLL_INTERVAL_SECONDS = 10
+# Zero-terminal onboarding (2026-10-08): while waiting without a headless
+# claim, check again this often whether it has become possible (an identity or
+# label written after the agent started). Quiet: nothing is logged per check.
+HEADLESS_RECHECK_SECONDS = 30
 
 
 class ApplianceAgent:
@@ -527,13 +531,19 @@ class ApplianceAgent:
         # while it waits, so the customer needs no terminal. Ineligible
         # appliances (no label file, no cloud portal) only wait, as before.
         headless=self.headless=self.headless_claim_factory(self.config,self.log)
-        next_step=0.0
+        next_step=0.0; next_recheck=time.monotonic()+HEADLESS_RECHECK_SECONDS
         while not self.stop_event.is_set():
             credential=load_credential(self.config)
             if credential and credential.get('credential'):
                 self.client.appliance_id=credential.get('appliance_id'); self.client.credential=credential.get('credential')
                 self.log.info('Appliance activation detected; resuming normal operation cloud_id=%s',self.config.cloud_id)
                 return
+            if headless is None and time.monotonic()>=next_recheck:
+                next_recheck=time.monotonic()+HEADLESS_RECHECK_SECONDS
+                if headless_ineligibility(self.config) is None:
+                    headless=self.headless=self.headless_claim_factory(self.config,self.log)
+                    if headless is not None: self.log.info('Headless claim is now available; opening a claim.')
+                    continue
             wait=ACTIVATION_POLL_INTERVAL_SECONDS
             if headless is not None:
                 now=time.monotonic()
