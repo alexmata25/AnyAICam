@@ -81,8 +81,18 @@ if ($previous) {
 }
 
 # ---------------------------------------------------------------- install
-$install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru
-Check 'silent install exit code 0' { if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
+# 2026-10-08: a setup that cannot even start (application control, a damaged
+# file) is reported with its reason instead of a blank exit code.
+$installError = ''
+try {
+    $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop
+} catch { $install = $null; $installError = $_.Exception.Message }
+Check 'silent install exit code 0' { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
+Check 'code integrity / Smart App Control state (diagnostic)' {
+    $ci = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue
+    $signature = Get-AuthenticodeSignature -LiteralPath $setup.FullName
+    "VerifiedAndReputablePolicyState=$($ci.VerifiedAndReputablePolicyState); setup signature=$($signature.Status)"
+}
 # 2026-10-07: the first Sandbox run found torch's DLLs need the Visual C++
 # runtime, which a clean Windows lacks; setup now installs it and preflights.
 $installLog = Get-Content (Join-Path $results 'setup-install.log') -ErrorAction SilentlyContinue
