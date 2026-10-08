@@ -728,13 +728,24 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         requested_step=request.query_params.get('step') or ''
         requested_appliance=request.query_params.get('appliance') or ''
         chosen=next((a for a in appliances if a['id']==requested_appliance),None)
+        # An explicit ?appliance= that is not one of this customer's own
+        # (unknown, malformed, another account's): select NO appliance -- never
+        # fall back to the draft's or the first one -- and stay at Add
+        # appliance (step 2), whatever ?step= or the saved draft says, so
+        # discovery can never start on an appliance the link did not name.
+        unselectable_appliance=bool(requested_appliance) and chosen is None
         if chosen is not None: initial_appliance_id=chosen['id']
+        if unselectable_appliance: initial_appliance_id=''
         if requested_step.isdigit() and appliances:
             initial_step=max(1,min(7,int(requested_step)))
             if chosen is not None and initial_step>=4:
                 from appliance_readiness import enrollment_ready
                 if not enrollment_ready(chosen['id']): initial_step=3
-        appliance_options=''.join(f'<option value="{a["id"]}" {"selected" if a["id"]==initial_appliance_id else ""}>{escape(a["cloud_id"])} · {escape(a.get("online_status") or "offline")}</option>' for a in appliances)
+        if unselectable_appliance: initial_step=min(initial_step,2)
+        appliance_notice=('<section class="panel" id="appliance-not-found" role="status" style="margin-bottom:14px">'
+                          '<strong>That appliance is not on your account.</strong><p class="health-detail" style="margin:6px 0 0">'
+                          'Add or claim your appliance here, or choose one of yours under Status.</p></section>') if unselectable_appliance else ''
+        appliance_options=('<option value="" selected disabled>Choose an appliance</option>' if unselectable_appliance else '')+''.join(f'<option value="{a["id"]}" {"selected" if a["id"]==initial_appliance_id else ""}>{escape(a["cloud_id"])} · {escape(a.get("online_status") or "offline")}</option>' for a in appliances)
         # Multi-appliance isolation fix (2026-09-12): `cameras` above is
         # fetched by customer_id alone (shared with the Step 6 review
         # panel, which is legitimately account-wide). The Step 5 table
@@ -790,7 +801,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                             '<p class="health-detail" style="margin:6px 0 0">You can choose a plan again under Review.</p></section>')
         setup_tab_names=['Welcome','Add appliance','Status','Discover','Cameras','Review','Confirm']
         setup_tabs=''.join(f'<button type="button" class="workspace-tab{" active" if i==1 else ""}" data-step="{i}" style="cursor:pointer">{i} {name}</button>' for i,name in enumerate(setup_tab_names,1))
-        content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header>{payment_banner}<p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>6</strong> of 7 (Customer portion)</p><section class="panel"><nav class="workspace-tabs" id="customer-setup-tabs" aria-label="Setup steps" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto">{setup_tabs}</nav>
+        content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header>{payment_banner}{appliance_notice}<p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>6</strong> of 7 (Customer portion)</p><section class="panel"><nav class="workspace-tabs" id="customer-setup-tabs" aria-label="Setup steps" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto">{setup_tabs}</nav>
         <div class="customer-setup-step" data-step="1"><h2>Welcome to AnyAiCam</h2><p>This setup links your appliance, requests camera discovery from that appliance, and saves your camera and subscription settings.</p><div class="mock-banner">The browser does not scan the local network. Camera discovery runs on the assigned appliance.</div></div>
         <div class="customer-setup-step" data-step="2" hidden><h2>Add appliance</h2>
         <!-- Claim with a code (2026-10-08): an appliance installed with
