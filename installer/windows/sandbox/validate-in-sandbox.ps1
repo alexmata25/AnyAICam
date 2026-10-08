@@ -358,6 +358,14 @@ Check 'repair reinstall restores readable, inherited permissions' { DataFilesHea
 Check 'repair reinstall keeps this PC linked to the cloud' { StillLinked }
 
 $uninstaller = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
+Check 'installed uninstaller carries the same valid signature as the setup' {
+    $setupSignature = Get-AuthenticodeSignature -LiteralPath $setup.FullName
+    if ($setupSignature.Status -ne 'Valid') { return "setup not signed ($($setupSignature.Status)); skipped" }
+    $signature = Get-AuthenticodeSignature -LiteralPath $uninstaller.FullName
+    if ($signature.Status -ne 'Valid') { throw "$($uninstaller.Name): $($signature.Status)" }
+    if ($signature.SignerCertificate.Subject -ne $setupSignature.SignerCertificate.Subject) { throw "signer $($signature.SignerCertificate.Subject)" }
+    "$($uninstaller.Name): Valid, $($signature.SignerCertificate.Subject)"
+}
 $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-uninstall.log') + '"') -Wait -PassThru
 Check 'uninstall exit code 0' { $uninstall.ExitCode -eq 0 }
 Check 'uninstall removes the service' { -not (Get-Service AnyAiCamVMS -ErrorAction SilentlyContinue) }
