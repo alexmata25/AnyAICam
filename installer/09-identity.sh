@@ -131,11 +131,48 @@ validate_install_portal_url() {
     fi
 }
 
+# Zero-terminal onboarding (2026-10-08): a customer install links itself to
+# the AnyAiCam cloud from the desktop "AnyAiCam Setup" page, so without
+# --portal-url the agent now points at the AnyAiCam cloud by default -- unless
+# agent.env already names another valid https cloud (kept, e.g. a repair).
+ANYAICAM_DEFAULT_PORTAL_URL="${ANYAICAM_DEFAULT_PORTAL_URL:-https://app.anyaicam.com}"
+
+current_agent_portal_url() {
+    local file="${AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}"
+    [[ -f "$file" && ! -L "$file" ]] || return 0
+    sed -n 's/^ANYAICAM_PORTAL_URL=//p' "$file" | tail -1 | tr -d '"'"'"
+}
+
 cloud_portal_provision() {
-    [[ -n "${ANYAICAM_INSTALL_PORTAL_URL:-}" ]] || return 0
+    local portal="${ANYAICAM_INSTALL_PORTAL_URL:-}" current
+    if [[ -z "$portal" ]]; then
+        current="$(current_agent_portal_url)"
+        if [[ -n "$current" ]] && validate_install_portal_url "$current" >/dev/null 2>&1; then
+            log "Agent cloud portal kept: ${current%/}."
+            return 0
+        fi
+        portal="$ANYAICAM_DEFAULT_PORTAL_URL"
+    fi
     printf 'op update_env\npath %s\nmode 0600\nowner anyaicam\noverride ANYAICAM_PORTAL_URL=%s\noverride ANYAICAM_AGENT_MODE=production\n' \
-        "${AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}" "${ANYAICAM_INSTALL_PORTAL_URL%/}" | agent_file
-    log "Agent cloud portal set to ${ANYAICAM_INSTALL_PORTAL_URL%/} (production)."
+        "${AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}" "${portal%/}" | agent_file
+    log "Agent cloud portal set to ${portal%/} (production)."
+}
+
+# Zero-terminal onboarding (2026-10-08): install_agent (07-install-agent.sh)
+# restarts the agent BEFORE identity_provision, claim_label_provision and
+# cloud_portal_provision run, so on a fresh install the running agent has no
+# identity, no label verifier and the 127.0.0.1 placeholder portal -- its
+# headless claim is ineligible and the desktop setup page cannot link.
+# systemd reads agent.env only at (re)start, so the agent is restarted once
+# everything it needs exists. A failed restart fails the install loudly.
+agent_restart_after_provisioning() {
+    command -v systemctl >/dev/null 2>&1 || { log "systemctl not available; agent not restarted."; return 0; }
+    systemctl is-enabled --quiet anyaicam-agent.service 2>/dev/null || { log "anyaicam-agent.service not enabled; not restarted."; return 0; }
+    if ! systemctl restart anyaicam-agent.service; then
+        echo "[ERROR] could not restart anyaicam-agent.service after provisioning its identity and cloud portal." >&2
+        return 1
+    fi
+    log "Agent restarted with its identity, claim label and cloud portal."
 }
 
 stamp_release() {

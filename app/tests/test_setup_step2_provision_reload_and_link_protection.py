@@ -126,7 +126,10 @@ def test_provision_success_handler_reloads_after_a_fresh_provision(http_client, 
     fresh_branch = body[body.index("messageEl.textContent=`Provisioned Cloud ID"):]
     assert "if(confirm(" in fresh_branch
     confirm_call = fresh_branch[fresh_branch.index("if(confirm("):]
-    assert confirm_call.index("))location.reload()") < confirm_call.index("document.getElementById('link-customer-appliance')")
+    # reloadSetup(): a plain reload on this page (see
+    # test_setup_selects_claimed_appliance.py for the unselectable-link case).
+    assert confirm_call.index("))reloadSetup(r.appliance_id)") < confirm_call.index("document.getElementById('link-customer-appliance')")
+    assert "const applianceLinkUnselectable=false;" in body
 
 
 def test_already_provisioned_offers_an_auditable_token_recovery_not_a_tokenless_reload(http_client, db_path):

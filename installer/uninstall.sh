@@ -73,6 +73,7 @@ run_uninstall() {
     # Software Update (2026-10-03): the staged / previous / failed application trees.
     rm -rf "$VMS_INSTALL_ROOT.next" "$VMS_INSTALL_ROOT.previous" "$VMS_INSTALL_ROOT.failed"
     rm -f /usr/local/sbin/anyaicam-rollback
+    desktop_setup_remove
     docker image rm anyaicam-vms 2>/dev/null || true
     # The VMS is gone, so UDP 8189 is no longer published: its restriction goes too.
     remove_webrtc_firewall

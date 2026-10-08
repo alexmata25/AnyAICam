@@ -133,14 +133,41 @@ class ClaimLabelTests(unittest.TestCase):
         self.assertIn("KEEP=1\n", out)
         self.assertNotIn("127.0.0.1", out)
 
-    def test_no_portal_url_leaves_agent_env_alone(self):
-        out = self.run_steps('''
-            printf 'ANYAICAM_PORTAL_URL=http://127.0.0.1:8000\\n' > "$CONFIG_DIR/agent.env"
+    # Zero-terminal onboarding (2026-10-08): without --portal-url a customer
+    # install now points at the AnyAiCam cloud, unless agent.env already
+    # names another valid https cloud.
+    def test_no_portal_url_defaults_to_the_anyaicam_cloud(self):
+        for before in (r"ANYAICAM_PORTAL_URL=http://127.0.0.1:8000\nKEEP=1\n", r"KEEP=1\n"):
+            out = self.run_steps(f'''
+                printf '{before}' > "$CONFIG_DIR/agent.env"
+                unset ANYAICAM_INSTALL_PORTAL_URL
+                cloud_portal_provision
+                cat "$CONFIG_DIR/agent.env"
+            ''').stdout
+            self.assertIn("ANYAICAM_PORTAL_URL=https://app.anyaicam.com\n", out)
+            self.assertIn("ANYAICAM_AGENT_MODE=production\n", out)
+            self.assertIn("KEEP=1\n", out)
+            self.assertNotIn("127.0.0.1", out)
+
+    def test_no_portal_url_keeps_an_existing_valid_cloud(self):
+        out = self.run_steps(r'''
+            printf 'ANYAICAM_PORTAL_URL=https://portal.example.test\n' > "$CONFIG_DIR/agent.env"
             unset ANYAICAM_INSTALL_PORTAL_URL
             cloud_portal_provision
             cat "$CONFIG_DIR/agent.env"
         ''').stdout
-        self.assertIn("ANYAICAM_PORTAL_URL=http://127.0.0.1:8000", out)
+        self.assertIn("Agent cloud portal kept: https://portal.example.test", out)
+        self.assertIn("ANYAICAM_PORTAL_URL=https://portal.example.test\n", out)
+        self.assertNotIn("app.anyaicam.com", out)
+
+    def test_explicit_portal_url_still_wins(self):
+        out = self.run_steps(r'''
+            printf 'ANYAICAM_PORTAL_URL=https://portal.example.test\n' > "$CONFIG_DIR/agent.env"
+            ANYAICAM_INSTALL_PORTAL_URL=https://other.example.test
+            cloud_portal_provision
+            cat "$CONFIG_DIR/agent.env"
+        ''').stdout
+        self.assertIn("ANYAICAM_PORTAL_URL=https://other.example.test\n", out)
 
     def test_install_refuses_a_bad_portal_url_before_changing_anything(self):
         install = (ROOT / "install.sh").read_text(encoding="utf-8")
