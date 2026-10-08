@@ -336,12 +336,15 @@ class CloudAgentServiceTests(unittest.TestCase):
         self.assertLess(self.runtime.index("[IO.File]::WriteAllLines($environmentFile"), cloud_link)
         self.assertLess(cloud_link, self.runtime.index("installer\\firewall.ps1') -Apply"))
 
-    def test_claim_code_is_shown_but_never_logged(self):
+    def test_claim_code_is_never_shown_or_logged(self):
+        # 2026-10-08 (test_windows_zero_terminal.py has the details): the
+        # finish page links without showing the code; no "Show claim code".
         code = self.iss.split("// ------------------------------------------------------------ claim code", 1)[1]
         self.assertNotIn("Log(", code)
         self.assertIn("WizardForm.FinishedLabel.Caption", code)
-        self.assertIn('Filename: "{code:ClaimLink}"; Description: "Link this computer to my AnyAiCam account"; Flags: postinstall shellexec skipifsilent; Check: HasClaimLink', self.iss)
-        self.assertIn("-Verb RunAs -ArgumentList '{commonappdata}\\AnyAiCam\\label\\claim-label.txt'", self.iss)
+        self.assertNotIn("ClaimLabelValue('Claim code:')", self.iss)
+        self.assertIn('Description: "Link this computer to my AnyAiCam account"; Flags: postinstall runasoriginaluser runhidden nowait dontlogparameters skipifsilent; Check: HasClaimLink', self.iss)
+        self.assertNotIn("claim-label.txt'", self.iss.split("[Icons]", 1)[1].split("[Run]", 1)[0])
         link = read("cloud-link.ps1")
         for statement in ("Write-Host", "Write-Output $code", "Write-Verbose"):
             self.assertNotIn(statement, link)

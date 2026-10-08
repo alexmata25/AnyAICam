@@ -48,6 +48,9 @@ Name: "{commonappdata}\AnyAiCam\label"; Flags: uninsneveruninstall
 ; VMS never linger next to the new ones. Data lives in {commonappdata}\AnyAiCam.
 Type: filesandordirs; Name: "{app}\app"
 Type: filesandordirs; Name: "{app}\agent"
+; 2026-10-08: the claim code is no longer shown; an upgrade from 1.3.0-aedecb6
+; removes that release's "Show AnyAiCam claim code" shortcut.
+Type: files; Name: "{group}\Show AnyAiCam claim code.lnk"
 [Files]
 Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
@@ -64,6 +67,7 @@ Source: "agent-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "AnyAiCamAgent.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamAgent.exe"; Flags: ignoreversion
 Source: "cloud-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "open-claim-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
 Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\get-pip.py"; DestDir: "{tmp}"; Flags: deleteafterinstall
@@ -77,13 +81,20 @@ Source: "vendor\vc_redist.x64-14.44.35211.exe"; DestDir: "{tmp}"; Flags: deletea
 [Icons]
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
-; The claim code file is Administrators-only, so it opens elevated.
-Name: "{group}\Show AnyAiCam claim code"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -WindowStyle Hidden -Command ""Start-Process notepad.exe -Verb RunAs -ArgumentList '{commonappdata}\AnyAiCam\label\claim-label.txt'"""
+; 2026-10-08: opens the link page without showing the claim code; only an
+; administrator of this PC can (open-claim-link.ps1 elevates before it reads
+; the Administrators-only code file).
+Name: "{group}\Link this computer to AnyAiCam"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\installer\open-claim-link.ps1"""
 [Run]
 ; The claim page with this computer's code in the URL fragment (never sent to
 ; a server; /claim moves it into the tab and out of the address bar).
-Filename: "{code:ClaimLink}"; Description: "Link this computer to my AnyAiCam account"; Flags: postinstall shellexec skipifsilent; Check: HasClaimLink
-Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: postinstall shellexec skipifsilent unchecked
+; runasoriginaluser: the browser opens as the person who started the setup,
+; never elevated. The link is a PowerShell parameter, not the Filename, so
+; dontlogparameters keeps the code out of the setup log (Inno logs every
+; [Run] Filename and, unless told not to, its Parameters). Both entries are
+; skipped in a silent install.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command ""Start-Process -FilePath '{code:ClaimLink}'"""; Description: "Link this computer to my AnyAiCam account"; Flags: postinstall runasoriginaluser runhidden nowait dontlogparameters skipifsilent; Check: HasClaimLink
+Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: postinstall shellexec runasoriginaluser skipifsilent unchecked
 [UninstallRun]
 Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamAgent"
 Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamAgent"
@@ -195,7 +206,9 @@ end;
 
 // ------------------------------------------------------------ claim code
 // cloud-link.ps1 writes the code to an Administrators-only file; setup runs
-// elevated, so it can show it once on the last page. Never logged.
+// elevated, so it can read it. 2026-10-08: the code is never shown (finish
+// page, Start menu) and never logged; it only travels, in the link's URL
+// fragment, to the browser of the person who ran the setup.
 function ClaimLabelValue(const Prefix: String): String;
 var
   Lines: TArrayOfString;
@@ -211,27 +224,46 @@ begin
       end;
 end;
 
+// The link the finish page opens: the label file's QR link
+// (https://<cloud>/claim#label=XXXX-XXXX-XXXX) plus link=windows, which tells
+// the claim page the owner came from this computer's own setup -- the same
+// link open-claim-link.ps1 builds. It is put inside single quotes on a
+// PowerShell command line, so only these characters are accepted; '' (no
+// link offered) when anything looks wrong.
 function ClaimLink(Param: String): String;
+var
+  Link: String;
+  I: Integer;
 begin
-  Result := ClaimLabelValue('QR code:');
+  Result := '';
+  Link := ClaimLabelValue('QR code:');
+  if (Pos('https://', Link) <> 1) or (Pos('/claim#label=', Link) = 0) or (Length(Link) > 200) then Exit;
+  for I := 1 to Length(Link) do
+    if Pos(Copy(Link, I, 1), 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:/-#=') = 0 then Exit;
+  Result := Link + '&link=windows';
+end;
+
+// Linked once the agent holds its cloud credential (a repair, upgrade or
+// reinstall of a linked PC offers no link).
+function IsLinked(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{commonappdata}\AnyAiCam\agent\credential.json'));
 end;
 
 function HasClaimLink(): Boolean;
 begin
-  Result := (not PostInstallFailed) and (Pos('https://', ClaimLink('')) = 1);
+  Result := (not PostInstallFailed) and (not IsLinked) and (ClaimLink('') <> '');
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
-var
-  Code, Link: String;
 begin
-  if CurPageID <> wpFinished then Exit;
-  Code := ClaimLabelValue('Claim code:');
-  Link := ClaimLink('');
-  if (Code = '') or PostInstallFailed then Exit;
-  WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-    'To see this computer''s cameras from anywhere, link it to your AnyAiCam account with this claim code:' + #13#10#13#10 +
-    '    ' + Code + #13#10#13#10 +
-    'Keep it private. Link page: ' + Copy(Link, 1, Pos('#', Link) - 1) + #13#10 +
-    'Start menu > AnyAiCam > Show AnyAiCam claim code shows it again.';
+  if (CurPageID <> wpFinished) or PostInstallFailed then Exit;
+  if IsLinked then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'This computer is linked to your AnyAiCam account.'
+  else if HasClaimLink then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'To see this computer''s cameras from anywhere, keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
+      'Your browser opens AnyAiCam: sign in (or create an account), choose a site and confirm. There is no code to type.' + #13#10#13#10 +
+      'Later: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).';
 end;

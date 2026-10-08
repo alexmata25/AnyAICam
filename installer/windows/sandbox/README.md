@@ -23,3 +23,25 @@ at the Sandbox itself, so the production cloud is never contacted.
 Not covered automatically (needs a person / a camera): adding a real camera,
 live view in a browser on another device, a recording and its playback, and a
 reboot of the Sandbox VM.
+
+## Interactive linking checks (2026-10-08, by hand)
+
+The automatic run is silent, and a silent setup skips the finish page's
+entries. In a fresh Sandbox, with a standard (non-administrator) user where
+possible:
+
+1. Run the setup by double-click (`/PortalUrl=https://cloud.anyaicam.test:8443`
+   from a command prompt to stay on the test cloud). The last page shows **no
+   claim code**, says "There is no code to type" and has *Link this computer
+   to my AnyAiCam account* ticked.
+2. Click Finish. The browser opens `/claim` **un-elevated** (Task Manager >
+   Details > *Elevated* column = No) and the address bar ends at `/claim` or
+   the sign-in page (the code is moved out of it).
+3. Search `%TEMP%\Setup Log*.txt` (and the setup's `/LOG=` file, if any) for
+   the code from `C:\ProgramData\AnyAiCam\label\claim-label.txt`: **no match**.
+4. Start menu > AnyAiCam > *Link this computer to AnyAiCam*: a UAC prompt
+   appears; Cancel = nothing opens and no code is shown; Yes = the browser
+   opens the same page un-elevated, as the signed-in user, and the claim page
+   finds the PC (the URL fragment survived explorer.exe).
+5. After linking: the Start menu entry says "already linked"; a repair or
+   reinstall's last page says "This computer is linked".

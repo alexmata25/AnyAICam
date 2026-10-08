@@ -13,7 +13,11 @@ if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found:
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 $sourceCommit = (& git -C $repo rev-parse HEAD).Trim()
 if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not read the source commit.' }
-if (& git -C $repo status --porcelain -- app installer/windows) { throw 'app/ or installer/windows/ has uncommitted changes; build only from a committed tree.' }
+# Every packaged repository folder (read from the .iss, so appliance-agent
+# is included) must be exactly the commit: see source-integrity.ps1.
+. (Join-Path $PSScriptRoot 'source-integrity.ps1')
+$sourceProblems = @(Get-PackagedSourceProblems $repo (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss'))
+if ($sourceProblems.Count) { throw ("The packaged sources are not exactly commit $sourceCommit; build only from a committed tree:`n  " + ($sourceProblems -join "`n  ")) }
 # Every vendored input is pinned by SHA-256 (DEPENDENCIES.md), not just present.
 $vendor = Join-Path $PSScriptRoot 'vendor'
 $pinned = [ordered]@{
@@ -34,11 +38,15 @@ foreach ($file in $pinned.Keys) {
 $vcRedist = Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor 'vc_redist.x64-14.44.35211.exe')
 if ($vcRedist.Status -ne 'Valid' -or $vcRedist.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { throw 'vc_redist.x64-14.44.35211.exe is not validly signed by Microsoft Corporation.' }
 $wheelRoot = Join-Path $vendor 'wheels'
+$lockedWheels = @()
 foreach ($line in Get-Content (Join-Path $PSScriptRoot 'wheels.lock.sha256')) {
     $parts = $line -split '  ', 2
     $wheel = Join-Path $wheelRoot $parts[1]
     if (-not (Test-Path $wheel) -or (Get-FileHash -Algorithm SHA256 $wheel).Hash.ToLowerInvariant() -ne $parts[0]) { throw "Wheel checksum failed: $($parts[1])" }
+    $lockedWheels += $parts[1]
 }
+$vendorProblems = @(Get-VendorProblems $vendor @($pinned.Keys) $lockedWheels)
+if ($vendorProblems.Count) { throw ("vendor/ holds files that are not pinned (they would be packaged):`n  " + ($vendorProblems -join "`n  ")) }
 $installerScript = Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss'
 $compilerArguments = @()
 if ($Sign) {

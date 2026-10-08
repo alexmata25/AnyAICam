@@ -142,6 +142,32 @@ Check 'setup provisioned identity, claim code, verifier, portal and release' {
     if ($release.release_version -ne $expectedVersion) { throw "release $($release.release_version)" }
     'UUIDv4 identity; code + matching verifier; portal; release'
 }
+# ---------------------------------------------------------------- zero-terminal linking (2026-10-08)
+# The code is never shown: no "Show AnyAiCam claim code" entry; the Start menu
+# entry opens the link page (open-claim-link.ps1, Administrators only). The
+# link it builds is the one the finish page opens; the details below never
+# include the code itself.
+$startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\AnyAiCam'
+$claimLink = ''
+Check 'Start menu: "Link this computer to AnyAiCam", no "Show AnyAiCam claim code"' {
+    if (-not (Test-Path -LiteralPath (Join-Path $startMenu 'Link this computer to AnyAiCam.lnk'))) { throw 'no Link entry' }
+    if (Test-Path -LiteralPath (Join-Path $startMenu 'Show AnyAiCam claim code.lnk')) { throw 'Show claim code entry present' }
+    'Link entry only'
+}
+Check 'the installed link helper builds this PC''s link (code only in the fragment)' {
+    . (Join-Path $app 'installer\open-claim-link.ps1')
+    $script:claimLink = Get-ClaimLink $labelFile
+    if ($script:claimLink -ne "$TestPortal/claim#label=$($script:claimCode)&link=windows") { throw 'unexpected link (not shown: it holds the code)' }
+    if ((Get-LinkState $data) -ne 'unlinked') { throw 'reports linked before the claim' }
+    '<portal>/claim#label=<code>&link=windows; unlinked'
+}
+Check 'the agent opens no listening port (no local link page on Windows)' {
+    $agentProcess = WaitFor 60 { @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like '*agent-main.py*' })[0] }
+    if (-not $agentProcess) { throw 'agent process not found' }
+    $listening = @(Get-NetTCPConnection -State Listen -OwningProcess $agentProcess.ProcessId -ErrorAction SilentlyContinue)
+    if ($listening) { throw "listening on $(($listening | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort)" }) -join ', ')" }
+    "agent pid $($agentProcess.ProcessId): no listening sockets"
+}
 $python = Join-Path $app 'runtime\python\python.exe'
 $cloudData = 'C:\TestCloud'
 & $python 'C:\Validation\scripts\test-cloud.py' --app (Join-Path $app 'app') --data $cloudData --host $TestCloudHost --certificates-only
@@ -156,8 +182,10 @@ Check 'agent opens a claim for this PC with its claim code verifier' {
     if (-not $claim) { throw 'no pending claim for this appliance' }
     'pending claim for this appliance'
 }
-Check 'owner confirms with the claim code' {
-    $result = Cloud POST '/api/portal/claims/confirm' @{ label_code = $script:claimCode; site_id = 'test-site' } -Owner
+Check 'owner confirms through the link the setup opens' {
+    # What the claim page sends for /claim#label=...&link=windows.
+    if ($script:claimLink -notmatch '#label=([0-9A-Z-]{14})&link=windows$') { throw 'no link' }
+    $result = Cloud POST '/api/portal/claims/confirm' @{ label_code = $Matches[1]; site_id = 'test-site' } -Owner
     if ($result.status -ne 'claimed') { throw "status $($result.status)" }
     'claimed'
 }

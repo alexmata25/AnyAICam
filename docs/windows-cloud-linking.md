@@ -7,19 +7,23 @@ same appliance agent and the same label-claim flow (`docs/headless-label-claim.m
 
 ## Customer flow
 
-1. Run the setup. Its last page shows this computer's **claim code**
-   (`XXXX-XXXX-XXXX`) and, ticked by default, *Link this computer to my
-   AnyAiCam account*, which opens `https://app.anyaicam.com/claim#label=<code>`.
-   The code sits in the URL fragment, so it never reaches a server; `/claim` moves
-   it into the tab and out of the address bar.
+*Updated 2026-10-08: the code is no longer shown; see
+`docs/windows-zero-terminal-onboarding.md`.*
+
+1. Run the setup. Its last page has, ticked by default, *Link this computer to
+   my AnyAiCam account*, which opens
+   `https://app.anyaicam.com/claim#label=<code>&link=windows` in the browser of
+   the person who ran the setup (never elevated). The code sits in the URL
+   fragment, so it never reaches a server; `/claim` moves it into the tab and
+   out of the address bar.
 2. The customer signs in (or creates an account), picks a site and confirms.
 3. The **AnyAiCam Cloud Agent** service redeems the confirmation, saves its
    credential, writes the VMS's cloud identity and `ANYAICAM_CLOUD_URL`, and
    restarts the VMS. Heartbeats, camera status and the portal's commands follow.
 
-Shown again later: *Start menu → AnyAiCam → Show AnyAiCam claim code* (opens the
-Administrators-only file elevated). The code survives repair, upgrade and
-uninstall/reinstall, so a code already shown stays valid.
+Later: *Start menu → AnyAiCam → Link this computer to AnyAiCam* (an
+administrator of the PC; opens the same link without showing the code). The
+code survives repair, upgrade and uninstall/reinstall.
 
 ## What the installer adds
 

@@ -20,6 +20,13 @@ $env:ANYAICAM_VMS_RECORDINGS_PATH = Join-Path $dataRoot 'recordings'
 $env:ANYAICAM_VMS_HLS_PATH = Join-Path $dataRoot 'hls'
 $env:ANYAICAM_VMS_RELEASE_MARKER = Join-Path $config 'vms_release.json'
 $env:PYTHONUNBUFFERED = '1'
+# 2026-10-08: no local link page on Windows. The Linux agent's "AnyAiCam
+# Setup" page (127.0.0.1:8790, branch feature/linux-zero-terminal-onboarding)
+# lets anyone signed in to the computer link it; this agent runs as
+# LocalSystem on a PC that may have several users, so linking stays
+# Administrators-only (open-claim-link.ps1). 0 = off; agent.env cannot
+# override it (only the two keys below are read from it).
+$env:ANYAICAM_LINK_PORT = '0'
 
 function Import-EnvFile([string]$Path, [string[]]$Keys) {
     $values = @{}
