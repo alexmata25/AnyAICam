@@ -87,10 +87,17 @@ bootstrap_capacity_identity() {
         fi
     elif ! systemctl start anyaicam-capacity-accept.service; then
         if [[ -e /var/lib/anyaicam/vms/data-config/vms_capacity_signed.json ]]; then
-            echo "[ERROR] A pending signed camera-capacity snapshot exists but identity/signature acceptance failed; refusing to report bootstrap success." >&2
-            return 1
+            # The watcher rejects bad, expired, replayed, or otherwise
+            # unauthorized staging without changing protected accepted
+            # state. A repair invokes this after deploy_vms has stopped the
+            # old container, so rejection must not strand the appliance
+            # before systemd_setup can bring the VMS back. Leave the staged
+            # file untouched for the owner/cloud retry path; the VMS keeps
+            # enforcing the last accepted capacity (or fails closed if none).
+            echo "[WARN] Pending signed camera-capacity snapshot was not accepted; existing protected capacity remains authoritative." >&2
+        else
+            echo "[INFO] No signed camera-capacity snapshot is pending; the claim must complete before cloud capacity can be accepted." >&2
         fi
-        echo "[INFO] No signed camera-capacity snapshot is pending; the claim must complete before cloud capacity can be accepted." >&2
     fi
     return 0
 }

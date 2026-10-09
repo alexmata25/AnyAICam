@@ -408,6 +408,23 @@ class AcceptanceFilesystemTests(unittest.TestCase):
                               compat_dir=str(self.compat), compat_file="vms_capacity.json",
                               now=now, verifier=self.verifier, allow_expired_first=allow_expired_first)
 
+    def call_migrated_accept_cli(self):
+        constants = {
+            "STAGING_FILE": str(self.stage),
+            "IDENTITY_FILE": str(self.identity_dir / "appliance_identity.json"),
+            "TRUST_DIR": str(self.trust),
+            "TRUST_FILE": "entitlement_signing_keys.json",
+            "ACCEPTED_FILE": "vms_capacity_accepted.json",
+            "COMPAT_DIR": str(self.compat),
+            "COMPAT_FILE": "vms_capacity.json",
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.multiple(capacity_accept, **constants), \
+                mock.patch.object(capacity_accept.sys, "argv", ["capacity_accept.py", "--accept-migrated-snapshot"]), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = capacity_accept.main()
+        return result, stdout.getvalue().strip(), stderr.getvalue().strip()
+
     def stage_snapshot(self, snapshot):
         self.stage.write_text(json.dumps(snapshot), encoding="utf-8")
         self.stage.chmod(0o600)
@@ -474,15 +491,80 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         self.assertFalse(self.accepted.exists())
 
     def test_legacy_124_signed_snapshot_without_transition_requires_migration_entrypoint(self):
+        # Only upgraded 1.2.4 installations lack the protected pending claim.
+        (self.trust / PENDING_CLAIM_FILE).unlink()
         self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
         with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
             self.call_accept()
         self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
-        self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
-        self.assertEqual(self.call_accept(allow_expired_first=True), "accepted")
+        now = dt.datetime.now(dt.timezone.utc)
+        self.stage_snapshot(make_snapshot(self.private, issued=now - dt.timedelta(days=2),
+                                          expires=now - dt.timedelta(days=1), **CLOUD_IDENTITY))
+        result, output, error = self.call_migrated_accept_cli()
+        self.assertEqual((result, output), (0, "accepted"), error)
         pin = json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text(encoding="utf-8"))
         self.assertEqual(pin["appliance_id"], CLOUD_IDENTITY["appliance_id"])
         self.assertNotEqual(pin["appliance_id"], PROVISIONAL_ID)
+
+    def test_clean_claim_migration_rejects_expired_and_transitionless_snapshots(self):
+        # This is the same migration CLI invoked by the installer repair path.
+        now = dt.datetime.now(dt.timezone.utc)
+        expired_claim = make_initial_claim_snapshot(self.private, CLOUD_IDENTITY,
+                                                    issued=now - dt.timedelta(days=2),
+                                                    expires=now - dt.timedelta(days=1))
+        self.stage_snapshot(expired_claim)
+        result, _, error = self.call_migrated_accept_cli()
+        self.assertEqual(result, 1)
+        self.assertIn("expired", error)
+        self.assertFalse(self.accepted.exists())
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertTrue((self.trust / PENDING_CLAIM_FILE).exists())
+
+        self.stage_snapshot(make_snapshot(self.private, issued=now, expires=now + dt.timedelta(days=1),
+                                          **CLOUD_IDENTITY))
+        result, _, error = self.call_migrated_accept_cli()
+        self.assertEqual(result, 1)
+        self.assertIn("initial_claim_transition_required", error)
+        self.assertFalse(self.accepted.exists())
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertTrue((self.trust / PENDING_CLAIM_FILE).exists())
+
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY,
+                                                         issued=now, expires=now + dt.timedelta(days=1)))
+        result, output, error = self.call_migrated_accept_cli()
+        self.assertEqual((result, output, error), (0, "accepted", ""))
+        self.assertFalse((self.trust / PENDING_CLAIM_FILE).exists())
+        self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
+
+    def test_offline_expired_retry_rejects_without_changing_accepted_capacity_or_identity(self):
+        snapshot = make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=4,
+                                               issued=NOW, expires=NOW + dt.timedelta(hours=24))
+        self.stage_snapshot(snapshot)
+        self.assertEqual(self.call_accept(now=NOW), "accepted")
+        accepted_before = self.accepted.read_bytes()
+        identity_before = (self.identity_dir / "appliance_identity.json").read_bytes()
+        anchor_before = (self.trust / IDENTITY_ANCHOR_FILE).read_bytes()
+        recordings = self.root / "customer-recordings"
+        credentials = self.root / "customer-config"
+        recordings.mkdir()
+        credentials.mkdir()
+        (recordings / "camera-1.mkv").write_bytes(b"recording-preserved")
+        (credentials / "camera-credentials.json").write_text('{"encrypted":"preserve"}', encoding="utf-8")
+        recording_before = (recordings / "camera-1.mkv").read_bytes()
+        credential_before = (credentials / "camera-credentials.json").read_bytes()
+
+        # The appliance was offline past TTL; repair sees the same staged
+        # authorization, which is rejected strictly and cannot replace the
+        # last accepted capacity.
+        with self.assertRaisesRegex(Reject, "expired"):
+            self.call_accept(now=NOW + dt.timedelta(days=2))
+        self.assertEqual(self.accepted.read_bytes(), accepted_before)
+        self.assertEqual(json.loads(self.compat_file.read_text())["camera_slot_quantity"], 4)
+        self.assertEqual((self.identity_dir / "appliance_identity.json").read_bytes(), identity_before)
+        self.assertEqual((self.trust / IDENTITY_ANCHOR_FILE).read_bytes(), anchor_before)
+        self.assertEqual((recordings / "camera-1.mkv").read_bytes(), recording_before)
+        self.assertEqual((credentials / "camera-credentials.json").read_bytes(), credential_before)
+        self.assertTrue(self.stage.exists())
 
     def test_124_upgrade_without_staged_snapshot_pins_activation_then_watcher_accepts(self):
         # 1.2.4 persisted a cloud identity before the signing rollout and did

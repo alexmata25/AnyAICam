@@ -117,7 +117,7 @@ install_agent() {
     deploy_agent_source || return 1
 
     log "Installing appliance-agent control-plane package..."
-    bash "$AGENT_SOURCE_ROOT/scripts/install.sh"
+    bash "$AGENT_SOURCE_ROOT/scripts/install.sh" || return $?
     if [[ "$state" == "clean" ]]; then
         log "Appliance agent installed (clean install)."
     else
