@@ -88,6 +88,10 @@ class ApplierTestCase(unittest.TestCase):
                               live=self.tmp / "opt/anyaicam", trusted_key=self.tmp / "etc/anyaicam-update/trusted_signing_key.pem",
                               vms_env=self.tmp / "etc/anyaicam/vms.env", release_marker=self.tmp / "etc/anyaicam/vms_release.json",
                               lock=self.tmp / "run/anyaicam-software-update.lock", os_release=self.tmp / "os-release")
+        # Signed camera capacity (2026-10-09): never the real system paths.
+        self.paths.capacity_fallback = self.tmp / "etc/anyaicam-update/vms_capacity_fallback.json"
+        self.paths.legacy_capacity = self.tmp / "var/lib/anyaicam/vms/data-config/vms_capacity.json"
+        self.paths.activation_identity = self.tmp / "var/lib/anyaicam/vms/recordings/appliance_identity.json"
         self.private_key, public_pem = generate_keypair()
         self.paths.trusted_key.parent.mkdir(parents=True)
         self.paths.trusted_key.write_bytes(public_pem)

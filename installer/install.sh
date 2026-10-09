@@ -152,6 +152,8 @@ source "$INSTALLER_DIR/12-update-signing-key.sh"
 source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"
 # shellcheck source=14-desktop-setup.sh
 source "$INSTALLER_DIR/14-desktop-setup.sh"
+# shellcheck source=15-capacity-fallback.sh
+source "$INSTALLER_DIR/15-capacity-fallback.sh"
 
 run_install() {
     local mode="install" allow_downgrade=0
@@ -192,6 +194,8 @@ run_install() {
     docker_setup
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"
+    # Signed camera capacity (1.2.5): before the new VMS starts.
+    migrate_capacity_fallback_step "$INSTALL_STATE"
     install_rollback_tool
     install_agent "$INSTALL_STATE"
     install_mediamtx "$INSTALL_STATE"

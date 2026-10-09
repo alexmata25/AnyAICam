@@ -129,6 +129,12 @@ class Paths:
     # Paid-feature trust anchor (2026-10-05): fixed, the path the VMS reads
     # (app/appliance_entitlements.py TRUST_ANCHOR_FILE).
     entitlement_keys: Path = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
+    # Signed camera capacity (2026-10-09): the root-owned fallback migrated
+    # once from the unsigned file, and the files it is migrated from (in
+    # agent-owned directories: read as untrusted).
+    capacity_fallback: Path = Path("/etc/anyaicam-update/vms_capacity_fallback.json")
+    legacy_capacity: Path = Path("/var/lib/anyaicam/vms/data-config/vms_capacity.json")
+    activation_identity: Path = Path("/var/lib/anyaicam/vms/recordings/appliance_identity.json")
     vms_env: Path = Path("/etc/anyaicam/vms.env")                   # in an agent-owned directory
     release_marker: Path = Path("/etc/anyaicam/vms_release.json")   # in an agent-owned directory
     recordings: Path = Path("/var/lib/anyaicam/vms/recordings")     # where the database backups are
@@ -315,6 +321,159 @@ def install_trust_anchor(target: Path, data: bytes, *, posix: Optional[bool] = N
         (write or safe_replace)(directory, target.name, data, mode=0o644, owner=(0, 0) if posix else None)
     except OSError as error:
         raise TrustAnchorError("trust_anchor_write_failed", f"writing {target} failed: {error}") from error
+
+
+# ---------------------------------------------------------------- capacity fallback (Linux 1.2.5)
+# Signed camera capacity (2026-10-09). From 1.2.5 the VMS enforces only a
+# camera capacity the cloud SIGNED (app/vms_capacity.py); the unsigned
+# vms_capacity.json the anyaicam user can edit is no longer trusted. An
+# appliance upgraded from an earlier release may have nothing signed yet and
+# may be offline, so -- once, as root, during the upgrade -- the capacity it
+# was already running with is copied into this root-owned file. The VMS uses
+# it only until the first signed capacity, and only for the identity it was
+# migrated for.
+#   * Only on an upgrade FROM a release before signed capacity (or one with no
+#     recorded release): a later upgrade never migrates, so a value forged
+#     into vms_capacity.json after 1.2.5 can never be laundered in as root.
+#   * Never overwritten once it exists; the unsigned file is left in place
+#     (a rollback to 1.2.4 keeps using it).
+#   * The source and the identity file live in directories the anyaicam user
+#     owns: read without following symlinks, single-link regular files only,
+#     size-capped; only three identity fields are copied, never the credential.
+CAPACITY_FALLBACK_FILE = Path("/etc/anyaicam-update/vms_capacity_fallback.json")
+LEGACY_CAPACITY_FILE = Path("/var/lib/anyaicam/vms/data-config/vms_capacity.json")
+ACTIVATION_IDENTITY_FILE = Path("/var/lib/anyaicam/vms/recordings/appliance_identity.json")
+SIGNED_CAPACITY_SINCE = (1, 2, 5)
+MAX_CAMERA_SLOTS = 10000
+_CAPACITY_SOURCE_MAX_BYTES = 64 * 1024
+_IDENTITY_FIELDS = ("appliance_id", "cloud_id", "customer_id")
+_IDENTITY_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,199}")
+
+
+def capacity_migration_applies(from_version: str) -> bool:
+    """True when the release being replaced predates signed capacity: no
+    recorded version (builds from before release versions) or one older than
+    1.2.5. An unparseable recorded version never migrates (never guesses)."""
+    version = (from_version or "").strip()
+    if not version:
+        return True
+    if not re.fullmatch(r"\d{1,4}(\.\d{1,4}){1,3}", version):
+        return False
+    parts = tuple(int(part) for part in version.split("."))
+    width = max(len(parts), len(SIGNED_CAPACITY_SINCE))
+    pad = lambda value: value + (0,) * (width - len(value))  # noqa: E731
+    return pad(parts) < pad(SIGNED_CAPACITY_SINCE)
+
+
+def _read_user_json(path: Path) -> Optional[dict]:
+    """A small JSON object from a file a less-privileged user controls, or
+    None: never through a symlink, a regular single-link file only, at most
+    _CAPACITY_SOURCE_MAX_BYTES. (Its content is untrusted either way; these
+    rules only stop root from being pointed at some other file.)"""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        if path.is_symlink():
+            return None
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    with os.fdopen(descriptor, "rb") as handle:
+        try:
+            info = os.fstat(handle.fileno())
+            if not statmod.S_ISREG(info.st_mode) or getattr(info, "st_nlink", 1) != 1:
+                return None
+            if info.st_size > _CAPACITY_SOURCE_MAX_BYTES:
+                return None
+            raw = handle.read(_CAPACITY_SOURCE_MAX_BYTES + 1)
+        except OSError:
+            return None
+    if len(raw) > _CAPACITY_SOURCE_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _legacy_camera_quantity(path: Path) -> Optional[int]:
+    data = _read_user_json(path)
+    quantity = (data or {}).get("camera_slot_quantity")
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or not 0 <= quantity <= MAX_CAMERA_SLOTS:
+        return None
+    return quantity
+
+
+def _activation_identity(path: Path) -> Optional[dict]:
+    data = _read_user_json(path)
+    if data is None:
+        return None
+    identity = {}
+    for name in _IDENTITY_FIELDS:
+        value = data.get(name)
+        if not isinstance(value, str) or not _IDENTITY_VALUE.fullmatch(value):
+            return None
+        identity[name] = value
+    return identity
+
+
+def migrate_capacity_fallback(*, from_version: str, migrated_by: str, target: Path = CAPACITY_FALLBACK_FILE,
+                              legacy: Path = LEGACY_CAPACITY_FILE, identity_file: Path = ACTIVATION_IDENTITY_FILE,
+                              posix: Optional[bool] = None, lstat=os.lstat, write=None, make_dir=None,
+                              now=None) -> str:
+    """Writes the root-owned capacity fallback once, on an upgrade from a
+    release before signed capacity. Returns what happened:
+      'not_applicable'  the replaced release already had signed capacity
+      'exists'          a fallback is already there (never overwritten)
+      'no_capacity'     no usable unsigned capacity to carry over
+      'no_identity'     the appliance has no complete activation identity
+      'migrated'        written root:root 0644
+    TrustAnchorError when an existing fallback or its directory is unsafe, or
+    the write fails: the caller stops before anything else changes."""
+    if migrated_by not in ("installer", "software_update"):
+        raise ValueError("migrated_by must be 'installer' or 'software_update'")
+    posix = _posix() if posix is None else posix
+    try:
+        existing = lstat(target)
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise TrustAnchorError("trust_anchor_unsafe", f"{target} cannot be inspected: {error}") from error
+    if existing is not None:
+        if statmod.S_ISLNK(existing.st_mode) or not statmod.S_ISREG(existing.st_mode):
+            raise TrustAnchorError("trust_anchor_unsafe", f"{target} is not a regular file")
+        problem = ownership_problem(existing, expected_uid=0 if posix else None, posix=posix)
+        if problem:
+            raise TrustAnchorError("trust_anchor_unsafe", f"{target} {problem}")
+        return "exists"
+    if not capacity_migration_applies(from_version):
+        return "not_applicable"
+    quantity = _legacy_camera_quantity(legacy)
+    if quantity is None:
+        return "no_capacity"
+    identity = _activation_identity(identity_file)
+    if identity is None:
+        return "no_identity"
+    record = {"schema": 1, "camera_slot_quantity": quantity, **identity,
+              "source": "migrated_unsigned_capacity", "migrated_from_version": (from_version or "").strip(),
+              "migrated_at": (now or (lambda: datetime.now(timezone.utc)))().isoformat(timespec="seconds"),
+              "migrated_by": migrated_by}
+    data = (json.dumps(record, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    install_trust_anchor(target, data, posix=posix, lstat=lstat, write=write, make_dir=make_dir)
+    return "migrated"
+
+
+def migrate_capacity_fallback_main(argv: list) -> int:
+    """Installer entry point (installer/15-capacity-fallback.sh):
+    apply_release.py-dir on sys.path, then main([from_version])."""
+    from_version = argv[0] if argv else ""
+    try:
+        outcome = migrate_capacity_fallback(from_version=from_version, migrated_by="installer")
+    except TrustAnchorError as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        return 1
+    print(outcome)
+    return 0
 
 
 def _open_untrusted(path: Path, *, expected_uid: Optional[int], dir_fd: Optional[int] = None):
@@ -1129,6 +1288,7 @@ class Applier:
             self._stage_next(release_root)
             self._prepare_before_downtime(manifest, previous)
             record["entitlement_keyset"] = self._install_entitlement_keyset()
+            record["capacity_fallback"] = self._migrate_capacity_fallback(previous.get("version", ""))
             progress("installing")
             downtime_started = True
             self._activate(manifest)
@@ -1338,6 +1498,20 @@ class Applier:
         except TrustAnchorError as error:
             raise Failure("install_failed", error.code, f"installing the entitlement keyset failed: {error}") from error
         return "updated"
+
+    def _migrate_capacity_fallback(self, from_version: str) -> str:
+        """Before any downtime, like the keyset: on an update from a release
+        before signed capacity, carries the capacity the appliance runs with
+        into the root-owned fallback (migrate_capacity_fallback). An unsafe
+        existing fallback stops the update with nothing changed. Kept if a
+        later step rolls back: the release rolled back to ignores it."""
+        try:
+            return migrate_capacity_fallback(from_version=from_version, migrated_by="software_update",
+                                             target=self.paths.capacity_fallback,
+                                             legacy=self.paths.legacy_capacity,
+                                             identity_file=self.paths.activation_identity)
+        except TrustAnchorError as error:
+            raise Failure("install_failed", error.code, f"migrating the camera capacity failed: {error}") from error
 
     # ------------------------------------------------------------------ activate (downtime)
     def _systemctl(self, action: str) -> tuple:
