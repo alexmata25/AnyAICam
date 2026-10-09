@@ -4,6 +4,11 @@ import main
 def _command(monkeypatch, copy):
     seen = {}
     monkeypatch.setattr(main, "LIVE_VIDEO_COPY", copy)
+    # 2026-10-08: copy also needs this camera's codec verified as H.264
+    # (test_live_stream_copy_safety.py covers the probe and the fallback).
+    import time
+    monkeypatch.setattr(main, "_live_copy_probe", {2: (time.monotonic(), "h264")})
+    monkeypatch.setattr(main, "_live_copy_disabled_until", {})
     monkeypatch.setattr(main, "camera_url", lambda n: "rtsp://cam/stream")
     monkeypatch.setattr(main.subprocess, "Popen", lambda cmd, **kw: seen.setdefault("cmd", cmd))
     main.start_live_stream(2)
