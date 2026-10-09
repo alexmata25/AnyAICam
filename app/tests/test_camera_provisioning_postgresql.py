@@ -71,6 +71,7 @@ def _tenant():
                        (ids["site"], ids["customer"], "Lock test", "now"))
             db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)",
                        (ids["appliance"], ids["customer"], ids["site"], "AIC-" + suffix.upper(), "now"))
+    ids["cloud_id"] = "AIC-" + suffix.upper()  # the callback route addresses the appliance by it
     return ids
 
 
@@ -78,7 +79,18 @@ def _cleanup(ids):
     with override_target(database_url=TEST_URL):
         with connection() as db:
             db.execute("DELETE FROM camera_provisioning_requests WHERE customer_id=?", (ids["customer"],))
+            db.execute("DELETE FROM camera_credentials WHERE camera_id IN (SELECT id FROM cameras WHERE customer_id=?)", (ids["customer"],))
             db.execute("DELETE FROM cameras WHERE customer_id=?", (ids["customer"],))
+            # Every row the routes wrote for this appliance (credentials, request
+            # nonces, ...): each table with a foreign key to appliances(id).
+            for item in db.execute(
+                    "SELECT tc.table_name AS t, kcu.column_name AS c FROM information_schema.table_constraints tc "
+                    "JOIN information_schema.key_column_usage kcu ON tc.constraint_name=kcu.constraint_name "
+                    "JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name=ccu.constraint_name "
+                    "WHERE tc.constraint_type='FOREIGN KEY' AND ccu.table_name='appliances' AND ccu.column_name='id'").fetchall():
+                if item["t"] != "cameras":
+                    db.execute(f'DELETE FROM "{item["t"]}" WHERE "{item["c"]}"=?', (ids["appliance"],))
+            db.execute("DELETE FROM customer_entitlements WHERE customer_id=?", (ids["customer"],))
             db.execute("DELETE FROM appliances WHERE id=?", (ids["appliance"],))
             db.execute("DELETE FROM sites WHERE id=?", (ids["site"],))
             db.execute("DELETE FROM customers WHERE id=?", (ids["customer"],))

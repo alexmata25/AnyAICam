@@ -61,7 +61,11 @@ def _postgres_sql(sql: str) -> str:
     converted=re.sub(r'\bBLOB\b','BYTEA',converted,flags=re.I)
     if re.match(r'\s*INSERT OR IGNORE\s+',converted,re.I):
         converted=re.sub(r'INSERT OR IGNORE','INSERT',converted,count=1,flags=re.I).rstrip().rstrip(';')+' ON CONFLICT DO NOTHING'
-    return converted.replace('?','%s')
+    # A literal % (LIKE 'AIC-APPLIANCE-%', NOT LIKE 'skipped%') is psycopg's
+    # placeholder character: escaped first, or psycopg rejects the statement
+    # ("only '%s', '%b', '%t' are allowed as placeholders") whenever it has
+    # parameters (2026-10-09; production runs PostgreSQL).
+    return converted.replace('%','%%').replace('?','%s')
 
 
 def lock_customer_camera_capacity(db, customer_id: str) -> bool:
