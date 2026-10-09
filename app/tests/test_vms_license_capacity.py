@@ -129,6 +129,12 @@ def edge(tmp_path, monkeypatch):
     return vms_capacity, state
 
 
+def _license(vms_capacity, quantity, **fields):
+    """A capacity in force, as an accepted configuration sync makes it
+    (where it may come from is tested in test_signed_camera_capacity.py)."""
+    vms_capacity._legacy_cloud_capacity = vms_capacity._record({"camera_slot_quantity": quantity, **fields}, "legacy_cloud")
+
+
 def test_a_never_claimed_copied_install_runs_no_camera(edge, monkeypatch):
     vms_capacity, state = edge
     state["activated"] = False
@@ -142,7 +148,7 @@ def test_a_never_claimed_copied_install_runs_no_camera(edge, monkeypatch):
 
 def test_a_synced_capacity_limits_which_cameras_run(edge, monkeypatch):
     vms_capacity, _ = edge
-    assert vms_capacity.persist_capacity({"camera_slot_quantity": 2, "plan_camera_slots": 8, "vms_license_capacity": 2}) is True
+    _license(vms_capacity, 2, plan_camera_slots=8, vms_license_capacity=2)
     assert vms_capacity.licensed_camera_numbers([3, 1, 2]) == [1, 2]
     import main
     monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2, 3])
@@ -152,7 +158,7 @@ def test_a_synced_capacity_limits_which_cameras_run(edge, monkeypatch):
     # A licensed camera still resolves normally.
     monkeypatch.setenv("CAMERA1_HOST", "192.0.2.11")
     assert "192.0.2.11" in main.camera_url(1)
-    assert vms_capacity.persist_capacity({"camera_slot_quantity": 0}) is True
+    _license(vms_capacity, 0)
     assert vms_capacity.licensed_camera_numbers([1, 2, 3]) == []
 
 
@@ -175,7 +181,7 @@ def test_an_activated_appliance_runs_nothing_before_its_first_authoritative_sync
 @pytest.mark.parametrize("capacity,expected", [(0, []), (1, [1]), (2, [1, 2]), (8, [1, 2, 3])])
 def test_authoritative_capacity_allows_exactly_n(edge, capacity, expected):
     vms_capacity, _ = edge
-    vms_capacity.persist_capacity({"camera_slot_quantity": capacity})
+    _license(vms_capacity, capacity)
     assert vms_capacity.licensed_camera_numbers([3, 1, 2]) == expected
 
 
@@ -188,7 +194,7 @@ def test_a_later_valid_sync_enables_the_licensed_cameras(edge, monkeypatch):
     monkeypatch.setenv("CAMERA2_HOST", "192.0.2.22")
     with pytest.raises(main.CameraNotLicensedError):
         main.camera_url(1)
-    assert vms_capacity.persist_capacity({"camera_slot_quantity": 1}) is True  # first configuration sync
+    _license(vms_capacity, 1)  # first configuration sync
     assert "192.0.2.21" in main.camera_url(1)
     with pytest.raises(main.CameraNotLicensedError):
         main.camera_url(2)
@@ -204,8 +210,8 @@ def test_claiming_never_depends_on_capacity(client, db_path):
 
 def test_an_older_cloud_without_capacity_changes_nothing(edge):
     vms_capacity, _ = edge
-    assert vms_capacity.persist_capacity(None) is False
-    assert vms_capacity.persist_capacity({"product_mode": "local"}) is False
+    assert vms_capacity.apply_sync(None, None) == "absent"
+    assert vms_capacity.apply_sync({"camera_slot_quantity": 8}, None) == "absent"  # unsigned only: not accepted
     assert vms_capacity.load_capacity() is None
 
 
@@ -219,7 +225,5 @@ def test_the_cloud_never_restricts_itself(edge, monkeypatch):
 def test_configuration_sync_stores_the_capacity(edge, monkeypatch):
     vms_capacity, _ = edge
     import edge_camera_sync
-    vms_capacity.persist_capacity({"camera_slot_quantity": 5, "plan_camera_slots": 8, "vms_license_capacity": 5})
-    assert json.loads(vms_capacity.STATE_FILE.read_text())["camera_slot_quantity"] == 5
     source = open(edge_camera_sync.__file__, encoding="utf-8").read()
-    assert 'vms_capacity.persist_capacity(response.get("usable_camera_capacity"))' in source
+    assert 'vms_capacity.apply_sync(response.get("usable_camera_capacity"), response.get("feature_entitlements"))' in source
