@@ -1310,7 +1310,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
     # echoed back to the browser. See ANYAICAM_CAMERA_CREDENTIAL_KEY's
     # own comment for the encryption details.
     CAMERA_PROVISIONING_TERMINAL_STATES={'provisioned','failed'}
-    CAMERA_PROVISIONING_TIMEOUT_SECONDS=300
+    from customer_entitlements import CAMERA_ADD_PENDING_SECONDS as CAMERA_PROVISIONING_TIMEOUT_SECONDS
 
     # Encryption itself now lives in appliance_protocol.py, shared with
     # appliance_cloud.py's decrypt-on-poll (see the import at the top of
@@ -1358,14 +1358,19 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # Usable capacity (2026-10-01): the camera plan AND the VMS software
         # license must both cover a new camera -- see customer_entitlements.
         # usable_camera_capacity(). Claiming an appliance is not gated; this is.
-        from customer_entitlements import capacity_refusal, usable_camera_capacity
+        from customer_entitlements import (capacity_refusal, capacity_refusal_code, cameras_in_service,
+                                           pending_camera_additions, usable_camera_capacity)
         already_known_device = row('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(identity['customer_id'],device_key))
         if not already_known_device:
             slot_limit=usable_camera_capacity(identity['customer_id'])
-            configured=row('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',(identity['customer_id'],))['n']
-            pending=row("SELECT COUNT(*) AS n FROM camera_provisioning_requests WHERE customer_id=? AND status='queued'",(identity['customer_id'],))['n']
-            if configured+pending>=slot_limit:
-                raise HTTPException(status_code=403,detail=capacity_refusal(identity['customer_id']))
+            # In service plus still-live add requests (queued or being
+            # verified, not timed out) -- the same count camera_capacity shows.
+            if cameras_in_service(identity['customer_id'])+pending_camera_additions(identity['customer_id'])>=slot_limit:
+                # "code" lets the Cameras tab tell a full plan from a refusal
+                # (2026-10-08); "detail" stays the text shown to the customer.
+                from fastapi.responses import JSONResponse
+                return JSONResponse(status_code=403,content={'detail':capacity_refusal(identity['customer_id']),
+                                                             'code':capacity_refusal_code(identity['customer_id'])})
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
             db.execute(
@@ -1376,12 +1381,14 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # Curated detail only -- never the raw payload, which may hold
         # username/password. audit() must never see those fields.
         audit(identity,'camera.provisioning_requested','appliance',appliance_id,{'job_id':job_id,'device_key':device_key,'name':name})
-        return {'job_id':job_id,'status':'queued','message':'Provisioning request queued for the appliance.'}
+        from customer_entitlements import camera_capacity_status
+        return {'job_id':job_id,'status':'queued','message':'Provisioning request queued for the appliance.',
+                'camera_capacity':camera_capacity_status(identity['customer_id'],can_manage=True)}
 
     @app.get('/api/customer/camera-provisioning/{job_id}')
     def camera_provisioning_status(request: Request,job_id: str) -> dict:
         identity=customer_owner(request)
-        job=row('SELECT id,status,camera_id,message,created_at,updated_at FROM camera_provisioning_requests WHERE id=? AND customer_id=?',(job_id,identity['customer_id']))
+        job=row('SELECT id,status,camera_id,message,failure_code,created_at,updated_at FROM camera_provisioning_requests WHERE id=? AND customer_id=?',(job_id,identity['customer_id']))
         if not job: raise HTTPException(status_code=404,detail='Provisioning job not found.')
         return _maybe_time_out_provisioning_job(job)
 
@@ -1440,7 +1447,13 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # by device_key here -- not status -- so a customer's progress
         # reflects real, working cameras, never a renamed placeholder.
         configured=len([c for c in cameras if c.get('device_key')])
-        return {'cameras':cameras,'expected_camera_count':expected_slots,'configured_camera_count':configured,'onboarding_complete':expected_slots>0 and configured>=expected_slots}
+        # camera_capacity (2026-10-08): account-wide room for another camera, for
+        # the Cameras tab's Add button and its limit message.
+        from customer_entitlements import camera_capacity_status
+        try: require_permission(identity,'camera.self.configure'); can_manage=True
+        except PermissionError: can_manage=False
+        return {'cameras':cameras,'expected_camera_count':expected_slots,'configured_camera_count':configured,'onboarding_complete':expected_slots>0 and configured>=expected_slots,
+                'camera_capacity':camera_capacity_status(identity['customer_id'],can_manage=can_manage)}
 
     # NOTE: a second, identically-pathed `provision_customer_camera`
     # handler used to be registered here. Starlette matches routes in
@@ -1500,8 +1513,17 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                 except (LookupError, ValueError):
                     pass
             db.execute('DELETE FROM camera_credentials WHERE camera_id=?',(camera_id,))
-            db.execute("UPDATE cameras SET device_key=NULL,camera_number=NULL,status='removed' WHERE id=?",(camera_id,))
-        audit(identity,'camera.removed','camera',camera_id); return {'message':'Camera removed. Historical recordings and events are preserved; the freed slot is available for a new camera.'}
+            # former_camera_number (2026-10-08): the appliance stores this
+            # camera's local recordings under its number (camera{n}), so the
+            # number is kept and never given to another camera on the appliance.
+            db.execute("UPDATE cameras SET former_camera_number=COALESCE(?,former_camera_number),device_key=NULL,camera_number=NULL,status='removed' WHERE id=?",
+                       (camera.get('camera_number'),camera_id))
+        audit(identity,'camera.removed','camera',camera_id)
+        # Billing is never touched here: the plan's camera quantity stays as
+        # bought; only this camera's place in it is freed (2026-10-08).
+        from customer_entitlements import camera_capacity_status
+        return {'message':'Camera removed. Historical recordings and events are preserved; the freed slot is available for a new camera.',
+                'camera_capacity':camera_capacity_status(identity['customer_id'],can_manage=True)}
 
     @app.put('/api/customer/cameras')
     def configure_customer_cameras(request: Request,payload: dict) -> dict:

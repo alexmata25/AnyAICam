@@ -81,6 +81,7 @@ def test_fresh_database_camera_provisioning_requests_has_the_real_columns(db_pat
         "id", "customer_id", "appliance_id", "site_id", "device_key", "camera_name",
         "recording_mode", "analytics_json", "encrypted_credentials", "status",
         "camera_id", "message", "created_at", "updated_at",
+        "failure_code",  # why an add was refused, machine-readable (2026-10-08)
     }
 
 
