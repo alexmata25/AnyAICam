@@ -54,6 +54,7 @@ INSTALLER_RUNTIME_FILES = (
     "02-storage-check.sh",
     "03-detect-install.sh",
     "03-product-mode.sh",
+    "03-release-guard.sh",
     "04-docker-setup.sh",
     "05-provision-users-dirs.sh",
     "06-deploy-vms.sh",
@@ -438,8 +439,12 @@ def main() -> int:
     # PUBLIC key the installer provisions as the appliance's trust anchor.
     # The private key is never given to this builder: releases are signed
     # offline afterwards (installer/sign_update_release.py).
-    parser.add_argument("--release-version", default="1.1.0",
-                        help="Dotted product release version (e.g. 1.2.0); build_id stays --vms-commit")
+    # Linux 1.2.5 (2026-10-08): required. The old default, "1.1.0", stamped
+    # any build that forgot the flag as 1.1.0 -- older than what appliances
+    # already run, so Software Update would then offer the previous release
+    # as an update and refuse the build itself.
+    parser.add_argument("--release-version",
+                        help="Required. Dotted product release version (e.g. 1.2.5); build_id stays --vms-commit")
     parser.add_argument("--update-signing-public-key",
                         help="PEM public key appliances use to verify Software Update releases")
     parser.add_argument("--no-update-signing-key", action="store_true",
@@ -460,7 +465,6 @@ def main() -> int:
     args = parser.parse_args()
 
     vms_commit = validate_commit(args.vms_commit, "--vms-commit")
-    release_version = validate_release_version(args.release_version)
 
     if args.mediamtx_binary and args.no_mediamtx:
         raise SystemExit("--mediamtx-binary and --no-mediamtx are mutually exclusive.")
@@ -499,6 +503,11 @@ def main() -> int:
     entitlement_keys_bytes = (read_entitlement_signing_keys(args.entitlement_signing_public_keys,
                                                             args.entitlement_signing_keys_sha256)
                               if args.entitlement_signing_public_keys else b"")
+
+    if not args.release_version:
+        raise SystemExit("--release-version is required (e.g. --release-version 1.2.5): the installer, its manifest "
+                         "and the installed appliance all report it, and Software Update compares it.")
+    release_version = validate_release_version(args.release_version)
 
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
@@ -635,7 +644,7 @@ def main() -> int:
 
         manifest = {
             "schema": 1,
-            "installer_version": "1.1.0",
+            "installer_version": release_version,   # 1.2.5: one version everywhere (was a fixed "1.1.0")
             "release_version": release_version,
             "update_signing_key_sha256": update_key_sha256,
             "entitlement_signing_keys_sha256": entitlement_keys_sha256,

@@ -113,6 +113,11 @@ load_release_metadata() {
         echo "[ERROR] ENTITLEMENT_SIGNING_KEYS_SHA256 is present but is not a lowercase SHA-256." >&2
         return 1
     fi
+    # Linux 1.2.5: the installer reports the release it carries (was a fixed
+    # "1.1.0" in $VERSION_MARKER and the appliance identity).
+    if [[ -n "${RELEASE_VERSION:-}" ]]; then
+        INSTALLER_VERSION="$RELEASE_VERSION"
+    fi
     export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256 RELEASE_VERSION UPDATE_SIGNING_KEY_SHA256 ENTITLEMENT_SIGNING_KEYS_SHA256
 }
 
@@ -121,6 +126,8 @@ source "$INSTALLER_DIR/01-preflight.sh"
 # shellcheck source=03-detect-install.sh
 source "$INSTALLER_DIR/03-detect-install.sh"
 source "$INSTALLER_DIR/03-product-mode.sh"
+# shellcheck source=03-release-guard.sh
+source "$INSTALLER_DIR/03-release-guard.sh"
 # shellcheck source=02-storage-check.sh
 source "$INSTALLER_DIR/02-storage-check.sh"
 # shellcheck source=04-docker-setup.sh
@@ -147,10 +154,11 @@ source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"
 source "$INSTALLER_DIR/14-desktop-setup.sh"
 
 run_install() {
-    local mode="install"
+    local mode="install" allow_downgrade=0
     for arg in "$@"; do
         case "$arg" in
             --repair) mode="repair" ;;
+            --allow-downgrade) allow_downgrade=1 ;;
             --product-mode=*) ANYAICAM_PRODUCT_MODE="${arg#*=}" ;;
             --portal-url=*) ANYAICAM_INSTALL_PORTAL_URL="${arg#*=}" ;;
             *) echo "Unknown argument: $arg" >&2; return 2 ;;
@@ -168,6 +176,8 @@ run_install() {
     webrtc_port_preflight
     vms_http_port_preflight
     detect_install_state
+    # Linux 1.2.5: never replace a newer release by accident (03-release-guard.sh).
+    release_downgrade_guard "$allow_downgrade" || return 1
     if [[ "$mode" == "install" && "$INSTALL_STATE" == "partial" ]]; then
         log "Partial installation detected -- treating as repair, never silently as clean."
         mode="repair"
