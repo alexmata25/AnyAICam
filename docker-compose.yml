@@ -44,6 +44,15 @@ services:
     # and can never change it.
     - /etc/anyaicam-update:/etc/anyaicam-update:ro
     restart: unless-stopped
+    # Bounded container log (2026-10-08): the json-file driver had no size
+    # limit, so the log only ever grew (and kept every line ever written).
+    # 5 x 50 MB is weeks at the Ryzen's ~6 MB/day of log text, and still
+    # a hard cap if a camera gets stuck in a fast reconnect loop.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     healthcheck:
       test:
       - CMD

@@ -15886,6 +15886,22 @@ def live_bitrate_cap_args() -> list[str]:
     return ["-maxrate", f"{LIVE_MAX_BITRATE_KBPS}k", "-bufsize", f"{LIVE_MAX_BITRATE_KBPS * 2}k"]
 
 
+# Live-view video stream copy (2026-10-05, Ryzen LPR test only; off by
+# default). The x264 encode below runs continuously for every camera,
+# because analytics read these same HLS segments. When the camera already
+# sends H.264, copying it removes that encode load and gives analytics the
+# camera's original frames. While on: no live bitrate cap, and HLS segments
+# follow the camera's own keyframes. Only for cameras verified to send H.264.
+LIVE_VIDEO_COPY = os.environ.get("ANYAICAM_LIVE_VIDEO_COPY", "false").strip().lower() == "true"
+
+
+def live_video_args() -> list[str]:
+    if LIVE_VIDEO_COPY:
+        return ["-c:v", "copy"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *live_bitrate_cap_args()]
+
+
 def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
@@ -15931,9 +15947,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
-        *live_bitrate_cap_args(),
+        *live_video_args(),
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
@@ -16100,7 +16114,7 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 
 
 
-    return subprocess.Popen(command)
+    return subprocess.Popen(command, stderr=subprocess.PIPE)  # drained + redacted by process_supervisor
 
 
 # ------------------------------------------------------------------
@@ -16190,7 +16204,7 @@ def start_event_recording_buffer(camera_number: int) -> subprocess.Popen:
         "-f", "segment", "-segment_time", str(EVENT_BUFFER_SEGMENT_SECONDS),
         "-reset_timestamps", "1", "-strftime", "1", output_pattern,
     ]
-    return subprocess.Popen(command)
+    return subprocess.Popen(command, stderr=subprocess.PIPE)  # drained + redacted by process_supervisor
 
 
 def _buffer_segment_start(clip: Path, camera_number: int) -> datetime | None:
@@ -16755,20 +16769,41 @@ def _redact_camera_stream_error(text: str) -> str:
     return _CAMERA_STREAM_URL_PATTERN.sub("rtsp://<redacted>", text)
 
 
+# Camera passwords in the container log (2026-10-08): ffmpeg prints its
+# input URL, user:password included, in every "Error opening input file"
+# line, and those lines were mirrored into `docker logs` verbatim for every
+# camera. Only the user:password part is masked; the host and path stay so
+# a connection error still says which camera failed.
+_STREAM_URL_CREDENTIALS_PATTERN = re.compile(r"\b(rtsps?|https?)://[^/\s@]+@", re.IGNORECASE)
+
+
+def _redact_stream_credentials(text: str) -> str:
+    return _STREAM_URL_CREDENTIALS_PATTERN.sub(r"\1://***@", text)
+
+
 async def _drain_camera_stderr(camera_number: int, process: subprocess.Popen, buffer: list[str]) -> None:
-    """Keep mirroring ffmpeg's stderr to the process log exactly as before,
-    while also retaining a small bounded tail in memory for camera-status
-    diagnostics. Runs concurrently with process.wait() so the pipe is never
-    left undrained (which would otherwise stall ffmpeg once the OS pipe
-    buffer filled)."""
+    """Keep mirroring ffmpeg's stderr to the process log, camera credentials
+    masked, while also retaining a small bounded tail in memory for
+    camera-status diagnostics. Runs concurrently with process.wait() so the
+    pipe is never left undrained (which would otherwise stall ffmpeg once
+    the OS pipe buffer filled). The reader is a dedicated thread, not
+    asyncio.to_thread: it lives as long as ffmpeg does, and one per live,
+    recording and buffer process would otherwise hold most of the default
+    executor (12 workers on the Ryzen) that AI detection and LPR also use."""
     stream = process.stderr
     if stream is None:
         return
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+
+    def mark_finished() -> None:
+        if not finished.done():
+            finished.set_result(None)
 
     def read_lines() -> None:
         try:
             for raw_line in iter(stream.readline, b""):
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                line = _redact_stream_credentials(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
                 print(f"[camera{camera_number}] {line}")
                 buffer.append(line)
                 if len(buffer) > CAMERA_STDERR_MAX_LINES:
@@ -16777,7 +16812,12 @@ async def _drain_camera_stderr(camera_number: int, process: subprocess.Popen, bu
             pass
         finally:
             stream.close()
-    await asyncio.to_thread(read_lines)
+            try:
+                loop.call_soon_threadsafe(mark_finished)
+            except RuntimeError:
+                pass  # event loop already closed (shutdown)
+    threading.Thread(target=read_lines, name=f"camera{camera_number}-ffmpeg-stderr", daemon=True).start()
+    await finished
 
 
 def _bounded_camera_error(stderr_tail: list[str]) -> str:
@@ -16917,7 +16957,7 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
         stderr_tail: list[str] = []
         drain_task = None
-        if mode == "live" and process.stderr is not None:
+        if process.stderr is not None:
             drain_task = asyncio.create_task(
                 _drain_camera_stderr(camera_number, process, stderr_tail)
             )
