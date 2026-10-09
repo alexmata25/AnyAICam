@@ -13,6 +13,7 @@
   and failed for every admin."""
 import json
 import sqlite3
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -133,10 +134,30 @@ def alerts_file(tmp_path, monkeypatch):
 
 
 def _populate(path):
+    # 2026-10-08: dated relative to now. The fixed 2026-10-01 timestamps
+    # passed RETENTION_DAYS (7) on 2026-10-08, after which the app's own
+    # retention pass (prune_expired_in_app_alerts, started with the app)
+    # could delete them before the page read the file -- an intermittent
+    # failure that only looked like a regression.
+    now = datetime.now()
     path.write_text("\n".join(json.dumps(item) for item in [
-        {"id": "a1", "timestamp": "2026-10-01T10:00:00", "title": "Camera offline", "message": "Bedroom stopped responding.", "severity": "warning"},
-        {"id": "a2", "timestamp": "2026-10-01T11:00:00", "event_type": "system_health", "message": "Storage below 10%.", "severity": "critical"},
+        {"id": "a1", "timestamp": (now - timedelta(hours=2)).isoformat(timespec="seconds"), "title": "Camera offline",
+         "message": "Bedroom stopped responding.", "severity": "warning"},
+        {"id": "a2", "timestamp": (now - timedelta(hours=1)).isoformat(timespec="seconds"), "event_type": "system_health",
+         "message": "Storage below 10%.", "severity": "critical"},
     ]) + "\n", encoding="utf-8")
+
+
+def test_the_alert_fixtures_are_within_retention():
+    # Guards the fixture above against going stale again.
+    path_items = []
+
+    class Capture:
+        def write_text(self, text, encoding=None):
+            path_items.extend(json.loads(line) for line in text.splitlines())
+    _populate(Capture())
+    cutoff = datetime.now() - timedelta(days=main.RETENTION_DAYS)
+    assert path_items and all(datetime.fromisoformat(item["timestamp"]) > cutoff for item in path_items)
 
 
 @pytest.mark.parametrize("populated", [False, True])
