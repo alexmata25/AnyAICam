@@ -181,6 +181,45 @@ class MigrationRuleTests(unittest.TestCase):
             code = ar.migrate_capacity_fallback_main(["1.2.5"])
         self.assertEqual((code, buffer.getvalue().strip()), (0, "not_applicable"))
 
+    def test_the_installer_entry_point_never_fails_the_install(self):
+        # Orange 2026-10-09: the installer step runs with the old VMS stopped.
+        import contextlib
+        import io
+        from unittest import mock
+        for raised, expected in ((ar.TrustAnchorError("trust_anchor_unsafe", "planted"), "unsafe"),
+                                 (IsADirectoryError(21, "Is a directory"), "error"),
+                                 (RuntimeError("anything"), "error")):
+            with self.subTest(expected=expected), mock.patch.object(ar, "migrate_capacity_fallback", side_effect=raised):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = ar.migrate_capacity_fallback_main(["1.2.4"])
+                self.assertEqual((code, out.getvalue().strip()), (0, expected))
+                self.assertIn("[WARN]", err.getvalue())
+
+    def test_a_non_regular_descriptor_is_rejected_before_fdopen_and_closed(self):
+        # Linux opens a directory with O_RDONLY and fdopen() then raises; the
+        # descriptor's type is now checked first. Simulated here by reporting
+        # the descriptor of a real file as a directory.
+        from unittest import mock
+        self.files.capacity(3)
+        real_fstat, opened = os.fstat, []
+        real_open = os.open
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def as_directory(fd):
+            info = real_fstat(fd)
+            return os.stat_result((stat.S_IFDIR | 0o755,) + tuple(info)[1:])
+        with mock.patch.object(ar.os, "open", tracking_open), mock.patch.object(ar.os, "fstat", as_directory), \
+                mock.patch.object(ar.os, "fdopen", side_effect=AssertionError("fdopen must not be reached")):
+            self.assertIsNone(ar._read_user_json(self.files.legacy))
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])           # closed, not leaked
+
 
 class SoftwareUpdateMigrationTests(ApplierTestCase):
     """Through the real applier: the installed release is 1.1.0 (marker)."""
