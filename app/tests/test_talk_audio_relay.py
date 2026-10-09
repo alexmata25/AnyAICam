@@ -292,11 +292,41 @@ def test_repeated_press_release_leaves_no_orphan_sessions(client, db_path):
         for _ in range(3):
             session_id = _start_session(client, "cam-1", cookie)
             with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio", cookies=cookie) as customer_ws:
-                appliance_ws.receive_json()
+                assert appliance_ws.receive_json()["type"] == "start"
                 customer_ws.send_bytes(b"\x00")
-                appliance_ws.receive_json()
+                assert appliance_ws.receive_json()["type"] == "audio"
+            # 2026-10-08: the release is complete when the appliance gets its
+            # "stop" -- the server ends the relay after the browser socket has
+            # closed, so checking straight after the close raced it (failed
+            # about half the time, on 1.2.4 too). The session is 'stopped' by then.
+            assert appliance_ws.receive_json() == {"type": "stop", "session_id": session_id}
             assert _session_state(db_path, session_id) == "stopped"
     assert talk_audio_relay._active_relays == {}
+
+
+def test_a_session_is_stopped_before_the_appliance_is_told_to_stop(client, db_path, monkeypatch):
+    # The order _end_relay() keeps: durable state first, then the "stop".
+    import asyncio
+    import json
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_tenant(db)
+            _seed_camera(db, "cam-1", talk_down_supported=1)
+            _seed_appliance_credential(db, "appl-1", "cred")
+    session_id = _start_session(client, "cam-1", {partner_portal.SESSION_COOKIE: _owner_cookie()})
+    seen = []
+
+    class Channel:
+        async def send_text(self, text):
+            seen.append((json.loads(text), _session_state(db_path, session_id)))
+
+    monkeypatch.setitem(talk_audio_relay._appliance_channels, "appl-1", Channel())
+    talk_audio_relay._active_relays[session_id] = {"camera_id": "cam-1", "appliance_id": "appl-1",
+                                                  "customer_id": "cust-1", "created_at": 0}
+    with override_target(sqlite_path=str(db_path)):
+        asyncio.run(talk_audio_relay._end_relay(session_id, notify_appliance=True, reason="customer_disconnected"))
+    assert seen == [({"type": "stop", "session_id": session_id}, "stopped")]
+    assert session_id not in talk_audio_relay._active_relays
 
 
 def test_one_cameras_session_never_receives_another_sessions_audio(client, db_path):

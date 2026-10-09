@@ -315,13 +315,10 @@ async def _end_relay(session_id: str, notify_appliance: bool, reason: str) -> No
     relay = _active_relays.pop(session_id, None)
     if relay is None:
         return
-    if notify_appliance:
-        channel = _appliance_channels.get(relay["appliance_id"])
-        if channel is not None:
-            try:
-                await channel.send_text(json.dumps({"type": "stop", "session_id": session_id}))
-            except Exception:
-                pass
+    # 2026-10-08: the session is marked 'stopped' BEFORE the appliance is
+    # told to stop (it used to be the other way round), so whoever sees the
+    # "stop" -- the appliance, or a press that follows at once -- never
+    # finds the session still 'requested'.
     now = datetime.now().isoformat()
     with connection() as db:
         cursor = db.execute(
@@ -333,6 +330,14 @@ async def _end_relay(session_id: str, notify_appliance: bool, reason: str) -> No
             "SELECT customer_id,camera_id,requested_by,role FROM customer_talk_sessions WHERE id=?",
             (session_id,),
         ).fetchone() if updated else None
+
+    if notify_appliance:
+        channel = _appliance_channels.get(relay["appliance_id"])
+        if channel is not None:
+            try:
+                await channel.send_text(json.dumps({"type": "stop", "session_id": session_id}))
+            except Exception:
+                pass
 
     logger.info(
         "talk_audio_relay.relay_ended session_id=%s reason=%s camera_id=%s customer_id=%s",
