@@ -2067,9 +2067,18 @@ def get_supervisor_slot_count() -> int:
     they're provisioned) and always CAMERA_SUPERVISOR_HEADROOM above
     whatever is already provisioned (so a customer with 5 cameras already
     provisioned at startup can add a few more without a VMS restart).
-    Provisioning a camera_number beyond this computed ceiling still needs
-    a restart to get a supervisor task -- see the Phase 3 report."""
-    return max(LEGACY_DEFAULT_CAMERA_COUNT, get_camera_count() + CAMERA_SUPERVISOR_HEADROOM)
+
+    2026-10-08 (Orange): also CAMERA_SUPERVISOR_HEADROOM above the HIGHEST
+    provisioned camera_number, not only above the count. A removed camera's
+    number is never reused (customer camera Add/Delete), so after camera
+    replacements the numbers run past count + headroom: 4 cameras numbered
+    1, 2, 3 and 9 had slots 1..8 only, camera 9 was never supervised (no
+    live view, no recording, even after a restart) and GET /ready answered
+    500 (KeyError: 9). A camera_number provisioned beyond this ceiling while
+    the VMS runs gets its supervisors from camera_supervisor_watcher()."""
+    numbers = get_camera_numbers()
+    return max(LEGACY_DEFAULT_CAMERA_COUNT, len(numbers) + CAMERA_SUPERVISOR_HEADROOM,
+               max(numbers, default=0) + CAMERA_SUPERVISOR_HEADROOM)
 
 
 
@@ -2981,46 +2990,72 @@ ffmpeg_processes: list[subprocess.Popen] = []
 
 
 
-camera_process_state = {
+class _PerCameraState(dict):
+    """camera_process_state / camera_reconnect_counts (2026-10-08, Orange):
+    a camera_number without an entry -- one provisioned after startup above
+    the boot-time ceiling -- gets a fresh entry on first use instead of a
+    KeyError that turned GET /ready and the camera status into a 500."""
+
+    def __init__(self, factory, numbers):
+        super().__init__((number, factory()) for number in numbers)
+        self._factory = factory
+
+    def __missing__(self, camera_number):
+        value = self[camera_number] = self._factory()
+        return value
 
 
-
-
-
-
-
-
-    camera_number: {
+def _new_camera_process_state() -> dict:
+    return {
         "live": "starting", "recording": "starting",
         "last_exit_code": None, "last_error": None, "last_error_at": None,
     }
 
 
+_boot_supervisor_slots = range(1, get_supervisor_slot_count() + 1)
+camera_process_state = _PerCameraState(_new_camera_process_state, _boot_supervisor_slots)
+camera_reconnect_counts = _PerCameraState(int, _boot_supervisor_slots)
+
+# camera_numbers that have their live and recording supervisor tasks.
+_supervised_camera_numbers: set[int] = set()
 
 
+def _claim_camera_supervisor_slots(numbers) -> list[int]:
+    """The camera_numbers among `numbers` without supervisors yet, now
+    marked as supervised (each number is supervised once)."""
+    claimed = [number for number in dict.fromkeys(int(n) for n in numbers) if number not in _supervised_camera_numbers]
+    _supervised_camera_numbers.update(claimed)
+    return claimed
 
 
+def start_camera_supervisors(numbers, tasks: list) -> list[int]:
+    """Starts live and recording supervisors for the camera_numbers among
+    `numbers` that have none; returns the numbers started."""
+    started = _claim_camera_supervisor_slots(numbers)
+    for camera_number in started:
+        camera_process_state[camera_number]  # noqa: B018 -- creates its entry
+        camera_reconnect_counts[camera_number]  # noqa: B018
+        tasks.append(asyncio.create_task(process_supervisor(camera_number, "live")))
+        tasks.append(asyncio.create_task(process_supervisor(camera_number, "recording")))
+    return started
 
 
-    for camera_number in range(1, get_supervisor_slot_count() + 1)
-
-
-
-
-
-
-
-
-}
-
-
-
-
-
-
-
-
-camera_reconnect_counts = {camera_number: 0 for camera_number in range(1, get_supervisor_slot_count() + 1)}
+async def camera_supervisor_watcher(tasks: list) -> None:
+    """A camera provisioned while the VMS runs with a camera_number above
+    the boot-time ceiling (get_supervisor_slot_count()) gets its live and
+    recording supervisors within CAMERA_NOT_CONFIGURED_POLL_SECONDS, with
+    no restart (2026-10-08, Orange)."""
+    while True:
+        await asyncio.sleep(CAMERA_NOT_CONFIGURED_POLL_SECONDS)
+        try:
+            numbers = await asyncio.to_thread(get_camera_numbers)
+            started = start_camera_supervisors(numbers, tasks)
+            if started:
+                structured_log("camera.supervisors_started", camera_numbers=started)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            structured_log("camera.supervisor_watch_failed", level="warning", error=type(error).__name__)
 
 
 
@@ -40313,7 +40348,7 @@ async def lifespan(app: FastAPI):
 
 
 
-        for camera_number in range(1, get_supervisor_slot_count() + 1):  # see CAMERA_SUPERVISOR_HEADROOM
+        for camera_number in _claim_camera_supervisor_slots(_boot_supervisor_slots):  # see CAMERA_SUPERVISOR_HEADROOM
 
 
 
@@ -40401,6 +40436,8 @@ async def lifespan(app: FastAPI):
         # database -- this fix is scoped to exactly the edge-only,
         # one-task-per-camera-slot startup pattern that stale local rows
         # actually broke.
+        # Numbers provisioned later above the boot ceiling (2026-10-08).
+        supervisor_tasks.append(asyncio.create_task(camera_supervisor_watcher(supervisor_tasks)))
         camera_numbers = sorted(set(get_camera_numbers()))
 
         if MOTION_DETECTION_ENABLED:
