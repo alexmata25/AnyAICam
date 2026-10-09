@@ -301,6 +301,14 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         activated = setup_wizard._complete_claim_with_retry(client, config, state, sleep_fn=lambda _: None)
         self.assertEqual(activated['customer_id'], self.customer_id)
         self.assertEqual(activated['site_id'], self.site_id)
+        with connection() as db:
+            transition_row=db.execute('SELECT capacity_identity_transition_json FROM appliances WHERE id=?',
+                                      (activated['appliance_id'],)).fetchone()
+        transition=json.loads(transition_row['capacity_identity_transition_json'])
+        self.assertEqual(transition['kind'],'initial_claim')
+        self.assertEqual(transition['from_appliance_id'],self.device_id)
+        self.assertEqual(transition['to_identity'],{'appliance_id':activated['appliance_id'],
+            'cloud_id':activated['cloud_id'],'customer_id':self.customer_id})
         # claim_main() itself calls clear_claim_state() immediately after
         # a successful _complete_claim_with_retry() -- done explicitly
         # here since this test drives the individual helpers directly

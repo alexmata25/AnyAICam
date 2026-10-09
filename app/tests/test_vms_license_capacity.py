@@ -64,6 +64,17 @@ def test_usable_capacity_is_the_smaller_of_plan_and_license(client, db_path, pla
         assert breakdown["camera_slot_quantity"] == expected and breakdown["plan_camera_slots"] == plan
 
 
+def test_capacity_breakdown_caps_cloud_fields_at_edge_verifier_limit(monkeypatch):
+    import customer_entitlements as entitlements
+    monkeypatch.setattr(entitlements, "total_camera_slots", lambda _customer_id: 25_000)
+    monkeypatch.setattr(entitlements, "vms_license_capacity", lambda _customer_id: 30_000)
+    assert entitlements.usable_camera_capacity("cust-large") == 10_000
+    assert entitlements.capacity_breakdown("cust-large") == {
+        "camera_slot_quantity": 10_000, "plan_camera_slots": 10_000,
+        "vms_license_capacity": 10_000, "vms_license_required": False,
+    }
+
+
 # ------------------------------------------------------------------ claim is open, provisioning is not
 
 def test_an_unlicensed_customer_activates_but_cannot_provision_a_camera(client, db_path):

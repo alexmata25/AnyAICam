@@ -64,7 +64,18 @@ install_capacity_accept() {
 
 bootstrap_capacity_identity() {
     local privileged_dir="/opt/anyaicam-agent/privileged"
-    /usr/bin/python3 -I "$privileged_dir/capacity_accept.py" --bootstrap-identity
+    local bootstrap_result
+    if ! bootstrap_result="$(/usr/bin/python3 -I "$privileged_dir/capacity_accept.py" --bootstrap-identity 2>&1)"; then
+        echo "[ERROR] Signed camera-capacity identity bootstrap failed: ${bootstrap_result:-helper returned failure}." >&2
+        return 1
+    fi
+    if [[ "$bootstrap_result" == "awaiting_signed_transition" ]]; then
+        echo "[INFO] Cloud-assigned appliance identity differs from the protected installer ID; waiting for a matching cloud-signed identity transition before accepting capacity." >&2
+    elif [[ "$bootstrap_result" != "unchanged" && "$bootstrap_result" != "bootstrapped" &&
+            "$bootstrap_result" != "reconciled_signed_transition" ]]; then
+        echo "[ERROR] Unexpected camera-capacity identity bootstrap result: $bootstrap_result" >&2
+        return 1
+    fi
     if [[ "${1:-}" == "migration" ]]; then
         if ! /usr/bin/python3 -I "$privileged_dir/capacity_accept.py" --accept-migrated-snapshot; then
             echo "[WARN] Pending migration snapshot was not accepted; existing protected capacity remains authoritative." >&2

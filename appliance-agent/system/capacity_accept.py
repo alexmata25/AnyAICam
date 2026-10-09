@@ -186,18 +186,78 @@ def _validate_snapshot(snapshot, public_keys: dict[str, bytes], identity: dict, 
     return body, issued.isoformat(), digest
 
 
-def _state_record(snapshot, identity, issued_at, digest, accepted_at, source="cloud") -> dict:
-    return {"schema": 1, "identity": identity, "snapshot": snapshot,
+def _transition_id(value) -> str:
+    if not isinstance(value, str) or not value or len(value) > 128 or not all(
+            char.isalnum() or char in "._:-" for char in value):
+        raise Reject("invalid_identity_transition")
+    return value
+
+
+def _snapshot_transition(body, identity) -> tuple[str | None, str | None]:
+    """Validate the signed cloud transition contract; return (id, source ID).
+
+    Initial claim/activation transitions bridge the installer-generated ID to
+    the cloud-assigned appliance ID. Later identity changes require an
+    explicit cloud-signed transition from the currently accepted identity.
+    """
+    transition = body.get("identity_transition")
+    if transition is None:
+        return None, None
+    if not isinstance(transition, dict) or transition.get("schema") != 1:
+        raise Reject("invalid_identity_transition")
+    transition_id = _transition_id(transition.get("transition_id"))
+    target = _safe_identity(transition.get("to_identity"))
+    if target != _safe_identity(identity):
+        raise Reject("identity_transition_target_mismatch")
+    kind = transition.get("kind")
+    if kind == "initial_claim":
+        source_id = transition.get("from_appliance_id")
+        if not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 256:
+            raise Reject("invalid_identity_transition")
+        return transition_id, source_id
+    if kind == "authorized":
+        _safe_identity(transition.get("from_identity"))
+        if transition.get("reason") not in {"reenrollment", "ownership_transfer"}:
+            raise Reject("invalid_identity_transition")
+        authorized_at = _parse_time(transition.get("authorized_at"))
+        if authorized_at is None:
+            raise Reject("invalid_identity_transition")
+        return transition_id, transition["from_identity"]["appliance_id"]
+    raise Reject("invalid_identity_transition")
+
+
+def _state_record(snapshot, identity, issued_at, digest, accepted_at, accepted_key, transition_id=None) -> dict:
+    return {"schema": 2, "identity": identity, "snapshot": snapshot,
+            "accepted_key": base64.b64encode(accepted_key).decode("ascii"),
+            "transition_id": transition_id,
             "high_water": {"issued_at": issued_at, "digest": digest},
-            "accepted_at": accepted_at, "source": source}
+            "accepted_at": accepted_at, "source": "cloud"}
 
 
 def _validate_state(state, public_keys, *, now=None, verifier=_openssl_verify) -> tuple[dict, dict]:
-    if not isinstance(state, dict) or state.get("schema") != 1:
+    if not isinstance(state, dict) or state.get("schema") not in {1, 2}:
         raise Reject("invalid_accepted_state")
     identity = _safe_identity(state.get("identity"))
-    body, issued_at, digest = _validate_snapshot(state.get("snapshot"), public_keys, identity,
+    state_keys = public_keys
+    if state.get("schema") == 2:
+        snapshot_key_id, _ = _decode_signature(state.get("snapshot"))
+        encoded_key = state.get("accepted_key")
+        try:
+            accepted_key = base64.b64decode(encoded_key, validate=True)
+        except (TypeError, ValueError, base64.binascii.Error):
+            raise Reject("invalid_accepted_key")
+        if len(accepted_key) != 32:
+            raise Reject("invalid_accepted_key")
+        state_keys = {snapshot_key_id: accepted_key}
+    body, issued_at, digest = _validate_snapshot(state.get("snapshot"), state_keys, identity,
                                                  now=now, check_expiry=False, verifier=verifier)
+    transition_id, _ = _snapshot_transition(body, identity)
+    if state.get("schema") == 2:
+        stored_transition_id = state.get("transition_id")
+        if stored_transition_id is not None:
+            _transition_id(stored_transition_id)
+        if transition_id is not None and stored_transition_id != transition_id:
+            raise Reject("invalid_identity_transition_state")
     high_water = state.get("high_water")
     if (not isinstance(high_water, dict) or high_water.get("issued_at") != issued_at or
             high_water.get("digest") != digest):
@@ -206,15 +266,26 @@ def _validate_state(state, public_keys, *, now=None, verifier=_openssl_verify) -
 
 
 def _advance(snapshot, public_keys, identity, current_state, *, now=None, verifier=_openssl_verify,
-             allow_expired_first=False):
+             allow_expired_first=False, anchor=None):
     """Pure policy step, also exercised by tests without filesystem privileges."""
     body, issued_at, digest = _validate_snapshot(snapshot, public_keys, identity, now=now,
                                                  check_expiry=(current_state is not None or not allow_expired_first),
                                                  verifier=verifier)
+    transition_id, transition_source_id = _snapshot_transition(body, identity)
     if current_state is not None:
         current_identity, high_water = _validate_state(current_state, public_keys, now=now, verifier=verifier)
         if _safe_identity(identity) != current_identity:
-            raise Reject("accepted_identity_changed")
+            transition = body.get("identity_transition")
+            if (not isinstance(transition, dict) or transition.get("kind") != "authorized" or
+                    _safe_identity(transition.get("from_identity")) != current_identity or
+                    transition_id == current_state.get("transition_id")):
+                raise Reject("accepted_identity_changed")
+        elif transition_id is not None and current_state.get("transition_id") != transition_id:
+            raise Reject("unexpected_identity_transition")
+        elif transition_id is None and current_state.get("transition_id") is not None:
+            # The cloud may retire a transition from later snapshots after it
+            # has been accepted; the accepted root state retains its proof.
+            transition_id = current_state.get("transition_id")
         current_time = _parse_time(high_water["issued_at"])
         new_time = _parse_time(issued_at)
         if new_time < current_time:
@@ -223,8 +294,27 @@ def _advance(snapshot, public_keys, identity, current_state, *, now=None, verifi
             if digest == high_water["digest"]:
                 return current_state, "unchanged"
             raise Reject("same_timestamp_conflict")
+    else:
+        bound = _safe_identity(identity)
+        transition = body.get("identity_transition")
+        if anchor is not None and transition is not None:
+            if transition.get("kind") == "initial_claim" and transition_source_id != anchor.get("appliance_id"):
+                raise Reject("identity_anchor_mismatch")
+            if transition.get("kind") == "authorized":
+                raise Reject("accepted_identity_changed")
+        if anchor is not None and anchor.get("appliance_id") != bound["appliance_id"]:
+            if (not isinstance(transition, dict) or transition.get("kind") != "initial_claim" or
+                    transition_source_id != anchor.get("appliance_id")):
+                raise Reject("identity_anchor_mismatch")
+        elif transition_id is not None and body.get("identity_transition", {}).get("kind") != "initial_claim":
+            raise Reject("unexpected_identity_transition")
+    key_id, _ = _decode_signature(snapshot)
+    accepted_key = public_keys.get(key_id)
+    if accepted_key is None:
+        raise Reject("bad_signature")
     record = _state_record(snapshot, _safe_identity(identity), issued_at, digest,
-                           (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).isoformat())
+                           (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc).isoformat(),
+                           accepted_key, transition_id)
     return record, "accepted"
 
 
@@ -320,6 +410,28 @@ def _identity_anchor(dir_fd: int) -> dict:
     return {"appliance_id": appliance_id}
 
 
+def _write_identity_anchor(dir_fd: int, appliance_id: str) -> None:
+    if not isinstance(appliance_id, str) or not appliance_id.strip() or len(appliance_id) > 256:
+        raise Reject("invalid_identity_anchor")
+    data = json.dumps({"schema": 1, "appliance_id": appliance_id}, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8") + b"\n"
+    _write_atomic_at(dir_fd, IDENTITY_ANCHOR_FILE, data, mode=0o600)
+
+
+def _transition_source_appliance_id(state) -> str | None:
+    if not isinstance(state, dict) or not isinstance(state.get("snapshot"), dict):
+        return None
+    body = _body(state["snapshot"])
+    transition = body.get("identity_transition")
+    if not isinstance(transition, dict):
+        return None
+    if transition.get("kind") == "initial_claim":
+        return transition.get("from_appliance_id")
+    if transition.get("kind") == "authorized" and isinstance(transition.get("from_identity"), dict):
+        return transition["from_identity"].get("appliance_id")
+    return None
+
+
 def _check_identity_anchor(identity, anchor) -> None:
     if not isinstance(identity, dict) or not isinstance(anchor, dict):
         raise Reject("identity_anchor_mismatch")
@@ -328,7 +440,7 @@ def _check_identity_anchor(identity, anchor) -> None:
 
 
 def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_name="appliance_identity.json") -> str:
-    """Pin the installer-created appliance ID (tenant fields arrive at claim)."""
+    """Create the initial local pin, or wait for signed cloud identity acceptance."""
     identity = _json(_read_at(identity_dir_fd, identity_name, MAX_IDENTITY_BYTES))
     appliance_id = identity.get("appliance_id") if isinstance(identity, dict) else None
     if not isinstance(appliance_id, str) or not appliance_id.strip() or len(appliance_id) > 256:
@@ -343,11 +455,26 @@ def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_nam
             existing = None
         if existing is not None:
             if existing["appliance_id"] != appliance_id:
-                raise Reject("identity_anchor_conflict")
+                # A local identity changes only after claim/re-enrollment.
+                # Never rewrite the root pin from this service-writable file;
+                # the acceptance watcher must first verify a signed transition.
+                try:
+                    accepted_raw = _read_at(trust_dir_fd, ACCEPTED_FILE, MAX_STATE_BYTES,
+                                            root_owned=True, absent_ok=True)
+                    if accepted_raw is not None:
+                        keyset = _validate_keyset(_json(_read_at(
+                            trust_dir_fd, TRUST_FILE, MAX_TRUST_BYTES, root_owned=True)))
+                        accepted_state = _json(accepted_raw)
+                        accepted_identity, _ = _validate_state(accepted_state, keyset)
+                        if (accepted_identity["appliance_id"] == appliance_id and
+                                _transition_source_appliance_id(accepted_state) == existing["appliance_id"]):
+                            _write_identity_anchor(trust_dir_fd, appliance_id)
+                            return "reconciled_signed_transition"
+                except (Reject, OSError):
+                    pass
+                return "awaiting_signed_transition"
             return "unchanged"
-        data = json.dumps({"schema": 1, "appliance_id": appliance_id}, sort_keys=True,
-                          separators=(",", ":")).encode("utf-8") + b"\n"
-        _write_atomic_at(trust_dir_fd, IDENTITY_ANCHOR_FILE, data, mode=0o600)
+        _write_identity_anchor(trust_dir_fd, appliance_id)
         return "bootstrapped"
     finally:
         os.close(lock_fd)
@@ -417,7 +544,6 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
         snapshot = _json(raw)
         identity = _json(_read_at(identity_dir_fd, identity_file.name, MAX_IDENTITY_BYTES))
         pinned_identity = _identity_anchor(root_dir_fd)
-        _check_identity_anchor(identity, pinned_identity)
         current_raw = _read_at(root_dir_fd, accepted_file, MAX_STATE_BYTES, root_owned=True, absent_ok=True)
         current_state = _json(current_raw) if current_raw is not None else None
         if current_state is not None:
@@ -428,16 +554,30 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
         # cannot validate against the same old high-water mark.
         current_raw = _read_at(root_dir_fd, accepted_file, MAX_STATE_BYTES, root_owned=True, absent_ok=True)
         current_state = _json(current_raw) if current_raw is not None else None
+        pinned_identity = _identity_anchor(root_dir_fd)
+        if current_state is not None and current_state.get("identity", {}).get("appliance_id") != pinned_identity["appliance_id"]:
+            _validate_state(current_state, keyset, now=now, verifier=verifier or
+                            (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl)))
+            if _transition_source_appliance_id(current_state) != pinned_identity["appliance_id"]:
+                raise Reject("identity_anchor_mismatch")
+            _write_identity_anchor(root_dir_fd, current_state["identity"]["appliance_id"])
+            pinned_identity = _identity_anchor(root_dir_fd)
         policy_verifier = verifier or (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl))
         next_state, outcome = _advance(snapshot, keyset, identity, current_state,
                                        now=now, verifier=policy_verifier,
-                                       allow_expired_first=allow_expired_first)
+                                       allow_expired_first=allow_expired_first,
+                                       anchor=pinned_identity)
         if outcome == "unchanged":
             return outcome
         encoded = (json.dumps(next_state, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         if len(encoded) > MAX_STATE_BYTES:
             raise Reject("accepted_state_too_large")
         _write_atomic_at(root_dir_fd, accepted_file, encoded)
+        if pinned_identity["appliance_id"] != next_state["identity"]["appliance_id"]:
+            # The accepted signed state is the transaction's source of truth.
+            # If this secondary pin write is interrupted, a later invocation
+            # can repair it only from the root-validated transition above.
+            _write_identity_anchor(root_dir_fd, next_state["identity"]["appliance_id"])
         try:
             _save_compatibility_copy(snapshot, compat_dir=compat_dir, compat_file=compat_file)
         except (OSError, Reject):

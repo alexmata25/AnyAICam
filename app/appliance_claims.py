@@ -734,6 +734,17 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 'INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)',
                 (appliance_id, claim['customer_id'], claim['site_id'], cloud_id, now.isoformat()),
             )
+            # The factory-generated UUID is the root pin on a fresh Linux
+            # appliance. The cloud row receives a separate canonical
+            # appliance_id; this signed transition lets root accept exactly
+            # that claim result without treating arbitrary identity changes
+            # as ordinary capacity refreshes.
+            import feature_entitlements
+            initial_transition = feature_entitlements.initial_capacity_identity_transition(
+                claim['device_id'], {'id': appliance_id, 'cloud_id': cloud_id,
+                                     'customer_id': claim['customer_id']})
+            db.execute('UPDATE appliances SET capacity_identity_transition_json=? WHERE id=?',
+                       (json.dumps(initial_transition, sort_keys=True, separators=(',', ':')), appliance_id))
             db.execute('UPDATE appliance_claims SET appliance_id=? WHERE id=?', (appliance_id, claim['id']))
             credential = secrets.token_urlsafe(48)
             credential_id = secrets.token_hex(8)

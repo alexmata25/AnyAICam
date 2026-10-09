@@ -27,6 +27,7 @@ from test_runtime_feature_enforcement import PRICES, _addon, _grant, _plan
 
 pytestmark = pytest.mark.real_entitlements
 
+
 # This appliance's persisted activation identity, as the cloud knows it
 # (_seed_cloud names the appliance's cloud_id "AIC-<appliance id>").
 EDGE_IDENTITY = {**IDENTITY, "cloud_id": f"AIC-{APPLIANCE_ID}"}
@@ -129,6 +130,37 @@ def test_an_entitled_appliance_runs_talk_down_and_voice_call(appliance, cloud_db
     assert snapshot["appliance_id"] == APPLIANCE_ID and snapshot["features"] == {"talk_down": True, "voice_call": True}
     assert snapshot["signature"]["alg"] == "Ed25519"
     assert _edge_allows("talk_down") and _edge_allows("voice_call")
+
+
+def test_signed_camera_capacity_fields_are_clamped_to_edge_supported_maximum(appliance, cloud_db, edge_db, monkeypatch):
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "capacity_breakdown", lambda _customer_id: {
+        "camera_slot_quantity": 25_000, "plan_camera_slots": 25_000,
+        "vms_license_capacity": 30_000, "vms_license_required": False,
+    })
+    _sync(edge_db)
+    snapshot = _cached()["snapshot"]
+    assert snapshot["camera_capacity"] == {
+        "camera_slot_quantity": 10_000, "plan_camera_slots": 10_000,
+        "vms_license_capacity": 10_000,
+    }
+    assert appliance_entitlements.verify(snapshot, appliance_entitlements._trusted_keys(),
+                                         identity=EDGE_IDENTITY) is None
+
+
+def test_cloud_snapshot_signs_the_explicit_initial_identity_transition(appliance, cloud_db, edge_db):
+    transition = feature_entitlements.initial_capacity_identity_transition(
+        "installer-generated-id", {"id": APPLIANCE_ID, "cloud_id": EDGE_IDENTITY["cloud_id"],
+                                   "customer_id": EDGE_IDENTITY["customer_id"]})
+    with override_target(sqlite_path=str(cloud_db)):
+        with connection() as db:
+            db.execute("UPDATE appliances SET capacity_identity_transition_json=? WHERE id=?",
+                       (json.dumps(transition), APPLIANCE_ID))
+    _sync(edge_db)
+    snapshot = _cached()["snapshot"]
+    assert snapshot["identity_transition"] == transition
+    assert appliance_entitlements.verify(snapshot, appliance_entitlements._trusted_keys(),
+                                         identity=EDGE_IDENTITY) is None
 
 
 def test_a_non_entitled_appliance_is_denied(appliance, cloud_db, edge_db):
@@ -504,7 +536,11 @@ def test_an_unreadable_runtime_role_cannot_bypass_the_check(monkeypatch):
 def test_a_cloud_outage_does_not_disable_the_local_vms(appliance, cloud_db, edge_db):
     import vms_capacity
     _plan(cloud_db, "basic_local")  # no paid talk features at all
-    assert _sync(edge_db)["status"] != "unreachable"
+    # Model the real root-owned acceptance trigger before going offline. The
+    # cloud sync only writes untrusted staging; the VMS must retain the
+    # previously accepted capacity rather than trusting that staging file.
+    from test_signed_camera_capacity import _sync as sync_and_accept_capacity
+    assert sync_and_accept_capacity(edge_db)["status"] != "unreachable"
     capacity = vms_capacity.load_capacity()
     assert capacity is not None
     appliance["online"] = False

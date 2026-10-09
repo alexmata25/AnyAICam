@@ -175,7 +175,14 @@ def interactive_main():
     client=PortalClient(config.portal_url)
     try: info=client.test(); print('Portal connectivity: OK',info.get('mode'))
     except PortalError as error: raise SystemExit(f'Portal connectivity failed: {error}')
-    try: activated=client.activate(config.cloud_id,token)
+    try:
+        provisional_identity={}
+        try:
+            provisional_identity=json.loads(config.installer_identity_file.read_text(encoding='utf-8'))
+        except (OSError,ValueError):
+            pass
+        activated=client.activate(config.cloud_id,token,
+                                  provisional_appliance_id=provisional_identity.get('appliance_id'))
     except PortalError as error: raise SystemExit(f'Activation failed: {error}')
     print('Assigned customer:',activated.get('customer_id')); print('Assigned site:',activated.get('site_id'))
     _finish_enrollment(config,activated)

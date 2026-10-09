@@ -85,6 +85,91 @@ def test_successful_activation_persists_the_identity_file(client, db_path, ident
     assert persisted["site_id"] == "site-1"
 
 
+def test_first_activation_persists_a_signed_capacity_identity_transition(client, db_path, identity_file):
+    provisional_id = "123e4567-e89b-42d3-a456-426614174000"
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance_with_token(db, "appl-1", "AIC-1", "activation-token-transition")
+    response = client.post("/api/appliance/activate", json={
+        "cloud_id": "AIC-1", "activation_token": "activation-token-transition",
+        "provisional_appliance_id": provisional_id,
+    })
+    assert response.status_code == 200
+    with _db(db_path):
+        with connection() as db:
+            row = db.execute("SELECT capacity_identity_transition_json FROM appliances WHERE id='appl-1'").fetchone()
+    transition = __import__("json").loads(row["capacity_identity_transition_json"])
+    assert transition["kind"] == "initial_claim"
+    assert transition["from_appliance_id"] == provisional_id
+    assert transition["to_identity"] == {
+        "appliance_id": "appl-1", "cloud_id": "AIC-1", "customer_id": "cust-1",
+    }
+    assert transition["transition_id"]
+
+
+def test_capacity_identity_transition_requires_global_platform_admin(client, db_path, monkeypatch):
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance_with_token(db, "appl-transition", "AIC-TRANSITION", "unused-token")
+            db.execute(
+                "INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at,account_status) "
+                "VALUES('partner-admin','partner-1','partner-admin@example.test','Partner Admin','administrator','x',1,?,'active')",
+                (datetime.now().isoformat(),),
+            )
+    monkeypatch.setattr(appliance_cloud, "require_partner_access", lambda *_args, **_kwargs: {
+        "email": "partner-admin@example.test", "role": "administrator", "partner_id": "partner-1",
+    })
+
+    response = client.post("/api/admin/appliances/appl-transition/capacity-identity-transition", json={
+        "from_identity": {"appliance_id": "old-appl", "cloud_id": "AIC-OLD", "customer_id": "old-customer"},
+        "reason": "ownership_transfer",
+    })
+
+    assert response.status_code == 403
+    with _db(db_path):
+        with connection() as db:
+            row = db.execute("SELECT capacity_identity_transition_json FROM appliances WHERE id='appl-transition'").fetchone()
+    assert row["capacity_identity_transition_json"] is None
+
+
+def test_capacity_identity_transition_uses_current_target_and_audits_global_admin(client, db_path, monkeypatch):
+    from global_admin_helper import make_live_global_admin
+
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance_with_token(db, "appl-transition", "AIC-TRANSITION", "unused-token")
+        admin_id = make_live_global_admin("platform-admin@example.test")
+        monkeypatch.setattr(appliance_cloud, "require_partner_access", lambda *_args, **_kwargs: {
+            "id": admin_id, "email": "platform-admin@example.test", "role": "administrator", "partner_id": None,
+        })
+
+        response = client.post("/api/admin/appliances/appl-transition/capacity-identity-transition", json={
+            "from_identity": {"appliance_id": "old-appl", "cloud_id": "AIC-OLD", "customer_id": "old-customer"},
+            "reason": "ownership_transfer",
+            # The endpoint must not accept a caller-selected target identity.
+            "to_identity": {"appliance_id": "attacker-appl", "cloud_id": "AIC-EVIL", "customer_id": "victim"},
+        })
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["target_identity"] == {
+        "appliance_id": "appl-transition", "cloud_id": "AIC-TRANSITION", "customer_id": "cust-1",
+    }
+    with _db(db_path):
+        with connection() as db:
+            row = db.execute("SELECT capacity_identity_transition_json FROM appliances WHERE id='appl-transition'").fetchone()
+            audit = db.execute(
+                "SELECT action,actor_email FROM audit_logs WHERE entity_id='appl-transition' "
+                "AND action='appliance.capacity_identity_transition_authorized' ORDER BY id DESC LIMIT 1",
+            ).fetchone()
+    import json
+    transition = json.loads(row["capacity_identity_transition_json"])
+    assert transition["transition_id"] == body["transition_id"]
+    assert transition["to_identity"] == body["target_identity"]
+    assert audit and audit["action"] == "appliance.capacity_identity_transition_authorized"
+    assert audit["actor_email"] == "platform-admin@example.test"
+
+
 def test_identity_is_readable_after_a_simulated_restart(client, db_path, identity_file, monkeypatch):
     with _db(db_path):
         with connection() as db:

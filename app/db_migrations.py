@@ -1539,6 +1539,12 @@ def apply_migrations():
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
+        # Linux 1.2.5 signed camera-capacity identity transitions. The cloud
+        # stores an explicit transition only after a verified initial claim or
+        # a global-admin authorization; feature_entitlements signs this object
+        # into the snapshot the root appliance helper accepts.
+        if 'capacity_identity_transition_json' not in appliance_columns:
+            db.execute('ALTER TABLE appliances ADD COLUMN capacity_identity_transition_json TEXT')
         if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')
 
         # WireGuard direct remote connectivity (docs/wireguard-remote-

@@ -58,6 +58,19 @@ def test_claim_begin_posts_device_id_unauthenticated():
     assert body == {"device_id": "AIC-DEVICE-0001", "device_secret": "secret-0123456789abcdef0123456789abcdef"}
 
 
+def test_activation_optionally_carries_the_factory_identity_for_signed_capacity_binding():
+    client = _client()
+    with patch("urllib.request.urlopen", return_value=_mock_response({"appliance_id": "cloud-row"})) as urlopen:
+        client.activate("AIC-DEVICE-0001", "one-time-token", provisional_appliance_id="factory-uuid")
+    request = urlopen.call_args[0][0]
+    assert request.full_url == "https://portal.example.test/api/appliance/activate"
+    assert request.get_header("Authorization") is None
+    assert json.loads(request.data.decode()) == {
+        "cloud_id": "AIC-DEVICE-0001", "activation_token": "one-time-token",
+        "provisional_appliance_id": "factory-uuid",
+    }
+
+
 def test_claim_begin_raises_portal_error_with_status_code_on_http_error():
     client = _client()
     error_body = json.dumps({"detail": "Claim attempt rate exceeded."}).encode()

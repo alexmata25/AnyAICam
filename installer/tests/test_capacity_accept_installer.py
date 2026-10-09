@@ -15,7 +15,7 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         for name in ("capacity_accept.py", "anyaicam-capacity-accept.path", "anyaicam-capacity-accept.service"):
             self.assertTrue((ROOT / "appliance-agent" / "system" / name).is_file())
 
-    def test_clean_installer_pins_identity_after_creation_and_before_agent_restart(self):
+    def test_clean_installer_bootstraps_capacity_identity_after_creation_before_agent_restart(self):
         installer = (ROOT / "installer/install.sh").read_text(encoding="utf-8")
         self.assertLess(installer.index("install_capacity_accept_step"), installer.index('deploy_vms "$INSTALL_STATE"'))
         self.assertLess(installer.index('identity_provision "$INSTALL_STATE"'), installer.index("bootstrap_capacity_identity ||"))

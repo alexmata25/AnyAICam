@@ -89,6 +89,13 @@ def test_only_verified_accepted_state_grants_capacity_and_remains_offline_after_
                                             "vms_license_capacity": 6, "source": "signed"}
 
 
+def test_accepted_capacity_remains_valid_after_its_signing_key_is_retired(capacity_state, monkeypatch):
+    accept_in_test(capacity_state, signed_snapshot(capacity_state, 6))
+    monkeypatch.setattr(appliance_entitlements, "_trusted_keys", lambda: {})
+    assert vms_capacity.load_capacity() == {"camera_slot_quantity": 6, "plan_camera_slots": 6,
+                                            "vms_license_capacity": 6, "source": "signed"}
+
+
 def test_new_untrusted_staging_cannot_revoke_or_raise_last_accepted_limit(capacity_state):
     snapshot = signed_snapshot(capacity_state, 4)
     accept_in_test(capacity_state, snapshot)

@@ -209,9 +209,9 @@ run_install() {
     disable_system_suspend
     identity_provision "$INSTALL_STATE"
     if [[ "$INSTALL_STATE" == "clean" ]]; then
-        bootstrap_capacity_identity || { echo "[ERROR] Could not pin the local appliance identity for signed capacity." >&2; return 1; }
+        bootstrap_capacity_identity || { echo "[ERROR] Could not establish protected appliance identity state for signed capacity." >&2; return 1; }
     else
-        bootstrap_capacity_identity migration || { echo "[ERROR] Could not pin the local appliance identity for signed capacity." >&2; return 1; }
+        bootstrap_capacity_identity migration || { echo "[ERROR] Could not establish protected appliance identity state for signed capacity." >&2; return 1; }
     fi
     claim_label_provision
     cloud_portal_provision

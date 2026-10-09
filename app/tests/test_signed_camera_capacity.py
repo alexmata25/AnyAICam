@@ -58,6 +58,11 @@ def _restart(monkeypatch):
 def _sync(edge_db):
     """Exercise cloud sync and simulate the root path trigger without sudo."""
     result = _cloud_sync(edge_db)
+    # An offline sync has no new staging snapshot to accept. Preserve the
+    # previously accepted state instead of making the harness read a path
+    # that the sync correctly did not create.
+    if result.get("status") == "unreachable":
+        return result
     snapshot = _signed_snapshot()
     if snapshot and snapshot.get("camera_capacity"):
         import base64
@@ -296,7 +301,8 @@ def test_an_unsafe_fallback_file_is_ignored(licensed, appliance, monkeypatch):
 
 
 def test_a_huge_fallback_file_is_ignored(licensed, appliance):
-    _fallback(5, padding="x" * (300 * 1024))
+    # vms_capacity bounds this file at 512 KiB; exceed that documented limit.
+    _fallback(5, padding="x" * (600 * 1024))
     assert _running() == []
 
 

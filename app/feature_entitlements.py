@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+import uuid
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("anyaicam.feature_entitlements")
@@ -90,6 +92,61 @@ def require(customer_id: str | None, feature: str) -> None:
 
 
 DEFAULT_SNAPSHOT_TTL_HOURS = 24
+MAX_CAMERA_SLOTS = 10_000
+_IDENTITY_FIELDS = ("appliance_id", "cloud_id", "customer_id")
+
+
+def _identity_transition_id() -> str:
+    return uuid.uuid4().hex
+
+
+def initial_capacity_identity_transition(source_appliance_id: str, appliance: dict) -> dict:
+    """Cloud-signed bridge from factory UUID to the newly claimed cloud row.
+
+    The caller is the single-use claim/activation completion transaction. The
+    source is the device UUID already pinned by the installer; the target is
+    the exact canonical cloud identity returned by that transaction.
+    """
+    target = {"appliance_id": str(appliance.get("id") or ""),
+              "cloud_id": str(appliance.get("cloud_id") or ""),
+              "customer_id": str(appliance.get("customer_id") or "")}
+    if not isinstance(source_appliance_id, str) or not source_appliance_id.strip() or not all(target.values()):
+        raise ValueError("Cannot create a capacity identity transition from incomplete identity data.")
+    return {"schema": 1, "transition_id": _identity_transition_id(), "kind": "initial_claim",
+            "from_appliance_id": source_appliance_id, "to_identity": target}
+
+
+def authorized_capacity_identity_transition(from_identity: dict, to_appliance: dict, *, reason: str) -> dict:
+    """Build explicit admin-authorized transition metadata for cloud signing."""
+    if reason not in {"reenrollment", "ownership_transfer"}:
+        raise ValueError("Unsupported identity transition reason.")
+    source = {field: from_identity.get(field) for field in _IDENTITY_FIELDS} if isinstance(from_identity, dict) else None
+    target = {"appliance_id": str(to_appliance.get("id") or ""),
+              "cloud_id": str(to_appliance.get("cloud_id") or ""),
+              "customer_id": str(to_appliance.get("customer_id") or "")}
+    if not source or any(not isinstance(value, str) or not value.strip() for value in source.values()) or not all(target.values()):
+        raise ValueError("Identity transition must name complete source and target identities.")
+    if source == target:
+        raise ValueError("Identity transition source and target are identical.")
+    return {"schema": 1, "transition_id": _identity_transition_id(), "kind": "authorized",
+            "reason": reason, "from_identity": source, "to_identity": target,
+            "authorized_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _capacity_identity_transition(appliance: dict, target: dict) -> dict | None:
+    raw = appliance.get("capacity_identity_transition_json")
+    if not raw:
+        return None
+    try:
+        transition = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        raise ValueError("Stored capacity identity transition is malformed.")
+    if not isinstance(transition, dict) or transition.get("schema") != 1:
+        raise ValueError("Stored capacity identity transition is malformed.")
+    transition_target = transition.get("to_identity")
+    if transition_target != target:
+        raise ValueError("Stored capacity identity transition does not match the appliance's current cloud identity.")
+    return transition
 
 
 def snapshot_ttl() -> timedelta:
@@ -120,17 +177,25 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
     customer_id = appliance.get("customer_id")
     now = now or datetime.now(timezone.utc)
     breakdown = customer_entitlements.capacity_breakdown(customer_id) if customer_id else {}
+    # The edge verifier and camera-numbering model support at most 10,000
+    # slots. Clamp every signed component, not just the usable minimum, so a
+    # large legacy license cannot make the entire signed snapshot invalid.
+    camera_capacity = {field: min(MAX_CAMERA_SLOTS, max(0, int(breakdown.get(field) or 0)))
+                       for field in ("camera_slot_quantity", "plan_camera_slots", "vms_license_capacity")}
+    identity = {"appliance_id": str(appliance.get("id") or ""),
+                "cloud_id": str(appliance.get("cloud_id") or ""),
+                "customer_id": str(customer_id or "")}
     body = {
         "type": "anyaicam.feature_entitlements", "version": 1,
-        "appliance_id": str(appliance.get("id") or ""), "cloud_id": str(appliance.get("cloud_id") or ""),
-        "customer_id": str(customer_id or ""),
+        **identity,
         "features": {TALK_DOWN: customer_entitled(customer_id, TALK_DOWN),
                      VOICE_CALL: customer_entitled(customer_id, VOICE_CALL)},
-        "camera_capacity": {"camera_slot_quantity": int(breakdown.get("camera_slot_quantity") or 0),
-                            "plan_camera_slots": int(breakdown.get("plan_camera_slots") or 0),
-                            "vms_license_capacity": int(breakdown.get("vms_license_capacity") or 0)},
+        "camera_capacity": camera_capacity,
         "issued_at": now.isoformat(), "expires_at": (now + snapshot_ttl()).isoformat(),
     }
+    transition = _capacity_identity_transition(appliance, identity)
+    if transition is not None:
+        body["identity_transition"] = transition
     with connection() as db:
         key = appliance_identity.ensure_signing_key(db)
     return {**body, "signature": appliance_identity.sign_body(body, key_id=key["key_id"], private_key_b64=key["private_key_b64"])}

@@ -491,6 +491,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not activation_limiter.allow(client): raise HTTPException(status_code=429,detail='Activation attempt rate exceeded.')
         cloud_id=str(payload.get('cloud_id','')).strip().upper(); token=str(payload.get('activation_token','')).strip(); appliance=row('SELECT * FROM appliances WHERE cloud_id=?',(cloud_id,))
         if not appliance or not token: raise HTTPException(status_code=403,detail='Invalid activation request.')
+        provisional_appliance_id=payload.get('provisional_appliance_id')
+        if provisional_appliance_id is not None:
+            from appliance_claims import _valid_device_id, _normalize_device_id
+            if not isinstance(provisional_appliance_id,str) or not _valid_device_id(provisional_appliance_id):
+                raise HTTPException(status_code=400,detail='The installer identity is invalid.')
+            provisional_appliance_id=_normalize_device_id(provisional_appliance_id)
         # Conflict check before the token is touched or a credential is minted -- see appliance_activation.py.
         # Only meaningful for a genuinely single-tenant process (RUNTIME_
         # ROLE edge/combined) -- see local_activation_tracking_applies()'s
@@ -515,6 +521,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if changed!=1: raise HTTPException(status_code=409,detail='Activation token was already used.')
             db.execute('INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)',(credential_id,appliance['id'],password_hash(credential),now_text,'activation'))
             db.execute("UPDATE appliances SET activation_status='activated',state='offline',partner_id=COALESCE(partner_id,(SELECT partner_id FROM customers WHERE id=appliances.customer_id)) WHERE id=?",(appliance['id'],))
+            # Bind the one-time installer UUID to the canonical cloud identity
+            # only on initial activation. Re-enrollment/ownership changes need
+            # the distinct global-admin transition below.
+            if appliance.get('activation_status') != 'activated' and provisional_appliance_id:
+                import feature_entitlements
+                transition=feature_entitlements.initial_capacity_identity_transition(
+                    provisional_appliance_id,appliance)
+                db.execute('UPDATE appliances SET capacity_identity_transition_json=? WHERE id=?',
+                           (json.dumps(transition,sort_keys=True,separators=(',',':')),appliance['id']))
         appliance=row('SELECT * FROM appliances WHERE id=?',(appliance['id'],))
         # Durable persistence (gap #1) -- see appliance_activation.py. Can still raise on a genuine race (two activations at once). Skipped entirely for a cloud deployment -- see the conflict-check comment above.
         if local_activation_tracking_applies():
@@ -2166,6 +2181,40 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         with connection() as db:
             db.execute('UPDATE appliance_activation_tokens SET revoked_at=? WHERE appliance_id=? AND used_at IS NULL AND revoked_at IS NULL',(now.isoformat(),appliance_id)); db.execute('INSERT INTO appliance_activation_tokens(id,appliance_id,token_hash,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?)',(token_id,appliance_id,password_hash(token),(now+timedelta(hours=hours)).isoformat(),now.isoformat(),identity['email']))
         audit(identity,'appliance.activation_token_regenerated','appliance',appliance_id,{'expires_hours':hours}); return {'activation_token':token,'expires_at':(now+timedelta(hours=hours)).isoformat(),'message':'Single-use activation token generated.'}
+
+    @app.post('/api/admin/appliances/{appliance_id}/capacity-identity-transition')
+    def authorize_capacity_identity_transition(request: Request,appliance_id: str,payload: dict) -> dict:
+        """Authorize a cloud-signed, one-time edge identity replacement.
+
+        This does not transfer the appliance or change its customer. A separate
+        approved ownership/re-enrollment operation must already have established
+        the target row identity. Only a global platform administrator can sign
+        the explicit old-to-current transition consumed by the root helper.
+        """
+        identity=require_partner_access(request,{'administrator'})
+        with connection() as db:
+            from appliance_identity import has_global_administrator_grant
+            if not has_global_administrator_grant(db,email=identity.get('email','')):
+                raise HTTPException(status_code=403,detail='A global platform administrator is required.')
+            appliance=db.execute('SELECT id,cloud_id,customer_id,capacity_identity_transition_json FROM appliances WHERE id=?',
+                                 (appliance_id,)).fetchone()
+            if not appliance:
+                raise HTTPException(status_code=404,detail='Appliance not found.')
+            appliance=dict(appliance)
+            from_identity=payload.get('from_identity')
+            reason=payload.get('reason')
+            try:
+                import feature_entitlements
+                transition=feature_entitlements.authorized_capacity_identity_transition(
+                    from_identity,appliance,reason=reason)
+            except (TypeError,ValueError) as error:
+                raise HTTPException(status_code=400,detail='A complete prior identity and supported transition reason are required.') from error
+            db.execute('UPDATE appliances SET capacity_identity_transition_json=? WHERE id=?',
+                       (json.dumps(transition,sort_keys=True,separators=(',',':')),appliance_id))
+        audit(identity,'appliance.capacity_identity_transition_authorized','appliance',appliance_id,
+              {'reason':reason,'transition_id':transition['transition_id']})
+        return {'appliance_id':appliance_id,'transition_id':transition['transition_id'],
+                'target_identity':transition['to_identity'],'message':'Cloud-signed identity transition authorized. The appliance accepts it only if its protected previous identity matches.'}
 
     @app.post('/api/admin/appliances/{appliance_id}/revoke')
     def revoke_appliance(request: Request,appliance_id: str) -> dict:

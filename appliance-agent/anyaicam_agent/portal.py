@@ -45,7 +45,10 @@ class PortalClient:
             raise PortalError(detail,status_code=error.code) from error
         except (urllib.error.URLError,TimeoutError,OSError,json.JSONDecodeError) as error: raise PortalError(str(error)) from error
     def test(self): return self.request('GET','/api/appliance/config',authenticated=False)
-    def activate(self,cloud_id,token): return self.request('POST','/api/appliance/activate',{'cloud_id':cloud_id,'activation_token':token},authenticated=False)
+    def activate(self,cloud_id,token,provisional_appliance_id=None):
+        payload={'cloud_id':cloud_id,'activation_token':token}
+        if provisional_appliance_id: payload['provisional_appliance_id']=provisional_appliance_id
+        return self.request('POST','/api/appliance/activate',payload,authenticated=False)
     # Phase 1 of the non-interactive/self-service claim flow (see
     # docs/non-interactive-activation-phase1-plan.md and
     # app/appliance_claims.py's own module docstring for the cloud-side

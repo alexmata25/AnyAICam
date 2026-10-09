@@ -286,6 +286,7 @@ def product_mode_for_customer(customer_id: str) -> str:
 # ever active at once (an older separate-subscription upgrade), camera
 # capacity is the larger of the two, not their sum.
 BASE_PLAN_PRODUCTS = ("camera_slots_local", "camera_slots_hybrid")
+MAX_CAMERA_SLOTS = 10_000  # shared with the Linux accepted-capacity verifier
 
 
 def total_camera_slots(customer_id: str) -> int:
@@ -350,12 +351,12 @@ def usable_camera_capacity(customer_id: str) -> int:
     appliance customer this equals the plan; a customer with a copied
     installer and no license gets 0. Claiming an appliance is deliberately
     NOT gated by this -- only provisioning and operating cameras are."""
-    return max(0, min(total_camera_slots(customer_id), vms_license_capacity(customer_id)))
+    return max(0, min(MAX_CAMERA_SLOTS, total_camera_slots(customer_id), vms_license_capacity(customer_id)))
 
 
 def capacity_breakdown(customer_id: str) -> dict:
-    plan = total_camera_slots(customer_id)
-    license_capacity = vms_license_capacity(customer_id)
+    plan = min(MAX_CAMERA_SLOTS, max(0, total_camera_slots(customer_id)))
+    license_capacity = min(MAX_CAMERA_SLOTS, max(0, vms_license_capacity(customer_id)))
     return {"camera_slot_quantity": max(0, min(plan, license_capacity)), "plan_camera_slots": plan,
             "vms_license_capacity": license_capacity, "vms_license_required": license_capacity <= 0}
 

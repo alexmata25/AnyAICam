@@ -89,7 +89,7 @@ class ProvisioningTests(KeysetTestCase):
             self.assertEqual(self.applier().apply_staged()["state"], "healthy")
         self.assertEqual(seen, [False])
 
-    def test_capacity_helper_units_and_identity_pin_are_installed_before_downtime(self):
+    def test_capacity_helper_units_and_identity_bootstrap_are_installed_before_downtime(self):
         self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A}))
         result = self.applier().apply_staged()
         self.assertEqual(result["state"], "healthy", result.get("error"))
@@ -106,7 +106,7 @@ class ProvisioningTests(KeysetTestCase):
                       else self.paths.capacity_accept_systemd / name)
             self.assertTrue(target.is_file(), name)
 
-    def test_identity_pin_failure_rejects_update_before_vms_downtime(self):
+    def test_capacity_identity_bootstrap_failure_rejects_update_before_vms_downtime(self):
         self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A}))
         self.host.fail[("/usr/bin/python3", "-I")] = 1
         result = self.applier().apply_staged()

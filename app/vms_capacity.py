@@ -18,6 +18,7 @@ mirror for an intentional rollback to 1.2.4; this release never reads it.
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import logging
 import os
@@ -65,10 +66,10 @@ def _record(capacity: dict, source: str) -> dict | None:
             "vms_license_capacity": capacity.get("vms_license_capacity"), "source": source}
 
 
-def _verified_capacity(snapshot, *, check_expiry: bool) -> tuple[str | None, dict | None]:
+def _verified_capacity(snapshot, *, check_expiry: bool, public_keys=None) -> tuple[str | None, dict | None]:
     """(reason, capacity record): reason is None when signature and identity verify."""
     import appliance_entitlements
-    reason = appliance_entitlements.verify(snapshot, appliance_entitlements._trusted_keys(),
+    reason = appliance_entitlements.verify(snapshot, public_keys if public_keys is not None else appliance_entitlements._trusted_keys(),
                                            identity=appliance_entitlements._local_identity(),
                                            check_expiry=check_expiry)
     if reason:
@@ -107,14 +108,25 @@ def _accepted_signed() -> tuple[bool, dict | None]:
         if len(raw) > _MAX_FILE_BYTES:
             return True, None
         state = json.loads(raw.decode("utf-8"))
-        if not isinstance(state, dict) or state.get("schema") != 1:
+        if not isinstance(state, dict) or state.get("schema") not in {1, 2}:
             return True, None
         accepted_identity = appliance_entitlements._bound_identity(state.get("identity"))
         local_identity = appliance_entitlements._local_identity()
         if accepted_identity is None or accepted_identity != local_identity:
             return True, None
         snapshot = state.get("snapshot")
-        reason, record = _verified_capacity(snapshot, check_expiry=False)
+        accepted_keys = None
+        if state.get("schema") == 2:
+            signature = snapshot.get("signature") if isinstance(snapshot, dict) else None
+            key_id = signature.get("key_id") if isinstance(signature, dict) else None
+            try:
+                accepted_key = base64.b64decode(state.get("accepted_key"), validate=True)
+            except (TypeError, ValueError, base64.binascii.Error):
+                return True, None
+            if not isinstance(key_id, str) or len(accepted_key) != 32:
+                return True, None
+            accepted_keys = {key_id: base64.b64encode(accepted_key).decode("ascii")}
+        reason, record = _verified_capacity(snapshot, check_expiry=False, public_keys=accepted_keys)
         if reason or record is None:
             return True, None
         body = {key: value for key, value in snapshot.items() if key != "signature"}
@@ -124,6 +136,10 @@ def _accepted_signed() -> tuple[bool, dict | None]:
         if (not isinstance(high_water, dict) or normalized_issued is None or
                 high_water.get("issued_at") != normalized_issued or
                 high_water.get("digest") != hashlib.sha256(_canonical_json(body)).hexdigest()):
+            return True, None
+        transition = body.get("identity_transition")
+        if transition is not None and (not isinstance(transition, dict) or
+                                       state.get("transition_id") != transition.get("transition_id")):
             return True, None
         return True, record
     except (OSError, ValueError, TypeError):
