@@ -162,6 +162,22 @@ Check 'runtime catalog registered, signed like the setup (Smart App Control)' {
     "registered; $($signature.SignerCertificate.Subject)"
 }
 
+# ---------------------------------------------------------------- entitlement trust anchor (2026-10-08)
+Check 'licensing state lives in the protected data folder (no C:\opt, C:\etc)' {
+    if (Test-Path 'C:\opt\anyaicam') { throw 'C:\opt\anyaicam exists' }
+    if (Test-Path 'C:\etc\anyaicam-update') { throw 'C:\etc\anyaicam-update exists' }
+    if (-not (WaitFor 120 { Test-Path (Join-Path $data 'config\vms_capacity.json') }) -and (Get-Service AnyAiCamAgent).Status -eq 'Running') { 'vms_capacity.json not written yet (no cloud link): location only checked by absence elsewhere' } else { 'config\vms_capacity.json under ProgramData' }
+}
+$keysetFile = Join-Path $data 'trust\entitlement_signing_keys.json'
+Check 'entitlement keyset: installed Administrators-owned and accepted by the VMS (or none in this build)' {
+    if (-not (Test-Path -LiteralPath $keysetFile)) { return 'this build carries no entitlement keyset (paid features stay off)' }
+    $python = Join-Path $app 'runtime\python\python.exe'
+    $answer = & $python -c "import sys; sys.path.insert(0, sys.argv[1]); import windows_trust_anchor as w; print(w.anchor_problem(w.anchor_file()) or 'OK')" (Join-Path $app 'app')
+    if (($answer | Select-Object -Last 1) -ne 'OK') { throw "VMS check: $answer" }
+    $owner = (Get-Acl -LiteralPath $keysetFile).Owner
+    "accepted; owner $owner"
+}
+
 # ---------------------------------------------------------------- firewall
 $rules = Get-NetFirewallRule -Group 'AnyAiCam VMS' -ErrorAction SilentlyContinue
 Check 'two firewall rules' { if (@($rules).Count -ne 2) { throw "found $(@($rules).Count)" }; ($rules.Name -join ',') }

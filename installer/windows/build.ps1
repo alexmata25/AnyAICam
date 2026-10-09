@@ -1,7 +1,12 @@
 param(
     [Parameter(Mandatory=$true)][string]$Version,
     [switch]$Sign,
-    [switch]$AzureSign
+    [switch]$AzureSign,
+    # 2026-10-08: the cloud's entitlement-signing public keyset and the
+    # SHA-256 obtained independently on the cloud host
+    # (docs/entitlement-signing-keys.md). Required for a signed build.
+    [string]$EntitlementKeyset = '',
+    [string]$EntitlementKeysetSha256 = ''
 )
 $ErrorActionPreference = 'Stop'
 if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
@@ -101,6 +106,24 @@ if ($Sign -or $AzureSign) {
     if ($LASTEXITCODE -ne 0) { throw "A catalogued file does not verify against the runtime catalog: $($sample.Name)" }
     Write-Output 'Runtime catalog signed and verified.'
 }
+# Entitlement trust anchor (2026-10-08, entitlement-keyset.ps1): a customer
+# (signed) build must carry the keyset, or Talk Down and AAC Voice Call stay
+# unavailable on every PC that installs it.
+. (Join-Path $PSScriptRoot 'entitlement-keyset.ps1')
+$keysetOut = Join-Path $outputDir 'entitlement_signing_keys.json'
+if (Test-Path -LiteralPath $keysetOut) { Remove-Item -LiteralPath $keysetOut -Force }
+$keysetSha = ''
+if ($EntitlementKeyset -or $EntitlementKeysetSha256) {
+    Test-KeysetPackaging $EntitlementKeyset $EntitlementKeysetSha256
+    Copy-Item -LiteralPath $EntitlementKeyset -Destination $keysetOut
+    $keysetSha = $EntitlementKeysetSha256
+    Write-Output "Entitlement keyset: sha256 $($keysetSha.Substring(0, 12))..."
+} elseif ($Sign -or $AzureSign) {
+    throw 'A signed build must carry the entitlement-signing keyset (-EntitlementKeyset <file> -EntitlementKeysetSha256 <digest>).'
+} else {
+    Write-Warning 'No entitlement keyset: this unsigned build leaves paid features unavailable.'
+}
+$compilerArguments += "/DEntitlementKeysetSha256=$keysetSha"
 $compilerArguments += "/DAppVersion=$Version"
 $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript

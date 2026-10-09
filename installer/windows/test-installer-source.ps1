@@ -16,13 +16,14 @@ $required = @(
     'installer\windows\open-claim-link.ps1',
     'installer\windows\source-integrity.ps1',
     'installer\windows\runtime-catalog.ps1',
+    'installer\windows\entitlement-keyset.ps1',
     'appliance-agent\anyaicam_agent\windows.py'
 )
 foreach ($relative in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $relative))) { throw "Missing $relative" }
 }
 $tokens = $null; $errors = $null
-foreach ($relative in @('installer\windows\install-runtime.ps1', 'installer\windows\service-launcher.ps1', 'installer\windows\build.ps1', 'installer\windows\firewall.ps1', 'installer\windows\cloud-link.ps1', 'installer\windows\agent-launcher.ps1', 'installer\windows\open-claim-link.ps1', 'installer\windows\source-integrity.ps1', 'installer\windows\runtime-catalog.ps1')) {
+foreach ($relative in @('installer\windows\install-runtime.ps1', 'installer\windows\service-launcher.ps1', 'installer\windows\build.ps1', 'installer\windows\firewall.ps1', 'installer\windows\cloud-link.ps1', 'installer\windows\agent-launcher.ps1', 'installer\windows\open-claim-link.ps1', 'installer\windows\source-integrity.ps1', 'installer\windows\runtime-catalog.ps1', 'installer\windows\entitlement-keyset.ps1')) {
     [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $root $relative), [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw "PowerShell syntax error in $relative`: $($errors[0].Message)" }
 }

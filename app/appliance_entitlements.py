@@ -82,6 +82,12 @@ def _parse_time(value) -> datetime | None:
 # Deliberately not configurable from the environment: vms.env is writable by
 # the unprivileged anyaicam user.
 TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
+if os.name == "nt":
+    # Native Windows install (2026-10-08): %ProgramData%\AnyAiCam\trust\...,
+    # Administrators-owned and checked by windows_trust_anchor.py. (Never
+    # imported on Linux.)
+    from windows_trust_anchor import anchor_file as _windows_anchor_file
+    TRUST_ANCHOR_FILE = _windows_anchor_file()
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -99,10 +105,16 @@ def ownership_problem(info) -> str:
 
 def _anchor_file_problem(path: Path) -> str:
     """The keyset and its directory must be root-owned, not symlinks, and not
-    writable by anyone else -- or a less-privileged user could swap it. (POSIX
-    only; a Windows development checkout has no such ownership model.)"""
+    writable by anyone else -- or a less-privileged user could swap it.
+    Windows (2026-10-08): owner and access list of the file and its two
+    parent folders (windows_trust_anchor.py). Any other platform: never
+    trusted (this used to pass every non-POSIX system, so a standard
+    Windows user could plant a keyset)."""
+    if os.name == "nt":
+        from windows_trust_anchor import anchor_problem
+        return anchor_problem(path)
     if os.name != "posix":
-        return ""
+        return f"cannot be checked on this platform ({os.name})"
     for candidate in (path.parent, path):
         try:
             problem = ownership_problem(os.lstat(candidate))

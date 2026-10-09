@@ -14,7 +14,11 @@ param(
     # 2026-10-08: the signed catalog of the runtime's native files
     # (runtime-catalog.ps1), registered before anything native is loaded, so
     # Smart App Control lets the bundled runtime run.
-    [Parameter(Mandatory=$true)][string]$RuntimeCatalog
+    [Parameter(Mandatory=$true)][string]$RuntimeCatalog,
+    # 2026-10-08: the release's entitlement-signing public keyset and its
+    # digest (entitlement-keyset.ps1); both empty for a build without one.
+    [string]$EntitlementKeyset = '',
+    [string]$EntitlementKeysetSha256 = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
@@ -127,6 +131,11 @@ $values['ANYAICAM_VERSION'] = $AppVersion
 $content = @('# Managed by the AnyAiCam Windows installer. Persistent across repair and uninstall.')
 $content += $values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
 [IO.File]::WriteAllLines($environmentFile, $content, [Text.UTF8Encoding]::new($false))
+
+# Entitlement trust anchor (2026-10-08): after the data folder's permissions
+# above, so the VMS's own check of the folder chain runs on the final state.
+. (Join-Path $PSScriptRoot 'entitlement-keyset.ps1')
+Install-EntitlementKeyset -DataRoot $DataRoot -Source $EntitlementKeyset -Sha256 $EntitlementKeysetSha256 -Python $python -AgentRoot (Join-Path $InstallRoot 'agent') -AppRoot (Join-Path $InstallRoot 'app')
 
 # Cloud linking (2026-10-07): appliance identity, claim code, cloud portal
 # and installed release for the agent service (see cloud-link.ps1).

@@ -9,6 +9,10 @@
   #define SourceCommit "0000000000000000000000000000000000000000"
 #endif
 #define ShortCommit Copy(SourceCommit, 1, 7)
+; 2026-10-08: the entitlement keyset's digest from build.ps1 (empty: none).
+#ifndef EntitlementKeysetSha256
+  #define EntitlementKeysetSha256 ""
+#endif
 [Setup]
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
 AppName={#AppName}
@@ -71,6 +75,9 @@ Source: "cloud-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; runtime-catalog.ps1); Smart App Control blocks them without it.
 Source: "runtime-catalog.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "output\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; 2026-10-08: the entitlement trust anchor (entitlement-keyset.ps1).
+Source: "entitlement-keyset.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "output\entitlement_signing_keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 Source: "open-claim-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
 Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
@@ -251,7 +258,7 @@ begin
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -AppVersion "{#AppVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -AppVersion "{#AppVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement_signing_keys.json') + '" -EntitlementKeysetSha256 "{#EntitlementKeysetSha256}"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');

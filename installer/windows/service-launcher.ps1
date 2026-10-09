@@ -27,6 +27,15 @@ $env:ANYAICAM_HLS_FOLDER = Join-Path $dataRoot 'hls'
 $env:ANYAICAM_PARTNER_DB = Join-Path $dataRoot 'database\partner_portal.db'
 $env:ANYAICAM_MEDIAMTX_BINARY = Join-Path $installRoot 'runtime\tools\mediamtx\mediamtx.exe'
 $env:ANYAICAM_MEDIAMTX_CONFIG = Join-Path $dataRoot 'mediamtx\anyaicam-mediamtx.yml'
+# Licensing state (2026-10-08): the VMS's Linux defaults are /opt/anyaicam/
+# data/config/..., which on Windows meant C:\opt\..., a folder any local user
+# may create or, once created, modify -- so a user could have raised the
+# licensed camera capacity (unsigned) or switched the product mode. They live
+# in the SYSTEM/Administrators-only data folder instead, set after vms.env so
+# nothing there can move them.
+$env:ANYAICAM_VMS_CAPACITY_FILE = Join-Path $dataRoot 'config\vms_capacity.json'
+$env:ANYAICAM_PRODUCT_MODE_STATE_FILE = Join-Path $dataRoot 'config\product_mode.json'
+$env:ANYAICAM_FEATURE_ENTITLEMENTS_FILE = Join-Path $dataRoot 'config\feature_entitlements.json'
 $env:PYTHONUNBUFFERED = '1'
 $env:PATH = (Join-Path $installRoot 'runtime\tools\ffmpeg') + ';' + $env:PATH
 foreach ($folder in @($env:ANYAICAM_RECORDINGS_FOLDER, $env:ANYAICAM_HLS_FOLDER,
