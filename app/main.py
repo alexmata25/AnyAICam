@@ -7640,11 +7640,6 @@ class HardwareCheckoutCreateModel(BaseModel):
     # browser can never submit an arbitrary Price ID.
     sku: str
     quantity: int = 1
-class CameraSlotCheckoutModel(BaseModel):
-    plan_type: str
-    tier_label: str
-
-
 class AnalyticsAddonCheckoutModel(BaseModel):
     # Each analytics package (pricing_catalog.ADDONS) is ONE recurring,
     # customer-billed add-on that unlocks its features together (Advanced
@@ -48814,9 +48809,6 @@ from build_orders import register_build_order_routes
 register_build_order_routes(app)
 from fulfillment_admin import register_fulfillment_admin_routes
 register_fulfillment_admin_routes(app, page_shell)
-from plan_changes import register_plan_change_routes, register_plan_management_routes
-register_plan_change_routes(app)
-register_plan_management_routes(app)
 from account_invitations import register_account_invitation_routes
 register_account_invitation_routes(app)
 from direct_onboarding import register_direct_onboarding_routes
@@ -104335,6 +104327,35 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
+def _vms_installer_download_html(customer_id: str, mode: str | None, is_owner: bool) -> str:
+    """Installer download (2026-10-01; moved 2026-10-08 from the removed fixed-
+    tier subscription page to the per-camera page's license card): the account
+    owner of a licensed account gets the exact published installer, with what
+    they need to verify it. Same eligibility as the download route
+    (customer_downloads.download_eligibility)."""
+    from customer_entitlements import vms_license_capacity
+    if not is_owner or vms_license_capacity(customer_id) <= 0:
+        return ""
+    import customer_downloads
+    _installer = customer_downloads.latest_vms_installer()
+    if not _installer:
+        return '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
+    # Customer-facing summary first; the build id, checksum and terminal
+    # commands stay available, tucked into a collapsed details section.
+    return (
+        f'<div class="health-row" id="vms-installer-download"><span>AnyAiCam VMS installer {escape(str(_installer["version"]))}'
+        f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk) &middot; '
+        f'{customer_downloads.human_size(int(_installer["size_bytes"]))}</span></span>'
+        f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
+        '<p class="health-detail" style="margin:8px 0 0">Install it on your PC, then link the PC to this account on '
+        '<a href="/customer/claim-appliance">Claim an appliance</a>. The step-by-step commands are in the technical details below.</p>'
+        '<details id="vms-installer-technical" style="margin-top:10px"><summary>Technical details and install commands</summary>'
+        f'<p class="health-detail" style="margin:8px 0 0">Build {escape(_installer["commit"][:7])}'
+        f'<br>SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></p>'
+        + _installer_steps_html(mode, str(_installer["filename"]), str(_installer["sha256"]))
+        + '</details>')
+
+
 def _installer_steps_html(mode: str | None, filename: str = "", sha256: str = "") -> str:
     """Install-and-activate steps under the installer download (2026-10-01).
 
@@ -104384,7 +104405,6 @@ def _customer_subscription_portal_page(identity: dict, request: Request | None =
     customer setup review step already established: customer_
     entitlements (camera-slot plan + Local/Hybrid mode) and analytics_
     entitlements (add-ons) -- never a static/mock JSON file."""
-    from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS, product_mode_for_customer
     import per_camera_billing as _per_camera_billing
     _v2_entitlement = _per_camera_billing.entitlement_for_customer(identity["customer_id"])
     # ?plan=&cameras= only pre-fill the picker or the change form (2026-10-05);
@@ -104396,391 +104416,11 @@ def _customer_subscription_portal_page(identity: dict, request: Request | None =
     _payment_outcome = _query.get("camera_plan_payment") or ""
     if _v2_entitlement and _v2_entitlement.get("status") in ("active", "suspended"):
         return _per_camera_billing.customer_portal_page(identity, _v2_entitlement, _selection, _payment_outcome)
-    # New purchases are billing v2 only (owner decision 2026-10-05): a
-    # customer with no active/suspended camera plan -- v2 or legacy -- gets
-    # the per-camera plan picker, never the legacy fixed-capacity chooser.
-    # Customers with a legacy plan stay on the legacy page (grandfathered).
-    _legacy_plan = [e for e in get_entitlements_for_customer(identity["customer_id"])
-                    if e["product"] in ("camera_slots_local", "camera_slots_hybrid")
-                    and e["status"] in ("active", "suspended")]
-    if not _legacy_plan:
-        return _per_camera_billing.customer_portal_page(identity, None, _selection, _payment_outcome)
-    from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
-
-    customer_id = identity["customer_id"]
-    mode = product_mode_for_customer(customer_id)
-    entitlements = get_entitlements_for_customer(customer_id)
-    camera_entitlement = next((e for e in entitlements if e["product"] in ("camera_slots_local", "camera_slots_hybrid") and e["status"] == "active"), None)
-    # A plan suspended for an unpaid period, a refund or a dispute is still the
-    # account's plan (2026-10-02): shown with why, never offered as "no plan".
-    suspended_plan = None if camera_entitlement else next(
-        (e for e in entitlements if e["product"] in ("camera_slots_local", "camera_slots_hybrid") and e["status"] == "suspended"), None)
-    licensed_slots = total_camera_slots(customer_id)
-    if camera_entitlement:
-        plan_type = "hybrid" if camera_entitlement["product"] == "camera_slots_hybrid" else "local"
-        tier_label = next((t[1] for t in PLAN_TIERS if t[0] == plan_type and t[4] == camera_entitlement["camera_slot_quantity"]), f"{licensed_slots} cameras")
-        plan_summary = f"{plan_type.title()} {tier_label} &middot; {licensed_slots} licensed camera slots"
-        import pricing_catalog as _plan_catalog
-        _plan = _plan_catalog.find_base_plan(plan_type, tier_label)
-        if _plan:
-            plan_summary = (f"{escape(_plan['label'])} &middot; {licensed_slots} licensed camera slots"
-                            f" &middot; ${_plan['monthly_cents'] / 100:.2f}/mo")
-    else:
-        plan_summary = "No camera-slot plan purchased yet"
-    # What Stripe says about this plan now (2026-10-02, record_billing_state):
-    # renewal date, a scheduled end, or a payment Stripe could not collect.
-    # Information only; which statuses keep access is unchanged.
-    billing_note = ""
-
-    def _local_date(value) -> str:
-        if isinstance(value, str):
-            moment = datetime.fromisoformat(value)
-            if moment.tzinfo is None:
-                moment = moment.astimezone()
-        else:
-            moment = datetime.fromtimestamp(int(value), tz=timezone.utc)
-        return f'<time datetime="{moment.isoformat()}" data-local-date>{moment.strftime("%b %d, %Y")}</time>'
-
-    import billing_status as _billing
-    if suspended_plan:
-        _why = {"payment_failed": "the payment for it could not be collected. Update your payment method to restore it.",
-                "refunded": "its payment was refunded. Please contact AnyAiCam support.",
-                "disputed": "its payment is disputed. Please contact AnyAiCam support."}.get(
-            suspended_plan.get("suspended_reason") or "", "of a billing problem. Please contact AnyAiCam support.")
-        plan_summary = "Your plan is paused"
-        billing_note = f'<p class="health-detail" id="plan-billing-note">This plan is paused because {_why}</p>'
-    elif camera_entitlement:
-        _grace_end = _billing.grace_ends_at(camera_entitlement.get("payment_failed_at"))
-        _period_end = camera_entitlement.get("current_period_end")
-        if _grace_end:
-            billing_note = ("The latest payment for this plan failed. Your plan stays active until "
-                            f"{_local_date(_grace_end.isoformat())}; please update your payment method before then.")
-        elif camera_entitlement.get("cancel_at_period_end") and _period_end:
-            billing_note = f"This plan is set to end on {_local_date(_period_end)} and will not renew."
-        elif camera_entitlement.get("scheduled_change") == "downgrade_to_local" and camera_entitlement.get("scheduled_change_at"):
-            billing_note = (f"Hybrid stays active until {_local_date(camera_entitlement['scheduled_change_at'])}; "
-                            "then your plan becomes Local.")
-        elif _period_end:
-            billing_note = f"Renews on {_local_date(_period_end)}."
-        if billing_note:
-            billing_note = f'<p class="health-detail" id="plan-billing-note">{billing_note}</p>'
-
-
-    # Plan-badge text is deliberately derived from `mode` (product_mode_
-    # for_customer(), Hybrid-wins-if-both-active) rather than
-    # camera_entitlement['product'] alone -- see that function's own
-    # docstring for why Hybrid must win the instant an upgrade purchase
-    # completes, even before any decision is made about a now-redundant
-    # Local entitlement.
-    plan_badge = {"local": "Local", "hybrid": "Hybrid"}.get(mode, "No active plan")
-
-    # Both customer_owner and customer_viewer reach this page (matching
-    # the legacy page's own no-role-distinction convention), but the
-    # underlying checkout endpoints (create_camera_slot_checkout()/
-    # create_analytics_addon_checkout()) are customer_owner-only,
-    # unconditionally 403ing a customer_viewer. Buy/upgrade actions are
-    # hidden here for a viewer rather than shown-then-403 on click --
-    # never a security boundary on their own (the real enforcement is
-    # server-side in those two routes, unchanged), just not offering an
-    # action this identity can never actually complete.
-    is_owner = identity.get("role") == "customer_owner"
-
-    hybrid_tier_options = [
-        {"tier_label": t[1], "camera_slot_maximum": t[4], "monthly_retail_usd": t[5]}
-        for t in PLAN_TIERS if t[0] == "hybrid" and os.environ.get(t[6], "").strip()
-    ]
-    # Self-service plan actions (owner policies 2026-10-02): cancel at period
-    # end / keep the plan, Hybrid -> Local at renewal / keep Hybrid, and the
-    # Customer Portal for card and plan management. Owners only; only actions
-    # that apply right now are shown.
-    plan_actions = ""
-    _actions = []
-    _held_plan = camera_entitlement or suspended_plan
-    if is_owner and _held_plan and _held_plan.get("stripe_subscription_id"):
-        if camera_entitlement and camera_entitlement.get("cancel_at_period_end"):
-            _actions.append('<button class="action-button plan-action" data-endpoint="/api/customer/plan/resume">Keep my plan</button>')
-        elif camera_entitlement:
-            if camera_entitlement["product"] == "camera_slots_hybrid":
-                if camera_entitlement.get("scheduled_change") == "downgrade_to_local":
-                    _actions.append('<button class="action-button plan-action" data-endpoint="/api/customer/plan/cancel-downgrade">Keep Hybrid</button>')
-                else:
-                    _actions.append('<button class="ghost-button plan-action" data-endpoint="/api/customer/plan/downgrade-to-local" '
-                                    'data-confirm="Switch to Local at your next renewal? Hybrid stays active until then.">Switch to Local at renewal</button>')
-            _actions.append('<button class="ghost-button plan-action" data-endpoint="/api/customer/plan/cancel" '
-                            'data-confirm="Cancel your plan? It stays active until the end of the period you have paid for, and you can keep it until then.">Cancel plan</button>')
-    import customer_billing as _customer_billing
-    if is_owner and _customer_billing.portal_enabled() and _customer_billing.stripe_customer_ids_for_customer(customer_id):
-        _actions.append('<button class="ghost-button" id="manage-billing-button">Manage billing</button>')
-    if _actions:
-        plan_actions = ('<div class="plan-actions" id="plan-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">'
-                        + "".join(_actions) + '</div><p id="plan-action-message" class="health-detail" role="status"></p>')
-
-    upgrade_tier = None
-    import plan_changes
-    if mode == "local" and camera_entitlement and is_owner and plan_changes.upgrade_available():
-        upgrade_tier = next((t for t in hybrid_tier_options if t["camera_slot_maximum"] == camera_entitlement["camera_slot_quantity"]), None)
-
-    active_analytics = set(get_active_analytics_for_customer(customer_id))
-    # 2026-09-30 pricing: prices and sellability come from pricing_catalog;
-    # which packages are held comes from addon_subscriptions (packages
-    # overlap, so "all of its features are on" no longer identifies one).
-    import pricing_catalog
-    import friends_family
-    from analytics_entitlements import active_addon_keys, checkout_item
-    from partner_db import rows as partner_rows
-    held_addons = set(active_addon_keys(customer_id))
-    _friends_family_panel = friends_family.customer_panel_html()
-    # One-time VMS software license (2026-09-30): included with an AnyAiCam
-    # appliance, bought once for a DIY / customer-owned PC installation.
-    from customer_entitlements import appliance_includes_vms_license, vms_license_capacity
-    _licensed = vms_license_capacity(customer_id)
-    _plan_capacity = int(camera_entitlement["camera_slot_quantity"] or 0) if camera_entitlement else 0
-    _license_offer = pricing_catalog.find_vms_license(_plan_capacity) if _plan_capacity else None
-    if appliance_includes_vms_license(customer_id):
-        _license_html = (f'<div class="health-row"><span>Included with your AnyAiCam appliance'
-                         f'{f" &middot; {_licensed} cameras" if _licensed else ""}</span><span class="pill">Included</span></div>')
-    elif _licensed:
-        _license_html = f'<div class="health-row"><span>Licensed for {_licensed} cameras (one-time purchase)</span><span class="pill">Active</span></div>'
-    elif _license_offer:
-        _price = f"${_license_offer['one_time_cents'] / 100:.2f} one-time"
-        if is_owner and _license_offer["stripe_price_id"]:
-            _action = f'<button class="ghost-button" id="vms-license-buy" data-capacity="{_license_offer["capacity"]}">Buy license</button>'
-        elif is_owner:
-            _action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
-        else:
-            _action = '<span class="health-detail">Not purchased</span>'
-        _license_html = (f'<div class="health-row"><span>Software license for {_license_offer["capacity"]} cameras<br>'
-                         f'<span class="health-detail">{_price} &middot; for your own PC. Included free with an AnyAiCam appliance.</span></span>{_action}</div>')
-    else:
-        _license_html = '<p class="health-detail">Choose a camera plan first; the software license matches its camera capacity. It is included with every AnyAiCam appliance.</p>'
-    # Installer download (2026-10-01): the account owner of a licensed account
-    # gets the exact published installer, with what they need to verify it.
-    _download_html = ''
-    if _licensed and is_owner:
-        import customer_downloads
-        _installer = customer_downloads.latest_vms_installer()
-        if _installer:
-            # Customer-facing summary first; the build id, checksum and terminal
-            # commands stay available, tucked into a collapsed details section.
-            _download_html = (
-                f'<div class="health-row" id="vms-installer-download"><span>AnyAiCam VMS installer {escape(str(_installer["version"]))}'
-                f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk) &middot; '
-                f'{customer_downloads.human_size(int(_installer["size_bytes"]))}</span></span>'
-                f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
-                '<p class="health-detail" style="margin:8px 0 0">Install it on your PC, then link the PC to this account on '
-                '<a href="/customer/claim-appliance">Claim an appliance</a>. The step-by-step commands are in the technical details below.</p>'
-                '<details id="vms-installer-technical" style="margin-top:10px"><summary>Technical details and install commands</summary>'
-                f'<p class="health-detail" style="margin:8px 0 0">Build {escape(_installer["commit"][:7])}'
-                f'<br>SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></p>'
-                + _installer_steps_html(mode, str(_installer["filename"]), str(_installer["sha256"]))
-                + '</details>')
-        else:
-            _download_html = '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
-    _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'
-                      f'{_license_html}{_download_html}<p id="vms-license-message" class="health-detail"></p></section>')
-    site_count = max(1, len(partner_rows("SELECT id FROM sites WHERE customer_id=?", (customer_id,))))
-
-    def _price_text(addon_key: str) -> str:
-        addon = pricing_catalog.find_addon(addon_key)
-        if addon and addon["monthly_cents"] is not None:
-            per = " per site" if addon["unit"] == "per_site" else ""
-            return f"${addon['monthly_cents'] / 100:.2f}/mo{per}"
-        tier = next((t for t in pricing_catalog.face_access_tiers() if f"face_access_{t['size']}" == addon_key), None)
-        return f"${tier['monthly_cents_per_door'] / 100:.2f}/mo per door" if tier else ""
-
-    addon_rows = ""
-    # Face Access: only the size that fits this customer's enrolled people is
-    # offered, billed per door; over 500 people is Enterprise (contact us).
-    from analytics_entitlements import face_access_size_for_customer, door_count_for_customer
-    face_size = face_access_size_for_customer(customer_id)
-    door_count = door_count_for_customer(customer_id)
-    face_access_held = any(key.startswith("face_access_") or key == "facial_recognition" for key in held_addons) or "facial_recognition" in active_analytics
-    for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
-        price_id = os.environ.get(env_var, "").strip()
-        # Purchases made before addon_subscriptions existed are recognised
-        # by their exact old shape: the old Advanced Analytics granted these
-        # four keys; every other old SKU wrote a row keyed by the SKU itself.
-        is_active = (addon_key in held_addons or addon_key in active_analytics
-                     or (addon_key == "advanced_analytics"
-                         and {"smart_motion", "people_counting", "lpr", "ppe"} <= active_analytics))
-        item = checkout_item(addon_key, customer_id)
-        if addon_key == "facial_recognition" and not is_active:
-            continue  # the old single-price SKU: shown only to customers who hold it
-        if addon_key.startswith("face_access_") and not is_active:
-            if face_access_held or addon_key != f"face_access_{face_size}":
-                continue
-        quantity = site_count if item["unit"] == "per_site" else door_count if item["unit"] == "per_door" else 1
-        # Analytics packages (2026-10-05, subscription_offers): customer names,
-        # no unpriced placeholder unless held, never an Add for analytics the
-        # account already has through another package.
-        import subscription_offers
-        is_package = addon_key in subscription_offers.PACKAGE_NAMES
-        if is_package:
-            label = subscription_offers.PACKAGE_NAMES[addon_key]
-        if not is_active and not addon_key.startswith("face_access_") and addon_key != "facial_recognition":
-            _addon = pricing_catalog.find_addon(addon_key)
-            if not _addon or _addon["monthly_cents"] is None:
-                continue
-        offer = subscription_offers.addon_offer(customer_id, addon_key) if is_package and not is_active else {"state": ""}
-        if is_active:
-            status_html = '<span class="pill">Active</span>'
-        elif offer["state"] in ("covered", "overlaps"):
-            status_html = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(offer["reason"])}</span>'
-        elif price_id and not item["sellable"] and addon_key.startswith("face_access_") and item["unavailable_reason"]:
-            # Say what the customer needs to do (e.g. set up a door first).
-            status_html = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(item["unavailable_reason"])}</span>'
-        elif not price_id or not item["sellable"]:
-            # Catalog defines this SKU but its Stripe Price ID env var
-            # isn't configured in this environment yet -- shown honestly
-            # rather than silently omitted (a customer with it already
-            # active via a non-Stripe grant still sees "Active" above;
-            # this branch is unreachable for them). Matches
-            # aaco_product_status()'s own "sellable: false" precedent.
-            status_html = '<span class="pending-badge" aria-disabled="true" title="Not available to purchase yet">Not available yet</span>'
-        elif is_owner:
-            status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}" data-quantity="{quantity}">Add</button>'
-        else:
-            status_html = '<span class="health-detail">Not purchased</span>'
-        # What the add-on turns on, from the catalog's own analytic mapping
-        # (only analytics customers see in the portal; no invented detail).
-        from customer_analytics_panel import ANALYTIC_LABELS as _PORTAL_ANALYTICS
-        included = [_PORTAL_ANALYTICS[key][0] for key in analytic_keys if key in _PORTAL_ANALYTICS]
-        details = [text for text in (_price_text(addon_key), f"Includes: {', '.join(included)}" if included else "") if text]
-        if addon_key == "talk_down" and site_count > 1:
-            details.append(f"{site_count} sites")
-        if addon_key.startswith("face_access_"):
-            details.append(f"{door_count} door{'s' if door_count != 1 else ''}" if door_count else "No door cameras set up yet")
-        includes_html = f'<br><span class="health-detail">{escape(" · ".join(details))}</span>' if details else ''
-        addon_rows += f'<div class="health-row"><span>{escape(label)}{includes_html}</span>{status_html}</div>'
-    if face_size == pricing_catalog.FACE_ACCESS_ENTERPRISE and not face_access_held:
-        addon_rows += ('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">'
-                       'More than 500 enrolled people: custom pricing</span></span>'
-                       '<a class="ghost-button" href="mailto:amata@anyaicam.com?subject=Face%20Access%20Enterprise">Contact us</a></div>')
-    if not addon_rows:
-        addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
-
-    # Direct self-service onboarding (2026-10-02): a customer with no plan
-    # yet chooses Local or Hybrid here, on My subscription -- previously
-    # only reachable inside step 6 of /customer/setup. Same route and
-    # server-side tier resolution as "Buy camera capacity" there and
-    # "Upgrade to Hybrid" below (create_camera_slot_checkout); only tiers
-    # with a configured Stripe Price ID are offered, owners only.
-    choose_plan_panel = ""
-    if is_owner and not camera_entitlement and not suspended_plan:
-        _plan_options = [t for t in PLAN_TIERS if os.environ.get(t[6], "").strip()]
-        if _plan_options:
-            _options_html = "".join(
-                f'<option value="{escape(t[0] + "|" + t[1], quote=True)}">{escape(t[0].title())} &middot; {escape(t[1])} cameras &middot; ${t[5]}/mo</option>'
-                for t in _plan_options)
-            choose_plan_panel = (
-                '<section id="choose-plan" class="panel" style="margin-top:14px"><h3 style="margin-top:0">Choose your plan</h3>'
-                '<p class="health-detail">Pick Local or Hybrid and how many cameras. You pay securely on Stripe and your plan is active as soon as the payment is confirmed.</p>'
-                f'<label class="health-detail" for="choose-plan-select">Plan</label> <select id="choose-plan-select">{_options_html}</select> '
-                '<button class="action-button" id="choose-plan-button">Continue to payment</button>'
-                '<p id="choose-plan-message" class="health-detail"></p></section>')
-
-    upgrade_panel = ""
-    if upgrade_tier:
-        upgrade_panel = (
-            f'<div id="upgrade-to-hybrid" class="panel" style="margin-top:14px">'
-            f'<h3 style="margin-top:0">Upgrade to Hybrid</h3>'
-            f'<p class="health-detail">Watch live and review events from anywhere, get email and phone alerts, and keep event clips in the cloud: {escape(upgrade_tier["tier_label"])} cameras for ${upgrade_tier["monthly_retail_usd"]}/mo. Your cameras, recordings, and analytics settings all carry over.</p>'
-            f'<button class="action-button" id="subscription-upgrade-button" data-tier-label="{escape(upgrade_tier["tier_label"],quote=True)}">Upgrade to Hybrid</button>'
-            f'<p id="subscription-upgrade-message" class="health-detail"></p>'
-            f'</div>'
-        )
-
-    content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
-    <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
-    <p>{plan_summary}</p>
-    {billing_note}
-    {plan_actions}
-    <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
-    </section>
-    <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
-    <div class="health-row"><span><strong>Local</strong> &middot; monthly subscription</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance or your own PC at home. Keeps working without an internet connection.</span></div>
-    <div class="health-row"><span><strong>Hybrid</strong> &middot; monthly subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
-    </section>
-    <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Included with every plan</h3>
-    <div class="health-row"><span>{escape(", ".join(label for _, label in pricing_catalog.INCLUDED_FEATURES))}</span><span class="pill">Included</span></div>
-    </section>
-    {choose_plan_panel}
-    {_license_panel}
-    {upgrade_panel}
-    <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
-    {addon_rows}
-    <p id="subscription-addon-message" class="health-detail"></p>
-    </section>
-    {_friends_family_panel if is_owner else ""}'''
-    scripts = '''<script>
-    const choosePlanButton=document.getElementById('choose-plan-button');
-    if(choosePlanButton)choosePlanButton.onclick=async()=>{
-      const [plan_type,tier_label]=document.getElementById('choose-plan-select').value.split('|');
-      const messageEl=document.getElementById('choose-plan-message');messageEl.textContent='';
-      choosePlanButton.disabled=true;choosePlanButton.textContent='Redirecting to Stripe…';
-      let response,r;
-      try{response=await fetch('/api/customer/camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type,tier_label})});r=await response.json()}
-      catch(error){choosePlanButton.disabled=false;choosePlanButton.textContent='Continue to payment';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-      if(!response.ok){choosePlanButton.disabled=false;choosePlanButton.textContent='Continue to payment';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
-      location.href=r.checkout_url
-    };
-    document.querySelectorAll('time[data-local-date]').forEach(t=>{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {dateStyle:'medium'})});
-    document.querySelectorAll('.plan-action').forEach(button=>{button.onclick=async()=>{
-      const messageEl=document.getElementById('plan-action-message');
-      if(button.dataset.confirm&&!confirm(button.dataset.confirm))return;
-      button.disabled=true;messageEl.textContent='';
-      let response,r;
-      try{response=await fetch(button.dataset.endpoint,{method:'POST'});r=await response.json()}
-      catch(error){button.disabled=false;messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-      messageEl.textContent=r.message||r.detail||'';
-      if(!response.ok){button.disabled=false;return}
-      setTimeout(()=>location.reload(),1200)
-    }});
-    const manageBilling=document.getElementById('manage-billing-button');
-    if(manageBilling)manageBilling.onclick=async()=>{
-      const messageEl=document.getElementById('plan-action-message');manageBilling.disabled=true;
-      let response,r;
-      try{response=await fetch('/api/customer/billing-portal',{method:'POST'});r=await response.json()}
-      catch(error){manageBilling.disabled=false;messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-      if(!response.ok){manageBilling.disabled=false;messageEl.textContent=r.detail||'Billing management could not be opened.';return}
-      location.href=r.url
-    };
-    const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
-    if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
-      const tier_label=subscriptionUpgradeButton.dataset.tierLabel;
-      subscriptionUpgradeButton.disabled=true;subscriptionUpgradeButton.textContent='Upgrading…';
-      const messageEl=document.getElementById('subscription-upgrade-message');messageEl.textContent='';
-      let response,r;
-      try{response=await fetch('/api/customer/plan/upgrade-to-hybrid',{method:'POST'});r=await response.json()}
-      catch(error){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-      if(!response.ok){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not upgrade (error ${response.status}).`;return}
-      messageEl.textContent=r.message||'Your plan is now Hybrid.';setTimeout(()=>location.reload(),1200)
-    };
-    const vmsLicenseButton=document.getElementById('vms-license-buy');
-    if(vmsLicenseButton)vmsLicenseButton.onclick=async()=>{
-      vmsLicenseButton.disabled=true;vmsLicenseButton.textContent='Redirecting…';
-      const messageEl=document.getElementById('vms-license-message');messageEl.textContent='';
-      let response,r;
-      try{response=await fetch('/api/customer/vms-license/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({capacity:Number(vmsLicenseButton.dataset.capacity)})});r=await response.json()}
-      catch(error){vmsLicenseButton.disabled=false;vmsLicenseButton.textContent='Buy license';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-      if(!response.ok){vmsLicenseButton.disabled=false;vmsLicenseButton.textContent='Buy license';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
-      location.href=r.checkout_url
-    };
-    document.querySelectorAll('.addon-buy-button').forEach(button=>{
-      button.onclick=async()=>{
-        const addon_key=button.dataset.addonKey;
-        button.disabled=true;button.textContent='Redirecting…';
-        const messageEl=document.getElementById('subscription-addon-message');messageEl.textContent='';
-        let response,r;
-        const quantity=Number(button.dataset.quantity||1);
-        try{response=await fetch('/api/customer/analytics/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addon_key,quantity})});r=await response.json()}
-        catch(error){button.disabled=false;button.textContent='Add';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-        if(!response.ok){button.disabled=false;button.textContent='Add';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
-        location.href=r.checkout_url
-      }
-    });
-    </script>'''
-    return page_shell("My subscription", "subscription-portal", content, scripts)
+    # Camera plans are per camera only (owner decisions 2026-10-05 and
+    # 2026-10-08): with no active/suspended per-camera plan the customer gets
+    # the per-camera plan picker. The fixed 8/16/32/64-camera Local/Hybrid
+    # tier page (and its upgrade, downgrade and cancel actions) was removed.
+    return _per_camera_billing.customer_portal_page(identity, None, _selection, _payment_outcome)
 
 
 @app.get("/subscription-portal", response_class=HTMLResponse)
@@ -104806,11 +104446,9 @@ def subscription_portal_page(request: Request) -> str:
     # is a different, older subscription concept entirely (Starter/
     # Professional/Enterprise license tiers, not camera_slots_local/
     # camera_slots_hybrid). This branch gives a real customer session
-    # the genuinely correct page instead: current plan, a Local/Hybrid
-    # comparison, an entitlement/billing-driven Upgrade-to-Hybrid
-    # action (the exact same /api/customer/camera-slots/checkout
-    # endpoint and panel already proven on the customer setup page),
-    # and their real analytics add-ons (analytics_entitlements.
+    # the genuinely correct page instead: their per-camera plan (billing
+    # v2: plan picker, change, cancel -- the fixed-tier page was removed
+    # 2026-10-08) and their real analytics add-ons (analytics_entitlements.
     # ANALYTICS_CATALOG / get_active_analytics_for_customer() -- never
     # a static/mock JSON file). Falls through to the untouched legacy
     # body below for every other caller (staff, the old local-VMS
@@ -113933,154 +113571,9 @@ def create_stripe_checkout(
     }
 
 
-# Billing v2 (owner decision 2026-10-05): new customers buy per-camera plans
-# only. The legacy fixed-capacity checkout below stays in the code for the
-# machinery it shares with grandfathered accounts (one payable session,
-# canonical Stripe customer, price guard, F&F coupons, webhook grant) and is
-# exercised by its own tests, but it never starts a NEW legacy purchase.
-LEGACY_CAMERA_SLOT_NEW_PURCHASES = False
-
-
-@app.post("/api/customer/camera-slots/checkout")
-def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Request) -> dict:
-    """Provisioning Phase 8: the customer-facing checkout that was
-    missing for camera-slot capacity. customer_entitlements.PLAN_TIERS
-    already has real, configured Stripe test-mode Price IDs, and the
-    webhook side (resolve_tier()/_sync_checkout_completed()/
-    upsert_entitlement()) already correctly turns a completed session
-    into a real entitlement -- but nothing in this app ever CREATED a
-    Checkout Session for one of those prices. The only purchase button
-    that existed, create_stripe_checkout() above, is for the unrelated
-    starter/professional/enterprise LICENSE tiers (stripe_price_map()),
-    a completely different product line. Confirmed live on
-    anyaicam-staging (2026-09-12): a real, newly-activated appliance
-    with zero configured cameras was refused at its very first camera
-    provisioning attempt with "Camera limit reached... licensed for 0
-    camera(s)" -- total_camera_slots() was correctly summing zero real
-    entitlement rows, because there was never a way to create one.
-
-    Stripe Checkout `mode` is derived from the tier's own billing_type
-    (customer_entitlements.PLAN_TIERS) -- "one_time" -> mode="payment"
-    (Local, confirmed 2026-09-21), "recurring" -> mode="subscription"
-    (Hybrid, matching create_stripe_checkout()'s own mode). This is read
-    off PLAN_TIERS, never hardcoded per plan_type string, so a future
-    third plan_type only needs a PLAN_TIERS row, not a new branch here.
-    `subscription_data[...]` fields are Stripe-rejected outright in
-    mode="payment" and are only appended for a recurring tier. The tier
-    is resolved server-side only from PLAN_TIERS, never from a browser-
-    submitted price_id -- the same discipline every other checkout
-    endpoint in this file already applies. customer_owner identity is
-    REQUIRED here (not optional the way the older two endpoints treat
-    it), so metadata[anyaicam_customer_id] is always present: _sync_
-    checkout_completed() only falls back to email-based pending_
-    customer_links reconciliation when that's missing, and an already-
-    authenticated customer buying capacity for their own account should
-    never need that fallback.
-    """
-    from partner_portal import partner_identity as _authoritative_identity
-    identity = _authoritative_identity(request)
-    if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
-        raise HTTPException(status_code=403, detail="Customer owner permission required.")
-    from customer_entitlements import PLAN_TIERS
-    plan_type = payload.plan_type.strip().lower()
-    tier_label = payload.tier_label.strip()
-    tier = next((t for t in PLAN_TIERS if t[0] == plan_type and t[1] == tier_label), None)
-    if not tier:
-        raise HTTPException(status_code=400, detail="Unknown camera-slot tier.")
-    _, _, _, _, camera_slot_maximum, _, env_var, billing_type = tier
-    price_id = os.environ.get(env_var, "").strip()
-    if not price_id:
-        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {plan_type} {tier_label}.")
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
-    customer_id = identity["customer_id"]
-    # One subscription per plan (2026-10-02): a second checkout for a plan
-    # this account already holds would start a second, parallel Stripe
-    # subscription (double billing) and overwrite the first one's record.
-    # One base plan per account (owner, 2026-10-02): Local -> Hybrid is an
-    # upgrade of the existing subscription (plan_changes.py), never a second
-    # base subscription; any other change of base plan is not self-service.
-    from customer_entitlements import BASE_PLAN_PRODUCTS as _BASE, get_entitlements_for_customer as _held
-    _active_base = [e["product"] for e in _held(customer_id) if e["product"] in _BASE and e["status"] in ("active", "suspended")]
-    if _active_base:
-        _current = "Hybrid" if "camera_slots_hybrid" in _active_base else "Local"
-        _how = " Use Upgrade to Hybrid on My subscription." if (_current == "Local" and plan_type == "hybrid") else ""
-        raise HTTPException(status_code=409, detail=f"Your account already has an active {_current} plan.{_how}")
-    # Billing v2 (owner decision 2026-10-05): every NEW camera plan is a
-    # per-camera plan. Legacy plan holders were refused just above and keep
-    # their own paths (Local -> Hybrid upgrade, billing portal, renewals).
-    # A per-camera account can never add a parallel legacy subscription.
-    import per_camera_billing as _v2
-    _v2_plan = _v2.entitlement_for_customer(customer_id)
-    if _v2_plan and _v2_plan.get("status") in ("active", "suspended"):
-        raise HTTPException(status_code=409, detail="Your account already has a per-camera plan. Change it on My subscription.")
-    if not LEGACY_CAMERA_SLOT_NEW_PURCHASES:
-        raise HTTPException(status_code=409, detail="New camera plans are per-camera: choose Basic Local, AI Local or Hybrid and your camera count on My subscription.")
-    stripe_mode = "payment" if billing_type == "one_time" else "subscription"
-    import pricing_catalog
-    _catalog_plan = pricing_catalog.find_base_plan(plan_type, tier_label)
-    require_stripe_price_matches_catalog(price_id, _catalog_plan["monthly_cents"], "month")
-    import friends_family
-    try:
-        friends_family.checkout_discount(customer_id, "base")
-    except friends_family.CheckoutHeld as held:
-        raise HTTPException(status_code=409, detail=str(held))
-    except RuntimeError as missing:
-        raise HTTPException(status_code=503, detail=str(missing))
-    fields = [
-        ("mode", stripe_mode),
-        ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
-        ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=cancelled"),
-        ("client_reference_id", customer_id),
-        ("line_items[0][price]", price_id),
-        # Fixed-tier purchase -- always exactly one, never a
-        # customer-submitted multiplier (see create_stripe_checkout()'s
-        # own comment on this same discipline).
-        ("line_items[0][quantity]", "1"),
-        ("metadata[anyaicam_stripe_price_id]", price_id),
-        ("metadata[anyaicam_customer_id]", customer_id),
-        ("metadata[anyaicam_camera_slot_plan_type]", plan_type),
-        ("metadata[anyaicam_camera_slot_tier_label]", tier_label),
-    ]
-    # Friends & Family (approved by an administrator) is applied here, as
-    # a server-side coupon, before the session exists; otherwise the
-    # normal promotion-code field is offered. Never both.
-    friends_family.apply_to_checkout_fields(fields, customer_id, "base")
-    if stripe_mode == "subscription":
-        fields.append(("subscription_data[metadata][anyaicam_stripe_price_id]", price_id))
-        fields.append(("subscription_data[metadata][anyaicam_customer_id]", customer_id))
-        fields.append(("subscription_data[metadata][anyaicam_product_class]", "base"))
-        fields.append(("subscription_data[metadata][anyaicam_camera_slot_plan_type]", plan_type))
-        fields.append(("subscription_data[metadata][anyaicam_camera_slot_maximum]", str(camera_slot_maximum)))
-    # The account's one Stripe customer, and one payable checkout per base
-    # plan at a time (Codex audit of 3f5b9c4, findings 1-2; checkout_guard.py).
-    import checkout_guard
-    fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
-    session = checkout_guard.create_session(customer_id, "base", price_id=price_id, quantity=1, fields=fields)
-    session_id = str(session.get("id") or "")
-    checkout_url = str(session.get("url") or "")
-    if not session_id or not checkout_url:
-        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
-    structured_log(
-        "stripe.camera_slot_checkout_created",
-        session_id=session_id,
-        customer_id=customer_id,
-        plan_type=plan_type,
-        tier_label=tier_label,
-        camera_slot_maximum=camera_slot_maximum,
-        billing_type=billing_type,
-        stripe_mode=stripe_mode,
-    )
-    return {
-        "status": "complete",
-        "session_id": session_id,
-        "checkout_url": checkout_url,
-        "plan_type": plan_type,
-        "tier_label": tier_label,
-        "camera_slot_maximum": camera_slot_maximum,
-        "billing_type": billing_type,
-        "message": "Stripe Checkout Session created.",
-    }
+# Fixed camera-slot tier checkout (POST /api/customer/camera-slots/checkout)
+# was removed on 2026-10-08 (owner decision): camera plans are per camera,
+# bought through billing v2 (per_camera_billing.py, build_orders.py).
 
 
 @app.post("/api/customer/analytics/checkout")

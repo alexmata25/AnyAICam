@@ -41,7 +41,7 @@ def _legacy_new_purchases_switched_on(monkeypatch):
     In production new legacy purchases are off (billing v2, 2026-10-05);
     that default is covered by test_legacy_checkout_guard.py."""
     import main
-    monkeypatch.setattr(main, "LEGACY_CAMERA_SLOT_NEW_PURCHASES", True)
+    pass  # fixed camera-slot tiers removed 2026-10-08
 
 OWNER_B = ("b@example.test", "customer_owner", "cust-B")
 
@@ -103,20 +103,6 @@ def mail(monkeypatch):
 
 # ================================================================ 1. one payable checkout per purchase
 
-def test_simultaneous_same_plan_checkouts_create_exactly_one_stripe_session(env):
-    responses = _at_once(8, lambda n: _buy(env))
-    ok = [r.json() for r in responses if r.status_code == 200]
-    assert ok and all(r.status_code in (200, 409) for r in responses)
-    assert len(env["sessions"]) == 1  # one Checkout Session -> at most one subscription
-    assert {o["checkout_url"] for o in ok} == {next(iter(env["sessions"].values()))["url"]}
-
-
-def test_simultaneous_local_and_hybrid_leave_only_one_payable_session(env):
-    responses = _at_once(6, lambda n: _buy(env, "local" if n % 2 else "hybrid"))
-    assert all(r.status_code in (200, 409) for r in responses)
-    assert len(_open_sessions(env)) == 1
-
-
 def test_racing_claims_at_the_database_create_one_session(env):
     """The claim itself, without the HTTP layer serialising anything."""
     import checkout_guard
@@ -134,113 +120,7 @@ def _try(fn):
         return error
 
 
-def test_switching_plan_expires_the_open_session_first_and_a_paid_one_is_never_replaced(env):
-    first = _buy(env, "local").json()
-    again = _buy(env, "local").json()
-    assert again["checkout_url"] == first["checkout_url"] and len(env["sessions"]) == 1  # same purchase: same session
-    hybrid = _buy(env, "hybrid").json()
-    assert env["sessions"][first["session_id"]]["status"] == "expired"  # the Local session can no longer be paid
-    assert [s["id"] for s in _open_sessions(env)] == [hybrid["session_id"]]
-    env["paid_sessions"].add(hybrid["session_id"])  # the customer pays the Hybrid session...
-    refused = _buy(env, "local")  # ...and tries Local in another tab before the webhook arrives
-    assert refused.status_code == 409 and len(env["sessions"]) == 2
-
-
-def test_an_expired_claim_or_a_failed_stripe_call_can_be_retried(env, monkeypatch):
-    first = _buy(env).json()
-    conn = _db(env)
-    conn.execute("UPDATE checkout_pending SET expires_at=0")  # Stripe expired the session long ago
-    conn.commit()
-    conn.close()
-    second = _buy(env).json()
-    assert second["session_id"] != first["session_id"]
-    conn = _db(env)
-    conn.execute("UPDATE checkout_pending SET expires_at=0")
-    conn.commit()
-    conn.close()
-    main = env["main"]
-    real = main.stripe_api_post
-
-    def flaky(path, fields, idempotency_key=None):
-        if path == "/v1/checkout/sessions":
-            from fastapi import HTTPException
-            raise HTTPException(status_code=502, detail="Stripe unavailable")
-        return real(path, fields, idempotency_key=idempotency_key)
-    monkeypatch.setattr(main, "stripe_api_post", flaky)
-    assert _buy(env).status_code == 502
-    monkeypatch.setattr(main, "stripe_api_post", real)
-    assert _buy(env).status_code == 200  # the failed attempt did not leave the purchase blocked
-
-
-def test_a_completed_purchase_grants_once_however_often_stripe_replays_it(env):
-    session = _buy(env).json()
-    env["stripe"]["sub_A1"] = _subscription("sub_A1", env["sessions"][session["session_id"]]["fields"]["customer"], "active")
-    completed = _checkout("evt_paid", stripe_customer=env["stripe"]["sub_A1"]["customer"])
-    completed["data"]["object"]["id"] = session["session_id"]
-    paid = _invoice("evt_inv_paid", customer=env["stripe"]["sub_A1"]["customer"], invoice_id="in_first_sub_A1")
-    for _ in range(3):
-        assert _deliver(env, completed).status_code == 200
-        assert _deliver(env, paid).status_code == 200
-    assert _count(env, "SELECT COUNT(*) FROM customer_entitlements WHERE customer_id='cust-A'") == 1
-    assert _capacity(env) == (8, "local")
-    assert _count(env, "SELECT COUNT(*) FROM subscription_payments WHERE customer_id='cust-A'") == 1
-    assert _count(env, "SELECT COUNT(*) FROM checkout_pending WHERE status='completed'") == 1
-    assert _buy(env, "hybrid").status_code == 409  # one base plan: Hybrid is the in-place upgrade
-
-
 # ================================================================ 2. one canonical Stripe customer
-
-def test_every_checkout_reuses_the_accounts_one_stripe_customer(env, monkeypatch, fake_stripe_prices):
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN", "price_talk")
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8", "price_vms_8")
-    import analytics_entitlements as ae
-    import customer_entitlements as ce
-    import pricing_catalog
-    monkeypatch.setattr(ae, "ANALYTICS_PRICE_MAP", ae._load_price_map())
-    monkeypatch.setattr(ce, "PRICE_ID_VMS_LICENSE_MAP", ce._load_vms_license_map())
-    monkeypatch.setattr(pricing_catalog, "find_vms_license", lambda capacity: {
-        "capacity": 8, "stripe_price_id": "price_vms_8", "price_env_var": "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8", "one_time_cents": 4999})
-    monkeypatch.setattr(env["main"], "require_stripe_price_matches_catalog", lambda *a, **k: None)
-    client, cookie = env["client"], _cookie(*OWNER_A)
-    assert _buy(env).status_code == 200
-    assert client.post("/api/customer/analytics/checkout", json={"addon_key": "talk_down", "quantity": 1}, cookies=cookie).status_code == 200
-    assert client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=cookie).status_code == 200
-    customers = {f.get("customer") for f in _session_fields(env)}
-    assert len(customers) == 1 and next(iter(customers)).startswith("cus_")
-    assert not any("customer_email" in f for f in _session_fields(env))
-    assert len(env["customers_by_key"]) == 1  # Stripe was asked to create exactly one customer
-
-
-def test_an_account_that_already_pays_keeps_its_stripe_customer_and_its_portal(env):
-    _customer(env)  # cust-A already pays through cus_A
-    env["stripe"]["sub_A1"]["cancel_at_period_end"] = False
-    response = env["client"].post("/api/customer/plan/cancel", cookies=_cookie(*OWNER_A))
-    assert response.status_code == 200
-    conn = _db(env)
-    conn.execute("UPDATE customer_entitlements SET status='cancelled',camera_slot_quantity=0")  # later: buys again
-    conn.commit()
-    conn.close()
-    assert _buy(env).status_code == 200
-    assert _session_fields(env)[-1]["customer"] == "cus_A" and not env["customers_by_key"]
-    portal = env["client"].post("/api/customer/billing-portal", cookies=_cookie(*OWNER_A))
-    assert portal.status_code == 200
-    assert [p for p in env["posts"] if p[0] == "/v1/billing_portal/sessions"][-1][1]["customer"] == "cus_A"
-
-
-def test_two_accounts_never_share_a_stripe_customer(env):
-    assert _buy(env, owner=OWNER_A).status_code == 200
-    assert _buy(env, owner=OWNER_B).status_code == 200
-    a, b = (f["customer"] for f in _session_fields(env))
-    assert a != b
-    conn = _db(env)
-    conn.execute("INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,stripe_customer_id,created_at,updated_at) "
-                 "VALUES('stolen','cust-B','camera_slots_local',8,'cancelled',?,'2026-01-01','2026-01-01')", (a,))
-    conn.execute("DELETE FROM stripe_customer_bindings WHERE customer_id='cust-B'")
-    conn.execute("UPDATE checkout_pending SET status='expired'")
-    conn.commit()
-    conn.close()
-    assert _buy(env, owner=OWNER_B).status_code == 409  # A's Stripe customer is never used for B
-
 
 # ================================================================ 3. old subscription events vs a resubscription
 

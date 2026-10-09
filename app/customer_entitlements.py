@@ -439,85 +439,16 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
 # as of Phase 2 -- see module docstring. Each function here remains
 # independently callable/testable against a synthetic Stripe event dict.
 
-# Local and Hybrid are deliberately separate service lines even where
-# their camera_slot_maximum coincides (both top out at 64) -- `product`
-# encodes which one, so a customer's Local and Hybrid entitlements (if
-# they somehow held both) never collide or overwrite each other, and an
-# upgrade within one line (e.g. Local 1-8 -> Local 9-16) never touches
-# the other. Each tier's Stripe Price ID goes in its own env var; unset
-# means that tier is not purchasable/grantable yet, never a guess.
-# create_camera_slot_checkout() in main.py branches Stripe Checkout
-# `mode` off billing_type alone, never off a plan_type string.
-#
-# 2026-09-30: prices and billing now come from pricing_catalog.BASE_PLANS,
-# the one authoritative catalog (approved working pricing). Local and
-# Hybrid are both MONTHLY subscriptions again (Local $14.99/$24.99/$39.99/
-# $69.99, Hybrid $24.99/$39.99/$69.99/$99.99), so every tier is
-# billing_type "recurring" -> Stripe mode="subscription". The tuple shape
-# below is unchanged for existing callers. The earlier live-mode Price IDs
-# were created at the previous amounts, so new Stripe Price objects at
-# these amounts must be configured in ANYAICAM_STRIPE_PRICE_LOCAL_*/
-# HYBRID_* -- see PROJECT_CHECKPOINT.md.
-from pricing_catalog import BASE_PLANS as _CATALOG_BASE_PLANS
+# Fixed camera-slot subscription tiers (Local/Hybrid 1-8, 9-16, 17-32, 33-64)
+# were removed on 2026-10-08 (owner decision): camera plans are per camera
+# (per_camera_billing, billing v2) and no customer ever paid for a fixed tier.
+# No Stripe Price ID maps to a fixed tier any more, so resolve_tier() grants
+# nothing for one (fail closed). The camera_slots_* entitlement products and
+# the webhook handling below stay: camera_slots_rdm (operator-set quota) and
+# total_camera_slots() still use them.
 from pricing_catalog import VMS_LICENSE_PRODUCT, VMS_LICENSES as _CATALOG_VMS_LICENSES
 
-PLAN_TIERS = [
-    # plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, price_id_env_var, billing_type
-    (plan_type, tier_label, min_cameras, max_cameras, max_cameras, round(cents / 100, 2), env_var, "recurring")
-    for plan_type, tier_label, min_cameras, max_cameras, cents, env_var in _CATALOG_BASE_PLANS
-]
-
-
-def _plan_tier_rows() -> list[dict]:
-    rows = []
-    for plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, env_var, billing_type in PLAN_TIERS:
-        rows.append({
-            "plan_type": plan_type,
-            "tier_label": tier_label,
-            "min_cameras": min_cameras,
-            "max_cameras": max_cameras,
-            "camera_slot_maximum": camera_slot_maximum,
-            "monthly_retail_usd": monthly_retail_usd,
-            "billing_type": billing_type,
-            "product": f"camera_slots_{plan_type}",
-            "stripe_price_id": os.environ.get(env_var, "").strip() or None,
-        })
-    return rows
-
-
-def pricing_table_for_website() -> list[dict]:
-    """Prepared, ready-to-render pricing data for the customer-facing VMS
-    website pricing section -- plan type, camera range, billing_type
-    (every tier is "recurring" -- monthly -- as of 2026-09-30; the website
-    still renders off this field, never infers it from plan_type), and the
-    catalog's monthly retail price for all 8 tiers. Does NOT include
-    stripe_price_id (irrelevant to a pricing page)."""
-    return [
-        {"plan_type": r["plan_type"], "tier_label": r["tier_label"], "min_cameras": r["min_cameras"],
-         "max_cameras": r["max_cameras"], "monthly_retail_usd": r["monthly_retail_usd"], "billing_type": r["billing_type"]}
-        for r in _plan_tier_rows()
-    ]
-
-
-def _load_price_tier_map() -> dict:
-    """Server-side, fixed Stripe-Price-ID -> camera-slot-tier mapping.
-    The ONLY source of camera-slot quantity as of Phase 3 -- never a
-    browser-submitted quantity, never a per-plan constant. Built from
-    PLAN_TIERS above; a tier whose env var is unset contributes no entry
-    at all, so resolve_tier() correctly treats its Price ID (there isn't
-    one yet) as unverified -- fail closed, not a guess."""
-    mapping = {}
-    for tier in _plan_tier_rows():
-        if tier["stripe_price_id"]:
-            mapping[tier["stripe_price_id"]] = {
-                "product": tier["product"],
-                "camera_slot_maximum": tier["camera_slot_maximum"],
-                "billing_type": tier["billing_type"],
-            }
-    return mapping
-
-
-PRICE_ID_CAMERA_SLOT_MAP = _load_price_tier_map()
+PRICE_ID_CAMERA_SLOT_MAP: dict = {}
 
 
 def _load_vms_license_map() -> dict:

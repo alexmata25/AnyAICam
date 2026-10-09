@@ -70,35 +70,6 @@ def _viewer_cookie(customer_id):
 # ---------------------------------------------------------- current plan
 
 
-def test_local_customer_sees_the_local_plan_badge(http_client, db_path):
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert response.status_code == 200
-    assert "My subscription" in response.text
-    assert '<span class="pill">Local</span>' in response.text
-    assert "Local 8 cameras &middot; 8 licensed camera slots" in response.text
-
-
-def test_hybrid_customer_sees_the_hybrid_plan_badge_and_no_upgrade_panel(http_client, db_path, monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert '<span class="pill">Hybrid</span>' in response.text
-    assert 'id="upgrade-to-hybrid"' not in response.text
-
-
 def test_customer_with_no_plan_gets_the_billing_v2_plan_picker(http_client, db_path):
     """2026-10-05 owner decision: new purchases are billing v2 only. A customer
     with no camera plan is offered the per-camera plans, never the legacy
@@ -116,41 +87,7 @@ def test_customer_with_no_plan_gets_the_billing_v2_plan_picker(http_client, db_p
     assert 'id="choose-plan-button"' not in html and "Local vs Hybrid" not in html
 
 
-def test_local_vs_hybrid_comparison_is_shown_to_legacy_plan_customers(http_client, db_path):
-    """Grandfathered legacy customers keep the legacy page and its comparison."""
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    html = response.text
-    assert "Local vs Hybrid" in html
-    # 2026-09-30 pricing: Local and Hybrid are both monthly.
-    assert "<strong>Local</strong> &middot; monthly subscription" in html
-    assert "<strong>Hybrid</strong> &middot; monthly subscription" in html
-    assert "one-time purchase" not in html
-
-
 # --------------------------------------------------------- upgrade to hybrid
-
-
-def test_upgrade_panel_shown_for_a_local_customer_with_a_priced_hybrid_tier(http_client, db_path, monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    html = response.text
-    assert 'id="upgrade-to-hybrid"' in html
-    assert 'id="subscription-upgrade-button"' in html
-    assert 'data-tier-label="1-8"' in html
 
 
 def test_upgrade_panel_hidden_when_no_matching_hybrid_price_is_configured(http_client, db_path):
@@ -166,23 +103,6 @@ def test_upgrade_panel_hidden_when_no_matching_hybrid_price_is_configured(http_c
         upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     assert 'id="upgrade-to-hybrid"' not in response.text
-
-
-def test_upgrade_button_upgrades_the_existing_subscription(http_client, db_path, monkeypatch):
-    """Owner, 2026-10-02: Local -> Hybrid is an upgrade of the SAME
-    subscription (plan_changes.py), never a second Hybrid checkout that left
-    Local billing too."""
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert "/api/customer/plan/upgrade-to-hybrid" in response.text
-    assert "plan_type:'hybrid'" not in response.text
 
 
 # ------------------------------------------------------------------ add-ons
@@ -277,46 +197,6 @@ def test_an_addon_already_active_without_its_price_id_configured_still_shows_act
 
 
 # ------------------------------------------------------- customer_viewer role
-
-
-def test_viewer_sees_the_new_page_with_real_data_but_no_purchase_actions(http_client, db_path, monkeypatch):
-    """create_camera_slot_checkout()/create_analytics_addon_checkout()
-    are both customer_owner-only (403 for any other role) -- a viewer
-    must never be shown a button that can only ever 403 when clicked.
-    The underlying data (plan badge, add-on active/inactive state) is
-    identical to what an owner sees; only the actionable buttons differ."""
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS", "price_test_ai_essentials")
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _viewer_cookie("cust-1")})
-    assert response.status_code == 200
-    html = response.text
-    assert "My subscription" in html
-    assert '<span class="pill">Local</span>' in html
-    assert 'id="upgrade-to-hybrid"' not in html
-    assert 'id="subscription-upgrade-button"' not in html
-    assert 'data-addon-key="ai_essentials"' not in html
-    assert 'id="friends-family-panel"' not in html
-    assert "Not purchased" in html
-
-
-def test_owner_still_sees_purchase_actions_unaffected_by_the_viewer_fix(http_client, db_path, monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    conn = sqlite3.connect(db_path)
-    _seed_tenant(conn, "cust-1")
-    conn.commit()
-    conn.close()
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert 'id="subscription-upgrade-button"' in response.text
 
 
 # ------------------------------------------------------- legacy path untouched

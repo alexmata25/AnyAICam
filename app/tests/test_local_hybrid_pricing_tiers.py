@@ -1,19 +1,10 @@
-"""Provisioning Phase 4: PLAN_TIERS -- the verified Local/Hybrid camera-
-slot pricing structure from AnyAiCam_AWS_Cost_Model_2026-09.xlsx (read
-directly from the workbook's "Local"/"Hybrid" sheets, not retyped from a
-description). Proves:
+"""Webhook entitlement lines for camera_slots_local / camera_slots_hybrid.
 
-- the exact 8 verified prices are present and correctly shaped for both
-  entitlement resolution and the website pricing table,
-- Local and Hybrid are genuinely separate entitlement lines (own
-  `product` key) even at camera_slot_maximum values they share,
-- every tier's Stripe Price ID is unset by default (none is proven to
-  exist -- see customer_entitlements.py's module docstring), and setting
-  one via its own env var is what's required before that tier can ever
-  grant a real entitlement,
-- an env-configured Local Price ID and Hybrid Price ID resolve
-  independently and update independent customer_entitlements rows.
-"""
+The fixed 8/16/32/64-camera Local/Hybrid subscription tiers were removed on
+2026-10-08 (owner decision; camera plans are per camera). What stays is the
+Stripe webhook machinery for camera_slots_* entitlements: these tests inject
+their own Price-ID map and prove Local and Hybrid lines stay independent and
+that an unrecognised Price ID grants nothing end to end."""
 import os
 import sqlite3
 
@@ -68,58 +59,6 @@ def _seed_customer(db_path, customer_id="cust-1", email="real-customer@example.t
 
 
 # ------------------------------------------------------------ structure
-
-
-def test_all_eight_verified_tiers_are_present_with_the_exact_workbook_prices():
-    rows = ce._plan_tier_rows()
-    assert len(rows) == 8
-    seen = {(r["plan_type"], r["tier_label"]): (r["camera_slot_maximum"], r["monthly_retail_usd"]) for r in rows}
-    assert seen == EXPECTED
-
-
-def test_pricing_table_for_website_omits_stripe_internals():
-    table = ce.pricing_table_for_website()
-    assert len(table) == 8
-    for row in table:
-        assert set(row.keys()) == {"plan_type", "tier_label", "min_cameras", "max_cameras", "monthly_retail_usd", "billing_type"}
-    local_1_8 = next(r for r in table if r["plan_type"] == "local" and r["tier_label"] == "1-8")
-    assert local_1_8["monthly_retail_usd"] == 14.99
-    hybrid_33_64 = next(r for r in table if r["plan_type"] == "hybrid" and r["tier_label"] == "33-64")
-    assert hybrid_33_64["monthly_retail_usd"] == 99.99
-
-
-def test_local_and_hybrid_are_both_monthly_subscriptions():
-    """Approved pricing 2026-09-30: Local and Hybrid are both monthly
-    (superseding the 2026-09-21 one-time Local model). billing_type is
-    what create_camera_slot_checkout() uses to pick Stripe Checkout
-    mode=subscription -- this locks it in."""
-    for row in ce._plan_tier_rows():
-        assert row["billing_type"] == "recurring"
-
-
-def test_local_and_hybrid_have_distinct_product_keys_even_at_the_same_slot_maximum():
-    rows = ce._plan_tier_rows()
-    local_64 = next(r for r in rows if r["plan_type"] == "local" and r["camera_slot_maximum"] == 64)
-    hybrid_64 = next(r for r in rows if r["plan_type"] == "hybrid" and r["camera_slot_maximum"] == 64)
-    assert local_64["product"] != hybrid_64["product"]
-    assert local_64["product"] == "camera_slots_local"
-    assert hybrid_64["product"] == "camera_slots_hybrid"
-
-
-def test_no_tier_has_a_stripe_price_id_configured_by_default():
-    """The core audit finding: none of these 8 prices has a proven
-    Stripe Price ID anywhere in existing configuration -- every tier
-    must ship with stripe_price_id unset until real configuration
-    exists, never a fabricated placeholder."""
-    for row in ce._plan_tier_rows():
-        assert row["stripe_price_id"] is None
-    assert ce.PRICE_ID_CAMERA_SLOT_MAP == {}
-
-
-def test_setting_a_tiers_price_id_env_var_makes_it_resolvable(monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_LOCAL_1_8", "price_real_local_1_8")
-    mapping = ce._load_price_tier_map()
-    assert mapping == {"price_real_local_1_8": {"product": "camera_slots_local", "camera_slot_maximum": 8, "billing_type": "recurring"}}
 
 
 # --------------------------------------------- Local vs Hybrid entitlements
@@ -246,58 +185,7 @@ EXPECTED_FOR_LIVE_ID = {
 }
 
 
-def test_all_eight_live_price_ids_are_distinct():
-    assert len(set(LIVE_PRICE_IDS.values())) == 8
-
-
-def test_all_eight_live_price_ids_resolve_to_the_correct_tier(monkeypatch):
-    for env_var, price_id in LIVE_PRICE_IDS.items():
-        monkeypatch.setenv(env_var, price_id)
-    mapping = ce._load_price_tier_map()
-    assert len(mapping) == 8
-    # PRICE_ID_CAMERA_SLOT_MAP is computed once at process/import time in
-    # production (matching how ECS actually injects env vars before the
-    # app starts) -- monkeypatch.setenv() alone doesn't retroactively
-    # change the already-imported module global, so re-point it at the
-    # freshly loaded mapping here to exercise resolve_tier()'s real
-    # lookup logic against these exact values, the same way it would run
-    # against a freshly started production process.
-    monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", mapping)
-    for price_id, (expected_product, expected_max, expected_billing_type) in EXPECTED_FOR_LIVE_ID.items():
-        tier = ce.resolve_tier(price_id)
-        assert tier == {"product": expected_product, "camera_slot_maximum": expected_max, "billing_type": expected_billing_type}
-
-
-def test_live_price_ids_never_collide_with_the_staging_test_ids():
-    """Sanity guard: the live and test-mode Price ID sets must be
-    disjoint -- if they ever collided, a sandbox purchase could
-    accidentally resolve against a production tier or vice versa."""
-    test_ids = {
-        "price_1UD2xKGllhK80H2nFJwtFJvw", "price_1UD2yLGllhK80H2n7Z2q8AM3",
-        "price_1UD2z4GllhK80H2ncjHZVhms", "price_1UD30bGllhK80H2nfmvPZnSA",
-        "price_1UD31AGllhK80H2nMKtYEmVw", "price_1UD31mGllhK80H2nJqorGzU6",
-        "price_1UD32kGllhK80H2nGaOQB9XI", "price_1UD33SGllhK80H2nxrbBT2ch",
-    }
-    assert test_ids.isdisjoint(LIVE_PRICE_IDS.values())
-
-
 # --------------------------------- Phase 4: the $1 live plumbing-test product
-
-
-def test_the_dollar_test_products_price_id_is_excluded_from_slot_entitlement():
-    """Phase 4: a real $1.00 live checkout against "AnyAiCam Test System"
-    (price_1UDegIGllhK80H2nHCfGvcz8) already succeeded, proving live
-    Stripe/payment/webhook plumbing -- but it must NEVER be treated as
-    proof of, or a source of, camera-slot entitlement. It is deliberately
-    absent from PLAN_TIERS/PRICE_ID_CAMERA_SLOT_MAP, so resolve_tier()
-    correctly returns None for it even if a real webhook event for this
-    exact purchase were replayed through sync_entitlement_from_stripe_
-    event() -- the event would be recorded as "ignored", not granted."""
-    dollar_test_price_id = "price_1UDegIGllhK80H2nHCfGvcz8"
-    assert dollar_test_price_id not in ce.PRICE_ID_CAMERA_SLOT_MAP
-    assert ce.resolve_tier(dollar_test_price_id) is None
-    for _, _, _, _, _, _, env_var, _ in ce.PLAN_TIERS:
-        assert os.environ.get(env_var, "") != dollar_test_price_id
 
 
 def test_dollar_test_checkout_event_grants_nothing_end_to_end(db_path):
