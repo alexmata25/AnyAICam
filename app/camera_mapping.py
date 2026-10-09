@@ -1,6 +1,6 @@
 """Phase 6a (docs/AI_HANDOFF.md Sec 8): resolves the mapping between a cloud
 `cameras.id` (TEXT, multi-tenant) and the appliance-local `camera_number`
-(INTEGER, 1..256) that app/main.py's FFmpeg/HLS pipeline actually uses.
+(INTEGER, 1..10,000) that app/main.py's FFmpeg/HLS pipeline actually uses.
 
 Deliberately dependency-light: both public functions take an already-open
 `db` connection (matching the calling convention already used throughout
@@ -23,12 +23,25 @@ treat a non-NULL camera_number as proof the slot exists.
 """
 
 MIN_CAMERA_NUMBER = 1
-MAX_CAMERA_NUMBER = 256
+# The license model permits more than 256 camera slots, and camera numbers
+# are never reused because local recordings are keyed by number. Match the
+# VMS supervisor's existing hard safety ceiling rather than silently
+# preventing otherwise licensed cameras after 256 lifetime assignments.
+MAX_CAMERA_NUMBER = 10_000
 
 
 class CameraNumberConflict(Exception):
     """Raised by assign_camera_number() when the requested camera_number is
     already assigned to a different camera on the same appliance."""
+
+
+def next_available_camera_number(used_camera_numbers) -> int | None:
+    """Return the lowest never-used valid appliance number, or None at limit."""
+    used = set(used_camera_numbers)
+    candidate = MIN_CAMERA_NUMBER
+    while candidate <= MAX_CAMERA_NUMBER and candidate in used:
+        candidate += 1
+    return candidate if candidate <= MAX_CAMERA_NUMBER else None
 
 
 def _validate_camera_number_value(camera_number):
@@ -63,7 +76,7 @@ def resolve_camera_number(db, camera_id: str, appliance_id: str, customer_id: st
 
 
 def assign_camera_number(db, camera_id: str, camera_number, *, appliance_id: str, customer_id: str) -> None:
-    """Assign (camera_number is an int in [1, 256]) or clear (camera_number is
+    """Assign (camera_number is an int in [1, MAX_CAMERA_NUMBER]) or clear (camera_number is
     None) the appliance-local slot number for a cloud camera_id, scoped to an
     expected appliance_id/customer_id.
 

@@ -20,6 +20,8 @@ import json
 import secrets as secrets_module
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -162,6 +164,41 @@ def test_cameras_1_through_8_allowed_camera_9_rejected_at_request_gate(client, d
         conn = sqlite3.connect(db_path)
         still_configured = conn.execute("SELECT COUNT(*) FROM cameras WHERE customer_id='cust-1' AND device_key IS NOT NULL").fetchone()[0]
     assert still_configured == 8  # the 9th camera was never even queued
+
+
+def test_concurrent_request_reservations_cannot_spend_the_same_final_slot(db_path, monkeypatch):
+    """The real request route must serialize its count-and-reserve transaction.
+
+    This SQLite regression protects the local test/development path. The
+    PostgreSQL-only integration test exercises the row lock used in production.
+    """
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import initialize_database
+        initialize_database()
+    _seed_tenant(db_path)
+    _grant_slots(db_path, "cust-1", 1)
+    _seed_and_activate_appliance(db_path)
+    import partner_workspace
+    monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: {
+        "role": "customer_owner", "customer_id": "cust-1", "email": "slot-test@example.test",
+    })
+    endpoint = next(route.endpoint for route in __import__("main").app.routes
+                    if getattr(route, "path", None) == "/api/customer/cameras/provision"
+                    and "POST" in (getattr(route, "methods", set()) or set()))
+
+    def reserve(device_key):
+        with override_target(sqlite_path=str(db_path)):
+            return endpoint(SimpleNamespace(headers={}, cookies={}, query_params={}), {
+                "appliance_id": "appl-1", "device_key": device_key, "name": device_key,
+            })
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, ("race-a", "race-b")))
+    statuses = sorted(result.status_code if hasattr(result, "status_code") else 200 for result in results)
+    assert statuses == [200, 403]
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        assert conn.execute("SELECT COUNT(*) FROM camera_provisioning_requests WHERE customer_id='cust-1'").fetchone()[0] == 1
 
 
 def test_zero_active_slots_blocks_the_first_camera(client, db_path):

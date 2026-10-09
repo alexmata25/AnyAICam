@@ -189,3 +189,27 @@ def test_an_appliance_side_refusal_reports_its_code(client, db_path, monkeypatch
     client.cookies.set(_session_cookie_name(), _owner_cookie())
     job = client.get(f"/api/customer/camera-provisioning/{job_id}").json()
     assert job["status"] == "failed" and job["failure_code"] == "camera_limit_reached"
+
+
+def test_repeated_camera_add_remove_cycles_preserve_mappings_and_never_reuse_numbers(client, db_path):
+    _seed_tenant(db_path)
+    _per_camera_plan(db_path, 1)
+    credential = _activated(client, db_path)
+    allocated = []
+    for index in range(1, 4):
+        device_key = f"cycle-camera-{index}"
+        assert _add(client, credential, device_key).status_code == 200
+        camera_id = _camera_id(db_path, device_key)
+        with override_target(sqlite_path=str(db_path)):
+            number = sqlite3.connect(db_path).execute(
+                "SELECT camera_number FROM cameras WHERE id=?", (camera_id,)
+            ).fetchone()[0]
+        allocated.append(number)
+        removed = _remove(client, camera_id)
+        assert removed.status_code == 200, removed.text
+        with override_target(sqlite_path=str(db_path)):
+            row = sqlite3.connect(db_path).execute(
+                "SELECT status,camera_number,former_camera_number,device_key FROM cameras WHERE id=?", (camera_id,)
+            ).fetchone()
+        assert row == ("removed", None, number, None)
+    assert allocated == [1, 2, 3]

@@ -1879,6 +1879,21 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         success=bool(payload.get('success')); message=str(payload.get('message',''))[:500]; failure_code=None
         now=datetime.now().isoformat(); camera_id=None
         with connection() as db:
+            from database_backend import lock_customer_camera_capacity
+            if not lock_customer_camera_capacity(db,job['customer_id']):
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            # Reload under the customer lock. Concurrent callbacks for this
+            # customer now see the committed result of the preceding callback
+            # instead of both provisioning against the same camera count.
+            locked_job=db.execute('SELECT * FROM camera_provisioning_requests WHERE id=? AND appliance_id=?',
+                                  (job_id,appliance['id'])).fetchone()
+            if (not locked_job or locked_job['customer_id']!=job['customer_id']
+                    or locked_job['customer_id']!=appliance['customer_id']
+                    or locked_job['site_id']!=appliance['site_id']):
+                raise HTTPException(status_code=404,detail='Provisioning job not found.')
+            job=locked_job
+            if job['status'] not in {'queued','verifying'}:
+                return {'message':'Provisioning result already recorded.'}
             # Provisioning Phase 7: second, appliance-authenticated
             # enforcement of the purchased camera-slot maximum -- the
             # first gate is request_camera_provisioning()'s own check
@@ -1890,6 +1905,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # genuinely NEW device_key -- rediscovering/reconnecting an
             # existing camera below never consumes a new slot and is
             # never blocked by this check.
+            next_number=None
             if success:
                 already_known=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
                 if not already_known:
@@ -1901,6 +1917,34 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         message=capacity_refusal(job['customer_id'])
                         from customer_entitlements import capacity_refusal_code
                         failure_code=capacity_refusal_code(job['customer_id'])
+                    else:
+                        # Camera numbers are stable and never reused because
+                        # recordings are stored by number. Refuse before
+                        # touching a placeholder or creating a camera if the
+                        # historical namespace is exhausted.
+                        from camera_mapping import next_available_camera_number
+                        used_numbers={int(item['n']) for item in db.execute(
+                            'SELECT camera_number AS n FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL '
+                            'UNION SELECT former_camera_number FROM cameras WHERE appliance_id=? AND former_camera_number IS NOT NULL',
+                            (appliance['id'],appliance['id'])).fetchall()}
+                        next_number=next_available_camera_number(used_numbers)
+                        if next_number is None:
+                            success=False
+                            message='Camera numbering capacity is exhausted on this appliance. Contact support before adding another camera.'
+                            failure_code='camera_number_exhausted'
+                else:
+                    existing_number=db.execute('SELECT camera_number FROM cameras WHERE id=?',(already_known['id'],)).fetchone()
+                    if existing_number and existing_number['camera_number'] is None:
+                        from camera_mapping import next_available_camera_number
+                        used_numbers={int(item['n']) for item in db.execute(
+                            'SELECT camera_number AS n FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL '
+                            'UNION SELECT former_camera_number FROM cameras WHERE appliance_id=? AND former_camera_number IS NOT NULL',
+                            (appliance['id'],appliance['id'])).fetchall()}
+                        next_number=next_available_camera_number(used_numbers)
+                        if next_number is None:
+                            success=False
+                            message='Camera numbering capacity is exhausted on this appliance. Contact support before adding another camera.'
+                            failure_code='camera_number_exhausted'
             if success:
                 # device_key identifies the physical camera itself (its
                 # ONVIF endpoint reference UUID), not an appliance-camera
@@ -1980,19 +2024,20 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # an already-bound camera) is never touched here.
                 camera_row=db.execute('SELECT camera_number FROM cameras WHERE id=?',(camera_id,)).fetchone()
                 if camera_row and camera_row['camera_number'] is None:
-                    # Numbers held now, and numbers a removed camera held
-                    # (former_camera_number): the appliance keeps local
-                    # recordings per number, so a number is never reused.
-                    used=set(int(item['n']) for item in db.execute('SELECT camera_number AS n FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL '
-                                                                     'UNION SELECT former_camera_number FROM cameras WHERE appliance_id=? AND former_camera_number IS NOT NULL',
-                                                                     (appliance['id'],appliance['id'])).fetchall())
-                    candidate=1
-                    while candidate in used: candidate+=1
-                    try:
-                        from camera_mapping import assign_camera_number
-                        assign_camera_number(db,camera_id,candidate,appliance_id=appliance['id'],customer_id=job['customer_id'])
-                    except (LookupError, ValueError):
-                        pass
+                    # The customer lock serializes competing assignments;
+                    # choose the same first-free number checked above.
+                    candidate=next_number
+                    if candidate is None:
+                        raise RuntimeError('Camera provisioning has no reserved camera number.')
+                    from camera_mapping import assign_camera_number
+                    assign_camera_number(db,camera_id,candidate,appliance_id=appliance['id'],customer_id=job['customer_id'])
+                # A successful job must never be recorded without a valid
+                # stable appliance-local number. Raising aborts this entire
+                # transaction, including placeholder/camera mutations.
+                camera_row=db.execute('SELECT camera_number FROM cameras WHERE id=?',(camera_id,)).fetchone()
+                from camera_mapping import _validate_camera_number_value
+                if not camera_row or _validate_camera_number_value(camera_row['camera_number']) is None:
+                    raise RuntimeError('Camera provisioning produced no valid camera number.')
                 if job['encrypted_credentials']:
                     # Persists the customer-supplied credentials from
                     # THIS job into camera_credentials -- the table

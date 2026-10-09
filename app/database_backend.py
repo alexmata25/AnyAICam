@@ -64,6 +64,32 @@ def _postgres_sql(sql: str) -> str:
     return converted.replace('?','%s')
 
 
+def lock_customer_camera_capacity(db, customer_id: str) -> bool:
+    """Serialize camera-slot reservations for one customer until commit.
+
+    PostgreSQL uses the customer's row as a transaction-scoped mutex. Every
+    camera request reservation and appliance provisioning callback must take
+    this lock before counting or creating a real camera, so concurrent
+    transactions cannot both spend the same final slot. SQLite has no
+    ``FOR UPDATE``; begin an immediate write transaction before its count so
+    it cannot race the same check-and-write sequence either.
+
+    Returns False when the customer row is missing, allowing callers to fail
+    closed instead of provisioning against an orphaned identity.
+    """
+    customer_id = str(customer_id or '').strip()
+    if not customer_id:
+        return False
+    if backend() == 'postgresql':
+        return db.execute(
+            'SELECT id FROM customers WHERE id=? FOR UPDATE', (customer_id,)
+        ).fetchone() is not None
+    db.execute('BEGIN IMMEDIATE')
+    return db.execute(
+        'SELECT id FROM customers WHERE id=?', (customer_id,)
+    ).fetchone() is not None
+
+
 @contextmanager
 def connect():
     if backend()=='sqlite':

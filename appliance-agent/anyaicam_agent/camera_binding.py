@@ -11,6 +11,10 @@ LOCAL_ONLY_KEYS = {
     'camera_password', 'credentials', 'secret', 'onvif_xaddrs',
 }
 
+# Keep in sync with app.camera_mapping.MAX_CAMERA_NUMBER. Numbers are stable
+# recording identities and are not reused after camera deletion.
+MAX_CAMERA_NUMBER = 10_000
+
 
 def atomic_write_json(path: str | Path, value) -> None:
     path = Path(path)
@@ -200,8 +204,8 @@ class CameraBindingStore:
         cloud_camera_id = str(cloud_camera_id).strip()
         if not cloud_camera_id:
             raise ValueError('cloud_camera_id is required.')
-        if isinstance(camera_number, bool) or not isinstance(camera_number, int) or not 1 <= camera_number <= 256:
-            raise ValueError('camera_number must be an integer between 1 and 256.')
+        if isinstance(camera_number, bool) or not isinstance(camera_number, int) or not 1 <= camera_number <= MAX_CAMERA_NUMBER:
+            raise ValueError(f'camera_number must be an integer between 1 and {MAX_CAMERA_NUMBER}.')
         mac = _safe_mac(mac_address)
         device_key = _identity_key({'device_key': device_key})
         stable_key = stable_device_key(device_key)

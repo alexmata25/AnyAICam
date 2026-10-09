@@ -52,6 +52,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from camera_mapping import MAX_CAMERA_NUMBER
 
 try:
     import boto3
@@ -130,7 +131,7 @@ def _validate_camera_number(value) -> int | None:
         number = int(value)
     except (TypeError, ValueError):
         return None
-    return number if 1 <= number <= 256 else None
+    return number if 1 <= number <= MAX_CAMERA_NUMBER else None
 
 
 def _validate_camera_id(value) -> str | None:

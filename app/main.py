@@ -43,6 +43,7 @@ import binascii
 # file before being treated as a confirmed production incident.
 import hashlib
 import hmac
+from camera_mapping import MAX_CAMERA_NUMBER
 
 
 
@@ -2076,7 +2077,7 @@ def get_supervisor_slot_count() -> int:
 
 # Sanity bound for a camera_number read from the local database: numbers
 # are never reused, so they grow with camera replacements, but never near this.
-CAMERA_NUMBER_MAX = 10_000
+CAMERA_NUMBER_MAX = MAX_CAMERA_NUMBER
 _rejected_camera_numbers: set[str] = set()  # each logged once
 
 
@@ -4768,7 +4769,7 @@ class EventSettingsModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
+    camera: int = Field(ge=1, le=CAMERA_NUMBER_MAX)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -4849,7 +4850,7 @@ class AlertRuleModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
+    camera: int = Field(ge=1, le=CAMERA_NUMBER_MAX)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -5749,7 +5750,7 @@ class AnalyticsRuleModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
+    camera: int = Field(ge=1, le=CAMERA_NUMBER_MAX)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -8332,7 +8333,7 @@ class SnapshotRequest(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
+    camera: int = Field(ge=1, le=CAMERA_NUMBER_MAX)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -8386,7 +8387,7 @@ class ClipRequest(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
+    camera: int = Field(ge=1, le=CAMERA_NUMBER_MAX)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 

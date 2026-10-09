@@ -242,5 +242,20 @@ class ReconcileCloudCamerasDiagnosticTests(unittest.TestCase):
         self.assertIsNone(reconciled[0]['last_error'])
 
 
+class CameraNumberCapacityTests(unittest.TestCase):
+    def test_agent_accepts_the_supported_upper_camera_number_and_rejects_overflow(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = CameraBindingStore(Path(folder) / 'bindings.json')
+            store.bind('cam-max', 10_000, '14:2f:fd:a2:f6:af',
+                       device_key='urn:uuid:11111111-1111-4111-8111-111111111111',
+                       valid_cloud_camera_ids={'cam-max'})
+            self.assertEqual(store.bindings()[0]['camera_number'], 10_000)
+            with self.assertRaises(ValueError):
+                store.bind('cam-overflow', 10_001, '14:2f:fd:a2:f6:b0',
+                           device_key='urn:uuid:22222222-2222-4222-8222-222222222222',
+                           valid_cloud_camera_ids={'cam-max', 'cam-overflow'})
+            self.assertEqual([item['cloud_camera_id'] for item in store.bindings()], ['cam-max'])
+
+
 if __name__ == '__main__':
     unittest.main()

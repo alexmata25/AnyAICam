@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .camera_binding import atomic_write_json
+from .camera_binding import MAX_CAMERA_NUMBER, atomic_write_json
 from .discovery import scan
 from .metrics import _cpu_percent, _memory_percent, disk_summary
 from . import windows
@@ -104,7 +104,7 @@ def _validate_relay_camera_number(value):
     if isinstance(value,bool): return None
     try: number=int(value)
     except (TypeError,ValueError): return None
-    return number if 1<=number<=256 else None
+    return number if 1<=number<=MAX_CAMERA_NUMBER else None
 
 
 def _validate_relay_camera_id(value):

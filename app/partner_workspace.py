@@ -1323,21 +1323,32 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # Usable capacity (2026-10-01): the camera plan AND the VMS software
         # license must both cover a new camera -- see customer_entitlements.
         # usable_camera_capacity(). Claiming an appliance is not gated; this is.
-        from customer_entitlements import (capacity_refusal, capacity_refusal_code, cameras_in_service,
-                                           pending_camera_additions, usable_camera_capacity)
-        already_known_device = row('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(identity['customer_id'],device_key))
-        if not already_known_device:
-            slot_limit=usable_camera_capacity(identity['customer_id'])
-            # In service plus still-live add requests (queued or being
-            # verified, not timed out) -- the same count camera_capacity shows.
-            if cameras_in_service(identity['customer_id'])+pending_camera_additions(identity['customer_id'])>=slot_limit:
-                # "code" lets the Cameras tab tell a full plan from a refusal
-                # (2026-10-08); "detail" stays the text shown to the customer.
-                from fastapi.responses import JSONResponse
-                return JSONResponse(status_code=403,content={'detail':capacity_refusal(identity['customer_id']),
-                                                             'code':capacity_refusal_code(identity['customer_id'])})
+        from customer_entitlements import (CAMERA_ADD_PENDING_SECONDS, CAMERA_ADD_PENDING_STATES,
+                                           capacity_refusal, capacity_refusal_code, usable_camera_capacity)
+        from database_backend import lock_customer_camera_capacity
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
+            # Capacity check and reservation are one serialized transaction.
+            # PostgreSQL locks this customer's row; SQLite starts an immediate
+            # write transaction. This prevents two requests from both seeing
+            # the same final slot as available.
+            if not lock_customer_camera_capacity(db,identity['customer_id']):
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            already_known_device=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',
+                                            (identity['customer_id'],device_key)).fetchone()
+            if not already_known_device:
+                slot_limit=usable_camera_capacity(identity['customer_id'])
+                configured=db.execute('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',
+                                      (identity['customer_id'],)).fetchone()['n']
+                cutoff=(datetime.now()-timedelta(seconds=CAMERA_ADD_PENDING_SECONDS)).isoformat()
+                pending=db.execute('SELECT COUNT(*) AS n FROM camera_provisioning_requests WHERE customer_id=? AND status IN (?,?) AND updated_at>=?',
+                                   (identity['customer_id'],*CAMERA_ADD_PENDING_STATES,cutoff)).fetchone()['n']
+                if configured+pending>=slot_limit:
+                    # "code" lets the Cameras tab tell a full plan from a refusal
+                    # (2026-10-08); "detail" stays the text shown to the customer.
+                    from fastapi.responses import JSONResponse
+                    return JSONResponse(status_code=403,content={'detail':capacity_refusal(identity['customer_id']),
+                                                                 'code':capacity_refusal_code(identity['customer_id'])})
             db.execute(
                 'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) '
                 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
