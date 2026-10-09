@@ -228,23 +228,6 @@ def test_held_packages_are_never_removed_by_the_reorganised_page(db_path, monkey
         assert {"people_counting", "lpr"} <= set(analytics.get_active_analytics_for_customer("cust-v2"))
 
 
-def test_a_legacy_plan_holder_keeps_the_legacy_page_and_plan(db_path, monkeypatch, prices):
-    import main
-    seed_customer(db_path)
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement, get_entitlements_for_customer
-        upsert_entitlement(customer_id="cust-v2", product="camera_slots_local", camera_slot_quantity=8)
-        _hold(db_path, "advanced_analytics")
-        html = main._customer_subscription_portal_page(OWNER)
-        assert "Local vs Hybrid" in html  # still the grandfathered page, not migrated
-        assert [e["product"] for e in get_entitlements_for_customer("cust-v2") if e["status"] == "active"].count("camera_slots_local") == 1
-    assert "Complete analytics: People Counting + LPR + PPE" in html
-    assert "AI Essentials" not in html and "Cloud Overflow" not in html
-    assert 'data-addon-key="ai_essentials"' not in html  # covered by the Complete package they hold
-    assert "Already included in your Complete analytics" in html
-    assert 'data-addon-key="talk_down"' in html  # a legacy plan does not include Talk Down
-
-
 # ------------------------------------------------------------ plan choice and changes
 
 def test_without_a_plan_the_three_plans_are_compared_from_the_catalog(db_path, monkeypatch, prices):

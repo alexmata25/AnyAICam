@@ -19,7 +19,7 @@ def _legacy_new_purchases_switched_on(monkeypatch):
     In production new legacy purchases are off (billing v2, 2026-10-05);
     that default is covered by test_legacy_checkout_guard.py."""
     import main
-    monkeypatch.setattr(main, "LEGACY_CAMERA_SLOT_NEW_PURCHASES", True)
+    pass  # fixed camera-slot tiers removed 2026-10-08
 
 
 # Billing reads Stripe's current state and applies nothing without it (Codex
@@ -29,30 +29,6 @@ pytestmark = pytest.mark.usefixtures("stripe_follows_events")
 
 
 # ================================================================ catalog
-
-@pytest.mark.parametrize("plan_type,tier,dollars", [
-    ("local", "1-8", "14.99"), ("local", "9-16", "24.99"), ("local", "17-32", "39.99"), ("local", "33-64", "69.99"),
-    ("hybrid", "1-8", "24.99"), ("hybrid", "9-16", "39.99"), ("hybrid", "17-32", "69.99"), ("hybrid", "33-64", "99.99"),
-])
-def test_base_plan_prices(plan_type, tier, dollars):
-    plan = pc.find_base_plan(plan_type, tier)
-    assert plan["monthly_cents"] == pc._cents(dollars)
-    assert plan["billing_type"] == "recurring"
-
-
-def test_camera_limits_are_licensing_tiers_only():
-    assert [p["camera_slot_maximum"] for p in pc.base_plans() if p["plan_type"] == "local"] == [8, 16, 32, 64]
-
-
-def test_secure_edge_smart_motion_and_aaco_are_included_and_never_charged():
-    assert set(pc.INCLUDED_FEATURE_KEYS) == {"secure_edge", "smart_motion", "aaco"}
-    sold = {a["addon_key"] for a in pc.addons()}
-    granted = {k for a in pc.addons() for k in a["grants"]}
-    assert not (set(pc.INCLUDED_FEATURE_KEYS) & sold)
-    assert not (set(pc.INCLUDED_FEATURE_KEYS) & granted)
-    # A base plan alone is a complete, purchasable quote.
-    assert pc.quote(plan_type="local", tier_label="1-8")["monthly_cents"] == 1499
-
 
 @pytest.mark.parametrize("key,dollars", [
     ("ai_essentials", "7.99"), ("ai_professional", "14.99"), ("vehicle_intelligence", "14.99"),
@@ -70,30 +46,9 @@ def test_package_contents():
     assert grants["advanced_analytics"] == {"people_counting", "lpr", "ppe"}
 
 
-@pytest.mark.parametrize("plan_type,tier,total", [
-    ("local", "1-8", 3998), ("local", "9-16", 4998), ("local", "17-32", 6498), ("local", "33-64", 9498),
-    ("hybrid", "1-8", 4998), ("hybrid", "9-16", 6498), ("hybrid", "17-32", 9498), ("hybrid", "33-64", 12498),
-])
-def test_advanced_analytics_is_a_flat_add_on_never_per_camera(plan_type, tier, total):
-    quote = pc.quote(plan_type=plan_type, tier_label=tier, addon_keys=["advanced_analytics"])
-    assert quote["monthly_cents"] == total
-    advanced = next(line for line in quote["lines"] if line["label"] == "Advanced Analytics")
-    assert advanced["quantity"] == 1 and advanced["cents"] == 2499
-
-
 def test_advanced_is_not_the_sum_of_the_individual_packages():
     parts = sum(pc.find_addon(k)["monthly_cents"] for k in ("ai_essentials", "ai_professional", "vehicle_intelligence"))
     assert pc.find_addon("advanced_analytics")["monthly_cents"] == 2499 != parts
-
-
-def test_talk_down_is_per_site_and_includes_voice_call():
-    talk_down = pc.find_addon("talk_down")
-    assert talk_down["unit"] == "per_site"
-    assert set(talk_down["grants"]) == {"talk_down", "voice_call"}
-    assert not any("voice_call" in a["addon_key"] for a in pc.addons())  # no second charge
-    assert pc.quote(plan_type="local", tier_label="1-8", talk_down_sites=1)["monthly_cents"] == 1998
-    assert pc.quote(plan_type="hybrid", tier_label="1-8", talk_down_sites=1)["monthly_cents"] == 2998
-    assert pc.quote(plan_type="local", tier_label="1-8", talk_down_sites=3)["monthly_cents"] == 1499 + 3 * 499
 
 
 def test_face_access_is_separate_per_door_and_not_in_advanced():
@@ -116,27 +71,11 @@ def test_cloud_overflow_has_no_invented_price_and_is_not_bundled():
     assert all("cloud_overflow" not in a["grants"] for a in pc.addons() if a["addon_key"] != "cloud_overflow")
 
 
-def test_friends_family_percentages_and_quote():
-    # The one-time VMS license has no approved Friends & Family discount (0%).
-    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0, "face_access": 0}
-    quote = pc.quote(plan_type="local", tier_label="1-8", addon_keys=["advanced_analytics"], friends_family_approved=True)
-    base, advanced = quote["lines"]
-    assert base["cents"] == 1499 - 750  # 50% of $14.99, rounded to the cent like Stripe
-    assert advanced["cents"] == 2499 - 625  # 25% of $24.99
-    assert quote["monthly_list_cents"] == 3998
-
-
 def test_public_catalog_exposes_prices_but_no_stripe_ids_or_commissions():
     import json
     text = json.dumps(pc.public_catalog())
     assert "price_" not in text and "ANYAICAM_STRIPE" not in text and "commission" not in text.lower()
     assert "14.99" in text and "99.99" in text
-
-
-def test_customer_entitlements_tiers_come_from_the_catalog():
-    import customer_entitlements as ce
-    assert [(t[0], t[1], t[4], t[5], t[7]) for t in ce.PLAN_TIERS] == [
-        (p["plan_type"], p["tier_label"], p["camera_slot_maximum"], p["monthly_cents"] / 100, "recurring") for p in pc.base_plans()]
 
 
 def test_no_duplicate_plan_prices_left_in_python_sources():
@@ -201,7 +140,7 @@ def _stripe_maps(monkeypatch, **prices):
     for env_var, value in prices.items():
         monkeypatch.setenv(env_var, value)
     monkeypatch.setattr(ae, "ANALYTICS_PRICE_MAP", ae._load_price_map())
-    monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", ce._load_price_tier_map())
+    monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", __import__("conftest").fixed_slot_price_map_for_tests())
 
 
 def _checkout_event(event_id, price_id, customer_id="cust-1", stripe_customer="cus_1", quantity=None):
@@ -328,22 +267,6 @@ def _checkout_plan(client):
     return client.post("/api/customer/camera-slots/checkout", json={"plan_type": "local", "tier_label": "1-8"}, cookies=_cookie(*OWNER))
 
 
-def test_friends_family_request_pending_blocks_checkout_and_emails_the_admin(portal, db_path):
-    client, captured, sent = portal
-    _seed(db_path)
-    assert client.get("/api/customer/friends-family", cookies=_cookie(*OWNER)).json() == {"status": "none"}
-    first = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()
-    assert first["status"] == "pending"
-    again = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()
-    assert again["request_id"] == first["request_id"]  # never duplicated
-    assert len(sent) == 1
-    assert "/admin/friends-family/" + first["request_id"] in sent[0]["text"]
-    assert "Real Customer" in sent[0]["subject"]
-    held = _checkout_plan(client)
-    assert held.status_code == 409 and "administrator approval" in held.json()["detail"]
-    assert captured == []  # no Stripe session while the price is unsettled
-
-
 def test_opening_the_review_link_never_approves_and_needs_an_administrator(portal, db_path):
     client, captured, sent = portal
     _seed(db_path)
@@ -357,49 +280,6 @@ def test_opening_the_review_link_never_approves_and_needs_an_administrator(porta
     page = client.get(f"/admin/friends-family/{request_id}", cookies=admin)
     assert page.status_code == 200 and "Approve" in page.text and "Decline" in page.text
     assert client.get("/api/customer/friends-family", cookies=_cookie(*OWNER)).json()["status"] == "pending"
-
-
-def test_approval_applies_the_coupons_before_checkout_without_promo_stacking(portal, db_path):
-    client, captured, sent = portal
-    _seed(db_path)
-    request_id = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()["request_id"]
-    decided = client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
-    assert decided.status_code == 200 and decided.json()["status"] == "approved"
-    assert client.get("/api/customer/friends-family", cookies=_cookie(*OWNER)).json()["status"] == "approved"
-    assert _checkout_plan(client).status_code == 200
-    plan = captured[-1]
-    assert plan["discounts[0][coupon]"] == "coupon_ff_base"
-    assert "allow_promotion_codes" not in plan
-    assert plan["metadata[anyaicam_friends_family]"] == "approved"
-    analytics = client.post("/api/customer/analytics/checkout", json={"addon_key": "advanced_analytics"}, cookies=_cookie(*OWNER))
-    assert analytics.status_code == 200
-    assert captured[-1]["discounts[0][coupon]"] == "coupon_ff_analytics"
-    assert "allow_promotion_codes" not in captured[-1]
-    # A second decision is refused.
-    again = client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "decline"}, cookies=_make_global_admin(db_path))
-    assert again.status_code == 409
-
-
-def test_approved_customer_is_never_charged_full_price_when_the_coupon_is_missing(portal, db_path, monkeypatch):
-    client, captured, sent = portal
-    _seed(db_path)
-    request_id = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()["request_id"]
-    client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
-    monkeypatch.delenv("ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE")
-    response = _checkout_plan(client)
-    assert response.status_code == 503 and "COUPON_REQUIRED" in response.json()["detail"]
-    assert captured == []
-
-
-def test_decline_restores_normal_checkout_with_promotion_codes(portal, db_path):
-    client, captured, sent = portal
-    _seed(db_path)
-    request_id = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()["request_id"]
-    client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "decline"}, cookies=_make_global_admin(db_path))
-    assert client.get("/api/customer/friends-family", cookies=_cookie(*OWNER)).json()["status"] == "declined"
-    assert _checkout_plan(client).status_code == 200
-    assert captured[-1]["allow_promotion_codes"] == "true"
-    assert "discounts[0][coupon]" not in captured[-1]
 
 
 def test_talk_down_checkout_is_billed_per_site(portal, db_path):
@@ -429,13 +309,6 @@ def test_hardware_is_never_discounted():
     assert "friends_family" not in source and "discounts[" not in source
     assert '("allow_promotion_codes", "false")' in source
     assert pc.friends_family_percent("hardware") == 0
-
-
-def test_catalog_api_is_public_and_customer_safe(portal):
-    client, captured, sent = portal
-    body = client.get("/api/pricing/catalog").json()
-    assert {p["monthly"] for p in body["base_plans"]} >= {14.99, 24.99, 39.99, 69.99, 99.99}
-    assert body["friends_family"]["requires_administrator_approval"] is True
 
 
 # ================================================================ commissions
@@ -652,40 +525,12 @@ def test_friends_family_panel_is_offered_where_customers_buy(portal, db_path):
     assert 'id="friends-family-panel"' in client.get("/customer/setup", cookies=_cookie(*OWNER)).text
 
 
-def test_my_subscription_shows_catalog_prices_and_included_features(portal, db_path, monkeypatch):
-    client, captured, sent = portal
-    _seed(db_path)
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert "Local 8 cameras &middot; 8 licensed camera slots &middot; $14.99/mo" in html
-    assert "Secure Edge, Smart Motion, AACO" in html
-    assert "$24.99/mo · Includes: People Counting, LPR, PPE" in html
-    assert "<span>Talk Down / two-way audio and AAC Voice Call<br><span class=\"health-detail\">$4.99/mo per site</span>" in html
-
-
 # ================================================================ one-time VMS software license
 
 @pytest.mark.parametrize("capacity,cents", [(8, 4999), (16, 7999), (32, 12999), (64, 19999)])
 def test_vms_license_prices_are_one_time(capacity, cents):
     lic = pc.find_vms_license(capacity)
     assert lic["one_time_cents"] == cents and lic["billing_type"] == "one_time"
-
-
-def test_vms_license_does_not_change_the_monthly_plans():
-    assert [p["monthly_cents"] for p in pc.base_plans()] == [1499, 2499, 3999, 6999, 2499, 3999, 6999, 9999]
-
-
-@pytest.mark.parametrize("plan_type,tier,capacity,cents", [
-    ("local", "1-8", 8, 4999), ("local", "9-16", 16, 7999), ("hybrid", "17-32", 32, 12999), ("hybrid", "33-64", 64, 19999),
-])
-def test_diy_quote_adds_the_matching_license_and_appliance_quote_includes_it(plan_type, tier, capacity, cents):
-    diy = pc.quote(plan_type=plan_type, tier_label=tier, with_appliance=False)
-    assert diy["one_time_cents"] == cents and f"{capacity} cameras" in diy["one_time_lines"][0]["label"]
-    appliance = pc.quote(plan_type=plan_type, tier_label=tier, with_appliance=True)
-    assert appliance["one_time_cents"] == 0 and appliance["one_time_lines"][0]["included"] is True
-    assert diy["monthly_cents"] == appliance["monthly_cents"]  # separate line item; plan price unchanged
 
 
 def _paid_appliance_order(db_path, customer_id="cust-1", status="paid"):
@@ -770,30 +615,11 @@ def test_license_checkout_waits_for_a_pending_friends_family_decision(license_po
     assert captured == []
 
 
-def test_plan_checkout_is_unaffected_by_the_license(license_portal, db_path):
-    client, captured, sent = license_portal
-    _seed(db_path)
-    assert _checkout_plan(client).status_code == 200
-    assert captured[-1]["mode"] == "subscription" and captured[-1]["line_items[0][price]"] == "price_local_8"
-
-
 def test_license_payment_earns_no_commission(ledger, db_path, monkeypatch):
     sc = ledger
     result = sc.sync_commissions_from_stripe_event({"id": "evt_lic", "type": "checkout.session.completed",
                                                     "data": {"object": {"id": "cs_lic", "mode": "payment", "payment_status": "paid"}}})
     assert result["status"] == "ignored" and _entries(sc) == []
-
-
-def test_my_subscription_offers_the_license_to_diy_and_shows_it_included_with_an_appliance(license_portal, db_path):
-    client, captured, sent = license_portal
-    _seed(db_path)
-    import customer_entitlements as ce
-    ce.upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=16)
-    diy = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert "Software license for 16 cameras" in diy and "$79.99 one-time" in diy and 'id="vms-license-buy"' in diy
-    _paid_appliance_order(db_path)
-    owner = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert "Included with your AnyAiCam appliance &middot; 16 cameras" in owner and 'id="vms-license-buy"' not in owner
 
 
 # ================================================================ Stripe object script (offline)
@@ -808,21 +634,6 @@ def _load_price_script():
     return module
 
 
-def test_price_script_creates_new_prices_at_catalog_amounts_and_one_time_licenses():
-    script = _load_price_script()
-    items = {i["env"]: i for i in script.catalog_prices()}
-    assert items["ANYAICAM_STRIPE_PRICE_HYBRID_33_64"]["amount"] == 9999 and items["ANYAICAM_STRIPE_PRICE_HYBRID_33_64"]["interval"] == "month"
-    assert items["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"]["amount"] == 19999 and items["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"]["interval"] is None
-    assert items["ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS"]["amount"] == 2499
-    assert "ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW" not in items  # no invented price
-    assert items["ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"]["amount"] == 124999 and items["ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"]["interval"] is None
-    assert items["ANYAICAM_STRIPE_PRICE_RELAY_NUMATO_3CH"]["amount"] == 14999
-    # lookup keys embed the amount, so a changed price always becomes a NEW Price object
-    assert all(str(i["amount"]) in i["lookup_key"] for i in items.values())
-    coupons = {c["env"]: c["percent_off"] for c in script.catalog_coupons()}
-    assert coupons == {"ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE": 50, "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS": 25}
-
-
 def test_price_script_refuses_live_keys(monkeypatch, capsys):
     script = _load_price_script()
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_not_real")
@@ -832,24 +643,6 @@ def test_price_script_refuses_live_keys(monkeypatch, capsys):
 
 
 # ================================================================ Stripe price guard
-
-def test_checkout_refuses_a_stripe_price_that_does_not_match_the_catalog(portal, db_path, fake_stripe_prices):
-    """A Price ID left over from earlier pricing (Stripe amounts are
-    immutable) must never charge a customer something other than what
-    they were shown."""
-    client, captured, sent = portal
-    _seed(db_path)
-    fake_stripe_prices["price_local_8"] = {"id": "price_local_8", "unit_amount": 1499, "currency": "usd", "active": True,
-                                           "recurring": {"interval": "month"}}
-    assert _checkout_plan(client).status_code == 200  # matches: $14.99 monthly
-    import main
-    main._VERIFIED_STRIPE_PRICES.clear()
-    fake_stripe_prices["price_local_8"]["unit_amount"] = 60  # an old sandbox amount
-    captured.clear()
-    response = _checkout_plan(client)
-    assert response.status_code == 503 and "PRICE_MISMATCH" in response.json()["detail"]
-    assert captured == []
-
 
 def test_checkout_refuses_a_one_time_price_for_a_monthly_item(license_portal, db_path, fake_stripe_prices):
     client, captured, sent = license_portal

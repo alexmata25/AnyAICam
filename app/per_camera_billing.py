@@ -854,6 +854,11 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                          f'<span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>')
     elif vms_capacity and not owned_license:
         license_card += f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>'
+    # The installer download (owner of a licensed account), formerly only on
+    # the removed fixed-tier subscription page (2026-10-08).
+    _main = sys.modules.get("main")
+    if _main is not None and hasattr(_main, "_vms_installer_download_html"):
+        license_card += _main._vms_installer_download_html(customer_id, customer_entitlements.product_mode_for_customer(customer_id), is_owner)
     setup_next = ""
     if is_owner and is_active and _setup_needed(customer_id):
         # Purchase comes first, then setup (2026-10-05): once the plan is

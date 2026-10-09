@@ -139,9 +139,6 @@ def fake_stripe_prices(monkeypatch):
         price_id = path.rsplit("/", 1)[-1]
         if price_id in overrides:
             return overrides[price_id]
-        for plan in pc.base_plans():
-            if plan["stripe_price_id"] == price_id:
-                return {"id": price_id, "unit_amount": plan["monthly_cents"], "currency": "usd", "active": True, "recurring": {"interval": "month"}}
         for addon in pc.addons():
             if addon["stripe_price_id"] == price_id:
                 return {"id": price_id, "unit_amount": addon["monthly_cents"], "currency": "usd", "active": True, "recurring": {"interval": "month"}}
@@ -252,3 +249,21 @@ def _appliance_entitlements(request, monkeypatch, tmp_path):
     if request.node.get_closest_marker("real_entitlements") is None:
         monkeypatch.setattr(appliance_entitlements, "feature_allowed", lambda feature, customer_id=None: True)
     yield
+
+
+def fixed_slot_price_map_for_tests() -> dict:
+    """Test-only stand-in for the fixed camera-slot tier Price-ID map that
+    production removed on 2026-10-08 (per-camera plans only; production's
+    customer_entitlements.PRICE_ID_CAMERA_SLOT_MAP is empty). The Stripe
+    webhook machinery for camera_slots_* entitlements (grace, refunds,
+    disputes, renewals, add-ons ending with the base plan, commissions) is
+    still in the product, and these suites keep exercising it by mapping the
+    fake Price IDs they set in the old env-var names to a slot count."""
+    import os
+    mapping = {}
+    for plan_type in ("local", "hybrid"):
+        for label, slots in (("1_8", 8), ("9_16", 16), ("17_32", 32), ("33_64", 64)):
+            price_id = os.environ.get(f"ANYAICAM_STRIPE_PRICE_{plan_type.upper()}_{label}", "").strip()
+            if price_id:
+                mapping[price_id] = {"product": f"camera_slots_{plan_type}", "camera_slot_maximum": slots, "billing_type": "recurring"}
+    return mapping
