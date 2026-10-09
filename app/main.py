@@ -15893,13 +15893,115 @@ def live_bitrate_cap_args() -> list[str]:
 # camera's original frames. While on: no live bitrate cap, and HLS segments
 # follow the camera's own keyframes. Only for cameras verified to send H.264.
 LIVE_VIDEO_COPY = os.environ.get("ANYAICAM_LIVE_VIDEO_COPY", "false").strip().lower() == "true"
+# Integration (2026-10-08, Red, on Orange's hotfix): the toggle alone copied
+# EVERY camera, so an H.265 camera would have produced live video most
+# browsers cannot play (and fed analytics H.265). Copy is now used per camera
+# only when ffprobe has confirmed, before the live worker starts, that the
+# camera sends one of LIVE_VIDEO_COPY_CODECS; an unknown codec, a probe that
+# fails or times out, or no ffprobe all mean the existing x264 encode. A
+# camera whose copied live stream keeps failing quickly (or stalls the HLS
+# watchdog) goes back to x264 for LIVE_VIDEO_COPY_FALLBACK_SECONDS.
+LIVE_VIDEO_COPY_CODECS = frozenset({"h264"})
+LIVE_VIDEO_COPY_PROBE_TTL_SECONDS = 600       # re-check a known codec this often
+LIVE_VIDEO_COPY_PROBE_RETRY_SECONDS = 60      # re-check after a failed probe
+LIVE_VIDEO_COPY_PROBE_TIMEOUT_SECONDS = 10
+LIVE_VIDEO_COPY_QUICK_EXIT_SECONDS = 60       # a copied stream ending sooner counts as a failure
+LIVE_VIDEO_COPY_FAILURES_BEFORE_FALLBACK = 2
+LIVE_VIDEO_COPY_FALLBACK_SECONDS = 3600
+_live_copy_probe: dict[int, tuple[float, str | None]] = {}   # camera -> (checked at, codec or None)
+_live_copy_quick_failures: dict[int, int] = {}
+_live_copy_disabled_until: dict[int, float] = {}
+_VIDEO_CODEC_NAME = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
-def live_video_args() -> list[str]:
-    if LIVE_VIDEO_COPY:
+def live_copy_allowed(camera_number: int) -> bool:
+    """True only when the toggle is on, this camera's codec was verified as
+    copyable, and the camera is not in its post-failure fallback period."""
+    if not LIVE_VIDEO_COPY:
+        return False
+    if time.monotonic() < _live_copy_disabled_until.get(camera_number, 0.0):
+        return False
+    probe = _live_copy_probe.get(camera_number)
+    return bool(probe and probe[1] in LIVE_VIDEO_COPY_CODECS)
+
+
+def live_video_args(camera_number: int | None = None) -> list[str]:
+    if camera_number is not None and live_copy_allowed(camera_number):
         return ["-c:v", "copy"]
     return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
             "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *live_bitrate_cap_args()]
+
+
+async def probe_camera_video_codec(url: str, timeout: float = LIVE_VIDEO_COPY_PROBE_TIMEOUT_SECONDS) -> str | None:
+    """The camera's video codec name (e.g. "h264"), or None. Asynchronous (the
+    event loop and the shared executor are never blocked); ffprobe's stderr is
+    discarded, so the URL -- credentials included -- is never logged."""
+    args = ["ffprobe", "-v", "error"]
+    if url.lower().startswith(("rtsp://", "rtsps://")):
+        args += ["-rtsp_transport", "tcp"]
+    args += ["-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", "-i", url]
+    try:
+        process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
+                                                       stderr=asyncio.subprocess.DEVNULL)
+    except (OSError, ValueError):
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        return None
+    if process.returncode != 0:
+        return None
+    lines = stdout.decode("utf-8", errors="replace").strip().lower().splitlines()
+    codec = lines[0].strip().strip(",") if lines else ""
+    return codec if _VIDEO_CODEC_NAME.match(codec) else None
+
+
+async def refresh_live_copy_probe(camera_number: int) -> None:
+    """Probes the camera's codec before its live worker starts, when copy is
+    on and the last answer is old enough. Never raises."""
+    if not LIVE_VIDEO_COPY:
+        return
+    now = time.monotonic()
+    cached = _live_copy_probe.get(camera_number)
+    if cached:
+        age_limit = LIVE_VIDEO_COPY_PROBE_TTL_SECONDS if cached[1] else LIVE_VIDEO_COPY_PROBE_RETRY_SECONDS
+        if now - cached[0] < age_limit:
+            return
+    try:
+        url = camera_url(camera_number)
+    except Exception:
+        return
+    try:
+        codec = await probe_camera_video_codec(url)
+    except Exception:
+        codec = None
+    _live_copy_probe[camera_number] = (time.monotonic(), codec)
+    if not cached or cached[1] != codec:
+        decision = "stream copy" if codec in LIVE_VIDEO_COPY_CODECS else "x264 encode"
+        print(f"Camera {camera_number} live video: camera sends {codec or 'an unknown codec'}; using {decision}.")
+
+
+def note_live_copy_run(camera_number: int, copy_used: bool, seconds: float, watchdog_restart: bool) -> None:
+    """After a live worker ends: a copied stream that ended quickly or stalled
+    counts as a failure; enough in a row send the camera back to x264."""
+    if not copy_used:
+        return
+    if seconds >= LIVE_VIDEO_COPY_QUICK_EXIT_SECONDS and not watchdog_restart:
+        _live_copy_quick_failures[camera_number] = 0
+        return
+    failures = _live_copy_quick_failures.get(camera_number, 0) + 1
+    if failures >= LIVE_VIDEO_COPY_FAILURES_BEFORE_FALLBACK:
+        _live_copy_quick_failures[camera_number] = 0
+        _live_copy_disabled_until[camera_number] = time.monotonic() + LIVE_VIDEO_COPY_FALLBACK_SECONDS
+        print(f"Camera {camera_number} live stream copy failed {failures} times; "
+              f"using x264 encode for {LIVE_VIDEO_COPY_FALLBACK_SECONDS // 60} minutes.")
+    else:
+        _live_copy_quick_failures[camera_number] = failures
 
 
 def start_live_stream(camera_number: int) -> subprocess.Popen:
@@ -15947,7 +16049,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-        *live_video_args(),
+        *live_video_args(camera_number),
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
@@ -16774,11 +16876,19 @@ def _redact_camera_stream_error(text: str) -> str:
 # line, and those lines were mirrored into `docker logs` verbatim for every
 # camera. Only the user:password part is masked; the host and path stay so
 # a connection error still says which camera failed.
-_STREAM_URL_CREDENTIALS_PATTERN = re.compile(r"\b(rtsps?|https?)://[^/\s@]+@", re.IGNORECASE)
+# Integration (2026-10-08): the userinfo is everything up to the LAST "@" of
+# the URL token. The first version stopped at the first "@" or "/", so a
+# password containing "@" leaked its tail and one containing "/" was not
+# masked at all.
+_STREAM_URL_TOKEN_PATTERN = re.compile(r"\b(rtsps?|https?)://(\S+)", re.IGNORECASE)
 
 
 def _redact_stream_credentials(text: str) -> str:
-    return _STREAM_URL_CREDENTIALS_PATTERN.sub(r"\1://***@", text)
+    def mask(match: re.Match) -> str:
+        rest = match.group(2)
+        at = rest.rfind("@")
+        return f"{match.group(1)}://***@{rest[at + 1:]}" if at != -1 else match.group(0)
+    return _STREAM_URL_TOKEN_PATTERN.sub(mask, text)
 
 
 async def _drain_camera_stderr(camera_number: int, process: subprocess.Popen, buffer: list[str]) -> None:
@@ -16888,6 +16998,13 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         camera_process_state[camera_number][mode] = "connecting"
+        live_copy_used = False
+        if mode == "live":
+            # Stream copy (2026-10-08): codec verified before the worker starts.
+            await refresh_live_copy_probe(camera_number)
+            live_copy_used = live_copy_allowed(camera_number)
+            camera_process_state[camera_number]["live_video"] = "copy" if live_copy_used else "encode"
+        worker_started = time.monotonic()
 
 
 
@@ -17034,6 +17151,8 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
             return_code = await asyncio.to_thread(process.wait)
             completed = True
+            if mode == "live":
+                note_live_copy_run(camera_number, live_copy_used, time.monotonic() - worker_started, watchdog_restart)
 
             if drain_task is not None:
                 await drain_task
