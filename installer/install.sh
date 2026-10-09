@@ -202,7 +202,10 @@ run_install() {
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"
     install_rollback_tool
-    install_agent "$INSTALL_STATE" || return $?
+    # The full installer validated identity/capacity before downtime and
+    # validates it again after systemd_setup restores the VMS. Do not run the
+    # agent sub-installer's redundant bootstrap while the VMS is stopped.
+    install_agent "$INSTALL_STATE" --defer-capacity-bootstrap || return $?
     install_mediamtx "$INSTALL_STATE"
     install_webrtc_firewall
     systemd_setup

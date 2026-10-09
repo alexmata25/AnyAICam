@@ -103,6 +103,11 @@ deploy_agent_source() {
 
 install_agent() {
     local state="$1"
+    local capacity_bootstrap_mode="${2:-}"
+    if [[ -n "$capacity_bootstrap_mode" && "$capacity_bootstrap_mode" != "--defer-capacity-bootstrap" ]]; then
+        echo "[ERROR] Unsupported agent-install option: $capacity_bootstrap_mode" >&2
+        return 2
+    fi
     log "Installing python3.12-venv prerequisite for the appliance agent..."
     apt-get update -y
     apt-get install -y python3.12-venv rsync
@@ -117,7 +122,11 @@ install_agent() {
     deploy_agent_source || return 1
 
     log "Installing appliance-agent control-plane package..."
-    bash "$AGENT_SOURCE_ROOT/scripts/install.sh" || return $?
+    if [[ "$capacity_bootstrap_mode" == "--defer-capacity-bootstrap" ]]; then
+        bash "$AGENT_SOURCE_ROOT/scripts/install.sh" "$capacity_bootstrap_mode" || return $?
+    else
+        bash "$AGENT_SOURCE_ROOT/scripts/install.sh" || return $?
+    fi
     if [[ "$state" == "clean" ]]; then
         log "Appliance agent installed (clean install)."
     else

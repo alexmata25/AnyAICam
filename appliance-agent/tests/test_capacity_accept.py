@@ -425,6 +425,39 @@ class AcceptanceFilesystemTests(unittest.TestCase):
             result = capacity_accept.main()
         return result, stdout.getvalue().strip(), stderr.getvalue().strip()
 
+    def test_bootstrap_rejects_accepted_snapshot_when_appliance_clock_is_over_five_minutes_behind(self):
+        # Simulate a valid accepted authorization made while the appliance
+        # clock was correct, then stepped back by more than the validator's
+        # five-minute future tolerance before an offline repair.
+        future = NOW + dt.timedelta(days=1)
+        snapshot = make_snapshot(self.private, issued=future, expires=future + dt.timedelta(days=1),
+                                 **CLOUD_IDENTITY)
+        accepted_state, outcome = _advance(snapshot, {"cloud-key": self.public}, CLOUD_IDENTITY,
+                                           None, now=future, verifier=self.verifier)
+        self.assertEqual(outcome, "accepted")
+        accepted_before = json.dumps(accepted_state, sort_keys=True).encode()
+        self.accepted.write_bytes(accepted_before)
+        self.accepted.chmod(0o600)
+        pending_before = (self.trust / PENDING_CLAIM_FILE).read_bytes()
+        constants = {
+            "TRUST_DIR": str(self.trust),
+            "IDENTITY_FILE": str(self.identity_dir / "appliance_identity.json"),
+            "INSTALLER_IDENTITY_FILE": str(self.installer_dir / "appliance_identity.json"),
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.multiple(capacity_accept, **constants), \
+                mock.patch.object(capacity_accept.sys, "argv", ["capacity_accept.py", "--bootstrap-identity",
+                                                                  "--legacy-upgrade"]), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = capacity_accept.main()
+
+        self.assertEqual(result, 1)
+        self.assertIn("issued_in_future", stderr.getvalue())
+        self.assertEqual(self.accepted.read_bytes(), accepted_before)
+        self.assertEqual((self.trust / PENDING_CLAIM_FILE).read_bytes(), pending_before)
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertEqual(stdout.getvalue(), "")
+
     def stage_snapshot(self, snapshot):
         self.stage.write_text(json.dumps(snapshot), encoding="utf-8")
         self.stage.chmod(0o600)

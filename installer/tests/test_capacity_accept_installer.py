@@ -84,11 +84,34 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         installer = (ROOT / "installer/install.sh").read_text(encoding="utf-8")
         agent_installer = (ROOT / "appliance-agent/scripts/install.sh").read_text(encoding="utf-8")
         self.assertLess(installer.index('deploy_vms "$INSTALL_STATE"'), installer.index('install_agent "$INSTALL_STATE"'))
-        self.assertLess(installer.index('install_agent "$INSTALL_STATE"'), installer.index("systemd_setup"))
-        self.assertLess(agent_installer.index("systemctl restart anyaicam-agent.service"),
-                        agent_installer.index("bootstrap_capacity_identity"))
+        self.assertLess(installer.index('install_agent "$INSTALL_STATE" --defer-capacity-bootstrap'),
+                        installer.index('    systemd_setup\n'))
+        self.assertIn('install_agent "$INSTALL_STATE" --defer-capacity-bootstrap || return $?', installer)
+        self.assertIn('"$1" == "--defer-capacity-bootstrap"', agent_installer)
+        self.assertIn('"$DEFER_CAPACITY_BOOTSTRAP" == 0', agent_installer)
+        self.assertLess(installer.index('    systemd_setup\n'), installer.index("bootstrap_capacity_identity migration"))
         library = (ROOT / "appliance-agent/scripts/lib-capacity-accept.sh").read_text(encoding="utf-8")
         self.assertIn("Pending signed camera-capacity snapshot was not accepted", library)
+
+    def test_full_installer_passes_deferral_to_agent_subinstaller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "agent-argv"
+            result = subprocess.run([BASH, "-c", r'''set -euo pipefail
+source ./install.sh
+AGENT_PAYLOAD_DIR="$TEST_PAYLOAD"
+AGENT_SOURCE_ROOT="$TEST_SOURCE"
+apt-get() { :; }
+deploy_agent_source() { :; }
+bash() { printf '%s\n' "$@" > "$AGENT_ARGV_TRACE"; }
+install_agent repair --defer-capacity-bootstrap
+'''], cwd=ROOT / "installer", text=True, capture_output=True,
+                                env={**os.environ, "TEST_PAYLOAD": str(ROOT / "appliance-agent"),
+                                     "TEST_SOURCE": str(ROOT / "appliance-agent"),
+                                     "AGENT_ARGV_TRACE": str(trace)})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(trace.read_text(encoding="utf-8").splitlines(),
+                             [str(ROOT / "appliance-agent/scripts/install.sh"),
+                              "--defer-capacity-bootstrap"])
 
 
 @unittest.skipUnless(BASH, "bash is required for installer repair integration")
@@ -197,6 +220,67 @@ run_install --repair
             "start anyaicam-capacity-accept.service"), 2)
         for label, path in self.files.items():
             self.assertEqual(path.read_bytes(), self.expected_files[label], label)
+
+    def test_full_repair_defers_agent_bootstrap_until_after_vms_restart(self):
+        agent_source = self.tmp / "agent-source/scripts"
+        agent_source.mkdir(parents=True)
+        child_installer = agent_source / "install.sh"
+        child_installer.write_text(f'''#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${{1:-}}" != "--defer-capacity-bootstrap" ]]; then
+  printf 'CHILD_BOOTSTRAP_FAILED\n' >> {shlex.quote(bash_path(self.trace))}
+  exit 1
+fi
+printf 'CHILD_BOOTSTRAP_DEFERRED\n' >> {shlex.quote(bash_path(self.trace))}
+''', encoding="utf-8", newline="\n")
+        env = dict(os.environ, REPAIR_TRACE=bash_path(self.trace),
+                   TEST_AGENT_SOURCE=bash_path(self.tmp / "agent-source"),
+                   TEST_AGENT_PAYLOAD=bash_path(self.tmp / "agent-payload"))
+        script = f'''\
+set -euo pipefail
+source {shlex.quote(bash_path(ROOT / "installer/install.sh"))}
+AGENT_SOURCE_ROOT="$TEST_AGENT_SOURCE"
+AGENT_PAYLOAD_DIR="$TEST_AGENT_PAYLOAD"
+mkdir -p "$AGENT_PAYLOAD_DIR/scripts"
+cp {shlex.quote(bash_path(child_installer))} "$AGENT_PAYLOAD_DIR/scripts/install.sh"
+apt-get() {{ :; }}
+deploy_agent_source() {{ :; }}
+log() {{ :; }}
+load_release_metadata() {{ INSTALLER_VERSION=1.2.5; VMS_RELEASE_COMMIT={"a" * 40}; }}
+verify_installer_payload() {{ :; }}; preflight_checks() {{ :; }}
+webrtc_port_preflight() {{ :; }}; vms_http_port_preflight() {{ :; }}
+detect_install_state() {{ INSTALL_STATE=existing; }}; release_downgrade_guard() {{ :; }}
+select_product_mode() {{ :; }}; storage_preflight() {{ :; }}
+secure_agent_install_root() {{ :; }}; provision_entitlement_signing_keys() {{ :; }}
+install_capacity_accept_step() {{ printf 'CAPACITY_VALIDATED_BEFORE_DOWNTIME\\n' >> "$REPAIR_TRACE"; }}
+migrate_capacity_fallback_step() {{ :; }}; docker_setup() {{ :; }}
+provision_users_dirs() {{ :; }}; deploy_vms() {{ printf 'VMS_STOPPED\\n' >> "$REPAIR_TRACE"; }}
+install_rollback_tool() {{ :; }}; install_mediamtx() {{ :; }}
+install_webrtc_firewall() {{ :; }}
+systemd_setup() {{ printf 'VMS_RESTARTED\\n' >> "$REPAIR_TRACE"; }}
+bootstrap_capacity_identity() {{
+  if [[ "${{1:-}}" == migration ]]; then
+    printf 'POST_RESTART_CLOCK_VALIDATION_REJECTED\\n' >> "$REPAIR_TRACE"
+    return 1
+  fi
+  return 0
+}}
+disable_system_suspend() {{ :; }}; identity_provision() {{ :; }}
+claim_label_provision() {{ :; }}; cloud_portal_provision() {{ :; }}
+desktop_setup_provision() {{ :; }}; provision_update_signing_key() {{ :; }}
+stamp_release() {{ :; }}; agent_restart_after_provisioning() {{ :; }}
+rc=0
+run_install --repair || rc=$?
+printf 'INSTALL_RC=%s\\n' "$rc" >> "$REPAIR_TRACE"
+'''
+        result = subprocess.run([BASH, "-c", script], cwd=ROOT / "installer", env=env,
+                                 text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.trace.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(events, ["CAPACITY_VALIDATED_BEFORE_DOWNTIME", "VMS_STOPPED",
+                                  "CHILD_BOOTSTRAP_DEFERRED", "VMS_RESTARTED",
+                                  "POST_RESTART_CLOCK_VALIDATION_REJECTED", "INSTALL_RC=1"])
+        self.assertNotIn("CHILD_BOOTSTRAP_FAILED", events)
 
 
 if __name__ == "__main__":
