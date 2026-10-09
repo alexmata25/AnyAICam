@@ -82,6 +82,12 @@ def release_files(version: str, build_id: str, *, app_files: dict | None = None,
                         f"INSTALLER_SOURCE_COMMIT={'e' * 40}\nMEDIAMTX_INCLUDED=false\nMEDIAMTX_SHA256=\n"
                         f"RELEASE_VERSION={version}\nUPDATE_SIGNING_KEY_SHA256=\n").encode(),
     }
+    # The privileged applier installs these exact fixed-path verifier assets
+    # before stopping the VMS. Keep them in every synthetic signed release so
+    # update integration tests exercise the real package contract.
+    system_dir = Path(__file__).resolve().parents[1] / "system"
+    for name in ("capacity_accept.py", "anyaicam-capacity-accept.path", "anyaicam-capacity-accept.service"):
+        files[f"payload/agent/system/{name}"] = (system_dir / name).read_bytes()
     if entitlement_keyset is not None or entitlement_keyset_sha256 is not _UNSET:
         if entitlement_keyset is not None:
             files["payload/keys/entitlement-signing-public-keys.json"] = entitlement_keyset

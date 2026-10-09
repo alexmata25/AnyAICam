@@ -4,6 +4,7 @@ if [[ $EUID -ne 0 ]]; then echo "Run with sudo." >&2; exit 1; fi
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib-privileged-watcher.sh
 source "$SOURCE_DIR/scripts/lib-privileged-watcher.sh"
+source "$SOURCE_DIR/scripts/lib-capacity-accept.sh"
 systemctl disable --now anyaicam-agent.service 2>/dev/null || true
 rm -f /etc/systemd/system/anyaicam-agent.service
 # Confirmed live on Ryzen (2026-09-11): a hand-created drop-in override
@@ -19,6 +20,10 @@ rm -f /etc/systemd/system/anyaicam-agent.service
 # who created it or why -- removing it here closes this class of defect
 # for any future drop-in, not just this one incident.
 rm -rf /etc/systemd/system/anyaicam-agent.service.d
+# Stop/remove the capacity path trigger before the privileged helper tree is
+# removed. The accepted state and trust anchor remain under /etc for a normal
+# uninstall, preserving offline camera authorization on reinstall.
+uninstall_capacity_accept
 # Pairs with install.sh's own install_privileged_watcher() call -- must
 # run before /opt/anyaicam-agent is removed below (disable the systemd
 # unit before deleting the script it points at, not after) so an

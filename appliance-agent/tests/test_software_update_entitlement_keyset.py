@@ -89,6 +89,32 @@ class ProvisioningTests(KeysetTestCase):
             self.assertEqual(self.applier().apply_staged()["state"], "healthy")
         self.assertEqual(seen, [False])
 
+    def test_capacity_helper_units_and_identity_pin_are_installed_before_downtime(self):
+        self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A}))
+        result = self.applier().apply_staged()
+        self.assertEqual(result["state"], "healthy", result.get("error"))
+        calls = self.host.calls
+        stop = next(index for index, call in enumerate(calls) if call[:2] == ["systemctl", "stop"])
+        helper = next(index for index, call in enumerate(calls)
+                      if len(call) > 3 and call[0:3] == ["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper)])
+        enable = next(index for index, call in enumerate(calls)
+                      if call[:3] == ["systemctl", "enable", "--now"] and call[-1] == "anyaicam-capacity-accept.path")
+        self.assertLess(enable, helper)
+        self.assertLess(helper, stop)
+        for name in ("capacity_accept.py", "anyaicam-capacity-accept.path", "anyaicam-capacity-accept.service"):
+            target = (self.paths.capacity_accept_helper.parent / name if name == "capacity_accept.py"
+                      else self.paths.capacity_accept_systemd / name)
+            self.assertTrue(target.is_file(), name)
+
+    def test_identity_pin_failure_rejects_update_before_vms_downtime(self):
+        self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A}))
+        self.host.fail[("/usr/bin/python3", "-I")] = 1
+        result = self.applier().apply_staged()
+        self.assertEqual(result["state"], "install_failed")
+        self.assertIn("capacity_identity_bootstrap_failed", result["error"])
+        self.assertFalse(any(call[:2] == ["systemctl", "stop"] for call in self.host.calls))
+        self.assertEqual(self.marker()["release_version"], "1.1.0")
+
     def test_rotation_replaces_the_keyset_with_old_and_new_keys(self):
         self.install_existing(keyset(**{"cloud-1": KEY_A}))
         self.stage_with(entitlement_keyset=keyset(**{"cloud-1": KEY_A, "cloud-2": KEY_B}))

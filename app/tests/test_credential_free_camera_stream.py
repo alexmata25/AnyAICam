@@ -21,8 +21,17 @@ def edge_db(tmp_path, monkeypatch):
     db_path = tmp_path / "edge.db"
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
     monkeypatch.setattr(vms_capacity, "STATE_FILE", tmp_path / "vms_capacity.json")
-    # Licensed for 8 (as a cloud sync in this process run would make it; vms_capacity.py).
-    monkeypatch.setattr(vms_capacity, "_legacy_cloud_capacity", {"camera_slot_quantity": 8, "source": "legacy_cloud"})
+    # This stream-focused test uses a fixture representing an eligible,
+    # migrated authorization; unsigned cloud capacity is never trusted.
+    identity = {"appliance_id": "appl-1", "cloud_id": "AIC-1", "customer_id": "cust-1"}
+    fallback = {"schema": 1, "camera_slot_quantity": 8, **identity,
+                "source": "migrated_unsigned_capacity", "migrated_from_version": "1.2.4",
+                "migrated_at": "2026-10-04T00:00:00+00:00", "migrated_by": "installer"}
+    monkeypatch.setattr(vms_capacity, "FALLBACK_FILE", tmp_path / "capacity-fallback.json")
+    vms_capacity.FALLBACK_FILE.write_text(__import__("json").dumps(fallback), encoding="utf-8")
+    import appliance_entitlements
+    monkeypatch.setattr(appliance_entitlements, "_local_identity", lambda: identity)
+    monkeypatch.setattr(appliance_entitlements, "_anchor_file_problem", lambda path: "" if path == vms_capacity.FALLBACK_FILE else "missing")
     monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", Fernet.generate_key().decode())
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database

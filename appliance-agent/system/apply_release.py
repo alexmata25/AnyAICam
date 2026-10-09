@@ -133,6 +133,9 @@ class Paths:
     # once from the unsigned file, and the files it is migrated from (in
     # agent-owned directories: read as untrusted).
     capacity_fallback: Path = Path("/etc/anyaicam-update/vms_capacity_fallback.json")
+    capacity_accepted: Path = Path("/etc/anyaicam-update/vms_capacity_accepted.json")
+    capacity_accept_helper: Path = Path("/opt/anyaicam-agent/privileged/capacity_accept.py")
+    capacity_accept_systemd: Path = Path("/etc/systemd/system")
     legacy_capacity: Path = Path("/var/lib/anyaicam/vms/data-config/vms_capacity.json")
     activation_identity: Path = Path("/var/lib/anyaicam/vms/recordings/appliance_identity.json")
     vms_env: Path = Path("/etc/anyaicam/vms.env")                   # in an agent-owned directory
@@ -1311,6 +1314,7 @@ class Applier:
             self._prepare_before_downtime(manifest, previous)
             record["entitlement_keyset"] = self._install_entitlement_keyset()
             record["capacity_fallback"] = self._migrate_capacity_fallback(previous.get("version", ""))
+            record["capacity_accept"] = self._install_capacity_accept(release_root)
             progress("installing")
             downtime_started = True
             self._activate(manifest)
@@ -1534,6 +1538,83 @@ class Applier:
                                              identity_file=self.paths.activation_identity)
         except TrustAnchorError as error:
             raise Failure("install_failed", error.code, f"migrating the camera capacity failed: {error}") from error
+
+    def _install_capacity_accept(self, release_root: Path) -> str:
+        """Install the fixed root-only acceptance service before VMS downtime.
+
+        Source bytes come only from the already verified release archive. The
+        helper is copied into the root-controlled privileged directory and
+        never imports VMS/agent code. Any install/unit failure rejects the
+        update while the currently running VMS is still untouched.
+        """
+        source = release_root / "payload" / "agent" / "system"
+        owner = (os.geteuid(), os.getegid()) if _posix() else None
+        expected_uid = owner[0] if owner is not None else None
+        files = {
+            "capacity_accept.py": (self.paths.capacity_accept_helper.parent, 0o700),
+            "anyaicam-capacity-accept.path": (self.paths.capacity_accept_systemd, 0o644),
+            "anyaicam-capacity-accept.service": (self.paths.capacity_accept_systemd, 0o644),
+        }
+        contents = {}
+        for name in files:
+            path = source / name
+            try:
+                info = os.lstat(path)
+                if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISREG(info.st_mode):
+                    raise Failure("install_failed", "capacity_accept_payload_unsafe", f"{name} is not a regular package file")
+                contents[name] = read_untrusted(path, max_bytes=128 * 1024,
+                                                expected_uid=expected_uid)
+            except Failure:
+                raise
+            except OSError as error:
+                raise Failure("install_failed", "capacity_accept_payload_missing", f"{name} cannot be read: {error}") from error
+
+        # Refuse, rather than repair, unsafe root destination directories: a
+        # privileged update must not follow a planted link or take ownership
+        # of an unexpected path.
+        directories = {self.paths.capacity_accept_helper.parent, self.paths.capacity_accept_systemd}
+        for directory in directories:
+            try:
+                info = os.lstat(directory)
+            except OSError as error:
+                raise Failure("install_failed", "capacity_accept_destination_unsafe", f"{directory}: {error}") from error
+            if (statmod.S_ISLNK(info.st_mode) or not statmod.S_ISDIR(info.st_mode) or
+                      (_posix() and (info.st_uid != expected_uid or info.st_mode & 0o022))):
+                raise Failure("install_failed", "capacity_accept_destination_unsafe", f"{directory} is not a safe root directory")
+        for name, (directory, mode) in files.items():
+            target = directory / name
+            try:
+                old = os.lstat(target)
+            except FileNotFoundError:
+                old = None
+            except OSError as error:
+                raise Failure("install_failed", "capacity_accept_destination_unsafe", f"{target}: {error}") from error
+            if old is not None and (statmod.S_ISLNK(old.st_mode) or not statmod.S_ISREG(old.st_mode) or
+                                      (_posix() and (old.st_uid != expected_uid or old.st_nlink != 1 or old.st_mode & 0o022))):
+                raise Failure("install_failed", "capacity_accept_destination_unsafe", f"{target} is not a safe root file")
+            safe_replace(directory, name, contents[name], mode=mode, owner=owner)
+
+        for args in (["systemctl", "daemon-reload"],
+                     ["systemctl", "enable", "--now", "anyaicam-capacity-accept.path"]):
+            code, output = self.run(args, 30)
+            if code != 0:
+                raise Failure("install_failed", "capacity_accept_service_failed",
+                              f"enabling the protected capacity acceptance service failed: {output[-300:]}")
+        code, output = self.run(["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper),
+                                 "--bootstrap-identity"], 15)
+        if code != 0:
+            raise Failure("install_failed", "capacity_identity_bootstrap_failed",
+                          f"pinning the local appliance identity failed before downtime: {output[-300:]}")
+        # Bootstrap the current staging snapshot before the VMS is stopped.
+        # This explicit root-only migration invocation may preserve an
+        # expired, correctly signed pre-acceptance snapshot only when no
+        # protected state exists yet. Later updates still require an
+        # unexpired snapshot because _advance validates against the existing
+        # high-water record. Invalid/absent staging leaves prior authority in
+        # place (or the eligible legacy fallback).
+        self.run(["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper),
+                  "--accept-migrated-snapshot"], 15)
+        return "installed_before_downtime"
 
     # ------------------------------------------------------------------ activate (downtime)
     def _systemctl(self, action: str) -> tuple:

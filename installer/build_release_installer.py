@@ -67,6 +67,7 @@ INSTALLER_RUNTIME_FILES = (
     "13-entitlement-signing-keys.sh",
     "14-desktop-setup.sh",
     "15-capacity-fallback.sh",
+    "16-capacity-accept.sh",
     "validate.sh",
     "uninstall.sh",
     "rollback.sh",

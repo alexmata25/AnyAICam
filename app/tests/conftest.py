@@ -251,8 +251,8 @@ def _appliance_entitlements(request, monkeypatch, tmp_path):
     import vms_capacity
     monkeypatch.setattr(vms_capacity, "STATE_FILE", tmp_path / "vms_capacity.json")
     monkeypatch.setattr(vms_capacity, "SIGNED_FILE", tmp_path / "vms_capacity_signed.json")
+    monkeypatch.setattr(vms_capacity, "ACCEPTED_FILE", tmp_path / "trust-anchor" / "vms_capacity_accepted.json")
     monkeypatch.setattr(vms_capacity, "FALLBACK_FILE", tmp_path / "trust-anchor" / "vms_capacity_fallback.json")
-    monkeypatch.setattr(vms_capacity, "_legacy_cloud_capacity", None)
     if request.node.get_closest_marker("real_entitlements") is None:
         monkeypatch.setattr(appliance_entitlements, "feature_allowed", lambda feature, customer_id=None: True)
     yield

@@ -154,6 +154,7 @@ source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"
 source "$INSTALLER_DIR/14-desktop-setup.sh"
 # shellcheck source=15-capacity-fallback.sh
 source "$INSTALLER_DIR/15-capacity-fallback.sh"
+source "$INSTALLER_DIR/16-capacity-accept.sh"
 
 run_install() {
     local mode="install" allow_downgrade=0
@@ -191,11 +192,15 @@ run_install() {
     # before any step that may run code from the agent tree (see
     # 07-install-agent.sh).
     secure_agent_install_root
+    # The signed-capacity key and root acceptance service must be ready
+    # before deploy_vms can stop/recreate the running VMS. On repairs this
+    # first captures the last valid signed authorization for offline use.
+    provision_entitlement_signing_keys
+    install_capacity_accept_step
+    migrate_capacity_fallback_step "$INSTALL_STATE"
     docker_setup
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"
-    # Signed camera capacity (1.2.5): before the new VMS starts.
-    migrate_capacity_fallback_step "$INSTALL_STATE"
     install_rollback_tool
     install_agent "$INSTALL_STATE"
     install_mediamtx "$INSTALL_STATE"
@@ -203,11 +208,15 @@ run_install() {
     systemd_setup
     disable_system_suspend
     identity_provision "$INSTALL_STATE"
+    if [[ "$INSTALL_STATE" == "clean" ]]; then
+        bootstrap_capacity_identity || { echo "[ERROR] Could not pin the local appliance identity for signed capacity." >&2; return 1; }
+    else
+        bootstrap_capacity_identity migration || { echo "[ERROR] Could not pin the local appliance identity for signed capacity." >&2; return 1; }
+    fi
     claim_label_provision
     cloud_portal_provision
     desktop_setup_provision
     provision_update_signing_key
-    provision_entitlement_signing_keys
     stamp_release
     agent_restart_after_provisioning
     log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."

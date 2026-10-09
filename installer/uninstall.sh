@@ -59,6 +59,15 @@ run_uninstall() {
     elif [[ -f "$AGENT_PAYLOAD_DIR/scripts/uninstall.sh" ]]; then
         bash "$AGENT_PAYLOAD_DIR/scripts/uninstall.sh" || true
     else
+        if [[ -f "$AGENT_SOURCE_ROOT/scripts/lib-capacity-accept.sh" ]]; then
+            # shellcheck source=../appliance-agent/scripts/lib-capacity-accept.sh
+            source "$AGENT_SOURCE_ROOT/scripts/lib-capacity-accept.sh"
+            uninstall_capacity_accept
+        elif [[ -f "$AGENT_PAYLOAD_DIR/scripts/lib-capacity-accept.sh" ]]; then
+            # shellcheck source=../appliance-agent/scripts/lib-capacity-accept.sh
+            source "$AGENT_PAYLOAD_DIR/scripts/lib-capacity-accept.sh"
+            uninstall_capacity_accept
+        fi
         systemctl disable --now anyaicam-agent.service 2>/dev/null || true
         rm -f /etc/systemd/system/anyaicam-agent.service
         # Same drop-in-survives-uninstall defect as the VMS unit above --

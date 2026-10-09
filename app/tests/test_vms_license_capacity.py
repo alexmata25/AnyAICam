@@ -122,21 +122,30 @@ def test_the_appliance_configuration_carries_the_usable_capacity(client, db_path
 @pytest.fixture()
 def edge(tmp_path, monkeypatch):
     import vms_capacity
+    import appliance_entitlements
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
     monkeypatch.setattr(vms_capacity, "STATE_FILE", tmp_path / "vms_capacity.json")
+    monkeypatch.setattr(vms_capacity, "ACCEPTED_FILE", tmp_path / "accepted.json")
+    monkeypatch.setattr(vms_capacity, "FALLBACK_FILE", tmp_path / "fallback.json")
+    identity = {"appliance_id": "appl-test", "cloud_id": "AIC-test", "customer_id": "cust-test"}
+    monkeypatch.setattr(appliance_entitlements, "_local_identity", lambda: identity)
+    monkeypatch.setattr(appliance_entitlements, "_anchor_file_problem", lambda _path: "")
     state = {"activated": True}
     monkeypatch.setattr(vms_capacity, "_activated", lambda: state["activated"])
-    return vms_capacity, state
+    return vms_capacity, state, identity
 
 
-def _license(vms_capacity, quantity, **fields):
-    """A capacity in force, as an accepted configuration sync makes it
-    (where it may come from is tested in test_signed_camera_capacity.py)."""
-    vms_capacity._legacy_cloud_capacity = vms_capacity._record({"camera_slot_quantity": quantity, **fields}, "legacy_cloud")
+def _license(vms_capacity, quantity, identity, **fields):
+    """A safe migrated test authorization; signed acceptance is covered elsewhere."""
+    record = {"schema": 1, "camera_slot_quantity": quantity, **identity,
+              "source": "migrated_unsigned_capacity", "migrated_from_version": "1.2.4",
+              "migrated_at": "2026-10-09T00:00:00+00:00", "migrated_by": "installer"}
+    record.update(fields)
+    vms_capacity.FALLBACK_FILE.write_text(__import__("json").dumps(record), encoding="utf-8")
 
 
 def test_a_never_claimed_copied_install_runs_no_camera(edge, monkeypatch):
-    vms_capacity, state = edge
+    vms_capacity, state, _ = edge
     state["activated"] = False
     assert vms_capacity.licensed_camera_numbers([1, 2, 3, 4]) == []
     import main
@@ -147,8 +156,8 @@ def test_a_never_claimed_copied_install_runs_no_camera(edge, monkeypatch):
 
 
 def test_a_synced_capacity_limits_which_cameras_run(edge, monkeypatch):
-    vms_capacity, _ = edge
-    _license(vms_capacity, 2, plan_camera_slots=8, vms_license_capacity=2)
+    vms_capacity, _, identity = edge
+    _license(vms_capacity, 2, identity, plan_camera_slots=8, vms_license_capacity=2)
     assert vms_capacity.licensed_camera_numbers([3, 1, 2]) == [1, 2]
     import main
     monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2, 3])
@@ -158,14 +167,14 @@ def test_a_synced_capacity_limits_which_cameras_run(edge, monkeypatch):
     # A licensed camera still resolves normally.
     monkeypatch.setenv("CAMERA1_HOST", "192.0.2.11")
     assert "192.0.2.11" in main.camera_url(1)
-    _license(vms_capacity, 0)
+    _license(vms_capacity, 0, identity)
     assert vms_capacity.licensed_camera_numbers([1, 2, 3]) == []
 
 
 def test_an_activated_appliance_runs_nothing_before_its_first_authoritative_sync(edge, monkeypatch):
     """Fail closed (2026-10-02, Codex): before the cloud has said what this
     appliance may run, nothing runs -- legacy CAMERA<n>_* settings included."""
-    vms_capacity, state = edge
+    vms_capacity, state, _ = edge
     state["activated"] = True
     assert vms_capacity.licensed_camera_numbers([1, 2, 3]) == []
     import main
@@ -180,13 +189,13 @@ def test_an_activated_appliance_runs_nothing_before_its_first_authoritative_sync
 
 @pytest.mark.parametrize("capacity,expected", [(0, []), (1, [1]), (2, [1, 2]), (8, [1, 2, 3])])
 def test_authoritative_capacity_allows_exactly_n(edge, capacity, expected):
-    vms_capacity, _ = edge
-    _license(vms_capacity, capacity)
+    vms_capacity, _, identity = edge
+    _license(vms_capacity, capacity, identity)
     assert vms_capacity.licensed_camera_numbers([3, 1, 2]) == expected
 
 
 def test_a_later_valid_sync_enables_the_licensed_cameras(edge, monkeypatch):
-    vms_capacity, state = edge
+    vms_capacity, state, identity = edge
     state["activated"] = True
     import main
     monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2])
@@ -194,7 +203,7 @@ def test_a_later_valid_sync_enables_the_licensed_cameras(edge, monkeypatch):
     monkeypatch.setenv("CAMERA2_HOST", "192.0.2.22")
     with pytest.raises(main.CameraNotLicensedError):
         main.camera_url(1)
-    _license(vms_capacity, 1)  # first configuration sync
+    _license(vms_capacity, 1, identity)  # eligible migrated test authorization
     assert "192.0.2.21" in main.camera_url(1)
     with pytest.raises(main.CameraNotLicensedError):
         main.camera_url(2)
@@ -209,21 +218,21 @@ def test_claiming_never_depends_on_capacity(client, db_path):
 
 
 def test_an_older_cloud_without_capacity_changes_nothing(edge):
-    vms_capacity, _ = edge
+    vms_capacity, _, _ = edge
     assert vms_capacity.apply_sync(None, None) == "absent"
     assert vms_capacity.apply_sync({"camera_slot_quantity": 8}, None) == "absent"  # unsigned only: not accepted
     assert vms_capacity.load_capacity() is None
 
 
 def test_the_cloud_never_restricts_itself(edge, monkeypatch):
-    vms_capacity, state = edge
+    vms_capacity, state, _ = edge
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
     state["activated"] = False
     assert vms_capacity.licensed_camera_numbers([1]) is None
 
 
 def test_configuration_sync_stores_the_capacity(edge, monkeypatch):
-    vms_capacity, _ = edge
+    vms_capacity, _, _ = edge
     import edge_camera_sync
     source = open(edge_camera_sync.__file__, encoding="utf-8").read()
     assert 'vms_capacity.apply_sync(response.get("usable_camera_capacity"), response.get("feature_entitlements"))' in source

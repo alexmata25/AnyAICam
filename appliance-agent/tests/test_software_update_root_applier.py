@@ -92,6 +92,12 @@ class ApplierTestCase(unittest.TestCase):
         self.paths.capacity_fallback = self.tmp / "etc/anyaicam-update/vms_capacity_fallback.json"
         self.paths.legacy_capacity = self.tmp / "var/lib/anyaicam/vms/data-config/vms_capacity.json"
         self.paths.activation_identity = self.tmp / "var/lib/anyaicam/vms/recordings/appliance_identity.json"
+        self.paths.capacity_accept_helper = self.tmp / "opt/anyaicam-agent/privileged/capacity_accept.py"
+        self.paths.capacity_accept_systemd = self.tmp / "etc/systemd/system"
+        self.paths.capacity_accept_helper.parent.mkdir(parents=True)
+        self.paths.capacity_accept_systemd.mkdir(parents=True)
+        self.paths.activation_identity.parent.mkdir(parents=True)
+        self.paths.activation_identity.write_text(json.dumps({"appliance_id": "appl-test"}))
         self.private_key, public_pem = generate_keypair()
         self.paths.trusted_key.parent.mkdir(parents=True)
         self.paths.trusted_key.write_bytes(public_pem)
@@ -186,12 +192,13 @@ class SuccessTests(ApplierTestCase):
     def test_every_command_is_a_fixed_argv_with_only_validated_values(self):
         self.stage(requested_by="x$(reboot);`id` ../../etc/passwd\n")
         self.applier().apply_staged()
-        allowed = re.compile(r"^(docker|systemctl|build|exec|tag|stop|start|python|-c|-t|anyaicam-vms(\.service)?|"
+        allowed = re.compile(r"^(docker|systemctl|build|exec|tag|stop|start|enable|python|-c|-t|daemon-reload|--now|"
+                             r"/usr/bin/python3|-I|--bootstrap-identity|--accept-migrated-snapshot|anyaicam-capacity-accept\.(path|service)|anyaicam-vms(\.service)?|"
                              r"anyaicam-vms:(latest|release-[0-9a-f]{12}|rollback-[0-9a-f]{12})|"
                              r"partner_portal-pre-[0-9a-f]{12}-\d{8}T\d{6}Z\.db)$")
         for call in self.host.calls:
             for token in call:
-                if token == str(self.paths.next) or token.startswith("import sqlite3"):
+                if token in {str(self.paths.next), str(self.paths.capacity_accept_helper)} or token.startswith("import sqlite3"):
                     continue
                 self.assertRegex(token, allowed, f"unexpected argv token {token!r} in {call}")
         audit = json.loads(self.paths.audit_log.read_text().splitlines()[-1])
@@ -217,12 +224,12 @@ class RollbackTests(ApplierTestCase):
 
     def test_a_release_whose_vms_never_starts_is_rolled_back(self):
         self.stage()
-        self.host.fail = {("systemctl", "start"): 1}
+        self.host.fail = {("systemctl", "start", "anyaicam-vms.service"): 1}
         applier = self.applier()
         original = self.host.run
 
         def run(argv, timeout):
-            if argv[:2] == ["systemctl", "start"] and (self.paths.live / "app/static/release-identity.json").read_text().find(BUILD_A) >= 0:
+            if argv[:3] == ["systemctl", "start", "anyaicam-vms.service"] and (self.paths.live / "app/static/release-identity.json").read_text().find(BUILD_A) >= 0:
                 self.host.fail = {}
             return original(argv, timeout)
         applier.run = run

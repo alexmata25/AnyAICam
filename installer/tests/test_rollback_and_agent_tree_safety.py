@@ -831,7 +831,10 @@ class OrderTests(unittest.TestCase):
                       "select_product_mode"):
             self.assertLess(steps.index(check), secure, check)
         self.assertEqual(steps[secure - 1], 'storage_preflight "$INSTALL_STATE"')
-        self.assertEqual(steps[secure + 1], "docker_setup")
+        self.assertEqual(steps[secure + 1], "provision_entitlement_signing_keys")
+        self.assertEqual(steps[secure + 2], "install_capacity_accept_step")
+        self.assertEqual(steps[secure + 3], 'migrate_capacity_fallback_step "$INSTALL_STATE"')
+        self.assertEqual(steps[secure + 4], "docker_setup")
         for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"", "install_agent \"$INSTALL_STATE\"",
                       "systemd_setup", "provision_update_signing_key", "provision_entitlement_signing_keys"):
             self.assertGreater(steps.index(later), secure, later)

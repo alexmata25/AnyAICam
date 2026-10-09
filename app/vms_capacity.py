@@ -1,76 +1,42 @@
-"""Licensed camera capacity on the appliance (2026-10-01; signed 2026-10-09).
+"""Licensed camera capacity on the appliance.
 
-Claiming an appliance is open to any customer account; what the VMS may
-actually run is not. The cloud sends this appliance's usable capacity --
-the smaller of the customer's camera plan and their VMS software license
-(customer_entitlements.usable_camera_capacity()) -- with every configuration
-sync, and it is kept here so it keeps applying offline (Local mode).
+Cloud configuration sync writes its signed camera-capacity snapshot only to
+untrusted staging. A separate, root-owned systemd helper verifies the cloud
+signature, fixed trust anchor, appliance/cloud/customer identity, expiry on
+arrival, and monotonic issue-time high-water mark before atomically promoting
+the snapshot to ACCEPTED_FILE. The VMS reads only that protected accepted
+store. Its expiry is deliberately not enforced after acceptance so the last
+authorized camera limit continues to apply during an offline period.
 
-The recording/live pipeline asks camera_licensed() through camera_url(), the
-one place every camera worker resolves its camera:
-
-- capacity known: only the first N provisioned camera numbers run
-  (0 runs none);
-- no authoritative capacity -- never claimed, claimed moments ago, or
-  nothing below applies -- nothing runs (fail closed, 2026-10-02 Codex
-  finding). The first configuration sync (seconds after activation) enables
-  the licensed cameras; the supervisor keeps polling refused slots, so no
-  restart is needed. Claiming and registering never depend on this.
-
-Where the capacity comes from (2026-10-09, owner-approved Option A; before,
-the unsigned vms_capacity.json -- writable by the anyaicam account -- was
-trusted, so the limit could be raised offline), in this order:
-
- 1. signed: camera_capacity inside the cloud's signed entitlement snapshot
-    (feature_entitlements.appliance_snapshot), verified on every read
-    against the root-owned trust anchor and this appliance's activation
-    identity (appliance_entitlements.verify). Its expiry is NOT enforced:
-    the last signed limit keeps applying offline, so recording never stops
-    because the cloud is unreachable. A newer signed limit replaces it
-    (never an older one).
- 2. legacy cloud, transitional: a cloud deployed before this change signs
-    no capacity. Only then -- the sync's signed snapshot verifies, is
-    unexpired and carries no camera_capacity -- the unsigned value of a sync
-    received IN THIS PROCESS RUN is used (held in memory, never read back
-    from disk), and never once a signed capacity has been accepted. It ends
-    by itself within the snapshot TTL (24 h) after the cloud ships, and is
-    removed in the release after that. The signed cloud change must be
-    deployed before this release is installed for customers.
- 3. migrated: FALLBACK_FILE, written once, root:root 0644, by the installer
-    or Software Update when an appliance is upgraded from a release that
-    did not sign capacity (installer/apply_release migration). Used only
-    while no signed capacity is present, only for the activation identity
-    it was migrated for, and only when it is a safe root-owned file. Keeps
-    an upgraded offline appliance recording.
- 4. none: fail closed.
-
-STATE_FILE (the old unsigned vms_capacity.json) is still written, from
-accepted values only, so a rollback to 1.2.4 keeps the right limit; it is
-never read for enforcement.
-
-A cloud process runs no camera pipeline and is never restricted here.
+Eligible pre-1.2.5 installations can still use the existing root-owned
+FALLBACK_FILE migration until a signed authorization is first accepted. That
+migration preserves the existing offline policy and its documented
+pre-migration provenance limitation. Unsigned cloud capacity is never used.
+The old STATE_FILE is maintained by the root helper only as a compatibility
+mirror for an intentional rollback to 1.2.4; this release never reads it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+import stat
+import tempfile
 
 logger = logging.getLogger("anyaicam.vms_capacity")
 
-STATE_FILE = Path(os.environ.get("ANYAICAM_VMS_CAPACITY_FILE", "/opt/anyaicam/data/config/vms_capacity.json"))
-SIGNED_FILE = Path(os.environ.get("ANYAICAM_VMS_CAPACITY_SIGNED_FILE", "/opt/anyaicam/data/config/vms_capacity_signed.json"))
-# Root-owned, beside the trust anchor (read-only mount). Deliberately not
-# configurable from the environment: vms.env is writable by the anyaicam user.
+STATE_FILE = Path("/opt/anyaicam/data/config/vms_capacity.json")
+# Fixed input path: runtime environment from vms.env must not redirect staging.
+SIGNED_FILE = Path("/opt/anyaicam/data/config/vms_capacity_signed.json")
+# Root-owned beside the entitlement trust anchor; never environment-configurable.
+ACCEPTED_FILE = Path("/etc/anyaicam-update/vms_capacity_accepted.json")
+_DEFAULT_ACCEPTED_FILE = ACCEPTED_FILE
 FALLBACK_FILE = Path("/etc/anyaicam-update/vms_capacity_fallback.json")
-
 MAX_CAMERA_SLOTS = 10_000
-_MAX_FILE_BYTES = 256 * 1024
-
-# Source 2: the unsigned capacity of a sync from a legacy cloud, this process run only.
-_legacy_cloud_capacity: dict | None = None
+_MAX_FILE_BYTES = 512 * 1024
 
 
 def _quantity(value) -> int | None:
@@ -91,18 +57,6 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
-def _write_json(path: Path, data: dict) -> bool:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(data), encoding="utf-8")
-        temporary.replace(path)
-        return True
-    except OSError as error:
-        logger.warning("vms_capacity.persist_failed file=%s error=%s", path.name, type(error).__name__)
-        return False
-
-
 def _record(capacity: dict, source: str) -> dict | None:
     quantity = _quantity(capacity.get("camera_slot_quantity"))
     if quantity is None:
@@ -111,49 +65,77 @@ def _record(capacity: dict, source: str) -> dict | None:
             "vms_license_capacity": capacity.get("vms_license_capacity"), "source": source}
 
 
-def _legacy_copy(record: dict) -> None:
-    """The unsigned file a rollback to 1.2.4 reads; never read here."""
-    _write_json(STATE_FILE, {key: record[key] for key in ("camera_slot_quantity", "plan_camera_slots", "vms_license_capacity")})
-
-
-# ------------------------------------------------------------------ 1. signed
-
 def _verified_capacity(snapshot, *, check_expiry: bool) -> tuple[str | None, dict | None]:
-    """(reason, capacity record): reason is None when the snapshot verifies;
-    the record is None when it carries no usable camera_capacity."""
+    """(reason, capacity record): reason is None when signature and identity verify."""
     import appliance_entitlements
     reason = appliance_entitlements.verify(snapshot, appliance_entitlements._trusted_keys(),
                                            identity=appliance_entitlements._local_identity(),
                                            check_expiry=check_expiry)
     if reason:
         return reason, None
-    capacity = snapshot.get("camera_capacity")
+    capacity = snapshot.get("camera_capacity") if isinstance(snapshot, dict) else None
     return None, (_record(capacity, "signed") if isinstance(capacity, dict) else None)
 
 
-def _stored_signed() -> tuple[dict | None, dict | None]:
-    """(snapshot, record) of the stored signed capacity when it still
-    verifies (signature, trust anchor, identity; expiry not enforced)."""
-    snapshot = _read_json(SIGNED_FILE)
-    if snapshot is None:
-        return None, None
-    reason, record = _verified_capacity(snapshot, check_expiry=False)
-    if reason or record is None:
-        logger.info("vms_capacity.signed_ignored reason=%s", reason or "malformed_capacity")
-        return None, None
-    return snapshot, record
-
-
-def _issued(snapshot: dict | None) -> datetime | None:
+def _accepted_signed() -> tuple[bool, dict | None]:
+    """Return (accepted-store-present, usable record); unsafe presence fails closed."""
     import appliance_entitlements
-    return appliance_entitlements._parse_time((snapshot or {}).get("issued_at"))
+
+    try:
+        parent = os.lstat(ACCEPTED_FILE.parent)
+        if (stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode) or
+                (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
+                 (parent.st_uid != 0 or parent.st_mode & 0o022))):
+            return os.path.lexists(ACCEPTED_FILE), None
+        try:
+            before = os.lstat(ACCEPTED_FILE)
+        except FileNotFoundError:
+            return False, None
+        if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+                (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
+                 (before.st_uid != 0 or before.st_mode & 0o022))):
+            return True, None
+        fd = os.open(ACCEPTED_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                     getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                    (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
+                     (opened.st_uid != 0 or opened.st_mode & 0o022))):
+                return True, None
+            raw = handle.read(_MAX_FILE_BYTES + 1)
+        if len(raw) > _MAX_FILE_BYTES:
+            return True, None
+        state = json.loads(raw.decode("utf-8"))
+        if not isinstance(state, dict) or state.get("schema") != 1:
+            return True, None
+        accepted_identity = appliance_entitlements._bound_identity(state.get("identity"))
+        local_identity = appliance_entitlements._local_identity()
+        if accepted_identity is None or accepted_identity != local_identity:
+            return True, None
+        snapshot = state.get("snapshot")
+        reason, record = _verified_capacity(snapshot, check_expiry=False)
+        if reason or record is None:
+            return True, None
+        body = {key: value for key, value in snapshot.items() if key != "signature"}
+        high_water = state.get("high_water")
+        issued = appliance_entitlements._parse_time(body.get("issued_at"))
+        normalized_issued = issued.astimezone(timezone.utc).isoformat() if issued else None
+        if (not isinstance(high_water, dict) or normalized_issued is None or
+                high_water.get("issued_at") != normalized_issued or
+                high_water.get("digest") != hashlib.sha256(_canonical_json(body)).hexdigest()):
+            return True, None
+        return True, record
+    except (OSError, ValueError, TypeError):
+        return os.path.lexists(ACCEPTED_FILE), None
 
 
-# ------------------------------------------------------------------ 3. migrated
+def _canonical_json(body: dict) -> bytes:
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
 
 def _fallback_capacity() -> dict | None:
-    """The installer/Software Update migrated limit, or None when absent,
-    unsafe, malformed or for another identity."""
+    """The existing installer/Software Update migrated limit, if safe."""
     import appliance_entitlements
     if not os.path.lexists(FALLBACK_FILE):
         return None
@@ -166,7 +148,8 @@ def _fallback_capacity() -> dict | None:
         logger.warning("vms_capacity.fallback_ignored problem=malformed")
         return None
     identity = appliance_entitlements._local_identity()
-    if identity is None or any(data.get(field) != identity[field] for field in appliance_entitlements.BOUND_IDENTITY_FIELDS):
+    if identity is None or any(data.get(field) != identity[field]
+                               for field in appliance_entitlements.BOUND_IDENTITY_FIELDS):
         logger.info("vms_capacity.fallback_ignored problem=other_identity")
         return None
     record = _record(data, "migrated")
@@ -175,50 +158,67 @@ def _fallback_capacity() -> dict | None:
     return record
 
 
-# ------------------------------------------------------------------ sync and reads
+def _stage_snapshot(path: Path, snapshot: dict) -> bool:
+    """Stage untrusted cloud data using a unique no-follow temp and atomic replace."""
+    raw = (json.dumps(snapshot, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(raw) > _MAX_FILE_BYTES:
+        logger.warning("vms_capacity.stage_rejected reason=too_large")
+        return False
+    directory_fd = None
+    temporary = f".{path.name}.{os.getpid()}.{os.urandom(12).hex()}.tmp"
+    try:
+        if os.name == "posix" and os.open in getattr(os, "supports_dir_fd", set()):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory_fd)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+            temporary = temp_path
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        return True
+    except (OSError, TypeError, NotImplementedError) as error:
+        logger.warning("vms_capacity.stage_failed error=%s", type(error).__name__)
+        return False
+    finally:
+        try:
+            if directory_fd is not None:
+                os.unlink(temporary, dir_fd=directory_fd)
+                os.close(directory_fd)
+            elif isinstance(temporary, str) and os.path.isabs(temporary):
+                os.unlink(temporary)
+        except OSError:
+            pass
+
 
 def apply_sync(breakdown, snapshot) -> str:
-    """Called by each configuration sync with its unsigned
-    usable_camera_capacity and its signed entitlement snapshot. Returns the
-    outcome. An invalid or capacity-less snapshot never removes an accepted
-    signed limit (a bad sync does not stop recording)."""
-    global _legacy_cloud_capacity
+    """Stage signed data for the root service; unsigned capacity is ignored."""
     if snapshot is None:
         return "absent"
-    reason, record = _verified_capacity(snapshot, check_expiry=True)
-    stored, _ = _stored_signed()
-    if reason is None and record is not None:
-        stored_issued, new_issued = _issued(stored), _issued(snapshot)
-        if stored_issued and new_issued and new_issued < stored_issued:
-            return "older_than_stored"
-        if not _write_json(SIGNED_FILE, snapshot):
-            return "persist_failed"
-        _legacy_cloud_capacity = None
-        _legacy_copy(record)
-        return "signed"
-    if reason is None and "camera_capacity" not in snapshot:
-        # A cloud deployed before capacity was signed (transitional, see the module docstring).
-        if stored is not None:
-            return "ignored_unsigned"
-        legacy = _record(breakdown, "legacy_cloud") if isinstance(breakdown, dict) else None
-        if legacy is None:
-            return "ignored_unsigned"
-        _legacy_cloud_capacity = legacy
-        _legacy_copy(legacy)
-        return "legacy_cloud"
-    logger.warning("vms_capacity.sync_rejected reason=%s", reason or "malformed_capacity")
-    return f"rejected:{reason or 'malformed_capacity'}"
+    if not isinstance(snapshot, dict):
+        logger.warning("vms_capacity.stage_rejected reason=malformed_snapshot")
+        return "stage_failed"
+    return "staged" if _stage_snapshot(SIGNED_FILE, snapshot) else "stage_failed"
 
 
 def load_capacity() -> dict | None:
-    """The capacity in force -- {"camera_slot_quantity", ..., "source"} -- or
-    None (fail closed). Never raises."""
+    """The authorized capacity, or None (fail closed). Never raises."""
     try:
-        _, record = _stored_signed()
+        store_exists, record = _accepted_signed()
         if record is not None:
             return record
-        if _legacy_cloud_capacity is not None:
-            return dict(_legacy_cloud_capacity)
+        if store_exists:
+            return None
         return _fallback_capacity()
     except Exception:
         logger.exception("vms_capacity.load_failed")
@@ -238,14 +238,13 @@ def _activated() -> bool:
 
 
 def licensed_camera_numbers(provisioned: list[int]) -> list[int] | None:
-    """The provisioned camera numbers this appliance may run, or None for
-    "no limit applies" (the cloud only, which runs no cameras)."""
+    """Allowed provisioned numbers, or None for cloud runtime (no cameras)."""
     if _cloud_runtime():
         return None
     capacity = load_capacity()
     if capacity is None:
-        return []  # no authoritative capacity: fail closed
-    return sorted(provisioned)[: int(capacity["camera_slot_quantity"])]
+        return []
+    return sorted(provisioned)[:int(capacity["camera_slot_quantity"])]
 
 
 def camera_licensed(camera_number: int, provisioned: list[int]) -> bool:

@@ -7,6 +7,7 @@ umask 022
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib-privileged-watcher.sh
 source "$SOURCE_DIR/scripts/lib-privileged-watcher.sh"
+source "$SOURCE_DIR/scripts/lib-capacity-accept.sh"
 chmod 0755 "$SOURCE_DIR"/scripts/*.sh
 id -u anyaicam >/dev/null 2>&1 || useradd --system --home /var/lib/anyaicam --shell /usr/sbin/nologin anyaicam
 # /opt/anyaicam-agent holds the venv and the root-only privileged/ folder the
@@ -40,4 +41,8 @@ systemctl enable anyaicam-agent.service
 # uses for anyaicam-vms.service.
 systemctl restart anyaicam-agent.service
 install_privileged_watcher "$SOURCE_DIR"
+install_capacity_accept "$SOURCE_DIR/system"
+if [[ -f /var/lib/anyaicam/vms/recordings/appliance_identity.json ]]; then
+  bootstrap_capacity_identity
+fi
 echo "Installed and running. Run: sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup"

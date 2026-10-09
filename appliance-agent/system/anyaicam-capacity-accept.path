@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for a new signed AnyAiCam camera-capacity snapshot
+
+[Path]
+# The VMS may write this file, but it is only untrusted staging input.
+# The root helper independently verifies it and atomically promotes it to
+# /etc/anyaicam-update/vms_capacity_accepted.json.
+PathChanged=/var/lib/anyaicam/vms/data-config/vms_capacity_signed.json
+Unit=anyaicam-capacity-accept.service
+
+[Install]
+WantedBy=multi-user.target

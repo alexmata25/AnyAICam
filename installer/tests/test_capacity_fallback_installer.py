@@ -117,13 +117,13 @@ migrate_capacity_fallback_step {state}
 
 
 class WiringTests(unittest.TestCase):
-    def test_the_step_runs_after_the_old_vms_stops_and_before_the_new_one_starts(self):
+    def test_the_step_runs_before_vms_downtime(self):
         source = (ROOT / "install.sh").read_text(encoding="utf-8")
         body = source.split("run_install() {", 1)[1]
         self.assertIn('source "$INSTALLER_DIR/15-capacity-fallback.sh"', source)
         step = body.index('migrate_capacity_fallback_step "$INSTALL_STATE"')
         self.assertLess(body.index('release_downgrade_guard "$allow_downgrade"'), step)
-        self.assertLess(body.index('deploy_vms "$INSTALL_STATE"'), step)
+        self.assertLess(step, body.index('deploy_vms "$INSTALL_STATE"'))
         self.assertLess(step, body.index("systemd_setup"))
         self.assertLess(step, body.index("stamp_release"))   # the replaced release is still the recorded one
 
@@ -131,6 +131,7 @@ class WiringTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT))
         from build_release_installer import INSTALLER_RUNTIME_FILES
         self.assertIn("15-capacity-fallback.sh", INSTALLER_RUNTIME_FILES)
+        self.assertIn("16-capacity-accept.sh", INSTALLER_RUNTIME_FILES)
 
     def test_the_step_uses_the_shipped_applier_and_no_path_from_the_environment(self):
         step = (ROOT / "15-capacity-fallback.sh").read_text(encoding="utf-8")

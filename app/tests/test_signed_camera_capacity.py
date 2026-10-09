@@ -16,7 +16,14 @@ import pytest
 import appliance_entitlements
 import vms_capacity
 from test_appliance_feature_entitlements import (  # noqa: F401 -- fixtures and helpers
-    EDGE_IDENTITY, _resign, _sync, appliance, cloud_client, cloud_db, edge_db, edge_env)
+    EDGE_IDENTITY, _resign, _sync as _cloud_sync, appliance, cloud_client, cloud_db, edge_db, edge_env)
+
+import sys
+from pathlib import Path
+_SYSTEM_DIR = Path(__file__).resolve().parents[2] / "appliance-agent" / "system"
+if str(_SYSTEM_DIR) not in sys.path:
+    sys.path.insert(0, str(_SYSTEM_DIR))
+import capacity_accept
 
 pytestmark = pytest.mark.real_entitlements
 
@@ -44,8 +51,36 @@ def _signed_snapshot():
 
 
 def _restart(monkeypatch):
-    """A VMS restart: nothing held in memory survives."""
-    monkeypatch.setattr(vms_capacity, "_legacy_cloud_capacity", None)
+    """A VMS restart rereads the protected accepted store."""
+    return None
+
+
+def _sync(edge_db):
+    """Exercise cloud sync and simulate the root path trigger without sudo."""
+    result = _cloud_sync(edge_db)
+    snapshot = _signed_snapshot()
+    if snapshot and snapshot.get("camera_capacity"):
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        keys = {key_id: base64.b64decode(value)
+                for key_id, value in appliance_entitlements._trusted_keys().items()}
+
+        def verify(raw_key, message, signature):
+            try:
+                Ed25519PublicKey.from_public_bytes(raw_key).verify(signature, message)
+                return True
+            except Exception:
+                return False
+
+        current = vms_capacity._read_json(vms_capacity.ACCEPTED_FILE)
+        try:
+            accepted, _ = capacity_accept._advance(snapshot, keys, EDGE_IDENTITY, current, verifier=verify)
+        except capacity_accept.Reject:
+            pass
+        else:
+            vms_capacity.ACCEPTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            vms_capacity.ACCEPTED_FILE.write_text(json.dumps(accepted), encoding="utf-8")
+    return result
 
 
 def _fallback(quantity=5, **changes):
@@ -102,7 +137,7 @@ def test_an_edited_signed_capacity_is_not_accepted(licensed, edge_db, monkeypatc
     tamper(snapshot)
     vms_capacity.SIGNED_FILE.write_text(json.dumps(snapshot), encoding="utf-8")
     _restart(monkeypatch)
-    assert _running() == []  # fail closed: no signed limit, no fallback on this appliance
+    assert _running() == [1, 2, 3]  # rejected staging cannot revoke accepted authorization
 
 
 def test_a_limit_signed_by_an_attacker_key_is_not_accepted(licensed, edge_db, monkeypatch):
@@ -118,15 +153,15 @@ def test_a_limit_signed_by_an_attacker_key_is_not_accepted(licensed, edge_db, mo
     forged = {**body, "signature": appliance_identity.sign_body(body, key_id="attacker",
                                                                private_key_b64=base64.b64encode(raw).decode())}
     vms_capacity.SIGNED_FILE.write_text(json.dumps(forged), encoding="utf-8")
-    assert _running() == []
-    assert vms_capacity.apply_sync({"camera_slot_quantity": 64}, forged).startswith("rejected:")
+    assert _running() == [1, 2, 3]
+    assert vms_capacity.apply_sync({"camera_slot_quantity": 64}, forged) == "staged"
 
 
 def test_another_appliances_signed_capacity_is_not_accepted(licensed, edge_db, cloud_db, monkeypatch):
     _sync(edge_db)
     other = _resign(_signed_snapshot(), cloud_db, appliance_id="appl-other")
     vms_capacity.SIGNED_FILE.write_text(json.dumps(other), encoding="utf-8")
-    assert _running() == []
+    assert _running() == [1, 2, 3]
 
 
 def test_an_older_signed_capacity_never_replaces_a_newer_one(licensed, edge_db, cloud_db):
@@ -134,7 +169,7 @@ def test_an_older_signed_capacity_never_replaces_a_newer_one(licensed, edge_db, 
     older = _resign(_signed_snapshot(), cloud_db, issued_at="2026-01-01T00:00:00+00:00",
                     expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
                     camera_capacity={"camera_slot_quantity": 8, "plan_camera_slots": 8, "vms_license_capacity": 64})
-    assert vms_capacity.apply_sync({"camera_slot_quantity": 8}, older) == "older_than_stored"
+    assert vms_capacity.apply_sync({"camera_slot_quantity": 8}, older) == "staged"
     assert _running() == [1, 2, 3]
 
 
@@ -143,9 +178,9 @@ def test_a_signed_capacity_outside_the_supported_range_is_not_accepted(licensed,
     _sync(edge_db)
     bad = _resign(_signed_snapshot(), cloud_db, camera_capacity={"camera_slot_quantity": quantity})
     vms_capacity.SIGNED_FILE.unlink()
-    assert vms_capacity.apply_sync({"camera_slot_quantity": 2}, bad).startswith("rejected:")
+    assert vms_capacity.apply_sync({"camera_slot_quantity": 2}, bad) == "staged"
     _restart(monkeypatch)
-    assert _running() == []
+    assert _running() == [1, 2, 3]
 
 
 # ------------------------------------------------------------------ offline operation
@@ -171,10 +206,11 @@ def test_a_bad_sync_never_removes_the_accepted_signed_limit(licensed, edge_db, a
     assert _running() == [1, 2, 3]
 
 
-def test_the_unsigned_file_still_follows_the_signed_limit_for_a_rollback_to_1_2_4(licensed, edge_db):
+def test_the_unsigned_file_is_never_runtime_authority(licensed, edge_db):
     licensed["n"] = 4
     _sync(edge_db)
-    assert json.loads(vms_capacity.STATE_FILE.read_text())["camera_slot_quantity"] == 4
+    vms_capacity.STATE_FILE.write_text(json.dumps({"camera_slot_quantity": 64}), encoding="utf-8")
+    assert _running() == [1, 2, 3, 4]
 
 
 # ------------------------------------------------------------------ a cloud that does not sign capacity yet
@@ -198,15 +234,14 @@ def _resign_without(snapshot, cloud_db):
     return {**body, "signature": appliance_identity.sign_body(body, key_id=key["key_id"], private_key_b64=key["private_key_b64"])}
 
 
-def test_with_a_legacy_cloud_the_synced_value_applies_only_in_this_process_run(licensed, edge_db, cloud_db, appliance, monkeypatch):
+def test_with_a_legacy_cloud_unsigned_capacity_is_never_accepted(licensed, edge_db, cloud_db, appliance, monkeypatch):
     appliance["rewrite"] = _legacy_cloud(cloud_db)
     _sync(edge_db)
-    assert _running() == [1, 2, 3]
-    assert vms_capacity.load_capacity()["source"] == "legacy_cloud"
+    assert _running() == []
     vms_capacity.STATE_FILE.write_text(json.dumps({"camera_slot_quantity": 64}), encoding="utf-8")
-    assert _running() == [1, 2, 3]  # the file is never read back
+    assert _running() == []  # the unsigned file is never read
     _restart(monkeypatch)
-    assert _running() == []  # an offline restart with a legacy cloud: no fallback on a fresh install
+    assert _running() == []
 
 
 def test_with_a_legacy_cloud_an_expired_snapshot_grants_nothing(licensed, edge_db, cloud_db, appliance):

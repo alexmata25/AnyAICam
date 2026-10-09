@@ -1,0 +1,33 @@
+[Unit]
+Description=Verify and accept AnyAiCam camera capacity
+# A compromised VMS can rewrite its staging file. Bound trigger cost while
+# ensuring ordinary 60-second configuration syncs are never rate limited.
+StartLimitIntervalSec=10s
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /opt/anyaicam-agent/privileged/capacity_accept.py
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+# Read-only access is needed for 0600 files owned by the anyaicam service;
+# CHOWN establishes protected file ownership and DAC_OVERRIDE lets the fixed
+# compatibility mirror be atomically replaced in the service-owned data dir.
+# ProtectSystem/ReadWritePaths still confines writes to the two declared trees.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+ReadWritePaths=/etc/anyaicam-update /var/lib/anyaicam/vms/data-config
