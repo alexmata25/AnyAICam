@@ -73,12 +73,13 @@ def test_every_cloud_snapshot_is_accepted_by_the_helper(cloud, edge_db, slots, p
     assert len(digest) == 64 and datetime.fromisoformat(issued_at).tzinfo is not None
 
 
-def test_a_cloud_value_above_the_helpers_bound_is_rejected_not_truncated(cloud, edge_db):
-    """plan_camera_slots is not clamped by the cloud: a value above 10000
-    (bad data) makes the helper keep the previous authorization."""
+def test_a_cloud_value_above_the_helpers_bound_is_clamped_and_accepted(cloud, edge_db):
+    """Gap C, fixed in Codex 9be78ab: the cloud clamps every signed component
+    to 10000 instead of issuing a snapshot the helper would reject."""
     snapshot = _issue(cloud, edge_db, slots=3, plan=10_001)
-    with pytest.raises(helper.Reject, match="malformed_capacity"):
-        helper._validate_snapshot(snapshot, cloud["keys"], _identity(), verifier=_verify)
+    assert snapshot["camera_capacity"]["plan_camera_slots"] == 10_000
+    body, _, _ = helper._validate_snapshot(snapshot, cloud["keys"], _identity(), verifier=_verify)
+    assert body["camera_capacity"]["camera_slot_quantity"] == 3
 
 
 def test_only_the_trusted_cloud_keys_verify(cloud, edge_db):
@@ -192,28 +193,27 @@ def test_a_rotated_key_not_yet_in_the_trust_anchor_keeps_the_previous_authorizat
     assert helper._validate_state(state, old_only, now=now, verifier=_verify)  # previous authorization intact
 
 
-def test_retiring_the_old_key_strands_an_appliance_whose_accepted_state_it_signed(cloud, edge_db, cloud_db):
-    """CONTRACT GAP (reported to Codex): an appliance that accepted under the
-    old key and missed the overlap window can never accept again once a
-    release drops that key from the trust anchor -- _advance validates the
-    current state first."""
+def test_retiring_the_old_key_no_longer_strands_an_appliance_whose_accepted_state_it_signed(cloud, edge_db, cloud_db):
+    """Gap A, fixed in Codex 9be78ab: the accepted state (schema 2) embeds the
+    verified key, so it stays valid after the key leaves the trust anchor and
+    the next snapshot, signed with the new key, is accepted."""
     before = _issue(cloud, edge_db)
     _, both = _rotate(cloud_db)
     after = _issue(cloud, edge_db, slots=5, plan=5)
     new_only = helper._validate_keyset({"keys": {"anyaicam-identity-rotated": both["anyaicam-identity-rotated"]}})
     now = datetime.fromisoformat(after["issued_at"])
     state, _ = helper._advance(before, helper._validate_keyset({"keys": both}), _identity(), None, now=now, verifier=_verify)
-    with pytest.raises(helper.Reject, match="bad_signature"):
-        helper._advance(after, new_only, _identity(), state, now=now, verifier=_verify)
+    assert state["schema"] == 2
+    state, outcome = helper._advance(after, new_only, _identity(), state, now=now, verifier=_verify)
+    assert outcome == "accepted" and state["snapshot"]["camera_capacity"]["camera_slot_quantity"] == 5
 
 
 # ------------------------------------------------------------------ ownership transfer
 
-def test_a_reclaimed_appliance_cannot_accept_its_new_owners_capacity(cloud, edge_db, cloud_db):
-    """CONTRACT GAP (reported to Codex/owner): after coordinated_reenroll()
-    binds the appliance to another customer, the accepted state's identity
-    rejects every snapshot for the new owner, and the VMS ignores the old
-    state (identity mismatch): cameras fail closed until a repair/reset."""
+def test_a_reclaimed_appliance_cannot_accept_its_new_owners_capacity_without_an_authorized_transition(cloud, edge_db, cloud_db):
+    """Gap B: an identity change is accepted only through a cloud-signed,
+    admin-authorized transition (Codex 9be78ab;
+    test_capacity_identity_transition_green.py covers the authorized path)."""
     first = _issue(cloud, edge_db)
     now = datetime.fromisoformat(first["issued_at"])
     state, _ = helper._advance(first, cloud["keys"], _identity(), None, now=now, verifier=_verify)
