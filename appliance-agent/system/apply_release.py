@@ -1600,8 +1600,11 @@ class Applier:
             if code != 0:
                 raise Failure("install_failed", "capacity_accept_service_failed",
                               f"enabling the protected capacity acceptance service failed: {output[-300:]}")
+        # Software Update is a root migration entrypoint too: 1.2.4 may
+        # already have a cloud activation identity but no capacity helper.
+        # Pending-claim state still takes precedence for fresh 1.2.5 claims.
         code, output = self.run(["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper),
-                                 "--bootstrap-identity"], 15)
+                                 "--bootstrap-identity", "--legacy-upgrade"], 15)
         if code != 0:
             raise Failure("install_failed", "capacity_identity_bootstrap_failed",
                           f"pinning the local appliance identity failed before downtime: {output[-300:]}")

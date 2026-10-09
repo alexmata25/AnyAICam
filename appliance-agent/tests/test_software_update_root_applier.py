@@ -193,7 +193,7 @@ class SuccessTests(ApplierTestCase):
         self.stage(requested_by="x$(reboot);`id` ../../etc/passwd\n")
         self.applier().apply_staged()
         allowed = re.compile(r"^(docker|systemctl|build|exec|tag|stop|start|enable|python|-c|-t|daemon-reload|--now|"
-                             r"/usr/bin/python3|-I|--bootstrap-identity|--accept-migrated-snapshot|anyaicam-capacity-accept\.(path|service)|anyaicam-vms(\.service)?|"
+                             r"/usr/bin/python3|-I|--bootstrap-identity|--legacy-upgrade|--accept-migrated-snapshot|anyaicam-capacity-accept\.(path|service)|anyaicam-vms(\.service)?|"
                              r"anyaicam-vms:(latest|release-[0-9a-f]{12}|rollback-[0-9a-f]{12})|"
                              r"partner_portal-pre-[0-9a-f]{12}-\d{8}T\d{6}Z\.db)$")
         for call in self.host.calls:

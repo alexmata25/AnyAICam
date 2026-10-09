@@ -97,6 +97,7 @@ class ProvisioningTests(KeysetTestCase):
         stop = next(index for index, call in enumerate(calls) if call[:2] == ["systemctl", "stop"])
         helper = next(index for index, call in enumerate(calls)
                       if len(call) > 3 and call[0:3] == ["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper)])
+        self.assertEqual(calls[helper][-2:], ["--bootstrap-identity", "--legacy-upgrade"])
         enable = next(index for index, call in enumerate(calls)
                       if call[:3] == ["systemctl", "enable", "--now"] and call[-1] == "anyaicam-capacity-accept.path")
         self.assertLess(enable, helper)

@@ -9,12 +9,15 @@ import tempfile
 import unittest
 from unittest import mock
 import sys
+import contextlib
+import io
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "system"))
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
+import capacity_accept
 
 from capacity_accept import (Reject, _advance, _validate_state, _write_atomic_at, _openssl_verify,
                              _canonical, _check_identity_anchor, _bootstrap_identity, _write_identity_anchor, IDENTITY_ANCHOR_FILE,
@@ -497,6 +500,36 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         self.assertEqual(json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text())["appliance_id"],
                          CLOUD_IDENTITY["appliance_id"])
         self.assertEqual(self.call_accept(allow_expired_first=True), "no_pending_snapshot")
+        self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
+        self.assertEqual(self.call_accept(), "accepted")
+        self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
+
+    def test_software_update_first_then_repair_bootstrap_is_idempotent(self):
+        # Software Update on 1.2.5 and a later installer repair both invoke
+        # the same migration bootstrap. Neither may stage a false pending
+        # claim from the installer UUID once the 1.2.4 activation identity is
+        # present.
+        (self.trust / PENDING_CLAIM_FILE).unlink()
+        constants = {
+            "TRUST_DIR": str(self.trust),
+            "IDENTITY_FILE": str(self.identity_dir / "appliance_identity.json"),
+            "INSTALLER_IDENTITY_FILE": str(self.installer_dir / "appliance_identity.json"),
+        }
+
+        def bootstrap_once():
+            output = io.StringIO()
+            with mock.patch.multiple(capacity_accept, **constants), \
+                    mock.patch.object(capacity_accept.sys, "argv", ["capacity_accept.py", "--bootstrap-identity",
+                                                                      "--legacy-upgrade"]), \
+                    contextlib.redirect_stdout(output):
+                result = capacity_accept.main()
+            return result, output.getvalue().strip()
+
+        self.assertEqual(bootstrap_once(), (0, "bootstrapped"))  # Software Update first
+        self.assertEqual(bootstrap_once(), (0, "unchanged"))  # subsequent installer repair
+        self.assertFalse((self.trust / PENDING_CLAIM_FILE).exists())
+        self.assertEqual(json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text())["appliance_id"],
+                         CLOUD_IDENTITY["appliance_id"])
         self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
         self.assertEqual(self.call_accept(), "accepted")
         self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
