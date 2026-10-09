@@ -31,6 +31,9 @@ VMS_INSTALL_ROOT="${VMS_INSTALL_ROOT:-/opt/anyaicam}"
 VMS_ENV_FILE="${VMS_ENV_FILE:-/etc/anyaicam/vms.env}"
 VMS_RECORDINGS_DIR="${VMS_RECORDINGS_DIR:-/var/lib/anyaicam/vms/recordings}"
 VMS_RELEASE_MARKER="${VMS_RELEASE_MARKER:-/etc/anyaicam/vms_release.json}"
+# The installer version marker (09-identity.sh). Linux 1.2.5: restored too,
+# so it never keeps naming the release that was rolled back.
+VERSION_MARKER="${VERSION_MARKER:-/etc/anyaicam/installed_version}"
 UPDATE_STATE_DIR="${ANYAICAM_UPDATE_STATE_DIR:-/var/lib/anyaicam-update}"
 ROLLBACK_DIR="${ANYAICAM_ROLLBACK_DIR:-$UPDATE_STATE_DIR/rollback}"
 LEGACY_ROLLBACK_DIR="${ANYAICAM_LEGACY_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}"
@@ -231,6 +234,12 @@ if printf 'op read\npath %s\n' "$VMS_RELEASE_MARKER" | agent_file > "$snapshot/m
 elif [[ "$?" != "3" ]]; then
     die "Could not read $VMS_RELEASE_MARKER safely; nothing was changed."
 fi
+version_marker_saved=0
+if printf 'op read\npath %s\n' "$VERSION_MARKER" | agent_file > "$snapshot/installed_version"; then
+    version_marker_saved=1
+elif [[ "$?" != "3" ]]; then
+    die "Could not read $VERSION_MARKER safely; nothing was changed."
+fi
 installed_record="$UPDATE_STATE_DIR/installed_release.json"
 installed_saved=0
 if [[ -f "$installed_record" && ! -L "$installed_record" ]]; then
@@ -258,6 +267,10 @@ restore_previous() {
     if [[ "$marker_saved" == "1" ]]; then
         { printf 'op write\npath %s\nmode 0644\nowner root\ncontent\n' "$VMS_RELEASE_MARKER"; cat "$snapshot/marker"; } | agent_file \
             || problems+=("$VMS_RELEASE_MARKER")
+    fi
+    if [[ "$version_marker_saved" == "1" ]]; then
+        { printf 'op write\npath %s\nmode 0644\nowner root\ncontent\n' "$VERSION_MARKER"; cat "$snapshot/installed_version"; } \
+            | agent_file || problems+=("$VERSION_MARKER")
     fi
     if [[ -d "$UPDATE_STATE_DIR" ]]; then
         if [[ "$installed_saved" == "1" ]]; then
@@ -321,6 +334,13 @@ printf '%s\n' "${env_edit[@]}" | agent_file || die "Could not update $VMS_ENV_FI
 
 { printf 'op write\npath %s\nmode 0644\nowner root\ncontent\n' "$VMS_RELEASE_MARKER"; cat "$record"; } | agent_file \
     || die "Could not write $VMS_RELEASE_MARKER safely."
+# The installer version of the restored release: what its own record names
+# (1.2.4 installers wrote 1.1.0 here; 1.2.5+ write the release version).
+restored_installer_version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("installer_version") or "")' "$record")" || restored_installer_version=""
+if [[ "$restored_installer_version" =~ ^[0-9]{1,4}(\.[0-9]{1,4}){1,3}$ ]]; then
+    printf 'op write\npath %s\nmode 0644\nowner root\ncontent\n%s\n' "$VERSION_MARKER" "$restored_installer_version" | agent_file \
+        || die "Could not write $VERSION_MARKER safely."
+fi
 if [[ -d "$UPDATE_STATE_DIR" ]]; then
     if [[ -n "$ROLLBACK_VERSION" ]]; then
         if [[ "$non_root_test" == "1" ]]; then

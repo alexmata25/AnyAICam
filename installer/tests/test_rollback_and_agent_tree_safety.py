@@ -147,6 +147,20 @@ class RollbackSafetyTests(unittest.TestCase):
         self.assertFalse([p for p in self.recordings.iterdir() if p.name.startswith("partner_portal-before-rollback-")])
         self.assertEqual(self.env_file.read_text(), self.env_text)
 
+    def test_the_installed_version_is_put_back_when_the_start_fails(self):
+        # Linux 1.2.5: rollback.sh now rewrites installed_version, so a
+        # failure after that write must restore it like the other records.
+        version_marker = self.tmp / "installed_version"
+        version_marker.write_text("1.2.2\n")
+        start_fails = self.bin / "systemctl"
+        start_fails.write_text(SYSTEMCTL_STUB.replace(
+            'exit 0\n', '[[ "$1" == "start" && ! -f "$STUB_LOG.started" ]] && { touch "$STUB_LOG.started"; exit 1; }\nexit 0\n'),
+            newline="\n")
+        result = self.rollback()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(version_marker.read_text().strip(), "1.2.2")
+        self.assertEqual(self.marker.read_text(), self.marker_text)
+
     # 4. a successful rollback still works
     def test_a_successful_rollback_still_works(self):
         result = self.rollback()

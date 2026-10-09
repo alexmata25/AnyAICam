@@ -109,6 +109,7 @@ class RollbackPointTests(unittest.TestCase):
                      VMS_RECORDINGS_DIR=bash_path(self.recordings), ANYAICAM_ROLLBACK_ALLOW_NON_ROOT="1",
                      VMS_RELEASE_MARKER=bash_path(self.marker), ANYAICAM_UPDATE_STATE_DIR=bash_path(state),
                      ANYAICAM_LEGACY_ROLLBACK_DIR=bash_path(self.tmp / "legacy-rollback"),
+                     VERSION_MARKER=bash_path(self.tmp / "installed_version"),
                      ANYAICAM_ROLLBACK_VALIDATE_SECONDS="0")
         paths.update(extra)
         return paths
@@ -229,9 +230,13 @@ deploy_vms clean
         # Upgraded to 1.2.2.
         self.env_file.write_text(f"ANYAICAM_VERSION=1.2.2\nANYAICAM_VMS_COMMIT={NEW}\nANYAICAM_BUILD_ID={NEW}\nOTHER=kept\n")
         self.marker.write_text('{"vms_release_commit": "%s", "release_version": "1.2.2"}' % NEW)
+        (self.tmp / "installed_version").write_text("1.2.2\n")
         paths = self.rollback_paths()
         result = subprocess.run([BASH, "./rollback.sh", "--yes"], cwd=ROOT, text=True, capture_output=True, env=self.env(**paths))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Linux 1.2.5 (Orange): installed_version names the restored release's
+        # installer version, not the release rolled back.
+        self.assertEqual((self.tmp / "installed_version").read_text().strip(), "1.2.1")
         env = self.env_file.read_text()
         self.assertIn("ANYAICAM_VERSION=1.2.1", env)
         self.assertIn(f"ANYAICAM_BUILD_ID={OLD}", env)
