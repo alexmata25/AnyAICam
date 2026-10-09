@@ -408,6 +408,23 @@ class AcceptanceFilesystemTests(unittest.TestCase):
                               compat_dir=str(self.compat), compat_file="vms_capacity.json",
                               now=now, verifier=self.verifier, allow_expired_first=allow_expired_first)
 
+    def call_migrated_accept_cli(self):
+        constants = {
+            "STAGING_FILE": str(self.stage),
+            "IDENTITY_FILE": str(self.identity_dir / "appliance_identity.json"),
+            "TRUST_DIR": str(self.trust),
+            "TRUST_FILE": "entitlement_signing_keys.json",
+            "ACCEPTED_FILE": "vms_capacity_accepted.json",
+            "COMPAT_DIR": str(self.compat),
+            "COMPAT_FILE": "vms_capacity.json",
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.multiple(capacity_accept, **constants), \
+                mock.patch.object(capacity_accept.sys, "argv", ["capacity_accept.py", "--accept-migrated-snapshot"]), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = capacity_accept.main()
+        return result, stdout.getvalue().strip(), stderr.getvalue().strip()
+
     def stage_snapshot(self, snapshot):
         self.stage.write_text(json.dumps(snapshot), encoding="utf-8")
         self.stage.chmod(0o600)
@@ -474,6 +491,8 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         self.assertFalse(self.accepted.exists())
 
     def test_legacy_124_signed_snapshot_without_transition_requires_migration_entrypoint(self):
+        # A legacy 1.2.4 appliance has no clean-install claim correlation.
+        (self.trust / PENDING_CLAIM_FILE).unlink()
         self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
         with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
             self.call_accept()
@@ -580,11 +599,11 @@ class AcceptanceFilesystemTests(unittest.TestCase):
             os.close(identity_fd)
             os.close(trust_fd)
 
-    def test_clean_125_repair_keeps_initial_claim_transition_requirement(self):
-        # A clean 1.2.5 install has the same provisional installer and
-        # activation IDs. A later repair may use the legacy-upgrade bootstrap
-        # entrypoint, but it must create/retain pending correlation rather
-        # than pinning that ID and accepting transition-less capacity.
+    def test_clean_125_repair_migration_cli_rejects_transitionless_and_expired_claim(self):
+        # Drive the same --accept-migrated-snapshot entrypoint used by
+        # bootstrap_capacity_identity migration during installer repair. A
+        # pending clean-install claim must disable both the transition-less
+        # legacy shortcut and its expired-first exception.
         provisional_identity = dict(CLOUD_IDENTITY, appliance_id=PROVISIONAL_ID,
                                     cloud_id="AIC-provisional")
         identity_path = self.identity_dir / "appliance_identity.json"
@@ -607,15 +626,28 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         self.assertEqual(json.loads((self.trust / PENDING_CLAIM_FILE).read_text())["provisional_appliance_id"],
                          PROVISIONAL_ID)
 
-        self.stage_snapshot(make_snapshot(self.private, **provisional_identity))
-        with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
-            self.call_accept()
+        now = dt.datetime.now(dt.timezone.utc)
+        self.stage_snapshot(make_snapshot(self.private, issued=now, expires=now + dt.timedelta(hours=24),
+                                          **provisional_identity))
+        result, _, error = self.call_migrated_accept_cli()
+        self.assertEqual(result, 1)
+        self.assertIn("initial_claim_transition_required", error)
         self.assertFalse(self.accepted.exists())
+        self.assertTrue((self.trust / PENDING_CLAIM_FILE).exists())
+
+        self.stage_snapshot(make_snapshot(self.private, issued=now - dt.timedelta(hours=73),
+                                          expires=now - dt.timedelta(hours=72), **provisional_identity))
+        result, _, error = self.call_migrated_accept_cli()
+        self.assertEqual(result, 1)
+        self.assertIn("expired", error)
+        self.assertFalse(self.accepted.exists())
+        self.assertTrue((self.trust / PENDING_CLAIM_FILE).exists())
 
         identity_path.write_text(json.dumps(CLOUD_IDENTITY), encoding="utf-8")
-        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY,
-                                                        provisional_id=PROVISIONAL_ID))
-        self.assertEqual(self.call_accept(), "accepted")
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, provisional_id=PROVISIONAL_ID,
+                                                        issued=now, expires=now + dt.timedelta(hours=24)))
+        result, output, error = self.call_migrated_accept_cli()
+        self.assertEqual((result, output, error), (0, "accepted", ""))
         self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
 
     def test_rejected_or_stale_ownership_transition_preserves_accepted_state(self):

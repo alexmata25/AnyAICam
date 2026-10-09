@@ -476,9 +476,13 @@ def _validate_first_acceptance_source(body, identity, *, anchor, pending_claim,
     root-protected provisional claim correlation ID. The legacy migration
     exception is available only to the fixed root installer/update entrypoint
     and relies on the pre-1.2.5 signed snapshot plus persisted activation ID.
+    A pending claim marks a clean-install population and disables that legacy
+    exception even when the installer explicitly requests migration mode.
     """
     transition = body.get("identity_transition")
     _, transition_source = _snapshot_transition(body, identity)
+    if pending_claim is not None and transition is None:
+        raise Reject("initial_claim_transition_required")
     if anchor is not None:
         if transition is not None and transition.get("kind") == "initial_claim":
             already_reconciled = anchor.get("appliance_id") == _safe_identity(identity)["appliance_id"]
@@ -675,6 +679,7 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
                 raise
             pinned_identity = None
         pending_claim = _pending_claim_identity(root_dir_fd)
+        allow_legacy_first = allow_expired_first and pending_claim is None
         if current_state is not None and pinned_identity is None:
             current_identity, _ = _validate_state(current_state, keyset, now=now,
                                                   verifier=verifier or (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl)))
@@ -691,14 +696,14 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
         policy_verifier = verifier or (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl))
         if current_state is None:
             first_body, _, _ = _validate_snapshot(snapshot, keyset, identity, now=now,
-                                                  check_expiry=not allow_expired_first,
+                                                  check_expiry=not allow_legacy_first,
                                                   verifier=policy_verifier)
             _validate_first_acceptance_source(first_body, identity, anchor=pinned_identity,
                                               pending_claim=pending_claim,
-                                              allow_legacy_migration=allow_expired_first)
+                                              allow_legacy_migration=allow_legacy_first)
         next_state, outcome = _advance(snapshot, keyset, identity, current_state,
                                        now=now, verifier=policy_verifier,
-                                       allow_expired_first=allow_expired_first,
+                                       allow_expired_first=allow_legacy_first,
                                        anchor=pinned_identity)
         if outcome == "unchanged":
             return outcome
@@ -807,7 +812,10 @@ def main() -> int:
                 os.close(trust_dir)
     if len(sys.argv) == 2 and sys.argv[1] == "--accept-migrated-snapshot":
         try:
-            print(accept_pending(allow_expired_first=True))
+            print(accept_pending(staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
+                                 trust_dir=TRUST_DIR, trust_file=TRUST_FILE,
+                                 accepted_file=ACCEPTED_FILE, compat_dir=COMPAT_DIR,
+                                 compat_file=COMPAT_FILE, allow_expired_first=True))
             return 0
         except (Reject, OSError, subprocess.SubprocessError, ValueError) as error:
             print(f"capacity migration snapshot not accepted: {type(error).__name__}: {error}", file=sys.stderr)

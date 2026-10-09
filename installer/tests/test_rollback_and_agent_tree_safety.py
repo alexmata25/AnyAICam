@@ -765,10 +765,13 @@ class LegacyAgentTreeTests(unittest.TestCase):
     # after every check that can refuse the install, storage included.
     # migrate_capacity_fallback_step: Linux 1.2.5 step 15 (Orange's Linux run
     # found it missing here, so the real step ran against a fixture payload).
-    LATER_STEPS = ("docker_setup", "provision_users_dirs", "deploy_vms", "migrate_capacity_fallback_step",
+    LATER_STEPS = ("provision_entitlement_signing_keys", "install_capacity_accept_step",
+                   "migrate_capacity_fallback_step", "docker_setup",
+                   "provision_users_dirs", "deploy_vms",
                    "install_rollback_tool", "install_agent",
                    "install_mediamtx", "install_webrtc_firewall", "systemd_setup", "disable_system_suspend",
-                   "identity_provision", "claim_label_provision", "cloud_portal_provision", "provision_update_signing_key", "provision_entitlement_signing_keys",
+                   "identity_provision", "bootstrap_capacity_identity", "claim_label_provision",
+                   "cloud_portal_provision", "provision_update_signing_key",
                    "stamp_release")
 
     def run_install(self, free_gb):
@@ -835,7 +838,8 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(steps[secure + 2], "install_capacity_accept_step")
         self.assertEqual(steps[secure + 3], 'migrate_capacity_fallback_step "$INSTALL_STATE"')
         self.assertEqual(steps[secure + 4], "docker_setup")
-        for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"", "install_agent \"$INSTALL_STATE\"",
+        for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"",
+                      "install_agent \"$INSTALL_STATE\" || return $?",
                       "systemd_setup", "provision_update_signing_key", "provision_entitlement_signing_keys"):
             self.assertGreater(steps.index(later), secure, later)
 
