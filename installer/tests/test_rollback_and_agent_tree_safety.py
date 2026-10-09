@@ -763,7 +763,10 @@ class LegacyAgentTreeTests(unittest.TestCase):
 
     # Codex re-review (2026-10-06): the move-aside is a change, so it comes
     # after every check that can refuse the install, storage included.
-    LATER_STEPS = ("docker_setup", "provision_users_dirs", "deploy_vms", "install_rollback_tool", "install_agent",
+    # migrate_capacity_fallback_step: Linux 1.2.5 step 15 (Orange's Linux run
+    # found it missing here, so the real step ran against a fixture payload).
+    LATER_STEPS = ("docker_setup", "provision_users_dirs", "deploy_vms", "migrate_capacity_fallback_step",
+                   "install_rollback_tool", "install_agent",
                    "install_mediamtx", "install_webrtc_firewall", "systemd_setup", "disable_system_suspend",
                    "identity_provision", "claim_label_provision", "cloud_portal_provision", "provision_update_signing_key", "provision_entitlement_signing_keys",
                    "stamp_release")
