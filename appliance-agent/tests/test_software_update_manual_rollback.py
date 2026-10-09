@@ -105,6 +105,9 @@ class RollbackScriptRoundTripTests(ApplierTestCase):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
         self.log = self.tmp / "stub.log"
+        self.version_marker = self.tmp / "etc/anyaicam/installed_version"
+        self.version_marker.parent.mkdir(parents=True, exist_ok=True)
+        self.version_marker.write_text("1.2.5\n", encoding="utf-8")
         self.stage()
         self.assertEqual(self.applier().apply_staged()["state"], "healthy")
 
@@ -112,7 +115,8 @@ class RollbackScriptRoundTripTests(ApplierTestCase):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", STUB_LOG=str(self.log),
                    ANYAICAM_ROLLBACK_ALLOW_NON_ROOT="1", ANYAICAM_ROLLBACK_VALIDATE_SECONDS="0",
                    VMS_INSTALL_ROOT=str(self.paths.live), VMS_ENV_FILE=str(self.paths.vms_env),
-                   VMS_RELEASE_MARKER=str(self.paths.release_marker), ANYAICAM_UPDATE_STATE_DIR=str(self.paths.root_state),
+                   VMS_RELEASE_MARKER=str(self.paths.release_marker), VERSION_MARKER=str(self.version_marker),
+                   ANYAICAM_UPDATE_STATE_DIR=str(self.paths.root_state),
                    VMS_RECORDINGS_DIR=str(self.tmp / "recordings"), ANYAICAM_LEGACY_ROLLBACK_DIR=str(self.tmp / "legacy"))
         return subprocess.run([BASH, str(INSTALLER / "rollback.sh"), "--yes", *args], text=True, capture_output=True, env=env)
 

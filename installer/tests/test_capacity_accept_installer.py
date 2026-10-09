@@ -109,9 +109,10 @@ install_agent repair --defer-capacity-bootstrap
                                      "TEST_SOURCE": str(ROOT / "appliance-agent"),
                                      "AGENT_ARGV_TRACE": str(trace)})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(trace.read_text(encoding="utf-8").splitlines(),
-                             [str(ROOT / "appliance-agent/scripts/install.sh"),
-                              "--defer-capacity-bootstrap"])
+            arguments = trace.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(Path(arguments[0]).resolve(),
+                             (ROOT / "appliance-agent/scripts/install.sh").resolve())
+            self.assertEqual(arguments[1:], ["--defer-capacity-bootstrap"])
 
 
 @unittest.skipUnless(BASH, "bash is required for installer repair integration")

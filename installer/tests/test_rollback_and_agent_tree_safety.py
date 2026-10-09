@@ -838,7 +838,7 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(steps[secure + 3], 'migrate_capacity_fallback_step "$INSTALL_STATE"')
         self.assertEqual(steps[secure + 4], "docker_setup")
         for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"",
-                      "install_agent \"$INSTALL_STATE\" || return $?",
+                      "install_agent \"$INSTALL_STATE\" --defer-capacity-bootstrap || return $?",
                       "systemd_setup", "provision_update_signing_key", "provision_entitlement_signing_keys"):
             self.assertGreater(steps.index(later), secure, later)
 
