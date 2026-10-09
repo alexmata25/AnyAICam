@@ -65,7 +65,11 @@ install_capacity_accept() {
 bootstrap_capacity_identity() {
     local privileged_dir="/opt/anyaicam-agent/privileged"
     local bootstrap_result
-    if ! bootstrap_result="$(/usr/bin/python3 -I "$privileged_dir/capacity_accept.py" --bootstrap-identity 2>&1)"; then
+    local legacy_upgrade=()
+    if [[ "${1:-}" == "migration" ]]; then
+        legacy_upgrade=(--legacy-upgrade)
+    fi
+    if ! bootstrap_result="$(/usr/bin/python3 -I "$privileged_dir/capacity_accept.py" --bootstrap-identity "${legacy_upgrade[@]}" 2>&1)"; then
         echo "[ERROR] Signed camera-capacity identity bootstrap failed: ${bootstrap_result:-helper returned failure}." >&2
         return 1
     fi

@@ -24,7 +24,8 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertIn("_write_pending_claim_identity", helper)
         self.assertIn("_write_identity_anchor(root_dir_fd, next_state[\"identity\"][\"appliance_id\"])", helper)
         self.assertIn("initial_claim_transition_required", helper)
-        self.assertNotIn("_write_identity_anchor(trust_dir_fd, appliance_id)", helper)
+        self.assertIn("pin_existing_identity=False", helper)
+        self.assertIn("if pin_existing_identity:", helper)
 
     def test_installer_bootstraps_preexisting_state_before_downtime(self):
         step = (ROOT / "installer/16-capacity-accept.sh").read_text(encoding="utf-8")
@@ -36,6 +37,8 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertIn('"${INSTALL_STATE:-existing}" == "clean"', step)
         self.assertIn("bootstrap_capacity_identity migration", step)
         self.assertIn('"${1:-}" == "migration"', library)
+        self.assertIn("legacy_upgrade=(--legacy-upgrade)", library)
+        self.assertIn('"${legacy_upgrade[@]}"', library)
         self.assertIn("--accept-migrated-snapshot", library)
         self.assertIn("pending signed camera-capacity snapshot exists but identity/signature acceptance failed", library)
         self.assertIn('"--accept-migrated-snapshot"', applier)

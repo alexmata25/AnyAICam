@@ -124,11 +124,13 @@ class BuilderTests(unittest.TestCase):
             with self.subTest(label), self.assertRaises(SystemExit):
                 builder.read_entitlement_signing_keys(self._keys_file(content), _digest({"k1": PUBLIC}))
 
-    def test_the_install_step_ships_and_runs_after_the_update_key(self):
+    def test_the_install_step_ships_and_runs_before_vms_deployment(self):
         self.assertIn("13-entitlement-signing-keys.sh", builder.INSTALLER_RUNTIME_FILES)
         install = _text(INSTALLER / "install.sh")
         self.assertIn('source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"', install)
-        self.assertLess(install.index("    provision_update_signing_key\n"), install.index("    provision_entitlement_signing_keys\n"))
+        self.assertLess(install.index("    secure_agent_install_root\n"), install.index("    provision_entitlement_signing_keys\n"))
+        self.assertLess(install.index("    provision_entitlement_signing_keys\n"), install.index("    install_capacity_accept_step\n"))
+        self.assertLess(install.index("    install_capacity_accept_step\n"), install.index('    deploy_vms "$INSTALL_STATE"\n'))
         self.assertIn("ENTITLEMENT_SIGNING_KEYS_SHA256", install)
         self.assertRegex(install, r'ENTITLEMENT_SIGNING_KEYS_SHA256.*=~ \^\[0-9a-f\]\{64\}\$')
 

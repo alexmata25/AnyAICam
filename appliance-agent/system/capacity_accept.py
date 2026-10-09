@@ -522,7 +522,8 @@ def _check_identity_anchor(identity, anchor) -> None:
         raise Reject("identity_anchor_mismatch")
 
 
-def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_name="appliance_identity.json") -> str:
+def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_name="appliance_identity.json",
+                        pin_existing_identity=False) -> str:
     """Stage claim correlation or recover an already accepted cloud identity.
 
     Never promote the installer's temporary UUID to the authoritative anchor.
@@ -578,6 +579,16 @@ def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_nam
                 # claim source. The cloud-signed first snapshot must bridge it.
                 return "awaiting_signed_transition"
             return "awaiting_signed_transition"
+        if pin_existing_identity:
+            # An upgrade from 1.2.4 has a cloud-assigned activation identity
+            # but no capacity acceptance state. Pin that existing identity
+            # under root so a transition-less legacy snapshot can establish
+            # its first high-water mark after upgrade. This mode is enabled
+            # only by the installer migration entrypoint. Fresh installs keep
+            # using pending-claim correlation and require initial_claim.
+            _safe_identity(identity)
+            _write_identity_anchor(trust_dir_fd, appliance_id)
+            return "bootstrapped"
         _write_pending_claim_identity(trust_dir_fd, appliance_id)
         return "awaiting_signed_transition"
     finally:
@@ -722,7 +733,9 @@ def main() -> int:
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         print("capacity acceptance helper must run as root", file=sys.stderr)
         return 1
-    if len(sys.argv) == 2 and sys.argv[1] == "--bootstrap-identity":
+    if (len(sys.argv) == 2 and sys.argv[1] == "--bootstrap-identity" or
+            len(sys.argv) == 3 and sys.argv[1:] == ["--bootstrap-identity", "--legacy-upgrade"]):
+        legacy_upgrade = len(sys.argv) == 3
         trust_dir = None
         try:
             trust_dir = _open_dir(TRUST_DIR, root_controlled=True)
@@ -737,6 +750,34 @@ def main() -> int:
             # a provisional claim-correlation value only.
             identity_paths = ((IDENTITY_FILE, INSTALLER_IDENTITY_FILE) if accepted_raw is not None
                               else (INSTALLER_IDENTITY_FILE, IDENTITY_FILE))
+            if legacy_upgrade and accepted_raw is None:
+                installer_dir = activation_dir = None
+                try:
+                    installer_dir = _open_dir(str(Path(INSTALLER_IDENTITY_FILE).parent))
+                    activation_dir = _open_dir(str(Path(IDENTITY_FILE).parent))
+                    installer_record = _json(_read_at(installer_dir, Path(INSTALLER_IDENTITY_FILE).name,
+                                                      MAX_IDENTITY_BYTES))
+                    activation_record = _json(_read_at(activation_dir, Path(IDENTITY_FILE).name,
+                                                       MAX_IDENTITY_BYTES))
+                    installer_id = installer_record.get("appliance_id") if isinstance(installer_record, dict) else None
+                    activation = _safe_identity(activation_record)
+                    if (isinstance(installer_id, str) and installer_id.strip() and
+                            installer_id != activation["appliance_id"]):
+                        result = _bootstrap_identity(activation_dir, trust_dir,
+                                                     identity_name=Path(IDENTITY_FILE).name,
+                                                     pin_existing_identity=True)
+                        print(result)
+                        return 0
+                except FileNotFoundError:
+                    pass
+                except Reject as error:
+                    if str(error) != "missing_file":
+                        raise
+                finally:
+                    if activation_dir is not None:
+                        os.close(activation_dir)
+                    if installer_dir is not None:
+                        os.close(installer_dir)
             for identity_path in identity_paths:
                 identity_dir = None
                 try:

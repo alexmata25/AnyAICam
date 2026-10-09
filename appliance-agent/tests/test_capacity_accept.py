@@ -481,6 +481,102 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         self.assertEqual(pin["appliance_id"], CLOUD_IDENTITY["appliance_id"])
         self.assertNotEqual(pin["appliance_id"], PROVISIONAL_ID)
 
+    def test_124_upgrade_without_staged_snapshot_pins_activation_then_watcher_accepts(self):
+        # 1.2.4 persisted a cloud identity before the signing rollout and did
+        # not stage signed capacity. The upgrade migration bootstrap must pin
+        # that existing identity; the later watcher can then accept the first
+        # transition-less signed snapshot without another install run.
+        (self.trust / PENDING_CLAIM_FILE).unlink()
+        identity_fd = os.open(self.identity_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        trust_fd = os.open(self.trust, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            self.assertEqual(_bootstrap_identity(identity_fd, trust_fd, pin_existing_identity=True), "bootstrapped")
+        finally:
+            os.close(identity_fd)
+            os.close(trust_fd)
+        self.assertEqual(json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text())["appliance_id"],
+                         CLOUD_IDENTITY["appliance_id"])
+        self.assertEqual(self.call_accept(allow_expired_first=True), "no_pending_snapshot")
+        self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
+        self.assertEqual(self.call_accept(), "accepted")
+        self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
+
+    def test_124_upgrade_n1_initial_claim_accepts_only_the_pinned_target(self):
+        (self.trust / PENDING_CLAIM_FILE).unlink()
+        trust_fd = os.open(self.trust, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        identity_fd = os.open(self.identity_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            self.assertEqual(_bootstrap_identity(identity_fd, trust_fd, pin_existing_identity=True), "bootstrapped")
+        finally:
+            os.close(identity_fd)
+            os.close(trust_fd)
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY))
+        self.assertEqual(self.call_accept(), "accepted")
+        self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
+
+    def test_124_upgrade_rejects_initial_claim_with_wrong_target(self):
+        (self.trust / PENDING_CLAIM_FILE).unlink()
+        trust_fd = os.open(self.trust, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        identity_fd = os.open(self.identity_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _bootstrap_identity(identity_fd, trust_fd, pin_existing_identity=True)
+        finally:
+            os.close(identity_fd)
+            os.close(trust_fd)
+        wrong_target = dict(CLOUD_IDENTITY, customer_id="cust-other")
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, wrong_target))
+        with self.assertRaisesRegex(Reject, "identity_mismatch|identity_transition_target_mismatch"):
+            self.call_accept()
+        self.assertFalse(self.accepted.exists())
+        self.assertEqual(json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text())["appliance_id"],
+                         CLOUD_IDENTITY["appliance_id"])
+
+    def test_legacy_upgrade_pin_mode_keeps_an_existing_fresh_claim_correlation(self):
+        trust_fd = os.open(self.trust, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        identity_fd = os.open(self.identity_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # Fresh installs already have the installer UUID as pending claim
+            # correlation. A later upgrade call must not replace it with the
+            # mutable activation identity before initial_claim is authorized.
+            self.assertEqual(_bootstrap_identity(identity_fd, trust_fd, pin_existing_identity=True),
+                             "awaiting_signed_transition")
+            self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+            self.assertEqual(json.loads((self.trust / PENDING_CLAIM_FILE).read_text())["provisional_appliance_id"],
+                             PROVISIONAL_ID)
+        finally:
+            os.close(identity_fd)
+            os.close(trust_fd)
+
+    def test_rejected_or_stale_ownership_transition_preserves_accepted_state(self):
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=4))
+        self.call_accept()
+        prior = self.accepted.read_bytes()
+        new_owner = dict(CLOUD_IDENTITY, appliance_id="new-owner", cloud_id="AIC-new-owner",
+                         customer_id="new-customer")
+        stale = make_snapshot(self.private, issued=NOW - dt.timedelta(minutes=1), quantity=32,
+                              **CLOUD_IDENTITY)
+        self.stage_snapshot(stale)
+        with self.assertRaisesRegex(Reject, "replay"):
+            self.call_accept()
+        (self.identity_dir / "appliance_identity.json").write_text(json.dumps(new_owner), encoding="utf-8")
+        unauthorized = make_snapshot(self.private, issued=NOW + dt.timedelta(minutes=2), quantity=64,
+                                     **new_owner)
+        self.stage_snapshot(unauthorized)
+        with self.assertRaisesRegex(Reject, "accepted_identity_changed"):
+            self.call_accept()
+        stale_transition = {"schema": 1, "transition_id": "old-owner-transfer", "kind": "authorized",
+                            "reason": "ownership_transfer", "from_identity": dict(CLOUD_IDENTITY,
+                                appliance_id="previous-appliance", cloud_id="AIC-previous",
+                                customer_id="previous-customer"), "to_identity": new_owner,
+                            "authorized_at": (NOW - dt.timedelta(days=2)).isoformat()}
+        stale_owner_snapshot = make_snapshot(self.private, issued=NOW + dt.timedelta(minutes=3),
+                                             **new_owner, identity_transition=stale_transition)
+        self.stage_snapshot(stale_owner_snapshot)
+        with self.assertRaisesRegex(Reject, "accepted_identity_changed"):
+            self.call_accept()
+        self.assertEqual(self.accepted.read_bytes(), prior)
+        self.assertEqual(json.loads(self.compat_file.read_text())["camera_slot_quantity"], 4)
+
     def test_claim_transition_promotes_different_cloud_assigned_identity(self):
         target = CLOUD_IDENTITY
         self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
@@ -505,7 +601,7 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         self.assertEqual(json.loads(self.compat_file.read_text())["camera_slot_quantity"], 4)
 
     def test_symlinked_staging_and_identity_mismatch_are_rejected_without_following_links(self):
-        self.stage.unlink()
+        self.stage.unlink(missing_ok=True)
         self.stage.symlink_to(self.sentinel)
         with self.assertRaisesRegex(Reject, "unsafe_file"):
             self.call_accept()
