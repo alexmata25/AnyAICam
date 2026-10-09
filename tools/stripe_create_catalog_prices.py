@@ -35,9 +35,8 @@ def catalog_prices() -> list[dict]:
     """Every Price the catalog needs: (env var, lookup key, product name,
     amount in cents, recurring interval or None for one-time)."""
     items = []
-    for plan in pc.base_plans():
-        items.append({"env": plan["price_env_var"], "lookup_key": f"anyaicam_{plan['plan_type']}_{plan['camera_slot_maximum']}_{plan['monthly_cents']}",
-                      "name": f"AnyAiCam {plan['label']}", "amount": plan["monthly_cents"], "interval": "month"})
+    # The fixed Local/Hybrid camera-slot tiers were removed (2026-10-08);
+    # per-camera plan Prices are configured for billing v2 (per_camera_billing).
     for addon in pc.addons():
         if addon["monthly_cents"] is None:
             continue  # Cloud Overflow: no approved price -- never invented

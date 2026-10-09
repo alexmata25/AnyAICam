@@ -641,7 +641,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # retention-days enforcement) and shown separately, as RECORDING
         # CONFIGURATION, never as a dollar amount -- Stripe is the only
         # source of what this customer is actually charged.
-        from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS
+        from customer_entitlements import get_entitlements_for_customer, total_camera_slots
         from hardware_orders import get_orders_for_customer
         from analytics_entitlements import get_active_analytics_for_customer
         from customer_analytics_panel import ANALYTIC_LABELS
@@ -650,8 +650,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         licensed_slots=total_camera_slots(identity['customer_id'])
         if camera_entitlement:
             plan_type='hybrid' if camera_entitlement['product']=='camera_slots_hybrid' else 'local'
-            tier_label=next((t[1] for t in PLAN_TIERS if t[0]==plan_type and t[4]==camera_entitlement['camera_slot_quantity']),f'{licensed_slots} cameras')
-            camera_plan_summary=f'{plan_type.title()} {tier_label} &middot; {licensed_slots} licensed camera slots'
+            camera_plan_summary=f'{plan_type.title()} &middot; {licensed_slots} licensed camera slots'
         else:
             camera_plan_summary='No camera-slot plan purchased yet'
         # Billing v2 (2026-10-05): a per-camera plan is the account's camera
@@ -661,33 +660,9 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         v2_plan_active=bool(v2_plan and v2_plan.get('status') in ('active','suspended'))
         if not camera_entitlement and v2_plan_active:
             camera_plan_summary=f"{escape(v2_plan['display_name'])} &middot; {_v2billing._camera_count(v2_plan['camera_quantity'],'licensed camera')}"
-        # Provisioning Phase 8: the tier list backing the "Buy camera
-        # capacity" action below -- only tiers with a real, configured
-        # Stripe Price ID are offered (same fail-closed discipline as
-        # customer_entitlements._load_price_tier_map()), so this page
-        # can never offer a tier create_camera_slot_checkout() would
-        # then reject with PRICE_ID_REQUIRED.
-        import os as _os
-        camera_tier_options=[{'plan_type':t[0],'tier_label':t[1],'camera_slot_maximum':t[4],'monthly_retail_usd':t[5]} for t in PLAN_TIERS if _os.environ.get(t[6],'').strip()]
-        # Upgrade Local -> Hybrid (2026-09-21): entitlement/billing-driven,
-        # not a bare UI toggle -- this reuses create_camera_slot_checkout()
-        # exactly (plan_type='hybrid'), the same route "Buy camera
-        # capacity" above already calls; the only new thing is offering it
-        # to a customer who ALREADY has an active plan (that button is
-        # hidden once camera_entitlement exists). Once the resulting
-        # Stripe subscription's webhook lands (upsert_entitlement(product=
-        # 'camera_slots_hybrid')), customer_entitlements.product_mode_for_
-        # customer() starts reporting "hybrid" immediately -- no separate
-        # code path updates the appliance's mode. Only offered when (a)
-        # this customer is currently on Local (never shown to an existing
-        # Hybrid customer, and never alongside the "no plan yet" purchase
-        # panel above), and (b) a real Stripe Price ID is actually
-        # configured for the equivalent-capacity Hybrid tier -- same fail-
-        # closed discipline as camera_tier_options itself.
-        hybrid_upgrade_tier=None
-        import plan_changes  # Local -> Hybrid upgrades the same subscription (2026-10-02)
-        if camera_entitlement and plan_type=='local' and plan_changes.upgrade_available():
-            hybrid_upgrade_tier=next((t for t in camera_tier_options if t['plan_type']=='hybrid' and t['camera_slot_maximum']==camera_entitlement['camera_slot_quantity']),None)
+        # Camera plans are per camera (billing v2, chosen on My subscription);
+        # the fixed-tier "Buy camera capacity" and Local -> Hybrid upgrade
+        # offers were removed with the fixed tiers (owner decision 2026-10-08).
         hardware_orders_list=[o for o in get_orders_for_customer(identity['customer_id']) if o['status']=='paid']
         hardware_summary=', '.join(f"{escape(o['product_name'])} (paid)" for o in hardware_orders_list) or 'No hardware purchased yet'
         # analytics_subscriptions.analytic_key (what active_analytics
@@ -871,7 +846,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         <div class="customer-setup-step" data-step="4" hidden><h2>Discover cameras</h2><p>The selected appliance performs discovery. This page only submits the job and displays its progress.</p><button class="action-button" id="start-camera-scan"{"" if selected_ready else " disabled"}>Request appliance scan</button>{"" if selected_ready else '<p class="health-detail" id="scan-not-ready">Camera discovery is available once this appliance has finished linking (see its status in step 3).</p>'}<div class="storage-bar"><span id="scan-progress" style="width:0%"></span></div><p id="scan-message" class="health-detail"></p><div id="scan-results"></div></div>
         <div class="customer-setup-step" data-step="5" hidden><h2>Camera setup</h2><p class="health-detail" id="camera-progress"></p><div style="overflow:auto"><table class="data-table"><thead><tr><th>Camera</th><th>Rename</th><th>Location/site</th><th>Status</th></tr></thead><tbody>{camera_rows}</tbody></table></div><p class="health-detail">Recording, retention, analytics, and notifications use the selected customer plan. Per-camera overrides can be added after activation.</p><button class="ghost-button" id="save-camera-setup">Save camera setup</button></div>
         <div class="customer-setup-step" data-step="6" hidden><h2>Review your account</h2>
-        <div id="customer-subscription-review" class="panel"><h3 style="margin-top:0">Licensing &amp; billing &middot; from Stripe</h3><p>Hardware: {hardware_summary}</p><p>Camera plan: {camera_plan_summary}</p><p>Analytics: {analytics_summary}</p><p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p><div id="camera-plan-purchase"{' hidden' if (camera_entitlement or v2_plan_active) else ''}><p class="health-detail">Choose Basic Local, AI Local or Hybrid and your camera count.</p><a class="action-button" href="/subscription-portal">Choose a camera plan</a></div>{f'<div id="upgrade-to-hybrid"><p class="health-detail">Want remote access, cloud backup, and analytics sync? Upgrade to Hybrid {escape(hybrid_upgrade_tier["tier_label"])} cameras for ${hybrid_upgrade_tier["monthly_retail_usd"]}/mo -- your cameras, recordings, and analytics settings all carry over.</p><button class="ghost-button" id="upgrade-to-hybrid-button" data-tier-label="{escape(hybrid_upgrade_tier["tier_label"],quote=True)}">Upgrade to Hybrid</button><p id="upgrade-to-hybrid-message" class="health-detail"></p></div>' if hybrid_upgrade_tier else ''}</div>{friends_family_panel}
+        <div id="customer-subscription-review" class="panel"><h3 style="margin-top:0">Licensing &amp; billing &middot; from Stripe</h3><p>Hardware: {hardware_summary}</p><p>Camera plan: {camera_plan_summary}</p><p>Analytics: {analytics_summary}</p><p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p><div id="camera-plan-purchase"{' hidden' if (camera_entitlement or v2_plan_active) else ''}><p class="health-detail">Choose Basic Local, AI Local or Hybrid and your camera count.</p><a class="action-button" href="/subscription-portal">Choose a camera plan</a></div>{friends_family_panel}
         <div class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local recording configuration</h3><p>{escape(str(plan.get('resolution','—')).upper())} &middot; {escape(str(plan.get('recording_mode','—')))} &middot; retention up to {plan.get('retention_days','—')} days</p><p class="health-detail">Recording length depends on your appliance's available storage, not a separate charge -- this is a configuration setting, not a purchased product.</p></div></div>
         <div class="customer-setup-step" data-step="7" hidden><h2>Confirm and save</h2><p>Confirm the appliance, camera assignments, recording plan, retention, analytics, and notification preferences.</p><button class="action-button" id="confirm-customer-setup">Confirm and open dashboard</button></div>
         <div class="dialog-actions"><span data-aaco-dock-slot style="margin-right:auto;display:inline-flex"></span><button class="ghost-button" id="customer-setup-back" hidden>Back</button><button class="action-button" id="customer-setup-next">Save and continue</button></div></section>'''
@@ -885,8 +860,6 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
 async function pollProvisioning(jobId,button){{const response=await fetch(`/api/customer/camera-provisioning/${{jobId}}`);let r;try{{r=await response.json()}}catch(error){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError('The camera could not be added: no response from the server. Check the connection and try again.')}}if(!response.ok){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError(r.detail||`The camera could not be added (error ${{response.status}}). Try again or contact support.`)}}if(r.status==='provisioned'){{document.getElementById('scan-message').style.color='';showToast('Camera added.');button.textContent='Added';button.disabled=true;refreshCameraProgress();return}}if(r.status==='failed'){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError(r.message||'The camera could not be added. Try again.')}}setTimeout(()=>pollProvisioning(jobId,button),1500)}}
         document.getElementById('scan-results').addEventListener('click',async event=>{{const button=event.target.closest('.provision-camera-button');if(!button)return;const row=button.closest('[data-device-key]'),deviceKey=row.dataset.deviceKey;if(!deviceKey)return showToast('This device has no stable identifier and cannot be added yet.');const name=prompt('Name this camera (you can rename it later):','Camera')||'Camera';const username=prompt('Camera ONVIF/RTSP username (leave blank if none):','')||'';const password=username?(prompt('Camera ONVIF/RTSP password:','')||''):'';button.disabled=true;button.textContent='Adding…';let response,r;try{{response=await fetch('/api/customer/cameras/provision',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{appliance_id:selectedAppliance(),device_key:deviceKey,name,onvif_endpoint:row.dataset.onvif,ip_address:row.dataset.ip,manufacturer:row.dataset.manufacturer,model:row.dataset.model,username,password}})}});r=await response.json()}}catch(error){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError('The camera could not be added: no response from the server. Check the connection and try again.')}}if(!response.ok){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError(r.detail||`The camera could not be added (error ${{response.status}}). Try again or contact support.`)}}document.getElementById('scan-message').style.color='';document.getElementById('scan-message').textContent=r.message||'Provisioning request queued for the appliance.';pollProvisioning(r.job_id,button);}});
         document.getElementById('save-camera-setup').onclick=async()=>{{const cameras=[...document.querySelectorAll('.setup-camera-name')].map((input,index)=>({{id:input.dataset.id,name:input.value,site_id:document.querySelectorAll('.setup-camera-site')[index].value,resolution:'{escape(str(plan.get('resolution','2mp')))}',status:'configured'}})),response=await fetch('/api/customer/cameras',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{appliance_id:selectedAppliance(),cameras}})}}),r=await response.json();showToast(r.message)}};document.getElementById('confirm-customer-setup').onclick=async()=>{{const response=await fetch('/api/customer/setup/confirm',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{appliance_id:selectedAppliance()}})}}),r=await response.json();if(response.ok)location.href=r.redirect;else showToast(r.detail)}};
-        const buyCameraPlanButton=document.getElementById('buy-camera-plan');if(buyCameraPlanButton)buyCameraPlanButton.onclick=async()=>{{const [plan_type,tier_label]=document.getElementById('camera-tier-select').value.split('|');buyCameraPlanButton.disabled=true;buyCameraPlanButton.textContent='Redirecting to Stripe…';const messageEl=document.getElementById('camera-plan-message');messageEl.textContent='';let response,r;try{{response=await fetch('/api/customer/camera-slots/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_type,tier_label}})}});r=await response.json()}}catch(error){{buyCameraPlanButton.disabled=false;buyCameraPlanButton.textContent='Buy camera capacity';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}}if(!response.ok){{buyCameraPlanButton.disabled=false;buyCameraPlanButton.textContent='Buy camera capacity';messageEl.textContent=r.detail||`Could not start checkout (error ${{response.status}}).`;return}}location.href=r.checkout_url}};
-        const upgradeToHybridButton=document.getElementById('upgrade-to-hybrid-button');if(upgradeToHybridButton)upgradeToHybridButton.onclick=async()=>{{const tier_label=upgradeToHybridButton.dataset.tierLabel;upgradeToHybridButton.disabled=true;upgradeToHybridButton.textContent='Upgrading…';const messageEl=document.getElementById('upgrade-to-hybrid-message');messageEl.textContent='';let response,r;try{{response=await fetch('/api/customer/plan/upgrade-to-hybrid',{{method:'POST'}});r=await response.json()}}catch(error){{upgradeToHybridButton.disabled=false;upgradeToHybridButton.textContent='Upgrade to Hybrid';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}}if(!response.ok){{upgradeToHybridButton.disabled=false;upgradeToHybridButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not upgrade (error ${{response.status}}).`;return}}messageEl.textContent=r.message||'Your plan is now Hybrid.';setTimeout(()=>location.reload(),1200)}};
         const paymentReturn=document.getElementById('payment-return');if(paymentReturn&&paymentReturn.dataset.sessionId){{let tries=0,wasProcessing=false;const titleEl=document.getElementById('payment-return-title'),detailEl=document.getElementById('payment-return-detail'),reviewButton=document.getElementById('payment-return-review');reviewButton.onclick=()=>{{enterStep(6);document.getElementById('customer-setup-tabs').scrollIntoView({{behavior:'smooth'}})}};async function checkPaymentReturn(){{let r;try{{const response=await fetch('/api/customer/setup/checkout-return?session_id='+encodeURIComponent(paymentReturn.dataset.sessionId));r=await response.json();if(!response.ok)r={{state:'unknown',title:r.detail||"We couldn't check this payment right now."}}}}catch(error){{r={{state:'unknown',title:"We couldn't check this payment right now.",message:'Your purchase appears under Review as soon as Stripe confirms it.'}}}}titleEl.textContent=r.title||'';detailEl.textContent=r.message||'';if(r.state==='processing'){{wasProcessing=true;if(++tries<20)setTimeout(checkPaymentReturn,3000);else detailEl.textContent=r.slow_message||''}}else if(r.state==='active'){{if(wasProcessing){{location.reload();return}}reviewButton.hidden=false}}}}checkPaymentReturn()}}
         showSetup();loadLatestScan();</script>'''
         return shell('Customer setup','users',content,scripts)
@@ -911,16 +884,8 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         metadata=session.get('metadata') or {}
         if str(metadata.get('anyaicam_customer_id') or '')!=customer_id:
             raise HTTPException(status_code=404,detail='Unknown checkout session.')
-        plan_type=str(metadata.get('anyaicam_camera_slot_plan_type') or '').lower()
-        tier_label=str(metadata.get('anyaicam_camera_slot_tier_label') or '')
         addon_key=str(metadata.get('anyaicam_addon_key') or '')
-        if plan_type in ('local','hybrid'):
-            from customer_entitlements import PLAN_TIERS
-            label=f'{plan_type.title()} {tier_label} camera plan'
-            slots=next((t[4] for t in PLAN_TIERS if t[0]==plan_type and t[1]==tier_label),1)
-            active=bool(row("SELECT 1 FROM customer_entitlements WHERE customer_id=? AND product=? AND status='active' AND camera_slot_quantity>=?",
-                            (customer_id,f'camera_slots_{plan_type}',slots)))
-        elif addon_key:
+        if addon_key:
             from analytics_entitlements import ANALYTICS_CATALOG
             label=next((item[1] for item in ANALYTICS_CATALOG if item[0]==addon_key),'add-on')
             active=bool(row("SELECT 1 FROM addon_subscriptions WHERE customer_id=? AND addon_key=? AND status='active'",(customer_id,addon_key)))

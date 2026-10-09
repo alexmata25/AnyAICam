@@ -1,9 +1,10 @@
 """The one authoritative AnyAiCam price, package, discount and commission
 catalog (approved working pricing, 2026-09-30).
 
-Every customer-visible price, every entitlement a purchase grants, the
-Friends & Family discount rules and the salesperson commission amounts
-live here and nowhere else. customer_entitlements.py (camera-slot tiers),
+The add-on, VMS licence, discount and commission catalog. Camera plans
+are per camera and live in per_camera_billing.PLANS (billing v2); the
+fixed 8/16/32/64-camera Local/Hybrid subscription tiers were removed
+(owner decision 2026-10-08). customer_entitlements.py (VMS licences),
 analytics_entitlements.py (analytics packages / Talk Down / Face Access),
 friends_family.py, sales_commissions.py and GET /api/pricing/catalog all
 read from this module; the storefront and website pages render its JSON.
@@ -36,22 +37,12 @@ def dollars(cents: int) -> float:
 
 
 # --------------------------------------------------------------------------
-# 1-2. Base VMS plans: Local and Hybrid, monthly, fixed camera-slot tiers.
-# Camera counts are licensing limits only -- never a software assumption.
+# 1-2. Camera plans are per camera (owner decision 2026-10-08): Basic Local,
+# AI Local and Hybrid, priced per camera per month in per_camera_billing.PLANS
+# (billing v2). The earlier fixed 8/16/32/64-camera Local and Hybrid
+# subscription tiers are removed -- they never had a paying customer. The
+# one-time VMS software licenses below are a separate product and unchanged.
 # --------------------------------------------------------------------------
-# plan_type, tier_label, min_cameras, max_cameras (= licensed slots),
-# monthly price (cents), Stripe Price ID env var
-BASE_PLANS = [
-    ("local", "1-8", 1, 8, _cents("14.99"), "ANYAICAM_STRIPE_PRICE_LOCAL_1_8"),
-    ("local", "9-16", 9, 16, _cents("24.99"), "ANYAICAM_STRIPE_PRICE_LOCAL_9_16"),
-    ("local", "17-32", 17, 32, _cents("39.99"), "ANYAICAM_STRIPE_PRICE_LOCAL_17_32"),
-    ("local", "33-64", 33, 64, _cents("69.99"), "ANYAICAM_STRIPE_PRICE_LOCAL_33_64"),
-    ("hybrid", "1-8", 1, 8, _cents("24.99"), "ANYAICAM_STRIPE_PRICE_HYBRID_1_8"),
-    ("hybrid", "9-16", 9, 16, _cents("39.99"), "ANYAICAM_STRIPE_PRICE_HYBRID_9_16"),
-    ("hybrid", "17-32", 17, 32, _cents("69.99"), "ANYAICAM_STRIPE_PRICE_HYBRID_17_32"),
-    ("hybrid", "33-64", 33, 64, _cents("99.99"), "ANYAICAM_STRIPE_PRICE_HYBRID_33_64"),
-]
-PLAN_TYPE_LABELS = {"local": "Local", "hybrid": "Hybrid"}
 
 # --------------------------------------------------------------------------
 # One-time AnyAiCam VMS software license (approved 2026-09-30), sized to the
@@ -162,24 +153,6 @@ def _price_id(env_var: str) -> Optional[str]:
     return os.environ.get(env_var, "").strip() or None
 
 
-def base_plans() -> list[dict]:
-    return [
-        {
-            "plan_type": plan_type, "tier_label": tier_label,
-            "label": f"{PLAN_TYPE_LABELS[plan_type]} {max_cameras} cameras",
-            "min_cameras": min_cameras, "max_cameras": max_cameras,
-            "camera_slot_maximum": max_cameras, "monthly_cents": cents,
-            "product": f"camera_slots_{plan_type}", "billing_type": "recurring",
-            "price_env_var": env_var, "stripe_price_id": _price_id(env_var),
-        }
-        for plan_type, tier_label, min_cameras, max_cameras, cents, env_var in BASE_PLANS
-    ]
-
-
-def find_base_plan(plan_type: str, tier_label: str) -> Optional[dict]:
-    return next((p for p in base_plans() if p["plan_type"] == plan_type and p["tier_label"] == tier_label), None)
-
-
 def vms_licenses() -> list[dict]:
     return [
         {"capacity": capacity, "label": f"AnyAiCam VMS software license, {capacity} cameras", "one_time_cents": cents,
@@ -245,64 +218,10 @@ def discounted_cents(cents: int, percent_off: int) -> int:
     return cents - int(round(cents * percent_off / 100))
 
 
-def quote(*, plan_type: str, tier_label: str, addon_keys=(), talk_down_sites: int = 0,
-          friends_family_approved: bool = False, with_appliance: Optional[bool] = None) -> dict:
-    """Monthly subscription quote for one base plan plus flat add-ons, and
-    (when with_appliance is given) the one-time VMS license for the plan's
-    capacity: $0 "included" with an AnyAiCam appliance, charged for a DIY
-    installation. Advanced Analytics (and every package) is flat -- never
-    multiplied by camera slots. Talk Down is per site. Hardware is quoted
-    separately and never discounted."""
-    plan = find_base_plan(plan_type, tier_label)
-    if plan is None:
-        raise ValueError("Unknown base plan.")
-    lines = []
-
-    def add(label, cents, discount_class, quantity=1):
-        percent = friends_family_percent(discount_class) if friends_family_approved else 0
-        unit = discounted_cents(cents, percent)
-        lines.append({"label": label, "quantity": quantity, "list_cents": cents * quantity,
-                      "percent_off": percent, "cents": unit * quantity})
-
-    add(plan["label"], plan["monthly_cents"], "base")
-    for key in dict.fromkeys(addon_keys):
-        if key == "talk_down":
-            continue
-        addon = find_addon(key)
-        if addon is None or not addon["sellable"]:
-            raise ValueError(f"Add-on not available: {key}")
-        add(addon["label"], addon["monthly_cents"], addon["discount_class"])
-    if talk_down_sites:
-        talk_down = find_addon("talk_down")
-        add(talk_down["label"], talk_down["monthly_cents"], "analytics", quantity=int(talk_down_sites))
-    one_time = []
-    if with_appliance is not None:
-        license_ = find_vms_license(plan["camera_slot_maximum"])
-        if with_appliance:
-            one_time.append({"label": license_["label"] + " (included with appliance)", "cents": 0, "included": True})
-        else:
-            percent = friends_family_percent("vms_license") if friends_family_approved else 0
-            one_time.append({"label": license_["label"], "cents": discounted_cents(license_["one_time_cents"], percent),
-                             "included": False})
-    return {
-        "lines": lines,
-        "monthly_list_cents": sum(line["list_cents"] for line in lines),
-        "monthly_cents": sum(line["cents"] for line in lines),
-        "one_time_lines": one_time,
-        "one_time_cents": sum(line["cents"] for line in one_time),
-        "friends_family_approved": friends_family_approved,
-    }
-
-
 def public_catalog() -> dict:
     """Customer-safe catalog JSON (no Stripe IDs, no commission data)."""
     return {
         "currency": "USD",
-        "base_plans": [
-            {k: p[k] for k in ("plan_type", "tier_label", "label", "min_cameras", "max_cameras")}
-            | {"monthly": dollars(p["monthly_cents"])}
-            for p in base_plans()
-        ],
         "included_features": [{"key": k, "label": label} for k, label in INCLUDED_FEATURES],
         "vms_licenses": [
             {"capacity": lic["capacity"], "label": lic["label"], "one_time": dollars(lic["one_time_cents"]),
