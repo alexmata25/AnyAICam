@@ -22,10 +22,14 @@
 #     in place (a rollback to 1.2.4 keeps using it).
 #   * The write is the Software Update applier's migrate_capacity_fallback()
 #     (appliance-agent/system/apply_release.py, shipped in this package): the
-#     same code for both paths. An unsafe existing fallback stops the install.
+#     same code for both paths.
 #
 # Runs after deploy_vms (the old VMS is stopped and legacy data moved to
-# /var/lib/anyaicam/vms) and before systemd_setup starts the new VMS.
+# /var/lib/anyaicam/vms) and before systemd_setup starts the new VMS. So it
+# NEVER fails the install (Orange, 2026-10-09: aborting here left the VMS
+# stopped): an unsafe existing fallback or any migration problem is a
+# warning, and the VMS -- which checks the fallback itself -- fails closed
+# until the cloud's first signed capacity.
 
 migrate_capacity_fallback_step() {
     local state="$1" identity from_version outcome
@@ -47,16 +51,15 @@ sys.path.insert(0, sys.argv[1])
 import apply_release
 sys.exit(apply_release.migrate_capacity_fallback_main(sys.argv[2:]))
 PYEOF
-)" || {
-        echo "[ERROR] The camera capacity could not be migrated safely; nothing else was changed by this step." >&2
-        return 1
-    }
+)" || outcome="error"
     case "$outcome" in
         migrated) log "Camera capacity: carried the running capacity into the root-owned fallback (used until the cloud's first signed capacity)." ;;
         exists) log "Camera capacity: the root-owned fallback already exists; left unchanged." ;;
         not_applicable) log "Camera capacity: the replaced release already used signed capacity; nothing to migrate." ;;
         no_capacity) log "Camera capacity: no capacity recorded yet; cameras start after the cloud's first signed capacity." ;;
         no_identity) log "Camera capacity: this appliance is not activated; cameras start after it is linked and the cloud signs its capacity." ;;
-        *) log "[WARN] Camera capacity: unexpected migration result '$outcome'." ;;
+        unsafe) log "[WARN] Camera capacity: an existing fallback is unsafe and was left alone; the VMS will ignore it. Cameras start after the cloud's first signed capacity." ;;
+        *) log "[WARN] Camera capacity: the migration did not complete ('$outcome'); the install continues and cameras start after the cloud's first signed capacity." ;;
     esac
+    return 0
 }

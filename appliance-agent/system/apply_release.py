@@ -377,13 +377,25 @@ def _read_user_json(path: Path) -> Optional[dict]:
         descriptor = os.open(path, flags)
     except OSError:
         return None
-    with os.fdopen(descriptor, "rb") as handle:
+    # Checked on the raw descriptor BEFORE it becomes a file object: on Linux
+    # os.open() succeeds on a directory and fdopen() then raises (Orange,
+    # 2026-10-09). Any rejection closes the descriptor.
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        return None
+    if (not statmod.S_ISREG(info.st_mode) or getattr(info, "st_nlink", 1) != 1
+            or info.st_size > _CAPACITY_SOURCE_MAX_BYTES):
+        os.close(descriptor)
+        return None
+    try:
+        handle = os.fdopen(descriptor, "rb")
+    except OSError:
+        os.close(descriptor)
+        return None
+    with handle:
         try:
-            info = os.fstat(handle.fileno())
-            if not statmod.S_ISREG(info.st_mode) or getattr(info, "st_nlink", 1) != 1:
-                return None
-            if info.st_size > _CAPACITY_SOURCE_MAX_BYTES:
-                return None
             raw = handle.read(_CAPACITY_SOURCE_MAX_BYTES + 1)
         except OSError:
             return None
@@ -465,13 +477,23 @@ def migrate_capacity_fallback(*, from_version: str, migrated_by: str, target: Pa
 
 def migrate_capacity_fallback_main(argv: list) -> int:
     """Installer entry point (installer/15-capacity-fallback.sh):
-    apply_release.py-dir on sys.path, then main([from_version])."""
+    apply_release.py-dir on sys.path, then main([from_version]).
+
+    Never fails the install (Orange, 2026-10-09): the step runs while the
+    old VMS is already stopped, so aborting there would leave the appliance
+    down. An unsafe existing fallback ('unsafe') or any unexpected problem
+    ('error') is reported and the install continues: the VMS checks the
+    fallback itself and fails closed until the cloud's first signed capacity.
+    (Software Update migrates before any downtime, where a refusal is safe.)"""
     from_version = argv[0] if argv else ""
     try:
         outcome = migrate_capacity_fallback(from_version=from_version, migrated_by="installer")
     except TrustAnchorError as error:
-        print(f"[ERROR] {error}", file=sys.stderr)
-        return 1
+        print(f"[WARN] {error}", file=sys.stderr)
+        outcome = "unsafe"
+    except Exception as error:  # noqa: BLE001 -- never abort an install half-way
+        print(f"[WARN] camera capacity migration failed: {type(error).__name__}", file=sys.stderr)
+        outcome = "error"
     print(outcome)
     return 0
 

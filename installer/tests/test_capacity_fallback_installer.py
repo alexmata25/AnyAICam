@@ -37,8 +37,8 @@ class CapacityStepTests(unittest.TestCase):
             "def migrate_capacity_fallback_main(argv):\n"
             "    open(os.environ['SEEN'], 'w').write(repr(argv))\n"
             "    outcome = os.environ.get('OUTCOME', 'migrated')\n"
-            "    if outcome == 'unsafe':\n"
-            "        print('[ERROR] unsafe', file=sys.stderr); return 1\n"
+            "    if outcome == 'crash':\n"
+            "        raise SystemExit(1)\n"
             "    print(outcome); return 0\n", encoding="utf-8")
         shim = self.tmp / "bin"
         shim.mkdir()
@@ -101,17 +101,19 @@ migrate_capacity_fallback_step {state}
         self.assertIsNone(self.given())
         self.assertIn("could not be read; nothing migrated", result.stdout)
 
-    def test_every_outcome_is_reported_and_only_unsafe_stops_the_install(self):
+    def test_every_outcome_is_reported_and_none_stops_the_install(self):
+        # Orange 2026-10-09: the step runs with the old VMS already stopped,
+        # so even an unsafe fallback or a crashed migration must not abort the
+        # install half-way; the VMS fails closed on its own.
         self.record(self.root_record, "1.2.4")
         for outcome, text in (("exists", "already exists"), ("not_applicable", "already used signed capacity"),
-                              ("no_capacity", "no capacity recorded yet"), ("no_identity", "not activated")):
+                              ("no_capacity", "no capacity recorded yet"), ("no_identity", "not activated"),
+                              ("unsafe", "existing fallback is unsafe"), ("error", "did not complete ('error')"),
+                              ("crash", "did not complete ('error')")):
             with self.subTest(outcome=outcome):
                 result = self.step(outcome=outcome)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(text, result.stdout)
-        result = self.step(outcome="unsafe")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not be migrated safely", result.stderr)
 
 
 class WiringTests(unittest.TestCase):
