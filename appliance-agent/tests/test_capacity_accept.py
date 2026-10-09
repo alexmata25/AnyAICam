@@ -580,6 +580,44 @@ class AcceptanceFilesystemTests(unittest.TestCase):
             os.close(identity_fd)
             os.close(trust_fd)
 
+    def test_clean_125_repair_keeps_initial_claim_transition_requirement(self):
+        # A clean 1.2.5 install has the same provisional installer and
+        # activation IDs. A later repair may use the legacy-upgrade bootstrap
+        # entrypoint, but it must create/retain pending correlation rather
+        # than pinning that ID and accepting transition-less capacity.
+        provisional_identity = dict(CLOUD_IDENTITY, appliance_id=PROVISIONAL_ID,
+                                    cloud_id="AIC-provisional")
+        identity_path = self.identity_dir / "appliance_identity.json"
+        identity_path.write_text(json.dumps(provisional_identity), encoding="utf-8")
+        (self.installer_dir / "appliance_identity.json").write_text(
+            json.dumps({"appliance_id": PROVISIONAL_ID}), encoding="utf-8")
+        constants = {
+            "TRUST_DIR": str(self.trust),
+            "IDENTITY_FILE": str(identity_path),
+            "INSTALLER_IDENTITY_FILE": str(self.installer_dir / "appliance_identity.json"),
+        }
+        output = io.StringIO()
+        with mock.patch.multiple(capacity_accept, **constants), \
+                mock.patch.object(capacity_accept.sys, "argv", ["capacity_accept.py", "--bootstrap-identity",
+                                                                  "--legacy-upgrade"]), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(capacity_accept.main(), 0)
+        self.assertEqual(output.getvalue().strip(), "awaiting_signed_transition")
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertEqual(json.loads((self.trust / PENDING_CLAIM_FILE).read_text())["provisional_appliance_id"],
+                         PROVISIONAL_ID)
+
+        self.stage_snapshot(make_snapshot(self.private, **provisional_identity))
+        with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
+            self.call_accept()
+        self.assertFalse(self.accepted.exists())
+
+        identity_path.write_text(json.dumps(CLOUD_IDENTITY), encoding="utf-8")
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY,
+                                                        provisional_id=PROVISIONAL_ID))
+        self.assertEqual(self.call_accept(), "accepted")
+        self.assertEqual(json.loads(self.accepted.read_text())["identity"], CLOUD_IDENTITY)
+
     def test_rejected_or_stale_ownership_transition_preserves_accepted_state(self):
         self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=4))
         self.call_accept()

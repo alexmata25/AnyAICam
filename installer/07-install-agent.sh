@@ -117,7 +117,17 @@ install_agent() {
     deploy_agent_source || return 1
 
     log "Installing appliance-agent control-plane package..."
-    bash "$AGENT_SOURCE_ROOT/scripts/install.sh"
+    # The full appliance installer already bootstrapped capacity before VMS
+    # downtime and will finish identity reconciliation after systemd_setup.
+    # Do not start the strict snapshot service from this post-deploy step: a
+    # rejected staged file must not abort the repair before the VMS is brought
+    # back. Standalone agent installs keep the agent script's normal bootstrap.
+    local install_status=0
+    bash "$AGENT_SOURCE_ROOT/scripts/install.sh" --defer-capacity-bootstrap || install_status=$?
+    if [[ "$install_status" -ne 0 ]]; then
+        echo "[ERROR] Appliance-agent install failed (exit $install_status)." >&2
+        return "$install_status"
+    fi
     if [[ "$state" == "clean" ]]; then
         log "Appliance agent installed (clean install)."
     else

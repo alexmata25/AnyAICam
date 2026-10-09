@@ -1,6 +1,9 @@
 """Release wiring tests for the protected Linux camera-capacity acceptance helper."""
 from pathlib import Path
+import os
+import subprocess
 import sys
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +49,71 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         unit = (ROOT / "appliance-agent/system/anyaicam-capacity-accept.service").read_text(encoding="utf-8")
         self.assertIn("ExecStart=/usr/bin/python3 -I /opt/anyaicam-agent/privileged/capacity_accept.py\n", unit)
         self.assertNotIn("--accept-migrated-snapshot", unit)
+
+    def test_full_repair_defers_second_capacity_start_until_vms_is_restarted(self):
+        installer_step = (ROOT / "installer/07-install-agent.sh").read_text(encoding="utf-8")
+        agent_script = (ROOT / "appliance-agent/scripts/install.sh").read_text(encoding="utf-8")
+        self.assertIn('bash "$AGENT_SOURCE_ROOT/scripts/install.sh" --defer-capacity-bootstrap', installer_step)
+        self.assertIn("--defer-capacity-bootstrap) DEFER_CAPACITY_BOOTSTRAP=1", agent_script)
+        self.assertIn('&& "$DEFER_CAPACITY_BOOTSTRAP" -eq 0 ]]; then', agent_script)
+        self.assertIn('bootstrap_capacity_identity\nfi', agent_script)
+        self.assertIn("systemd_setup", (ROOT / "installer/install.sh").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.name == "posix" and __import__("shutil").which("bash"), "requires Bash")
+    def test_full_installer_agent_step_passes_defer_and_preserves_child_status(self):
+        harness = textwrap.dedent(f"""
+            source {str(ROOT / 'installer/07-install-agent.sh')!r}
+            AGENT_PAYLOAD_DIR="$TMPDIR/payload"
+            AGENT_SOURCE_ROOT="$TMPDIR/source"
+            mkdir -p "$AGENT_PAYLOAD_DIR/scripts" "$AGENT_SOURCE_ROOT/scripts"
+            touch "$AGENT_PAYLOAD_DIR/scripts/install.sh"
+            apt-get() {{ :; }}
+            deploy_agent_source() {{ :; }}
+            log() {{ :; }}
+            bash() {{ printf 'CHILD_ARGS=%s\\n' "$*"; return 42; }}
+            if install_agent repair; then result=0; else result=$?; fi
+            printf 'AGENT_INSTALL_RESULT=%s\\n' "$result"
+        """)
+        result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--defer-capacity-bootstrap", result.stdout)
+        self.assertIn("AGENT_INSTALL_RESULT=42", result.stdout)
+        self.assertNotIn("Appliance agent verified/updated", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix" and __import__("shutil").which("bash"), "requires Bash")
+    def test_run_install_propagates_agent_installer_failure_in_conditional_context(self):
+        # `set -e` is suppressed throughout a function when the caller tests
+        # that function in an if-condition. The real installer must therefore
+        # explicitly propagate an agent install failure rather than continuing
+        # to report success without reaching systemd_setup.
+        harness = textwrap.dedent(f"""
+            source {str(ROOT / 'installer/install.sh')!r}
+            load_release_metadata() {{ :; }}
+            verify_installer_payload() {{ :; }}
+            preflight_checks() {{ :; }}
+            webrtc_port_preflight() {{ :; }}
+            vms_http_port_preflight() {{ :; }}
+            detect_install_state() {{ INSTALL_STATE=existing; }}
+            release_downgrade_guard() {{ :; }}
+            select_product_mode() {{ :; }}
+            storage_preflight() {{ :; }}
+            secure_agent_install_root() {{ :; }}
+            provision_entitlement_signing_keys() {{ :; }}
+            install_capacity_accept_step() {{ :; }}
+            migrate_capacity_fallback_step() {{ :; }}
+            docker_setup() {{ :; }}
+            provision_users_dirs() {{ :; }}
+            deploy_vms() {{ :; }}
+            install_rollback_tool() {{ :; }}
+            install_agent() {{ return 73; }}
+            systemd_setup() {{ echo SYSTEMD_SETUP_RAN; }}
+            if run_install --repair; then result=0; else result=$?; fi
+            printf 'INSTALL_RESULT=%s\\n' "$result"
+        """)
+        result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INSTALL_RESULT=73", result.stdout)
+        self.assertNotIn("SYSTEMD_SETUP_RAN", result.stdout)
 
     def test_helper_unit_is_fixed_root_isolated_and_rate_limited(self):
         unit = (ROOT / "appliance-agent/system/anyaicam-capacity-accept.service").read_text(encoding="utf-8")

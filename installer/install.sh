@@ -202,7 +202,10 @@ run_install() {
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"
     install_rollback_tool
-    install_agent "$INSTALL_STATE"
+    # Preserve the child installer failure status even when run_install is
+    # invoked from a conditional test/harness (where Bash suppresses errexit
+    # throughout the function).
+    install_agent "$INSTALL_STATE" || return $?
     install_mediamtx "$INSTALL_STATE"
     install_webrtc_firewall
     systemd_setup

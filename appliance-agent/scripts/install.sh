@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+DEFER_CAPACITY_BOOTSTRAP=0
+for arg in "$@"; do
+  case "$arg" in
+    --defer-capacity-bootstrap) DEFER_CAPACITY_BOOTSTRAP=1 ;;
+    *) echo "Unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 if [[ $EUID -ne 0 ]]; then echo "Run with sudo." >&2; exit 1; fi
 # Root-run code is installed below (the venv, the privileged watcher): never
 # with a group/other-writable umask inherited from the invoking login.
@@ -42,7 +49,7 @@ systemctl enable anyaicam-agent.service
 systemctl restart anyaicam-agent.service
 install_privileged_watcher "$SOURCE_DIR"
 install_capacity_accept "$SOURCE_DIR/system"
-if [[ -f /var/lib/anyaicam/vms/recordings/appliance_identity.json ]]; then
+if [[ -f /var/lib/anyaicam/vms/recordings/appliance_identity.json && "$DEFER_CAPACITY_BOOTSTRAP" -eq 0 ]]; then
   bootstrap_capacity_identity
 fi
 echo "Installed and running. Run: sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup"
