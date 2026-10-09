@@ -2068,17 +2068,57 @@ def get_supervisor_slot_count() -> int:
     whatever is already provisioned (so a customer with 5 cameras already
     provisioned at startup can add a few more without a VMS restart).
 
-    2026-10-08 (Orange): also CAMERA_SUPERVISOR_HEADROOM above the HIGHEST
-    provisioned camera_number, not only above the count. A removed camera's
-    number is never reused (customer camera Add/Delete), so after camera
-    replacements the numbers run past count + headroom: 4 cameras numbered
-    1, 2, 3 and 9 had slots 1..8 only, camera 9 was never supervised (no
-    live view, no recording, even after a restart) and GET /ready answered
-    500 (KeyError: 9). A camera_number provisioned beyond this ceiling while
-    the VMS runs gets its supervisors from camera_supervisor_watcher()."""
-    numbers = get_camera_numbers()
-    return max(LEGACY_DEFAULT_CAMERA_COUNT, len(numbers) + CAMERA_SUPERVISOR_HEADROOM,
-               max(numbers, default=0) + CAMERA_SUPERVISOR_HEADROOM)
+    2026-10-08 (Orange): these slots are not the whole boot set any more --
+    see _boot_supervisor_numbers(), which adds every provisioned
+    camera_number above them."""
+    return max(LEGACY_DEFAULT_CAMERA_COUNT, get_camera_count() + CAMERA_SUPERVISOR_HEADROOM)
+
+
+# Sanity bound for a camera_number read from the local database: numbers
+# are never reused, so they grow with camera replacements, but never near this.
+CAMERA_NUMBER_MAX = 10_000
+_rejected_camera_numbers: set[str] = set()  # each logged once
+
+
+def _valid_camera_numbers(numbers) -> list[int]:
+    """Distinct camera_numbers in 1..CAMERA_NUMBER_MAX, in order. Anything
+    else is logged (once) and skipped; the other cameras are unaffected."""
+    valid = []
+    for raw in numbers:
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            number = None
+        if number is None or not 0 < number <= CAMERA_NUMBER_MAX:
+            key = repr(raw)[:40]
+            if key not in _rejected_camera_numbers:
+                _rejected_camera_numbers.add(key)
+                structured_log("camera.number_out_of_range", level="warning", camera_number=key,
+                               maximum=CAMERA_NUMBER_MAX)
+            continue
+        if number not in valid:
+            valid.append(number)
+    return valid
+
+
+def _boot_supervisor_numbers() -> list[int]:
+    """The camera_numbers supervised from startup, in start order: every
+    provisioned camera_number, then the idle headroom slots of
+    1..get_supervisor_slot_count() not already in use.
+
+    2026-10-08 (Orange): a removed camera's number is never reused
+    (customer camera Add/Delete), so after replacements numbers run past
+    count + headroom: 4 cameras numbered 1, 2, 3 and 9 had slots 1..8 only,
+    camera 9 was never supervised (no live view or recording, even after a
+    restart) and GET /ready answered 500 (KeyError: 9). Only numbers that
+    exist are added -- never every number up to the highest one, so one
+    bad or huge camera_number cannot start thousands of supervisors."""
+    provisioned = _valid_camera_numbers(get_camera_numbers())
+    idle_slots = max(LEGACY_DEFAULT_CAMERA_COUNT, len(provisioned) + CAMERA_SUPERVISOR_HEADROOM)  # get_supervisor_slot_count(), valid numbers only
+    # Provisioned cameras first, so they get the earliest startup-stagger
+    # positions (camera 9 above is not delayed behind idle slots 4..8).
+    provisioned = sorted(provisioned)
+    return provisioned + [number for number in range(1, idle_slots + 1) if number not in provisioned]
 
 
 
@@ -3012,7 +3052,7 @@ def _new_camera_process_state() -> dict:
     }
 
 
-_boot_supervisor_slots = range(1, get_supervisor_slot_count() + 1)
+_boot_supervisor_slots = _boot_supervisor_numbers()
 camera_process_state = _PerCameraState(_new_camera_process_state, _boot_supervisor_slots)
 camera_reconnect_counts = _PerCameraState(int, _boot_supervisor_slots)
 
@@ -3030,13 +3070,16 @@ def _claim_camera_supervisor_slots(numbers) -> list[int]:
 
 def start_camera_supervisors(numbers, tasks: list) -> list[int]:
     """Starts live and recording supervisors for the camera_numbers among
-    `numbers` that have none; returns the numbers started."""
-    started = _claim_camera_supervisor_slots(numbers)
-    for camera_number in started:
+    `numbers` that have none; returns the numbers started. The startup
+    stagger follows each camera's position in this start, not its number
+    (the same as before for cameras 1..N; a camera numbered 9 found later
+    does not wait 16-17 stagger steps)."""
+    started = _claim_camera_supervisor_slots(_valid_camera_numbers(numbers))
+    for position, camera_number in enumerate(started):
         camera_process_state[camera_number]  # noqa: B018 -- creates its entry
         camera_reconnect_counts[camera_number]  # noqa: B018
-        tasks.append(asyncio.create_task(process_supervisor(camera_number, "live")))
-        tasks.append(asyncio.create_task(process_supervisor(camera_number, "recording")))
+        tasks.append(asyncio.create_task(process_supervisor(camera_number, "live", stagger_index=position * 2)))
+        tasks.append(asyncio.create_task(process_supervisor(camera_number, "recording", stagger_index=position * 2 + 1)))
     return started
 
 
@@ -16816,16 +16859,10 @@ def _bounded_camera_error(stderr_tail: list[str]) -> str:
     return _redact_camera_stream_error(joined)[:CAMERA_ERROR_MAX_CHARS]
 
 
-async def process_supervisor(camera_number: int, mode: str) -> None:
-
-
-
-
-
-
-
-
-    """Keep one camera worker alive and retry when a camera is unavailable."""
+async def process_supervisor(camera_number: int, mode: str, *, stagger_index: int | None = None) -> None:
+    """Keep one camera worker alive and retry when a camera is unavailable.
+    stagger_index: the startup-stagger slot (start_camera_supervisors()
+    passes the camera's position); by default derived from camera_number."""
 
     # Startup stagger (2026-09-22) -- see CAMERA_SUPERVISOR_STARTUP_STAGGER_
     # SECONDS's own comment for the real restart-loop this fixes. lifespan()
@@ -16835,7 +16872,8 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
     # tasks against each other -- 10 total launches on a 5-camera appliance,
     # evenly spread instead of colliding in the same instant.
     if CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS:
-        stagger_index = (camera_number - 1) * 2 + (0 if mode == "live" else 1)
+        if stagger_index is None:
+            stagger_index = (camera_number - 1) * 2 + (0 if mode == "live" else 1)
         await asyncio.sleep(stagger_index * CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS)
 
 
@@ -40189,61 +40227,7 @@ async def lifespan(app: FastAPI):
 
 
 
-        for camera_number in _claim_camera_supervisor_slots(_boot_supervisor_slots):  # see CAMERA_SUPERVISOR_HEADROOM
-
-
-
-
-
-
-
-
-            supervisor_tasks.append(
-
-
-
-
-
-
-
-
-                asyncio.create_task(process_supervisor(camera_number, "live"))
-
-
-
-
-
-
-
-
-            )
-
-
-
-
-
-
-
-
-            supervisor_tasks.append(
-
-
-
-
-
-
-
-
-                asyncio.create_task(process_supervisor(camera_number, "recording"))
-
-
-
-
-
-
-
-
-            )
+        start_camera_supervisors(_boot_supervisor_slots, supervisor_tasks)  # see _boot_supervisor_numbers()
 
 
 
