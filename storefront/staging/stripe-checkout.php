@@ -55,6 +55,13 @@ set_exception_handler(function (Throwable $e): void {
     json_fail('Stripe checkout server configuration error.', 500);
 });
 
+// Retired on the staging storefront (2026-10-04). This older multi-item cart
+// sells cameras, PoE switches and adapters -- whose Price IDs belong to another
+// Stripe account -- and falls back to ad-hoc price_data amounts the portal can
+// never recognize. Build Your System (checkout-session.php) is the only
+// checkout here: portal-recognized Prices, verified against the catalog.
+json_fail('This checkout is not available. Please use Build Your System.', 410);
+
 require_once __DIR__ . '/stripe-config.php'; // staging config -- see file header
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {

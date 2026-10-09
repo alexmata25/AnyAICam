@@ -48,8 +48,8 @@ return [
  // price_id are unchanged. Real retail is 124999/174999/224999/14999
  // cents -- restore those values (and repoint price_id at live Price
  // IDs) before any promotion of this file to production.
- 'AIC-APPLIANCE-RYZEN-STARTER'=>['name'=>'AnyAiCam Starter','unit_amount'=>50,'price_id'=>hardware_price_catalog_config_value('RYZEN_STARTER_PRICE_ID')],
- 'AIC-APPLIANCE-RYZEN-ENTERPRISE'=>['name'=>'AnyAiCam Professional','unit_amount'=>51,'price_id'=>hardware_price_catalog_config_value('RYZEN_ENTERPRISE_PRICE_ID')],
- 'AIC-APPLIANCE-RYZEN-AAC-FACIAL'=>['name'=>'AnyAiCam Enterprise','unit_amount'=>52,'price_id'=>hardware_price_catalog_config_value('RYZEN_AAC_FACIAL_PRICE_ID')],
- 'AIC-RELAY-NUMATO-3CH'=>['name'=>'Numato 3-Channel Relay Module','unit_amount'=>53,'price_id'=>hardware_price_catalog_config_value('RELAY_MODULE_3CH_PRICE_ID')],
+ 'AIC-APPLIANCE-RYZEN-STARTER'=>['name'=>'AnyAiCam Starter','unit_amount'=>124999,'price_id'=>hardware_price_catalog_config_value('RYZEN_STARTER_PRICE_ID')],
+ 'AIC-APPLIANCE-RYZEN-ENTERPRISE'=>['name'=>'AnyAiCam Professional','unit_amount'=>174999,'price_id'=>hardware_price_catalog_config_value('RYZEN_ENTERPRISE_PRICE_ID')],
+ 'AIC-APPLIANCE-RYZEN-AAC-FACIAL'=>['name'=>'AnyAiCam Enterprise','unit_amount'=>224999,'price_id'=>hardware_price_catalog_config_value('RYZEN_AAC_FACIAL_PRICE_ID')],
+ 'AIC-RELAY-NUMATO-3CH'=>['name'=>'Numato 3-Channel Relay Module','unit_amount'=>14999,'price_id'=>hardware_price_catalog_config_value('RELAY_MODULE_3CH_PRICE_ID')],
 ];

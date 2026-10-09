@@ -71,21 +71,6 @@ def test_no_panel_without_a_return_and_no_markup_from_a_malformed_session_id(por
     assert 'id="payment-return"' not in html and "alert(1)" not in html
 
 
-def test_paid_plan_reads_activating_until_the_webhook_grants_it_then_active(portal, db_path, monkeypatch):
-    client, captured, sent = portal
-    _seed(db_path)
-    _stripe_session(monkeypatch, anyaicam_camera_slot_plan_type="local", anyaicam_camera_slot_tier_label="1-8")
-    first = _return_status(client).json()
-    assert first["state"] == "processing"
-    assert first["title"] == "Payment received. Activating your Local 1-8 camera plan…"
-    with override_target(sqlite_path=str(db_path)):
-        from customer_entitlements import upsert_entitlement
-        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
-    second = _return_status(client).json()
-    assert second["state"] == "active"
-    assert second["title"] == "Payment received. Your Local 1-8 camera plan is active."
-
-
 def test_the_return_check_grants_nothing(portal, db_path, monkeypatch):
     client, captured, sent = portal
     _seed(db_path)
@@ -110,8 +95,8 @@ def test_add_on_return_is_reported_by_its_own_name(portal, db_path, monkeypatch)
 def test_unpaid_session_is_never_reported_as_received(portal, db_path, monkeypatch):
     client, captured, sent = portal
     _seed(db_path)
-    _stripe_session(monkeypatch, status="open", payment_status="unpaid",
-                    anyaicam_camera_slot_plan_type="local", anyaicam_camera_slot_tier_label="1-8")
+    # An add-on checkout (the fixed-tier camera plans were removed 2026-10-08).
+    _stripe_session(monkeypatch, status="open", payment_status="unpaid", anyaicam_addon_key="talk_down")
     body = _return_status(client).json()
     assert body["state"] == "not_paid" and "received" not in body["title"].lower()
 

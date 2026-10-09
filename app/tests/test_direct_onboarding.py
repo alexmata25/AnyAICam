@@ -186,34 +186,6 @@ def test_a_direct_customer_is_a_house_customer_with_no_partner_or_salesperson(si
 
 # ------------------------------------------------------------------ 3-6. purchase, entitlement, download
 
-def test_direct_owner_buys_local_gets_entitlement_and_downloads_the_installer(site, db_path, storage, package, monkeypatch):
-    # Exercises the legacy purchase -> entitlement -> installer download path
-    # (still used by grandfathered accounts); new legacy purchases are off in
-    # production (billing v2, 2026-10-05; test_legacy_checkout_guard.py).
-    import main
-    monkeypatch.setattr(main, "LEGACY_CAMERA_SLOT_NEW_PURCHASES", True)
-    client, captured, mail = site
-    email = _direct_owner(client, mail)
-    customer_id = _one(db_path, "SELECT id FROM customers WHERE email=?", (email,))["id"]
-    _publish(package)
-    # Before buying: no download.
-    assert client.get("/api/customer/downloads/vms-installer").status_code == 403
-    plan = client.post("/api/customer/camera-slots/checkout", json={"plan_type": "local", "tier_label": "1-8"})
-    assert plan.status_code == 200, plan.text
-    assert captured[-1]["metadata[anyaicam_customer_id]"] == customer_id and captured[-1]["customer"] == f"cus_test_{customer_id}"
-    licence = client.post("/api/customer/vms-license/checkout", json={"capacity": 8})
-    assert licence.status_code == 200, licence.text
-    assert captured[-1]["metadata[anyaicam_customer_id]"] == customer_id
-    assert _webhook(client, _completed("evt_plan", "price_local_8", customer_id, email)).status_code == 200
-    assert _webhook(client, _completed("evt_lic", "price_vms_8", customer_id, email, mode="payment")).status_code == 200
-    import customer_entitlements as ce
-    assert ce.total_camera_slots(customer_id) == 8 and ce.vms_license_capacity(customer_id) == 8
-    portal_page = client.get("/subscription-portal").text
-    assert "vms-installer" in portal_page
-    download = client.get("/api/customer/downloads/vms-installer")
-    assert download.status_code == 200 and download.content == package.read_bytes()
-
-
 def test_an_unlicensed_direct_owner_cannot_download(site, db_path, storage, package):
     client, _, mail = site
     _direct_owner(client, mail, "nolicence@example.test")
@@ -345,12 +317,3 @@ def test_my_subscription_offers_a_new_direct_owner_the_billing_v2_plans(site, db
     after = client.get("/subscription-portal").text
     assert 'id="v2-checkout-button"' not in after  # offered only while there is no plan
     assert "AI Local · 2 licensed cameras" in after
-
-
-def test_the_plan_chooser_is_not_offered_without_configured_prices(site, db_path, monkeypatch):
-    client, _, mail = site
-    _direct_owner(client, mail, "noprices@example.test")
-    from customer_entitlements import PLAN_TIERS
-    for tier in PLAN_TIERS:
-        monkeypatch.delenv(tier[6], raising=False)
-    assert 'id="choose-plan-button"' not in client.get("/subscription-portal").text

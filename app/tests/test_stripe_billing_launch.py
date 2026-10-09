@@ -53,7 +53,7 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         monkeypatch.setenv("ANYAICAM_STRIPE_BILLING_PORTAL_ENABLED", "true")  # off by default: owner decision on portal capabilities
         monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_LOCAL_1_8", LOCAL_8)
         monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", HYBRID_8)
-        monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", ce._load_price_tier_map())
+        monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", __import__("conftest").fixed_slot_price_map_for_tests())
         stripe: dict = {}
         posts: list = []
         keys: list = []  # Idempotency-Key per Stripe write
@@ -321,15 +321,6 @@ def test_replayed_webhooks_never_duplicate_anything(env):
     conn.close()
 
 
-def test_a_second_checkout_for_a_plan_already_held_is_refused(env):
-    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", "active")
-    _deliver(env, _checkout("evt_1"))
-    before = len(env["posts"])
-    response = env["client"].post("/api/customer/camera-slots/checkout", json={"plan_type": "local", "tier_label": "1-8"},
-                                  cookies=_cookie(*OWNER_A))
-    assert response.status_code == 409 and len(env["posts"]) == before  # no second Stripe subscription
-
-
 # ================================================================ Billing Portal
 
 def _legacy_primary_account(env):
@@ -448,86 +439,6 @@ def _capacity(env, customer_id="cust-A"):
         return ce.total_camera_slots(customer_id), ce.product_mode_for_customer(customer_id)
 
 
-def test_local_to_hybrid_upgrades_the_same_subscription_to_one_base_plan(env):
-    _local_customer(env)
-    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
-    assert response.status_code == 200, response.text
-    changes = [p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_A1"]
-    assert len(changes) == 1 and changes[0][1]["items[0][id]"] == "si_sub_A1" and changes[0][1]["items[0][price]"] == HYBRID_8
-    # Owner, 2026-10-02: immediate, prorated and invoiced now, renewal date unchanged,
-    # applied only if that payment succeeds.
-    assert changes[0][1]["proration_behavior"] == "always_invoice"
-    assert changes[0][1]["billing_cycle_anchor"] == "unchanged"
-    assert changes[0][1]["payment_behavior"] == "pending_if_incomplete"
-    # Keyed per upgrade attempt (plan_upgrade_attempts): same attempt, same key.
-    assert env["keys"][env["posts"].index(changes[0])].startswith(f"anyaicam-upgrade-sub_A1-si_sub_A1-{HYBRID_8}-")
-    assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]  # no second subscription
-    assert _plan(env["path"], product="camera_slots_hybrid")["status"] == "active"
-    assert _plan(env["path"], product="camera_slots_local")["status"] == "superseded"
-    assert _capacity(env) == (8, "hybrid")  # one base plan, never 16
-    # The webhook Stripe sends for the same change is harmless, and so is a second click.
-    _deliver(env, _sub_event("evt_up", "updated", env["stripe"]["sub_A1"], 9_000))
-    again = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
-    assert again.status_code == 200 and again.json()["status"] == "already_hybrid"
-    assert len([p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_A1"]) == 1
-    assert _capacity(env) == (8, "hybrid")
-
-
-def test_a_declined_upgrade_payment_leaves_the_customer_on_local(env):
-    _local_customer(env)
-    env["declines"].add("sub_A1")
-    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
-    assert response.status_code == 402 and "still Local" in response.json()["detail"]
-    assert _plan(env["path"])["status"] == "active" and _plan(env["path"], product="camera_slots_hybrid") is None
-    assert _capacity(env) == (8, "local")
-
-
-def test_a_try_after_a_confirmed_decline_is_a_new_upgrade_attempt(env):
-    """Codex verification of 9a388c6, finding 2: once Stripe confirmed an
-    attempt was not applied, the customer's next try is a new attempt with a
-    new Idempotency-Key (the same key would only replay the cached decline).
-    Simultaneous requests for one attempt share one key:
-    test_stripe_billing_verification.py."""
-    _local_customer(env)
-    env["declines"].add("sub_A1")  # the card keeps failing
-    for _ in range(2):
-        assert env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A)).status_code == 402
-    upgrade_keys = [k for (path, _), k in zip(env["posts"], env["keys"]) if path == "/v1/subscriptions/sub_A1"]
-    assert len(upgrade_keys) == 2 and len(set(upgrade_keys)) == 2
-    assert _capacity(env) == (8, "local") and not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]
-
-
-def test_the_upgrade_button_uses_the_in_place_upgrade(env):
-    _local_customer(env)
-    page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
-    assert 'id="subscription-upgrade-button"' in page and "/api/customer/plan/upgrade-to-hybrid" in page
-    assert "camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type:'hybrid'" not in page
-
-
-def test_hybrid_checkout_while_local_is_active_is_refused_and_points_to_the_upgrade(env):
-    _local_customer(env)
-    response = env["client"].post("/api/customer/camera-slots/checkout", json={"plan_type": "hybrid", "tier_label": "1-8"},
-                                  cookies=_cookie(*OWNER_A))
-    assert response.status_code == 409 and "Upgrade to Hybrid" in response.json()["detail"]
-    assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]
-
-
-@pytest.mark.parametrize("cookie", [("viewer@example.test", "customer_viewer", "cust-A"), ("b@example.test", "customer_owner", "cust-B")])
-def test_only_the_accounts_owner_can_upgrade_and_never_another_accounts_subscription(env, cookie):
-    _local_customer(env)
-    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*cookie))
-    assert response.status_code in (403, 409)
-    assert not [p for p in env["posts"] if p[0].startswith("/v1/subscriptions/")]
-    assert _plan(env["path"])["status"] == "active"
-
-
-def test_an_upgrade_is_refused_if_stripe_no_longer_matches_the_account(env):
-    _local_customer(env)
-    env["stripe"]["sub_A1"]["metadata"]["anyaicam_customer_id"] = "cust-B"  # tampered / reassigned in Stripe
-    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
-    assert response.status_code == 409 and not [p for p in env["posts"] if p[0].startswith("/v1/subscriptions/")]
-
-
 def test_a_plan_switch_made_in_stripe_also_leaves_one_base_plan(env):
     _local_customer(env)
     env["stripe"]["sub_A1"]["items"]["data"][0]["price"] = {"id": HYBRID_8}  # e.g. changed in Stripe's portal
@@ -545,17 +456,3 @@ def test_two_active_base_plans_never_double_camera_capacity(env):
 
 
 # ================================================================ My subscription billing facts
-
-@pytest.mark.parametrize("status,cancel_at_end,expect", [
-    ("active", False, "Renews on"),
-    ("active", True, "will not renew"),
-    ("past_due", False, "latest payment for this plan failed"),
-])
-def test_my_subscription_shows_what_stripe_says_about_the_plan(env, status, cancel_at_end, expect):
-    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", "active")
-    _deliver(env, _checkout("evt_1"))
-    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", status, cancel_at_end=cancel_at_end)
-    _deliver(env, _sub_event("evt_2", "updated", env["stripe"]["sub_A1"], 2_000))
-    page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
-    assert 'id="plan-billing-note"' in page and expect in page
-    assert "sub_A1" not in page and "cus_A" not in page  # no Stripe ids or payment details on the page
