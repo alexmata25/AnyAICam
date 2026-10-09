@@ -172,8 +172,9 @@ def test_zero_active_slots_blocks_the_first_camera(client, db_path):
 
     response = _provision_request(client, appliance_id="appl-1", device_key="dev-1")
     assert response.status_code == 403
-    # No plan and no VMS license: the refusal names the missing license.
-    assert "VMS software license is required" in response.json()["detail"]
+    # No plan and no VMS license: the refusal names the missing camera plan
+    # first (2026-10-08) -- with per-camera plans the license follows the plan.
+    assert "A camera plan is required" in response.json()["detail"]
 
 
 def test_reconnecting_an_existing_camera_is_never_blocked_by_the_slot_limit(client, db_path):
