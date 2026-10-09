@@ -1899,6 +1899,17 @@ def apply_migrations():
         if 'last_heartbeat_at' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN last_heartbeat_at TEXT')
         if 'end_reason' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN end_reason TEXT')
         if 'superseded_by' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN superseded_by TEXT')
+        # Why a camera add was refused, machine-readable (2026-10-08): e.g.
+        # camera_limit_reached when the appliance's confirmation finds the plan full.
+        # A removed camera keeps the appliance-local number it held (2026-10-08):
+        # the appliance files local recordings by that number, so it is never
+        # handed to another camera (appliance_submit_provisioning()).
+        camera_columns_now=_columns('cameras')
+        if camera_columns_now and 'former_camera_number' not in camera_columns_now:
+            db.execute('ALTER TABLE cameras ADD COLUMN former_camera_number INTEGER')
+        provisioning_columns=_columns('camera_provisioning_requests')
+        if provisioning_columns and 'failure_code' not in provisioning_columns:  # only where the table exists
+            db.execute('ALTER TABLE camera_provisioning_requests ADD COLUMN failure_code TEXT')
         db.execute('CREATE TABLE IF NOT EXISTS aaco_door_unlock_confirmations(token_hash TEXT PRIMARY KEY,customer_id TEXT NOT NULL,'
                    'user_email TEXT NOT NULL,door_camera_id TEXT NOT NULL,door_name TEXT,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,'
                    'consumed_at TEXT)')

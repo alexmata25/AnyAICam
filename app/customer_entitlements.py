@@ -361,14 +361,83 @@ def capacity_breakdown(customer_id: str) -> dict:
 
 
 def capacity_refusal(customer_id: str) -> str:
-    """The customer-facing reason a new camera cannot be added."""
+    """The customer-facing reason a new camera cannot be added.
+
+    Per-camera plans (2026-10-08): with no camera plan the customer is told
+    to choose one; when the per-camera plan's quantity is what is full, to
+    increase that quantity (or remove a camera). Never a price -- the plan
+    page shows those."""
     breakdown = capacity_breakdown(customer_id)
+    if breakdown["plan_camera_slots"] <= 0:
+        return ("A camera plan is required to add cameras. Choose Basic Local, AI Local or Hybrid and how many "
+                "cameras on My subscription.")
     if breakdown["vms_license_required"]:
         return ("A VMS software license is required to add cameras. It is included with every AnyAiCam appliance, "
                 "or can be purchased for your own PC from My subscription.")
     usable = breakdown["camera_slot_quantity"]
+    if usable >= breakdown["plan_camera_slots"] and _per_camera_plan_active(customer_id):
+        return (f"Camera limit reached: this account is licensed for {usable} camera(s). To add another camera, "
+                "increase the number of cameras on your plan in My subscription, or remove a camera first.")
     return (f"Camera limit reached: this account is licensed for {usable} camera(s). "
             "Upgrade your plan or license, or remove a camera before adding another.")
+
+
+def _per_camera_plan_active(customer_id: str) -> bool:
+    try:
+        import per_camera_billing
+        plan = per_camera_billing.entitlement_for_customer(customer_id)
+    except Exception:
+        return False
+    return bool(plan and plan.get("status") == "active")
+
+
+def capacity_refusal_code(customer_id: str) -> str:
+    """Machine-readable twin of capacity_refusal() for the Cameras tab."""
+    breakdown = capacity_breakdown(customer_id)
+    if breakdown["plan_camera_slots"] <= 0:
+        return "camera_plan_required"
+    if breakdown["vms_license_required"]:
+        return "vms_license_required"
+    return "camera_limit_reached"
+
+
+# An add request holds its place while it is queued or being verified by the
+# appliance, for as long as it can still complete: partner_workspace times a
+# request out after this many seconds without the appliance confirming it.
+CAMERA_ADD_PENDING_SECONDS = 300
+CAMERA_ADD_PENDING_STATES = ("queued", "verifying")
+SUBSCRIPTION_PAGE_URL = "/subscription-portal"
+
+
+def pending_camera_additions(customer_id: str) -> int:
+    from datetime import timedelta
+    from partner_db import row as _row
+    cutoff = (datetime.now() - timedelta(seconds=CAMERA_ADD_PENDING_SECONDS)).isoformat()
+    return int(_row(
+        "SELECT COUNT(*) AS n FROM camera_provisioning_requests WHERE customer_id=? AND status IN (?,?) AND updated_at>=?",
+        (customer_id, *CAMERA_ADD_PENDING_STATES, cutoff))["n"])
+
+
+def cameras_in_service(customer_id: str) -> int:
+    from partner_db import row as _row
+    return int(_row("SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL", (customer_id,))["n"])
+
+
+def camera_capacity_status(customer_id: str, *, can_manage: bool = False) -> dict:
+    """Account-wide camera capacity for the Cameras tab (2026-10-08): how many
+    cameras the account may run, how many are in service or being added (the
+    same count both provisioning gates enforce), whether this caller may add
+    or remove cameras, and, when full, why (text, code and where to go).
+    Removing a camera frees its place; it never changes billing."""
+    usable = usable_camera_capacity(customer_id)
+    in_use = cameras_in_service(customer_id)
+    pending = pending_camera_additions(customer_id)
+    can_add = in_use + pending < usable
+    return {"usable": usable, "in_use": in_use, "pending": pending, "available": max(0, usable - in_use - pending),
+            "can_add_camera": can_add, "can_manage": bool(can_manage),
+            "message": None if can_add else capacity_refusal(customer_id),
+            "code": None if can_add else capacity_refusal_code(customer_id),
+            "action_url": SUBSCRIPTION_PAGE_URL}
 
 # ----------------------------------------------------------- pending links
 

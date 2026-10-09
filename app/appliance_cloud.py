@@ -1875,7 +1875,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not job: raise HTTPException(status_code=404,detail='Provisioning job not found.')
         if job['customer_id']!=appliance['customer_id'] or job['site_id']!=appliance['site_id']:
             raise HTTPException(status_code=403,detail='Provisioning job does not belong to this appliance.')
-        success=bool(payload.get('success')); message=str(payload.get('message',''))[:500]
+        success=bool(payload.get('success')); message=str(payload.get('message',''))[:500]; failure_code=None
         now=datetime.now().isoformat(); camera_id=None
         with connection() as db:
             # Provisioning Phase 7: second, appliance-authenticated
@@ -1898,6 +1898,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     if configured>=slot_limit:
                         success=False
                         message=capacity_refusal(job['customer_id'])
+                        from customer_entitlements import capacity_refusal_code
+                        failure_code=capacity_refusal_code(job['customer_id'])
             if success:
                 # device_key identifies the physical camera itself (its
                 # ONVIF endpoint reference UUID), not an appliance-camera
@@ -1977,7 +1979,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # an already-bound camera) is never touched here.
                 camera_row=db.execute('SELECT camera_number FROM cameras WHERE id=?',(camera_id,)).fetchone()
                 if camera_row and camera_row['camera_number'] is None:
-                    used=set(int(item['camera_number']) for item in db.execute('SELECT camera_number FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL',(appliance['id'],)).fetchall())
+                    # Numbers held now, and numbers a removed camera held
+                    # (former_camera_number): the appliance keeps local
+                    # recordings per number, so a number is never reused.
+                    used=set(int(item['n']) for item in db.execute('SELECT camera_number AS n FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL '
+                                                                     'UNION SELECT former_camera_number FROM cameras WHERE appliance_id=? AND former_camera_number IS NOT NULL',
+                                                                     (appliance['id'],appliance['id'])).fetchall())
                     candidate=1
                     while candidate in used: candidate+=1
                     try:
@@ -2016,7 +2023,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # retention actually ends.
                 db.execute("UPDATE camera_provisioning_requests SET status='provisioned',camera_id=?,message=?,updated_at=?,encrypted_credentials=NULL WHERE id=?",(camera_id,message or 'Camera provisioned.',now,job_id))
             else:
-                db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,updated_at=?,encrypted_credentials=NULL WHERE id=?",(message or 'Provisioning failed.',now,job_id))
+                db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,failure_code=?,updated_at=?,encrypted_credentials=NULL WHERE id=?",(message or 'Provisioning failed.',failure_code,now,job_id))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.provisioning_result','camera_provisioning_request',job_id,{'success':success,'camera_id':camera_id})
         return {'message':'Provisioning result saved.'}
 
