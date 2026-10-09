@@ -26,22 +26,69 @@ def appliance(monkeypatch):
     return boot
 
 
-def test_the_boot_ceiling_covers_the_highest_camera_number_not_only_the_count(appliance):
-    assert main.get_supervisor_slot_count() == 9 + main.CAMERA_SUPERVISOR_HEADROOM
-    assert main.get_supervisor_slot_count() > main.get_camera_count() + main.CAMERA_SUPERVISOR_HEADROOM
+def test_boot_supervises_every_provisioned_number_plus_the_idle_headroom(appliance):
+    assert main.get_supervisor_slot_count() == 4 + main.CAMERA_SUPERVISOR_HEADROOM  # count-based, unchanged
+    assert main._boot_supervisor_numbers() == [1, 2, 3, 9, 4, 5, 6, 7, 8]  # provisioned first
 
 
 def test_a_restart_supervises_the_camera_above_the_old_ceiling(monkeypatch, appliance):
     monkeypatch.setattr(main, "_supervised_camera_numbers", set())
-    claimed = main._claim_camera_supervisor_slots(range(1, main.get_supervisor_slot_count() + 1))
-    assert 9 in claimed
+    assert 9 in main._claim_camera_supervisor_slots(main._boot_supervisor_numbers())
+
+
+@pytest.mark.parametrize("bad", [10**6, main.CAMERA_NUMBER_MAX + 1, 0, -3, "x", None])
+def test_a_bad_or_huge_camera_number_is_skipped_and_logged_not_fatal(monkeypatch, appliance, bad):
+    logged = []
+    monkeypatch.setattr(main, "structured_log", lambda event, level="info", **fields: logged.append((event, fields)))
+    monkeypatch.setattr(main, "_rejected_camera_numbers", set())
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, bad, 2])
+    boot = main._boot_supervisor_numbers()
+    assert boot == [1, 2, 3, 4, 5, 6]  # never every number up to the huge one
+    assert main._valid_camera_numbers([1, bad, 2]) == [1, 2]
+    assert [event for event, _ in logged] == ["camera.number_out_of_range"]  # logged once, not every poll
+
+
+def test_a_high_camera_number_at_boot_starts_within_a_few_stagger_steps(monkeypatch, appliance):
+    staggers = {}
+
+    async def fake_supervisor(camera_number, mode, *, stagger_index=None):
+        staggers[(camera_number, mode)] = stagger_index
+    monkeypatch.setattr(main, "process_supervisor", fake_supervisor)
+    monkeypatch.setattr(main, "_supervised_camera_numbers", set())
+
+    async def run():
+        tasks = []
+        main.start_camera_supervisors(main._boot_supervisor_numbers(), tasks)
+        await asyncio.gather(*tasks)
+    asyncio.run(run())
+    assert (staggers[(9, "live")], staggers[(9, "recording")]) == (6, 7)  # 4th camera, not behind idle slots
+    assert staggers[(4, "live")] == 8
+
+
+def test_boot_stagger_is_unchanged_for_cameras_1_to_n(monkeypatch):
+    staggers = {}
+
+    async def fake_supervisor(camera_number, mode, *, stagger_index=None):
+        staggers[(camera_number, mode)] = stagger_index
+    monkeypatch.setattr(main, "process_supervisor", fake_supervisor)
+    monkeypatch.setattr(main, "_supervised_camera_numbers", set())
+
+    async def run():
+        tasks = []
+        main.start_camera_supervisors(range(1, 6), tasks)
+        await asyncio.gather(*tasks)
+    asyncio.run(run())
+    assert staggers == {(n, mode): (n - 1) * 2 + (0 if mode == "live" else 1)
+                        for n in range(1, 6) for mode in ("live", "recording")}
 
 
 def test_a_camera_provisioned_while_running_gets_its_supervisors_without_a_restart(monkeypatch, appliance):
     started = []
+    staggers = []
 
-    async def fake_supervisor(camera_number, mode):
+    async def fake_supervisor(camera_number, mode, *, stagger_index=None):
         started.append((camera_number, mode))
+        staggers.append(stagger_index)
     monkeypatch.setattr(main, "process_supervisor", fake_supervisor)
 
     async def run():
@@ -52,12 +99,29 @@ def test_a_camera_provisioned_while_running_gets_its_supervisors_without_a_resta
     asyncio.run(run())
     assert sorted(started) == [(9, "live"), (9, "recording")]
     assert main.camera_process_state[9]["live"] == "starting"
+    assert sorted(staggers) == [0, 1]  # not camera 9's boot stagger (16 and 17 steps)
+
+
+def test_a_runtime_started_supervisor_waits_one_stagger_step_at_most(monkeypatch):
+    waits = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+        raise asyncio.CancelledError
+    monkeypatch.setattr(main, "CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS", 1.0)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    for mode, index in (("live", 0), ("recording", 1)):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main.process_supervisor(40, mode, stagger_index=index))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main.process_supervisor(40, "live"))  # boot default unchanged
+    assert waits == [0.0, 1.0, 78.0]
 
 
 def test_the_watcher_starts_the_missing_supervisors(monkeypatch, appliance):
     started = []
 
-    async def fake_supervisor(camera_number, mode):
+    async def fake_supervisor(camera_number, mode, *, stagger_index=None):
         started.append((camera_number, mode))
     monkeypatch.setattr(main, "process_supervisor", fake_supervisor)
     monkeypatch.setattr(main, "CAMERA_NOT_CONFIGURED_POLL_SECONDS", 0)
