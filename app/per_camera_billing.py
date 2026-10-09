@@ -1104,6 +1104,7 @@ def register_routes(app: FastAPI) -> None:
         if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
             raise HTTPException(status_code=403, detail="Customer owner permission required.")
         import main
+        import stripe_state
         entitlement, current = _owner_subscription(identity)
         if current.get("cancel_at_period_end"):
             return {"status": "already_scheduled", "effective_at": _period_end(current)}
