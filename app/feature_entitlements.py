@@ -106,17 +106,29 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
     """The signed entitlement snapshot for one appliance (cloud side; sent
     with its configuration -- see appliance_entitlements.py). Only the paid
     runtime features the appliance runs, each decided from billing for the
-    appliance's own customer."""
+    appliance's own customer.
+
+    camera_capacity (2026-10-09, owner-approved Option A): the licensed camera
+    limit -- customer_entitlements.capacity_breakdown(), the smaller of the
+    camera plan and the VMS license -- signed with the features, so the
+    appliance accepts a capacity only with a valid signature
+    (vms_capacity.py). Same type and version: a 1.2.4 appliance ignores the
+    added field."""
     import appliance_identity
+    import customer_entitlements
     from partner_db import connection
     customer_id = appliance.get("customer_id")
     now = now or datetime.now(timezone.utc)
+    breakdown = customer_entitlements.capacity_breakdown(customer_id) if customer_id else {}
     body = {
         "type": "anyaicam.feature_entitlements", "version": 1,
         "appliance_id": str(appliance.get("id") or ""), "cloud_id": str(appliance.get("cloud_id") or ""),
         "customer_id": str(customer_id or ""),
         "features": {TALK_DOWN: customer_entitled(customer_id, TALK_DOWN),
                      VOICE_CALL: customer_entitled(customer_id, VOICE_CALL)},
+        "camera_capacity": {"camera_slot_quantity": int(breakdown.get("camera_slot_quantity") or 0),
+                            "plan_camera_slots": int(breakdown.get("plan_camera_slots") or 0),
+                            "vms_license_capacity": int(breakdown.get("vms_license_capacity") or 0)},
         "issued_at": now.isoformat(), "expires_at": (now + snapshot_ttl()).isoformat(),
     }
     with connection() as db:

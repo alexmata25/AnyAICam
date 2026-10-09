@@ -448,8 +448,11 @@ def test_a_missing_trust_anchor_denies_paid_features_but_not_the_vms(appliance, 
     appliance_entitlements.TRUST_ANCHOR_FILE.unlink()
     result = _sync(edge_db)
     assert result["status"] != "unreachable"
-    capacity = vms_capacity.load_capacity()
-    assert capacity is not None and vms_capacity.camera_licensed(1, [1]) == (int(capacity["camera_slot_quantity"]) >= 1)
+    # Since 2026-10-09 the camera limit is signed too (vms_capacity.py): with
+    # no trust anchor no capacity can be verified, so cameras fail closed
+    # unless the appliance holds a migrated fallback. Releases must ship the
+    # entitlement keyset.
+    assert vms_capacity.load_capacity() is None
     _talk_denied_everywhere()
     fired = [{"analytic_type": "intrusion_alarm", "talkdown_text": "Leave now", "customer_id": "cust-1"}]
     assert worker.speak_alarm_talkdowns("cam-1", fired, ["e1"], provider=aac_voice_call_greeting.MockGreetingAudioProvider()) == 0

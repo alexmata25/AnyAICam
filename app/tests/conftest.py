@@ -246,6 +246,13 @@ def _appliance_entitlements(request, monkeypatch, tmp_path):
         return
     monkeypatch.setattr(appliance_entitlements, "STATE_FILE", tmp_path / "feature_entitlements.json")
     monkeypatch.setattr(appliance_entitlements, "TRUST_ANCHOR_FILE", tmp_path / "trust-anchor" / "entitlement_signing_keys.json")
+    # Licensed camera capacity (vms_capacity.py, signed 2026-10-09): its files
+    # live in the test's directory too, the root-owned fallback included.
+    import vms_capacity
+    monkeypatch.setattr(vms_capacity, "STATE_FILE", tmp_path / "vms_capacity.json")
+    monkeypatch.setattr(vms_capacity, "SIGNED_FILE", tmp_path / "vms_capacity_signed.json")
+    monkeypatch.setattr(vms_capacity, "FALLBACK_FILE", tmp_path / "trust-anchor" / "vms_capacity_fallback.json")
+    monkeypatch.setattr(vms_capacity, "_legacy_cloud_capacity", None)
     if request.node.get_closest_marker("real_entitlements") is None:
         monkeypatch.setattr(appliance_entitlements, "feature_allowed", lambda feature, customer_id=None: True)
     yield

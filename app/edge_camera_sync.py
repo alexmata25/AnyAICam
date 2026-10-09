@@ -364,9 +364,11 @@ def sync_provisioned_cameras() -> dict:
     # since every governed flag is still read once at import time.
     restart_required = product_mode.persist_mode(str(response.get("product_mode") or ""))
     # Licensed camera capacity (2026-10-01, vms_capacity.py): camera plan AND
-    # VMS license, kept so it keeps applying offline.
+    # VMS license, kept so it keeps applying offline. Since 2026-10-09 only a
+    # capacity inside the cloud-signed snapshot is accepted (the unsigned
+    # value is used only from a cloud that does not sign it yet).
     import vms_capacity
-    vms_capacity.persist_capacity(response.get("usable_camera_capacity"))
+    vms_capacity.apply_sync(response.get("usable_camera_capacity"), response.get("feature_entitlements"))
     # Paid runtime features (2026-10-05, appliance_entitlements.py): the
     # cloud's signed snapshot, verified against the installer-provisioned
     # keyset and cached so it keeps applying offline until it expires. Keys

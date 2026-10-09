@@ -196,11 +196,17 @@ def _local_identity() -> dict[str, str] | None:
         return None
 
 
-def verify(snapshot, public_keys: dict[str, str], *, identity, now: datetime | None = None) -> str | None:
+def verify(snapshot, public_keys: dict[str, str], *, identity, now: datetime | None = None,
+           check_expiry: bool = True) -> str | None:
     """None when the snapshot is valid right now for this appliance's
     persisted identity, else the reason. The snapshot's appliance_id,
     cloud_id and customer_id must each be present and equal that identity;
-    a missing or malformed persisted identity denies."""
+    a missing or malformed persisted identity denies.
+
+    check_expiry=False (camera capacity only, vms_capacity.py): everything is
+    verified except expires_at, so the licensed camera limit keeps applying
+    to an offline appliance (recording never stops because the cloud is
+    unreachable). Paid features always check expiry."""
     if not isinstance(snapshot, dict):
         return "missing"
     if not public_keys:
@@ -226,7 +232,7 @@ def verify(snapshot, public_keys: dict[str, str], *, identity, now: datetime | N
     issued, expires = _parse_time(body.get("issued_at")), _parse_time(body.get("expires_at"))
     if issued is None or expires is None or issued - CLOCK_SKEW > now:
         return "bad_time"
-    if expires <= now:
+    if check_expiry and expires <= now:
         return "expired"
     if not isinstance(body.get("features"), dict):
         return "unsupported"

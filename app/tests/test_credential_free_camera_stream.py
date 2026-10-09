@@ -21,7 +21,8 @@ def edge_db(tmp_path, monkeypatch):
     db_path = tmp_path / "edge.db"
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
     monkeypatch.setattr(vms_capacity, "STATE_FILE", tmp_path / "vms_capacity.json")
-    vms_capacity.persist_capacity({"camera_slot_quantity": 8, "plan_camera_slots": 8, "vms_license_capacity": 8})
+    # Licensed for 8 (as a cloud sync in this process run would make it; vms_capacity.py).
+    monkeypatch.setattr(vms_capacity, "_legacy_cloud_capacity", {"camera_slot_quantity": 8, "source": "legacy_cloud"})
     monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", Fernet.generate_key().decode())
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
