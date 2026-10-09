@@ -734,11 +734,11 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 'INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)',
                 (appliance_id, claim['customer_id'], claim['site_id'], cloud_id, now.isoformat()),
             )
-            # The factory-generated UUID is the root pin on a fresh Linux
-            # appliance. The cloud row receives a separate canonical
-            # appliance_id; this signed transition lets root accept exactly
-            # that claim result without treating arbitrary identity changes
-            # as ordinary capacity refreshes.
+            # The installer UUID is provisional claim correlation, not the
+            # permanent root identity. The cloud row receives its own
+            # canonical appliance_id; this signed transition lets the root
+            # helper pin that cloud identity only after validating the first
+            # capacity authorization for this exact completed claim.
             import feature_entitlements
             initial_transition = feature_entitlements.initial_capacity_identity_transition(
                 claim['device_id'], {'id': appliance_id, 'cloud_id': cloud_id,

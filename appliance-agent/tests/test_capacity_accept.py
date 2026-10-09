@@ -17,12 +17,16 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives import serialization
 
 from capacity_accept import (Reject, _advance, _validate_state, _write_atomic_at, _openssl_verify,
-                             _canonical, _check_identity_anchor, _bootstrap_identity, IDENTITY_ANCHOR_FILE,
-                             accept_pending)
+                             _canonical, _check_identity_anchor, _bootstrap_identity, _write_identity_anchor, IDENTITY_ANCHOR_FILE,
+                             PENDING_CLAIM_FILE, _validate_first_acceptance_source,
+                             _validate_snapshot, accept_pending)
 
 
 IDENTITY = {"appliance_id": "appl-test", "cloud_id": "AIC-test", "customer_id": "cust-test"}
 NOW = dt.datetime(2026, 10, 9, 12, 0, tzinfo=dt.timezone.utc)
+PROVISIONAL_ID = "c3d0d6f2-3561-4f4e-a411-608e4dcff29e"
+CLOUD_IDENTITY = {"appliance_id": "cloud-assigned-appliance-7f2a", "cloud_id": "AIC-c3d0d6f2",
+                  "customer_id": "cust-test"}
 
 
 def make_snapshot(private, *, issued=None, expires=None, quantity=8, **changes):
@@ -35,6 +39,14 @@ def make_snapshot(private, *, issued=None, expires=None, quantity=8, **changes):
     body.update(changes)
     signature = base64.urlsafe_b64encode(private.sign(_canonical(body))).decode("ascii").rstrip("=")
     return {**body, "signature": {"alg": "Ed25519", "key_id": "cloud-key", "value": signature}}
+
+
+def make_initial_claim_snapshot(private, identity=CLOUD_IDENTITY, *, provisional_id=PROVISIONAL_ID,
+                                issued=None, quantity=8, expires=None):
+    transition = {"schema": 1, "transition_id": "claim-test-01", "kind": "initial_claim",
+                  "from_appliance_id": provisional_id, "to_identity": identity}
+    return make_snapshot(private, issued=issued, expires=expires, quantity=quantity,
+                         **identity, identity_transition=transition)
 
 
 def verifier_for(public_key, public_bytes):
@@ -129,11 +141,14 @@ class CapacityAcceptancePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(Reject, "identity_anchor_mismatch"):
             _advance(snapshot, self.keys, target, None, now=NOW, verifier=self.verify,
                      anchor={"appliance_id": "attacker-controlled-id"})
-        # A cloud ID that happens to equal the current pin does not waive
-        # validation of the signed transition's source.
-        with self.assertRaisesRegex(Reject, "identity_anchor_mismatch"):
-            _advance(snapshot, self.keys, target, None, now=NOW, verifier=self.verify,
-                     anchor={"appliance_id": target["appliance_id"]})
+        # A 1.2.4 install can already pin the cloud-assigned target before
+        # installing 1.2.5. The authenticated signed target exactly equals
+        # the protected pin, so its old provisional source is reconciled.
+        reconciled, outcome = _advance(snapshot, self.keys, target, None, now=NOW,
+                                       verifier=self.verify,
+                                       anchor={"appliance_id": target["appliance_id"]})
+        self.assertEqual(outcome, "accepted")
+        self.assertEqual(reconciled["identity"], target)
         wrong_target = dict(target, customer_id="cust-other")
         wrong = make_snapshot(self.private, issued=NOW + dt.timedelta(minutes=1), **wrong_target,
                               identity_transition=transition)
@@ -158,6 +173,92 @@ class CapacityAcceptancePolicyTests(unittest.TestCase):
         self.assertEqual(outcome, "accepted")
         self.assertEqual(state["identity"], target)
         self.assertEqual(state["transition_id"], "admin-transition-02")
+
+    def test_first_acceptance_binds_different_installer_and_cloud_ids(self):
+        snapshot = make_initial_claim_snapshot(self.private)
+        body, _, _ = _validate_snapshot(snapshot, self.keys, CLOUD_IDENTITY,
+                                        now=NOW, verifier=self.verify)
+        self.assertNotEqual(PROVISIONAL_ID, CLOUD_IDENTITY["appliance_id"])
+        _validate_first_acceptance_source(body, CLOUD_IDENTITY, anchor=None,
+                                          pending_claim={"appliance_id": PROVISIONAL_ID},
+                                          allow_legacy_migration=False)
+        with self.assertRaisesRegex(Reject, "pending_claim_identity_mismatch"):
+            _validate_first_acceptance_source(body, CLOUD_IDENTITY, anchor=None,
+                                              pending_claim={"appliance_id": "other-installer-id"},
+                                              allow_legacy_migration=False)
+
+    def test_fresh_claim_and_124_claims_before_after_rollout_reconcile(self):
+        target = dict(CLOUD_IDENTITY)
+        scenarios = (
+            # Fresh 1.2.5: installer UUID is checked against protected
+            # pending-claim correlation, then cloud identity is accepted.
+            ("fresh-125", make_initial_claim_snapshot(self.private, target), None,
+             {"appliance_id": PROVISIONAL_ID}, False),
+            # 1.2.4 claimed before transition rollout: the signed snapshot
+            # has no transition, but its persisted cloud identity is pinned.
+            ("legacy-before-rollout", make_snapshot(self.private, **target),
+             {"appliance_id": target["appliance_id"]}, None, True),
+            # 1.2.4 claimed after rollout: the signed transition target is
+            # already the pin written by 1.2.4 activation.
+            ("legacy-after-rollout", make_initial_claim_snapshot(self.private, target),
+             {"appliance_id": target["appliance_id"]}, None, False),
+            # Upgrade from either 1.2.4 path to the helper follows the same
+            # first-acceptance rule and must not require another claim.
+            ("upgrade-124", make_initial_claim_snapshot(self.private, target),
+             {"appliance_id": target["appliance_id"]}, None, False),
+        )
+        for name, snapshot, anchor, pending_claim, migration in scenarios:
+            with self.subTest(name=name):
+                body, _, _ = _validate_snapshot(snapshot, self.keys, target,
+                                                now=NOW, verifier=self.verify)
+                _validate_first_acceptance_source(body, target, anchor=anchor,
+                                                  pending_claim=pending_claim,
+                                                  allow_legacy_migration=migration)
+                state, outcome = _advance(snapshot, self.keys, target, None, now=NOW,
+                                          verifier=self.verify, anchor=anchor,
+                                          allow_expired_first=migration)
+                self.assertEqual(outcome, "accepted")
+                self.assertEqual(state["identity"], target)
+                self.assertEqual(state["high_water"]["digest"],
+                                 __import__("hashlib").sha256(_canonical({k: v for k, v in snapshot.items() if k != "signature"})).hexdigest())
+
+    def test_reconciled_initial_claim_still_rejects_wrong_anchor_and_wrong_target(self):
+        target = dict(CLOUD_IDENTITY)
+        snapshot = make_initial_claim_snapshot(self.private, target)
+        wrong_anchor = {"appliance_id": "another-cloud-appliance"}
+        with self.assertRaisesRegex(Reject, "identity_anchor_mismatch"):
+            _advance(snapshot, self.keys, target, None, now=NOW, verifier=self.verify,
+                     anchor=wrong_anchor)
+        wrong_target = dict(target, customer_id="other-customer")
+        transition = {"schema": 1, "transition_id": "claim-test-01", "kind": "initial_claim",
+                      "from_appliance_id": PROVISIONAL_ID, "to_identity": target}
+        mismatched = make_snapshot(self.private, **wrong_target, identity_transition=transition)
+        with self.assertRaisesRegex(Reject, "identity_transition_target_mismatch"):
+            _advance(mismatched, self.keys, wrong_target, None, now=NOW, verifier=self.verify,
+                     anchor={"appliance_id": target["appliance_id"]})
+
+    def test_fresh_first_acceptance_requires_signed_initial_claim_transition(self):
+        snapshot = make_snapshot(self.private, **CLOUD_IDENTITY)
+        body, _, _ = _validate_snapshot(snapshot, self.keys, CLOUD_IDENTITY,
+                                        now=NOW, verifier=self.verify)
+        with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
+            _validate_first_acceptance_source(body, CLOUD_IDENTITY, anchor=None,
+                                              pending_claim=None, allow_legacy_migration=False)
+        body, _, _ = _validate_snapshot(make_initial_claim_snapshot(self.private), self.keys,
+                                        CLOUD_IDENTITY, now=NOW, verifier=self.verify)
+        with self.assertRaisesRegex(Reject, "missing_pending_claim"):
+            _validate_first_acceptance_source(body, CLOUD_IDENTITY, anchor=None,
+                                              pending_claim=None, allow_legacy_migration=False)
+
+    def test_legacy_migration_is_the_only_no_transition_first_acceptance_exception(self):
+        snapshot = make_snapshot(self.private, **CLOUD_IDENTITY)
+        body, _, _ = _validate_snapshot(snapshot, self.keys, CLOUD_IDENTITY,
+                                        now=NOW, verifier=self.verify)
+        _validate_first_acceptance_source(body, CLOUD_IDENTITY, anchor=None,
+                                          pending_claim=None, allow_legacy_migration=True)
+        with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
+            _validate_first_acceptance_source(body, CLOUD_IDENTITY, anchor=None,
+                                              pending_claim=None, allow_legacy_migration=False)
 
     def test_tampering_forgery_and_identity_mismatch_fail_closed(self):
         good = make_snapshot(self.private)
@@ -223,7 +324,7 @@ class CapacityAcceptancePolicyTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0,
                      "identity-pin filesystem test requires Linux/root ownership semantics")
 class IdentityPinFilesystemTests(unittest.TestCase):
-    def test_identity_bootstrap_refuses_unsigned_local_replacement(self):
+    def test_identity_bootstrap_stages_provisional_source_without_pinning_it(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             identity_dir, trust_dir = root / "recordings", root / "trust"
@@ -234,14 +335,19 @@ class IdentityPinFilesystemTests(unittest.TestCase):
             identity_fd = os.open(identity_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             trust_fd = os.open(trust_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
-                self.assertEqual(_bootstrap_identity(identity_fd, trust_fd), "bootstrapped")
+                self.assertEqual(_bootstrap_identity(identity_fd, trust_fd), "awaiting_signed_transition")
                 pin = trust_dir / IDENTITY_ANCHOR_FILE
-                self.assertEqual(json.loads(pin.read_text()), {"schema": 1, "appliance_id": IDENTITY["appliance_id"]})
-                self.assertEqual(os.stat(pin).st_uid, 0)
-                self.assertEqual(_bootstrap_identity(identity_fd, trust_fd), "unchanged")
+                self.assertFalse(pin.exists(), "installer UUID must not become the authoritative cloud anchor")
+                pending = trust_dir / PENDING_CLAIM_FILE
+                self.assertEqual(json.loads(pending.read_text()), {
+                    "schema": 1, "purpose": "initial_claim_correlation",
+                    "provisional_appliance_id": IDENTITY["appliance_id"]})
+                self.assertEqual(os.stat(pending).st_uid, 0)
+                self.assertEqual(_bootstrap_identity(identity_fd, trust_fd), "awaiting_signed_transition")
                 identity_file.write_text(json.dumps({**IDENTITY, "appliance_id": "appl-other"}))
                 self.assertEqual(_bootstrap_identity(identity_fd, trust_fd), "awaiting_signed_transition")
-                self.assertEqual(json.loads(pin.read_text()), {"schema": 1, "appliance_id": IDENTITY["appliance_id"]})
+                self.assertFalse(pin.exists())
+                self.assertEqual(json.loads(pending.read_text())["provisional_appliance_id"], IDENTITY["appliance_id"])
             finally:
                 os.close(identity_fd)
                 os.close(trust_fd)
@@ -266,11 +372,15 @@ class AcceptanceFilesystemTests(unittest.TestCase):
                                                              serialization.PublicFormat.Raw)
         (self.trust / "entitlement_signing_keys.json").write_text(
             json.dumps({"keys": {"cloud-key": base64.b64encode(self.public).decode()}}), encoding="utf-8")
-        (self.identity_dir / "appliance_identity.json").write_text(json.dumps(IDENTITY), encoding="utf-8")
-        identity_fd = os.open(self.identity_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.installer_dir = self.root / "installer-config"
+        self.installer_dir.mkdir(mode=0o750)
+        (self.installer_dir / "appliance_identity.json").write_text(
+            json.dumps({"appliance_id": PROVISIONAL_ID}), encoding="utf-8")
+        (self.identity_dir / "appliance_identity.json").write_text(json.dumps(CLOUD_IDENTITY), encoding="utf-8")
+        identity_fd = os.open(self.installer_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         trust_fd = os.open(self.trust, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            _bootstrap_identity(identity_fd, trust_fd)
+            self.assertEqual(_bootstrap_identity(identity_fd, trust_fd), "awaiting_signed_transition")
         finally:
             os.close(identity_fd)
             os.close(trust_fd)
@@ -289,46 +399,105 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         except InvalidSignature:
             return False
 
-    def call_accept(self, *, now=NOW):
+    def call_accept(self, *, now=NOW, allow_expired_first=False):
         return accept_pending(staging_path=str(self.stage), identity_path=str(self.identity_dir / "appliance_identity.json"),
                               trust_dir=str(self.trust), accepted_file="vms_capacity_accepted.json",
                               compat_dir=str(self.compat), compat_file="vms_capacity.json",
-                              now=now, verifier=self.verifier)
+                              now=now, verifier=self.verifier, allow_expired_first=allow_expired_first)
 
     def stage_snapshot(self, snapshot):
         self.stage.write_text(json.dumps(snapshot), encoding="utf-8")
         self.stage.chmod(0o600)
 
     def test_pending_snapshot_is_accepted_to_one_atomic_root_state(self):
-        self.stage_snapshot(make_snapshot(self.private, quantity=6))
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=6))
         self.assertEqual(self.call_accept(), "accepted")
         state = json.loads(self.accepted.read_text(encoding="utf-8"))
-        self.assertEqual(state["identity"], IDENTITY)
+        self.assertEqual(state["identity"], CLOUD_IDENTITY)
         self.assertEqual(state["snapshot"]["camera_capacity"]["camera_slot_quantity"], 6)
         self.assertEqual(state["high_water"]["issued_at"], NOW.isoformat())
         self.assertEqual(os.stat(self.accepted).st_uid, 0)
         self.assertEqual(os.stat(self.accepted).st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(self.compat_file.read_text())["camera_slot_quantity"], 6)
 
-    def test_claim_transition_promotes_cloud_identity_and_updates_root_pin(self):
-        provisional = "installer-generated-id"
-        target = dict(IDENTITY, appliance_id="cloud-assigned-appliance")
-        (self.trust / IDENTITY_ANCHOR_FILE).write_text(json.dumps({"schema": 1, "appliance_id": provisional}))
-        (self.identity_dir / "appliance_identity.json").write_text(json.dumps(target), encoding="utf-8")
-        transition = {"schema": 1, "transition_id": "claim-root-01", "kind": "initial_claim",
-                      "from_appliance_id": provisional, "to_identity": target}
-        self.stage_snapshot(make_snapshot(self.private, **target, identity_transition=transition))
+    def test_cloud_assigned_identity_is_pinned_only_after_first_valid_signed_claim(self):
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertEqual(json.loads((self.trust / PENDING_CLAIM_FILE).read_text())["provisional_appliance_id"],
+                         PROVISIONAL_ID)
+        self.assertNotEqual(PROVISIONAL_ID, CLOUD_IDENTITY["appliance_id"])
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=9))
+        self.assertEqual(self.call_accept(), "accepted")
+        pin = json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(pin["appliance_id"], CLOUD_IDENTITY["appliance_id"])
+        self.assertNotEqual(pin["appliance_id"], PROVISIONAL_ID)
+        self.assertFalse((self.trust / PENDING_CLAIM_FILE).exists())
+
+    def test_124_cloud_identity_pin_reconciles_signed_initial_claim_during_upgrade(self):
+        # 1.2.4 may have already persisted the cloud-assigned ID after claim.
+        # On upgrade, the signed transition still names the earlier installer
+        # UUID as its source; accepting it is safe only because its signed
+        # target is exactly the existing protected pin.
+        trust_fd = os.open(self.trust, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _write_identity_anchor(trust_fd, CLOUD_IDENTITY["appliance_id"])
+        finally:
+            os.close(trust_fd)
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=7))
+
+        self.assertEqual(self.call_accept(), "accepted")
+        state = json.loads(self.accepted.read_text(encoding="utf-8"))
+        pin = json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(state["identity"], CLOUD_IDENTITY)
+        self.assertEqual(state["snapshot"]["identity_transition"]["from_appliance_id"], PROVISIONAL_ID)
+        self.assertEqual(pin["appliance_id"], CLOUD_IDENTITY["appliance_id"])
+        self.assertEqual(state["high_water"]["issued_at"], NOW.isoformat())
+
+    def test_wrong_claim_source_does_not_create_anchor_or_accepted_state(self):
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY,
+                                                        provisional_id="other-installer-uuid"))
+        with self.assertRaisesRegex(Reject, "pending_claim_identity_mismatch"):
+            self.call_accept()
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertFalse(self.accepted.exists())
+        self.assertTrue((self.trust / PENDING_CLAIM_FILE).exists())
+
+    def test_invalid_signature_does_not_create_authoritative_anchor(self):
+        snapshot = make_initial_claim_snapshot(self.private, CLOUD_IDENTITY)
+        snapshot["camera_capacity"] = {"camera_slot_quantity": 64}
+        self.stage_snapshot(snapshot)
+        with self.assertRaisesRegex(Reject, "bad_signature"):
+            self.call_accept()
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.assertFalse(self.accepted.exists())
+
+    def test_legacy_124_signed_snapshot_without_transition_requires_migration_entrypoint(self):
+        self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
+        with self.assertRaisesRegex(Reject, "initial_claim_transition_required"):
+            self.call_accept()
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.stage_snapshot(make_snapshot(self.private, **CLOUD_IDENTITY))
+        self.assertEqual(self.call_accept(allow_expired_first=True), "accepted")
+        pin = json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(pin["appliance_id"], CLOUD_IDENTITY["appliance_id"])
+        self.assertNotEqual(pin["appliance_id"], PROVISIONAL_ID)
+
+    def test_claim_transition_promotes_different_cloud_assigned_identity(self):
+        target = CLOUD_IDENTITY
+        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, target))
         self.assertEqual(self.call_accept(), "accepted")
         state = json.loads(self.accepted.read_text(encoding="utf-8"))
         pin = json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text(encoding="utf-8"))
         self.assertEqual(state["identity"], target)
         self.assertEqual(pin["appliance_id"], target["appliance_id"])
+        self.assertNotEqual(pin["appliance_id"], PROVISIONAL_ID)
 
     def test_replay_and_invalid_signature_preserve_last_accepted_state(self):
-        self.stage_snapshot(make_snapshot(self.private, quantity=4))
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY, quantity=4))
         self.call_accept()
         old = self.accepted.read_bytes()
-        older = make_snapshot(self.private, issued=NOW - dt.timedelta(days=1), quantity=64)
+        older = make_snapshot(self.private, issued=NOW - dt.timedelta(days=1), quantity=64,
+                              **CLOUD_IDENTITY)
         self.stage_snapshot(older)
         with self.assertRaisesRegex(Reject, "replay"):
             self.call_accept()
@@ -342,15 +511,15 @@ class AcceptanceFilesystemTests(unittest.TestCase):
             self.call_accept()
         self.assertEqual(self.sentinel.read_text(), "preserve")
         self.stage.unlink()
-        self.stage_snapshot(make_snapshot(self.private))
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY))
         identity = self.identity_dir / "appliance_identity.json"
-        identity.write_text(json.dumps(dict(IDENTITY, appliance_id="appl-other")), encoding="utf-8")
-        with self.assertRaisesRegex(Reject, "identity_anchor_mismatch"):
+        identity.write_text(json.dumps(dict(CLOUD_IDENTITY, appliance_id="appl-other")), encoding="utf-8")
+        with self.assertRaisesRegex(Reject, "identity_mismatch"):
             self.call_accept()
         self.assertFalse(self.accepted.exists())
 
     def test_symlinked_trust_key_or_accepted_store_fails_closed(self):
-        self.stage_snapshot(make_snapshot(self.private))
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY))
         trust_key = self.trust / "entitlement_signing_keys.json"
         trust_key.unlink()
         trust_key.symlink_to(self.sentinel)
@@ -359,7 +528,7 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         trust_key.unlink()
         trust_key.write_text(json.dumps({"keys": {"cloud-key": base64.b64encode(self.public).decode()}}))
         trust_key.chmod(0o600)
-        self.stage_snapshot(make_snapshot(self.private))
+        self.stage_snapshot(make_initial_claim_snapshot(self.private, CLOUD_IDENTITY))
         self.call_accept()
         self.accepted.unlink()
         self.accepted.symlink_to(self.sentinel)

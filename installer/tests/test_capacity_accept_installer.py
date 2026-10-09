@@ -20,6 +20,11 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertLess(installer.index("install_capacity_accept_step"), installer.index('deploy_vms "$INSTALL_STATE"'))
         self.assertLess(installer.index('identity_provision "$INSTALL_STATE"'), installer.index("bootstrap_capacity_identity ||"))
         self.assertLess(installer.index("bootstrap_capacity_identity ||"), installer.index("agent_restart_after_provisioning"))
+        helper = (ROOT / "appliance-agent/system/capacity_accept.py").read_text(encoding="utf-8")
+        self.assertIn("_write_pending_claim_identity", helper)
+        self.assertIn("_write_identity_anchor(root_dir_fd, next_state[\"identity\"][\"appliance_id\"])", helper)
+        self.assertIn("initial_claim_transition_required", helper)
+        self.assertNotIn("_write_identity_anchor(trust_dir_fd, appliance_id)", helper)
 
     def test_installer_bootstraps_preexisting_state_before_downtime(self):
         step = (ROOT / "installer/16-capacity-accept.sh").read_text(encoding="utf-8")
@@ -32,6 +37,7 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertIn("bootstrap_capacity_identity migration", step)
         self.assertIn('"${1:-}" == "migration"', library)
         self.assertIn("--accept-migrated-snapshot", library)
+        self.assertIn("pending signed camera-capacity snapshot exists but identity/signature acceptance failed", library)
         self.assertIn('"--accept-migrated-snapshot"', applier)
         # The steady-state systemd invocation has no migration exception.
         unit = (ROOT / "appliance-agent/system/anyaicam-capacity-accept.service").read_text(encoding="utf-8")

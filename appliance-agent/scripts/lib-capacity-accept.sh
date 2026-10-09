@@ -70,8 +70,9 @@ bootstrap_capacity_identity() {
         return 1
     fi
     if [[ "$bootstrap_result" == "awaiting_signed_transition" ]]; then
-        echo "[INFO] Cloud-assigned appliance identity differs from the protected installer ID; waiting for a matching cloud-signed identity transition before accepting capacity." >&2
+        echo "[INFO] The installer UUID is staged only as claim correlation; waiting for a matching cloud-signed identity transition before pinning cloud identity or accepting capacity." >&2
     elif [[ "$bootstrap_result" != "unchanged" && "$bootstrap_result" != "bootstrapped" &&
+            "$bootstrap_result" != "reconciled_accepted_identity" &&
             "$bootstrap_result" != "reconciled_signed_transition" ]]; then
         echo "[ERROR] Unexpected camera-capacity identity bootstrap result: $bootstrap_result" >&2
         return 1
@@ -81,7 +82,11 @@ bootstrap_capacity_identity() {
             echo "[WARN] Pending migration snapshot was not accepted; existing protected capacity remains authoritative." >&2
         fi
     elif ! systemctl start anyaicam-capacity-accept.service; then
-        echo "[WARN] Pending signed camera capacity was not accepted; existing protected capacity remains authoritative." >&2
+        if [[ -e /var/lib/anyaicam/vms/data-config/vms_capacity_signed.json ]]; then
+            echo "[ERROR] A pending signed camera-capacity snapshot exists but identity/signature acceptance failed; refusing to report bootstrap success." >&2
+            return 1
+        fi
+        echo "[INFO] No signed camera-capacity snapshot is pending; the claim must complete before cloud capacity can be accepted." >&2
     fi
     return 0
 }

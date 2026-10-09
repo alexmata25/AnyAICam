@@ -5,7 +5,7 @@ import pytest
 import feature_entitlements
 
 
-def test_initial_claim_transition_binds_factory_id_to_exact_cloud_identity():
+def test_initial_claim_transition_binds_provisional_installer_id_to_exact_cloud_identity():
     appliance = {"id": "cloud-appliance", "cloud_id": "AIC-device", "customer_id": "customer-1"}
     transition = feature_entitlements.initial_capacity_identity_transition("factory-uuid", appliance)
 

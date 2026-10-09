@@ -73,12 +73,16 @@ def test_every_cloud_snapshot_is_accepted_by_the_helper(cloud, edge_db, slots, p
     assert len(digest) == 64 and datetime.fromisoformat(issued_at).tzinfo is not None
 
 
-def test_a_cloud_value_above_the_helpers_bound_is_rejected_not_truncated(cloud, edge_db):
-    """plan_camera_slots is not clamped by the cloud: a value above 10000
-    (bad data) makes the helper keep the previous authorization."""
+def test_cloud_capacity_above_edge_bound_is_clamped_before_signing(cloud, edge_db):
+    """Every signed component stays within the helper's supported 10,000 slots."""
     snapshot = _issue(cloud, edge_db, slots=3, plan=10_001)
-    with pytest.raises(helper.Reject, match="malformed_capacity"):
-        helper._validate_snapshot(snapshot, cloud["keys"], _identity(), verifier=_verify)
+    assert snapshot["camera_capacity"] == {
+        "camera_slot_quantity": 3,
+        "plan_camera_slots": 10_000,
+        "vms_license_capacity": 64,
+    }
+    body, _, _ = helper._validate_snapshot(snapshot, cloud["keys"], _identity(), verifier=_verify)
+    assert body["camera_capacity"]["plan_camera_slots"] <= helper.MAX_CAMERA_SLOTS
 
 
 def test_only_the_trusted_cloud_keys_verify(cloud, edge_db):
@@ -192,19 +196,20 @@ def test_a_rotated_key_not_yet_in_the_trust_anchor_keeps_the_previous_authorizat
     assert helper._validate_state(state, old_only, now=now, verifier=_verify)  # previous authorization intact
 
 
-def test_retiring_the_old_key_strands_an_appliance_whose_accepted_state_it_signed(cloud, edge_db, cloud_db):
-    """CONTRACT GAP (reported to Codex): an appliance that accepted under the
-    old key and missed the overlap window can never accept again once a
-    release drops that key from the trust anchor -- _advance validates the
-    current state first."""
+def test_retiring_the_old_key_preserves_appliance_continuity(cloud, edge_db, cloud_db):
+    """The accepted state retains its verified key while the next snapshot
+    is verified with the currently trusted rotated key."""
     before = _issue(cloud, edge_db)
     _, both = _rotate(cloud_db)
     after = _issue(cloud, edge_db, slots=5, plan=5)
     new_only = helper._validate_keyset({"keys": {"anyaicam-identity-rotated": both["anyaicam-identity-rotated"]}})
     now = datetime.fromisoformat(after["issued_at"])
     state, _ = helper._advance(before, helper._validate_keyset({"keys": both}), _identity(), None, now=now, verifier=_verify)
-    with pytest.raises(helper.Reject, match="bad_signature"):
-        helper._advance(after, new_only, _identity(), state, now=now, verifier=_verify)
+    advanced, outcome = helper._advance(after, new_only, _identity(), state, now=now, verifier=_verify)
+    assert outcome == "accepted"
+    assert advanced["snapshot"] == after
+    assert base64.b64decode(advanced["accepted_key"]) == new_only[after["signature"]["key_id"]]
+    assert helper._validate_state(advanced, new_only, now=now, verifier=_verify)
 
 
 # ------------------------------------------------------------------ ownership transfer

@@ -8,12 +8,13 @@ checking the release-provisioned Ed25519 keyset and the appliance identity.
 The VMS may write the staging file; it cannot write the accepted store.
 
 The accepted snapshot and its monotonic issue-time/digest high-water mark
-are replaced as one fsync'd file.  An already accepted capacity remains
+are replaced as one fsync'd file. An already accepted capacity remains
 usable offline after its snapshot expires; newly received snapshots must be
-unexpired.  On first migration only, an expired but otherwise valid signed
-snapshot may be bootstrapped to preserve the capacity already in use.  This
-cannot prove that a snapshot was not replayed before the protected store was
-introduced; see docs/signed-camera-capacity-acceptance.md.
+unexpired. A fresh install keeps the installer UUID only as root-controlled
+claim correlation and pins the cloud-assigned identity after signed
+acceptance. On first migration only, an expired but otherwise valid signed
+snapshot may be accepted to preserve existing capacity; its pre-migration
+provenance cannot be proven retroactively.
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ TRUST_DIR = "/etc/anyaicam-update"
 TRUST_FILE = "entitlement_signing_keys.json"
 ACCEPTED_FILE = "vms_capacity_accepted.json"
 IDENTITY_ANCHOR_FILE = "capacity_appliance_identity.json"
+PENDING_CLAIM_FILE = "capacity_pending_claim.json"
 LOCK_FILE = ".vms_capacity_accepted.lock"
 COMPAT_DIR = "/var/lib/anyaicam/vms/data-config"
 COMPAT_FILE = "vms_capacity.json"
@@ -298,7 +300,18 @@ def _advance(snapshot, public_keys, identity, current_state, *, now=None, verifi
         bound = _safe_identity(identity)
         transition = body.get("identity_transition")
         if anchor is not None and transition is not None:
-            if transition.get("kind") == "initial_claim" and transition_source_id != anchor.get("appliance_id"):
+            # A 1.2.4 claim may already have persisted the cloud-assigned ID
+            # before 1.2.5 installs the root acceptance helper. In that case
+            # the signed initial-claim bridge is already reconciled if its
+            # authenticated target is exactly the protected pin. It does not
+            # authorize a new identity; it only lets the first capacity
+            # snapshot establish its high-water mark.
+            already_reconciled = (
+                transition.get("kind") == "initial_claim" and
+                anchor.get("appliance_id") == bound["appliance_id"]
+            )
+            if (transition.get("kind") == "initial_claim" and
+                    transition_source_id != anchor.get("appliance_id") and not already_reconciled):
                 raise Reject("identity_anchor_mismatch")
             if transition.get("kind") == "authorized":
                 raise Reject("accepted_identity_changed")
@@ -418,6 +431,76 @@ def _write_identity_anchor(dir_fd: int, appliance_id: str) -> None:
     _write_atomic_at(dir_fd, IDENTITY_ANCHOR_FILE, data, mode=0o600)
 
 
+def _pending_claim_identity(dir_fd: int) -> dict | None:
+    """Read the root-controlled claim correlation value, if one was staged.
+
+    This is deliberately not an identity anchor and never authorizes capacity.
+    It exists only to ensure a cloud-signed initial-claim transition is for the
+    installer identity created during this installation. It is removed after
+    the first accepted cloud identity is pinned.
+    """
+    raw = _read_at(dir_fd, PENDING_CLAIM_FILE, 4096, root_owned=True, absent_ok=True)
+    if raw is None:
+        return None
+    record = _json(raw)
+    appliance_id = record.get("provisional_appliance_id") if isinstance(record, dict) else None
+    if (not isinstance(record, dict) or record.get("schema") != 1 or
+            record.get("purpose") != "initial_claim_correlation" or
+            not isinstance(appliance_id, str) or not appliance_id.strip() or len(appliance_id) > 256):
+        raise Reject("invalid_pending_claim")
+    return {"appliance_id": appliance_id}
+
+
+def _write_pending_claim_identity(dir_fd: int, appliance_id: str) -> None:
+    if not isinstance(appliance_id, str) or not appliance_id.strip() or len(appliance_id) > 256:
+        raise Reject("invalid_pending_claim")
+    data = json.dumps({"schema": 1, "purpose": "initial_claim_correlation",
+                       "provisional_appliance_id": appliance_id}, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8") + b"\n"
+    _write_atomic_at(dir_fd, PENDING_CLAIM_FILE, data, mode=0o600)
+
+
+def _remove_pending_claim_identity(dir_fd: int) -> None:
+    try:
+        os.unlink(PENDING_CLAIM_FILE, dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _validate_first_acceptance_source(body, identity, *, anchor, pending_claim,
+                                      allow_legacy_migration: bool) -> None:
+    """Bind first acceptance to either the pending claim or explicit legacy migration.
+
+    A fresh install must present the signed initial_claim bridge from the
+    root-protected provisional claim correlation ID. The legacy migration
+    exception is available only to the fixed root installer/update entrypoint
+    and relies on the pre-1.2.5 signed snapshot plus persisted activation ID.
+    """
+    transition = body.get("identity_transition")
+    _, transition_source = _snapshot_transition(body, identity)
+    if anchor is not None:
+        if transition is not None and transition.get("kind") == "initial_claim":
+            already_reconciled = anchor.get("appliance_id") == _safe_identity(identity)["appliance_id"]
+            if transition_source != anchor.get("appliance_id") and not already_reconciled:
+                raise Reject("identity_anchor_mismatch")
+        return
+    if transition is not None:
+        if transition.get("kind") != "initial_claim":
+            raise Reject("unexpected_identity_transition")
+        if pending_claim is None:
+            raise Reject("missing_pending_claim")
+        if transition.get("from_appliance_id") != pending_claim.get("appliance_id"):
+            raise Reject("pending_claim_identity_mismatch")
+        return
+    if not allow_legacy_migration:
+        raise Reject("initial_claim_transition_required")
+    # A migrated 1.2.4 authorization may predate the signed transition field.
+    # Its historical provenance cannot be retroactively established; it is
+    # still signature- and persisted-identity-validated before becoming root state.
+    _safe_identity(identity)
+
+
 def _transition_source_appliance_id(state) -> str | None:
     if not isinstance(state, dict) or not isinstance(state.get("snapshot"), dict):
         return None
@@ -440,7 +523,10 @@ def _check_identity_anchor(identity, anchor) -> None:
 
 
 def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_name="appliance_identity.json") -> str:
-    """Create the initial local pin, or wait for signed cloud identity acceptance."""
+    """Stage claim correlation or recover an already accepted cloud identity.
+
+    Never promote the installer's temporary UUID to the authoritative anchor.
+    """
     identity = _json(_read_at(identity_dir_fd, identity_name, MAX_IDENTITY_BYTES))
     appliance_id = identity.get("appliance_id") if isinstance(identity, dict) else None
     if not isinstance(appliance_id, str) or not appliance_id.strip() or len(appliance_id) > 256:
@@ -453,29 +539,47 @@ def _bootstrap_identity(identity_dir_fd: int, trust_dir_fd: int, *, identity_nam
             if str(error) != "missing_file":
                 raise
             existing = None
+        accepted_raw = _read_at(trust_dir_fd, ACCEPTED_FILE, MAX_STATE_BYTES,
+                                root_owned=True, absent_ok=True)
+        if accepted_raw is not None:
+            trust_raw = _read_at(trust_dir_fd, TRUST_FILE, MAX_TRUST_BYTES,
+                                 root_owned=True)
+            keyset = _validate_keyset(_json(trust_raw))
+            accepted_state = _json(accepted_raw)
+            accepted_identity, _ = _validate_state(accepted_state, keyset)
+            accepted_id = accepted_identity["appliance_id"]
+            try:
+                local_identity = _safe_identity(identity)
+            except Reject:
+                local_identity = None
+            if existing is None:
+                _write_identity_anchor(trust_dir_fd, accepted_id)
+            elif existing["appliance_id"] != accepted_id:
+                if _transition_source_appliance_id(accepted_state) != existing["appliance_id"]:
+                    raise Reject("identity_anchor_mismatch")
+                _write_identity_anchor(trust_dir_fd, accepted_id)
+            if local_identity != accepted_identity:
+                # A local activation change is not itself authorization. Keep
+                # the last signed anchor and wait for a cloud-signed transition.
+                return "awaiting_signed_transition"
+            _remove_pending_claim_identity(trust_dir_fd)
+            return "reconciled_accepted_identity" if existing is None or existing["appliance_id"] != accepted_id else "unchanged"
         if existing is not None:
             if existing["appliance_id"] != appliance_id:
                 # A local identity changes only after claim/re-enrollment.
                 # Never rewrite the root pin from this service-writable file;
                 # the acceptance watcher must first verify a signed transition.
-                try:
-                    accepted_raw = _read_at(trust_dir_fd, ACCEPTED_FILE, MAX_STATE_BYTES,
-                                            root_owned=True, absent_ok=True)
-                    if accepted_raw is not None:
-                        keyset = _validate_keyset(_json(_read_at(
-                            trust_dir_fd, TRUST_FILE, MAX_TRUST_BYTES, root_owned=True)))
-                        accepted_state = _json(accepted_raw)
-                        accepted_identity, _ = _validate_state(accepted_state, keyset)
-                        if (accepted_identity["appliance_id"] == appliance_id and
-                                _transition_source_appliance_id(accepted_state) == existing["appliance_id"]):
-                            _write_identity_anchor(trust_dir_fd, appliance_id)
-                            return "reconciled_signed_transition"
-                except (Reject, OSError):
-                    pass
                 return "awaiting_signed_transition"
             return "unchanged"
-        _write_identity_anchor(trust_dir_fd, appliance_id)
-        return "bootstrapped"
+        pending = _pending_claim_identity(trust_dir_fd)
+        if pending is not None:
+            if pending["appliance_id"] != appliance_id:
+                # A later mutable/local identity cannot replace the original
+                # claim source. The cloud-signed first snapshot must bridge it.
+                return "awaiting_signed_transition"
+            return "awaiting_signed_transition"
+        _write_pending_claim_identity(trust_dir_fd, appliance_id)
+        return "awaiting_signed_transition"
     finally:
         os.close(lock_fd)
 
@@ -543,7 +647,6 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
         identity_dir_fd = _open_dir(str(identity_file.parent))
         snapshot = _json(raw)
         identity = _json(_read_at(identity_dir_fd, identity_file.name, MAX_IDENTITY_BYTES))
-        pinned_identity = _identity_anchor(root_dir_fd)
         current_raw = _read_at(root_dir_fd, accepted_file, MAX_STATE_BYTES, root_owned=True, absent_ok=True)
         current_state = _json(current_raw) if current_raw is not None else None
         if current_state is not None:
@@ -554,7 +657,19 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
         # cannot validate against the same old high-water mark.
         current_raw = _read_at(root_dir_fd, accepted_file, MAX_STATE_BYTES, root_owned=True, absent_ok=True)
         current_state = _json(current_raw) if current_raw is not None else None
-        pinned_identity = _identity_anchor(root_dir_fd)
+        try:
+            pinned_identity = _identity_anchor(root_dir_fd)
+        except Reject as error:
+            if str(error) != "missing_file":
+                raise
+            pinned_identity = None
+        pending_claim = _pending_claim_identity(root_dir_fd)
+        if current_state is not None and pinned_identity is None:
+            current_identity, _ = _validate_state(current_state, keyset, now=now,
+                                                  verifier=verifier or (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl)))
+            _write_identity_anchor(root_dir_fd, current_identity["appliance_id"])
+            _remove_pending_claim_identity(root_dir_fd)
+            pinned_identity = _identity_anchor(root_dir_fd)
         if current_state is not None and current_state.get("identity", {}).get("appliance_id") != pinned_identity["appliance_id"]:
             _validate_state(current_state, keyset, now=now, verifier=verifier or
                             (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl)))
@@ -563,6 +678,13 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
             _write_identity_anchor(root_dir_fd, current_state["identity"]["appliance_id"])
             pinned_identity = _identity_anchor(root_dir_fd)
         policy_verifier = verifier or (lambda key, message, sig: _openssl_verify(key, message, sig, openssl=openssl))
+        if current_state is None:
+            first_body, _, _ = _validate_snapshot(snapshot, keyset, identity, now=now,
+                                                  check_expiry=not allow_expired_first,
+                                                  verifier=policy_verifier)
+            _validate_first_acceptance_source(first_body, identity, anchor=pinned_identity,
+                                              pending_claim=pending_claim,
+                                              allow_legacy_migration=allow_expired_first)
         next_state, outcome = _advance(snapshot, keyset, identity, current_state,
                                        now=now, verifier=policy_verifier,
                                        allow_expired_first=allow_expired_first,
@@ -573,11 +695,12 @@ def accept_pending(*, staging_path=STAGING_FILE, identity_path=IDENTITY_FILE,
         if len(encoded) > MAX_STATE_BYTES:
             raise Reject("accepted_state_too_large")
         _write_atomic_at(root_dir_fd, accepted_file, encoded)
-        if pinned_identity["appliance_id"] != next_state["identity"]["appliance_id"]:
+        if pinned_identity is None or pinned_identity["appliance_id"] != next_state["identity"]["appliance_id"]:
             # The accepted signed state is the transaction's source of truth.
             # If this secondary pin write is interrupted, a later invocation
             # can repair it only from the root-validated transition above.
             _write_identity_anchor(root_dir_fd, next_state["identity"]["appliance_id"])
+        _remove_pending_claim_identity(root_dir_fd)
         try:
             _save_compatibility_copy(snapshot, compat_dir=compat_dir, compat_file=compat_file)
         except (OSError, Reject):
@@ -607,7 +730,14 @@ def main() -> int:
             if info.st_uid != 0 or info.st_mode & 0o022:
                 raise Reject("unsafe_trust_directory")
             missing = None
-            for identity_path in (IDENTITY_FILE, INSTALLER_IDENTITY_FILE):
+            accepted_raw = _read_at(trust_dir, ACCEPTED_FILE, MAX_STATE_BYTES,
+                                    root_owned=True, absent_ok=True)
+            # With accepted state, compare against the mutable VMS activation
+            # identity. Before first acceptance, stage the installer UUID as
+            # a provisional claim-correlation value only.
+            identity_paths = ((IDENTITY_FILE, INSTALLER_IDENTITY_FILE) if accepted_raw is not None
+                              else (INSTALLER_IDENTITY_FILE, IDENTITY_FILE))
+            for identity_path in identity_paths:
                 identity_dir = None
                 try:
                     identity_dir = _open_dir(str(Path(identity_path).parent))

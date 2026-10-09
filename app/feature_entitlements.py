@@ -104,8 +104,9 @@ def initial_capacity_identity_transition(source_appliance_id: str, appliance: di
     """Cloud-signed bridge from factory UUID to the newly claimed cloud row.
 
     The caller is the single-use claim/activation completion transaction. The
-    source is the device UUID already pinned by the installer; the target is
-    the exact canonical cloud identity returned by that transaction.
+    source is the installer-generated provisional device UUID. It is only a
+    claim-correlation value; the target is the canonical cloud identity and
+    becomes authoritative on the appliance only after signed capacity acceptance.
     """
     target = {"appliance_id": str(appliance.get("id") or ""),
               "cloud_id": str(appliance.get("cloud_id") or ""),
@@ -133,19 +134,59 @@ def authorized_capacity_identity_transition(from_identity: dict, to_appliance: d
             "authorized_at": datetime.now(timezone.utc).isoformat()}
 
 
-def _capacity_identity_transition(appliance: dict, target: dict) -> dict | None:
+def capacity_identity_transition_status(appliance: dict, target: dict) -> tuple[str, dict | None]:
+    """Classify persisted identity-transition metadata without raising.
+
+    A stale or malformed transition is a configuration readiness problem,
+    not a reason to fail the whole authenticated appliance configuration
+    request. Callers must not issue identity-bound entitlements from an
+    invalid transition. ``approved`` means the transition is structurally
+    valid and targets the appliance's current cloud identity.
+    """
     raw = appliance.get("capacity_identity_transition_json")
-    if not raw:
-        return None
+    if raw is None:
+        return "absent", None
+    if isinstance(raw, str) and not raw.strip():
+        return "invalid", None
     try:
         transition = json.loads(raw) if isinstance(raw, str) else raw
     except (TypeError, ValueError):
-        raise ValueError("Stored capacity identity transition is malformed.")
-    if not isinstance(transition, dict) or transition.get("schema") != 1:
-        raise ValueError("Stored capacity identity transition is malformed.")
+        return "invalid", None
+    if (not isinstance(transition, dict) or transition.get("schema") != 1 or
+            not isinstance(transition.get("transition_id"), str) or
+            not transition["transition_id"] or len(transition["transition_id"]) > 128 or
+            not all(char.isalnum() or char in "._:-" for char in transition["transition_id"])):
+        return "invalid", None
     transition_target = transition.get("to_identity")
     if transition_target != target:
-        raise ValueError("Stored capacity identity transition does not match the appliance's current cloud identity.")
+        return "invalid", None
+    kind = transition.get("kind")
+    if kind == "initial_claim":
+        source = transition.get("from_appliance_id")
+        if not isinstance(source, str) or not source.strip() or len(source) > 256:
+            return "invalid", None
+    elif kind == "authorized":
+        source = transition.get("from_identity")
+        if (transition.get("reason") not in {"reenrollment", "ownership_transfer"} or
+                not isinstance(source, dict) or set(source) != set(_IDENTITY_FIELDS) or
+                any(not isinstance(source.get(field), str) or not source[field].strip()
+                    for field in _IDENTITY_FIELDS) or source == target):
+            return "invalid", None
+        try:
+            authorized_at = datetime.fromisoformat(str(transition.get("authorized_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return "invalid", None
+        if authorized_at.tzinfo is None:
+            return "invalid", None
+    else:
+        return "invalid", None
+    return "approved", transition
+
+
+def _capacity_identity_transition(appliance: dict, target: dict) -> dict | None:
+    status, transition = capacity_identity_transition_status(appliance, target)
+    if status == "invalid":
+        raise ValueError("Stored capacity identity transition is malformed or stale.")
     return transition
 
 

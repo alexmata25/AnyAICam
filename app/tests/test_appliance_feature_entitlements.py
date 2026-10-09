@@ -778,3 +778,111 @@ def test_an_appliance_talk_session_ends_when_a_sync_revokes_talk_down(appliance,
                 socket.receive_json()
     assert closed.value.code == 4403
     assert len(frames) == 1
+
+
+# ----------------------------------------------------- transition/config safety (B2)
+
+def _set_capacity_identity_transition(cloud_db, transition):
+    with override_target(sqlite_path=str(cloud_db)):
+        with connection() as db:
+            db.execute("UPDATE appliances SET capacity_identity_transition_json=? WHERE id=?",
+                       (json.dumps(transition) if transition is not None else None, APPLIANCE_ID))
+
+
+def _approved_test_transition(*, target=None):
+    return feature_entitlements.authorized_capacity_identity_transition(
+        {"appliance_id": "appl-old", "cloud_id": "AIC-old", "customer_id": "cust-old"},
+        target or {"id": APPLIANCE_ID, "cloud_id": EDGE_IDENTITY["cloud_id"],
+                   "customer_id": EDGE_IDENTITY["customer_id"]},
+        reason="ownership_transfer",
+    )
+
+
+def test_pending_transfer_with_noncurrent_target_returns_safe_retryable_configuration(
+        appliance, cloud_client, cloud_db, monkeypatch):
+    pending = _approved_test_transition(target={
+        "id": APPLIANCE_ID, "cloud_id": EDGE_IDENTITY["cloud_id"], "customer_id": "cust-next"})
+    _set_capacity_identity_transition(cloud_db, pending)
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
+
+    with override_target(sqlite_path=str(cloud_db)):
+        response = cloud_client.get("/api/appliance/configuration", headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"configuration_status": "identity_transition_unavailable"}
+
+
+def test_approved_transfer_snapshot_is_bound_to_the_current_appliance_identity(
+        appliance, cloud_client, cloud_db, monkeypatch):
+    approved = _approved_test_transition()
+    _set_capacity_identity_transition(cloud_db, approved)
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
+
+    with override_target(sqlite_path=str(cloud_db)):
+        response = cloud_client.get("/api/appliance/configuration", headers=_auth_headers())
+
+    assert response.status_code == 200
+    config = response.json()
+    assert config["feature_entitlements"]["identity_transition"] == approved
+    assert {key: config["feature_entitlements"][key]
+            for key in ("appliance_id", "cloud_id", "customer_id")} == {
+                key: EDGE_IDENTITY[key] for key in ("appliance_id", "cloud_id", "customer_id")}
+    assert appliance_entitlements.verify(config["feature_entitlements"],
+                                         appliance_entitlements._trusted_keys(),
+                                         identity=EDGE_IDENTITY) is None
+    assert "cameras" in config and "usable_camera_capacity" in config
+
+
+@pytest.mark.parametrize("transition", [
+    "not-an-object",
+    # Ownership changed again after an earlier authorized transition was
+    # stored, so its target is no longer the current appliance identity.
+    {"schema": 1, "transition_id": "stale-1", "kind": "authorized",
+     "reason": "ownership_transfer", "from_identity": {
+         "appliance_id": "appl-old", "cloud_id": "AIC-old", "customer_id": "cust-old"},
+     "to_identity": {"appliance_id": APPLIANCE_ID, "cloud_id": EDGE_IDENTITY["cloud_id"],
+                      "customer_id": "cust-former"}, "authorized_at": "2026-10-09T12:00:00+00:00"},
+    # Rejected/corrupt persisted metadata also fails closed without taking
+    # down the entire configuration route.
+    {"schema": 99, "transition_id": "rejected-1", "kind": "authorized",
+     "reason": "ownership_transfer", "from_identity": {
+         "appliance_id": "appl-old", "cloud_id": "AIC-old", "customer_id": "cust-old"},
+     "to_identity": {"appliance_id": APPLIANCE_ID, "cloud_id": EDGE_IDENTITY["cloud_id"],
+                      "customer_id": "cust-other"}, "authorized_at": "2026-10-09T12:00:00+00:00"},
+])
+def test_stale_or_rejected_transfer_does_not_disclose_current_owner_configuration(
+        appliance, cloud_client, cloud_db, monkeypatch, transition):
+    _set_capacity_identity_transition(cloud_db, transition)
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
+
+    with override_target(sqlite_path=str(cloud_db)):
+        response = cloud_client.get("/api/appliance/configuration", headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {"configuration_status": "identity_transition_unavailable"}
+
+
+def test_edge_sync_keeps_last_accepted_state_when_cloud_transition_is_stale(
+        appliance, cloud_db, edge_db, monkeypatch):
+    assert _sync(edge_db)["status"] == "ok"
+    old_snapshot = _cached()["snapshot"]
+    with override_target(sqlite_path=str(edge_db)):
+        with connection() as db:
+            before_cameras = [dict(row) for row in db.execute("SELECT id,name FROM cameras ORDER BY id").fetchall()]
+
+    pending = _approved_test_transition(target={
+        "id": APPLIANCE_ID, "cloud_id": EDGE_IDENTITY["cloud_id"], "customer_id": "cust-next"})
+    _set_capacity_identity_transition(cloud_db, pending)
+    import appliance_config_cache
+    published = []
+    monkeypatch.setattr(appliance_config_cache, "publish", lambda response: published.append(response))
+
+    result = _sync(edge_db)
+
+    assert result == {"status": "identity_transition_unavailable"}
+    assert _cached()["snapshot"] == old_snapshot
+    assert published == []
+    with override_target(sqlite_path=str(edge_db)):
+        with connection() as db:
+            after_cameras = [dict(row) for row in db.execute("SELECT id,name FROM cameras ORDER BY id").fetchall()]
+    assert after_cameras == before_cameras

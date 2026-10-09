@@ -323,6 +323,13 @@ def sync_provisioned_cameras() -> dict:
     response = _control_plane_get("/api/appliance/configuration", identity["appliance_id"], identity["credential"])
     if not isinstance(response, dict):
         return {"status": "unreachable"}
+    if response.get("configuration_status") == "identity_transition_unavailable":
+        # The cloud intentionally returns no tenant-scoped configuration
+        # while stored transfer/re-enrollment metadata is stale or malformed.
+        # Do not publish/cache that response or reconcile empty lists: retain
+        # the last local configuration and accepted capacity, and retry on
+        # the next normal sync interval.
+        return {"status": "identity_transition_unavailable"}
     cloud_cameras = response.get("cameras")
     if not isinstance(cloud_cameras, list):
         return {"status": "malformed_response"}

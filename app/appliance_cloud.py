@@ -677,6 +677,24 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
+        appliance=authenticate_appliance(request)
+        # A transfer/re-enrollment transition is valid only for the exact
+        # identity currently stored on this appliance row. If ownership has
+        # moved again (or the metadata is malformed), do not let snapshot
+        # construction throw a 500 after partially building tenant-scoped
+        # configuration, and do not expose the new owner's settings to an
+        # appliance whose protected identity has not accepted that change.
+        # The edge treats this marker as a retryable no-op, preserving its
+        # last accepted capacity and local configuration until the metadata
+        # is repaired by an authorized workflow.
+        import feature_entitlements
+        transition_target={"appliance_id":str(appliance.get('id') or ''),
+                           "cloud_id":str(appliance.get('cloud_id') or ''),
+                           "customer_id":str(appliance.get('customer_id') or '')}
+        transition_status,_transition=feature_entitlements.capacity_identity_transition_status(appliance,transition_target)
+        if transition_status == "invalid":
+            logger.warning("appliance.configuration_identity_transition_unavailable appliance_id=%s",appliance.get('id'))
+            return {'configuration_status':'identity_transition_unavailable'}
         # smart_motion_enabled/lpr_enabled/ppe_enabled (2026-09-16) join
         # people_counting_enabled here for the same reason: this is the
         # one route recording_uploader._refresh_camera_map() polls to
@@ -693,7 +711,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # recording strategy to run for a camera. Omitting it here would
         # be the exact same unreachable-in-practice gap this comment
         # already documents for people_counting_enabled.
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,door_access_enabled,door_relay_channel,door_relay_pulse_ms,door_feedback_enabled,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
+        camera_items=rows('SELECT id,name,site_id,door_access_enabled,door_relay_channel,door_relay_pulse_ms,door_feedback_enabled,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
         # analytics_rules (2026-09-21): the tenant-safe customer-drawn
         # Intrusion Zone / Line-Crossing rules (customer_analytics_
         # rules.py) for THIS appliance's own cameras only -- the same
