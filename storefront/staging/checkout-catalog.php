@@ -64,19 +64,13 @@ function config_value_checked(string $name): string {
 // appliance_sku is looked up in stripe-checkout.php's existing
 // $hardwareCatalog (never duplicated here) -- checkout-session.php
 // requires stripe-checkout.php's catalog builder for that reason. This
-// module only defines the two categories that don't already have a
-// catalog anywhere: camera plans and analytics.
-
-const CAMERA_PLAN_CATALOG = [
-    'local_1_8'    => ['type' => 'local',  'capacity' => 8,  'label' => 'Local 8 cameras',   'display_price' => 0.60, 'price_id_const' => 'LOCAL_1_8_PRICE_ID'],
-    'local_9_16'   => ['type' => 'local',  'capacity' => 16, 'label' => 'Local 16 cameras',  'display_price' => 0.61, 'price_id_const' => 'LOCAL_9_16_PRICE_ID'],
-    'local_17_32'  => ['type' => 'local',  'capacity' => 32, 'label' => 'Local 32 cameras',  'display_price' => 0.62, 'price_id_const' => 'LOCAL_17_32_PRICE_ID'],
-    'local_33_64'  => ['type' => 'local',  'capacity' => 64, 'label' => 'Local 64 cameras',  'display_price' => 0.63, 'price_id_const' => 'LOCAL_33_64_PRICE_ID'],
-    'hybrid_1_8'   => ['type' => 'hybrid', 'capacity' => 8,  'label' => 'Hybrid 8 cameras',  'display_price' => 0.70, 'price_id_const' => 'HYBRID_1_8_PRICE_ID'],
-    'hybrid_9_16'  => ['type' => 'hybrid', 'capacity' => 16, 'label' => 'Hybrid 16 cameras', 'display_price' => 0.71, 'price_id_const' => 'HYBRID_9_16_PRICE_ID'],
-    'hybrid_17_32' => ['type' => 'hybrid', 'capacity' => 32, 'label' => 'Hybrid 32 cameras', 'display_price' => 0.72, 'price_id_const' => 'HYBRID_17_32_PRICE_ID'],
-    'hybrid_33_64' => ['type' => 'hybrid', 'capacity' => 64, 'label' => 'Hybrid 64 cameras', 'display_price' => 0.73, 'price_id_const' => 'HYBRID_33_64_PRICE_ID'],
-];
+// module only defines what doesn't already have a catalog anywhere:
+// analytics and the one-time VMS software license.
+//
+// Camera plans are not sold here (2026-10-08): they are per camera (Basic
+// Local, AI Local or Hybrid) and chosen in the customer's AnyAiCam account.
+// The earlier fixed 8/16/32/64-camera Local/Hybrid tiers were removed;
+// their TEST Price IDs stay recorded in stripe-config.php, unused.
 
 // Analytics packages (flat, never per camera) and Talk Down (per site,
 // includes AAC Voice Call). Package contents live in app/pricing_catalog.py.
@@ -111,19 +105,6 @@ function resolve_vms_license(int $capacity): ?array {
 }
 
 const INCLUDED_FEATURES = ['Secure Edge', 'Smart Motion', 'AACO'];
-
-/** Fail-closed: an unknown camera-plan key resolves to null, never a guess. */
-function resolve_camera_plan(string $key): ?array {
-    if (!isset(CAMERA_PLAN_CATALOG[$key])) {
-        return null;
-    }
-    $entry = CAMERA_PLAN_CATALOG[$key];
-    $priceId = config_value_checked($entry['price_id_const']);
-    if ($priceId === '') {
-        return null;
-    }
-    return ['key' => $key] + $entry + ['price_id' => $priceId];
-}
 
 /** Fail-closed: an unknown analytic key resolves to null, never a guess. */
 function resolve_analytic(string $key): ?array {
@@ -160,13 +141,13 @@ function normalize_cart(array $raw, array $hardwareCatalog): array {
 
     $relay = (bool)($raw['relay'] ?? false);
 
-    $cameraPlanKey = trim((string)($raw['camera_plan'] ?? ''));
-    $cameraPlan = null;
-    if ($cameraPlanKey !== '') {
-        $cameraPlan = resolve_camera_plan($cameraPlanKey);
-        if ($cameraPlan === null) {
-            throw new InvalidArgumentException('Unknown or unconfigured camera-slot plan.');
-        }
+    if (trim((string)($raw['camera_plan'] ?? '')) !== '') {
+        throw new InvalidArgumentException('Camera plans are per camera (Basic Local, AI Local or Hybrid) and are chosen with your number of cameras in your AnyAiCam account under My subscription, not on this page.');
+    }
+    // One-time VMS software license, by size (8/16/32/64 cameras).
+    $licenseCapacity = (int)($raw['vms_license_capacity'] ?? 0);
+    if ($licenseCapacity !== 0 && !isset(VMS_LICENSE_CATALOG[$licenseCapacity])) {
+        throw new InvalidArgumentException('Unknown VMS software license size.');
     }
 
     $analyticsKeys = is_array($raw['analytics'] ?? null) ? $raw['analytics'] : [];
@@ -190,16 +171,16 @@ function normalize_cart(array $raw, array $hardwareCatalog): array {
         throw new InvalidArgumentException('Invalid customer email.');
     }
 
-    if ($applianceSku === '' && !$relay && $cameraPlan === null && count($analytics) === 0) {
+    if ($applianceSku === '' && !$relay && $licenseCapacity === 0 && count($analytics) === 0) {
         throw new InvalidArgumentException('Select at least one item before checking out.');
     }
 
     // One-time VMS software license: included with an AnyAiCam appliance
     // (never charged twice); charged once for a DIY / customer-owned PC.
     $vmsLicense = null;
-    $vmsLicenseIncluded = $cameraPlan !== null && $applianceSku !== '';
-    if ($cameraPlan !== null && $applianceSku === '') {
-        $vmsLicense = resolve_vms_license((int)$cameraPlan['capacity']);
+    $vmsLicenseIncluded = $licenseCapacity !== 0 && $applianceSku !== '';
+    if ($licenseCapacity !== 0 && $applianceSku === '') {
+        $vmsLicense = resolve_vms_license($licenseCapacity);
         if ($vmsLicense === null) {
             throw new InvalidArgumentException('The VMS software license for this camera capacity is not available yet.');
         }
@@ -209,7 +190,6 @@ function normalize_cart(array $raw, array $hardwareCatalog): array {
         'customer_email' => $email,
         'appliance_sku' => $applianceSku,
         'relay' => $relay,
-        'camera_plan' => $cameraPlan,
         'analytics' => $analytics,
         'vms_license' => $vmsLicense,
         'vms_license_included' => $vmsLicenseIncluded,
@@ -247,18 +227,6 @@ function build_checkout_legs(array $cart, array $hardwareCatalog): array {
             'price_id' => $item['price_id'],
             'mode' => 'payment',
             'amount' => $item['unit_amount'] / 100,
-        ];
-    }
-
-    if ($cart['camera_plan'] !== null) {
-        $plan = $cart['camera_plan'];
-        $legs[] = [
-            'kind' => 'camera_plan',
-            'key' => $plan['key'],
-            'label' => $plan['label'],
-            'price_id' => $plan['price_id'],
-            'mode' => 'subscription',
-            'amount' => $plan['display_price'],
         ];
     }
 

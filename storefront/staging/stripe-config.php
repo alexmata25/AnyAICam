@@ -111,6 +111,10 @@ define('RELAY_MODULE_3CH_PRICE_ID', 'price_1UDnpkGllhK80H2n2EA2lFmQ');
 // this file has no test/live switch of its own, exactly like every
 // hardware constant above; environment is what's staged, not the code.
 //
+// RETIRED 2026-10-08 -- not sold. The fixed 8/16/32/64-camera Local/Hybrid
+// tiers were removed (camera plans are per camera, chosen in the AnyAiCam
+// account); nothing reads these constants any more. They stay recorded,
+// unchanged, as the TEST Price IDs that exist in Stripe.
 // LOCAL -- recurring monthly, $0.60/$0.61/$0.62/$0.63 TEST.
 define('LOCAL_1_8_PRICE_ID', 'price_1UD2xKGllhK80H2nFJwtFJvw');
 define('LOCAL_9_16_PRICE_ID', 'price_1UD2yLGllhK80H2n7Z2q8AM3');

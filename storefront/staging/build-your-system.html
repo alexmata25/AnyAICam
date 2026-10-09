@@ -74,18 +74,14 @@ h1{font-size:clamp(1.6rem,3vw,2.2rem);margin:.4rem 0 .2rem}
   </section>
 
   <section class="section">
-    <h2>Camera service</h2>
-    <p class="hint">Local or Hybrid -- not both at once. Recurring monthly subscription.</p>
-    <div class="option-grid" id="service-options">
-      <label class="option-card" data-service="local"><input type="radio" name="camera-service" value="local"><span class="name">Local</span><span class="model">Recorded and served from the appliance on-site.</span></label>
-      <label class="option-card" data-service="hybrid"><input type="radio" name="camera-service" value="hybrid"><span class="name">Hybrid</span><span class="model">Local recording plus cloud-protected off-site copy.</span></label>
-    </div>
+    <h2>Camera plan</h2>
+    <p class="hint" id="camera-plan-note">Camera plans are per camera (Basic Local, AI Local or Hybrid) and are chosen with your number of cameras in your AnyAiCam account under My subscription, not on this page.</p>
   </section>
 
   <section class="section">
-    <h2>Camera capacity</h2>
-    <p class="hint">Choose the tier that matches your camera count. Price depends on the camera service selected above.</p>
-    <div class="option-grid" id="capacity-options"></div>
+    <h2>VMS software license</h2>
+    <p class="hint">One-time. Included with an AnyAiCam appliance; for your own PC, choose the size that covers your cameras.</p>
+    <div class="option-grid" id="license-options"></div>
   </section>
 
   <section class="section">
@@ -136,14 +132,10 @@ const APPLIANCES = [
   {sku:'AIC-APPLIANCE-RYZEN-AAC-FACIAL', name:'AnyAiCam Enterprise', model:'MINISFORUM AI X1 Pro-470', price:0.52},
 ];
 const RELAY = {sku:'AIC-RELAY-NUMATO-3CH', name:'Numato 3-Channel Relay Module', model:'Numato 3-channel Ethernet relay', price:0.53};
-const CAPACITY_TIERS = ['1_8','9_16','17_32','33_64'];
-const CAPACITY_LABELS = {'1_8':'Up to 8 cameras','9_16':'Up to 16 cameras','17_32':'Up to 32 cameras','33_64':'Up to 64 cameras'};
-const LOCAL_PRICES = {'1_8':0.60,'9_16':0.61,'17_32':0.62,'33_64':0.63};
-const HYBRID_PRICES = {'1_8':0.70,'9_16':0.71,'17_32':0.72,'33_64':0.73};
 // One-time VMS software license by capacity (sandbox TEST amounts; retail in
 // app/pricing_catalog.py). Included with an appliance, charged for DIY.
-const VMS_LICENSE_PRICES = {'1_8':0.40,'9_16':0.41,'17_32':0.42,'33_64':0.43};
-const TIER_CAPACITY = {'1_8':8,'9_16':16,'17_32':32,'33_64':64};
+const LICENSE_SIZES = [8, 16, 32, 64];
+const VMS_LICENSE_PRICES = {8:0.40, 16:0.41, 32:0.42, 64:0.43};
 // Sandbox TEST amounts (retail lives only in app/pricing_catalog.py). Packages
 // are flat add-ons, never per camera; Secure Edge, Smart Motion and AACO are
 // included in every plan. price null = no TEST Price ID yet (not selectable).
@@ -155,7 +147,7 @@ const ANALYTICS = [
   {key:'talk_down', label:'Talk Down', note:'Per site, includes AAC Voice Call', price:0.84},
 ];
 
-const state = {applianceSku:null, relay:false, service:null, tier:null, analytics:new Set()};
+const state = {applianceSku:null, relay:false, licenseSize:null, analytics:new Set()};
 
 const money = v => Number(v || 0).toLocaleString('en-US', {style:'currency', currency:'USD'});
 
@@ -187,24 +179,14 @@ function renderRelay() {
   });
 }
 
-function renderService() {
-  document.querySelectorAll('#service-options .option-card').forEach(card => {
-    const isSelected = card.dataset.service === state.service;
-    card.classList.toggle('selected', isSelected);
-    card.querySelector('input').checked = isSelected;
-  });
-}
-
-function renderCapacity() {
-  if (!state.service) {
-    document.getElementById('capacity-options').innerHTML = '<p class="hint">Choose a camera service above first.</p>';
-    return;
-  }
-  const prices = state.service === 'local' ? LOCAL_PRICES : HYBRID_PRICES;
-  renderOptionGrid('capacity-options', CAPACITY_TIERS.map(tier => ({key:tier, name:CAPACITY_LABELS[tier], price:prices[tier], recurring:true})), {
-    selectedKey: state.tier,
-    groupName: 'capacity',
-    onSelect: tier => { state.tier = tier; renderCapacity(); renderAll(); },
+function renderLicense() {
+  // Included with an appliance (shown at $0 in the summary); charged once for a customer-owned PC.
+  renderOptionGrid('license-options', LICENSE_SIZES.map(size => ({key:String(size), name:`Up to ${size} cameras`,
+    model: state.applianceSku ? 'Included with your appliance' : null,
+    price: state.applianceSku ? 0 : VMS_LICENSE_PRICES[size]})), {
+    selectedKey: state.licenseSize === null ? null : String(state.licenseSize),
+    groupName: 'license',
+    onSelect: key => { state.licenseSize = Number(key); renderLicense(); renderAll(); },
   });
 }
 
@@ -233,13 +215,9 @@ function currentLegs() {
   if (state.relay) {
     legs.push({kind:'hardware', key:RELAY.sku, label:RELAY.name, amount:RELAY.price, mode:'one_time'});
   }
-  if (state.service && state.tier) {
-    const prices = state.service === 'local' ? LOCAL_PRICES : HYBRID_PRICES;
-    legs.push({kind:'camera_plan', key:`${state.service}_${state.tier}`, label:`${state.service === 'local' ? 'Local' : 'Hybrid'} ${CAPACITY_LABELS[state.tier]}`, amount:prices[state.tier], mode:'monthly'});
-    if (!state.applianceSku) {
-      // Customer-owned PC: the one-time VMS software license for this capacity.
-      legs.push({kind:'vms_license', key:String(TIER_CAPACITY[state.tier]), label:`VMS software license, ${TIER_CAPACITY[state.tier]} cameras`, amount:VMS_LICENSE_PRICES[state.tier], mode:'one_time'});
-    }
+  if (state.licenseSize && !state.applianceSku) {
+    // Customer-owned PC: the one-time VMS software license of the chosen size.
+    legs.push({kind:'vms_license', key:String(state.licenseSize), label:`VMS software license, ${state.licenseSize} cameras`, amount:VMS_LICENSE_PRICES[state.licenseSize], mode:'one_time'});
   }
   ANALYTICS.forEach(item => {
     if (state.analytics.has(item.key)) legs.push({kind:'analytics', key:item.key, label:item.label, amount:item.price, mode:'monthly'});
@@ -258,8 +236,8 @@ function renderSummary() {
       ? items.map(i => `<li><span>${i.label}</span><span>${money(i.amount)}</span></li>`).join('')
       : '<li class="summary-empty">Nothing selected</li>';
   };
-  const includedLicense = state.applianceSku && state.service && state.tier
-    ? [{label:`VMS software license, ${TIER_CAPACITY[state.tier]} cameras (included with appliance)`, amount:0}] : [];
+  const includedLicense = state.applianceSku && state.licenseSize
+    ? [{label:`VMS software license, ${state.licenseSize} cameras (included with appliance)`, amount:0}] : [];
   listEl('summary-one-time', oneTime.concat(includedLicense));
   listEl('summary-monthly', monthly);
   document.getElementById('summary-one-time-total').textContent = money(oneTime.reduce((s, i) => s + i.amount, 0));
@@ -275,17 +253,10 @@ function renderSummary() {
 }
 
 function renderAll() {
-  renderAppliances(); renderRelay(); renderService(); renderCapacity(); renderAnalytics();
+  renderAppliances(); renderRelay(); renderLicense(); renderAnalytics();
   return renderSummary();
 }
 
-document.querySelectorAll('#service-options .option-card').forEach(card => {
-  card.querySelector('input').addEventListener('change', () => {
-    state.service = card.dataset.service;
-    state.tier = null; // switching service clears the tier -- prices differ, and Local/Hybrid are mutually exclusive by construction (state.service is a single value, never a set)
-    renderAll();
-  });
-});
 document.getElementById('customer-email').addEventListener('input', renderSummary);
 
 document.getElementById('checkout-button').addEventListener('click', async () => {

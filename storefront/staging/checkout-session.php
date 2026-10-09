@@ -158,11 +158,8 @@ function verified_leg(array $leg, array $hardwareCatalog): array {
         return ['kind' => 'hardware', 'key' => $key, 'label' => $item['name'], 'price_id' => $item['price_id'], 'mode' => 'payment'];
     }
     if ($kind === 'camera_plan') {
-        $resolved = resolve_camera_plan($key);
-        if ($resolved === null) {
-            json_fail_checkout('Unknown or unconfigured camera-slot plan in checkout leg.');
-        }
-        return ['kind' => 'camera_plan', 'key' => $key, 'label' => $resolved['label'], 'price_id' => $resolved['price_id'], 'mode' => 'subscription'];
+        // Camera plans are per camera and chosen in the AnyAiCam account (2026-10-08).
+        json_fail_checkout('Camera plans are per camera (Basic Local, AI Local or Hybrid) and are chosen with your number of cameras in your AnyAiCam account under My subscription, not on this page.');
     }
     if ($kind === 'analytics') {
         $resolved = resolve_analytic($key);
