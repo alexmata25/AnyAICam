@@ -606,6 +606,63 @@ function wireTalkMic(button, cameraId) {
 # defines (main.py's page_shell). stopPropagation() keeps a click here
 # from also being read as a tile double-click (which navigates to the
 # single-camera page) while the request is in flight.
+# Cameras tab: add and remove cameras (2026-10-08, owner-approved; cloud
+# contract from feature/camera-capacity-add-remove-20261008). Owners only:
+# GET /api/customer/cameras now carries camera_capacity {usable, in_use,
+# pending, available, can_add_camera, can_manage, message, code,
+# action_url}. Add uses the existing scan/provision flow (setup step 4);
+# Remove asks for confirmation, then DELETE /api/customer/cameras/{id}.
+# A cloud without camera_capacity shows nothing new. Text from the server is
+# only ever set as textContent; a link target must be a site path.
+_CAMERA_MANAGE_JS = """
+(function(){
+  const bar=document.getElementById('camera-manage');
+  if(!bar)return;
+  const text=document.getElementById('camera-capacity-text'),
+        message=document.getElementById('camera-capacity-message'),
+        link=document.getElementById('camera-capacity-link'),
+        add=document.getElementById('add-camera-button');
+  function sitePath(value){return typeof value==='string'&&/^\\/(?!\\/)[A-Za-z0-9\\-_/?=&.%]*$/.test(value)?value:'';}
+  function render(capacity){
+    if(!capacity||typeof capacity!=='object')return;
+    const usable=Number(capacity.usable)||0,inUse=Number(capacity.in_use)||0,pending=Number(capacity.pending)||0,available=Number(capacity.available)||0;
+    text.textContent=`${inUse} of ${usable} camera${usable===1?'':'s'} in use`+(pending?` · ${pending} being added`:'')+` · ${available} available`;
+    const manage=capacity.can_manage===true;
+    add.hidden=!(manage&&capacity.can_add_camera===true);
+    const refusal=capacity.can_add_camera===true?'':String(capacity.message||'');
+    message.textContent=refusal;
+    message.hidden=!refusal;
+    const target=sitePath(capacity.action_url);
+    link.hidden=!(refusal&&target);
+    if(target)link.setAttribute('href',target);
+    document.querySelectorAll('.remove-camera').forEach(button=>{button.hidden=!manage;});
+    bar.hidden=false;
+  }
+  fetch('/api/customer/cameras',{headers:{'Accept':'application/json'}})
+    .then(response=>response.ok?response.json():null)
+    .then(body=>{if(body&&body.camera_capacity)render(body.camera_capacity);})
+    .catch(()=>{});
+  document.querySelectorAll('.remove-camera').forEach(button=>{
+    button.addEventListener('click',async event=>{
+      event.preventDefault();event.stopPropagation();
+      const name=button.dataset.cameraName||'this camera';
+      const ok=window.confirm(`Remove ${name} from your cameras?\\n\\n`+
+        'AnyAiCam stops recording it within about a minute, its place on your plan becomes free, and the appliance forgets the camera and its saved password. '+
+        'Its recordings, events and clips are kept. If you add this camera again later, it starts as a new camera.');
+      if(!ok)return;
+      button.disabled=true;
+      try{
+        const response=await fetch(`/api/customer/cameras/${encodeURIComponent(button.dataset.cameraId)}`,{method:'DELETE'});
+        let body={};try{body=await response.json();}catch(e){}
+        if(!response.ok){button.disabled=false;showToast(String(body.detail||'The camera could not be removed.'));return;}
+        showToast(String(body.message||'Camera removed.'));
+        setTimeout(()=>window.location.reload(),900);
+      }catch(e){button.disabled=false;showToast('The camera could not be removed. Check your connection and try again.');}
+    });
+  });
+})();
+"""
+
 _UNLOCK_DOOR_JS = """
 function wireUnlockButton(button, cameraId) {
   button.addEventListener('click', async (event) => {
@@ -1579,6 +1636,21 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
         columns = 1 if len(cameras) == 1 else 2 if len(cameras) <= 4 else 3 if len(cameras) <= 9 else 4
         camera_ids = [camera['id'] for camera in cameras]
+        is_owner = identity.get('role') == 'customer_owner'
+        # Add camera: the existing discovery step of setup, for this
+        # appliance when the page shows one (or the account has only one).
+        shown_appliances = list(dict.fromkeys(c['appliance_id'] for c in cameras if c.get('appliance_id')))
+        add_appliance = appliance_id or (shown_appliances[0] if len(shown_appliances) == 1 else '')
+        add_href = '/customer/setup?step=4' + (f'&appliance={quote(add_appliance, safe="")}' if add_appliance else '')
+        manage_bar = (
+            '<section class="camera-manage panel" id="camera-manage" hidden aria-live="polite">'
+            '<div class="camera-manage-text"><strong id="camera-capacity-text"></strong>'
+            '<p class="camera-capacity-message" id="camera-capacity-message" hidden></p></div>'
+            '<div class="camera-manage-actions">'
+            '<a class="ghost-button" id="camera-capacity-link" href="/subscription-portal" hidden>My subscription</a>'
+            f'<a class="action-button" id="add-camera-button" href="{escape(add_href, quote=True)}" hidden>Add camera</a>'
+            '</div></section>'
+        ) if is_owner else ''
 
         def _tile(camera: dict) -> str:
             # Unlock Door only ever appears here for a camera the account
@@ -1593,6 +1665,15 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 f' data-camera-id="{escape(camera["id"], quote=True)}"'
                 f' title="Unlock door" aria-label="Unlock door">🔓</button>'
                 if camera.get('door_enabled') else ''
+            )
+            # Remove (owners only; revealed by _CAMERA_MANAGE_JS once the
+            # cloud confirms can_manage).
+            remove_button = (
+                f'<button class="camera-tool remove-camera" hidden'
+                f' data-camera-id="{escape(camera["id"], quote=True)}"'
+                f' data-camera-name="{escape(_camera_display_label(camera), quote=True)}"'
+                f' title="Remove camera" aria-label="Remove {escape(_camera_display_label(camera), quote=True)}">🗑</button>'
+                if is_owner else ''
             )
             offline = bool(camera.get('known_offline'))
             return f'''<article class="live-grid-tile{' tile-offline' if offline else ''}" data-camera-id="{escape(camera['id'], quote=True)}"{' data-offline="1"' if offline else ''}>
@@ -1612,6 +1693,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                     title="Camera tools (mute, snapshot, fullscreen, playback, analytics, stop)"
                     aria-label="Open camera tools">⚙</a>
                   {unlock_button}
+                  {remove_button}
                 </div>
               </div>
             </article>'''
@@ -1679,7 +1761,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             # streaming -- see that same script's own comment.
             f'.aaco-highlight{{outline:3px solid var(--brand,#42e4dc);outline-offset:-3px;transition:outline-color .3s ease}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
+            f'.camera-manage{{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;margin:0 0 16px;padding:12px 16px}}'
+            f'.camera-manage-actions{{display:flex;flex-wrap:wrap;gap:8px}}'
+            f'.camera-capacity-message{{margin:4px 0 0;max-width:62ch}}'
+            f'.remove-camera:disabled{{opacity:.4;cursor:not-allowed}}'
             f'</style>'
+            f'{manage_bar}'
             f'<section class="live-grid">{tiles}</section>'
         )
 
@@ -1954,6 +2041,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 }})();
 </script>'''
 
+        if is_owner:
+            scripts += f'<script>{_CAMERA_MANAGE_JS}</script>'
         return page_shell('Live view', 'live', content, scripts)
 
     def _require_customer_owner(request: Request) -> dict:

@@ -248,6 +248,38 @@ class CameraBindingStore:
         atomic_write_json(self.path, {'version': 1, 'bindings': retained})
         return binding
 
+    def forget(self, cloud_camera_ids) -> int:
+        """Drops the bindings of cameras the customer removed (2026-10-08):
+        a removed camera must stop holding its physical camera and local
+        number, or the same device could never be bound again when it is
+        re-added (bind() refuses a device still bound to a camera that is in
+        the configuration -- removed cameras stay there with status
+        'removed'). Returns how many were dropped; idempotent."""
+        ids = {str(item).strip() for item in cloud_camera_ids if str(item).strip()}
+        current = self.bindings()
+        kept = [item for item in current if item.get('cloud_camera_id') not in ids]
+        if len(kept) != len(current):
+            atomic_write_json(self.path, {'version': 1, 'bindings': kept})
+        return len(current) - len(kept)
+
+
+def split_removed_cameras(cloud_cameras: list) -> tuple[list[dict], list[str]]:
+    """(active cameras, ids of removed cameras) from the configuration's
+    camera list. A removed camera (status 'removed', no device_key and no
+    camera_number) is never bound, resolved, reported or counted as a valid
+    camera of this appliance."""
+    active, removed = [], []
+    for camera in cloud_cameras or []:
+        if not isinstance(camera, dict):
+            continue
+        if str(camera.get('status') or '').strip().lower() == 'removed':
+            camera_id = str(camera.get('id') or '').strip()
+            if camera_id:
+                removed.append(camera_id)
+            continue
+        active.append(camera)
+    return active, removed
+
 
 def auto_bind_discovered_cameras(cloud_cameras: list[dict], discovered_cameras: list[dict],
                                   binding_store: 'CameraBindingStore') -> list[str]:

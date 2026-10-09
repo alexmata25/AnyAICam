@@ -289,6 +289,24 @@ def _reconcile_aac_voice_call(db, appliance_id: str, cloud_config: dict, now: st
     return {"entrance_cameras": len(wanted_cameras), "site_greetings": len(wanted_sites)}
 
 
+def _forget_removed_camera(db, camera_id: str, former_device_key) -> None:
+    """A camera the customer removed (2026-10-08, DELETE /api/customer/
+    cameras/{id}): its stored camera credentials are deleted -- with SQLite
+    secure_delete on, so the freed pages are overwritten rather than left in
+    the database file -- including any credential still waiting for that
+    device. Its recordings, events and clips are kept; it stops running
+    because it no longer has a camera_number. Idempotent: called once, when
+    the local row first becomes removed."""
+    try:
+        db.execute("PRAGMA secure_delete=ON")
+    except Exception:
+        pass  # not SQLite: the rows are still deleted
+    db.execute("DELETE FROM camera_credentials WHERE camera_id=?", (camera_id,))
+    if former_device_key:
+        db.execute("DELETE FROM pending_camera_credentials WHERE device_key=?", (former_device_key,))
+    logger.info("edge_camera_sync.camera_removed camera_id=%s credentials_deleted=1", camera_id)
+
+
 def sync_provisioned_cameras() -> dict:
     """One reconciliation pass. Safe to call repeatedly (idempotent) and
     safe to call after any restart (reads only durable local/cloud
@@ -437,6 +455,15 @@ def sync_provisioned_cameras() -> dict:
                 continue
             camera_number = item.get("camera_number")
             device_key = item.get("device_key")
+            # Removed by the customer (2026-10-08): the cloud sends the camera
+            # with status "removed" and no device_key/camera_number. The local
+            # row read here, before the upsert below overwrites it, still has
+            # the former device_key -- needed to forget its credentials.
+            removed_now, former_device_key = False, None
+            if str(item.get("status") or "").strip().lower() == "removed":
+                previous = db.execute("SELECT status, device_key FROM cameras WHERE id=?", (camera_id,)).fetchone()
+                if previous is not None and str(previous["status"] or "").strip().lower() != "removed":
+                    removed_now, former_device_key = True, previous["device_key"]
             talk_down = item.get("talk_down")
             talk_down_supported = None
             talk_down_metadata = None
@@ -496,6 +523,8 @@ def sync_provisioned_cameras() -> dict:
                 db.execute("UPDATE cameras SET door_feedback_enabled=? WHERE id=?",
                            (1 if item.get("door_feedback_enabled") else 0, camera_id))
             synced += 1
+            if removed_now:
+                _forget_removed_camera(db, camera_id, former_device_key)
 
             if not device_key:
                 continue

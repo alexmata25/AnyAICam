@@ -13,7 +13,7 @@ from .commands import execute
 from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
                              LocalVmsStatusReader,atomic_write_json,
                              auto_bind_discovered_cameras,
-                             reconcile_cloud_cameras,redact_discovery_for_cloud)
+                             reconcile_cloud_cameras,redact_discovery_for_cloud,split_removed_cameras)
 from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential
 from .headless_claim import HeadlessClaim, ineligibility as headless_ineligibility
 from .link_server import DEFAULT_PORT as LINK_DEFAULT_PORT, LinkServer
@@ -475,7 +475,12 @@ class ApplianceAgent:
     def sync_configuration(self):
         try:
             configuration=self.client.request('GET','/api/appliance/configuration')
-            cloud_cameras=configuration.get('cameras',[])
+            # Cameras the customer removed (2026-10-08): forget their
+            # bindings and leave them out of everything below.
+            cloud_cameras,removed_camera_ids=split_removed_cameras(configuration.get('cameras',[]))
+            if removed_camera_ids:
+                forgotten=self.binding_store.forget(removed_camera_ids)
+                if forgotten: self.log.info('Forgot %s removed camera binding(s)',forgotten)
             # Closes the camera_not_bound gap for any camera the cloud has
             # just assigned a relay slot to: matches it against this
             # appliance's own already-discovered cameras by device_key

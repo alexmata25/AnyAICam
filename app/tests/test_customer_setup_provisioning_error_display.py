@@ -84,7 +84,7 @@ def test_provisioning_failure_shows_a_persistent_error_not_only_a_toast(http_cli
     persistent #scan-message status line."""
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     body = response.text
-    assert "function showProvisioningError(message)" in body
+    assert "function showProvisioningError(message,code)" in body  # code: camera-capacity refusals link to My subscription (2026-10-08)
     assert "document.getElementById('scan-message')" in body
     assert "showProvisioningError(r.detail||" in body
 
@@ -116,7 +116,7 @@ def test_provisioning_error_message_never_carries_credential_fields(http_client,
     expected_statement = (
         "if(!response.ok){button.disabled=false;button.textContent='Add this camera';"
         "return showProvisioningError(r.detail||`The camera could not be added "
-        "(error ${response.status}). Try again or contact support.`)}"
+        "(error ${response.status}). Try again or contact support.`,r.code)}"
     )
     assert "username" not in expected_statement
     assert "password" not in expected_statement
