@@ -20,7 +20,7 @@ from partner_db import audit, authorize_appliance_tenant, connection, password_h
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
-from event_media_policy import allows_event_media
+from event_media_policy import allows_event_media, effective_cloud_recording_mode
 import product_mode
 import runtime_paths
 
@@ -278,6 +278,22 @@ def _fanout_detection_event(camera: dict,camera_id: str,event_id: str,local_even
         logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
         return False
     return True
+
+
+def _effective_camera_mode(customer_id,explicit,cache: dict | None = None) -> str:
+    """The camera's cloud_recording_mode as the edge and the media routes
+    must see it. 2026-10-10: a camera added by a paying Hybrid customer
+    used to stay NULL until an administrator set 'motion' by hand, so its
+    event media was refused end to end (edge camera_ineligible, this
+    module's 403s) and the edge treated NULL as continuous upload. An
+    explicit column value still wins; NULL now follows the customer's
+    paid plan (see effective_cloud_recording_mode())."""
+    key=(str(customer_id or ''),explicit)
+    if cache is not None and key in cache: return cache[key]
+    with connection() as db:
+        mode=effective_cloud_recording_mode(db,key[0],explicit)
+    if cache is not None: cache[key]=mode
+    return mode
 
 
 def _authorized_camera(appliance: dict,camera_id: str) -> dict:
@@ -774,6 +790,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             except (TypeError,ValueError):
                 rule_item['geometry']=[]
             rule_item['notifications_enabled']=bool(rule_item.get('notifications_enabled',1))
+        _modes: dict={}
+        for item in camera_items:
+            item['recording_mode']=_effective_camera_mode(appliance.get('customer_id'),item.get('recording_mode'),_modes)
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)
@@ -1104,6 +1123,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if RECORDING_UPLOAD_ENABLED or camera['id'] in RECORDING_UPLOAD_PILOT_CAMERAS:
             policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         else:
+            # Event-media-only credentials go only to a camera whose plan
+            # includes cloud event protection: no S3 write for a Local (or
+            # cancelled) plan, so nothing is uploaded that the catalog would
+            # refuse and the retention sweep would never see.
+            if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
+                raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
             policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         session_name=recording_session_name(appliance['id'],camera_id)
         try:
@@ -1117,6 +1142,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         return {
             'status':'accepted',
             'bucket':RECORDING_S3_BUCKET,
+            # The edge has no other source for the bucket's region (the
+            # installer never writes AWS_REGION); see recording_uploader.session_region().
+            'region':RECORDING_AWS_REGION,
             'key_prefix':recording_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id),
             'credentials':{
                 'access_key_id':issued['AccessKeyId'],
@@ -1495,7 +1523,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
 
         camera=_authorized_camera(appliance,camera_id)
-        if camera.get('cloud_recording_mode') != 'motion':
+        if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
         safe=sanitize_appliance_payload(payload)
 
@@ -1659,7 +1687,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
 
         camera=_authorized_camera(appliance,camera_id)
-        if camera.get('cloud_recording_mode') != 'motion':
+        if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
         safe=sanitize_appliance_payload(payload)
 

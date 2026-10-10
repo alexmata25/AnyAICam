@@ -501,6 +501,9 @@ def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
         "bucket": response["bucket"],
         "key_prefix": response["key_prefix"],
         "expires_at": expiration,
+        # 2026-10-10: the cloud now names the bucket's region; a fresh
+        # install never had AWS_REGION in its environment.
+        "region": response["region"].strip() if isinstance(response.get("region"), str) and response["region"].strip() else None,
     }
     _sessions[camera_number] = session
     # A freshly (re-)issued session invalidates whatever S3 client was
@@ -508,6 +511,12 @@ def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
     # baked in at construction time. _ensure_client() rebuilds on demand.
     _clients.pop(camera_number, None)
     return session
+
+
+def session_region(session: dict) -> str:
+    """The S3 region for a credential session: the one the cloud named in
+    its credential response, else this appliance's AWS_REGION env."""
+    return (session.get("region") or AWS_REGION or "").strip()
 
 
 def _ensure_client(camera_number: int, session: dict):
@@ -522,7 +531,8 @@ def _ensure_client(camera_number: int, session: dict):
         return client
     if boto3 is None:
         return None
-    if not AWS_REGION:
+    region = session_region(session)
+    if not region:
         # Confirmed live twice now (Phase C's real-hardware validation,
         # then independently again in live_relay_uploader.py): an empty
         # AWS_REGION/AWS_DEFAULT_REGION silently builds
@@ -543,7 +553,7 @@ def _ensure_client(camera_number: int, session: dict):
     creds = session["credentials"]
     client = boto3.client(
         "s3",
-        region_name=AWS_REGION,
+        region_name=region,
         aws_access_key_id=creds["access_key_id"],
         aws_secret_access_key=creds["secret_access_key"],
         aws_session_token=creds["session_token"],

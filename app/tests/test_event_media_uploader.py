@@ -81,6 +81,7 @@ def _wire_happy_path(monkeypatch, identity, fake_s3, media_status="accepted"):
         "bucket": "fake-bucket",
         "key_prefix": "cust-1/site-1/appl-1/cam-1/",
         "expires_at": "2026-09-10T12:00:00+00:00",
+        "region": "us-east-1",
     }
     ensure_session_calls = []
     monkeypatch.setattr(recording_upload, "_ensure_session", lambda cam, cam_id: (ensure_session_calls.append((cam, cam_id)), session)[1])
@@ -482,3 +483,25 @@ def test_stale_skipped_jobs_drain_and_no_longer_block_real_retries(monkeypatch, 
 
     assert outbox.load() == []
     assert [item["key"].rsplit(".", 1)[-1] for item in fake_s3.uploaded] == ["mp4"]
+
+
+def test_the_region_named_by_the_cloud_is_used_when_the_appliance_env_has_none(monkeypatch):
+    """A fresh install never had AWS_REGION; the Samsung appliance refused
+    every S3 client until it was added by hand."""
+    monkeypatch.setattr(recording_upload, "AWS_REGION", "")
+    assert recording_upload.session_region({"region": "us-east-1"}) == "us-east-1"
+    monkeypatch.setattr(recording_upload, "AWS_REGION", "us-west-2")
+    assert recording_upload.session_region({"region": None}) == "us-west-2"
+    assert recording_upload.session_region({"region": "us-east-1"}) == "us-east-1"
+
+
+def test_no_region_anywhere_refuses_before_building_an_s3_client(monkeypatch, fake_s3, _local_files, caplog):
+    calls = _wire_happy_path(monkeypatch, _eligible_identity(cloud_recording_mode="motion"), fake_s3)
+    session = recording_upload._ensure_session(1, "cam-1")
+    session.pop("region")
+    monkeypatch.setattr(recording_upload, "AWS_REGION", "")
+    with caplog.at_level("WARNING"):
+        assert _call() is False
+    assert fake_s3.uploaded == []
+    assert not [c for c in calls["control_plane_calls"] if c[0].endswith("/media")]
+    assert "event_media.region_unavailable" in caplog.text

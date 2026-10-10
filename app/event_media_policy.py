@@ -146,6 +146,21 @@ def daily_seconds_used(db, camera_id: str, event_at: datetime) -> float:
 _MAX_SINGLE_CLIP_SECONDS = 3600
 
 
+CLOUD_RECORDING_MODES = ("motion", "continuous", "disabled")
+
+
+def effective_cloud_recording_mode(db, customer_id: str, explicit) -> str:
+    """An explicit per-camera cloud_recording_mode (set by an administrator)
+    always wins. A camera nobody configured follows the customer's paid
+    plan: 'motion' (event clips and thumbnails to the cloud) when the plan
+    includes cloud event protection (motion_event_policy()), otherwise
+    'disabled'. Never 'continuous' by default: continuous cloud recording
+    is not sold and is only ever an explicit choice."""
+    if explicit in CLOUD_RECORDING_MODES:
+        return explicit
+    return "motion" if customer_id and motion_event_policy(db, customer_id) else "disabled"
+
+
 def allows_event_media(db, customer_id: str, camera_id: str, event_at: datetime, duration_seconds: float) -> tuple[bool, str]:
     policy = motion_event_policy(db, customer_id)
     if not policy:

@@ -383,11 +383,18 @@ def upload_motion_event_media(
         )
         return False
 
+    region = recording_upload.session_region(session)
+    if not region:
+        # Same refusal as recording_uploader._ensure_client(): an empty
+        # region builds https://s3..amazonaws.com and fails obscurely.
+        logger.warning("event_media.region_unavailable event_id=%s camera=%s", event_id, camera_number)
+        return False
+
     creds = session["credentials"]
 
     client = recording_upload.boto3.client(
         "s3",
-        region_name=recording_upload.AWS_REGION,
+        region_name=region,
         aws_access_key_id=creds["access_key_id"],
         aws_secret_access_key=creds["secret_access_key"],
         aws_session_token=creds["session_token"],

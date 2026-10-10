@@ -39,6 +39,16 @@ def _seed(db, appliance_id, cloud_id, credential, camera_id, camera_site_id="sit
     db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,created_at) VALUES(?,?,?,?,?,?,?)", (camera_id, "cust-1", camera_site_id, appliance_id, "Camera 1", 1, now))
 
 
+def _grant_v2_plan(db, customer_id="cust-1", plan_key="hybrid", status="active"):
+    cloud = 1 if plan_key == "hybrid" else 0
+    db.execute(
+        "INSERT INTO camera_plan_entitlements_v2(id,customer_id,plan_key,camera_quantity,stripe_customer_id,stripe_subscription_id,"
+        "stripe_subscription_item_id,stripe_price_id,status,stripe_status,local_retention_days,cloud_event_storage,"
+        "cloud_event_retention_days,created_at,updated_at) VALUES(?,?,?,2,'cus_t','sub_t','si_t','price_t',?,'active',7,?,?,"
+        "'2026-10-10','2026-10-10')",
+        (f"v2-{customer_id}", customer_id, plan_key, status, cloud, 14 if cloud else None))
+
+
 def _appliance_auth_headers(appliance_id: str, credential: str) -> dict:
     return {
         "X-Appliance-Id": appliance_id,
@@ -219,7 +229,10 @@ def test_configuration_route_exposes_recording_mode_field(client, db_path):
     assert cameras[0]["recording_mode"] == "motion"
 
 
-def test_configuration_route_reports_null_when_unset(client, db_path):
+def test_configuration_route_reports_disabled_when_unset_and_no_cloud_plan(client, db_path):
+    """2026-10-10: an unset mode is no longer reported as null (which the
+    edge treated as continuous upload); without a plan that includes cloud
+    event protection it is 'disabled'."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -227,4 +240,43 @@ def test_configuration_route_reports_null_when_unset(client, db_path):
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
 
     assert response.status_code == 200
-    assert response.json()["cameras"][0]["recording_mode"] is None
+    assert response.json()["cameras"][0]["recording_mode"] == "disabled"
+
+
+@pytest.mark.parametrize("plan_key,expected", [("hybrid", "motion"), ("ai_local", "disabled"), ("basic_local", "disabled")])
+def test_configuration_route_derives_an_unset_mode_from_the_paid_plan(client, db_path, plan_key, expected):
+    """A new paying customer's camera works without an administrator: the
+    Samsung Mobile Demo (Hybrid, NULL mode) had every event refused."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _grant_v2_plan(db, plan_key=plan_key)
+
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    assert response.status_code == 200
+    assert response.json()["cameras"][0]["recording_mode"] == expected
+
+
+@pytest.mark.parametrize("explicit", ["disabled", "continuous", "motion"])
+def test_an_explicit_mode_still_wins_over_the_plan(client, db_path, explicit):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _grant_v2_plan(db, plan_key="hybrid")
+            db.execute("UPDATE cameras SET cloud_recording_mode=? WHERE id='cam-1'", (explicit,))
+
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    assert response.json()["cameras"][0]["recording_mode"] == explicit
+
+
+def test_a_suspended_hybrid_plan_does_not_enable_cloud_event_media(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _grant_v2_plan(db, plan_key="hybrid", status="suspended")
+
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    assert response.json()["cameras"][0]["recording_mode"] == "disabled"

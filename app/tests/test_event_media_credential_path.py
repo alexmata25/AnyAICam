@@ -36,7 +36,8 @@ with override_target(sqlite_path="/tmp/test_event_media_credential_path.db"):
 
 
 def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
-          device_key="urn:uuid:fake", customer_id="cust-1", site_id="site-1", other_appliance=False):
+          device_key="urn:uuid:fake", customer_id="cust-1", site_id="site-1", other_appliance=False,
+          cloud_recording_mode="motion"):
     now = "2026-09-13T00:00:00"
     db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-1','Test Partner','approved','real',?)", (now,))
     db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -47,9 +48,9 @@ def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)",
                (f"cred-{appliance_id}", appliance_id, password_hash(credential), now))
     db.execute(
-        "INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,device_key,status,name,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
-        (camera_id, customer_id, site_id, appliance_id, camera_number, device_key, "configured", "Camera 1", now),
+        "INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,device_key,status,name,created_at,cloud_recording_mode) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (camera_id, customer_id, site_id, appliance_id, camera_number, device_key, "configured", "Camera 1", now, cloud_recording_mode),
     )
     if other_appliance:
         db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-other',?,?,?,?)",
@@ -249,8 +250,8 @@ def test_event_media_credential_cannot_write_to_a_different_camera(client, db_pa
         with connection() as db:
             _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1")
             db.execute(
-                "INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,device_key,status,name,created_at) "
-                "VALUES('cam-2','cust-1','site-1','appl-1',2,'urn:uuid:fake2','configured','Camera 2','2026-09-13T00:00:00')"
+                "INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,device_key,status,name,created_at,cloud_recording_mode) "
+                "VALUES('cam-2','cust-1','site-1','appl-1',2,'urn:uuid:fake2','configured','Camera 2','2026-09-13T00:00:00','motion')"
             )
 
     resource_1 = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
@@ -453,3 +454,56 @@ def test_bulk_recording_globally_enabled_behavior_is_unchanged_regardless_of_pil
 
     resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
     assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
+
+
+def _grant_v2_plan(db, customer_id="cust-1", plan_key="hybrid", status="active"):
+    cloud = 1 if plan_key == "hybrid" else 0
+    db.execute(
+        "INSERT INTO camera_plan_entitlements_v2(id,customer_id,plan_key,camera_quantity,stripe_customer_id,stripe_subscription_id,"
+        "stripe_subscription_item_id,stripe_price_id,status,stripe_status,local_retention_days,cloud_event_storage,"
+        "cloud_event_retention_days,created_at,updated_at) VALUES(?,?,?,2,'cus_t','sub_t','si_t','price_t',?,'active',7,?,?,"
+        "'2026-10-10','2026-10-10')",
+        (f"v2-{customer_id}", customer_id, plan_key, status, cloud, 14 if cloud else None))
+
+
+def test_unset_mode_on_a_hybrid_plan_gets_event_media_credentials_with_the_region(client, db_path, monkeypatch):
+    """New-customer path: no administrator ever set the camera's mode."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True)
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode=None)
+            _grant_v2_plan(db, plan_key="hybrid")
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
+
+    assert response.status_code == 200
+    assert response.json()["region"] == appliance_cloud.RECORDING_AWS_REGION
+
+
+@pytest.mark.parametrize("plan_key", [None, "basic_local", "ai_local"])
+def test_unset_mode_without_cloud_event_protection_gets_no_s3_credential(client, db_path, monkeypatch, plan_key):
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True)
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode=None)
+            if plan_key:
+                _grant_v2_plan(db, plan_key=plan_key)
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
+
+    assert response.status_code == 403
+
+
+def test_an_explicitly_disabled_camera_gets_no_event_media_credential_even_on_hybrid(client, db_path, monkeypatch):
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True)
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode="disabled")
+            _grant_v2_plan(db, plan_key="hybrid")
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
+
+    assert response.status_code == 403
