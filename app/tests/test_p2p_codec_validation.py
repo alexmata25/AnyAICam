@@ -180,12 +180,43 @@ def test_sync_replaces_a_path_when_an_expired_decision_changes(selection, monkey
 
 def test_transcoding_is_limited_per_appliance(selection, monkeypatch, caplog):
     monkeypatch.setattr(wp, "P2P_TRANSCODE_MAX_CAMERAS", 1)
+    monkeypatch.setattr(wp, "_camera_map", {"cam-a": 1, "cam-b": 2})
     selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}
     assert wp.p2p_source_for("cam-a", MAIN)[1] == "transcode"
     with caplog.at_level(logging.INFO, logger=LOGGER):
         assert wp.p2p_source_for("cam-b", MAIN) == (MAIN, "main")  # over budget: warn-only
     assert "p2p_transcode_limit_reached camera_id=cam-b max=1" in caplog.text
     assert selection["saved"][-1]["webrtc"]["compatible"] is False
+
+
+def test_stale_or_removed_cameras_do_not_consume_the_transcode_budget(selection, monkeypatch):
+    monkeypatch.setattr(wp, "P2P_TRANSCODE_MAX_CAMERAS", 1)
+    monkeypatch.setattr(wp, "_camera_map", {"cam-b": 2})  # cam-gone is no longer configured
+    wp._p2p_source_choice["cam-gone"] = (MAIN, SUB, "transcode", 1e18)  # removed camera, never expires
+    wp._p2p_source_choice["cam-old"] = (MAIN, SUB, "transcode")                     # expired/old format
+    selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}
+    assert wp.p2p_source_for("cam-b", MAIN) == (SUB, "transcode")
+
+
+def test_removing_a_path_evicts_its_cached_decision(selection, monkeypatch):
+    monkeypatch.setattr(wp, "_config_request", lambda method, path, payload=None: (200, "ok"))
+    monkeypatch.setattr(wp, "_camera_map", {})
+    monkeypatch.setattr(wp, "_known_paths", {"cam-x"})
+    monkeypatch.setattr(wp, "_path_add_retries", {})
+    wp._p2p_source_choice["cam-x"] = (MAIN, SUB, "transcode", 0.0)
+    wp.sync_camera_paths(lambda n: MAIN)
+    assert "cam-x" not in wp._p2p_source_choice
+
+
+@pytest.mark.parametrize("text", ["at 15:20:01 UTC", "mac aa:bb:cc:dd:ee:ff", "ratio 16:9", "codecs not supported by client"])
+def test_ipv6_redaction_leaves_ordinary_text_alone(monkeypatch, caplog, text):
+    def reject(request, timeout=0):
+        raise _http_error(('{"error":"' + text + '"}').encode())
+    monkeypatch.setattr(wp.urllib.request, "urlopen", reject)
+    monkeypatch.setattr(wp, "_codec_revalidated_at", {"cam-x": float("inf")})
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        wp.whep_offer("cam-x", "v=0")
+    assert text in caplog.text
 
 
 def test_records_carry_the_camera_lifecycle_field_names(selection, monkeypatch):

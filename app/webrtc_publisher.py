@@ -857,8 +857,13 @@ def _choice_expired(cached) -> bool:
 
 
 def _transcode_budget_allows(camera_id: str) -> bool:
+    """Counts other cameras currently configured for transcoding: only
+    unexpired decisions of cameras still in the camera map consume budget."""
+    with _lock:
+        known = set(_camera_map)
     others = sum(1 for cid, entry in _p2p_source_choice.items()
-                 if cid != camera_id and len(entry) > 2 and entry[2] == "transcode")
+                 if cid != camera_id and cid in known and len(entry) > 2 and entry[2] == "transcode"
+                 and not _choice_expired(entry))
     return others < P2P_TRANSCODE_MAX_CAMERAS
 
 
@@ -919,6 +924,7 @@ def sync_camera_paths(camera_url_fn) -> None:
         status, _ = _config_request("DELETE", f"/v3/config/paths/delete/{camera_id}")
         if status in (200, 404):
             _known_paths.discard(camera_id)
+            _p2p_source_choice.pop(camera_id, None)
         else:
             logger.warning("webrtc_publisher.path_delete_failed camera_id=%s status=%s", camera_id, status)
 
@@ -1005,8 +1011,9 @@ def _whep_error_reason(error) -> str:
     body = re.sub(r"candidate:[^\r\n\"]*?\btyp\s+\S+", "candidate:<redacted>", body)
     body = re.sub(r"candidate:\S+", "candidate:<redacted>", body)
     body = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", body)
-    body = re.sub(r"\[?\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[\w.-]+)?\]?|\[?(?:[0-9A-Fa-f]{1,4})?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:%[\w.-]+)?\]?",
-                  "<ip>", body)
+    body = re.sub(r"\[?(?<![0-9A-Fa-f:])(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+                  r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)"
+                  r"(?:%[\w.-]+)?(?![0-9A-Fa-f:])\]?", "<ip>", body)
     body = re.sub(r"v=0.*", "<sdp-redacted>", body, flags=re.DOTALL)
     return " ".join(body.split())[:200] or "empty"
 
