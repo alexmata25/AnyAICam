@@ -108,6 +108,24 @@ def test_live_view_connects_exactly_the_rendered_cameras(signed_in_customer, pla
         browser.close()
 
 
+@browser_only
+def test_customer_analytics_settings_header_fits_a_phone_viewport(signed_in_customer, playwright_instance):
+    """The settings header has two actions; keep both inside a 390px phone
+    viewport instead of letting the portal link widen the document."""
+    browser = _launch(playwright_instance, "chromium", None)
+    try:
+        page, errors = _signed_in_page(browser, signed_in_customer["origin"], "phone")
+        page.goto(f"{signed_in_customer['origin']}/customer-app-settings")
+        page.wait_for_load_state("load")
+        assert _no_horizontal_overflow(page), page.evaluate(
+            "() => ({document: document.documentElement.scrollWidth, viewport: innerWidth})"
+        )
+        assert page.locator(".customer-app-settings-header > .ghost-button").count() == 2
+        assert not errors, errors
+    finally:
+        browser.close()
+
+
 # ------------------------------------------------ server-rendered (always)
 
 

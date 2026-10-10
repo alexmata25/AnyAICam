@@ -228,8 +228,11 @@ def register_customer_platform_routes(
             'No cameras are set up on your account yet. Once a camera is added, its analytics and alerts can be configured here.</div>'
         )
         content = f'''
-        <style>#camera-select,#camera-name-input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}</style>
-        <header class="topbar">
+        <style>
+          #camera-select,#camera-name-input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}
+          @media(max-width:760px){{.customer-app-settings-header{{flex-direction:column;align-items:flex-start;gap:12px}}.customer-app-settings-header>.ghost-button{{max-width:100%;white-space:normal}}}}
+        </style>
+        <header class="topbar customer-app-settings-header">
           <div><p class="eyebrow">Settings</p><h1>Camera analytics and alerts</h1></div>
           <a class="ghost-button" href="/settings/notifications">Notification settings</a>
           <a class="ghost-button" href="/customer-portal">Back to customer portal</a>
