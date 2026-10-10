@@ -743,6 +743,8 @@ def test_stream_codec_metadata_keeps_advertised_and_observed_values_separate(db_
     appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
     appliance_submit_media_profiles = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-profiles", "POST")
     appliance_configuration = _route("/api/appliance/configuration", "GET")
+    audit_calls = []
+    monkeypatch.setattr("appliance_cloud.audit", lambda *args, **kwargs: audit_calls.append((args, kwargs)))
     with override_target(sqlite_path=db_path):
         initialize_database()
         conn = sqlite3.connect(db_path)
@@ -763,7 +765,8 @@ def test_stream_codec_metadata_keeps_advertised_and_observed_values_separate(db_
             "SELECT profile_token,stream_role,rtsp_uri,advertised_codec,observed_codec FROM camera_stream_profiles WHERE camera_id=? ORDER BY profile_token",
             (camera_id,),
         ).fetchall()
-        configured = appliance_configuration(_fake_request(_appliance_auth_headers()))["cameras"][0]
+        configuration = appliance_configuration(_fake_request(_appliance_auth_headers()))
+        configured = configuration["cameras"][0]
     assert result["stored"] == 2
     assert stored == [
         ("main", "main", "rtsp://192.0.2.10/main", "h264", "h265"),
@@ -771,6 +774,15 @@ def test_stream_codec_metadata_keeps_advertised_and_observed_values_separate(db_
     ]
     assert configured["browser_profile_token"] is None
     assert configured["codec_compatibility_warning"]
+    # Stream URIs stay server-side even when an appliance submits a URI
+    # containing userinfo. The configuration response and audit event expose
+    # codec metadata only, never the URI or camera credentials.
+    public_payload = json.dumps({"result": result, "configuration": configuration, "audit": audit_calls})
+    assert "rtsp_uri" not in configured["stream_profiles"][0]
+    assert configuration["camera_credentials_included"] is False
+    assert "admin" not in public_payload
+    assert "secret" not in public_payload
+
 
 
 def test_stream_metadata_rejects_wrong_device_identity_and_duplicate_profiles(db_path, monkeypatch):
