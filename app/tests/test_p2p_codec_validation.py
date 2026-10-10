@@ -130,10 +130,73 @@ def test_both_streams_are_probed_and_recorded(selection, monkeypatch):
     assert _stream(selection["saved"][-1], "main")["observed_codec"] == "h265"
 
 
-def test_main_preference_probes_nothing(selection):
+def test_main_preference_checks_only_the_main_stream(selection):
     wp.P2P_STREAM_PREFERENCE = "main"
+    selection["codecs"] = {MAIN: "h264", SUB: "h264"}
     assert wp.p2p_source_for("cam-x", MAIN) == (MAIN, "main")
-    assert selection["probes"] == []
+    assert selection["probes"] == [MAIN]
+
+
+def test_main_preference_with_an_h265_main_stream_is_transcoded(selection):
+    # Codex review (2026-10-10, high): ANYAICAM_LIVE_P2P_STREAM=main must not bypass the codec check.
+    wp.P2P_STREAM_PREFERENCE = "main"
+    selection["codecs"] = {MAIN: "hevc"}
+    assert wp.p2p_source_for("cam-x", MAIN) == (MAIN, "transcode")
+
+
+def test_a_cached_choice_is_rechecked_after_the_recheck_interval(selection, monkeypatch):
+    selection["codecs"] = {SUB: "h264", MAIN: "h264"}
+    assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "substream")
+    probes = len(selection["probes"])
+    monkeypatch.setattr(wp, "P2P_SOURCE_RECHECK_SECONDS", 0.0)
+    selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}  # camera reconfigured, same main URL
+    assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "transcode")
+    assert len(selection["probes"]) > probes
+
+
+def test_an_old_format_cache_entry_is_rechecked(selection):
+    wp._p2p_source_choice["cam-x"] = (MAIN, SUB)  # pre-2026-10-10 tuple, no kind/timestamp
+    selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}
+    assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "transcode")
+
+
+def test_sync_replaces_a_path_when_an_expired_decision_changes(selection, monkeypatch):
+    calls = []
+    monkeypatch.setattr(wp, "_config_request", lambda method, path, payload=None: calls.append((method, path, payload)) or (200, "ok"))
+    monkeypatch.setattr(wp, "_camera_map", {"cam-x": 1})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    monkeypatch.setattr(wp, "_path_add_retries", {})
+    selection["codecs"] = {SUB: "h264", MAIN: "h264"}
+    wp.sync_camera_paths(lambda n: MAIN)
+    assert [c[1] for c in calls] == ["/v3/config/paths/add/cam-x"]
+    calls.clear()
+    wp.sync_camera_paths(lambda n: MAIN)
+    assert calls == []  # fresh decision: nothing re-checked, nothing replaced
+    monkeypatch.setattr(wp, "P2P_SOURCE_RECHECK_SECONDS", 0.0)
+    selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}
+    wp.sync_camera_paths(lambda n: MAIN)
+    assert [c[1] for c in calls] == ["/v3/config/paths/replace/cam-x"] and calls[0][2]["source"] == "publisher"
+
+
+def test_transcoding_is_limited_per_appliance(selection, monkeypatch, caplog):
+    monkeypatch.setattr(wp, "P2P_TRANSCODE_MAX_CAMERAS", 1)
+    selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}
+    assert wp.p2p_source_for("cam-a", MAIN)[1] == "transcode"
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        assert wp.p2p_source_for("cam-b", MAIN) == (MAIN, "main")  # over budget: warn-only
+    assert "p2p_transcode_limit_reached camera_id=cam-b max=1" in caplog.text
+    assert selection["saved"][-1]["webrtc"]["compatible"] is False
+
+
+def test_records_carry_the_camera_lifecycle_field_names(selection, monkeypatch):
+    _use_onvif(selection, monkeypatch, _onvif_record("H264"))
+    selection["codecs"] = {SUB: "hevc", MAIN: "hevc"}
+    wp.p2p_source_for("cam-x", MAIN)
+    saved = selection["saved"][-1]
+    sub, main = _stream(saved, "sub"), _stream(saved, "main")
+    assert (sub["stream_role"], sub["advertised_codec"], sub["observed_codec"]) == ("substream", "h264", "h265")
+    assert (main["stream_role"], main["advertised_codec"], main["observed_codec"]) == ("main", "h264", "h265")
+    assert sub["role"] == "sub" and sub["codec"] == "H264"  # legacy fields kept for existing readers
 
 
 def test_choice_is_cached_until_the_stream_changes(selection):
@@ -320,6 +383,18 @@ def test_whep_rejection_reason_is_sanitized(monkeypatch, caplog):
     for secret in ("s3cr", "SECRETPWD", "AB:CD", "192.168.0.5", "10.0.0.9"):
         assert secret not in text
     assert "<rtsp-url>" in text and "ice-pwd:<redacted>" in text and "candidate:<redacted>" in text
+
+
+@pytest.mark.parametrize("address", ["2600:100d:b211:4109::2a", "fe80::5868:c683:162a:bbe6%enx9c69d3a75ca1",
+                                     "[fd7a:115c:a1e0::c737:2761]:443", "::1", "2001:db8:0:0:0:0:0:1"])
+def test_whep_rejection_reason_redacts_ipv6(monkeypatch, caplog, address):
+    def reject(request, timeout=0):
+        raise _http_error(('{"error":"peer ' + address + ' unreachable"}').encode())
+    monkeypatch.setattr(wp.urllib.request, "urlopen", reject)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        wp.whep_offer("cam-x", "v=0\r\n")
+    core = address.strip("[]").split("]")[0].split("%")[0]
+    assert core not in caplog.text and "<ip>" in caplog.text
 
 
 def test_whep_rejection_with_unreadable_body_still_logs(monkeypatch, caplog):

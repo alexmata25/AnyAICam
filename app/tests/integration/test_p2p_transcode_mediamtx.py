@@ -270,3 +270,35 @@ def test_real_webrtc_client_receives_and_decodes_transcoded_h264(stack):
     print(f"PLAYABLE frames={len(frames)} size={frames[-1].width}x{frames[-1].height} codec={codecs}")
     # viewer gone -> transcoder stops after runOnDemandCloseAfter
     assert _wait(lambda: _transcoders() == [], 30)
+
+
+def test_sustained_camera_outage_with_a_viewer_is_rate_limited_and_cleaned_up(stack):
+    """Codex review 2026-10-10: restart behaviour while the camera stays down."""
+    aiortc = pytest.importorskip("aiortc")
+    import asyncio
+    wp = stack["wp"]
+    wp._config_request("POST", "/v3/config/paths/add/cam-x", wp.path_config_for(CAMERA, "transcode"))
+
+    async def outage():
+        pc = aiortc.RTCPeerConnection(aiortc.RTCConfiguration(iceServers=[]))
+        pc.addTransceiver("video", direction="recvonly")
+        await pc.setLocalDescription(await pc.createOffer())
+        while pc.iceGatheringState != "complete":
+            await asyncio.sleep(0.05)
+        result = await asyncio.to_thread(wp.whep_offer, "cam-x", pc.localDescription.sdp)
+        assert result is not None
+        await pc.setRemoteDescription(aiortc.RTCSessionDescription(sdp=result[1], type="answer"))
+        await asyncio.sleep(3)  # connected and receiving
+        stack["camera"].terminate()  # camera goes down while the viewer stays connected
+        seen, samples = set(), 0
+        end = time.monotonic() + 30
+        while time.monotonic() < end:
+            seen.update(_transcoders())
+            samples += 1
+            await asyncio.sleep(0.5)
+        await pc.close()
+        return seen
+    seen = asyncio.run(outage())
+    print(f"OUTAGE transcoder_processes_in_30s={len(seen)}")
+    assert len(seen) <= 10  # MediaMTX pauses between restarts: no restart storm
+    assert _wait(lambda: _transcoders() == [], 40), "transcoder left running after the viewer left during an outage"

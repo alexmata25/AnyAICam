@@ -648,6 +648,14 @@ P2P_TRANSCODE_MAX_WIDTH = max(320, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCO
 P2P_TRANSCODE_FPS = max(5, min(30, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_FPS", "15"))))
 P2P_TRANSCODE_KBPS = max(200, min(4000, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_KBPS", "1000"))))
 MEDIAMTX_RTSP_LOOPBACK = "rtsp://127.0.0.1:8554"
+# At most this many cameras may be configured for transcoding at once
+# (each runs one ffmpeg only while it has viewers); beyond it, a camera
+# falls back to warn-only so one appliance cannot be overloaded.
+P2P_TRANSCODE_MAX_CAMERAS = max(0, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_MAX_CAMERAS", "2")))
+# A cached WebRTC source decision is re-checked on the capability re-probe
+# schedule even when the camera's main URL is unchanged (profile/codec
+# changes on the camera itself).
+P2P_SOURCE_RECHECK_SECONDS = float(camera_capabilities.REPROBE_SECONDS)
 
 
 def transcode_command(source_url: str) -> str:
@@ -753,12 +761,23 @@ def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
     rejects an offer for codec reasons (see _revalidate_after_codec_rejection).
     Runs network calls, so only call it off the event loop."""
     cached = _p2p_source_choice.get(camera_id)
-    if cached and cached[0] == main_url:
+    if cached and cached[0] == main_url and not _choice_expired(cached):
         kind = cached[2] if len(cached) > 2 else ("main" if cached[1] == main_url else "substream")
         return cached[1], kind
     chosen = main_url
     transcode = False
-    if P2P_STREAM_PREFERENCE != "main":
+    if P2P_STREAM_PREFERENCE == "main":
+        # Main stream by preference -- still decided by its observed codec,
+        # so an H.265 main stream is transcoded rather than sent as-is.
+        main_codec = normalize_codec(_probe_video_codec(main_url))
+        if main_codec is not None and main_codec not in WEBRTC_VIDEO_CODECS:
+            if P2P_TRANSCODE != "off" and _transcode_budget_allows(camera_id):
+                transcode = True
+                logger.info("webrtc_publisher.p2p_transcode camera_id=%s from=main", camera_id)
+            else:
+                logger.warning("webrtc_publisher.no_webrtc_compatible_stream camera_id=%s main_codec=%s sub_codecs=none "
+                               "action=set_one_camera_stream_to_h264_or_use_relay", camera_id, main_codec)
+    else:
         _clean, username, password = camera_capabilities.split_credentials(main_url)
         record = _load_capabilities(camera_id)
         if camera_capabilities.needs_reprobe(record, main_url):
@@ -772,6 +791,9 @@ def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
         def observe(stream: dict, url: str) -> str | None:
             codec = normalize_codec(_probe_video_codec(url))
             stream["observed_codec"] = normalize_codec(codec)
+            # Field names shared with the camera-lifecycle work (stream_codec.py):
+            stream["stream_role"] = "main" if stream.get("role") == "main" else "substream"
+            stream["advertised_codec"] = normalize_codec(stream.get("codec"))
             stream["verified"] = codec is not None
             stream["observed_at"] = observed_at
             return codec
@@ -793,7 +815,9 @@ def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
         if source_role is None and main_codec in WEBRTC_VIDEO_CODECS:
             source_role = "main"
         incompatible = source_role is None and (main_codec is not None or any(c is not None for c in sub_codecs))
-        if incompatible and P2P_TRANSCODE != "off":
+        if incompatible and P2P_TRANSCODE != "off" and not _transcode_budget_allows(camera_id):
+            logger.warning("webrtc_publisher.p2p_transcode_limit_reached camera_id=%s max=%s", camera_id, P2P_TRANSCODE_MAX_CAMERAS)
+        if incompatible and P2P_TRANSCODE != "off" and _transcode_budget_allows(camera_id):
             # Transcode the smallest stream that could actually be opened.
             openable = [(s, camera_capabilities.with_credentials(s["uri"], username, password)) for s in subs if s.get("verified")]
             if main_streams and main_streams[0].get("verified") or (not main_streams and main_codec):
@@ -821,9 +845,21 @@ def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
         }
         _save_capabilities(camera_id, record)
     kind = "transcode" if transcode else ("main" if chosen == main_url else "substream")
-    _p2p_source_choice[camera_id] = (main_url, chosen, kind)
+    _p2p_source_choice[camera_id] = (main_url, chosen, kind, time.monotonic())
     logger.info("webrtc_publisher.p2p_source camera_id=%s stream=%s", camera_id, kind)
     return chosen, kind
+
+
+def _choice_expired(cached) -> bool:
+    """A cached decision without a timestamp (older format) or older than
+    P2P_SOURCE_RECHECK_SECONDS is re-decided."""
+    return len(cached) < 4 or time.monotonic() - cached[3] >= P2P_SOURCE_RECHECK_SECONDS
+
+
+def _transcode_budget_allows(camera_id: str) -> bool:
+    others = sum(1 for cid, entry in _p2p_source_choice.items()
+                 if cid != camera_id and len(entry) > 2 and entry[2] == "transcode")
+    return others < P2P_TRANSCODE_MAX_CAMERAS
 
 
 # camera_id -> monotonic time of the last codec-triggered revalidation.
@@ -888,6 +924,24 @@ def sync_camera_paths(camera_url_fn) -> None:
 
     for camera_id in set(_path_add_retries) - desired:
         _path_add_retries.pop(camera_id, None)
+    for camera_id in desired & _known_paths:
+        cached = _p2p_source_choice.get(camera_id)
+        if cached is None or not _choice_expired(cached):
+            continue
+        try:
+            main_url = camera_url_fn(camera_map[camera_id])
+        except Exception as error:
+            logger.warning("webrtc_publisher.camera_url_unavailable camera_id=%s error=%s", camera_id, error)
+            continue
+        previous = (cached[1], cached[2] if len(cached) > 2 else None)
+        source, stream_kind = p2p_source_for(camera_id, main_url)
+        if (source, stream_kind) != previous:
+            status, _ = _config_request("POST", f"/v3/config/paths/replace/{camera_id}", path_config_for(source, stream_kind))
+            if status not in (200, 201):
+                logger.warning("webrtc_publisher.path_replace_failed camera_id=%s status=%s", camera_id, status)
+                _known_paths.discard(camera_id)  # re-added on the next sync
+            else:
+                logger.info("webrtc_publisher.p2p_source_changed camera_id=%s stream=%s", camera_id, stream_kind)
 
     for camera_id in desired - _known_paths:
         camera_number = camera_map[camera_id]
@@ -951,6 +1005,8 @@ def _whep_error_reason(error) -> str:
     body = re.sub(r"candidate:[^\r\n\"]*?\btyp\s+\S+", "candidate:<redacted>", body)
     body = re.sub(r"candidate:\S+", "candidate:<redacted>", body)
     body = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", body)
+    body = re.sub(r"\[?\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[\w.-]+)?\]?|\[?(?:[0-9A-Fa-f]{1,4})?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:%[\w.-]+)?\]?",
+                  "<ip>", body)
     body = re.sub(r"v=0.*", "<sdp-redacted>", body, flags=re.DOTALL)
     return " ".join(body.split())[:200] or "empty"
 

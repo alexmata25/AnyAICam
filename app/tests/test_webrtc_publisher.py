@@ -714,7 +714,7 @@ def test_no_working_substream_keeps_the_main_stream(fake_mediamtx, monkeypatch, 
 def test_main_preference_never_probes_a_substream(monkeypatch, fresh_choice):
     monkeypatch.setattr(wp, "P2P_STREAM_PREFERENCE", "main")
     assert wp.p2p_source_for("cam-x", MAIN) == (MAIN, "main")
-    assert fresh_choice == []
+    assert SUB not in fresh_choice  # the main stream is still codec-checked (2026-10-10), the substream never probed
 
 
 def test_the_choice_is_probed_once_and_redecided_when_the_camera_url_changes(monkeypatch, fresh_choice):
