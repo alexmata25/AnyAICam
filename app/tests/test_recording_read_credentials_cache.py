@@ -210,3 +210,19 @@ def test_cacheable_presigned_redirect_omits_cache_control_when_ttl_is_zero(monke
     response = main._cacheable_presigned_redirect("recordings/a.jpg")
     assert response.status_code == 302
     assert "cache-control" not in {k.lower() for k in response.headers.keys()}
+
+
+def test_credentials_are_refreshed_before_a_reused_presigned_url_could_outlive_them():
+    """P7 (2026-10-10): a URL signed now is reused and browser-cached for
+    PRESIGNED_URL_REUSE_SECONDS; credentials with less life left than that
+    must be replaced first, or the browser gets 403s near expiry."""
+    fake_sts = MagicMock()
+    fake_sts.assume_role.side_effect = [
+        _fake_assumed_role("AKIAOLD", expires_in_seconds=main.PRESIGNED_URL_REUSE_SECONDS + 30),
+        _fake_assumed_role("AKIANEW", expires_in_seconds=900),
+    ]
+    with patch("boto3.client", return_value=fake_sts):
+        main._recording_read_credentials("arn:aws:iam::123456789012:role/fake", "us-east-1")
+        second = main._recording_read_credentials("arn:aws:iam::123456789012:role/fake", "us-east-1")
+    assert second["access_key_id"] == "AKIANEW"
+    assert second["expiration"] > datetime.now(timezone.utc) + timedelta(seconds=main.PRESIGNED_URL_REUSE_SECONDS)

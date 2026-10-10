@@ -19,7 +19,7 @@ from object_storage import get_storage
 from partner_db import audit, authorize_appliance_tenant, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
-from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
+from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy, recording_session_tags
 from event_media_policy import allows_event_media, effective_cloud_recording_mode, motion_event_policy
 import product_mode
 import runtime_paths
@@ -93,6 +93,7 @@ EVENT_MEDIA_UPLOAD_ENABLED=os.getenv('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED','fals
 # per camera already meaning 'motion' for this same camera's proven
 # event-media entitlement; reusing it for this would silently break
 # that pipeline, which is exactly why this is a separate mechanism.
+RECORDING_SESSION_TAGS_ENABLED=os.getenv('ANYAICAM_RECORDING_SESSION_TAGS_ENABLED','false').strip().lower()=='true'
 RECORDING_UPLOAD_PILOT_CAMERAS: frozenset[str] = frozenset(
     item.strip() for item in os.getenv('ANYAICAM_RECORDING_UPLOAD_PILOT_CAMERAS','').split(',') if item.strip()
 )
@@ -299,6 +300,10 @@ def _effective_camera_mode(customer_id,explicit,cache: dict | None = None) -> st
 def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
     if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
+    # Defense in depth (2026-10-10): the camera's tenant must be the
+    # appliance's own; every S3 prefix and session tag is built from it.
+    if str(camera.get('customer_id') or '')!=str(appliance.get('customer_id') or ''):
+        raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
     return camera
 
 
@@ -1120,6 +1125,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         camera=_authorized_camera(appliance,camera_id)
         if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
             raise HTTPException(status_code=503,detail='Recording upload is not configured.')
+        try:
+            recording_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        except ValueError:
+            raise HTTPException(status_code=403,detail='Camera identity cannot be used for cloud media.')
         if RECORDING_UPLOAD_ENABLED or camera['id'] in RECORDING_UPLOAD_PILOT_CAMERAS:
             policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         else:
@@ -1134,9 +1143,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
             policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         session_name=recording_session_name(appliance['id'],camera_id)
+        assume_args={'RoleArn':RECORDING_UPLOAD_ROLE_ARN,'RoleSessionName':session_name,'Policy':json.dumps(policy),'DurationSeconds':RECORDING_SESSION_DURATION_SECONDS}
+        if RECORDING_SESSION_TAGS_ENABLED:
+            # Only once the role's trust policy allows sts:TagSession (an
+            # AssumeRole with Tags is refused otherwise). See
+            # docs/abac-media-authorization-20261010.md.
+            tier='continuous' if (RECORDING_UPLOAD_ENABLED or camera['id'] in RECORDING_UPLOAD_PILOT_CAMERAS) else 'events'
+            assume_args['Tags']=recording_session_tags(camera['customer_id'],camera['site_id'],appliance['id'],camera_id,tier)
         try:
             sts=boto3.client('sts',region_name=RECORDING_AWS_REGION)
-            assumed=sts.assume_role(RoleArn=RECORDING_UPLOAD_ROLE_ARN,RoleSessionName=session_name,Policy=json.dumps(policy),DurationSeconds=RECORDING_SESSION_DURATION_SECONDS)
+            assumed=sts.assume_role(**assume_args)
         except Exception as error:
             logger.exception('recording_upload.assume_role_failed appliance_id=%s camera_id=%s',appliance['id'],camera_id)
             raise HTTPException(status_code=502,detail='Could not obtain a recording-upload credential.') from error

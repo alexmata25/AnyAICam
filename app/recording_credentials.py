@@ -52,6 +52,18 @@ import time
 
 RECORDING_SESSION_DURATION_SECONDS = 900  # matches the live-relay precedent (Phase 1 decision 4)
 _SESSION_NAME_SAFE = re.compile(r'[^\w+=,.@-]')
+# Every id that becomes an S3 key segment, an IAM policy resource or an STS
+# session tag (2026-10-10). Real ids are hex; anything else -- '*', '/',
+# '..', '${...}', empty -- could widen a policy or escape the tenant prefix.
+_KEY_SEGMENT_SAFE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+SESSION_TAG_KEYS = ('cust', 'site', 'appl', 'cam', 'tier')
+
+
+def _safe_segment(name: str, value) -> str:
+    text = str(value or '')
+    if not _KEY_SEGMENT_SAFE.fullmatch(text):
+        raise ValueError(f'unsafe {name} id for a recording key prefix')
+    return text
 
 
 def recording_s3_prefix(customer_id: str, site_id: str, appliance_id: str, camera_id: str) -> str:
@@ -59,7 +71,23 @@ def recording_s3_prefix(customer_id: str, site_id: str, appliance_id: str, camer
     to -- same shape as live_relay_s3_prefix(), under a separate
     `recordings/` root so recording and live objects never share a
     lifecycle policy or a credential's write scope."""
-    return f'recordings/{customer_id}/{site_id}/{appliance_id}/{camera_id}/'
+    return (f"recordings/{_safe_segment('customer', customer_id)}/{_safe_segment('site', site_id)}/"
+            f"{_safe_segment('appliance', appliance_id)}/{_safe_segment('camera', camera_id)}/")
+
+
+def recording_session_tags(customer_id: str, site_id: str, appliance_id: str, camera_id: str, tier: str) -> list[dict]:
+    """STS session tags for attribute-based access control: the upload
+    role's policy builds its allowed resource from these
+    (recordings/${aws:PrincipalTag/cust}/.../${aws:PrincipalTag/cam}/...),
+    so one generic role serves every customer without a per-customer IAM
+    edit, and a bug in the session policy alone cannot reach another
+    customer's prefix. tier is 'events' (event media only) or
+    'continuous'. Values come only from the database identity."""
+    if tier not in ('events', 'continuous'):
+        raise ValueError('tier must be events or continuous')
+    values = (_safe_segment('customer', customer_id), _safe_segment('site', site_id),
+              _safe_segment('appliance', appliance_id), _safe_segment('camera', camera_id), tier)
+    return [{'Key': key, 'Value': value} for key, value in zip(SESSION_TAG_KEYS, values)]
 
 
 def recording_session_policy(bucket: str, customer_id: str, site_id: str, appliance_id: str, camera_id: str) -> dict:

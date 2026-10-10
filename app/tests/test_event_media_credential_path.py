@@ -110,14 +110,16 @@ class _FakeSTS:
 
     last_policy = None
     last_role_arn = None
+    last_tags = None
 
     def __init__(self, *a, **k):
         pass
 
-    def assume_role(self, RoleArn, RoleSessionName, Policy, DurationSeconds):
+    def assume_role(self, RoleArn, RoleSessionName, Policy, DurationSeconds, Tags=None):
         from datetime import datetime, timezone
         _FakeSTS.last_policy = json.loads(Policy)
         _FakeSTS.last_role_arn = RoleArn
+        _FakeSTS.last_tags = Tags
         return {
             "Credentials": {
                 "AccessKeyId": "FAKEACCESSKEYID",
@@ -530,3 +532,70 @@ def test_an_explicit_motion_camera_on_a_local_plan_gets_no_s3_credential(client,
     response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
 
     assert response.status_code == 403
+
+
+
+# ------------------------------------------- ABAC session tags (2026-10-10)
+
+
+def test_session_tags_are_not_sent_until_enabled(client, db_path, monkeypatch):
+    """Tags make AssumeRole fail unless the trust policy allows
+    sts:TagSession, so they stay off until that IAM change is approved."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True)
+    _install_fake_boto3(monkeypatch)
+    monkeypatch.setattr(appliance_cloud, "RECORDING_SESSION_TAGS_ENABLED", False)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1")
+
+    assert client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred")).status_code == 200
+    assert _FakeSTS.last_tags is None
+
+
+@pytest.mark.parametrize("pilot,tier", [(False, "events"), (True, "continuous")])
+def test_session_tags_carry_the_database_identity_and_tier(client, db_path, monkeypatch, pilot, tier):
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True,
+               pilot_cameras=frozenset({"cam-1"}) if pilot else frozenset())
+    _install_fake_boto3(monkeypatch)
+    monkeypatch.setattr(appliance_cloud, "RECORDING_SESSION_TAGS_ENABLED", True)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1",
+                  customer_id="cust-1", site_id="site-1")
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
+
+    assert response.status_code == 200
+    assert {t["Key"]: t["Value"] for t in _FakeSTS.last_tags} == {
+        "cust": "cust-1", "site": "site-1", "appl": "appl-1", "cam": "cam-1", "tier": tier}
+
+
+def test_a_camera_whose_customer_differs_from_its_appliance_is_refused(client, db_path, monkeypatch):
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True)
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1")
+            db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) "
+                       "VALUES('cust-2','partner-1','Other','o@example.test','active','real','2026-09-13')")
+            db.execute("UPDATE cameras SET customer_id='cust-2' WHERE id='cam-1'")
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("bad", ["*", "..", "a/b", "${aws:username}", "", "x" * 65, "cam 1"])
+def test_unsafe_ids_never_become_a_key_prefix_or_tag(bad):
+    from recording_credentials import recording_s3_prefix, recording_session_tags
+    with pytest.raises(ValueError):
+        recording_s3_prefix("cust-1", "site-1", "appl-1", bad)
+    with pytest.raises(ValueError):
+        recording_session_tags(bad, "site-1", "appl-1", "cam-1", "events")
+
+
+def test_real_hex_ids_are_accepted_unchanged():
+    from recording_credentials import recording_s3_prefix
+    assert recording_s3_prefix("a9fe82756fd0f9caeadc830d01dea567", "7a30bcd816fd3dd0",
+                               "878a006788178f2ab59e1a758c15a085", "32670b0358") == (
+        "recordings/a9fe82756fd0f9caeadc830d01dea567/7a30bcd816fd3dd0/878a006788178f2ab59e1a758c15a085/32670b0358/")

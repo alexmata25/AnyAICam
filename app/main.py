@@ -142238,7 +142238,11 @@ def _recording_read_credentials(role_arn: str, region: str) -> dict | None:
     global _recording_read_credentials_cache
     with _recording_read_credentials_lock:
         cached = _recording_read_credentials_cache
-        if cached and cached['expiration'] > datetime.now(timezone.utc) + timedelta(seconds=60):
+        # 2026-10-10: a URL signed with these credentials is reused, and
+        # cached by the browser, for up to PRESIGNED_URL_REUSE_SECONDS; it
+        # dies when the credentials expire. Refresh early enough that no
+        # handed-out URL can outlive them (was 60 s: up to ~4 min of 403s).
+        if cached and cached['expiration'] > datetime.now(timezone.utc) + timedelta(seconds=PRESIGNED_URL_REUSE_SECONDS + 60):
             return cached
         try:
             import boto3
