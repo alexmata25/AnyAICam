@@ -101,6 +101,67 @@ deploy_agent_source() {
     fi
 }
 
+AGENT_WHEELHOUSE_DIR=""
+AGENT_WHEELHOUSE_PARENT_DIR=""
+AGENT_PREPARATION_VENV_DIR=""
+
+prepare_agent_install_prerequisites() {
+    local staging_root
+    [[ -f "$AGENT_PAYLOAD_DIR/scripts/install.sh" ]] || {
+        echo "[ERROR] Built appliance-agent payload is missing." >&2
+        return 1
+    }
+
+    log "Preparing appliance-agent OS and Python prerequisites before VMS downtime ..."
+    apt-get update -y || return 1
+    apt-get install -y python3.12-venv rsync || return 1
+
+    staging_root="${ANYAICAM_INSTALLER_STAGING_ROOT:-${UPDATE_STATE_DIR:-/var/lib/anyaicam-update}/installer-staging}"
+    if [[ -L "$staging_root" ]]; then
+        echo "[ERROR] Installer staging directory must not be a symlink: $staging_root" >&2
+        return 1
+    fi
+    if [[ "$(id -u)" == "0" ]]; then
+        install -d -m 0700 -o root -g root "$staging_root"
+    else
+        install -d -m 0700 "$staging_root"
+    fi || return 1
+    [[ -d "$staging_root" && ! -L "$staging_root" ]] || return 1
+
+    AGENT_WHEELHOUSE_PARENT_DIR="$(mktemp -d "$staging_root/agent.XXXXXXXX")" || return 1
+    chmod 0700 "$AGENT_WHEELHOUSE_PARENT_DIR" || { cleanup_agent_install_prerequisites; return 1; }
+    AGENT_WHEELHOUSE_DIR="$AGENT_WHEELHOUSE_PARENT_DIR/wheels"
+    AGENT_PREPARATION_VENV_DIR="$AGENT_WHEELHOUSE_PARENT_DIR/venv"
+    mkdir -m 0700 "$AGENT_WHEELHOUSE_DIR" || { cleanup_agent_install_prerequisites; return 1; }
+    if ! python3 -m venv "$AGENT_PREPARATION_VENV_DIR"; then
+        cleanup_agent_install_prerequisites
+        echo "[ERROR] Could not create the temporary agent dependency preparation environment." >&2
+        return 1
+    fi
+    if ! "$AGENT_PREPARATION_VENV_DIR/bin/python" -m pip wheel --disable-pip-version-check \
+        --wheel-dir "$AGENT_WHEELHOUSE_DIR" "$AGENT_PAYLOAD_DIR"; then
+        cleanup_agent_install_prerequisites
+        echo "[ERROR] Could not download/build the appliance-agent wheels; the running VMS was not changed." >&2
+        return 1
+    fi
+    if ! compgen -G "$AGENT_WHEELHOUSE_DIR/*.whl" >/dev/null; then
+        cleanup_agent_install_prerequisites
+        echo "[ERROR] Agent dependency preparation produced no installable wheels." >&2
+        return 1
+    fi
+    rm -rf -- "$AGENT_PREPARATION_VENV_DIR" || { cleanup_agent_install_prerequisites; return 1; }
+    AGENT_PREPARATION_VENV_DIR=""
+}
+
+cleanup_agent_install_prerequisites() {
+    if [[ -n "$AGENT_WHEELHOUSE_PARENT_DIR" ]]; then
+        rm -rf -- "$AGENT_WHEELHOUSE_PARENT_DIR" || return 1
+    fi
+    AGENT_WHEELHOUSE_DIR=""
+    AGENT_WHEELHOUSE_PARENT_DIR=""
+    AGENT_PREPARATION_VENV_DIR=""
+}
+
 install_agent() {
     local state="$1"
     local capacity_bootstrap_mode="${2:-}"
@@ -108,9 +169,16 @@ install_agent() {
         echo "[ERROR] Unsupported agent-install option: $capacity_bootstrap_mode" >&2
         return 2
     fi
-    log "Installing python3.12-venv prerequisite for the appliance agent..."
-    apt-get update -y
-    apt-get install -y python3.12-venv rsync
+    if [[ "$capacity_bootstrap_mode" == "--defer-capacity-bootstrap" ]]; then
+        [[ -n "$AGENT_WHEELHOUSE_DIR" && -d "$AGENT_WHEELHOUSE_DIR" && ! -L "$AGENT_WHEELHOUSE_DIR" ]] || {
+            echo "[ERROR] Full installer agent prerequisites were not prepared before VMS downtime." >&2
+            return 1
+        }
+    else
+        log "Installing python3.12-venv prerequisite for the appliance agent..."
+        apt-get update -y || return 1
+        apt-get install -y python3.12-venv rsync || return 1
+    fi
 
     [[ -f "$AGENT_PAYLOAD_DIR/scripts/install.sh" ]] || {
         echo "[ERROR] Built appliance-agent payload is missing." >&2
@@ -123,7 +191,8 @@ install_agent() {
 
     log "Installing appliance-agent control-plane package..."
     if [[ "$capacity_bootstrap_mode" == "--defer-capacity-bootstrap" ]]; then
-        bash "$AGENT_SOURCE_ROOT/scripts/install.sh" "$capacity_bootstrap_mode" || return $?
+        ANYAICAM_AGENT_WHEELHOUSE="$AGENT_WHEELHOUSE_DIR" \
+            bash "$AGENT_SOURCE_ROOT/scripts/install.sh" "$capacity_bootstrap_mode" || return $?
     else
         bash "$AGENT_SOURCE_ROOT/scripts/install.sh" || return $?
     fi

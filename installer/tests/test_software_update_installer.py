@@ -188,8 +188,11 @@ class PrivilegeBoundaryTests(unittest.TestCase):
 
     def test_repairs_stop_the_vms_before_rewriting_its_bind_mounted_tree(self):
         script = _text(INSTALLER / "06-deploy-vms.sh")
+        staged_copy = script.index('rsync -a --no-owner --no-group --delete')
         stop = script.index("systemctl stop anyaicam-vms.service")
-        self.assertLess(stop, script.index('rsync -a --no-owner --no-group --delete'))
+        live_copy = script.index('rsync -a --no-owner --no-group --delete', stop)
+        self.assertLess(staged_copy, stop)
+        self.assertLess(stop, live_copy)
 
 
 class OfflineSignerTests(unittest.TestCase):

@@ -47,6 +47,8 @@ reset_fixture() {
     VMS_HLS_DIR="$FIXTURE_ROOT/var/lib/anyaicam/vms/hls"
     VMS_ENV_FILE="$CONFIG_DIR/vms.env"
     QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
+    UPDATE_STATE_DIR="$FIXTURE_ROOT/var/lib/anyaicam-update"
+    ANYAICAM_INSTALLER_STAGING_ROOT="$UPDATE_STATE_DIR/installer-staging"
     # Release-driven deploy_vms() constants (installer: make VMS payload
     # release-driven) -- same fixture-redirection pattern as every other
     # path constant here. VMS_RELEASE_COMMIT is a fixed, fake-but-valid
@@ -85,8 +87,9 @@ reset_fixture() {
     # id/docker mocks default to "absent" until a test overrides them.
     ID_MOCK_EXIT=1
     DOCKER_IMAGE_MOCK_EXIT=1
-    DOCKER_COMPOSE_BUILD_MARKER="$FIXTURE_ROOT/.docker-compose-build-called"
-    rm -f "$DOCKER_COMPOSE_BUILD_MARKER"
+    DOCKER_BUILD_MARKER="$FIXTURE_ROOT/.docker-build-called"
+    DOCKER_LATEST_TAG_MARKER="$FIXTURE_ROOT/.docker-latest-tagged"
+    rm -f "$DOCKER_BUILD_MARKER" "$DOCKER_LATEST_TAG_MARKER"
     export APT_PYTHON_VENV_MARKER="$FIXTURE_ROOT/.apt-python3.12-venv-installed"
     export FAKE_AGENT_INSTALL_MARKER="$FIXTURE_ROOT/.fake-agent-install-ran"
     export FAKE_AGENT_UNINSTALL_MARKER="$FIXTURE_ROOT/.fake-agent-uninstall-ran"
@@ -163,18 +166,16 @@ id() {
     command id "$@"
 }
 docker() {
+    if [[ "$1" == "build" ]]; then
+        touch "$DOCKER_BUILD_MARKER"
+        return "${FAKE_DOCKER_BUILD_STATUS:-0}"
+    fi
+    if [[ "$1" == "tag" && "${3:-}" == "${VMS_IMAGE:-anyaicam-vms}:latest" ]]; then
+        touch "$DOCKER_LATEST_TAG_MARKER"
+        return 0
+    fi
     if [[ "$1" == "image" && "$2" == "inspect" ]]; then
         return "$DOCKER_IMAGE_MOCK_EXIT"
-    fi
-    if [[ "$1" == "compose" && "$2" == "build" ]]; then
-        # deploy_vms() only needs to know the build step ran; the
-        # actual image build is exercised for real in Phase 4 on a
-        # genuine Ubuntu host, not here. deploy_vms() invokes this
-        # inside a `( cd ... && docker compose build )` subshell, so a
-        # plain variable assignment here would not survive back to the
-        # caller -- a marker file is used instead.
-        touch "$DOCKER_COMPOSE_BUILD_MARKER"
-        return 0
     fi
     if [[ "$1" == "compose" && "$2" == "down" ]]; then
         return 0
@@ -183,6 +184,14 @@ docker() {
         return 0
     fi
     command docker "$@"
+}
+# The shell harness uses a fake docker function, so keep calls routed
+# through the function. The Python resilience tests exercise GNU timeout
+# itself with an external Docker stub, including a genuinely bounded wait.
+timeout() {
+    while [[ "${1:-}" == --* ]]; do shift; done
+    shift
+    "$@"
 }
 systemctl() {
     # run_uninstall() only needs these to not fail; no real systemd is
@@ -404,7 +413,7 @@ echo "== deploy_vms() =="
 #     found in live Phase 4 validation: (1) docker-compose.yml's
 #     `build: .` resolves to a file literally named Dockerfile, but the
 #     original deploy_vms() only copied Dockerfile.production, leaving
-#     nothing for `docker compose build` to read on a genuinely fresh
+#     nothing for an image build to read on a genuinely fresh
 #     install; (2) the plain Dockerfile does
 #     `COPY requirements.txt /tmp/requirements.txt`, and that file is
 #     tracked only at repo root, not under app/. All of Dockerfile,
@@ -418,7 +427,8 @@ deploy_vms clean >/dev/null 2>&1
 assert_exit "plain Dockerfile is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile"
 assert_exit "Dockerfile.production is also copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile.production"
 assert_exit "requirements.txt is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/requirements.txt"
-assert_exit "docker compose build was invoked" 0 test -f "$DOCKER_COMPOSE_BUILD_MARKER"
+assert_exit "VMS image was built under its release-specific tag" 0 test -f "$DOCKER_BUILD_MARKER"
+assert_exit "the prepared VMS image was activated as latest" 0 test -f "$DOCKER_LATEST_TAG_MARKER"
 
 # 14a. Missing release payload -> deploy_vms fails closed, never silently
 #      proceeds to build/deploy a nonexistent app, and never touches

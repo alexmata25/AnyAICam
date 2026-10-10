@@ -237,6 +237,72 @@ ROLLBACK_TOOL="${ANYAICAM_ROLLBACK_TOOL:-/usr/local/sbin/anyaicam-rollback}"
 VMS_IMAGE="${ANYAICAM_VMS_IMAGE:-anyaicam-vms}"
 VMS_CONTAINER="${ANYAICAM_VMS_CONTAINER:-anyaicam-vms}"
 VMS_DATABASE_NAME="partner_portal.db"
+PREPARED_VMS_IMAGE_TAG=""
+
+# Build from a root-only copy of the verified release payload before changing
+# any live VMS files or rollback metadata. The image build downloads OS/Python
+# packages and model assets, so it must complete while the current VMS is up.
+prepare_vms_image() {
+    local build_timeout staging_root staging_dir image_tag build_status
+    build_timeout="${ANYAICAM_VMS_BUILD_TIMEOUT:-5400}"
+    staging_root="${ANYAICAM_INSTALLER_STAGING_ROOT:-${UPDATE_STATE_DIR:-/var/lib/anyaicam-update}/installer-staging}"
+    image_tag="$VMS_IMAGE:release-${VMS_RELEASE_COMMIT:0:12}"
+    PREPARED_VMS_IMAGE_TAG=""
+
+    if [[ ! "$build_timeout" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[ERROR] ANYAICAM_VMS_BUILD_TIMEOUT must be a positive number of seconds." >&2
+        return 1
+    fi
+    if [[ -L "$staging_root" ]]; then
+        echo "[ERROR] Installer staging directory must not be a symlink: $staging_root" >&2
+        return 1
+    fi
+    if [[ "$(id -u)" == "0" ]]; then
+        install -d -m 0700 -o root -g root "$staging_root"
+    else
+        install -d -m 0700 "$staging_root"
+    fi || {
+        echo "[ERROR] Could not create the secure installer staging directory." >&2
+        return 1
+    }
+    if [[ ! -d "$staging_root" || -L "$staging_root" ]]; then
+        echo "[ERROR] Installer staging directory is not a real directory: $staging_root" >&2
+        return 1
+    fi
+
+    staging_dir="$(mktemp -d "$staging_root/vms.XXXXXXXX")" || {
+        echo "[ERROR] Could not create a fresh VMS build staging directory." >&2
+        return 1
+    }
+    chmod 0700 "$staging_dir" || { rm -rf -- "$staging_dir"; return 1; }
+    if ! rsync -a --no-owner --no-group --delete \
+        --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
+        "$VMS_PAYLOAD_DIR/" "$staging_dir/"; then
+        rm -rf -- "$staging_dir"
+        echo "[ERROR] Could not stage the verified VMS release; the running VMS was not changed." >&2
+        return 1
+    fi
+
+    log "Preparing the VMS image before downtime (timeout ${build_timeout}s, tag $image_tag) ..."
+    if timeout --kill-after=30s "${build_timeout}s" docker build -t "$image_tag" "$staging_dir"; then
+        build_status=0
+    else
+        build_status=$?
+    fi
+    rm -rf -- "$staging_dir" || {
+        echo "[ERROR] Could not remove the temporary VMS build context: $staging_dir" >&2
+        return 1
+    }
+    if [[ "$build_status" -ne 0 ]]; then
+        if [[ "$build_status" -eq 124 || "$build_status" -eq 137 ]]; then
+            echo "[ERROR] VMS image preparation timed out; the running VMS, installed files, and rollback point were not changed." >&2
+        else
+            echo "[ERROR] Building the VMS image failed (network/model download may be unavailable); the running VMS, installed files, and rollback point were not changed. Retry when network access is available." >&2
+        fi
+        return 1
+    fi
+    PREPARED_VMS_IMAGE_TAG="$image_tag"
+}
 
 previous_vms_commit() {
     sed -n 's/^ANYAICAM_VMS_COMMIT=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1
@@ -348,12 +414,17 @@ create_rollback_point() {
 }
 
 deploy_vms() {
-    local state="$1"
+    local state="$1" expected_image_tag
 
     [[ -d "$VMS_PAYLOAD_DIR/app" ]] || {
         echo "[ERROR] Missing built VMS payload: $VMS_PAYLOAD_DIR/app" >&2
         return 1
     }
+
+    expected_image_tag="$VMS_IMAGE:release-${VMS_RELEASE_COMMIT:0:12}"
+    if [[ "$PREPARED_VMS_IMAGE_TAG" != "$expected_image_tag" ]]; then
+        prepare_vms_image || return $?
+    fi
 
     migrate_legacy_persistent_data "$VMS_INSTALL_ROOT/recordings" "$VMS_RECORDINGS_DIR" "VMS recordings/application state"
     migrate_legacy_persistent_data "$VMS_INSTALL_ROOT/data/config" "$VMS_DATA_CONFIG_DIR" "VMS data/config"
@@ -368,7 +439,7 @@ deploy_vms() {
         fi
     fi
 
-    install -d -m 0755 -o root -g root "$VMS_INSTALL_ROOT"
+    install -d -m 0755 -o root -g root "$VMS_INSTALL_ROOT" || return 1
 
     log "Installing exact VMS release $VMS_RELEASE_COMMIT into $VMS_INSTALL_ROOT ..."
     # --delete makes /opt/anyaicam an exact software mirror of the release.
@@ -405,17 +476,24 @@ deploy_vms() {
     # (Software Update does not use this path: it swaps whole directories.)
     if [[ "$state" != "clean" ]] && systemctl is-active --quiet anyaicam-vms.service 2>/dev/null; then
         log "Stopping the VMS before replacing its bind-mounted application tree ..."
-        systemctl stop anyaicam-vms.service
+        systemctl stop anyaicam-vms.service || return 1
     fi
     rsync -a --no-owner --no-group --delete \
         --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
-        "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/"
-    normalize_vms_install_ownership
+        "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/" || {
+            echo "[ERROR] Could not replace the installed VMS files with the verified release payload." >&2
+            return 1
+        }
+    normalize_vms_install_ownership || return 1
 
-    ensure_vms_env
+    ensure_vms_env || return 1
 
-    log "Building VMS Docker image for release $VMS_RELEASE_COMMIT ..."
-    (cd "$VMS_INSTALL_ROOT" && docker compose build)
+    log "Activating the prepared VMS image $PREPARED_VMS_IMAGE_TAG ..."
+    docker tag "$PREPARED_VMS_IMAGE_TAG" "$VMS_IMAGE:latest" || {
+        echo "[ERROR] Could not activate the prepared VMS image." >&2
+        return 1
+    }
+    PREPARED_VMS_IMAGE_TAG=""
 
     if [[ "$state" == "clean" ]]; then
         log "VMS deployed from exact release payload (clean install)."

@@ -766,7 +766,8 @@ class LegacyAgentTreeTests(unittest.TestCase):
     # migrate_capacity_fallback_step: Linux 1.2.5 step 15 (Orange's Linux run
     # found it missing here, so the real step ran against a fixture payload).
     LATER_STEPS = ("provision_entitlement_signing_keys", "install_capacity_accept_step",
-                   "migrate_capacity_fallback_step", "docker_setup", "provision_users_dirs", "deploy_vms",
+                   "migrate_capacity_fallback_step", "docker_setup", "prepare_agent_install_prerequisites",
+                   "prepare_vms_image", "provision_users_dirs", "deploy_vms",
                    "install_rollback_tool", "install_agent",
                    "install_mediamtx", "install_webrtc_firewall", "systemd_setup", "disable_system_suspend",
                    "identity_provision", "bootstrap_capacity_identity", "claim_label_provision",
@@ -838,9 +839,11 @@ class OrderTests(unittest.TestCase):
         self.assertEqual(steps[secure + 3], 'migrate_capacity_fallback_step "$INSTALL_STATE"')
         self.assertEqual(steps[secure + 4], "docker_setup")
         for later in ("provision_users_dirs \"$INSTALL_STATE\"", "deploy_vms \"$INSTALL_STATE\"",
-                      "install_agent \"$INSTALL_STATE\" --defer-capacity-bootstrap || return $?",
                       "systemd_setup", "provision_update_signing_key", "provision_entitlement_signing_keys"):
-            self.assertGreater(steps.index(later), secure, later)
+            self.assertGreater(body.index(later), body.index("secure_agent_install_root"), later)
+        self.assertLess(body.index("prepare_agent_install_prerequisites"), body.index('provision_users_dirs "$INSTALL_STATE"'))
+        self.assertLess(body.index("prepare_vms_image"), body.index('provision_users_dirs "$INSTALL_STATE"'))
+        self.assertIn('if install_agent "$INSTALL_STATE" --defer-capacity-bootstrap; then', body)
 
     def test_agent_subinstaller_failure_is_returned_to_the_orchestrator(self):
         step = (ROOT / "07-install-agent.sh").read_text(encoding="utf-8")

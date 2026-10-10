@@ -26,7 +26,21 @@ id -u anyaicam >/dev/null 2>&1 || useradd --system --home /var/lib/anyaicam --sh
 install -d -m 0755 -o root -g root /opt/anyaicam-agent
 install -d -m 0750 -o anyaicam -g anyaicam /etc/anyaicam /var/lib/anyaicam /var/lib/anyaicam/recordings /var/log/anyaicam
 python3 -m venv /opt/anyaicam-agent/venv
-/opt/anyaicam-agent/venv/bin/pip install --no-cache-dir "$SOURCE_DIR"
+if [[ "$DEFER_CAPACITY_BOOTSTRAP" == 1 ]]; then
+  WHEELHOUSE="${ANYAICAM_AGENT_WHEELHOUSE:-}"
+  if [[ -z "$WHEELHOUSE" || ! -d "$WHEELHOUSE" || -L "$WHEELHOUSE" ]]; then
+    echo "A root-owned, pre-staged agent wheelhouse is required for deferred full-installer mode." >&2
+    exit 1
+  fi
+  if [[ "$(stat -c '%u' -- "$WHEELHOUSE")" != 0 || "$(stat -c '%a' -- "$WHEELHOUSE")" != 700 ]] \
+    || [[ -n "$(find "$WHEELHOUSE" -type l -print -quit 2>/dev/null)" ]]; then
+    echo "The deferred agent wheelhouse must be root-owned, mode 0700, and contain no symlinks." >&2
+    exit 1
+  fi
+  /opt/anyaicam-agent/venv/bin/pip install --no-cache-dir --no-index --find-links "$WHEELHOUSE" anyaicam-appliance-agent
+else
+  /opt/anyaicam-agent/venv/bin/pip install --no-cache-dir "$SOURCE_DIR"
+fi
 install -m 0644 "$SOURCE_DIR/systemd/anyaicam-agent.service" /etc/systemd/system/anyaicam-agent.service
 # Created only when absent, through the root applier's symlink-safe write
 # (system/apply_release.py agent_file_main): /etc/anyaicam is owned by the

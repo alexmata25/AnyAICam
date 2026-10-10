@@ -199,13 +199,38 @@ run_install() {
     install_capacity_accept_step
     migrate_capacity_fallback_step "$INSTALL_STATE"
     docker_setup
-    provision_users_dirs "$INSTALL_STATE"
-    deploy_vms "$INSTALL_STATE"
-    install_rollback_tool
+    # All network-dependent image and agent preparation happens before
+    # provision_users_dirs, rollback-point creation, or VMS downtime.
+    if ! prepare_agent_install_prerequisites; then return 1; fi
+    if ! prepare_vms_image; then
+        cleanup_agent_install_prerequisites || true
+        return 1
+    fi
+    if provision_users_dirs "$INSTALL_STATE"; then :; else
+        local step_status=$?
+        cleanup_agent_install_prerequisites || true
+        return "$step_status"
+    fi
+    if deploy_vms "$INSTALL_STATE"; then :; else
+        local step_status=$?
+        cleanup_agent_install_prerequisites || true
+        return "$step_status"
+    fi
+    if install_rollback_tool; then :; else
+        local step_status=$?
+        cleanup_agent_install_prerequisites || true
+        return "$step_status"
+    fi
     # The full installer validated identity/capacity before downtime and
     # validates it again after systemd_setup restores the VMS. Do not run the
     # agent sub-installer's redundant bootstrap while the VMS is stopped.
-    install_agent "$INSTALL_STATE" --defer-capacity-bootstrap || return $?
+    if install_agent "$INSTALL_STATE" --defer-capacity-bootstrap; then
+        cleanup_agent_install_prerequisites || return 1
+    else
+        local step_status=$?
+        cleanup_agent_install_prerequisites || true
+        return "$step_status"
+    fi
     install_mediamtx "$INSTALL_STATE"
     install_webrtc_firewall
     systemd_setup

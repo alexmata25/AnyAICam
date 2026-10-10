@@ -86,7 +86,7 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertLess(installer.index('deploy_vms "$INSTALL_STATE"'), installer.index('install_agent "$INSTALL_STATE"'))
         self.assertLess(installer.index('install_agent "$INSTALL_STATE" --defer-capacity-bootstrap'),
                         installer.index('    systemd_setup\n'))
-        self.assertIn('install_agent "$INSTALL_STATE" --defer-capacity-bootstrap || return $?', installer)
+        self.assertIn('if install_agent "$INSTALL_STATE" --defer-capacity-bootstrap; then', installer)
         self.assertIn('"$1" == "--defer-capacity-bootstrap"', agent_installer)
         self.assertIn('"$DEFER_CAPACITY_BOOTSTRAP" == 0', agent_installer)
         self.assertLess(installer.index('    systemd_setup\n'), installer.index("bootstrap_capacity_identity migration"))
@@ -96,10 +96,13 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
     def test_full_installer_passes_deferral_to_agent_subinstaller(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "agent-argv"
+            wheelhouse = Path(tmp) / "wheels"
+            wheelhouse.mkdir(mode=0o700)
             result = subprocess.run([BASH, "-c", r'''set -euo pipefail
 source ./install.sh
 AGENT_PAYLOAD_DIR="$TEST_PAYLOAD"
 AGENT_SOURCE_ROOT="$TEST_SOURCE"
+AGENT_WHEELHOUSE_DIR="$TEST_WHEELHOUSE"
 apt-get() { :; }
 deploy_agent_source() { :; }
 bash() { printf '%s\n' "$@" > "$AGENT_ARGV_TRACE"; }
@@ -107,6 +110,7 @@ install_agent repair --defer-capacity-bootstrap
 '''], cwd=ROOT / "installer", text=True, capture_output=True,
                                 env={**os.environ, "TEST_PAYLOAD": str(ROOT / "appliance-agent"),
                                      "TEST_SOURCE": str(ROOT / "appliance-agent"),
+                                     "TEST_WHEELHOUSE": bash_path(wheelhouse),
                                      "AGENT_ARGV_TRACE": str(trace)})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             arguments = trace.read_text(encoding="utf-8").splitlines()
@@ -191,6 +195,7 @@ select_product_mode() {{ :; }}; storage_preflight() {{ :; }}
 secure_agent_install_root() {{ :; }}; provision_entitlement_signing_keys() {{ :; }}
 install_capacity_accept_step() {{ :; }}; migrate_capacity_fallback_step() {{ :; }}
 docker_setup() {{ :; }}; provision_users_dirs() {{ :; }}
+prepare_agent_install_prerequisites() {{ :; }}; prepare_vms_image() {{ :; }}
 deploy_vms() {{ printf 'VMS_REMOVED\\n' >> "$REPAIR_TRACE"; }}
 install_rollback_tool() {{ :; }}
 install_agent() {{ bootstrap_capacity_identity; printf 'AGENT_RETURNED\\n' >> "$REPAIR_TRACE"; }}
@@ -236,7 +241,8 @@ printf 'CHILD_BOOTSTRAP_DEFERRED\n' >> {shlex.quote(bash_path(self.trace))}
 ''', encoding="utf-8", newline="\n")
         env = dict(os.environ, REPAIR_TRACE=bash_path(self.trace),
                    TEST_AGENT_SOURCE=bash_path(self.tmp / "agent-source"),
-                   TEST_AGENT_PAYLOAD=bash_path(self.tmp / "agent-payload"))
+                   TEST_AGENT_PAYLOAD=bash_path(self.tmp / "agent-payload"),
+                   TEST_AGENT_WHEELHOUSE=bash_path(self.tmp / "agent-wheelhouse"))
         script = f'''\
 set -euo pipefail
 source {shlex.quote(bash_path(ROOT / "installer/install.sh"))}
@@ -255,7 +261,9 @@ select_product_mode() {{ :; }}; storage_preflight() {{ :; }}
 secure_agent_install_root() {{ :; }}; provision_entitlement_signing_keys() {{ :; }}
 install_capacity_accept_step() {{ printf 'CAPACITY_VALIDATED_BEFORE_DOWNTIME\\n' >> "$REPAIR_TRACE"; }}
 migrate_capacity_fallback_step() {{ :; }}; docker_setup() {{ :; }}
-provision_users_dirs() {{ :; }}; deploy_vms() {{ printf 'VMS_STOPPED\\n' >> "$REPAIR_TRACE"; }}
+prepare_agent_install_prerequisites() {{ AGENT_WHEELHOUSE_DIR="$TEST_AGENT_WHEELHOUSE"; mkdir -p "$AGENT_WHEELHOUSE_DIR"; }}
+prepare_vms_image() {{ :; }}; provision_users_dirs() {{ :; }}
+deploy_vms() {{ printf 'VMS_STOPPED\\n' >> "$REPAIR_TRACE"; }}
 install_rollback_tool() {{ :; }}; install_mediamtx() {{ :; }}
 install_webrtc_firewall() {{ :; }}
 systemd_setup() {{ printf 'VMS_RESTARTED\\n' >> "$REPAIR_TRACE"; }}

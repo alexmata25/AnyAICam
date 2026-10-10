@@ -151,6 +151,7 @@ class RollbackPointTests(unittest.TestCase):
         result = self.run_bash('''
 VMS_PAYLOAD_DIR="$(mktemp -d)"; mkdir -p "$VMS_PAYLOAD_DIR/app"
 migrate_legacy_persistent_data() { :; }; migrate_legacy_persistent_file() { :; }
+prepare_vms_image() { :; }
 install() { echo "INSTALL-REACHED"; return 0; }
 deploy_vms existing
 ''', success=False, FAKE_TAG_FAILS="1")
