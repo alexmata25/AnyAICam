@@ -19,6 +19,7 @@ way -- only the outbound network calls below are."""
 
 import logging
 import os
+import re
 import subprocess
 import time
 import asyncio
@@ -648,6 +649,23 @@ def report_media_failed(*, event_id: str, camera_number: int, reason: str) -> bo
     return delivered
 
 
+def _upload_error_code(error: BaseException) -> str:
+    """A short, log-safe code for a failed upload: the S3/STS error code
+    (e.g. AccessDenied) when one is available, else the exception class.
+    Never the message itself -- that carries the bucket and object key."""
+    response = getattr(error, "response", None)
+    if isinstance(response, dict):
+        code = (response.get("Error") or {}).get("Code")
+        if code:
+            return str(code)[:64]
+    # boto3's S3UploadFailedError wraps the ClientError only as text:
+    # "Failed to upload ... An error occurred (AccessDenied) when ..."
+    match = re.search(r"An error occurred \(([A-Za-z0-9.]+)\)", str(error))
+    if match:
+        return match.group(1)[:64]
+    return type(error).__name__
+
+
 def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     """Retry durable jobs on the next local worker tick; never contacts a
     service unless the normal event-media feature gate is enabled."""
@@ -691,6 +709,19 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
             attempts = int(job.get("attempts", 0)) + 1
             delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
             event_media_outbox.replace(str(job.get("event_id")), {**job, "attempts": attempts, "last_error": "invalid_job", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
+        except Exception as error:
+            # 2026-10-10: an S3 or STS failure (e.g. AccessDenied from an
+            # upload role that does not cover this appliance's prefix)
+            # used to escape this loop, abort the whole tick, and leave
+            # the job due again next tick without backoff -- the same
+            # head-of-queue jobs failed forever with nothing recorded.
+            # Back off this job only and keep the error code inspectable.
+            attempts = int(job.get("attempts", 0)) + 1
+            delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
+            code = _upload_error_code(error)
+            logger.warning("event_media.retry_job_failed event_id=%s camera=%s attempts=%s error=%s",
+                           job.get("event_id"), job.get("camera_number"), attempts, code)
+            event_media_outbox.replace(str(job.get("event_id")), {**job, "attempts": attempts, "last_error": code, "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
     return {"attempted": attempted, "completed": completed, "pending": len(event_media_outbox.load())}
 
 

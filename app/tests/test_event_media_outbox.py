@@ -60,6 +60,59 @@ def test_malformed_item_does_not_block_later_completed_item(tmp_path, monkeypatc
     assert outbox.load()[0]["last_error"] == "invalid_job"
 
 
+def _job(event_id):
+    return {"event_id": event_id, "camera_number": 1, "event_start": "2026-01-01T00:00:00", "event_end": "2026-01-01T00:00:01", "clip_url": "/recordings/a.mp4", "thumbnail_url": None}
+
+
+class _S3UploadFailedError(Exception):
+    """Shape of boto3.exceptions.S3UploadFailedError: no .response, code only in the text."""
+
+
+def test_s3_access_denied_backs_off_that_job_and_does_not_block_later_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    outbox.save([_job("denied"), _job("good")])
+
+    def upload(**kwargs):
+        if kwargs["event_id"] == "denied":
+            raise _S3UploadFailedError(
+                "Failed to upload /app/recordings/clips/motion/x.mp4 to bucket/recordings/cust/site/app/cam/x.mp4: "
+                "An error occurred (AccessDenied) when calling the PutObject operation: Access Denied")
+        outbox.remove(kwargs["event_id"])
+        return True
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", upload)
+    summary = uploader.retry_pending_event_media()
+    assert summary == {"attempted": 2, "completed": 1, "pending": 1}
+    saved = outbox.load()[0]
+    assert saved["event_id"] == "denied"
+    assert saved["attempts"] == 1 and saved["next_attempt_at"]
+    assert saved["last_error"] == "AccessDenied"
+    # Backed off: the very next tick does not re-attempt it.
+    assert uploader.retry_pending_event_media()["attempted"] == 0
+
+
+def test_upload_error_code_prefers_client_error_code_and_never_returns_the_message():
+    class ClientError(Exception):
+        response = {"Error": {"Code": "ExpiredToken", "Message": "bucket/recordings/secret-key"}}
+    assert uploader._upload_error_code(ClientError("bucket/recordings/secret-key")) == "ExpiredToken"
+    assert uploader._upload_error_code(RuntimeError("bucket/recordings/secret-key")) == "RuntimeError"
+
+
+def test_unexpected_exception_is_logged_without_the_object_key(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    outbox.save([_job("evt-1")])
+
+    def upload(**_):
+        raise _S3UploadFailedError("Failed to upload x to bucket/recordings/cust-123/site/x.mp4: "
+                                   "An error occurred (AccessDenied) when calling the PutObject operation")
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", upload)
+    with caplog.at_level("WARNING"):
+        uploader.retry_pending_event_media()
+    assert "event_media.retry_job_failed" in caplog.text and "AccessDenied" in caplog.text
+    assert "cust-123" not in caplog.text
+
+
 def test_retry_worker_disabled_never_attempts_jobs(monkeypatch):
     monkeypatch.setattr(uploader, "EVENT_MEDIA_UPLOAD_ENABLED", False)
     async def run_once():
