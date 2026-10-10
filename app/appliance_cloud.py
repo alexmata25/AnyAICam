@@ -4,7 +4,7 @@ import logging
 import os
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Callable
@@ -210,7 +210,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows("SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? AND COALESCE(status,'')!='removed' ORDER BY camera_number,name",(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows("SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? AND COALESCE(status,'')!='removed' ORDER BY camera_number,name",(appliance['id'],))
+        for camera in camera_items:
+            camera['stream_profiles']=rows('SELECT profile_token,profile_name,stream_role,advertised_codec,observed_codec,verified_at FROM camera_stream_profiles WHERE camera_id=? ORDER BY profile_token',(camera['id'],))
+            verified_h264=[p for p in camera['stream_profiles'] if p.get('observed_codec')=='h264']
+            selected=next((p for p in verified_h264 if p.get('stream_role')=='substream'),None) or next((p for p in verified_h264 if p.get('stream_role')=='main'),None)
+            camera['browser_profile_token']=selected.get('profile_token') if selected else None
+            camera['codec_compatibility_warning']=None if selected else 'No verified H.264 stream is available for browser WebRTC; choose another camera profile or enable an approved transcoding path.'
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -225,7 +232,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         try: parsed=urlsplit(value.strip())
         except ValueError: return None
         if parsed.scheme.lower()!='rtsp' or not parsed.hostname: return None
-        netloc=parsed.hostname+(f':{parsed.port}' if parsed.port else '')
+        try: port=parsed.port
+        except ValueError: return None
+        netloc=parsed.hostname+(f':{port}' if port else '')
         return urlunsplit((parsed.scheme,netloc,parsed.path,parsed.query,parsed.fragment))
 
     @app.post('/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri')
@@ -256,6 +265,44 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if updated:
                 audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.media_uri_resolved','camera',camera_id,{'device_key':device_key})
         return {'message':'Media URI recorded.' if updated else 'Camera already has a media URI; not replaced.','updated':updated}
+
+    @app.post('/api/appliance/{cloud_id}/cameras/{camera_id}/media-profiles')
+    def appliance_submit_media_profiles(request: Request,cloud_id: str,camera_id: str,payload: dict) -> dict:
+        """Store advertised and FFprobe-observed stream codecs separately.
+
+        The authenticated appliance must identify the same camera. Profile
+        RTSP URIs are sanitized and remain server-side; credentials are never
+        accepted as fields or returned by configuration.
+        """
+        appliance=authenticate_appliance(request)
+        if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
+        camera=_authorized_camera(appliance,camera_id)
+        if str(payload.get('device_key') or '').strip()!=(camera.get('device_key') or ''): raise HTTPException(status_code=409,detail='device_key does not match this camera; refusing to associate stream metadata.')
+        profiles=payload.get('streams')
+        if not isinstance(profiles,list) or not 1<=len(profiles)<=16: raise HTTPException(status_code=400,detail='Between one and sixteen ONVIF stream profiles are required.')
+        safe=[]; tokens=set()
+        for profile in profiles:
+            if not isinstance(profile,dict): raise HTTPException(status_code=400,detail='Invalid stream profile.')
+            token=str(profile.get('profile_token') or '').strip()
+            uri=_sanitize_rtsp_uri(profile.get('rtsp_uri'))
+            role=str(profile.get('stream_role') or 'unknown')
+            advertised=str(profile.get('advertised_codec') or '').lower()[:32] or None
+            observed=str(profile.get('observed_codec') or '').lower()[:32] or None
+            if not token or len(token)>128 or token in tokens or not uri or role not in ('main','substream','unknown'):
+                raise HTTPException(status_code=400,detail='Invalid or duplicate ONVIF stream profile.')
+            tokens.add(token); safe.append((token,str(profile.get('profile_name') or '')[:128] or None,role,uri,advertised,observed))
+        verified_at=datetime.now(timezone.utc).isoformat()
+        with connection() as db:
+            db.execute('DELETE FROM camera_stream_profiles WHERE camera_id=?',(camera_id,))
+            for token,name,role,uri,advertised,observed in safe:
+                db.execute('INSERT INTO camera_stream_profiles(camera_id,profile_token,profile_name,stream_role,rtsp_uri,advertised_codec,observed_codec,verified_at) VALUES(?,?,?,?,?,?,?,?)',(camera_id,token,name,role,uri,advertised,observed,verified_at))
+            # This endpoint is called only after a successful, credentialed
+            # provisioning verification. Use the verified main profile as
+            # the canonical source and refresh it on reprovisioning.
+            main_uri=next((item[3] for item in safe if item[2]=='main'),safe[0][3])
+            db.execute('UPDATE cameras SET onvif_endpoint=? WHERE id=? AND appliance_id=?',(main_uri,camera_id,appliance['id']))
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.stream_codecs_verified','camera',camera_id,{'profile_count':len(safe),'verified_h264_count':sum(item[5]=='h264' for item in safe)})
+        return {'stored':len(safe),'verified_at':verified_at}
 
     @app.get('/api/appliance/signing-keys')
     def identity_signing_keys() -> dict:
@@ -586,15 +633,17 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # may discover the same endpoint, but only the first
                 # authorized customer can bind it. A removed camera keeps its
                 # claim until a separately authorized transfer is completed.
-                foreign_camera=db.execute(
-                    'SELECT id FROM cameras WHERE device_key=? AND customer_id<>? LIMIT 1',
-                    (job['device_key'],job['customer_id']),
+                foreign_active_camera=db.execute(
+                    "SELECT id FROM cameras WHERE lower(trim(device_key))=? AND customer_id<>? AND COALESCE(status,'')!='removed' LIMIT 1",
+                    (job['device_key'].strip().casefold(),job['customer_id']),
                 ).fetchone()
                 claim=db.execute(
                     'SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',
                     (job['device_key'].casefold(),),
                 ).fetchone()
-                if foreign_camera or (claim and claim['customer_id']!=job['customer_id']):
+                unresolved=db.execute("SELECT 1 FROM camera_identity_conflicts WHERE device_key=? AND status='needs_review'",(job['device_key'].strip().casefold(),)).fetchone()
+                pending_transfer=db.execute("SELECT 1 FROM camera_ownership_transfers WHERE device_key=? AND status IN ('awaiting_recipient','finalizing') AND expires_at>?",(job['device_key'].strip().casefold(),datetime.now().isoformat())).fetchone()
+                if unresolved or pending_transfer or foreign_active_camera or (claim and claim['customer_id']!=job['customer_id']):
                     success=False
                     message='Camera is already registered to another customer; an authorized transfer is required.'
                     failure_code='camera_owned_by_another_customer'

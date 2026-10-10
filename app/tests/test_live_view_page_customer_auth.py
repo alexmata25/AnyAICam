@@ -1,39 +1,20 @@
-"""Regression coverage for the /customer/cameras/{camera_id}/live
-customer-auth routing fix: confirmed live on Samsung that clicking Live
-view redirected to /login?next=... (the legacy local-emergency-recovery
-login) instead of ever reaching this page.
+"""HTTP regression coverage for live-view customer authentication.
 
-Investigation traced this to TWO separate things, both covered here:
-
-1. live_view_page.py's own genuinely-unauthenticated branch redirected
-   to /partner-login, never /customer-login.html -- fixed by this
-   commit to distinguish "no identity at all" (-> /customer-login.html,
-   preserving the intended destination via ?next=) from "a recognized
-   identity with the wrong role, e.g. partner/administrator" (still
-   /partner-login, deliberately unchanged).
-
-2. The actual live-observed /login?next=... redirect turned out to come
-   from a DIFFERENT layer entirely -- authentication_middleware
-   (main.py) falls through to that legacy redirect when
-   partner_identity(request) returns None, which happens when the
-   user's session was force-revoked by appliance_identity.
-   sessions_to_revoke() for having no identity_grants row (a separate,
-   deeper account-provisioning gap, fixed live on Samsung directly, out
-   of scope for this isolated routing fix -- see the session's own
-   report). This file tests live_view_page.py's OWN guard in isolation,
-   using partner_portal._token() with no session_id (same pattern
-   test_customer_analytics_integration.py already established), which
-   bypasses the separate user_sessions revocation check entirely --
-   exactly right for testing this route's routing logic on its own,
-   without needing to also stand up the identity_grants system.
-
-Real HTTP through the real app (TestClient(main.app)), a throwaway
-sqlite DB via override_target() -- same style as test_customer_
-analytics_integration.py, which already exercises this exact route.
+The real application middleware and route are exercised with signed,
+revocable partner sessions and a throwaway database. TestClient does not
+enter the appliance lifespan, keeping unrelated edge workers out of this
+focused HTTP test without skipping authentication or authorization.
 """
+
+import os
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+_TEST_RUNTIME=Path(__file__).parent/'.live-view-test-runtime'
+os.environ.setdefault('ANYAICAM_PARTNER_DB',str(_TEST_RUNTIME/'partner.db'))
+os.environ.setdefault('ANYAICAM_RECORDINGS_DIR',str(_TEST_RUNTIME/'recordings'))
 
 import main
 import partner_portal
@@ -69,23 +50,29 @@ def _seed_two_customers(conn):
         "INSERT OR IGNORE INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
         "VALUES('user-b','owner-b@example.test','customer_owner','cust-b','x','all','2026-01-01')"
     )
+    conn.execute("INSERT OR IGNORE INTO partner_users(id,email,role,password_hash,created_at) VALUES('user-admin','admin@example.test','administrator','x','2026-01-01')")
+    for session_id,user_id,email,role in (
+        ('session-a','user-a','owner-a@example.test','customer_owner'),
+        ('session-b','user-b','owner-b@example.test','customer_owner'),
+        ('session-admin','user-admin','admin@example.test','administrator'),
+    ):
+        conn.execute("INSERT OR IGNORE INTO user_sessions(id,user_id,email,role,session_type,created_at,last_seen_at,expires_at) VALUES(?,?,?,?,?,?,?,?)",(session_id,user_id,email,role,'cookie','2026-10-10T00:00:00','2026-10-10T00:00:00','2099-01-01T00:00:00'))
     conn.commit()
 
 
 def _owner_cookie(customer_id, email):
-    # session_id=None deliberately: bypasses the separate user_sessions
-    # revocation lookup, matching test_customer_analytics_integration.
-    # py's own established pattern for testing route-level auth logic
-    # in isolation from that unrelated mechanism.
-    return partner_portal._token(email, "customer_owner", None, customer_id, None)
+    session_id='session-a' if customer_id=='cust-a' else 'session-b'
+    return partner_portal._token(email, "customer_owner", None, customer_id, session_id)
 
 
 def _admin_cookie():
-    return partner_portal._token("admin@example.test", "administrator", None, None, None)
+    return partner_portal._token("admin@example.test", "administrator", None, None, 'session-admin')
 
 
 @pytest.fixture()
 def client(db_path):
+    if os.name == "nt":
+        pytest.skip("Starlette TestClient needs a local asyncio socketpair; this restricted Windows runner blocks it. Run this real-auth HTTP test on Linux.")
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
         initialize_database()
@@ -93,8 +80,15 @@ def client(db_path):
             from partner_db import connection
             with connection() as conn:
                 _seed_two_customers(conn)
-        with TestClient(main.app) as test_client:
+        # Exercise the real app's middleware, registered route, signed,
+        # revocable partner sessions, and per-camera authorization. The
+        # TestClient is intentionally not entered as a context manager so
+        # appliance lifespan workers do not start in this HTTP-only test.
+        test_client=TestClient(main.app)
+        try:
             yield test_client
+        finally:
+            test_client.close()
 
 
 # --------------------------------------------------- 1. authenticated customer_owner, own camera

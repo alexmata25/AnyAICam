@@ -47,12 +47,14 @@ import hashlib
 import re
 import secrets
 import socket
+import json
+import subprocess
 import time
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -302,8 +304,137 @@ def get_profiles(media_url: str, timeout: float = DEFAULT_TIMEOUT, username: str
             continue
         name_element = _find(element, 'Name')
         name = (name_element.text or '').strip() if name_element is not None and name_element.text else ''
-        profiles.append({'token': token, 'name': name})
+        encoding_element = _find(element, 'VideoEncoderConfiguration', 'Encoding')
+        advertised_codec = (encoding_element.text or '').strip().lower() if encoding_element is not None and encoding_element.text else None
+        resolution = _find(element, 'VideoEncoderConfiguration', 'Resolution')
+        width = _find(resolution, 'Width') if resolution is not None else None
+        height = _find(resolution, 'Height') if resolution is not None else None
+        try:
+            dimensions = (int(width.text), int(height.text)) if width is not None and height is not None else (None, None)
+        except (TypeError, ValueError):
+            dimensions = (None, None)
+        profiles.append({'token': token, 'name': name, 'advertised_codec': advertised_codec,
+                         'width': dimensions[0], 'height': dimensions[1]})
     return profiles
+
+
+def _codec_name(value):
+    value = (value or '').strip().lower()
+    if value in ('h264', 'avc', 'avc1'):
+        return 'h264'
+    if value in ('h265', 'hevc', 'hev1', 'hvc1'):
+        return 'h265'
+    return value or None
+
+
+def _stream_role(profile):
+    label = f"{profile.get('name', '')} {profile.get('token', '')}".lower()
+    if any(word in label for word in ('sub', 'secondary', 'low', 'mobile')):
+        return 'substream'
+    if any(word in label for word in ('main', 'primary', 'high')):
+        return 'main'
+    return 'unknown'
+
+
+def probe_rtsp_codec(uri: str, username: str | None = None, password: str | None = None, timeout: float = 8) -> str | None:
+    """Probe one actual RTSP video stream with FFprobe.
+
+    Credentials are supplied only by the authenticated provisioning flow.
+    The credential-bearing URI is never returned, logged, or included in
+    raised errors. Output is parsed as JSON and the process has a hard
+    timeout so an unavailable camera cannot stall provisioning forever.
+    """
+    clean_uri, _ = sanitize_rtsp_uri(uri)
+    if not clean_uri:
+        return None
+    probe_uri = credentialed_rtsp_uri(clean_uri, username or '', password or '')
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name', '-of', 'json', probe_uri],
+            capture_output=True, text=True, timeout=max(1, min(float(timeout), 15)), check=False,
+        )
+        if result.returncode != 0:
+            return None
+        payload = json.loads(result.stdout or '{}')
+        streams = payload.get('streams') if isinstance(payload, dict) else None
+        if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+            return None
+        return _codec_name(streams[0].get('codec_name'))
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return None
+
+
+def resolve_media_streams(ip: str, device_key: str, timeout: float = DEFAULT_TIMEOUT,
+                         username: str | None = None, password: str | None = None,
+                         ffprobe=probe_rtsp_codec) -> dict:
+    """Resolve and verify each ONVIF profile independently.
+
+    ONVIF encoder metadata is retained as advertised_codec; observed_codec
+    comes only from probing the actual RTSP profile. This intentionally
+    exposes Samsung's H264-advertised/H265-delivered mismatch instead of
+    trusting metadata. Returned URIs have embedded userinfo removed.
+    """
+    xaddr = _probe_xaddr(ip, device_key, timeout=DISCOVERY_TIMEOUT)
+    device_url = device_service_url(ip, xaddr)
+    try:
+        media_url = get_media_service_url(device_url, timeout, username, password)
+        profiles = get_profiles(media_url, timeout, username, password)
+    except (OnvifAuthRequired, OnvifRequestError) as error:
+        return {'status': 'auth_required' if isinstance(error, OnvifAuthRequired) else 'error', 'streams': []}
+    streams = []
+    for profile in profiles:
+        try:
+            raw_uri = get_stream_uri(media_url, profile['token'], timeout, username, password)
+        except (OnvifAuthRequired, OnvifRequestError):
+            continue
+        clean_uri, _ = sanitize_rtsp_uri(raw_uri)
+        if not clean_uri:
+            continue
+        observed = ffprobe(clean_uri, username, password)
+        streams.append({
+            'profile_token': profile['token'],
+            'profile_name': profile.get('name') or None,
+            'stream_role': _stream_role(profile),
+            'width': profile.get('width'),
+            'height': profile.get('height'),
+            'rtsp_uri': clean_uri,
+            'advertised_codec': _codec_name(profile.get('advertised_codec')),
+            'observed_codec': _codec_name(observed),
+            'verified': bool(observed),
+            'browser_compatible': _codec_name(observed) == 'h264',
+        })
+    dimensioned = [item for item in streams if item.get('width') and item.get('height')]
+    if len(dimensioned) >= 2:
+        largest = max(int(item['width']) * int(item['height']) for item in dimensioned)
+        for item in dimensioned:
+            if item['stream_role'] == 'unknown':
+                item['stream_role'] = 'main' if int(item['width']) * int(item['height']) == largest else 'substream'
+    selected = select_browser_stream(streams)
+    warning = None if selected else 'No verified H.264 stream is available for browser WebRTC; choose another camera profile or enable an approved transcoding path.'
+    return {'status': 'resolved' if streams else 'no_streams', 'streams': streams,
+            'browser_profile_token': selected.get('profile_token') if selected else None,
+            'compatibility_warning': warning}
+
+
+def select_browser_stream(streams: list[dict]) -> dict | None:
+    verified = [item for item in streams if item.get('observed_codec') == 'h264']
+    if not verified:
+        return None
+    # Browser WebRTC prefers the verified substream for bandwidth; when
+    # that is H265, select a verified H264 main stream instead.
+    return next((item for item in verified if item.get('stream_role') == 'substream'),
+                next((item for item in verified if item.get('stream_role') == 'main'), verified[0]))
+
+
+def credentialed_rtsp_uri(uri: str, username: str, password: str) -> str:
+    parsed = urlsplit(uri)
+    host = parsed.hostname or ''
+    if parsed.port:
+        host += f':{parsed.port}'
+    if username or password:
+        host = f"{quote(username, safe='')}:{quote(password, safe='')}@{host}"
+    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
 
 
 def select_profile(profiles: list[dict]) -> dict | None:

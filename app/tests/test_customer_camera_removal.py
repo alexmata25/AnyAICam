@@ -305,7 +305,7 @@ def test_removed_camera_is_not_returned_as_active_appliance_configuration(db_pat
         assert appliance_configuration(_request())["cameras"] == []
 
 
-def test_customer_management_page_exposes_remove_only_to_camera_owner(db_path, monkeypatch):
+def test_customer_management_page_exposes_lifecycle_controls_only_to_camera_owner(db_path, monkeypatch):
     customer_account = _route("/customer-account", "GET")
     monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _identity())
     with override_target(sqlite_path=db_path):
@@ -318,7 +318,11 @@ def test_customer_management_page_exposes_remove_only_to_camera_owner(db_path, m
         owner_html = owner.body.decode() if hasattr(owner, "body") else str(owner)
         assert "Camera Management" in owner_html
         assert "Remove camera" in owner_html
+        assert "Transfer camera" in owner_html
+        assert "Replace camera" in owner_html
         monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _identity(role="customer_viewer"))
         viewer = customer_account(_request())
         viewer_html = viewer.body.decode() if hasattr(viewer, "body") else str(viewer)
         assert "Remove camera" not in viewer_html
+        assert "Transfer camera" not in viewer_html
+        assert "Replace camera" not in viewer_html

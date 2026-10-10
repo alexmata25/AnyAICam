@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 
-from database_backend import connect
+from database_backend import backend, connect
 
 logger=logging.getLogger('anyaicam.migrations')
 
@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS camera_credentials(camera_id TEXT PRIMARY KEY,encrypt
 '''),
     ('20260827_camera_analytics_entitlements','''
 CREATE TABLE IF NOT EXISTS camera_analytics_entitlements(camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(camera_id,analytic_key),FOREIGN KEY(camera_id) REFERENCES cameras(id));
+'''),
+    ('20261010_camera_stream_codecs','''
+CREATE TABLE IF NOT EXISTS camera_stream_profiles(
+    camera_id TEXT NOT NULL,profile_token TEXT NOT NULL,profile_name TEXT,stream_role TEXT NOT NULL DEFAULT 'unknown',
+    rtsp_uri TEXT NOT NULL,advertised_codec TEXT,observed_codec TEXT,verified_at TEXT,
+    PRIMARY KEY(camera_id,profile_token),FOREIGN KEY(camera_id) REFERENCES cameras(id));
 '''),
 ]
 
@@ -203,13 +209,57 @@ def apply_migrations():
         # another customer cannot silently register the same device. A
         # separately authorized transfer flow may move this claim later.
         db.execute('CREATE TABLE IF NOT EXISTS camera_identity_registry(device_key TEXT PRIMARY KEY,customer_id TEXT NOT NULL,camera_id TEXT,created_at TEXT NOT NULL)')
+        db.execute('''CREATE TABLE IF NOT EXISTS camera_transfer_invites(
+            id TEXT PRIMARY KEY,code_hash TEXT NOT NULL UNIQUE,target_customer_id TEXT NOT NULL,
+            created_by_email TEXT NOT NULL,expires_at TEXT NOT NULL,consumed_at TEXT,created_at TEXT NOT NULL)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS camera_ownership_transfers(
+            id TEXT PRIMARY KEY,device_key TEXT NOT NULL,source_customer_id TEXT NOT NULL,source_camera_id TEXT NOT NULL,
+            target_customer_id TEXT NOT NULL,invite_id TEXT,status TEXT NOT NULL,initiated_by_email TEXT NOT NULL,
+            accepted_by_email TEXT,target_appliance_id TEXT,target_site_id TEXT,target_camera_id TEXT,
+            provisioning_job_id TEXT,expires_at TEXT NOT NULL,evidence_reference TEXT,admin_reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)''')
+        transfer_columns=({item['name'] for item in db.execute('PRAGMA table_info(camera_ownership_transfers)').fetchall()}
+                          if backend()=='sqlite' else
+                          {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='camera_ownership_transfers'").fetchall()})
+        if 'provisioning_job_id' not in transfer_columns:
+            db.execute('ALTER TABLE camera_ownership_transfers ADD COLUMN provisioning_job_id TEXT')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_transfer_pending_identity ON camera_ownership_transfers(device_key) WHERE status IN (\'awaiting_recipient\',\'finalizing\')')
+        db.execute('''CREATE TABLE IF NOT EXISTS camera_ownership_transfer_events(
+            id TEXT PRIMARY KEY,transfer_id TEXT NOT NULL,actor_email TEXT NOT NULL,actor_role TEXT NOT NULL,
+            action TEXT NOT NULL,details_json TEXT NOT NULL,created_at TEXT NOT NULL,
+            FOREIGN KEY(transfer_id) REFERENCES camera_ownership_transfers(id))''')
+        db.execute('''CREATE TABLE IF NOT EXISTS camera_identity_conflicts(
+            device_key TEXT PRIMARY KEY,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'needs_review',
+            created_at TEXT NOT NULL,resolved_at TEXT,resolved_by TEXT,evidence_reference TEXT)''')
         for camera in db.execute(
             'SELECT id,customer_id,device_key,created_at FROM cameras '
             "WHERE device_key IS NOT NULL AND TRIM(device_key)!='' ORDER BY created_at,id"
         ).fetchall():
+            key=str(camera['device_key'] or '').strip().casefold()
+            owners=db.execute('SELECT DISTINCT customer_id FROM cameras WHERE lower(trim(device_key))=?',(key,)).fetchall()
+            if len(owners)>1:
+                # Existing duplicate identity rows may represent a legitimate
+                # historical transfer. Timestamps do not prove current ownership;
+                # leave the identity blocked until an owner transfer or audited
+                # administrator reconciliation resolves it.
+                db.execute(
+                    "INSERT OR IGNORE INTO camera_identity_conflicts(device_key,reason,status,created_at) VALUES(?,?,'needs_review',?)",
+                    (key,'multiple_customer_rows_require_authorized_reconciliation',camera['created_at']),
+                )
+                continue
+            current=db.execute('SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',(key,)).fetchone()
+            if current and current['customer_id']!=camera['customer_id']:
+                db.execute(
+                    "INSERT OR IGNORE INTO camera_identity_conflicts(device_key,reason,status,created_at) VALUES(?,?,'needs_review',?)",
+                    (key,'registry_owner_conflicts_with_camera_rows',camera['created_at']),
+                )
+                continue
+            preferred=db.execute(
+                "SELECT id,customer_id,created_at FROM cameras WHERE lower(trim(device_key))=? ORDER BY CASE WHEN COALESCE(status,'')!='removed' THEN 0 ELSE 1 END,created_at,id LIMIT 1",
+                (key,),
+            ).fetchone()
             db.execute(
                 'INSERT OR IGNORE INTO camera_identity_registry(device_key,customer_id,camera_id,created_at) VALUES(?,?,?,?)',
-                (str(camera['device_key'] or '').strip().casefold(),camera['customer_id'],camera['id'],camera['created_at']),
+                (key,camera['customer_id'],preferred['id'],preferred['created_at']),
             )
         # Restored from production's 20260824_camera_discovery migration
         # (see that migration's own comment below for the full story):

@@ -1,5 +1,6 @@
 from cloud_config import settings as cloud_settings
 import json
+import hashlib
 import secrets
 import subprocess
 from datetime import datetime, timedelta
@@ -344,7 +345,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # wizard, has real, online, recording cameras that must show as
         # installed without ever touching that wizard.
         all_customer_cameras=rows(
-            'SELECT c.id,c.name,c.camera_number,c.status,'
+            'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,'
             'MAX(COALESCE(acs.online,0)) AS appliance_online,'
             'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
             'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
@@ -359,7 +360,8 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 appliance_reported_recording=bool(camera['appliance_recording']),
                 has_cloud_recording=camera['has_recording'],
             )
-        cameras=[camera for camera in all_customer_cameras if camera['installed']]
+        owner_can_manage=identity.get('role')=='customer_owner'
+        cameras=[camera for camera in all_customer_cameras if camera['installed'] or (owner_can_manage and camera.get('device_key'))]
 
         # An activated appliance is necessary but not sufficient: a
         # customer can have a linked, activated appliance and still
@@ -370,7 +372,8 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         if identity['role']=='customer_owner' and not activated:
             return RedirectResponse('/customer/setup',status_code=303)
 
-        owner_can_manage=identity.get('role')=='customer_owner'
+        customer_appliances=rows('SELECT id,cloud_id FROM appliances WHERE customer_id=? ORDER BY cloud_id',(customer['id'],))
+        appliance_options=''.join(f'<option value="{escape(item["id"],quote=True)}">{escape(item.get("cloud_id") or item["id"])}</option>' for item in customer_appliances)
         camera_cards=''.join(
             f'''<article class="feature-card">
                 <div class="feature-icon">▣</div>
@@ -383,6 +386,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 ))}</p>
                 <a class="action-button" href="/customer/cameras/{escape(camera['id'],quote=True)}/live">Live view</a>
                 {f'<button type="button" class="ghost-button remove-camera-button" data-camera-id="{escape(camera["id"],quote=True)}">Remove camera</button>' if owner_can_manage else ''}
+                {f'<button type="button" class="ghost-button transfer-camera-button" data-camera-id="{escape(camera["id"],quote=True)}">Transfer camera</button><button type="button" class="ghost-button replace-camera-button" data-camera-id="{escape(camera["id"],quote=True)}">Replace camera</button>' if owner_can_manage and camera.get('device_key') and camera['status']!='pending_installation' else ''}
             </article>'''
             for camera in cameras
         ) or '<div class="empty">No cameras are assigned to this customer account.</div>'
@@ -405,10 +409,47 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 {('<a class="action-button" href="/customer/setup?step=4">Add camera</a>' if owner_can_manage else '')}
             </div>
             <div class="feature-grid">{camera_cards}</div>
+            {('<div class="rule-form"><label>Destination appliance<select id="camera-lifecycle-appliance">'+appliance_options+'</select></label></div><section class="panel"><h3>Incoming camera transfers</h3><div id="camera-transfer-inbox">Loading…</div></section>' if owner_can_manage else '')}
         </section>'''
 
         scripts='''<script>
 document.addEventListener('click',async event=>{
+  const transfer=event.target.closest('.transfer-camera-button');
+  if(transfer){
+    const cameraId=transfer.dataset.cameraId;
+    const email=window.prompt('Enter the destination customer owner email. The destination owner must accept the transfer.');
+    if(!email)return;
+    transfer.disabled=true;
+    try{
+      const invite=await fetch('/api/customer/camera-transfer-invitations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_email:email})});
+      const inviteResult=await invite.json();
+      if(!invite.ok){showToast(inviteResult.detail||'Transfer could not be started.');return;}
+      const response=await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}/transfers`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation:'TRANSFER',invitation_code:inviteResult.invitation_code})});
+      const result=await response.json();
+      if(!response.ok){showToast(result.detail||'Transfer could not be started.');return;}
+      showToast('Transfer requested. The destination owner must accept before ownership changes.');
+      await refreshTransferInbox();
+    }catch(error){showToast('Transfer could not be confirmed. Check the connection and retry.');}
+    finally{transfer.disabled=false;}
+    return;
+  }
+  const replace=event.target.closest('.replace-camera-button');
+  if(replace){
+    const key=window.prompt('Enter the new camera physical identity (device UUID).');
+    if(!key)return;
+    const appliance=document.getElementById('camera-lifecycle-appliance')?.value;
+    if(!appliance){showToast('Select a destination appliance first.');return;}
+    if(window.prompt('Type REPLACE to archive this camera and commission the new device.')!=='REPLACE')return;
+    replace.disabled=true;
+    try{
+      const response=await fetch(`/api/customer/cameras/${encodeURIComponent(replace.dataset.cameraId)}/replace`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation:'REPLACE',device_key:key,appliance_id:appliance})});
+      const result=await response.json();
+      if(!response.ok){showToast(result.detail||'Replacement failed.');return;}
+      showToast('Replacement queued. Historical media remains archived under this account.');location.reload();
+    }catch(error){showToast('Replacement could not be confirmed. Check the connection and retry.');}
+    finally{replace.disabled=false;}
+    return;
+  }
   const button=event.target.closest('.remove-camera-button');
   if(!button)return;
   const cameraId=button.dataset.cameraId;
@@ -423,6 +464,30 @@ document.addEventListener('click',async event=>{
     location.reload();
   }catch(error){button.disabled=false;showToast('Camera removal could not be confirmed. Check the connection and retry.');}
 });
+async function refreshTransferInbox(){
+  const container=document.getElementById('camera-transfer-inbox');if(!container)return;
+  try{
+    const response=await fetch('/api/customer/camera-transfers/incoming');const result=await response.json();
+    container.replaceChildren();
+    for(const transfer of (result.transfers||[])){
+      const row=document.createElement('div');row.className='rule-form';
+      const label=document.createElement('span');label.textContent=`Transfer request for device ${transfer.device_key}`;row.append(label);
+      const accept=document.createElement('button');accept.type='button';accept.className='action-button';accept.textContent='Accept transfer';
+      accept.addEventListener('click',async()=>{
+        const appliance=document.getElementById('camera-lifecycle-appliance')?.value;
+        if(!appliance){showToast('Select a destination appliance first.');return;}
+        if(window.prompt('Type ACCEPT TRANSFER to confirm destination ownership.')!=='ACCEPT TRANSFER')return;
+        accept.disabled=true;
+        const reply=await fetch(`/api/customer/camera-transfers/${encodeURIComponent(transfer.id)}/accept`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation:'ACCEPT TRANSFER',appliance_id:appliance})});
+        const value=await reply.json();
+        if(!reply.ok){showToast(value.detail||'Transfer acceptance failed.');accept.disabled=false;return;}
+        showToast('Camera transfer accepted and queued for the destination appliance.');location.reload();
+      });row.append(accept);container.append(row);
+    }
+    if(!result.transfers?.length)container.textContent='No incoming transfers.';
+  }catch(error){container.textContent='Incoming transfers could not be loaded.';}
+}
+refreshTransferInbox();
 </script>'''
         return shell('Customer VMS','dashboard',content,scripts)
 
@@ -613,6 +678,76 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
     CAMERA_PROVISIONING_TERMINAL_STATES={'provisioned','failed'}
     CAMERA_PROVISIONING_TIMEOUT_SECONDS=300
 
+    def _active_camera_count(db,customer_id: str) -> int:
+        configured=int(db.execute(
+            "SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL AND COALESCE(status,'')!='removed'",
+            (customer_id,),
+        ).fetchone()['n'])
+        queued_without_row=int(db.execute(
+            "SELECT COUNT(*) AS n FROM camera_provisioning_requests j WHERE j.customer_id=? AND j.status='queued' AND NOT EXISTS (SELECT 1 FROM cameras c WHERE c.customer_id=j.customer_id AND lower(trim(c.device_key))=lower(trim(j.device_key)) AND COALESCE(c.status,'')!='removed')",
+            (customer_id,),
+        ).fetchone()['n'])
+        return configured+queued_without_row
+
+    def _require_camera_capacity(db,customer_id: str,*,replacing_camera_id: str|None=None) -> int:
+        plan=db.execute('SELECT id FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(customer_id,)).fetchone()
+        if plan:
+            # A no-op write serializes capacity reservations on the purchased
+            # plan row across workers and processes (SQLite and PostgreSQL).
+            db.execute('UPDATE plans SET camera_quantity=camera_quantity WHERE id=?',(plan['id'],))
+            plan=db.execute('SELECT camera_quantity FROM plans WHERE id=?',(plan['id'],)).fetchone()
+        quantity=int(plan['camera_quantity'] or 0) if plan else 0
+        used=_active_camera_count(db,customer_id)
+        if replacing_camera_id:
+            old=db.execute("SELECT 1 FROM cameras WHERE id=? AND customer_id=? AND device_key IS NOT NULL AND COALESCE(status,'')!='removed'",(replacing_camera_id,customer_id)).fetchone()
+            if old: used=max(0,used-1)
+        if quantity<=0 or used>=quantity:
+            raise HTTPException(status_code=409,detail='No licensed camera slot is available on this account.')
+        return quantity
+
+    def _transfer_event(db,transfer_id: str,actor_email: str,actor_role: str,action: str,details: dict,now: str) -> None:
+        db.execute(
+            'INSERT INTO camera_ownership_transfer_events(id,transfer_id,actor_email,actor_role,action,details_json,created_at) VALUES(?,?,?,?,?,?,?)',
+            (secrets.token_hex(12),transfer_id,actor_email,actor_role,action,json.dumps(details,sort_keys=True),now),
+        )
+
+    def _transfer_target(db,customer_id: str,appliance_id: str,site_id: str|None,*,camera_name: str|None=None) -> tuple[dict,str]:
+        appliance=db.execute('SELECT id,site_id FROM appliances WHERE id=? AND customer_id=?',(appliance_id,customer_id)).fetchone()
+        if not appliance: raise HTTPException(status_code=404,detail='Destination appliance was not found on this account.')
+        selected_site=site_id or appliance['site_id']
+        site=db.execute('SELECT id FROM sites WHERE id=? AND customer_id=?',(selected_site,customer_id)).fetchone()
+        if not site: raise HTTPException(status_code=404,detail='Destination site was not found on this account.')
+        return dict(appliance),selected_site
+
+    def _create_target_camera_and_job(db,*,customer_id: str,appliance_id: str,site_id: str,device_key: str,name: str,encrypted_credentials,now: str) -> tuple[str,str]:
+        camera_id=secrets.token_hex(5); job_id=secrets.token_hex(6)
+        db.execute(
+            'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
+            (camera_id,customer_id,site_id,appliance_id,device_key,name,'pending_installation',now),
+        )
+        db.execute(
+            'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (job_id,customer_id,appliance_id,site_id,device_key,name,'motion','[]',encrypted_credentials,'queued','Authorized camera lifecycle operation queued for the destination appliance.',now,now),
+        )
+        return camera_id,job_id
+
+    def _archive_for_lifecycle(db,camera,now: str) -> None:
+        db.execute(
+            "UPDATE cameras SET former_camera_number=COALESCE(camera_number,former_camera_number),camera_number=NULL,status='removed' WHERE id=? AND customer_id=?",
+            (camera['id'],camera['customer_id']),
+        )
+        db.execute('DELETE FROM camera_credentials WHERE camera_id=?',(camera['id'],))
+        db.execute('DELETE FROM live_relay_idle_tracking WHERE camera_id=?',(camera['id'],))
+        db.execute("UPDATE live_view_sessions SET state='failed',failed_at=?,error='camera_transferred_or_replaced' WHERE camera_id=? AND state IN ('requested','starting','ready')",(now,camera['id']))
+
+    def _stop_lifecycle_stream(camera_number) -> None:
+        if camera_number is None: return
+        from main import _ffmpeg_process_lock,stop_camera_processes
+        try:
+            with _ffmpeg_process_lock: stop_camera_processes(int(camera_number))
+        except (OSError,subprocess.TimeoutExpired) as error:
+            raise HTTPException(status_code=503,detail='Camera streams could not be stopped. No lifecycle changes were saved; retry or contact support.') from error
+
     # Encryption itself now lives in appliance_protocol.py, shared with
     # appliance_cloud.py's decrypt-on-poll (see the import at the top of
     # this file) -- one source of truth for ANYAICAM_CAMERA_CREDENTIAL_KEY
@@ -646,6 +781,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured on this deployment yet. Contact support before adding a credentialed camera.')
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
+            _require_camera_capacity(db,identity['customer_id'])
             # A physical device identity is globally bound to one customer.
             # Removal releases the licensed slot but retains this ownership
             # claim; a future transfer must explicitly authorize moving it.
@@ -653,11 +789,17 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                 'SELECT customer_id FROM camera_identity_registry WHERE device_key=?',
                 (device_key.casefold(),),
             ).fetchone()
-            foreign_camera=db.execute(
-                'SELECT id FROM cameras WHERE device_key=? AND customer_id<>? LIMIT 1',
-                (device_key,identity['customer_id']),
+            foreign_active=db.execute(
+                "SELECT id FROM cameras WHERE lower(trim(device_key))=? AND customer_id<>? AND COALESCE(status,'')!='removed' LIMIT 1",
+                (device_key.casefold(),identity['customer_id']),
             ).fetchone()
-            if (identity_claim and identity_claim['customer_id']!=identity['customer_id']) or foreign_camera:
+            any_foreign=db.execute(
+                'SELECT id FROM cameras WHERE lower(trim(device_key))=? AND customer_id<>? LIMIT 1',
+                (device_key.casefold(),identity['customer_id']),
+            ).fetchone()
+            conflict=db.execute("SELECT 1 FROM camera_identity_conflicts WHERE device_key=? AND status='needs_review'",(device_key.casefold(),)).fetchone()
+            pending_transfer=db.execute("SELECT 1 FROM camera_ownership_transfers WHERE device_key=? AND status IN ('awaiting_recipient','finalizing') AND expires_at>?",(device_key.casefold(),datetime.now().isoformat())).fetchone()
+            if conflict or pending_transfer or (identity_claim and identity_claim['customer_id']!=identity['customer_id']) or foreign_active or (any_foreign and not identity_claim):
                 raise HTTPException(status_code=409,detail='This camera is already registered to another customer. An authorized transfer is required.')
             db.execute(
                 'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) '
@@ -782,6 +924,265 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             'status':'removed','already_removed':already_removed,
             'camera_capacity':{'configured_camera_count':active_count,'licensed_camera_slots':int(plan['camera_quantity'] if plan else 0)},
         }
+
+    @app.post('/api/customer/camera-transfer-invitations')
+    def create_camera_transfer_invitation(request: Request,payload: dict) -> dict:
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        target_email=str((payload or {}).get('target_email') or '').strip().casefold()
+        if not target_email or '@' not in target_email:
+            raise HTTPException(status_code=400,detail='A destination customer owner email is required.')
+        token=secrets.token_urlsafe(32); now=datetime.now(); expires=now+timedelta(hours=24)
+        with connection() as db:
+            target=db.execute("SELECT id FROM customers WHERE lower(email)=? AND status NOT IN ('suspended','cancelled')",(target_email,)).fetchone()
+            if not target or target['id']==identity['customer_id']:
+                raise HTTPException(status_code=404,detail='Transfer invitation could not be created for that destination.')
+            target_customer_id=target['id']
+            invite_id=secrets.token_hex(12)
+            db.execute(
+                'INSERT INTO camera_transfer_invites(id,code_hash,target_customer_id,created_by_email,expires_at,created_at) VALUES(?,?,?,?,?,?)',
+                (invite_id,hashlib.sha256(token.encode()).hexdigest(),target_customer_id,identity['email'],expires.isoformat(),now.isoformat()),
+            )
+            db.execute(
+                'INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',
+                (identity['email'],identity['role'],'camera.transfer_invitation_created','customer',target_customer_id,json.dumps({'invite_id':invite_id,'expires_at':expires.isoformat()}),now.isoformat()),
+            )
+        # The high-entropy token is shown once for out-of-band delivery; only
+        # its digest is persisted and it grants no ownership until acceptance.
+        return {'invitation_code':token,'expires_at':expires.isoformat(),'message':'Share this one-time code with the destination customer owner through a trusted channel.'}
+
+    @app.post('/api/customer/cameras/{camera_id}/transfers')
+    def request_customer_camera_transfer(request: Request,camera_id: str,payload: dict) -> dict:
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        payload=payload if isinstance(payload,dict) else {}
+        if payload.get('confirmation')!='TRANSFER' or not payload.get('invitation_code'):
+            raise HTTPException(status_code=400,detail='Explicit transfer confirmation and a destination invitation code are required.')
+        digest=hashlib.sha256(str(payload['invitation_code']).encode()).hexdigest(); now=datetime.now(); now_text=now.isoformat()
+        with connection() as db:
+            camera=db.execute('SELECT id,customer_id,device_key,status FROM cameras WHERE id=? AND customer_id=?',(camera_id,identity['customer_id'])).fetchone()
+            if not camera or not (camera['device_key'] or '').strip(): raise HTTPException(status_code=404,detail='Provisioned camera not found.')
+            key=camera['device_key'].strip().casefold()
+            if db.execute("SELECT 1 FROM camera_identity_conflicts WHERE device_key=? AND status='needs_review'",(key,)).fetchone():
+                raise HTTPException(status_code=409,detail='This identity requires administrator reconciliation before customer transfer.')
+            invite=db.execute('SELECT * FROM camera_transfer_invites WHERE code_hash=?',(digest,)).fetchone()
+            prior=db.execute('SELECT id,status,expires_at FROM camera_ownership_transfers WHERE invite_id=? AND source_camera_id=? AND source_customer_id=?',(invite['id'],camera_id,identity['customer_id'])).fetchone() if invite else None
+            if prior and prior['status'] in {'awaiting_recipient','completed'} and (prior['status']=='completed' or prior['expires_at']>now_text):
+                return {'transfer_id':prior['id'],'status':prior['status'],'expires_at':prior['expires_at'],'already_requested':True}
+            if not invite or invite['consumed_at'] or invite['expires_at']<=now_text:
+                raise HTTPException(status_code=409,detail='Destination invitation is invalid, expired, or already used.')
+            if invite['target_customer_id']==identity['customer_id']:
+                raise HTTPException(status_code=400,detail='A camera cannot be transferred to its current account.')
+            claim=db.execute('SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',(key,)).fetchone()
+            if not claim or claim['customer_id']!=identity['customer_id'] or claim['camera_id'] not in (None,camera_id):
+                raise HTTPException(status_code=409,detail='Camera ownership registry does not match this source camera.')
+            transfer_id=secrets.token_hex(12); expires=(now+timedelta(hours=24)).isoformat()
+            db.execute("UPDATE camera_ownership_transfers SET status='expired',updated_at=? WHERE device_key=? AND status='awaiting_recipient' AND expires_at<=?",(now_text,key,now_text))
+            try:
+                db.execute("INSERT INTO camera_ownership_transfers(id,device_key,source_customer_id,source_camera_id,target_customer_id,invite_id,status,initiated_by_email,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,'awaiting_recipient',?,?,?,?)",(transfer_id,key,identity['customer_id'],camera_id,invite['target_customer_id'],invite['id'],identity['email'],expires,now_text,now_text))
+            except Exception as error:
+                if 'UNIQUE' in str(error).upper(): raise HTTPException(status_code=409,detail='Another transfer is already pending for this camera.') from error
+                raise
+            changed=db.execute('UPDATE camera_transfer_invites SET consumed_at=? WHERE id=? AND consumed_at IS NULL',(now_text,invite['id'])).rowcount
+            if not changed: raise HTTPException(status_code=409,detail='Destination invitation was already used.')
+            _transfer_event(db,transfer_id,identity['email'],identity['role'],'source_authorized',{'source_camera_id':camera_id,'source_customer_id':identity['customer_id'],'target_customer_id':invite['target_customer_id']},now_text)
+        return {'transfer_id':transfer_id,'status':'awaiting_recipient','expires_at':expires,'message':'The destination owner must accept before ownership changes.'}
+
+    @app.get('/api/customer/camera-transfers/incoming')
+    def incoming_customer_camera_transfers(request: Request) -> dict:
+        identity=customer_owner(request)
+        with connection() as db:
+            items=db.execute("SELECT id,device_key,source_customer_id,expires_at,created_at FROM camera_ownership_transfers WHERE target_customer_id=? AND status='awaiting_recipient' AND expires_at>? ORDER BY created_at",(identity['customer_id'],datetime.now().isoformat())).fetchall()
+        return {'transfers':[dict(item) for item in items]}
+
+    @app.post('/api/customer/camera-transfers/{transfer_id}/accept')
+    def accept_customer_camera_transfer(request: Request,transfer_id: str,payload: dict) -> dict:
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        payload=payload if isinstance(payload,dict) else {}
+        if payload.get('confirmation')!='ACCEPT TRANSFER': raise HTTPException(status_code=400,detail='Explicit destination-owner confirmation is required.')
+        username=payload.get('username'); password=payload.get('password'); encrypted=None
+        if username or password:
+            encrypted=encrypt_camera_credentials(str(username or ''),str(password or ''))
+            if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured; no ownership changes were saved.')
+        from main import _ffmpeg_process_lock
+        now=datetime.now(); now_text=now.isoformat()
+        with _ffmpeg_process_lock:
+            with connection() as db:
+                transfer=db.execute('SELECT * FROM camera_ownership_transfers WHERE id=? AND target_customer_id=?',(transfer_id,identity['customer_id'])).fetchone()
+                if not transfer: raise HTTPException(status_code=404,detail='Transfer request not found.')
+                if transfer['status']=='completed': return {'transfer_id':transfer_id,'status':'completed','camera_id':transfer['target_camera_id'],'already_completed':True}
+                if transfer['status']!='awaiting_recipient' or transfer['expires_at']<=now_text: raise HTTPException(status_code=409,detail='Transfer request is no longer available.')
+                target_appliance_id=str(payload.get('appliance_id') or '').strip()
+                target_appliance,target_site_id=_transfer_target(db,identity['customer_id'],target_appliance_id,payload.get('site_id'))
+                _require_camera_capacity(db,identity['customer_id'])
+                source=db.execute('SELECT * FROM cameras WHERE id=? AND customer_id=?',(transfer['source_camera_id'],transfer['source_customer_id'])).fetchone()
+                if not source or (source['device_key'] or '').strip().casefold()!=transfer['device_key']:
+                    raise HTTPException(status_code=409,detail='Source camera identity changed; transfer cannot proceed.')
+                claim=db.execute('SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',(transfer['device_key'],)).fetchone()
+                if not claim or claim['customer_id']!=transfer['source_customer_id'] or claim['camera_id'] not in (None,source['id']):
+                    raise HTTPException(status_code=409,detail='Camera ownership changed while this transfer was pending.')
+                duplicate=db.execute('SELECT id FROM cameras WHERE lower(trim(device_key))=? AND customer_id=?',(transfer['device_key'],identity['customer_id'])).fetchone()
+                if duplicate: raise HTTPException(status_code=409,detail='Destination already has a camera row for this physical device; administrator reconciliation is required.')
+                other_active=db.execute("SELECT id FROM cameras WHERE lower(trim(device_key))=? AND customer_id NOT IN (?,?) AND COALESCE(status,'')!='removed' LIMIT 1",(transfer['device_key'],transfer['source_customer_id'],identity['customer_id'])).fetchone()
+                if other_active: raise HTTPException(status_code=409,detail='Another active owner is registered for this device.')
+                if source['camera_number'] is not None:
+                    try: from main import stop_camera_processes; stop_camera_processes(int(source['camera_number']))
+                    except (OSError,subprocess.TimeoutExpired) as error: raise HTTPException(status_code=503,detail='Source camera stream could not be stopped; transfer was not saved.') from error
+                camera_id,job_id=_create_target_camera_and_job(db,customer_id=identity['customer_id'],appliance_id=target_appliance_id,site_id=target_site_id,device_key=source['device_key'],name=str(payload.get('name') or source['name'] or 'Transferred camera').strip(),encrypted_credentials=encrypted,now=now_text)
+                changed=db.execute('UPDATE camera_identity_registry SET customer_id=?,camera_id=? WHERE device_key=? AND customer_id=? AND (camera_id=? OR camera_id IS NULL)',(identity['customer_id'],camera_id,transfer['device_key'],transfer['source_customer_id'],source['id'])).rowcount
+                if not changed: raise HTTPException(status_code=409,detail='Camera ownership changed concurrently; retry after refreshing the page.')
+                _archive_for_lifecycle(db,source,now_text)
+                db.execute("UPDATE camera_ownership_transfers SET status='completed',accepted_by_email=?,target_appliance_id=?,target_site_id=?,target_camera_id=?,provisioning_job_id=?,updated_at=? WHERE id=? AND status='awaiting_recipient'",(identity['email'],target_appliance_id,target_site_id,camera_id,job_id,now_text,transfer_id))
+                _transfer_event(db,transfer_id,identity['email'],identity['role'],'recipient_accepted_and_completed',{'source_camera_id':source['id'],'target_camera_id':camera_id,'destination_job_id':job_id},now_text)
+                db.execute('UPDATE camera_identity_conflicts SET status=\'resolved\',resolved_at=?,resolved_by=?,evidence_reference=? WHERE device_key=? AND status=\'needs_review\'',(now_text,identity['email'],'customer_two_party_transfer:'+transfer_id,transfer['device_key']))
+                for owner,actor_role,action,entity in ((transfer['initiated_by_email'],'customer_owner','camera.transferred_out',source['id']),(identity['email'],identity['role'],'camera.transferred_in',camera_id)):
+                    db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',(owner,actor_role,action,'camera',entity,json.dumps({'transfer_id':transfer_id,'device_key':transfer['device_key'],'other_customer_id':identity['customer_id'] if owner==transfer['initiated_by_email'] else transfer['source_customer_id']}),now_text))
+        return {'transfer_id':transfer_id,'status':'completed','camera_id':camera_id,'provisioning_job_id':job_id,'credentials_transferred':False}
+
+    @app.post('/api/customer/camera-lifecycle/{operation_id}/retry')
+    def retry_camera_lifecycle_provisioning(request: Request,operation_id: str,payload: dict) -> dict:
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        payload=payload if isinstance(payload,dict) else {}
+        username=payload.get('username'); password=payload.get('password'); encrypted=None
+        if username or password:
+            encrypted=encrypt_camera_credentials(str(username or ''),str(password or ''))
+            if encrypted is None: raise HTTPException(status_code=503,detail='Credential handling is not configured; no retry was queued.')
+        now=datetime.now().isoformat()
+        with connection() as db:
+            operation=db.execute('SELECT * FROM camera_ownership_transfers WHERE id=? AND target_customer_id=?',(operation_id,identity['customer_id'])).fetchone()
+            if not operation or operation['status'] not in {'completed','admin_reconciled','replaced'}:
+                raise HTTPException(status_code=404,detail='Completed camera lifecycle operation was not found.')
+            camera=db.execute("SELECT * FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",(operation['target_camera_id'],identity['customer_id'])).fetchone()
+            if not camera: raise HTTPException(status_code=409,detail='Destination camera is no longer active; administrator review is required.')
+            claim=db.execute('SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',(camera['device_key'].strip().casefold(),)).fetchone()
+            if not claim or claim['customer_id']!=identity['customer_id'] or claim['camera_id']!=camera['id']:
+                raise HTTPException(status_code=409,detail='Destination ownership registry changed; provisioning retry is blocked.')
+            plan=db.execute('SELECT camera_quantity FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(identity['customer_id'],)).fetchone()
+            quantity=int(plan['camera_quantity'] or 0) if plan else 0
+            if quantity<=0 or _active_camera_count(db,identity['customer_id'])>quantity:
+                raise HTTPException(status_code=409,detail='Current customer licensing does not authorize the active camera count.')
+            previous=db.execute('SELECT id,status FROM camera_provisioning_requests WHERE id=?',(operation['provisioning_job_id'],)).fetchone() if operation['provisioning_job_id'] else None
+            if previous and previous['status']=='queued': return {'operation_id':operation_id,'status':'queued','provisioning_job_id':previous['id'],'already_queued':True}
+            if (previous and previous['status']=='provisioned') or camera['status']=='configured': return {'operation_id':operation_id,'status':'provisioned','provisioning_job_id':previous['id'] if previous else None,'already_provisioned':True}
+            appliance_id=str(payload.get('appliance_id') or operation['target_appliance_id'] or camera['appliance_id'])
+            site_id=str(payload.get('site_id') or operation['target_site_id'] or camera['site_id'])
+            appliance,site_id=_transfer_target(db,identity['customer_id'],appliance_id,site_id)
+            job_id=secrets.token_hex(6)
+            db.execute('INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(job_id,identity['customer_id'],appliance_id,site_id,camera['device_key'],camera['name'],'motion','[]',encrypted,'queued','Lifecycle provisioning retry queued by the destination customer owner.',now,now))
+            db.execute('UPDATE cameras SET appliance_id=?,site_id=?,status=\'pending_installation\' WHERE id=? AND customer_id=?',(appliance_id,site_id,camera['id'],identity['customer_id']))
+            db.execute('UPDATE camera_identity_registry SET camera_id=? WHERE device_key=? AND customer_id=?',(camera['id'],camera['device_key'].strip().casefold(),identity['customer_id']))
+            db.execute('UPDATE camera_ownership_transfers SET target_appliance_id=?,target_site_id=?,provisioning_job_id=?,updated_at=? WHERE id=?',(appliance_id,site_id,job_id,now,operation_id))
+            _transfer_event(db,operation_id,identity['email'],identity['role'],'destination_provisioning_retry',{'camera_id':camera['id'],'job_id':job_id,'credentials_supplied':bool(encrypted)},now)
+        return {'operation_id':operation_id,'status':'queued','provisioning_job_id':job_id,'credentials_transferred':False}
+
+    @app.post('/api/customer/cameras/{camera_id}/replace')
+    def replace_customer_camera(request: Request,camera_id: str,payload: dict) -> dict:
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        payload=payload if isinstance(payload,dict) else {}
+        new_key=str(payload.get('device_key') or '').strip(); appliance_id=str(payload.get('appliance_id') or '').strip()
+        if payload.get('confirmation')!='REPLACE' or not new_key or not appliance_id: raise HTTPException(status_code=400,detail='Explicit replacement confirmation, destination appliance, and new camera identity are required.')
+        username=payload.get('username'); password=payload.get('password'); encrypted=None
+        if username or password:
+            encrypted=encrypt_camera_credentials(str(username or ''),str(password or ''))
+            if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured; no replacement changes were saved.')
+        from main import _ffmpeg_process_lock
+        now=datetime.now().isoformat(); normalized=new_key.casefold()
+        with _ffmpeg_process_lock:
+            with connection() as db:
+                old=db.execute('SELECT * FROM cameras WHERE id=? AND customer_id=?',(camera_id,identity['customer_id'])).fetchone()
+                if old and old['status']=='removed':
+                    prior=db.execute("SELECT * FROM camera_ownership_transfers WHERE source_camera_id=? AND source_customer_id=? AND status='replaced' ORDER BY created_at DESC LIMIT 1",(camera_id,identity['customer_id'])).fetchone()
+                    target=db.execute('SELECT device_key FROM cameras WHERE id=?',(prior['target_camera_id'],)).fetchone() if prior else None
+                    if prior and target and (target['device_key'] or '').strip().casefold()==normalized:
+                        return {'replacement_id':prior['id'],'status':'queued','old_camera_id':camera_id,'camera_id':prior['target_camera_id'],'provisioning_job_id':prior['provisioning_job_id'],'already_replaced':True,'credentials_transferred':False}
+                    raise HTTPException(status_code=409,detail='This camera was already removed or replaced; no second operation was created.')
+                if not old or not old['device_key']: raise HTTPException(status_code=404,detail='Active provisioned camera not found.')
+                appliance,site_id=_transfer_target(db,identity['customer_id'],appliance_id,payload.get('site_id'))
+                _require_camera_capacity(db,identity['customer_id'],replacing_camera_id=camera_id)
+                if normalized==old['device_key'].strip().casefold(): raise HTTPException(status_code=400,detail='Replacement identity must identify a different physical camera.')
+                claim=db.execute('SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',(normalized,)).fetchone()
+                conflict=db.execute("SELECT 1 FROM camera_identity_conflicts WHERE device_key=? AND status='needs_review'",(normalized,)).fetchone()
+                foreign=db.execute("SELECT id FROM cameras WHERE lower(trim(device_key))=? AND customer_id<>? AND COALESCE(status,'')!='removed' LIMIT 1",(normalized,identity['customer_id'])).fetchone()
+                existing=db.execute('SELECT id FROM cameras WHERE lower(trim(device_key))=?',(normalized,)).fetchone()
+                if conflict or foreign or existing or (claim and claim['customer_id']!=identity['customer_id']): raise HTTPException(status_code=409,detail='Replacement camera identity is already registered or requires ownership reconciliation.')
+                if old['camera_number'] is not None:
+                    try: from main import stop_camera_processes; stop_camera_processes(int(old['camera_number']))
+                    except (OSError,subprocess.TimeoutExpired) as error: raise HTTPException(status_code=503,detail='Existing camera stream could not be stopped; replacement was not saved.') from error
+                new_camera_id,job_id=_create_target_camera_and_job(db,customer_id=identity['customer_id'],appliance_id=appliance_id,site_id=site_id,device_key=new_key,name=str(payload.get('name') or 'Replacement camera').strip(),encrypted_credentials=encrypted,now=now)
+                db.execute('INSERT INTO camera_identity_registry(device_key,customer_id,camera_id,created_at) VALUES(?,?,?,?)',(normalized,identity['customer_id'],new_camera_id,now))
+                _archive_for_lifecycle(db,old,now)
+                operation_id=secrets.token_hex(12)
+                db.execute("INSERT INTO camera_ownership_transfers(id,device_key,source_customer_id,source_camera_id,target_customer_id,status,initiated_by_email,target_appliance_id,target_site_id,target_camera_id,provisioning_job_id,expires_at,admin_reason,created_at,updated_at) VALUES(?,?,?, ?,?,'replaced',?,?,?,?,?,?,?,?,?)",(operation_id,old['device_key'].strip().casefold(),identity['customer_id'],camera_id,identity['customer_id'],identity['email'],appliance_id,site_id,new_camera_id,job_id,now,'customer_camera_replacement',now,now))
+                _transfer_event(db,operation_id,identity['email'],identity['role'],'camera_replaced',{'old_camera_id':camera_id,'new_camera_id':new_camera_id,'new_device_key':normalized,'destination_job_id':job_id},now)
+                db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',(identity['email'],identity['role'],'camera.replaced','camera',camera_id,json.dumps({'replacement_id':operation_id,'new_camera_id':new_camera_id,'new_device_key':normalized,'credentials_transferred':False}),now))
+        return {'replacement_id':operation_id,'status':'queued','old_camera_id':camera_id,'camera_id':new_camera_id,'provisioning_job_id':job_id,'credentials_transferred':False}
+
+    @app.post('/api/admin/camera-ownership/reconcile')
+    def reconcile_camera_ownership(request: Request,payload: dict) -> dict:
+        admin=partner_identity(request)
+        if not admin or admin.get('role')!='administrator' or not admin.get('session_id'):
+            raise HTTPException(status_code=403,detail='A session-authenticated global administrator is required.')
+        payload=payload if isinstance(payload,dict) else {}
+        source_camera_id=str(payload.get('source_camera_id') or '').strip(); target_customer_id=str(payload.get('target_customer_id') or '').strip()
+        basis=str(payload.get('basis') or ''); evidence=str(payload.get('evidence_reference') or '').strip(); reason=str(payload.get('reason') or '').strip()
+        if basis not in {'verified_historical_transfer','source_account_unavailable'} or len(evidence)<6 or len(reason)<20:
+            raise HTTPException(status_code=400,detail='Reconciliation requires an explicit approved basis, evidence reference, and detailed reason.')
+        if payload.get('confirmation')!=f"RECONCILE {source_camera_id}": raise HTTPException(status_code=400,detail='Exact camera reconciliation confirmation is required.')
+        appliance_id=str(payload.get('appliance_id') or '').strip(); site_id=str(payload.get('site_id') or '').strip(); name=str(payload.get('name') or 'Transferred camera').strip()
+        now=datetime.now().isoformat(); transfer_id=secrets.token_hex(12)
+        with connection() as db:
+            global_admin=db.execute("SELECT 1 FROM partner_users u JOIN identity_grants g ON g.user_id=u.id WHERE lower(u.email)=lower(?) AND g.role='administrator' AND g.scope_type='global' AND g.revoked_at IS NULL LIMIT 1",(admin['email'],)).fetchone()
+            if not global_admin: raise HTTPException(status_code=403,detail='Global administrator grant is required for ownership reconciliation.')
+            source=db.execute('SELECT * FROM cameras WHERE id=?',(source_camera_id,)).fetchone()
+            target=db.execute('SELECT * FROM cameras WHERE id=? AND customer_id=?',(str(payload.get('target_camera_id') or ''),target_customer_id)).fetchone()
+            if not source or not source['device_key'] or source['customer_id']==target_customer_id:
+                raise HTTPException(status_code=409,detail='A source camera and a different destination account are required.')
+            key=source['device_key'].strip().casefold()
+            if target and ((target['device_key'] or '').strip().casefold()!=key or target['status']=='removed'):
+                raise HTTPException(status_code=409,detail='Destination camera row does not match the physical identity or is inactive.')
+            if not target:
+                if not appliance_id: raise HTTPException(status_code=400,detail='Provide an existing destination camera row or a destination appliance.')
+                appliance,target_site=_transfer_target(db,target_customer_id,appliance_id,site_id or None)
+                _require_camera_capacity(db,target_customer_id)
+            else:
+                plan=db.execute('SELECT camera_quantity FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(target_customer_id,)).fetchone()
+                active=_active_camera_count(db,target_customer_id); licensed=int(plan['camera_quantity'] or 0) if plan else 0
+                if licensed<=0 or active>licensed: raise HTTPException(status_code=409,detail='Destination camera count exceeds its purchased camera capacity.')
+            target_id=target['id'] if target else None
+            other_active=db.execute("SELECT id FROM cameras WHERE lower(trim(device_key))=? AND COALESCE(status,'')!='removed' AND id<>? AND (? IS NULL OR id<>?) LIMIT 1",(key,source_camera_id,target_id,target_id)).fetchone()
+            if other_active: raise HTTPException(status_code=409,detail='A third active owner exists; reconciliation is blocked.')
+            claim=db.execute('SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',(key,)).fetchone()
+            if claim and claim['customer_id'] not in {source['customer_id'],target_customer_id}:
+                raise HTTPException(status_code=409,detail='Registry points to a third customer; separate investigation is required.')
+            if source['camera_number'] is not None: _stop_lifecycle_stream(source['camera_number'])
+            job_id=None
+            if not target:
+                target_id,job_id=_create_target_camera_and_job(db,customer_id=target_customer_id,appliance_id=appliance_id,site_id=target_site,device_key=source['device_key'],name=name,encrypted_credentials=None,now=now)
+            # Reconcile only the current registry projection. This records the
+            # administrator decision as such; it does not invent owner consent
+            # or rewrite past audit/recording ownership.
+            if claim:
+                changed=db.execute('UPDATE camera_identity_registry SET customer_id=?,camera_id=? WHERE device_key=? AND customer_id=?',(target_customer_id,target_id,key,claim['customer_id'])).rowcount
+                if not changed: raise HTTPException(status_code=409,detail='Registry changed concurrently; refresh and retry reconciliation.')
+            else:
+                db.execute('INSERT INTO camera_identity_registry(device_key,customer_id,camera_id,created_at) VALUES(?,?,?,?)',(key,target_customer_id,target_id or 'pending:'+transfer_id,now))
+            if not target_id:
+                target_id,job_id=_create_target_camera_and_job(db,customer_id=target_customer_id,appliance_id=appliance_id,site_id=target_site,device_key=source['device_key'],name=name,encrypted_credentials=None,now=now)
+                db.execute('UPDATE camera_identity_registry SET camera_id=? WHERE device_key=? AND customer_id=?',(target_id,key,target_customer_id))
+            db.execute("UPDATE camera_identity_conflicts SET status='resolved',resolved_at=?,resolved_by=?,evidence_reference=? WHERE device_key=?",(now,admin['email'],evidence,key))
+            db.execute("INSERT INTO camera_ownership_transfers(id,device_key,source_customer_id,source_camera_id,target_customer_id,status,initiated_by_email,accepted_by_email,target_appliance_id,target_site_id,target_camera_id,provisioning_job_id,expires_at,evidence_reference,admin_reason,created_at,updated_at) VALUES(?,?,?,?,?,'admin_reconciled',?,?,?,?,?,?,?,?,?,?,?)",(transfer_id,key,source['customer_id'],source_camera_id,target_customer_id,admin['email'],None,appliance_id or (target['appliance_id'] if target else None),site_id or (target['site_id'] if target else None),target_id,job_id,now,evidence,f'{basis}: {reason}',now,now))
+            _transfer_event(db,transfer_id,admin['email'],'administrator','admin_reconciled',{'basis':basis,'evidence_reference':evidence,'reason':reason,'source_camera_id':source_camera_id,'target_camera_id':target_id,'destination_job_id':job_id,'owner_authorizations_fabricated':False},now)
+            if source['status']!='removed': _archive_for_lifecycle(db,source,now)
+            db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',(admin['email'],'administrator','camera.ownership_reconciled','camera',source_camera_id,json.dumps({'transfer_id':transfer_id,'basis':basis,'evidence_reference':evidence,'reason':reason,'target_customer_id':target_customer_id,'target_camera_id':target_id,'owner_authorizations_fabricated':False}),now))
+        return {'status':'reconciled','transfer_id':transfer_id,'source_camera_id':source_camera_id,'target_camera_id':target_id,'provisioning_job_id':job_id,'basis':basis,'owner_authorizations_fabricated':False}
 
     @app.put('/api/customer/cameras')
     def configure_customer_cameras(request: Request,payload: dict) -> dict:

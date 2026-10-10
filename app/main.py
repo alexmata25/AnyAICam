@@ -534,7 +534,7 @@ HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
 
 
 
-RECORDINGS_FOLDER = Path("/app/recordings")
+RECORDINGS_FOLDER = Path(os.environ.get("ANYAICAM_RECORDINGS_DIR", "/app/recordings"))
 
 
 
@@ -16020,7 +16020,7 @@ def diagnostics_snapshot() -> dict:
 
 
 
-def _provisioned_camera_stream(camera_number: int) -> dict | None:
+def _provisioned_camera_stream(camera_number: int, purpose: str = "local_live") -> dict | None:
     """Real, provisioned-camera source for camera_url(): looks up the
     cameras row assigned this camera_number (see camera_mapping.py) plus
     its encrypted credentials, and returns {rtsp_url, username, password}
@@ -16046,6 +16046,18 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
                 "SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?",
                 (camera["id"],),
             ).fetchone()
+            profile = None
+            try:
+                from stream_codec import select_stream_profile
+                profiles = [dict(item) for item in db.execute(
+                    "SELECT stream_role,rtsp_uri,observed_codec FROM camera_stream_profiles WHERE camera_id=?",
+                    (camera["id"],),
+                ).fetchall()]
+                profile = select_stream_profile(profiles, purpose)
+            except Exception:
+                # Codec metadata is additive; a missing/unreadable optional
+                # profile must preserve the already-configured RTSP path.
+                profile = None
     except Exception:
         return None
     if not credential_row:
@@ -16053,7 +16065,7 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
     credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
     if not credentials:
         return None
-    rtsp_url = camera["onvif_endpoint"] or ""
+    rtsp_url = (profile or {}).get("rtsp_uri") or camera["onvif_endpoint"] or ""
     if not rtsp_url.startswith("rtsp://"):
         return None
     return {
@@ -16076,7 +16088,7 @@ def credentialed_rtsp_url(rtsp_url: str, username: str, password: str) -> str:
     return urlunsplit((parsed.scheme or "rtsp", netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-def camera_url(camera_number: int) -> str:
+def camera_url(camera_number: int, purpose: str = "local_live") -> str:
     """Real, provisioned-camera source first (dynamic camera registry --
     see _provisioned_camera_stream()); falls back to the legacy
     CAMERA{n}_HOST/USERNAME/PASSWORD/PATH env vars for backward
@@ -16085,7 +16097,7 @@ def camera_url(camera_number: int) -> str:
     neither source has anything for this camera_number -- see that
     exception's docstring for why process_supervisor() depends on this
     distinction."""
-    provisioned = _provisioned_camera_stream(camera_number)
+    provisioned = _provisioned_camera_stream(camera_number, purpose)
     if provisioned and provisioned.get("removed"):
         raise CameraNotConfiguredError(f"Camera {camera_number} has been removed from active service.")
     if provisioned:
@@ -16151,7 +16163,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number),
+        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number, "local_live"),
 
 
 
@@ -16282,7 +16294,7 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 
 
 
-        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number),
+        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number, "recording"),
 
 
 
@@ -16780,6 +16792,75 @@ def _bounded_camera_error(stderr_tail: list[str]) -> str:
     return _redact_camera_stream_error(joined)[:CAMERA_ERROR_MAX_CHARS]
 
 
+def _is_codec_negotiation_failure(stderr_tail: list[str]) -> bool:
+    """Recognize FFmpeg codec/decode negotiation failures for re-probing."""
+    text = " ".join(stderr_tail[-10:]).lower()
+    return "codec" in text and any(term in text for term in (
+        "not supported", "unsupported", "decoder", "negotiat", "failed to open",
+    ))
+
+
+def _revalidate_camera_stream_codecs(camera_number: int) -> None:
+    """Re-probe authorized camera streams after a codec-related live failure.
+
+    Credentials are read from the existing encrypted local credential
+    record, kept in memory, and used only for FFprobe. No URI or secret is
+    logged or returned. Probe failures clear the observed codec so browser
+    source selection fails closed until the next successful reprovision.
+    """
+    try:
+        from partner_db import connection
+        from appliance_protocol import decrypt_camera_credentials
+        with connection() as db:
+            camera = db.execute(
+                "SELECT id FROM cameras WHERE camera_number=? AND COALESCE(status,'')!='removed'",
+                (camera_number,),
+            ).fetchone()
+            if not camera:
+                return
+            credential = db.execute(
+                "SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchone()
+            profiles = [dict(item) for item in db.execute(
+                "SELECT profile_token,rtsp_uri FROM camera_stream_profiles WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchall()]
+            if not credential or not profiles:
+                return
+            credentials = decrypt_camera_credentials(credential["encrypted_blob"]) or {}
+            username = credentials.get("username", "")
+            password = credentials.get("password", "")
+            observations = []
+            for profile in profiles[:8]:
+                probe_uri = credentialed_rtsp_url(profile["rtsp_uri"], username, password)
+                observed = None
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+                         "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+                         "-of", "json", probe_uri],
+                        capture_output=True, text=True, timeout=8, check=False,
+                    )
+                    if probe.returncode == 0:
+                        streams = json.loads(probe.stdout or "{}").get("streams", [])
+                        if streams and isinstance(streams[0], dict):
+                            name = str(streams[0].get("codec_name") or "").lower()
+                            observed = "h265" if name in ("hevc", "h265") else name or None
+                except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+                    pass
+                observations.append((observed, datetime.now().isoformat(), camera["id"], profile["profile_token"]))
+            for observed, checked_at, camera_id, token in observations:
+                db.execute(
+                    "UPDATE camera_stream_profiles SET observed_codec=?,verified_at=? WHERE camera_id=? AND profile_token=?",
+                    (observed, checked_at, camera_id, token),
+                )
+    except Exception:
+        # A diagnostic refresh must never prevent the VMS supervisor from
+        # restarting the existing live pipeline.
+        return
+
+
 async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
@@ -16908,6 +16989,8 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
                 camera_process_state[camera_number]["last_error_at"] = (
                     datetime.now().isoformat()
                 )
+                if _is_codec_negotiation_failure(stderr_tail):
+                    await asyncio.to_thread(_revalidate_camera_stream_codecs, camera_number)
 
             camera_reconnect_counts[camera_number] += 1
             camera_process_state[camera_number][mode] = "retrying"

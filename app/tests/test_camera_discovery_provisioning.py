@@ -66,6 +66,10 @@ def _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1
         "VALUES(?,?,?,?, 'activated', ?, '2026-01-01')",
         (appliance_id, customer_id, site_id, cloud_id, online),
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO plans(id,customer_id,camera_quantity,status,created_at) VALUES(?,?,8,'active','2026-01-01')",
+        (f"plan-{customer_id}", customer_id),
+    )
     # authenticate_appliance() checks appliance_credentials, not
     # activation_token_hash -- that swap is the point of this hardening
     # pass, so every appliance-facing test seeds a real credential row.
@@ -732,6 +736,110 @@ def test_credential_bearing_uri_is_stripped_before_storage(db_path, monkeypatch)
     assert "hunter2" not in stored
     assert "admin" not in stored
     assert "hunter2" not in json.dumps(audit_calls)
+
+
+def test_stream_codec_metadata_keeps_advertised_and_observed_values_separate(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_profiles = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-profiles", "POST")
+    appliance_configuration = _route("/api/appliance/configuration", "GET")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        result = appliance_submit_media_profiles(
+            _fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+            {"device_key": "onvif-uuid-1", "streams": [
+                {"profile_token": "main", "profile_name": "MainStream", "stream_role": "main",
+                 "rtsp_uri": "rtsp://admin:secret@192.0.2.10/main", "advertised_codec": "h264", "observed_codec": "h265"},
+                {"profile_token": "sub", "profile_name": "SubStream", "stream_role": "substream",
+                 "rtsp_uri": "rtsp://192.0.2.10/sub", "advertised_codec": "h264", "observed_codec": "h265"},
+            ]},
+        )
+        stored = sqlite3.connect(db_path).execute(
+            "SELECT profile_token,stream_role,rtsp_uri,advertised_codec,observed_codec FROM camera_stream_profiles WHERE camera_id=? ORDER BY profile_token",
+            (camera_id,),
+        ).fetchall()
+        configured = appliance_configuration(_fake_request(_appliance_auth_headers()))["cameras"][0]
+    assert result["stored"] == 2
+    assert stored == [
+        ("main", "main", "rtsp://192.0.2.10/main", "h264", "h265"),
+        ("sub", "substream", "rtsp://192.0.2.10/sub", "h264", "h265"),
+    ]
+    assert configured["browser_profile_token"] is None
+    assert configured["codec_compatibility_warning"]
+
+
+def test_stream_metadata_rejects_wrong_device_identity_and_duplicate_profiles(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    submit = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-profiles", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        with pytest.raises(Exception) as wrong:
+            submit(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                   {"device_key": "wrong", "streams": [{"profile_token": "p", "rtsp_uri": "rtsp://192.0.2.10/p"}]})
+        with pytest.raises(Exception) as duplicate:
+            submit(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                   {"device_key": "onvif-uuid-1", "streams": [
+                       {"profile_token": "p", "rtsp_uri": "rtsp://192.0.2.10/p"},
+                       {"profile_token": "p", "rtsp_uri": "rtsp://192.0.2.10/p2"},
+                   ]})
+    assert getattr(wrong.value, "status_code", None) == 409
+    assert getattr(duplicate.value, "status_code", None) == 400
+
+
+def test_stream_metadata_rejects_malformed_port_without_server_error(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    submit = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-profiles", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        with pytest.raises(Exception) as invalid:
+            submit(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id, {
+                "device_key": "onvif-uuid-1",
+                "streams": [{"profile_token": "bad", "stream_role": "main",
+                             "rtsp_uri": "rtsp://192.0.2.10:999999/stream",
+                             "advertised_codec": "h264", "observed_codec": "h264"}],
+            })
+    assert getattr(invalid.value, "status_code", None) == 400
+
+
+def test_reprovisioned_stream_profiles_refresh_the_verified_main_source(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    submit = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-profiles", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        result = submit(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id, {
+            "device_key": "onvif-uuid-1",
+            "streams": [{"profile_token": "main", "stream_role": "main",
+                         "rtsp_uri": "rtsp://192.0.2.10/new-main", "advertised_codec": "h265",
+                         "observed_codec": "h264"}],
+        })
+        current = sqlite3.connect(db_path).execute(
+            "SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,),
+        ).fetchone()[0]
+    assert result["stored"] == 1
+    assert current == "rtsp://192.0.2.10/new-main"
 
 
 # ---------------------------------------------------------- auth hardening

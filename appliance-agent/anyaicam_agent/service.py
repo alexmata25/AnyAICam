@@ -14,7 +14,7 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
 from .config import AgentConfig,load_credential
 from .discovery import scan
 from .metrics import collect
-from .onvif_media import resolve_media_uri
+from .onvif_media import resolve_media_uri,resolve_media_streams
 from .portal import PortalClient,PortalError,sanitize
 from .provisioning import locate_device,verify_device
 from .queue import OfflineQueue
@@ -240,19 +240,20 @@ class ApplianceAgent:
         camera_id=None
         for camera in configuration.get('cameras',[]):
             if camera.get('device_key')==device_key:
-                if camera.get('onvif_endpoint'):
-                    return  # already resolved (e.g. an earlier attempt for this same camera) -- nothing to do
                 camera_id=camera.get('id'); break
         if not camera_id:
             return
         username=str((credentials or {}).get('username','')) or None
         password=str((credentials or {}).get('password','')) or None
-        result=resolve_media_uri(device['ip'],device_key,username=username,password=password)
+        result=resolve_media_streams(device['ip'],device_key,username=username,password=password)
         if result['status']!='resolved':
             self.log.info('onvif_media.not_resolved_during_provisioning device_key=%s status=%s',device_key,result['status'])
             return
+        streams=result['streams']
+        selected=next((item for item in streams if item['stream_role']=='main'),streams[0])
         try:
-            self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':result['rtsp_uri']})
+            self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':selected['rtsp_uri']})
+            self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-profiles',{'device_key':device_key,'streams':streams})
         except PortalError as error:
             self.log.debug('onvif_media.submit_failed_during_provisioning device_key=%s error=%s',device_key,error)
     def poll_commands(self):
