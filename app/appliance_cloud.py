@@ -20,7 +20,7 @@ from partner_db import audit, authorize_appliance_tenant, connection, password_h
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
-from event_media_policy import allows_event_media, effective_cloud_recording_mode
+from event_media_policy import allows_event_media, effective_cloud_recording_mode, motion_event_policy
 import product_mode
 import runtime_paths
 
@@ -280,7 +280,7 @@ def _fanout_detection_event(camera: dict,camera_id: str,event_id: str,local_even
     return True
 
 
-def _effective_camera_mode(customer_id,explicit,cache: dict | None = None) -> str:
+def _effective_camera_mode(customer_id,explicit,cache: dict | None = None) -> str | None:
     """The camera's cloud_recording_mode as the edge and the media routes
     must see it. 2026-10-10: a camera added by a paying Hybrid customer
     used to stay NULL until an administrator set 'motion' by hand, so its
@@ -1129,6 +1129,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # refuse and the retention sweep would never see.
             if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
                 raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
+            with connection() as db:
+                if not motion_event_policy(db,camera.get('customer_id')):
+                    raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
             policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         session_name=recording_session_name(appliance['id'],camera_id)
         try:

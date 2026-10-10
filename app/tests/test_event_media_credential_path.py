@@ -37,7 +37,7 @@ with override_target(sqlite_path="/tmp/test_event_media_credential_path.db"):
 
 def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
           device_key="urn:uuid:fake", customer_id="cust-1", site_id="site-1", other_appliance=False,
-          cloud_recording_mode="motion"):
+          cloud_recording_mode="motion", legacy_plan="motion"):
     now = "2026-09-13T00:00:00"
     db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-1','Test Partner','approved','real',?)", (now,))
     db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -52,6 +52,13 @@ def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
         "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (camera_id, customer_id, site_id, appliance_id, camera_number, device_key, "configured", "Camera 1", now, cloud_recording_mode),
     )
+    if legacy_plan:
+        # A customer with an active legacy motion plan (motion_event_policy()) -- the
+        # precondition for event media now that Local plans get no S3 credential.
+        db.execute(
+            "INSERT OR IGNORE INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,"
+            "partner_monthly,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (f"plan-{customer_id}", customer_id, "2mp", legacy_plan, 30, 2, 50.0, 25.0, "active", now))
     if other_appliance:
         db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-other',?,?,?,?)",
                    (customer_id, site_id, "AIC-OTHER", now))
@@ -487,7 +494,8 @@ def test_unset_mode_without_cloud_event_protection_gets_no_s3_credential(client,
     _install_fake_boto3(monkeypatch)
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode=None)
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode=None,
+                  legacy_plan=None)
             if plan_key:
                 _grant_v2_plan(db, plan_key=plan_key)
 
@@ -503,6 +511,21 @@ def test_an_explicitly_disabled_camera_gets_no_event_media_credential_even_on_hy
         with connection() as db:
             _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode="disabled")
             _grant_v2_plan(db, plan_key="hybrid")
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("plan_key", ["basic_local", "ai_local"])
+def test_an_explicit_motion_camera_on_a_local_plan_gets_no_s3_credential(client, db_path, monkeypatch, plan_key):
+    """Codex review (d9f1f11): Local plans never upload, even with an explicit 'motion'."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True)
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", cloud_recording_mode="motion")
+            _grant_v2_plan(db, plan_key=plan_key)
 
     response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
 

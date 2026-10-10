@@ -149,16 +149,35 @@ _MAX_SINGLE_CLIP_SECONDS = 3600
 CLOUD_RECORDING_MODES = ("motion", "continuous", "disabled")
 
 
-def effective_cloud_recording_mode(db, customer_id: str, explicit) -> str:
-    """An explicit per-camera cloud_recording_mode (set by an administrator)
-    always wins. A camera nobody configured follows the customer's paid
-    plan: 'motion' (event clips and thumbnails to the cloud) when the plan
-    includes cloud event protection (motion_event_policy()), otherwise
-    'disabled'. Never 'continuous' by default: continuous cloud recording
-    is not sold and is only ever an explicit choice."""
-    if explicit in CLOUD_RECORDING_MODES:
+def _billing_v2_entitlement(customer_id: str) -> dict | None:
+    try:
+        from per_camera_billing import entitlement_for_customer
+        return entitlement_for_customer(customer_id)
+    except Exception:
+        return None
+
+
+def effective_cloud_recording_mode(db, customer_id: str, explicit):
+    """The per-camera cloud_recording_mode the edge and the media routes act on.
+
+    Billing-v2 (per-camera plan) customers: the paid plan decides. An unset
+    camera is 'motion' (event clips and thumbnails to the cloud) when the
+    plan includes active cloud event protection (motion_event_policy()),
+    otherwise 'disabled' -- never 'continuous' by default, which is not
+    sold. An explicit value still wins, except that 'motion' becomes
+    'disabled' while the plan does not include cloud event protection
+    (Local plans, suspended or cancelled Hybrid), so nothing is uploaded
+    that the catalog would refuse.
+
+    Every other customer (legacy plans, partner-managed): the stored value,
+    unchanged -- an unset camera stays None, which older edges treat as
+    continuous upload for the legacy continuous plans that rely on it."""
+    if not customer_id or not _billing_v2_entitlement(customer_id):
+        return explicit if explicit in CLOUD_RECORDING_MODES else None
+    cloud_events = bool(motion_event_policy(db, customer_id))
+    if explicit in ("continuous", "disabled"):
         return explicit
-    return "motion" if customer_id and motion_event_policy(db, customer_id) else "disabled"
+    return "motion" if cloud_events else "disabled"
 
 
 def allows_event_media(db, customer_id: str, camera_id: str, event_at: datetime, duration_seconds: float) -> tuple[bool, str]:

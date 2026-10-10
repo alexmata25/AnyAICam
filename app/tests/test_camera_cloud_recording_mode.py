@@ -39,6 +39,13 @@ def _seed(db, appliance_id, cloud_id, credential, camera_id, camera_site_id="sit
     db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,created_at) VALUES(?,?,?,?,?,?,?)", (camera_id, "cust-1", camera_site_id, appliance_id, "Camera 1", 1, now))
 
 
+def _grant_legacy_plan(db, customer_id="cust-1", recording_mode="continuous"):
+    db.execute(
+        "INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,status,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (f"plan-{customer_id}", customer_id, "2mp", recording_mode, 30, 2, 50.0, 25.0, "active", "2026-08-21T00:00:00"))
+
+
 def _grant_v2_plan(db, customer_id="cust-1", plan_key="hybrid", status="active"):
     cloud = 1 if plan_key == "hybrid" else 0
     db.execute(
@@ -229,10 +236,9 @@ def test_configuration_route_exposes_recording_mode_field(client, db_path):
     assert cameras[0]["recording_mode"] == "motion"
 
 
-def test_configuration_route_reports_disabled_when_unset_and_no_cloud_plan(client, db_path):
-    """2026-10-10: an unset mode is no longer reported as null (which the
-    edge treated as continuous upload); without a plan that includes cloud
-    event protection it is 'disabled'."""
+def test_configuration_route_reports_null_when_unset_without_a_billing_v2_plan(client, db_path):
+    """Customers outside per-camera billing keep the stored value unchanged:
+    an unset camera stays null (older edges read it as continuous upload)."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -240,7 +246,21 @@ def test_configuration_route_reports_disabled_when_unset_and_no_cloud_plan(clien
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
 
     assert response.status_code == 200
-    assert response.json()["cameras"][0]["recording_mode"] == "disabled"
+    assert response.json()["cameras"][0]["recording_mode"] is None
+
+
+@pytest.mark.parametrize("legacy_mode", ["continuous", "motion"])
+def test_a_legacy_plan_customer_keeps_the_stored_unset_mode(client, db_path, legacy_mode):
+    """Codex review (d9f1f11): a legacy continuous customer's unset camera
+    must not be switched to 'disabled' by the cloud."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _grant_legacy_plan(db, recording_mode=legacy_mode)
+
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    assert response.json()["cameras"][0]["recording_mode"] is None
 
 
 @pytest.mark.parametrize("plan_key,expected", [("hybrid", "motion"), ("ai_local", "disabled"), ("basic_local", "disabled")])
@@ -259,7 +279,7 @@ def test_configuration_route_derives_an_unset_mode_from_the_paid_plan(client, db
 
 
 @pytest.mark.parametrize("explicit", ["disabled", "continuous", "motion"])
-def test_an_explicit_mode_still_wins_over_the_plan(client, db_path, explicit):
+def test_an_explicit_mode_is_kept_on_a_hybrid_plan(client, db_path, explicit):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -269,6 +289,21 @@ def test_an_explicit_mode_still_wins_over_the_plan(client, db_path, explicit):
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
 
     assert response.json()["cameras"][0]["recording_mode"] == explicit
+
+
+@pytest.mark.parametrize("plan_key,status", [("ai_local", "active"), ("basic_local", "active"), ("hybrid", "suspended")])
+def test_an_explicit_motion_camera_without_cloud_event_protection_is_disabled(client, db_path, plan_key, status):
+    """Codex review (d9f1f11): an explicit 'motion' must not make a Local (or
+    suspended Hybrid) camera upload bytes the catalog then refuses."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _grant_v2_plan(db, plan_key=plan_key, status=status)
+            db.execute("UPDATE cameras SET cloud_recording_mode='motion' WHERE id='cam-1'")
+
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    assert response.json()["cameras"][0]["recording_mode"] == "disabled"
 
 
 def test_a_suspended_hybrid_plan_does_not_enable_cloud_event_media(client, db_path):
