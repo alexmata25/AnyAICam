@@ -226,7 +226,7 @@ def _no_real_capability_discovery(monkeypatch):
     monkeypatch.setattr(wp, "_load_capabilities", lambda camera_id: None)
     monkeypatch.setattr(wp, "_save_capabilities", lambda camera_id, record: None)
     monkeypatch.setattr(wp, "_onvif_soap_call", lambda: None)
-    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: False)
+    monkeypatch.setattr(wp, "_probe_video_codec", lambda url: None)
     monkeypatch.setattr(wp, "_paths_resync_pending", False)
     monkeypatch.setattr(wp, "_path_add_retries", {})
     monkeypatch.setattr(wp, "_whep_sessions", {})
@@ -688,7 +688,7 @@ def fresh_choice(monkeypatch):
     monkeypatch.setattr(wp, "_save_capabilities", lambda camera_id, record: None)
     monkeypatch.setattr(wp, "_onvif_soap_call", lambda: None)
     probes = []
-    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: probes.append(url) or url == SUB)
+    monkeypatch.setattr(wp, "_probe_video_codec", lambda url: probes.append(url) or ("h264" if url == SUB else None))
     return probes
 
 
@@ -705,7 +705,7 @@ def test_a_verified_substream_is_what_p2p_sends(fake_mediamtx, monkeypatch, fres
 def test_no_working_substream_keeps_the_main_stream(fake_mediamtx, monkeypatch, fresh_choice):
     monkeypatch.setattr(wp, "_camera_map", {"cam-x": 7})
     monkeypatch.setattr(wp, "_known_paths", set())
-    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: False)
+    monkeypatch.setattr(wp, "_probe_video_codec", lambda url: None)
     wp.sync_camera_paths(lambda n: MAIN)
     added = [c for c in fake_mediamtx.calls if c[1] == "/v3/config/paths/add/cam-x"]
     assert json.loads(added[0][2])["source"] == MAIN
@@ -720,10 +720,10 @@ def test_main_preference_never_probes_a_substream(monkeypatch, fresh_choice):
 def test_the_choice_is_probed_once_and_redecided_when_the_camera_url_changes(monkeypatch, fresh_choice):
     assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "substream")
     assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "substream")
-    assert fresh_choice == [SUB]
+    assert fresh_choice == [SUB, MAIN]  # every stream's observed codec is recorded (2026-10-10)
     other = MAIN.replace("10.0.0.9", "10.0.0.10")  # camera re-provisioned at a new address
     assert wp.p2p_source_for("cam-x", other) == (other, "main")  # the fake probe rejects this host's substream
-    assert fresh_choice == [SUB, SUB.replace("10.0.0.9", "10.0.0.10")]  # probed again, not served from cache
+    assert fresh_choice == [SUB, MAIN, SUB.replace("10.0.0.9", "10.0.0.10"), other]  # probed again, not served from cache
 
 
 def test_recording_and_live_hls_still_use_the_main_stream_only():
@@ -862,20 +862,20 @@ def test_an_unreadable_path_list_changes_nothing(configured):
 
 def test_a_restart_keeps_the_substream_choice_and_lan_hosts_without_reprobing(configured, tmp_path, monkeypatch):
     probes = []
-    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: probes.append(url) or True)
+    monkeypatch.setattr(wp, "_probe_video_codec", lambda url: probes.append(url) or "h264")
     main = "rtsp://u:p@10.0.0.9/Streaming/Channels/101"
     monkeypatch.setattr(wp, "_camera_map", {"cam-x": 9})
     monkeypatch.setattr(wp, "_known_paths", set())
     wp.reconcile_camera_paths(lambda n: main)
     first_source = json.loads([c for c in configured.calls if c[1] == "/v3/config/paths/add/cam-x"][0][2])["source"]
-    assert first_source.endswith("/Streaming/Channels/102") and len(probes) == 1
+    assert first_source.endswith("/Streaming/Channels/102") and len(probes) == 2  # substream + main
     _write_lan(tmp_path, monkeypatch, ["192.168.0.228"])
     configured.calls.clear()
     _crash_and_restart(configured, tmp_path, monkeypatch)
     assert "192.168.0.228" in (tmp_path / "mediamtx.yml").read_text()
     wp.reconcile_camera_paths(lambda n: main)
     readded = json.loads([c for c in configured.calls if c[1] == "/v3/config/paths/add/cam-x"][0][2])["source"]
-    assert readded == first_source and len(probes) == 1  # cached choice, no re-probe
+    assert readded == first_source and len(probes) == 2  # cached choice, no re-probe
     wp.sync_additional_hosts()
     assert not [c for c in configured.calls if c[1] == "/v3/config/global/patch"]  # new process already has them
 
