@@ -385,8 +385,15 @@ class LocalVmsStatusReader:
             recordings = list(self.recordings_path.rglob(f'camera{camera_number}*.mkv'))
         fresh_recordings = [item for item in recordings if self._fresh(item, self.recording_freshness_seconds, now)]
         newest = max(fresh_recordings, key=lambda item: item.stat().st_mtime, default=None)
+        # On-demand live HLS (VMS ANYAICAM_LIVE_HLS_MODE=on_demand,
+        # app/live_hls_demand.py): an idle live encoder leaves its playlist
+        # stale by design, and the VMS refreshes camera<N>.alive instead
+        # while the camera is reachable. The VMS never writes that file when
+        # the encoder is always on, so this changes nothing there.
+        alive = self.hls_path / f'camera{camera_number}.alive'
         return {
-            'online': self._fresh(manifest, self.stream_freshness_seconds, now),
+            'online': (self._fresh(manifest, self.stream_freshness_seconds, now)
+                       or self._fresh(alive, self.stream_freshness_seconds, now)),
             'recording': newest is not None,
             'last_recording_at': (
                 datetime.fromtimestamp(newest.stat().st_mtime, timezone.utc).isoformat()

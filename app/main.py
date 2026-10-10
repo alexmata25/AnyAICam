@@ -557,6 +557,9 @@ STATIC_FOLDER = runtime_paths.STATIC_ROOT
 HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).parent / "static" / "hls") if os.name == "nt" else "/app/static/hls"))
 
 HLS_URL_PREFIX = "/static/hls"
+# On-demand live HLS (2026-10-10, perf-substream-hls): see live_hls_demand.py.
+# ANYAICAM_LIVE_HLS_MODE=always (the default) keeps the previous behaviour.
+import live_hls_demand
 
 HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
 
@@ -17010,6 +17013,29 @@ def _bounded_camera_error(stderr_tail: list[str]) -> str:
     return _redact_camera_stream_error(joined)[:CAMERA_ERROR_MAX_CHARS]
 
 
+LIVE_HLS_WATCHDOG_FROM_WORKER_START = os.environ.get(
+    "ANYAICAM_LIVE_HLS_WATCHDOG_FROM_WORKER_START", "true").strip().lower() != "false"
+
+
+async def _wait_for_live_hls_demand(camera_number: int) -> None:
+    """On-demand live HLS (live_hls_demand.py; ANYAICAM_LIVE_HLS_MODE=
+    on_demand only): the camera's live encoder is not running and nothing
+    needs it. Waits until something does, re-checking every
+    IDLE_POLL_SECONDS, and meanwhile keeps camera{N}.alive fresh while the
+    camera is demonstrably reachable, so status readers that used the
+    playlist's freshness as "online" do not report an idle camera offline."""
+    camera_process_state[camera_number]["live"] = "idle"
+    next_alive = 0.0
+    while not live_hls_demand.wanted(camera_number):
+        now = time.monotonic()
+        if now >= next_alive:
+            recorder_running = camera_process_state[camera_number].get("recording") == "running"
+            if live_hls_demand.camera_reachable(camera_number, recorder_running):
+                live_hls_demand.write_alive(HLS_FOLDER, camera_number)
+            next_alive = now + 5
+        await asyncio.sleep(live_hls_demand.IDLE_POLL_SECONDS)
+
+
 async def process_supervisor(camera_number: int, mode: str, *, stagger_index: int | None = None) -> None:
     """Keep one camera worker alive and retry when a camera is unavailable.
     stagger_index: the startup-stagger slot (start_camera_supervisors()
@@ -17059,14 +17085,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
 
     while True:
-
-
-
-
-
-
-
-
+        if mode == "live" and live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
+            await _wait_for_live_hls_demand(camera_number)
         camera_process_state[camera_number][mode] = "connecting"
         live_copy_used = False
         if mode == "live":
@@ -17158,13 +17178,34 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
         completed = False
         watchdog_restart = False
+        idle_stop = False
         try:
             if mode == "live":
                 playlist_path = HLS_FOLDER / f"camera{camera_number}.m3u8"
                 watchdog_started = time.monotonic()
-
+                watchdog_started_wall = time.time()
                 while process.poll() is None:
                     await asyncio.sleep(5)
+                    # On-demand live HLS only: keep camera{N}.alive fresh
+                    # (status) while this encoder starts up; and once nothing
+                    # has needed this camera's live video for IDLE_SECONDS,
+                    # stop the encoder (not a failure: no reconnect count,
+                    # no error, no backoff).
+                    if live_hls_demand.on_demand() and live_hls_demand.camera_reachable(
+                            camera_number, camera_process_state[camera_number].get("recording") == "running"):
+                        live_hls_demand.write_alive(HLS_FOLDER, camera_number)
+                    if live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
+                        idle_stop = True
+                        print(
+                            f"Camera {camera_number} live HLS not needed for "
+                            f"{live_hls_demand.IDLE_SECONDS:.0f}s; stopping the encoder until it is."
+                        )
+                        process.terminate()
+                        try:
+                            await asyncio.to_thread(process.wait, timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        break
 
                     # Give a newly-started RTSP/HLS pipeline time to connect,
                     # decode and write its first playlist before judging it.
@@ -17172,7 +17213,20 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         continue
 
                     try:
-                        playlist_age = time.time() - playlist_path.stat().st_mtime
+                        playlist_mtime = playlist_path.stat().st_mtime
+                        # Restart churn (2026-10-10, perf-substream-hls): with
+                        # append_list the PREVIOUS worker's playlist is still
+                        # on disk, so a new worker that had not yet written its
+                        # first segment after the 30 s grace was judged by its
+                        # predecessor's stale mtime and killed at the very
+                        # first check (a ~40 s restart loop: 30 s + TERM +
+                        # 10 s backoff). Its age now counts from this
+                        # worker's own start at the earliest.
+                        # ANYAICAM_LIVE_HLS_WATCHDOG_FROM_WORKER_START=false
+                        # restores the previous rule.
+                        if LIVE_HLS_WATCHDOG_FROM_WORKER_START:
+                            playlist_mtime = max(playlist_mtime, watchdog_started_wall)
+                        playlist_age = time.time() - playlist_mtime
                     except OSError:
                         playlist_age = time.monotonic() - watchdog_started
 
@@ -17221,13 +17275,14 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
             return_code = await asyncio.to_thread(process.wait)
             completed = True
-            if mode == "live":
+            if mode == "live" and not idle_stop:
                 note_live_copy_run(camera_number, live_copy_used, time.monotonic() - worker_started, watchdog_restart)
-
             if drain_task is not None:
                 await drain_task
-
-            if mode == "live":
+            if idle_stop:
+                live_hls_demand.mark_playlist_stale(playlist_path)
+                camera_process_state[camera_number][mode] = "idle"
+            elif mode == "live":
                 camera_process_state[camera_number]["last_exit_code"] = return_code
                 camera_process_state[camera_number]["last_error"] = (
                     "HLS playlist stopped advancing; worker restarted automatically."
@@ -17238,13 +17293,13 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                     datetime.now().isoformat()
                 )
 
-            camera_reconnect_counts[camera_number] += 1
-            camera_process_state[camera_number][mode] = "retrying"
-
-            print(
-                f"Camera {camera_number} {mode} process exited with "
-                f"code {return_code}; retrying in 10 seconds."
-            )
+            if not idle_stop:
+                camera_reconnect_counts[camera_number] += 1
+                camera_process_state[camera_number][mode] = "retrying"
+                print(
+                    f"Camera {camera_number} {mode} process exited with "
+                    f"code {return_code}; retrying in 10 seconds."
+                )
         finally:
             if completed:
                 try:
@@ -17257,14 +17312,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         ffmpeg_processes.remove(process)
                     except ValueError:
                         pass
-
-
-
-
-
-
-
-
+        if idle_stop:
+            continue  # straight back to waiting for demand
         await asyncio.sleep(10)
 
 
@@ -34269,97 +34318,33 @@ async def create_motion_thumbnail(
 
 
 
-    if manifest.exists():
-
-
-
-
-
-
-
-
+    thumbnail_input = ["-i", str(manifest)] if manifest.exists() else None
+    thumbnail_from_substream = False
+    # On-demand live HLS (live_hls_demand.py): when the live encoder is idle
+    # its playlist is stale, so the color frame comes from the camera's
+    # substream instead (same field of view, 640 px wide). Never logged.
+    if live_hls_demand.on_demand() and not live_hls_demand.playlist_fresh(manifest):
+        substream_url = await asyncio.to_thread(motion_substream_url, camera_number)
+        thumbnail_input = ["-rtsp_transport", "tcp", "-i", substream_url] if substream_url else None
+        thumbnail_from_substream = bool(substream_url)
+    if thumbnail_input:
         try:
-
-
-
-
-
-
-
-
             process = await asyncio.create_subprocess_exec(
-
-
-
-
-
-
-
-
                 "ffmpeg", "-loglevel", "error", "-y",
-
-
-
-
-
-
-
-
-                "-i", str(manifest),
-
-
-
-
-
-
-
-
+                *thumbnail_input,
                 "-frames:v", "1", "-vf", "scale=640:-2",
-
-
-
-
-
-
-
-
                 "-q:v", "3", str(output_path),
-
-
-
-
-
-
-
-
                 stdout=asyncio.subprocess.DEVNULL,
-
-
-
-
-
-
-
-
                 stderr=asyncio.subprocess.DEVNULL,
-
-
-
-
-
-
-
-
             )
-
-
-
-
-
-
-
-
-            await process.wait()
+            if thumbnail_from_substream:
+                try:
+                    await asyncio.wait_for(process.wait(), 20)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            else:
+                await process.wait()
 
 
 
@@ -35645,6 +35630,41 @@ def _compare_motion_frames(
 
 
 
+# Motion source selection (2026-10-10, perf-substream-hls) -- see
+# motion_source.py. One selector for the whole process: it keeps each
+# camera's substream failure count and HLS fallback window.
+import motion_source
+_motion_source_selector = motion_source.MotionSourceSelector()
+
+
+def motion_substream_url(camera_number: int) -> str | None:
+    """Credentialed RTSP URL of this camera's substream for the motion
+    reader, or None when it has no distinct one (or is not configured).
+    Synchronous (database + camera_url()); always called off the event
+    loop. Never logs the URL."""
+    try:
+        main_url = camera_url(camera_number)
+    except Exception:
+        return None
+    record = None
+    try:
+        import camera_capabilities
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute("SELECT id FROM cameras WHERE camera_number=?", (camera_number,)).fetchone()
+            if row:
+                record = camera_capabilities.load(db, row["id"])
+    except Exception:
+        record = None
+    try:
+        import webrtc_publisher as _publisher
+        url_candidates = _publisher.substream_candidates
+    except Exception:
+        url_candidates = None
+    return motion_source.resolve_substream_url(main_url, record, url_candidates)
+
+
+
 async def motion_detector(camera_number: int) -> None:
 
 
@@ -35727,186 +35747,65 @@ async def motion_detector(camera_number: int) -> None:
 
 
     manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
-
-
-
-
-
-
-
-
+    # Motion source (2026-10-10, perf-substream-hls): the camera's own
+    # substream when it has a distinct one, else this live HLS playlist --
+    # see motion_source.py. Frames are scaled to exactly 160x90 gray
+    # either way, so the thresholds below do not depend on the source.
+    # ANYAICAM_MOTION_SOURCE=hls restores the previous behaviour exactly.
     while True:
-
-
-
-
-
-
-
-
-        if not manifest.exists():
-
-
-
-
-
-
-
-
-            await asyncio.sleep(5)
-
-
-
-
-
-
-
-
-            continue
-
-
-
-
-
-
-
-
-        process = None
-
-
-
-
-
-
-
-
-        try:
-
-
-
-
-
-
-
-
-            command = [
-
-
-
-
-
-
-
-
-                "ffmpeg", "-loglevel", "error", "-fflags", "nobuffer",
-
-
-
-
-
-
-
-
-                "-i", str(manifest), "-an", "-vf", "fps=1,scale=160:90,format=gray",
-
-
-
-
-
-
-
-
-                "-f", "rawvideo", "pipe:1",
-
-
-
-
-
-
-
-
-            ]
-
-
-
-
-
-
-
-
-            process = await asyncio.create_subprocess_exec(
-
-
-
-
-
-
-
-
-                *command,
-
-
-
-
-
-
-
-
-                stdout=asyncio.subprocess.PIPE,
-
-
-
-
-
-
-
-
-                stderr=asyncio.subprocess.DEVNULL,
-
-
-
-
-
-
-
-
+        if _motion_source_selector.mode == "hls":
+            source_kind, source_url = "hls", None
+        else:
+            source_kind, source_url = await asyncio.to_thread(
+                _motion_source_selector.choose, camera_number, motion_substream_url
             )
-
-
-
-
-
-
-
-
+        source_message = _motion_source_selector.note_kind(camera_number, source_kind)
+        if source_message:
+            print(source_message)
+            # Never compare frames from two different sources.
+            previous_frame = None
+        # On-demand live HLS (live_hls_demand.py): while motion reads the
+        # HLS playlist it keeps the live encoder running; no-ops when the
+        # encoder is always on (the default).
+        if source_kind == "hls":
+            live_hls_demand.hold(camera_number, "motion")
+        else:
+            live_hls_demand.release(camera_number, "motion")
+        if source_kind == "hls" and not manifest.exists():
+            await asyncio.sleep(5)
+            continue
+        process = None
+        frames_read = 0
+        stalled = False
+        try:
+            if source_kind == "substream":
+                # The URL carries the camera's credentials: stderr is
+                # discarded below and the command is never logged.
+                command = motion_source.substream_command(source_url)
+            else:
+                command = motion_source.hls_command(str(manifest))
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
             if process.stdout is None:
-
-
-
-
-
-
-
-
                 raise RuntimeError("Motion detector could not read video frames.")
-
-
-
-
-
-
-
-
             while True:
-
-
-
-
-
-
-
-
-                frame = await process.stdout.readexactly(frame_size)
+                if source_kind == "substream":
+                    try:
+                        frame = await asyncio.wait_for(
+                            process.stdout.readexactly(frame_size),
+                            motion_source.SUBSTREAM_STALL_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        stalled = True
+                        previous_frame = None
+                        raise RuntimeError("the camera substream stopped sending frames")
+                    live_hls_demand.note_source_frame(camera_number)
+                else:
+                    frame = await process.stdout.readexactly(frame_size)
+                frames_read += 1
 
 
 
@@ -36349,7 +36248,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-            print(f"Camera {camera_number} motion detector retrying: {error}")
+            print(f"Camera {camera_number} motion detector retrying: {_redact_stream_credentials(str(error))}")
 
 
 
@@ -36413,6 +36312,10 @@ async def motion_detector(camera_number: int) -> None:
 
 
                     process.kill()
+            # Substream bookkeeping (motion_source.py); never logs a URL.
+            fallback_message = _motion_source_selector.note_run(camera_number, source_kind, frames_read, stalled)
+            if fallback_message:
+                print(fallback_message)
 
 
 
@@ -36688,59 +36591,22 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
     manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
-
-
-
-
-
-
-
-
+    # On-demand live HLS (live_hls_demand.py): this reader keeps the
+    # camera's live encoder running, and never analyses a stale playlist
+    # (an idle-stopped encoder leaves its last segments on disk).
+    if live_hls_demand.on_demand():
+        live_hls_demand.touch(camera_number, "analytics")
+        if not live_hls_demand.playlist_fresh(manifest):
+            return {
+                "ok": False,
+                "error": "Live HLS stream is starting.",
+                "detections": [],
+            }
     if not manifest.exists():
-
-
-
-
-
-
-
-
         return {
-
-
-
-
-
-
-
-
             "ok": False,
-
-
-
-
-
-
-
-
             "error": "Live HLS stream is not ready.",
-
-
-
-
-
-
-
-
             "detections": [],
-
-
-
-
-
-
-
-
         }
 
 
@@ -40607,6 +40473,9 @@ async def lifespan(app: FastAPI):
 
 
     cloud_upload_task = asyncio.create_task(cloud_upload_worker_placeholder())
+    # On-demand live HLS: a camera relayed to a cloud viewer keeps its
+    # live encoder running (no-op when the encoder is always on).
+    live_hls_demand.add_provider(live_relay_uploader.active_camera_numbers)
     live_relay_task = (
         asyncio.create_task(live_relay_uploader.live_relay_worker(HLS_FOLDER))
         if RUNTIME_ROLE in {"edge", "combined"} and live_relay_uploader.LIVE_RELAY_ENABLED
@@ -41840,15 +41709,13 @@ async def forwarded_https_middleware(request: Request, call_next):
 
 
 
+    # On-demand live HLS (live_hls_demand.py): a player or the WireGuard
+    # proxy asking for a camera's playlist/segment is live-video demand.
+    if live_hls_demand.on_demand() and request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
+        demanded_camera = live_hls_demand.camera_number_from_hls_path(request.url.path)
+        if demanded_camera is not None:
+            live_hls_demand.touch(demanded_camera, "http")
     response = await call_next(request)
-
-
-
-
-
-
-
-
     # Live playlists are rewritten every second and reference a three-segment
     # rolling window. Reusing an old manifest makes the player request
     # segments that FFmpeg has already deleted.
@@ -49371,7 +49238,7 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';if(Hls.isSupported()){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';function loadDetailHls(attempt){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});hls.on(Hls.Events.ERROR,(_,data)=>{{if(!data.fatal)return;hls.destroy();if(attempt<20)setTimeout(()=>loadDetailHls(attempt+1),3000)}})}}if(Hls.isSupported()){{loadDetailHls(0)}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
 
 
 
@@ -52872,6 +52739,11 @@ def _legacy_camera_status() -> dict:
 
 
         streaming = manifest_age is not None and manifest_age < 15
+        # On-demand live HLS: an idle encoder's playlist is stale by design;
+        # camera{N}.alive (refreshed while the camera is reachable) counts.
+        if not streaming and live_hls_demand.on_demand():
+            alive_age = live_hls_demand.file_age(live_hls_demand.alive_path(HLS_FOLDER, camera_number), now)
+            streaming = alive_age is not None and alive_age < 15
 
 
 
@@ -73057,7 +72929,7 @@ function toggleAnalytics(n){
 
 
 
-function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}document.querySelectorAll('video[id^="camera"]').forEach(v=>{const n=Number(v.id.slice(6));if(n)connectCamera(n)});
+function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){loadCameraHls(n,video,source,0)}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}function loadCameraHls(n,video,source,attempt){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(!data.fatal)return;setState(n,'Waiting for camera');hls.destroy();if(attempt<20)setTimeout(()=>loadCameraHls(n,video,source,attempt+1),3000)})}document.querySelectorAll('video[id^="camera"]').forEach(v=>{const n=Number(v.id.slice(6));if(n)connectCamera(n)});
 
 
 
@@ -79610,7 +79482,7 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 
 
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const type='{analytic_type}',canvas=document.getElementById('rule-canvas'),context=canvas.getContext('2d'),points=[];function draw(){{context.clearRect(0,0,canvas.width,canvas.height);if(!points.length)return;context.strokeStyle='#42e4dc';context.fillStyle='rgba(66,228,220,.16)';context.lineWidth=5;context.beginPath();points.forEach((point,index)=>index?context.lineTo(point.x*canvas.width,point.y*canvas.height):context.moveTo(point.x*canvas.width,point.y*canvas.height));if(type==='intrusion'&&points.length>2){{context.closePath();context.fill()}}context.stroke();points.forEach(point=>{{context.beginPath();context.arc(point.x*canvas.width,point.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}canvas.addEventListener('click',event=>{{const rect=canvas.getBoundingClientRect();if(type==='line_crossing'&&points.length>=2)points.length=0;points.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});draw()}});document.getElementById('clear-rule').addEventListener('click',()=>{{points.length=0;draw()}});const camera=document.getElementById('rule-camera'),video=document.getElementById('rule-preview');function connectPreview(){{const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.ruleHls)window.ruleHls.destroy();if(Hls.isSupported()){{window.ruleHls=new Hls();window.ruleHls.loadSource(source);window.ruleHls.attachMedia(video)}}else video.src=source}}camera.addEventListener('change',connectPreview);connectPreview();document.getElementById('analytic-rule-form').addEventListener('submit',async event=>{{event.preventDefault();if(points.length<(type==='line_crossing'?2:3)){{showToast('Draw the required line or zone first.');return}}const payload={{camera:Number(camera.value),name:document.getElementById('rule-name').value,analytic_type:type,enabled:document.getElementById('rule-enabled').checked,direction:document.getElementById('rule-direction').value,sensitivity:Number(document.getElementById('rule-sensitivity').value),confidence_threshold:Number(document.getElementById('rule-confidence').value),schedule_start:document.getElementById('rule-start').value,schedule_end:document.getElementById('rule-end').value,retention_days:Number(document.getElementById('rule-retention').value),alerts_enabled:document.getElementById('rule-alerts').checked,geometry:points}},response=await fetch('/api/analytics/rules',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();showToast(result.message)}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const type='{analytic_type}',canvas=document.getElementById('rule-canvas'),context=canvas.getContext('2d'),points=[];function draw(){{context.clearRect(0,0,canvas.width,canvas.height);if(!points.length)return;context.strokeStyle='#42e4dc';context.fillStyle='rgba(66,228,220,.16)';context.lineWidth=5;context.beginPath();points.forEach((point,index)=>index?context.lineTo(point.x*canvas.width,point.y*canvas.height):context.moveTo(point.x*canvas.width,point.y*canvas.height));if(type==='intrusion'&&points.length>2){{context.closePath();context.fill()}}context.stroke();points.forEach(point=>{{context.beginPath();context.arc(point.x*canvas.width,point.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}canvas.addEventListener('click',event=>{{const rect=canvas.getBoundingClientRect();if(type==='line_crossing'&&points.length>=2)points.length=0;points.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});draw()}});document.getElementById('clear-rule').addEventListener('click',()=>{{points.length=0;draw()}});const camera=document.getElementById('rule-camera'),video=document.getElementById('rule-preview');function connectPreview(attempt){{attempt=typeof attempt==='number'?attempt:0;const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.ruleHls)window.ruleHls.destroy();window.ruleHls=null;if(Hls.isSupported()){{const hls=new Hls();window.ruleHls=hls;hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal&&window.ruleHls===hls&&attempt<20)setTimeout(()=>{{if(window.ruleHls===hls)connectPreview(attempt+1)}},3000)}})}}else video.src=source}}camera.addEventListener('change',()=>connectPreview(0));connectPreview(0);document.getElementById('analytic-rule-form').addEventListener('submit',async event=>{{event.preventDefault();if(points.length<(type==='line_crossing'?2:3)){{showToast('Draw the required line or zone first.');return}}const payload={{camera:Number(camera.value),name:document.getElementById('rule-name').value,analytic_type:type,enabled:document.getElementById('rule-enabled').checked,direction:document.getElementById('rule-direction').value,sensitivity:Number(document.getElementById('rule-sensitivity').value),confidence_threshold:Number(document.getElementById('rule-confidence').value),schedule_start:document.getElementById('rule-start').value,schedule_end:document.getElementById('rule-end').value,retention_days:Number(document.getElementById('rule-retention').value),alerts_enabled:document.getElementById('rule-alerts').checked,geometry:points}},response=await fetch('/api/analytics/rules',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();showToast(result.message)}});</script>"""
 
 
 
@@ -147434,6 +147306,7 @@ const monitorData = {monitor_data};
 
 
 const videos = new Map();
+const streamRetries = new Map();
 
 
 
@@ -147694,7 +147567,16 @@ function attachStream(camera) {{
 
 
 
-      hls.on(Hls.Events.ERROR, (_, data) => console.warn(`Camera ${{camera}} HLS error`, data));
+      hls.on(Hls.Events.ERROR, (_, data) => {{
+        console.warn(`Camera ${{camera}} HLS error`, data);
+        // A camera whose live encoder starts on demand needs a few
+        // seconds: retry a fatal error (bounded) instead of staying dead.
+        if (!data.fatal || videos.get(camera) !== hls) return;
+        hls.destroy();
+        videos.delete(camera);
+        streamRetries.set(camera, (streamRetries.get(camera) || 0) + 1);
+        if (streamRetries.get(camera) <= 20) setTimeout(() => {{ if (!videos.has(camera)) attachStream(camera); }}, 3000);
+      }});
 
 
 
