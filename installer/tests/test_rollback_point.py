@@ -219,6 +219,18 @@ deploy_vms clean
         self.assertEqual(saved.parent, self.rollback_dir)
         self.assertIn('"release_version": "1.2.1"', saved.read_text())
 
+    def test_failure_publishing_latest_manifest_is_reported_even_in_a_conditional_caller(self):
+        result = self.run_bash('''
+cp() {
+    if [[ "${@: -1}" == "$ROLLBACK_DIR/latest.env" ]]; then return 46; fi
+    command cp "$@"
+}
+if ! create_rollback_point; then echo "ROLLBACK-FAILURE-CAUGHT"; else exit 51; fi
+''', success=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ROLLBACK-FAILURE-CAUGHT", result.stdout)
+        self.assertFalse((self.rollback_dir / "latest.env").exists())
+
     def test_by_default_rollback_points_live_in_roots_update_state_directory(self):
         state = self.tmp / "update-state-default"
         result = self.run_bash('echo "DIR=$ROLLBACK_DIR"', ANYAICAM_ROLLBACK_DIR="", UPDATE_STATE_DIR=bash_path(state))

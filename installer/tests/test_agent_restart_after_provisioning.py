@@ -73,7 +73,7 @@ class AgentRestartAfterProvisioningTests(unittest.TestCase):
         install = (ROOT / "install.sh").read_text(encoding="utf-8")
         steps = install[install.index("run_install() {"):]
         restart = steps.index("    agent_restart_after_provisioning\n")
-        for earlier in ("    if install_agent ", '    identity_provision "$INSTALL_STATE"\n', "    claim_label_provision\n",
+        for earlier in ('    install_agent "$INSTALL_STATE" --defer-capacity-bootstrap\n', '    identity_provision "$INSTALL_STATE"\n', "    claim_label_provision\n",
                         "    cloud_portal_provision\n", "    desktop_setup_provision\n", "    provision_update_signing_key\n",
                         "    provision_entitlement_signing_keys\n", "    stamp_release\n"):
             self.assertLess(steps.index(earlier), restart, earlier.strip())

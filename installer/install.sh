@@ -201,36 +201,22 @@ run_install() {
     docker_setup
     # All network-dependent image and agent preparation happens before
     # provision_users_dirs, rollback-point creation, or VMS downtime.
-    if ! prepare_agent_install_prerequisites; then return 1; fi
-    if ! prepare_vms_image; then
-        cleanup_agent_install_prerequisites || true
-        return 1
-    fi
-    if provision_users_dirs "$INSTALL_STATE"; then :; else
-        local step_status=$?
-        cleanup_agent_install_prerequisites || true
-        return "$step_status"
-    fi
-    if deploy_vms "$INSTALL_STATE"; then :; else
-        local step_status=$?
-        cleanup_agent_install_prerequisites || true
-        return "$step_status"
-    fi
-    if install_rollback_tool; then :; else
-        local step_status=$?
-        cleanup_agent_install_prerequisites || true
-        return "$step_status"
-    fi
+    # Keep Bash's errexit behavior active through each installer step. Using
+    # these functions as if-conditions suppresses errexit in their entire
+    # call trees and can turn an unchecked failure into an apparent success.
+    # The EXIT trap removes temporary prerequisites on both success and
+    # failure without wrapping any installation step in a conditional.
+    trap 'install_exit_status=$?; cleanup_agent_install_prerequisites || true; exit "$install_exit_status"' EXIT
+    prepare_agent_install_prerequisites
+    prepare_vms_image
+    provision_users_dirs "$INSTALL_STATE"
+    deploy_vms "$INSTALL_STATE"
+    install_rollback_tool
     # The full installer validated identity/capacity before downtime and
     # validates it again after systemd_setup restores the VMS. Do not run the
     # agent sub-installer's redundant bootstrap while the VMS is stopped.
-    if install_agent "$INSTALL_STATE" --defer-capacity-bootstrap; then
-        cleanup_agent_install_prerequisites || return 1
-    else
-        local step_status=$?
-        cleanup_agent_install_prerequisites || true
-        return "$step_status"
-    fi
+    install_agent "$INSTALL_STATE" --defer-capacity-bootstrap
+    cleanup_agent_install_prerequisites
     install_mediamtx "$INSTALL_STATE"
     install_webrtc_firewall
     systemd_setup

@@ -224,7 +224,8 @@ class AgentSourceOwnershipTests(unittest.TestCase):
     def test_install_agent_uses_the_trusted_deploy(self):
         text = (ROOT / "07-install-agent.sh").read_text(encoding="utf-8")
         body = text.split("install_agent() {", 1)[1]
-        self.assertIn("deploy_agent_source || return 1", body)
+        self.assertIn("deploy_agent_source || return $?", body)
+        self.assertRegex(text, r'rsync -a --no-owner --no-group --chmod=go-w --delete .*\|\| \{')
         self.assertNotIn('rsync -a --delete "$AGENT_PAYLOAD_DIR/"', text)
         self.assertIn("umask 022", (ROOT.parent / "appliance-agent" / "scripts" / "install.sh").read_text(encoding="utf-8"))
 

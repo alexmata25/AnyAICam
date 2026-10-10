@@ -85,7 +85,10 @@ deploy_agent_source() {
         return 1
     fi
     install -d -m 0755 -o root -g root "$dst"
-    rsync -a --no-owner --no-group --chmod=go-w --delete "$src/" "$dst/"
+    rsync -a --no-owner --no-group --chmod=go-w --delete "$src/" "$dst/" || {
+        echo "[ERROR] Could not copy the verified appliance-agent source into $dst." >&2
+        return 1
+    }
     # Recheck the copied tree, not only the mutable extracted payload. The
     # scan above and rsync are separate operations; reject a symlink inserted
     # during that interval before any installed code is executed.
@@ -187,7 +190,7 @@ install_agent() {
 
     # Keep an installed source copy so uninstall/repair remains self-contained
     # even if the user deletes the downloaded installer archive afterward.
-    deploy_agent_source || return 1
+    deploy_agent_source || return $?
 
     log "Installing appliance-agent control-plane package..."
     if [[ "$capacity_bootstrap_mode" == "--defer-capacity-bootstrap" ]]; then

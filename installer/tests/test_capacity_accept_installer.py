@@ -86,7 +86,7 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertLess(installer.index('deploy_vms "$INSTALL_STATE"'), installer.index('install_agent "$INSTALL_STATE"'))
         self.assertLess(installer.index('install_agent "$INSTALL_STATE" --defer-capacity-bootstrap'),
                         installer.index('    systemd_setup\n'))
-        self.assertIn('if install_agent "$INSTALL_STATE" --defer-capacity-bootstrap; then', installer)
+        self.assertIn('    install_agent "$INSTALL_STATE" --defer-capacity-bootstrap\n', installer)
         self.assertIn('"$1" == "--defer-capacity-bootstrap"', agent_installer)
         self.assertIn('"$DEFER_CAPACITY_BOOTSTRAP" == 0', agent_installer)
         self.assertLess(installer.index('    systemd_setup\n'), installer.index("bootstrap_capacity_identity migration"))

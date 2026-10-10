@@ -130,8 +130,9 @@ class BuilderTests(unittest.TestCase):
         self.assertIn('source "$INSTALLER_DIR/13-entitlement-signing-keys.sh"', install)
         self.assertLess(install.index("    secure_agent_install_root\n"), install.index("    provision_entitlement_signing_keys\n"))
         self.assertLess(install.index("    provision_entitlement_signing_keys\n"), install.index("    install_capacity_accept_step\n"))
-        self.assertLess(install.index("    install_capacity_accept_step\n"), install.index("    if ! prepare_vms_image; then\n"))
-        self.assertLess(install.index("    if ! prepare_vms_image; then\n"), install.index('    if deploy_vms "$INSTALL_STATE"; then :; else\n'))
+        self.assertLess(install.index("    install_capacity_accept_step\n"), install.index("    prepare_agent_install_prerequisites\n"))
+        self.assertLess(install.index("    prepare_agent_install_prerequisites\n"), install.index("    prepare_vms_image\n"))
+        self.assertLess(install.index("    prepare_vms_image\n"), install.index('    deploy_vms "$INSTALL_STATE"\n'))
         self.assertIn("ENTITLEMENT_SIGNING_KEYS_SHA256", install)
         self.assertRegex(install, r'ENTITLEMENT_SIGNING_KEYS_SHA256.*=~ \^\[0-9a-f\]\{64\}\$')
 

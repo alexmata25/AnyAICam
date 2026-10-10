@@ -8,7 +8,7 @@
 provision_users_dirs() {
     local state="$1"
     id -u anyaicam >/dev/null 2>&1 || \
-        useradd --system --home /var/lib/anyaicam --shell /usr/sbin/nologin anyaicam
+        useradd --system --home /var/lib/anyaicam --shell /usr/sbin/nologin anyaicam || return $?
 
     # install -d is idempotent: creates only what's missing.
     # /var/lib/anyaicam/vms/{recordings,hls,data-config} are the VMS's

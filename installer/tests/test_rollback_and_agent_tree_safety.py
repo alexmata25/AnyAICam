@@ -843,7 +843,13 @@ class OrderTests(unittest.TestCase):
             self.assertGreater(body.index(later), body.index("secure_agent_install_root"), later)
         self.assertLess(body.index("prepare_agent_install_prerequisites"), body.index('provision_users_dirs "$INSTALL_STATE"'))
         self.assertLess(body.index("prepare_vms_image"), body.index('provision_users_dirs "$INSTALL_STATE"'))
-        self.assertIn('if install_agent "$INSTALL_STATE" --defer-capacity-bootstrap; then', body)
+        self.assertIn('install_agent "$INSTALL_STATE" --defer-capacity-bootstrap', body)
+        self.assertIn("trap 'install_exit_status=$?; cleanup_agent_install_prerequisites || true; exit \"$install_exit_status\"' EXIT", body)
+        for step in ('prepare_agent_install_prerequisites', 'prepare_vms_image',
+                     'provision_users_dirs "$INSTALL_STATE"', 'deploy_vms "$INSTALL_STATE"',
+                     'install_rollback_tool'):
+            self.assertIn(f'    {step}\n', body)
+        self.assertNotIn('if install_agent ', body)
 
     def test_agent_subinstaller_failure_is_returned_to_the_orchestrator(self):
         step = (ROOT / "07-install-agent.sh").read_text(encoding="utf-8")

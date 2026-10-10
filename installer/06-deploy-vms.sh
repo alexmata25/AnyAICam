@@ -163,7 +163,7 @@ ensure_vms_env() {
     # printed or logged anywhere: the generated value exists only in this
     # command substitution and the file it's redirected into.
     env_request+=("default ANYAICAM_CAMERA_CREDENTIAL_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_')")
-    printf '%s\n' "${env_request[@]}" | agent_file
+    printf '%s\n' "${env_request[@]}" | agent_file || return $?
 
     persist_product_mode
 
@@ -364,9 +364,9 @@ create_rollback_point() {
     previous_version="$(previous_vms_version)"
     [[ -n "$previous" ]] || previous="unknown"
     short="${previous:0:12}"
-    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)" || return 1
     mkdir -p "$ROLLBACK_DIR" && chmod 0750 "$ROLLBACK_DIR" || return 1
-    if [[ "$(id -u)" == "0" ]]; then chown root:root "$(dirname "$ROLLBACK_DIR")" "$ROLLBACK_DIR"; fi
+    if [[ "$(id -u)" == "0" ]]; then chown root:root "$(dirname "$ROLLBACK_DIR")" "$ROLLBACK_DIR" || return 1; fi
 
     if docker image inspect "$VMS_IMAGE:latest" >/dev/null 2>&1; then
         image_tag="$VMS_IMAGE:rollback-$short"
@@ -383,7 +383,7 @@ create_rollback_point() {
             --exclude="$root_name/app/auto.key" --exclude="$root_name/app/auto.crt" --exclude='__pycache__' \
             "$root_name" || return 1
         gzip -t "$archive" || return 1
-        chmod 0640 "$archive"
+        chmod 0640 "$archive" || return 1
     else
         archive="none"
     fi
@@ -407,9 +407,9 @@ create_rollback_point() {
         printf 'ROLLBACK_CREATED_AT=%s\n' "$stamp"
         printf 'UPGRADE_TO_COMMIT=%s\n' "$VMS_RELEASE_COMMIT"
         printf 'CREATED_BY=installer\n'
-    } > "$manifest"
-    chmod 0640 "$manifest"
-    cp -f "$manifest" "$ROLLBACK_DIR/latest.env"
+    } > "$manifest" || return 1
+    chmod 0640 "$manifest" || return 1
+    cp -f "$manifest" "$ROLLBACK_DIR/latest.env" || return 1
     log "Rollback point for $previous: image ${image_tag:-none}, code $archive, database $db_backup (manifest $manifest)."
 }
 
@@ -486,7 +486,7 @@ deploy_vms() {
         }
     normalize_vms_install_ownership || return 1
 
-    ensure_vms_env || return 1
+    ensure_vms_env
 
     log "Activating the prepared VMS image $PREPARED_VMS_IMAGE_TAG ..."
     docker tag "$PREPARED_VMS_IMAGE_TAG" "$VMS_IMAGE:latest" || {
