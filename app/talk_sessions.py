@@ -62,7 +62,7 @@ def _authorized_talk_camera(db, camera_id: str, identity: dict) -> dict:
     with different error messages so the frontend can show the right
     one, but neither is ever treated as "go ahead"."""
     camera = db.execute(
-        'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+        "SELECT * FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
         (camera_id, identity['customer_id']),
     ).fetchone()
     if not camera:

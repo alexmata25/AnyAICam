@@ -1945,7 +1945,7 @@ def get_camera_numbers() -> list[int]:
         from partner_db import connection
         with connection() as db:
             assigned = db.execute(
-                "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
+                "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL AND COALESCE(status,'')!='removed' ORDER BY camera_number"
             ).fetchall()
     except Exception:
         assigned = []
@@ -2802,6 +2802,40 @@ YOLO_ALLOWED_CLASSES = {
 
 
 ffmpeg_processes: list[subprocess.Popen] = []
+_ffmpeg_process_lock = threading.RLock()
+_ffmpeg_process_camera_numbers: dict[subprocess.Popen, int] = {}
+
+
+def stop_camera_processes(camera_number: int, *, timeout: float = 5.0) -> int:
+    """Stop this VMS process's live/recording FFmpeg workers for one slot.
+
+    The camera-removal route calls this while holding the same lock and
+    the archive transaction. Holding the lock used when workers start
+    prevents a retry loop from launching another process between stopping
+    the current worker and committing removal. The next loop iteration
+    then observes the archived camera and remains not_configured.
+    """
+    with _ffmpeg_process_lock:
+        selected = [
+            process for process, number in _ffmpeg_process_camera_numbers.items()
+            if number == int(camera_number) and process.poll() is None
+        ]
+        for process in selected:
+            try:
+                process.terminate()
+            except OSError:
+                # A process may exit between poll() and terminate().
+                pass
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        for process in selected:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+        return len(selected)
 
 
 
@@ -15997,10 +16031,16 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
         from appliance_protocol import decrypt_camera_credentials
         with connection() as db:
             camera = db.execute(
-                "SELECT id, onvif_endpoint, ip_address FROM cameras WHERE camera_number=?",
+                "SELECT id, onvif_endpoint, ip_address FROM cameras WHERE camera_number=? AND COALESCE(status,'')!='removed'",
                 (camera_number,),
             ).fetchone()
             if not camera:
+                archived = db.execute(
+                    'SELECT 1 FROM cameras WHERE former_camera_number=? LIMIT 1',
+                    (camera_number,),
+                ).fetchone()
+                if archived:
+                    return {"removed": True}
                 return None
             credential_row = db.execute(
                 "SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?",
@@ -16046,6 +16086,8 @@ def camera_url(camera_number: int) -> str:
     exception's docstring for why process_supervisor() depends on this
     distinction."""
     provisioned = _provisioned_camera_stream(camera_number)
+    if provisioned and provisioned.get("removed"):
+        raise CameraNotConfiguredError(f"Camera {camera_number} has been removed from active service.")
     if provisioned:
         return credentialed_rtsp_url(provisioned["rtsp_url"], provisioned["username"], provisioned["password"])
 
@@ -16784,7 +16826,10 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         try:
-            process = starter(camera_number)
+            with _ffmpeg_process_lock:
+                process = starter(camera_number)
+                ffmpeg_processes.append(process)
+                _ffmpeg_process_camera_numbers[process] = camera_number
         except CameraNotConfiguredError:
             # Not an error: this slot has no camera provisioned yet (a
             # fresh install, or a not-yet-configured supervisor headroom
@@ -16823,15 +16868,6 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
             )
             await asyncio.sleep(10)
             continue
-
-
-
-
-
-
-
-
-        ffmpeg_processes.append(process)
 
 
 
@@ -16888,10 +16924,12 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
                     if drain_task is not None and not drain_task.done():
                         await asyncio.shield(drain_task)
                 finally:
-                    try:
-                        ffmpeg_processes.remove(process)
-                    except ValueError:
-                        pass
+                    with _ffmpeg_process_lock:
+                        try:
+                            ffmpeg_processes.remove(process)
+                        except ValueError:
+                            pass
+                        _ffmpeg_process_camera_numbers.pop(process, None)
 
 
 
@@ -38373,6 +38411,8 @@ async def lifespan(app: FastAPI):
 
 
     ffmpeg_processes = []
+    with _ffmpeg_process_lock:
+        _ffmpeg_process_camera_numbers.clear()
 
 
 
@@ -137269,7 +137309,7 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
         if identity.get("role") == "customer_owner":
             return [
                 dict(camera) for camera in db.execute(
-                    'SELECT id, name, camera_number FROM cameras WHERE customer_id=? '
+                    'SELECT id, name, COALESCE(camera_number,former_camera_number) AS camera_number FROM cameras WHERE customer_id=? '
                     'ORDER BY camera_number, id',
                     (identity["customer_id"],),
                 ).fetchall()
@@ -137283,8 +137323,8 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
             return []
 
         return [
-            dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name, c.camera_number FROM cameras c '
+                dict(camera) for camera in db.execute(
+                'SELECT c.id, c.name, COALESCE(c.camera_number,c.former_camera_number) AS camera_number FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'WHERE c.customer_id=? AND p.can_playback=1 '
                 'ORDER BY c.camera_number, c.id',

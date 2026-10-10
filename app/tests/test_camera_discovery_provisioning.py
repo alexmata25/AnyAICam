@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 import main
 import partner_workspace
@@ -946,7 +947,7 @@ def test_camera_moved_to_a_second_appliance_under_the_same_customer_reassigns_no
     assert cameras[0][1] == "site-cust-1-b"  # site_id moved with it
 
 
-def test_same_device_key_under_a_different_customer_is_a_separate_camera(db_path, monkeypatch):
+def test_same_device_key_cannot_be_registered_under_a_different_customer(db_path, monkeypatch):
     request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
     appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
     with override_target(sqlite_path=db_path):
@@ -959,19 +960,16 @@ def test_same_device_key_under_a_different_customer_is_a_separate_camera(db_path
         job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-shared", "name": "Front Door"})
         appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
 
-        # A coincidentally-identical device_key under an ENTIRELY
-        # different customer/appliance -- must be allowed as its own
-        # separate camera row, never merged with cust-1's.
+        # A device key is a global physical-camera identity. A second
+        # customer must complete an explicitly authorized transfer first.
         monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity("cust-2"))
-        job2 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-2", "device_key": "onvif-uuid-shared", "name": "Front Door"})
-        appliance_submit_provisioning(
-            _fake_request(_appliance_auth_headers(appliance_id="appl-2", credential="token-appl-2")),
-            "AIC-TEST2", job2["job_id"], {"success": True},
-        )
+        with pytest.raises(HTTPException) as blocked:
+            request_camera_provisioning(_fake_request(), {"appliance_id": "appl-2", "device_key": "ONVIF-UUID-SHARED", "name": "Front Door"})
+        assert blocked.value.status_code == 409
 
         conn2 = sqlite3.connect(db_path)
         cameras = conn2.execute("SELECT customer_id FROM cameras WHERE device_key='onvif-uuid-shared' ORDER BY customer_id").fetchall()
-    assert [row[0] for row in cameras] == ["cust-1", "cust-2"]  # two real rows, one per customer, no collision
+    assert [row[0] for row in cameras] == ["cust-1"]
 
 
 def test_multiple_null_device_key_cameras_coexist_under_one_customer(db_path):

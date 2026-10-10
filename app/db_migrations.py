@@ -195,7 +195,22 @@ def apply_migrations():
         # table -- see camera_credentials (encrypted) instead.
         for name,definition in (('device_key','TEXT'),('ip_address','TEXT'),('onvif_endpoint','TEXT'),('manufacturer','TEXT'),('model','TEXT')):
             if name not in camera_columns: db.execute(f'ALTER TABLE cameras ADD COLUMN {name} {definition}')
+        if 'former_camera_number' not in camera_columns:
+            db.execute('ALTER TABLE cameras ADD COLUMN former_camera_number INTEGER')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_customer_device_key ON cameras(customer_id,device_key) WHERE device_key IS NOT NULL')
+        # A device key is a global physical-camera identity, not a tenant
+        # namespace. Keep its owner binding when the camera is archived so
+        # another customer cannot silently register the same device. A
+        # separately authorized transfer flow may move this claim later.
+        db.execute('CREATE TABLE IF NOT EXISTS camera_identity_registry(device_key TEXT PRIMARY KEY,customer_id TEXT NOT NULL,camera_id TEXT,created_at TEXT NOT NULL)')
+        for camera in db.execute(
+            'SELECT id,customer_id,device_key,created_at FROM cameras '
+            "WHERE device_key IS NOT NULL AND TRIM(device_key)!='' ORDER BY created_at,id"
+        ).fetchall():
+            db.execute(
+                'INSERT OR IGNORE INTO camera_identity_registry(device_key,customer_id,camera_id,created_at) VALUES(?,?,?,?)',
+                (str(camera['device_key'] or '').strip().casefold(),camera['customer_id'],camera['id'],camera['created_at']),
+            )
         # Restored from production's 20260824_camera_discovery migration
         # (see that migration's own comment below for the full story):
         # production's appliance-scoped, non-unique index on the same

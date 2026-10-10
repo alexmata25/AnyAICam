@@ -302,7 +302,7 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
     if identity.get('role') == 'customer_owner':
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT id, name, camera_number, talk_down_supported FROM cameras WHERE customer_id=? '
+                "SELECT id, name, camera_number, talk_down_supported FROM cameras WHERE customer_id=? AND COALESCE(status,'')!='removed' "
                 'ORDER BY camera_number, id',
                 (identity['customer_id'],),
             ).fetchall()
@@ -319,7 +319,7 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
             dict(camera) for camera in db.execute(
                 'SELECT c.id, c.name, c.camera_number, c.talk_down_supported FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
-                'WHERE c.customer_id=? AND p.can_live=1 '
+                "WHERE c.customer_id=? AND COALESCE(c.status,'')!='removed' AND p.can_live=1 "
                 'ORDER BY c.camera_number, c.id',
                 (user['id'], identity['customer_id']),
             ).fetchall()
@@ -358,7 +358,7 @@ def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
     playlist calls this page's own JavaScript makes are independently
     re-checked by Phase 6b/6c's own routes regardless."""
     camera = db.execute(
-        'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+        "SELECT * FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
         (camera_id, identity['customer_id']),
     ).fetchone()
     if not camera:
@@ -655,7 +655,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         identity = _require_customer_owner(request)
         with connection() as db:
             camera = db.execute(
-                'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+                "SELECT id FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
                 (camera_id, identity['customer_id']),
             ).fetchone()
             if not camera:
@@ -673,7 +673,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         identity = _require_customer_owner(request)
         with connection() as db:
             camera = db.execute(
-                'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+                "SELECT id FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
                 (camera_id, identity['customer_id']),
             ).fetchone()
             if not camera:

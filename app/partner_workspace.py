@@ -1,6 +1,7 @@
 from cloud_config import settings as cloud_settings
 import json
 import secrets
+import subprocess
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
@@ -347,7 +348,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             'MAX(COALESCE(acs.online,0)) AS appliance_online,'
             'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
             'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
-            'WHERE c.customer_id=? GROUP BY c.id,c.name,c.camera_number,c.status ORDER BY c.camera_number',
+            "WHERE c.customer_id=? AND COALESCE(c.status,'')!='removed' GROUP BY c.id,c.name,c.camera_number,c.status ORDER BY c.camera_number",
             (customer['id'],)
         )
         for camera in all_customer_cameras:
@@ -366,9 +367,10 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # never reported in by the appliance either) -- that customer
         # belongs in Setup too, not looking at an empty or
         # placeholder-only camera list on their own account page.
-        if identity['role']=='customer_owner' and not (activated and cameras):
+        if identity['role']=='customer_owner' and not activated:
             return RedirectResponse('/customer/setup',status_code=303)
 
+        owner_can_manage=identity.get('role')=='customer_owner'
         camera_cards=''.join(
             f'''<article class="feature-card">
                 <div class="feature-icon">▣</div>
@@ -380,6 +382,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                     has_cloud_recording=camera['has_recording'],
                 ))}</p>
                 <a class="action-button" href="/customer/cameras/{escape(camera['id'],quote=True)}/live">Live view</a>
+                {f'<button type="button" class="ghost-button remove-camera-button" data-camera-id="{escape(camera["id"],quote=True)}">Remove camera</button>' if owner_can_manage else ''}
             </article>'''
             for camera in cameras
         ) or '<div class="empty">No cameras are assigned to this customer account.</div>'
@@ -396,14 +399,32 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         <section class="panel">
             <div class="panel-head">
                 <div>
-                    <h2>Your cameras</h2>
+                    <h2>Camera Management</h2>
                     <div class="health-detail">Live video is delivered through the AnyAiCam cloud relay.</div>
                 </div>
+                {('<a class="action-button" href="/customer/setup?step=4">Add camera</a>' if owner_can_manage else '')}
             </div>
             <div class="feature-grid">{camera_cards}</div>
         </section>'''
 
-        return shell('Customer VMS','dashboard',content)
+        scripts='''<script>
+document.addEventListener('click',async event=>{
+  const button=event.target.closest('.remove-camera-button');
+  if(!button)return;
+  const cameraId=button.dataset.cameraId;
+  if(!cameraId||!window.confirm('Remove this camera from active service? Its licensed slot will be released. Existing recordings, events, thumbnails, and audit history will be kept.'))return;
+  if(window.prompt('Type REMOVE to confirm. This stops new live/recording service for this camera.')!=='REMOVE')return;
+  button.disabled=true;
+  try{
+    const response=await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation:'REMOVE'})});
+    const result=await response.json();
+    if(!response.ok){button.disabled=false;showToast(result.detail||'Camera removal failed. No camera data was deleted.');return;}
+    showToast(result.message||'Camera removed.');
+    location.reload();
+  }catch(error){button.disabled=false;showToast('Camera removal could not be confirmed. Check the connection and retry.');}
+});
+</script>'''
+        return shell('Customer VMS','dashboard',content,scripts)
 
     @app.get('/customer/setup',response_class=HTMLResponse)
     def customer_first_setup(request: Request):
@@ -625,6 +646,19 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured on this deployment yet. Contact support before adding a credentialed camera.')
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
+            # A physical device identity is globally bound to one customer.
+            # Removal releases the licensed slot but retains this ownership
+            # claim; a future transfer must explicitly authorize moving it.
+            identity_claim=db.execute(
+                'SELECT customer_id FROM camera_identity_registry WHERE device_key=?',
+                (device_key.casefold(),),
+            ).fetchone()
+            foreign_camera=db.execute(
+                'SELECT id FROM cameras WHERE device_key=? AND customer_id<>? LIMIT 1',
+                (device_key,identity['customer_id']),
+            ).fetchone()
+            if (identity_claim and identity_claim['customer_id']!=identity['customer_id']) or foreign_camera:
+                raise HTTPException(status_code=409,detail='This camera is already registered to another customer. An authorized transfer is required.')
             db.execute(
                 'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) '
                 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -668,7 +702,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # called from that same path); a placeholder has neither. Counting
         # by device_key here -- not status -- so a customer's progress
         # reflects real, working cameras, never a renamed placeholder.
-        configured=len([c for c in cameras if c.get('device_key')])
+        configured=len([c for c in cameras if c.get('device_key') and c.get('status')!='removed'])
         expected=int(plan.get('camera_quantity') or 0)
         return {'cameras':cameras,'expected_camera_count':expected,'configured_camera_count':configured,'onboarding_complete':expected>0 and configured>=expected}
 
@@ -686,22 +720,68 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
     # of this route exists -- see test_exactly_one_camera_provision_route_is_registered().
 
     @app.delete('/api/customer/cameras/{camera_id}')
-    def remove_customer_camera(request: Request,camera_id: str) -> dict:
+    def remove_customer_camera(request: Request,camera_id: str,payload: dict) -> dict:
         identity=customer_owner(request)
         try: require_permission(identity,'camera.self.configure')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        camera=row('SELECT id, camera_number, appliance_id FROM cameras WHERE id=? AND customer_id=?',(camera_id,identity['customer_id']))
-        if not camera: raise HTTPException(status_code=404,detail='Camera not found.')
-        with connection() as db:
-            if camera.get('camera_number') is not None and camera.get('appliance_id'):
-                try:
-                    from camera_mapping import assign_camera_number
-                    assign_camera_number(db,camera_id,None,appliance_id=camera['appliance_id'],customer_id=identity['customer_id'])
-                except (LookupError, ValueError):
-                    pass
-            db.execute('DELETE FROM camera_credentials WHERE camera_id=?',(camera_id,))
-            db.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
-        audit(identity,'camera.removed','camera',camera_id); return {'message':'Camera removed.'}
+        if not isinstance(payload,dict) or payload.get('confirmation')!='REMOVE':
+            raise HTTPException(status_code=400,detail='Explicit camera removal confirmation is required.')
+        now=datetime.now().isoformat()
+        already_removed=False
+        from main import _ffmpeg_process_lock,stop_camera_processes
+        # Serialize worker start and the archive transaction. If stopping
+        # FFmpeg fails, raising inside connection() rolls the database
+        # changes back and leaves the camera and its credentials active.
+        with _ffmpeg_process_lock:
+            with connection() as db:
+                camera=db.execute(
+                    'SELECT id,name,camera_number,former_camera_number,device_key,status FROM cameras WHERE id=? AND customer_id=?',
+                    (camera_id,identity['customer_id']),
+                ).fetchone()
+                if not camera: raise HTTPException(status_code=404,detail='Camera not found.')
+                if camera['status']=='removed':
+                    already_removed=True
+                else:
+                    changed=db.execute(
+                        "UPDATE cameras SET former_camera_number=COALESCE(camera_number,former_camera_number),camera_number=NULL,status='removed' "
+                        "WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
+                        (camera_id,identity['customer_id']),
+                    ).rowcount
+                    if changed:
+                        # Credentials are active access material, not history.
+                        # Remove them in the same transaction as the archive so
+                        # a partial failure rolls back both operations.
+                        db.execute('DELETE FROM camera_credentials WHERE camera_id=?',(camera_id,))
+                        db.execute('DELETE FROM live_relay_idle_tracking WHERE camera_id=?',(camera_id,))
+                        db.execute(
+                            "UPDATE live_view_sessions SET state='failed',failed_at=?,error='camera_removed' "
+                            "WHERE camera_id=? AND state IN ('requested','starting','ready')",
+                            (now,camera_id),
+                        )
+                        details=json.dumps({'former_camera_number':camera['camera_number'],'slot_released':True})
+                        db.execute(
+                            'INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) '
+                            'VALUES(?,?,?,?,?,?,?)',
+                            (identity['email'],identity['role'],'camera.removed','camera',camera_id,details,now),
+                        )
+                    else:
+                        already_removed=True
+                camera_number=camera['camera_number'] or camera['former_camera_number']
+                if camera_number is not None:
+                    try:
+                        stop_camera_processes(int(camera_number))
+                    except (OSError,subprocess.TimeoutExpired):
+                        raise HTTPException(status_code=503,detail='Camera streams could not be stopped. No removal changes were saved; retry the removal or contact support.')
+                plan=db.execute('SELECT camera_quantity FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(identity['customer_id'],)).fetchone()
+                active_count=db.execute(
+                    "SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL AND COALESCE(status,'')!='removed'",
+                    (identity['customer_id'],),
+                ).fetchone()['n']
+        return {
+            'message':'Camera was already removed.' if already_removed else 'Camera removed. Historical recordings, events, thumbnails, and audit history are preserved; its licensed slot is available again.',
+            'status':'removed','already_removed':already_removed,
+            'camera_capacity':{'configured_camera_count':active_count,'licensed_camera_slots':int(plan['camera_quantity'] if plan else 0)},
+        }
 
     @app.put('/api/customer/cameras')
     def configure_customer_cameras(request: Request,payload: dict) -> dict:

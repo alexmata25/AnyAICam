@@ -64,7 +64,7 @@ def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
     logic exactly (see module docstring for why this is duplicated,
     not shared)."""
     camera = db.execute(
-        'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+        "SELECT * FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
         (camera_id, identity['customer_id']),
     ).fetchone()
     if not camera:

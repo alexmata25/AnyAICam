@@ -137,7 +137,7 @@ def register_live_playlist_routes(app: FastAPI) -> None:
         identity = customer_owner(request)
         with connection() as db:
             camera = db.execute(
-                'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+                "SELECT * FROM cameras WHERE id=? AND customer_id=? AND COALESCE(status,'')!='removed'",
                 (camera_id, identity['customer_id']),
             ).fetchone()
             if not camera:

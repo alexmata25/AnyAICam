@@ -210,7 +210,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows("SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? AND COALESCE(status,'')!='removed' ORDER BY camera_number,name",(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -581,6 +581,46 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         now=datetime.now().isoformat(); camera_id=None
         with connection() as db:
             if success:
+                # device_key claims are global across tenants. The registry
+                # insertion is the concurrency-safe boundary: two appliances
+                # may discover the same endpoint, but only the first
+                # authorized customer can bind it. A removed camera keeps its
+                # claim until a separately authorized transfer is completed.
+                foreign_camera=db.execute(
+                    'SELECT id FROM cameras WHERE device_key=? AND customer_id<>? LIMIT 1',
+                    (job['device_key'],job['customer_id']),
+                ).fetchone()
+                claim=db.execute(
+                    'SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',
+                    (job['device_key'].casefold(),),
+                ).fetchone()
+                if foreign_camera or (claim and claim['customer_id']!=job['customer_id']):
+                    success=False
+                    message='Camera is already registered to another customer; an authorized transfer is required.'
+                    failure_code='camera_owned_by_another_customer'
+                else:
+                    db.execute(
+                        'INSERT OR IGNORE INTO camera_identity_registry(device_key,customer_id,camera_id,created_at) VALUES(?,?,NULL,?)',
+                        (job['device_key'].casefold(),job['customer_id'],now),
+                    )
+                    claim=db.execute(
+                        'SELECT customer_id,camera_id FROM camera_identity_registry WHERE device_key=?',
+                        (job['device_key'].casefold(),),
+                    ).fetchone()
+                    if not claim or claim['customer_id']!=job['customer_id']:
+                        success=False
+                        message='Camera is already registered to another customer; an authorized transfer is required.'
+                        failure_code='camera_owned_by_another_customer'
+                    elif claim['camera_id']:
+                        claimed_camera=db.execute(
+                            'SELECT device_key FROM cameras WHERE id=? AND customer_id=?',
+                            (claim['camera_id'],job['customer_id']),
+                        ).fetchone()
+                        if not claimed_camera or (claimed_camera['device_key'] or '').strip().casefold()!=job['device_key'].strip().casefold():
+                            success=False
+                            message='Camera identity registry does not match the existing camera record.'
+                            failure_code='camera_identity_conflict'
+            if success:
                 # device_key identifies the physical camera itself (its
                 # ONVIF endpoint reference UUID), not an appliance-camera
                 # relationship -- scoped to customer_id, never looked up
@@ -626,7 +666,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # an already-bound camera) is never touched here.
                 camera_row=db.execute('SELECT camera_number FROM cameras WHERE id=?',(camera_id,)).fetchone()
                 if camera_row and camera_row['camera_number'] is None:
-                    used=set(int(item['camera_number']) for item in db.execute('SELECT camera_number FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL',(appliance['id'],)).fetchall())
+                    used=set(int(item['camera_number']) for item in db.execute(
+                        'SELECT camera_number FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL '
+                        'UNION SELECT former_camera_number FROM cameras WHERE appliance_id=? AND former_camera_number IS NOT NULL',
+                        (appliance['id'],appliance['id']),
+                    ).fetchall())
                     candidate=1
                     while candidate in used: candidate+=1
                     try:
@@ -634,6 +678,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         assign_camera_number(db,camera_id,candidate,appliance_id=appliance['id'],customer_id=job['customer_id'])
                     except (LookupError, ValueError):
                         pass
+                db.execute(
+                    'UPDATE camera_identity_registry SET camera_id=? WHERE device_key=? AND customer_id=? AND (camera_id IS NULL OR camera_id=?)',
+                    (camera_id,job['device_key'].casefold(),job['customer_id'],camera_id),
+                )
                 if job['encrypted_credentials']:
                     # Persists the customer-supplied credentials from
                     # THIS job into camera_credentials -- the table
