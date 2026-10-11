@@ -552,3 +552,97 @@ def test_main_frame_grab_started_before_retirement_is_not_cached():
                                                enabled=True)
     holder["grabber"] = grabber
     assert grabber.grab(2) is None and 2 not in grabber._cache
+
+
+# ---------------------------------------------------------------- races (Codex re-review of 9158804)
+
+def _fake_popen_counter():
+    spawned = []
+
+    class Proc:
+        stdout = None
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    def popen(*a, **k):
+        spawned.append(1)
+        return Proc()
+
+    return spawned, popen
+
+
+def test_a_retired_reader_is_permanently_dead():
+    spawned, popen = _fake_popen_counter()
+    reader = analytics_frames.FrameReader(3, lambda n: None, popen=popen, log=lambda m: None)
+    reader.retire()
+    assert reader.ensure_running() is False and reader._thread is None     # never (re)started
+    frames = analytics_frames.AnalyticsFrames(lambda n: None, mode="main", start_housekeeping=False)
+    old = frames._reader(3)
+    frames.forget(3)                                             # retired between acquisition and start
+    assert old.retired and old.ensure_running() is False and old._thread is None
+    new = frames._reader(3, frames.generation(3), start=True)   # re-added: a NEW reader
+    assert new is not old and not new.retired
+    new.stop()
+
+
+def test_start_happens_under_the_generation_check():
+    frames = analytics_frames.AnalyticsFrames(lambda n: None, mode="main", start_housekeeping=False)
+    generation = frames.generation(5)
+    frames.forget(5)
+    assert frames._reader(5, generation, start=True) is None and 5 not in frames._readers
+
+
+def test_reader_thread_of_a_stale_generation_never_spawns():
+    spawned, popen = _fake_popen_counter()
+    reader = analytics_frames.FrameReader(4, lambda n: analytics_frames.SourceSpec("rtsp://x", 8, 6, "main"),
+                                          popen=popen, log=lambda m: None, in_service=lambda n: True,
+                                          generation=0, current_generation=lambda: 1)   # camera re-added
+    reader.ensure_running()
+    reader._thread.join(timeout=5)
+    assert spawned == [] and not reader._thread.is_alive()
+
+
+def test_grab_cache_hit_is_never_returned_across_retirement():
+    import types
+    runs = []
+
+    def run(args, **kwargs):
+        runs.append(1)
+        return types.SimpleNamespace(returncode=0, stdout=b"x")
+
+    frames_out = iter([np.full((4, 4, 3), 1, np.uint8), np.full((4, 4, 3), 2, np.uint8)])
+    grabber = main_frame_grab.MainFrameGrabber(lambda n: "rtsp://x", run=run, decode=lambda raw: next(frames_out),
+                                               enabled=True)
+    first = grabber.grab(2)
+    assert first[0, 0, 0] == 1
+    grabber.forget(2)                                            # retired and re-added
+    second = grabber.grab(2)
+    assert second[0, 0, 0] == 2 and len(runs) == 2               # the old cached frame is never returned
+
+
+def test_grab_waiting_for_the_camera_lock_across_retirement_returns_nothing():
+    import threading
+    import types
+    grabber = main_frame_grab.MainFrameGrabber(lambda n: "rtsp://x", enabled=True,
+                                               run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=b"x"),
+                                               decode=lambda raw: np.zeros((4, 4, 3), np.uint8))
+    grabber._cache[7] = (grabber._clock(), np.ones((4, 4, 3), np.uint8), 0)   # a fresh cached frame
+    lock = grabber._lock_for(7)
+    lock.acquire()                                               # another grab is in progress
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("frame", grabber.grab(7)))
+    worker.start()
+    import time as _time
+    _time.sleep(0.1)                                             # the caller captured generation 0 and waits
+    grabber.forget(7)                                            # retired meanwhile
+    lock.release()
+    worker.join(timeout=5)
+    assert result["frame"] is None

@@ -99,8 +99,11 @@ class MainFrameGrabber:
             generation = self._generation.get(camera_number, 0)
         with self._lock_for(camera_number):
             now = self._clock()
-            cached = self._cache.get(camera_number)
-            if cached and now - cached[0] <= CACHE_SECONDS:
+            with self._guard:
+                if self._generation.get(camera_number, 0) != generation:
+                    return None  # retired while waiting for the camera's lock
+                cached = self._cache.get(camera_number)
+            if cached and cached[2] == generation and now - cached[0] <= CACHE_SECONDS:
                 return cached[1]
             if now < self._failed_until.get(camera_number, 0.0):
                 return None
@@ -118,7 +121,7 @@ class MainFrameGrabber:
                     return None  # the camera was retired during the grab: never cache or use it
                 if frame is None:
                     self._failed_until[camera_number] = now + FAILURE_BACKOFF_SECONDS
-                self._cache[camera_number] = (now, frame)
+                self._cache[camera_number] = (now, frame, generation)
             return frame
 
     def forget(self, camera_number: int) -> None:

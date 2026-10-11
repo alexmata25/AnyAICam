@@ -144,10 +144,14 @@ class FrameReader:
                  popen: Callable = subprocess.Popen, fps: float = None, clock: Callable[[], float] = time.monotonic,
                  wall_clock: Callable[[], datetime] = datetime.now, on_run_end: Callable = None,
                  log: Callable[[str], None] = print, in_service: Callable[[int], bool] = None,
-                 generation: int = 0):
+                 generation: int = 0, current_generation: Callable[[], int] = None):
         self.camera_number = int(camera_number)
         self._in_service = in_service
         self.generation = generation
+        self._current_generation = current_generation
+        # A retired reader (its camera was retired) is permanently dead: it is
+        # never restarted, even if the same camera number is re-added.
+        self.retired = False
         self._resolve = resolve
         self._popen = popen
         self._fps = READER_FPS if fps is None else fps
@@ -172,14 +176,25 @@ class FrameReader:
         self.last_error: Optional[str] = None
 
     # ---------------------------------------------------------------- control
-    def ensure_running(self) -> None:
+    def ensure_running(self) -> bool:
+        """Start the reader thread if needed. False (nothing started) for a
+        retired reader."""
         with self._lock:
+            if self.retired:
+                return False
             self._last_request = self._clock()
             if self._thread is not None and self._thread.is_alive():
-                return
+                return True
             self._stop = False
             self._thread = threading.Thread(target=self._run, name=f"ai-reader-{self.camera_number}", daemon=True)
             self._thread.start()
+            return True
+
+    def retire(self) -> None:
+        """Permanently stop this reader (camera retired)."""
+        with self._lock:
+            self.retired = True
+        self.stop()
 
     def restart(self) -> None:
         """Re-resolve the source (e.g. the camera's measured size changed)."""
@@ -234,6 +249,14 @@ class FrameReader:
 
     # ---------------------------------------------------------------- thread
     def _still_in_service(self) -> bool:
+        if self.retired:
+            return False
+        if self._current_generation is not None:
+            try:
+                if self._current_generation() != self.generation:
+                    return False  # the camera was retired (maybe re-added): this reader is stale
+            except Exception:
+                pass
         if self._in_service is None:
             return True
         try:
@@ -376,16 +399,19 @@ class AnalyticsFrames:
         else:
             reader = FrameReader(camera_number, self._resolve, clock=self._clock, log=self._log,
                                  on_run_end=lambda n, frames, error, g=generation: self._note_run(n, frames, error, g),
-                                 in_service=self._in_service, generation=generation)
+                                 in_service=self._in_service, generation=generation,
+                                 current_generation=lambda n=camera_number: self.generation(n))
         try:
             reader.generation = generation
         except Exception:
             pass
         return reader
 
-    def _reader(self, camera_number: int, generation: Optional[int] = None) -> Optional[FrameReader]:
+    def _reader(self, camera_number: int, generation: Optional[int] = None, start: bool = False) -> Optional[FrameReader]:
         """The camera's reader, created if needed -- unless the camera was
-        retired since `generation` was read (then None: nothing is created)."""
+        retired since `generation` was read (then None: nothing is created).
+        start=True starts it under the same lock and generation check, so a
+        retirement can never slip in between acquiring and starting it."""
         with self._lock:
             current = self._generation.get(camera_number, 0)
             if generation is not None and generation != current:
@@ -393,6 +419,8 @@ class AnalyticsFrames:
             reader = self._readers.get(camera_number)
             if reader is None:
                 reader = self._readers[camera_number] = self._make_reader(camera_number, current)
+            if start and getattr(reader, "ensure_running")() is False:
+                return None
             start_thread = not self._housekeeping_started
             self._housekeeping_started = True
         if start_thread:
@@ -466,10 +494,9 @@ class AnalyticsFrames:
                         "error": "Camera is not configured."}
         if self.uses_hls(camera_number):
             return None
-        reader = self._reader(camera_number, generation)
+        reader = self._reader(camera_number, generation, start=True)
         if reader is None:
-            return gone  # retired after the service check: never create a reader for it
-        reader.ensure_running()
+            return gone  # retired after the service check: never create or start a reader for it
         got = reader.latest(wait=FIRST_FRAME_WAIT_SECONDS if wait is None else wait)
         if self.generation(camera_number) != generation:
             return gone  # retired while we waited: its frame is not delivered
@@ -498,8 +525,13 @@ class AnalyticsFrames:
             reader = self._readers.pop(camera_number, None)
             self._failures.pop(camera_number, None)
             self._hls_until.pop(camera_number, None)
+            if reader is not None:
+                try:
+                    reader.retired = True  # dead before the lock is released
+                except Exception:
+                    pass
         if reader is not None:
-            reader.stop()
+            (getattr(reader, "retire", None) or reader.stop)()
 
     def stop_all(self) -> None:
         with self._lock:
