@@ -312,6 +312,10 @@ def _activate(db_path, appliance_id: str) -> None:
     with override_target(sqlite_path=str(db_path)):
         conn = sqlite3.connect(db_path)
         conn.execute("UPDATE appliances SET activation_status='activated' WHERE id=?", (appliance_id,))
+        # Token activation always issues a credential (appliance_cloud.activate());
+        # readiness requires a non-revoked one (appliance_readiness._live).
+        conn.execute("INSERT OR IGNORE INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) "
+                     "VALUES(?,?,?,?,?)", (f"cred-{appliance_id}", appliance_id, "x", "2026-01-01", "activation"))
         conn.commit()
 
 

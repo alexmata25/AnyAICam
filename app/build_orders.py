@@ -16,6 +16,12 @@ that sets a product, price or Stripe Price ID:
   repeated activation, a retry or a lost answer never creates a second
   subscription or charge. The plan's entitlement is still granted only by
   billing v2 from Stripe's own subscription state.
+  Activation is a token activation (activation_status='activated') or, since
+  2026-10-11, a claim-code appliance that really enrolled (appliances.
+  activated_at, recorded by appliance_claims.record_claim_activation()).
+  Starts pending for appliances claimed before that are HELD for an explicit,
+  audited owner/admin decision (STORAGE_HELD, /admin/storage-starts) and are
+  never charged automatically.
 * own_pc -- one Stripe Checkout (mode=subscription): the per-camera plan
   starts today, plus the one-time VMS software license for the smallest
   license tier that covers the camera count, as a one-time line on the
@@ -42,6 +48,10 @@ STORAGE_STARTED = "started"
 STORAGE_FAILED = "failed"                # transient: retried by the billing worker
 STORAGE_PAYMENT_FAILED = "payment_failed"  # Stripe refused (e.g. card declined): the customer retries
 STORAGE_SUPERSEDED = "superseded"        # the account got a plan another way; nothing to start
+# Held for an explicit owner/admin decision (db_migrations.hold_pre_cutover_
+# claimed_storage_starts): never started by activation, a claim or the worker;
+# only admin_start_held_storage() releases it.
+STORAGE_HELD = "owner_review"
 STARTING_STALE_SECONDS = 300
 RELAY_SKU = "AIC-RELAY-NUMATO-3CH"
 
@@ -348,7 +358,16 @@ def _grant_vms_license(session: dict, customer_id: str, metadata: dict) -> dict:
 # ------------------------------------------------------------------ activation
 
 def _appliance_activated(customer_id: str) -> bool:
-    return bool(row("SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated' LIMIT 1", (customer_id,)))
+    """Activated for billing: token-activated (activation_status='activated',
+    appliance_cloud.activate()), or claimed after claim-flow activation shipped
+    and really enrolled -- activated_at, recorded once by appliance_claims.
+    record_claim_activation() on the row claim/complete marked
+    activated_via='claim'. An appliance claimed before that change has no
+    marker and never counts here: its account's start waits for an explicit
+    owner/admin decision instead (STORAGE_HELD)."""
+    return bool(row("SELECT id FROM appliances WHERE customer_id=? AND (activation_status='activated' OR "
+                    "(activated_via='claim' AND activated_at IS NOT NULL AND COALESCE(activation_status,'pending')!='released')) "
+                    "LIMIT 1", (customer_id,)))
 
 
 def _hardware_still_paid(plan: dict) -> bool:
@@ -416,7 +435,11 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
     plan = storage_plan(customer_id)
     if not plan or plan["state"] in (STORAGE_STARTED, STORAGE_SUPERSEDED):
         return {"status": "ignored", "reason": "nothing to start"}
-    if not _appliance_activated(customer_id):
+    if plan["state"] == STORAGE_HELD:
+        return {"status": "ignored", "reason": "held for an owner decision"}
+    # An owner/admin-approved start (admin_start_held_storage) is its own
+    # activation signal, so a transient failure after approval is retried.
+    if not (_appliance_activated(customer_id) or plan.get("owner_approved_at")):
         return {"status": "ignored", "reason": "appliance not activated"}
     if billing.has_camera_plan(customer_id):
         _finish(customer_id, STORAGE_SUPERSEDED)
@@ -481,7 +504,14 @@ def on_appliance_activated(customer_id: str | None) -> dict:
 def retry_storage_starts(limit: int = 50) -> int:
     """Billing-worker pass: start plans for activated appliances whose start
     has not happened or failed transiently. Declined cards wait for the
-    customer's own retry."""
+    customer's own retry. Held plans (STORAGE_HELD) are never selected.
+    First records the activation of any claim-marked appliance that has
+    enrolled since (its heartbeat normally does this at once)."""
+    try:
+        import appliance_claims
+        appliance_claims.record_pending_claim_activations(limit)
+    except Exception:
+        logger.exception("build_order.claim_activation_sweep_failed")
     stale = (datetime.now() - timedelta(seconds=STARTING_STALE_SECONDS)).isoformat()
     started = 0
     for plan in rows("SELECT customer_id FROM deferred_storage_plans WHERE state IN (?,?) OR (state=? AND updated_at<?) LIMIT ?",
@@ -492,6 +522,81 @@ def retry_storage_starts(limit: int = 50) -> int:
         except Exception:
             continue
     return started
+
+
+# ------------------------------------------------------------------ owner decision
+
+def held_storage_starts() -> list[dict]:
+    """Storage starts waiting for an owner/admin decision (STORAGE_HELD), and
+    approved ones that have not started yet, with what the decision needs:
+    the order, the claimed appliances and whether one has really enrolled."""
+    from appliance_readiness import customer_has_activated_appliance
+    found = rows("SELECT p.*, c.name AS customer_name, c.email AS customer_email FROM deferred_storage_plans p "
+                 "LEFT JOIN customers c ON c.id=p.customer_id WHERE p.state=? OR (p.owner_approved_at IS NOT NULL AND p.state!=?) "
+                 "ORDER BY p.created_at", (STORAGE_HELD, STORAGE_STARTED))
+    out = []
+    for plan in found:
+        appliances = rows("SELECT a.id,a.cloud_id,a.activation_status,a.activated_via,a.last_check_in,cl.completed_at AS claimed_at "
+                          "FROM appliances a LEFT JOIN appliance_claims cl ON cl.appliance_id=a.id AND cl.status='completed' "
+                          "WHERE a.customer_id=? ORDER BY a.created_at", (plan["customer_id"],))
+        out.append({
+            "customer_id": plan["customer_id"], "customer_name": plan.get("customer_name"),
+            "customer_email": plan.get("customer_email"), "plan_key": plan["plan_key"],
+            "camera_quantity": int(plan["camera_quantity"]), "state": plan["state"],
+            "hold_reason": plan.get("hold_reason"), "held_at": plan.get("held_at"),
+            "owner_approved_at": plan.get("owner_approved_at"), "owner_approved_by": plan.get("owner_approved_by"),
+            "checkout_session_id": plan["checkout_session_id"], "ordered_at": plan["created_at"],
+            "hardware_still_paid": _hardware_still_paid(plan),
+            "appliance_enrolled": customer_has_activated_appliance(plan["customer_id"]),
+            "appliances": appliances,
+        })
+    return out
+
+
+def _audit_storage(db, actor: dict, action: str, customer_id: str, details: dict) -> None:
+    import json
+    db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
+               "VALUES(?,?,?,?,?,?,?)", (actor.get("email", ""), actor.get("role", ""), action, "deferred_storage_plan",
+                                          customer_id, json.dumps(details), datetime.now().isoformat()))
+
+
+def admin_start_held_storage(customer_id: str, actor: dict) -> dict:
+    """The owner/admin's explicit 'start storage now' for one account's held
+    order (/admin/storage-starts). The approval and its audit record are one
+    transaction; the start itself is the same idempotent path activation
+    uses (one claimed row, fixed Idempotency-Key per round, adoption of a
+    subscription Stripe already made), so repeating the action never makes a
+    second subscription, and a transient Stripe error is retried by the
+    billing worker. Only an order whose appliance has really enrolled."""
+    from appliance_readiness import customer_has_activated_appliance
+    plan = storage_plan(customer_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="No storage plan is recorded for this account.")
+    if plan["state"] == STORAGE_STARTED:
+        return {"status": "unchanged", "state": STORAGE_STARTED, "subscription_id": plan.get("stripe_subscription_id")}
+    if plan["state"] != STORAGE_HELD and not plan.get("owner_approved_at"):
+        raise HTTPException(status_code=409, detail="This storage plan is not waiting for an owner decision.")
+    if not _hardware_still_paid(plan):
+        raise HTTPException(status_code=409, detail="The appliance order is no longer paid (refunded or disputed).")
+    if not customer_has_activated_appliance(customer_id):
+        raise HTTPException(status_code=409, detail="No appliance on this account has finished enrolling yet.")
+    now = datetime.now().isoformat()
+    with connection() as db:
+        approved = db.execute("UPDATE deferred_storage_plans SET state=?,owner_approved_at=?,owner_approved_by=?,updated_at=? "
+                              "WHERE customer_id=? AND state=?",
+                              (STORAGE_AWAITING, now, actor.get("email", ""), now, customer_id, STORAGE_HELD)).rowcount
+        if approved == 1:
+            _audit_storage(db, actor, "storage_start.owner_approved", customer_id,
+                           {"plan_key": plan["plan_key"], "camera_quantity": int(plan["camera_quantity"]),
+                            "checkout_session_id": plan["checkout_session_id"], "hold_reason": plan.get("hold_reason")})
+    current = storage_plan(customer_id) or plan
+    if not current.get("owner_approved_at"):
+        raise HTTPException(status_code=409, detail="This storage plan is not waiting for an owner decision.")
+    result = start_storage_plan(customer_id, manual=current["state"] == STORAGE_PAYMENT_FAILED)
+    with connection() as db:
+        _audit_storage(db, actor, "storage_start.admin_start", customer_id, {"result": result.get("status")})
+    latest = storage_plan(customer_id) or current
+    return {"status": result.get("status"), "state": latest["state"], "subscription_id": latest.get("stripe_subscription_id")}
 
 
 def register_build_order_routes(app: FastAPI) -> None:

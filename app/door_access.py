@@ -45,6 +45,33 @@ def face_access_active(customer_id: str | None) -> bool:
         return False
 
 
+def unentitled_enabled_doors() -> list[dict]:
+    """Owner review (2026-10-11), read-only: every door still enabled
+    (cameras.door_access_enabled=1) on an account without Face Access.
+
+    The 9b892ab gate applies only when a door is SAVED (update_door_config);
+    it never touched doors that were already enabled, and the unlock paths
+    (manual unlock, AACO, Visitor Call, backup access) check
+    door_access_enabled, not the add-on -- so these doors keep working.
+    Listed for an explicit owner decision; nothing here changes them."""
+    from partner_db import rows
+    found = rows(
+        "SELECT c.id AS camera_id,c.name AS camera_name,c.customer_id,c.site_id,c.appliance_id,c.door_relay_channel,"
+        "c.door_relay_pulse_ms,c.door_feedback_enabled,cu.name AS customer_name,cu.email AS customer_email,s.name AS site_name "
+        "FROM cameras c LEFT JOIN customers cu ON cu.id=c.customer_id LEFT JOIN sites s ON s.id=c.site_id "
+        "WHERE c.door_access_enabled=1 ORDER BY cu.name,s.name,c.name"
+    )
+    entitled: dict = {}
+    out = []
+    for door in found:
+        customer_id = door.get('customer_id')
+        if customer_id not in entitled:
+            entitled[customer_id] = face_access_active(customer_id)
+        if not entitled[customer_id]:
+            out.append(dict(door))
+    return out
+
+
 FACE_ACCESS_REQUIRED_MESSAGE = (
     "{name} is saved as a door. Unlock and automatic Face Access stay off until the Face Access "
     "add-on is active -- add it on My subscription (it is billed per door)."

@@ -149,6 +149,10 @@ def _activate_appliance(db_path, customer_id):
               "serial_number": "SN-BUILD", "name": "Build appliance", "status": "online", "created_at": "2026-10-05"}
     values = {key: value for key, value in values.items() if key in columns}
     conn.execute(f"INSERT INTO appliances({','.join(values)}) VALUES({','.join('?' * len(values))})", tuple(values.values()))
+    # Token activation always issues a credential (appliance_cloud.activate());
+    # readiness requires a non-revoked one (appliance_readiness._live).
+    conn.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) "
+                 "VALUES('cred-build','app-build','x','2026-10-05','activation')")
     conn.commit()
     conn.close()
 

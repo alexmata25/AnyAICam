@@ -143,14 +143,22 @@ def apply_step(order_id: str, payload: FulfillmentRequest, actor: dict) -> dict:
 
 def _orders_page_rows() -> str:
     import hardware_fulfillment
-    found = rows("SELECT o.*, c.name AS customer_name, c.email AS customer_email, "
-                 "(SELECT 1 FROM appliances a WHERE a.customer_id=o.customer_id AND a.activation_status='activated' LIMIT 1) AS activated "
+    from appliance_readiness import customer_has_activated_appliance
+    found = rows("SELECT o.*, c.name AS customer_name, c.email AS customer_email, p.state AS storage_state "
                  "FROM hardware_orders o LEFT JOIN customers c ON c.id=o.customer_id "
+                 "LEFT JOIN deferred_storage_plans p ON p.customer_id=o.customer_id AND p.checkout_session_id=o.stripe_checkout_session_id "
                  "WHERE o.status='paid' ORDER BY o.created_at DESC LIMIT 200")
+    # Activated = token-activated, or claimed and really enrolled -- the same
+    # appliance_readiness signal the customer portal uses (a claim leaves
+    # activation_status 'pending', so it used to never show as activated).
+    activated: dict = {}
     out = []
     for order in found:
         state = str(order.get("fulfillment_status") or "paid")
-        shown = "activated" if order.get("activated") and state == "delivered" else ("paid" if state == "unfulfilled" else state)
+        customer_id = order.get("customer_id") or ""
+        if customer_id not in activated:
+            activated[customer_id] = customer_has_activated_appliance(customer_id)
+        shown = "activated" if activated[customer_id] and state == "delivered" else ("paid" if state == "unfulfilled" else state)
         action = ""
         oid = escape(order["id"], quote=True)
         if state in OPERATOR_STEPS["preparing"]:
@@ -162,11 +170,13 @@ def _orders_page_rows() -> str:
                       f'<button class="ghost-button fulfil" data-order="{oid}" data-status="shipped">Mark shipped</button></span>')
         elif state == "shipped":
             action = f'<button class="ghost-button fulfil" data-order="{oid}" data-status="delivered">Mark delivered</button>'
+        held = ('<br><a class="health-detail" href="/admin/storage-starts">Storage plan held for owner decision</a>'
+                if order.get("storage_state") == "owner_review" else "")
         tracking = " · ".join(escape(str(order[key])) for key in ("carrier", "tracking_number") if order.get(key))
         out.append(f'<tr data-order-row="{oid}"><td>{escape(hardware_fulfillment.generate_order_number(order["id"]))}</td>'
                    f'<td>{escape(str(order.get("customer_name") or ""))}<br><span class="health-detail">{escape(str(order.get("customer_email") or ""))}</span></td>'
                    f'<td>{escape(str(order.get("product_name") or ""))} × {int(order.get("quantity") or 1)}</td>'
-                   f'<td><span class="pill">{escape(shown)}</span><br><span class="health-detail">{tracking}</span></td><td>{action}</td></tr>')
+                   f'<td><span class="pill">{escape(shown)}</span><br><span class="health-detail">{tracking}</span>{held}</td><td>{action}</td></tr>')
     return "".join(out) or '<tr><td colspan="5">No paid hardware orders.</td></tr>'
 
 
@@ -177,6 +187,57 @@ SCRIPT = ("const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsW
           "if(!confirm('Mark this order '+s+'?'))return;b.disabled=true;const r=await fetch(`/api/admin/hardware-orders/${encodeURIComponent(id)}/fulfillment`,"
           "{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify(body)});const d=await r.json().catch(()=>({}));"
           "document.getElementById('fulfil-message').textContent=r.ok?'Saved.':(d.detail||'Could not save.');if(r.ok)setTimeout(()=>location.reload(),600);else b.disabled=false});")
+
+
+class StorageStartRequest(BaseModel):
+    """The owner/admin's explicit confirmation: nothing else is accepted."""
+    confirm: bool
+
+    class Config:
+        extra = "forbid"
+
+
+def _storage_starts_rows() -> str:
+    import build_orders
+    out = []
+    for item in build_orders.held_storage_starts():
+        cid = escape(item["customer_id"], quote=True)
+        appliances = "<br>".join(
+            f'{escape(str(a.get("cloud_id") or a["id"]))} · {escape(str(a.get("activated_via") or a.get("activation_status") or ""))}'
+            f'{" · claimed " + escape(str(a["claimed_at"])) if a.get("claimed_at") else ""}' for a in item["appliances"]) or "none"
+        startable = item["appliance_enrolled"] and item["hardware_still_paid"] and item["state"] != "started"
+        action = (f'<button class="ghost-button storage-start" data-customer="{cid}">Start storage now</button>' if startable
+                  else '<span class="health-detail">Not startable: ' +
+                  ("order no longer paid" if not item["hardware_still_paid"] else "no enrolled appliance") + '</span>')
+        decided = (f'<br><span class="health-detail">Approved by {escape(str(item["owner_approved_by"] or ""))} at '
+                   f'{escape(str(item["owner_approved_at"]))}</span>' if item.get("owner_approved_at") else "")
+        out.append(f'<tr data-storage-row="{cid}"><td>{escape(str(item.get("customer_name") or ""))}<br>'
+                   f'<span class="health-detail">{escape(str(item.get("customer_email") or ""))}</span></td>'
+                   f'<td>{escape(item["plan_key"])} · {int(item["camera_quantity"])} cameras<br>'
+                   f'<span class="health-detail">ordered {escape(str(item["ordered_at"]))}</span></td>'
+                   f'<td>{appliances}</td><td><span class="pill">{escape(item["state"])}</span>{decided}</td><td>{action}</td></tr>')
+    return "".join(out) or '<tr><td colspan="5">No storage starts are waiting for a decision.</td></tr>'
+
+
+def _door_review_rows() -> str:
+    from door_access import unentitled_enabled_doors
+    out = []
+    for door in unentitled_enabled_doors():
+        channel = door.get("door_relay_channel")
+        out.append(f'<tr><td>{escape(str(door.get("customer_name") or ""))}<br><span class="health-detail">'
+                   f'{escape(str(door.get("customer_email") or ""))}</span></td><td>{escape(str(door.get("site_name") or ""))}</td>'
+                   f'<td>{escape(str(door.get("camera_name") or ""))}</td>'
+                   f'<td>{escape(str(channel) if channel is not None else "none")}</td></tr>')
+    return "".join(out) or '<tr><td colspan="4">No enabled doors without Face Access.</td></tr>'
+
+
+STORAGE_SCRIPT = (SCRIPT.split("document.querySelectorAll")[0] +
+                  "document.querySelectorAll('button.storage-start').forEach(b=>b.onclick=async()=>{const id=b.dataset.customer;"
+                  "if(!confirm('Start this storage plan now? The saved card will be charged.'))return;b.disabled=true;"
+                  "const r=await fetch(`/api/admin/storage-starts/${encodeURIComponent(id)}/start`,{method:'POST',headers:"
+                  "{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({confirm:true})});"
+                  "const d=await r.json().catch(()=>({}));document.getElementById('storage-message').textContent="
+                  "r.ok?('Result: '+d.status):(d.detail||'Could not start.');if(r.ok)setTimeout(()=>location.reload(),900);else b.disabled=false});")
 
 
 def register_fulfillment_admin_routes(app: FastAPI, shell) -> None:
@@ -203,3 +264,50 @@ def register_fulfillment_admin_routes(app: FastAPI, shell) -> None:
         order = result["order"]
         return {"status": result["status"], "order_id": order["id"], "fulfillment_status": order["fulfillment_status"],
                 "carrier": order.get("carrier"), "tracking_number": order.get("tracking_number")}
+
+    # ------------------------------------------------------------ owner decisions (2026-10-11)
+
+    @app.get("/admin/storage-starts", response_class=HTMLResponse)
+    def storage_starts_page(request: Request):
+        administrator(request)
+        content = ('<header class="topbar"><div><p class="eyebrow">Platform administrator</p><h1>Held storage starts</h1></div></header>'
+                   '<section class="panel"><p class="health-detail">Appliance orders whose storage plan was paid for with the '
+                   'appliance but never started, because the appliance was linked with a claim code before claim activation '
+                   'started storage plans. Nothing here is charged automatically. "Start storage now" charges the saved card '
+                   'for the plan ordered and is recorded in the audit log.</p>'
+                   '<p id="storage-message" class="health-detail" role="status"></p>'
+                   '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>Customer</th><th>Plan ordered</th>'
+                   f'<th>Appliances</th><th>State</th><th></th></tr></thead><tbody>{_storage_starts_rows()}</tbody></table></div></section>')
+        return HTMLResponse(shell("Held storage starts", "admin-portal", content, f"<script>{STORAGE_SCRIPT}</script>"),
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/admin/storage-starts")
+    def storage_starts(request: Request) -> dict:
+        administrator(request)
+        import build_orders
+        return {"storage_starts": build_orders.held_storage_starts()}
+
+    @app.post("/api/admin/storage-starts/{customer_id}/start")
+    def storage_start_now(customer_id: str, payload: StorageStartRequest, request: Request) -> dict:
+        actor = administrator(request)
+        if payload.confirm is not True:
+            raise HTTPException(status_code=400, detail="Confirm starting this storage plan.")
+        import build_orders
+        return {"customer_id": customer_id, **build_orders.admin_start_held_storage(customer_id, actor)}
+
+    @app.get("/admin/door-access-review", response_class=HTMLResponse)
+    def door_access_review_page(request: Request):
+        administrator(request)
+        content = ('<header class="topbar"><div><p class="eyebrow">Platform administrator</p><h1>Doors without Face Access</h1>'
+                   '</div></header><section class="panel"><p class="health-detail">Doors enabled before the Face Access gate '
+                   'that still unlock (manual, AACO, Visitor Call, backup access) on accounts without the Face Access add-on. '
+                   'Listed for review only; nothing here changes them.</p><div style="overflow-x:auto"><table style="width:100%">'
+                   f'<thead><tr><th>Customer</th><th>Site</th><th>Door camera</th><th>Relay channel</th></tr></thead><tbody>{_door_review_rows()}'
+                   '</tbody></table></div></section>')
+        return HTMLResponse(shell("Doors without Face Access", "admin-portal", content, ""), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/admin/door-access-review")
+    def door_access_review(request: Request) -> dict:
+        administrator(request)
+        from door_access import unentitled_enabled_doors
+        return {"doors": unentitled_enabled_doors()}

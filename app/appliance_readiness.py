@@ -34,10 +34,25 @@ def enrollment_ready(appliance_id: str) -> bool:
     return bool(appliance and appliance['last_check_in'] and str(appliance['last_check_in']) >= str(credential['created_at']))
 
 
+def _live(appliance_id: str) -> bool:
+    """Not revoked or released, and holding a credential that still works.
+    Revocation (appliance_cloud revoke) revokes every credential and sets
+    state='revoked' but leaves activation_status as it was, so
+    activation_status alone never proves the appliance is still in service
+    (Codex review of 9b892ab, 2026-10-11)."""
+    return bool(appliance_id) and bool(row(
+        "SELECT a.id FROM appliances a WHERE a.id=? AND COALESCE(a.state,'')!='revoked' "
+        "AND COALESCE(a.activation_status,'pending')!='released' "
+        "AND EXISTS(SELECT 1 FROM appliance_credentials c WHERE c.appliance_id=a.id AND c.revoked_at IS NULL)",
+        (appliance_id,),
+    ))
+
+
 def appliance_activated(appliance: dict | None) -> bool:
     """The appliance is set up for its customer: device-activated with a
     token (appliance_cloud.activate() writes activation_status='activated'),
-    or claimed and really enrolled.
+    or claimed and really enrolled -- and, either way, still in service: not
+    revoked or released, with a non-revoked credential (_live).
 
     claim/complete (appliance_claims.py) issues the credential but leaves
     activation_status at its 'pending' default, so an owner whose appliance
@@ -46,27 +61,29 @@ def appliance_activated(appliance: dict | None) -> bool:
     A claimed appliance counts once enrollment_ready() proves it is really
     working; a released appliance never does. Read-only: nothing is
     written, so every existing claimed appliance is covered as is, with no
-    database backfill (and activation_status keeps driving only what it
-    already drove, e.g. build_orders.py's storage-plan start)."""
+    database backfill. activation_status keeps its meaning (token
+    activation); the storage-plan start (build_orders.py) uses that or the
+    claim flow's own recorded activation (appliances.activated_at, set by
+    appliance_claims.record_claim_activation() from enrollment_ready())."""
     if not appliance:
         return False
     status = str(appliance.get('activation_status') or '')
-    if status == 'activated':
-        return True
-    if status == 'released':
+    if status == 'released' or str(appliance.get('state') or '') == 'revoked':
         return False
-    return enrollment_ready(str(appliance.get('id') or ''))
+    appliance_id = str(appliance.get('id') or '')
+    if status == 'activated':
+        return _live(appliance_id)
+    return enrollment_ready(appliance_id) and _live(appliance_id)
 
 
 def customer_has_activated_appliance(customer_id: str) -> bool:
     """appliance_activated() for any of this customer's own appliances."""
     if not customer_id:
         return False
-    if row("SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated' LIMIT 1", (customer_id,)):
-        return True
     candidates = rows(
-        "SELECT a.id,a.activation_status FROM appliances a WHERE a.customer_id=? "
-        "AND COALESCE(a.activation_status,'pending')!='released' AND a.last_check_in IS NOT NULL "
+        "SELECT a.id,a.activation_status,a.state FROM appliances a WHERE a.customer_id=? "
+        "AND COALESCE(a.activation_status,'pending')!='released' AND COALESCE(a.state,'')!='revoked' "
+        "AND (a.activation_status='activated' OR a.last_check_in IS NOT NULL) "
         "AND EXISTS(SELECT 1 FROM appliance_credentials c WHERE c.appliance_id=a.id AND c.revoked_at IS NULL)",
         (customer_id,),
     )

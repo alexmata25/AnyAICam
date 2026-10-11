@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime
 
@@ -1927,3 +1928,59 @@ def apply_migrations():
         db.execute('CREATE TABLE IF NOT EXISTS aaco_door_unlock_confirmations(token_hash TEXT PRIMARY KEY,customer_id TEXT NOT NULL,'
                    'user_email TEXT NOT NULL,door_camera_id TEXT NOT NULL,door_name TEXT,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,'
                    'consumed_at TEXT)')
+        # Claim-flow activation (2026-10-11, build_orders.py): how an
+        # appliance was activated, and when. claim/complete records
+        # activated_via='claim' on the row it creates; activated_at is set
+        # once that appliance has really enrolled (appliance_claims.
+        # record_claim_activation) -- the explicit, audited event that starts
+        # its deferred storage plan. Token activation records 'token'. NULL on
+        # every row that existed before this change, so no appliance claimed
+        # before it is ever treated as newly activated.
+        appliance_columns_now=_columns('appliances')
+        if 'activated_via' not in appliance_columns_now: db.execute('ALTER TABLE appliances ADD COLUMN activated_via TEXT')
+        if 'activated_at' not in appliance_columns_now: db.execute('ALTER TABLE appliances ADD COLUMN activated_at TEXT')
+        # A deferred storage start held for an explicit owner/admin decision
+        # (state 'owner_review'), and who approved starting it.
+        storage_columns=_columns('deferred_storage_plans')
+        for name in ('hold_reason','held_at','owner_approved_at','owner_approved_by'):
+            if storage_columns and name not in storage_columns: db.execute(f'ALTER TABLE deferred_storage_plans ADD COLUMN {name} TEXT')
+        if HOLD_CLAIMED_STORAGE_STARTS not in applied:
+            hold_pre_cutover_claimed_storage_starts(db)
+            db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(HOLD_CLAIMED_STORAGE_STARTS,datetime.now().isoformat()))
+            logger.info('Applied database migration %s',HOLD_CLAIMED_STORAGE_STARTS)
+
+
+# One-time, at the deploy of claim-flow activation (2026-10-11). Before it, an
+# appliance linked through a claim code never started its account's deferred
+# storage plan (build_orders.py waited for activation_status='activated', which
+# only token activation writes). Starting those now would charge existing
+# customers without warning, so every such pending start is HELD instead
+# (state 'owner_review', audited) for an explicit owner/admin decision on
+# /admin/storage-starts -- nothing here, in the billing worker or on any later
+# claim starts a held plan. Accounts with a token-activated appliance are left
+# exactly as they were (their start already ran, or is being retried, under the
+# old rules). Runs once, guarded by its schema_migrations marker, so a later
+# restart never holds a NEW claim's plan.
+HOLD_CLAIMED_STORAGE_STARTS='20261011_hold_pre_cutover_claimed_storage_starts'
+
+
+def hold_pre_cutover_claimed_storage_starts(db) -> int:
+    now=datetime.now().isoformat()
+    candidates=db.execute(
+        "SELECT p.customer_id,p.state FROM deferred_storage_plans p WHERE p.state IN ('awaiting_activation','failed','starting') "
+        "AND NOT EXISTS(SELECT 1 FROM appliances a WHERE a.customer_id=p.customer_id AND a.activation_status='activated') "
+        "AND EXISTS(SELECT 1 FROM appliances a JOIN appliance_claims c ON c.appliance_id=a.id "
+        "WHERE a.customer_id=p.customer_id AND c.status='completed')").fetchall()
+    held=0
+    for plan in candidates:
+        changed=db.execute("UPDATE deferred_storage_plans SET state='owner_review',hold_reason='claimed_before_claim_activation',"
+                           "held_at=?,updated_at=? WHERE customer_id=? AND state=?",
+                           (now,now,plan['customer_id'],plan['state'])).rowcount
+        if changed==1:
+            held+=1
+            db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',
+                       ('system:migration','system','storage_start.held_for_owner_review','deferred_storage_plan',plan['customer_id'],
+                        json.dumps({'from_state':plan['state'],'reason':'claimed_before_claim_activation',
+                                    'migration':HOLD_CLAIMED_STORAGE_STARTS}),now))
+    if held: logger.warning('Held %s deferred storage start(s) of claim-linked appliances for owner review',held)
+    return held

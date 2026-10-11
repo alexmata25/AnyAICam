@@ -723,7 +723,13 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         except (TypeError,ValueError): draft_data={}
         initial_step=max(1,min(7,int(draft['current_step']))) if draft else 1
         initial_appliance_id=str(draft_data.get('appliance_id') or '')
-        if not any(a['id']==initial_appliance_id for a in appliances): initial_appliance_id=appliances[0]['id'] if appliances else ''
+        # No saved/valid choice: the first appliance still in service. An
+        # account can keep an older, revoked or released identity of the same
+        # box; selecting it held a finished owner at step 3 (owner report
+        # 2026-10-11). Otherwise unchanged: the first appliance.
+        if not any(a['id']==initial_appliance_id for a in appliances):
+            in_service=[a for a in appliances if a.get('state')!='revoked' and a.get('activation_status')!='released' and not a.get('credential_revoked_at')]
+            initial_appliance_id=(in_service or appliances)[0]['id'] if appliances else ''
         # ?appliance=<id>&step=N (2026-10-08): the claim page sends the owner
         # of a just-linked appliance here with THAT appliance. It is selected
         # explicitly -- never "the first one" -- and only if it is one of this
