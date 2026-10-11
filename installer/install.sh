@@ -75,13 +75,45 @@ parse_kv_line() {
     }'
 }
 
+# Every name build_release_installer.py writes to release.env. Nothing else
+# is accepted from that file.
+RELEASE_ENV_KEYS=" VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256 RELEASE_VERSION UPDATE_SIGNING_KEY_SHA256 ENTITLEMENT_SIGNING_KEYS_SHA256 VMS_PRELOAD_IMAGE_FILE VMS_PRELOAD_IMAGE_SHA256 VMS_PRELOAD_IMAGE_BYTES VMS_PRELOAD_IMAGE_UNPACKED_BYTES VMS_PRELOAD_IMAGE_COMPRESSION VMS_PRELOAD_IMAGE_REF VMS_PRELOAD_IMAGE_ID VMS_PRELOAD_IMAGE_CONFIG_DIGEST VMS_PRELOAD_IMAGE_PAYLOAD_SHA256 VMS_PRELOAD_IMAGE_PLATFORM "
+
+# release.env is DATA, never shell (2026-10-11): it was `source`d, so an
+# edited file ran its commands as root. Each line must be KEY=VALUE with a
+# known KEY, at most once, and a VALUE of only the characters the builder
+# writes (letters, digits, . _ : / + -) -- no quotes, $, backticks, spaces,
+# ; or CR. Anything else refuses the install before any value is used.
+parse_release_env() {
+    local file="$1" line key value seen=" " number=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        number=$(( number + 1 ))
+        [[ -z "$line" ]] && continue
+        if [[ ! "$line" =~ ^([A-Z][A-Z0-9_]{0,63})=([A-Za-z0-9._:/+-]{0,200})$ ]]; then
+            echo "[ERROR] release.env line $number is not a plain KEY=VALUE entry; refusing to use this installer." >&2
+            return 1
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        if [[ "$RELEASE_ENV_KEYS" != *" $key "* ]]; then
+            echo "[ERROR] release.env line $number names an unknown setting ($key); refusing to use this installer." >&2
+            return 1
+        fi
+        if [[ "$seen" == *" $key "* ]]; then
+            echo "[ERROR] release.env sets $key more than once; refusing to use this installer." >&2
+            return 1
+        fi
+        seen+="$key "
+        printf -v "$key" '%s' "$value"
+    done < "$file"
+}
+
 load_release_metadata() {
-    if [[ ! -f "$RELEASE_ENV_FILE" ]]; then
+    if [[ ! -f "$RELEASE_ENV_FILE" || -L "$RELEASE_ENV_FILE" ]]; then
         echo "[ERROR] release.env is missing. Run a built installer artifact; do not install directly from an unbuilt source checkout." >&2
         return 1
     fi
-    # shellcheck disable=SC1090
-    source "$RELEASE_ENV_FILE"
+    parse_release_env "$RELEASE_ENV_FILE" || return 1
     if [[ ! "${VMS_RELEASE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
         echo "[ERROR] VMS_RELEASE_COMMIT must be one exact 40-character lowercase Git commit hash." >&2
         return 1
@@ -185,10 +217,12 @@ run_install() {
     if [[ -n "${ANYAICAM_INSTALL_PORTAL_URL:-}" ]]; then
         validate_install_portal_url "$ANYAICAM_INSTALL_PORTAL_URL" || return 2
     fi
-    load_release_metadata
-    log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode, VMS=$VMS_RELEASE_COMMIT)"
+    # The package is verified against its own file list BEFORE release.env
+    # (one of the listed files) is read, and release.env is parsed as data.
     log "Verifying this installer package against its own file list..."
     verify_installer_payload || return 1
+    load_release_metadata
+    log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode, VMS=$VMS_RELEASE_COMMIT)"
     preflight_checks
     webrtc_port_preflight
     vms_http_port_preflight

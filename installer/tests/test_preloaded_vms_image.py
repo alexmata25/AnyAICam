@@ -61,7 +61,7 @@ DOCKER_STUB = textwrap.dedent(r'''\
         touch "$PL_LOADED_MARK"; echo "Loaded image: $PL_REF"; exit 0 ;;
       image)
         if [[ "$2" == inspect ]]; then
-          [[ -f "$PL_LOADED_MARK" ]] || exit 1
+          [[ -f "$PL_LOADED_MARK" || "${PL_PREEXISTING:-0}" == 1 ]] || exit 1
           case "$4" in
             *release-commit*) printf '%s\n' "$PL_LABEL_COMMIT" ;;
             *payload-sha256*) printf '%s\n' "$PL_LABEL_PAYLOAD" ;;
@@ -78,7 +78,10 @@ DOCKER_STUB = textwrap.dedent(r'''\
 DF_STUB = textwrap.dedent(r'''\
     #!/usr/bin/env bash
     printf 'df %s\n' "$*" >> "$PL_CALL_LOG"
-    printf 'Avail\n%s\n' "$PL_FREE_BYTES"
+    case "${@: -1}" in
+      *containerd*) printf 'Avail\n%s\n' "${PL_FREE_CONTAINERD:-$PL_FREE_BYTES}" ;;
+      *) printf 'Avail\n%s\n' "$PL_FREE_BYTES" ;;
+    esac
     ''')
 
 
@@ -113,6 +116,8 @@ class PreloadedImageInstallerTests(unittest.TestCase):
         self.docker_root = self.tmp / "docker-root"
         self.docker_root.mkdir()
         self.loaded_mark = self.tmp / "loaded"
+        self.containerd_root = self.tmp / "containerd-root"
+        self.containerd_root.mkdir()
 
     def release(self, **overrides):
         values = {
@@ -130,7 +135,7 @@ class PreloadedImageInstallerTests(unittest.TestCase):
         values.update(overrides)
         return values
 
-    def run_prepare(self, release=None, extra_env=None, **stub):
+    def run_prepare(self, release=None, extra_env=None, prelude="", **stub):
         release = self.release() if release is None else release
         lines = "\n".join(f"{key}={q(value)}" for key, value in release.items())
         script = textwrap.dedent(f'''\
@@ -141,7 +146,7 @@ class PreloadedImageInstallerTests(unittest.TestCase):
             INSTALLER_DIR={q(bash_path(self.installer))}
             VMS_PAYLOAD_DIR={q(bash_path(self.payload))}
             VMS_RELEASE_COMMIT={COMMIT}
-            ''') + lines + "\nprepare_vms_image\necho \"PREPARED=$PREPARED_VMS_IMAGE_TAG\"\n"
+            ''') + prelude + "\n" + lines + "\nprepare_vms_image\necho \"PREPARED=$PREPARED_VMS_IMAGE_TAG\"\n"
         env = dict(os.environ)
         env.update({
             "PATH": bash_path(self.bin) + ":" + env.get("PATH", ""),
@@ -153,6 +158,7 @@ class PreloadedImageInstallerTests(unittest.TestCase):
             "PL_LABEL_COMMIT": COMMIT,
             "PL_LABEL_PAYLOAD": self.payload_sha,
             "PL_FREE_BYTES": str(100 * GIB),
+            "ANYAICAM_CONTAINERD_ROOT": bash_path(self.containerd_root),
             "ANYAICAM_INSTALLER_STAGING_ROOT": bash_path(self.staging),
         })
         env.update(stub)
@@ -274,6 +280,51 @@ class PreloadedImageInstallerTests(unittest.TestCase):
         result, calls = self.run_prepare(extra_env={"ANYAICAM_VMS_PRELOAD": "0"})
         self.assert_built_not_loaded(result, calls)
 
+    # A stat shim reporting the containerd root as its own filesystem.
+    SEPARATE_CONTAINERD_FS = textwrap.dedent("""\
+        stat() {
+            if [[ "${1:-}" == -c && "${2:-}" == %d && "${@: -1}" == *containerd* ]]; then echo 4242; return 0; fi
+            command stat "$@"
+        }
+        """)
+
+    def test_low_space_on_a_separate_containerd_filesystem_falls_back(self):
+        result, calls = self.run_prepare(prelude=self.SEPARATE_CONTAINERD_FS, PL_FREE_CONTAINERD=str(GIB // 2))
+        self.assert_built_not_loaded(result, calls)
+        self.assertIn("not enough free disk space", result.stdout)
+        self.assertIn("containerd-root", result.stdout)
+        self.assertIn("df --output=avail -B1 " + bash_path(self.containerd_root), calls)
+
+    def test_enough_space_on_a_separate_containerd_filesystem_loads(self):
+        result, calls = self.run_prepare(prelude=self.SEPARATE_CONTAINERD_FS, PL_FREE_CONTAINERD=str(3 * GIB))
+        self.assertNotIn("docker build", calls)
+        self.assertIn("df --output=avail -B1 " + bash_path(self.containerd_root), calls)
+
+    def test_one_filesystem_counts_the_image_once(self):
+        release = self.release()
+        archive, unpacked = int(release["VMS_PRELOAD_IMAGE_BYTES"]), int(release["VMS_PRELOAD_IMAGE_UNPACKED_BYTES"])
+        exact = (archive + GIB) + (archive + unpacked + GIB)   # archive copy + image, not image twice
+        result, calls = self.run_prepare(release, PL_FREE_BYTES=str(exact))
+        self.assertNotIn("docker build", calls)
+        self.assertEqual(calls.count("df --output=avail"), 1, "one filesystem is checked once")
+        self.log.unlink()
+        self.loaded_mark.unlink()
+        result, calls = self.run_prepare(release, PL_FREE_BYTES=str(exact - 1))
+        self.assert_built_not_loaded(result, calls)
+
+    def test_a_preload_tag_that_existed_before_this_run_is_never_removed(self):
+        for stub in ({"PL_LOAD": "fail"}, {"PL_LOADED_ID": "sha256:" + "9" * 64}, {}):
+            with self.subTest(stub=stub):
+                self.log.unlink(missing_ok=True)
+                self.loaded_mark.unlink(missing_ok=True)
+                result, calls = self.run_prepare(PL_PREEXISTING="1", **stub)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("docker image rm", calls)
+
+    def test_a_preload_tag_created_by_this_run_is_removed_on_load_failure(self):
+        result, calls = self.run_prepare(PL_LOAD="fail")
+        self.assertIn(f"docker image rm anyaicam-vms-preload:{SHORT}", calls)
+
     def test_build_failure_after_a_rejected_preload_still_fails_closed(self):
         result, calls = self.run_prepare(self.release(VMS_PRELOAD_IMAGE_SHA256="0" * 64), PL_BUILD_STATUS="1")
         self.assertNotEqual(result.returncode, 0)
@@ -318,6 +369,93 @@ class PreloadedImageTrustTests(unittest.TestCase):
                         install.index("    prepare_vms_image\n"))
         # Only release.env can set the preload metadata: install.sh resets it first.
         self.assertLess(install.index('VMS_PRELOAD_IMAGE_SHA256=""'), install.index("load_release_metadata() {"))
+
+
+@unittest.skipUnless(BASH, "bash is required")
+class ReleaseEnvParserTests(unittest.TestCase):
+    """release.env is parsed as data, never sourced: a modified file can never
+    run a command, and only the builder's own KEY=VALUE lines are accepted."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="anyaicam-release-env-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.marker = self.tmp / "PWNED"
+        self.env_file = self.tmp / "release.env"
+
+    def parse(self, content: bytes):
+        self.env_file.write_bytes(content)
+        script = (f"source {q(bash_path(ROOT / 'install.sh'))}; set +e; "
+                  f"parse_release_env {q(bash_path(self.env_file))}; rc=$?; "
+                  'echo "RC=$rc COMMIT=${VMS_RELEASE_COMMIT:-} SHA=${VMS_PRELOAD_IMAGE_SHA256:-} PATHV=$PATH"')
+        return subprocess.run([BASH, "-c", script], capture_output=True, text=True, cwd=self.tmp)
+
+    def builder_release_env(self) -> bytes:
+        # Exactly the lines build_release_installer.py writes (see its main()).
+        fields = {
+            "VMS_RELEASE_COMMIT": COMMIT, "VMS_RELEASE_SHA256": "a" * 64, "INSTALLER_SOURCE_COMMIT": "b" * 40,
+            "MEDIAMTX_INCLUDED": "false", "MEDIAMTX_SHA256": "", "RELEASE_VERSION": "1.2.5",
+            "UPDATE_SIGNING_KEY_SHA256": "", "ENTITLEMENT_SIGNING_KEYS_SHA256": "c" * 64,
+            "VMS_PRELOAD_IMAGE_FILE": f"images/anyaicam-vms-{SHORT}.tar.zst", "VMS_PRELOAD_IMAGE_SHA256": "d" * 64,
+            "VMS_PRELOAD_IMAGE_BYTES": "866721451", "VMS_PRELOAD_IMAGE_UNPACKED_BYTES": "3405931699",
+            "VMS_PRELOAD_IMAGE_COMPRESSION": "zstd", "VMS_PRELOAD_IMAGE_REF": f"anyaicam-vms-preload:{SHORT}",
+            "VMS_PRELOAD_IMAGE_ID": IMAGE_ID, "VMS_PRELOAD_IMAGE_CONFIG_DIGEST": CONFIG_DIGEST,
+            "VMS_PRELOAD_IMAGE_PAYLOAD_SHA256": "e" * 64, "VMS_PRELOAD_IMAGE_PLATFORM": "linux/amd64",
+        }
+        return "".join(f"{key}={value}\n" for key, value in fields.items()).encode()
+
+    def test_builder_output_parses(self):
+        result = self.parse(self.builder_release_env())
+        self.assertIn(f"RC=0 COMMIT={COMMIT} SHA={'d' * 64}", result.stdout, result.stderr)
+
+    def test_every_builder_key_is_accepted(self):
+        import re
+        source = (ROOT / "build_release_installer.py").read_text(encoding="utf-8")
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        keys = set(re.findall(r'f"([A-Z0-9_]+)=\{', source)) | set(re.findall(r'"(VMS_PRELOAD_IMAGE_[A-Z_]+)"', source))
+        self.assertGreater(len(keys), 15)
+        allowed = install.split('RELEASE_ENV_KEYS="', 1)[1].split('"', 1)[0].replace("\\\n", " ").split()
+        self.assertEqual(sorted(keys - set(allowed)), [])
+
+    def test_malicious_content_is_refused_without_running_anything(self):
+        m = bash_path(self.marker)
+        cases = {
+            "command substitution": f"RELEASE_VERSION=$(touch {m})\n",
+            "backticks": f"RELEASE_VERSION=`touch {m}`\n",
+            "command after ;": f"RELEASE_VERSION=1.2.5; touch {m}\n",
+            "bare command": f"touch {m}\n",
+            "unknown key": "PATH=/tmp/evil\n",
+            "unknown key LD_PRELOAD": "LD_PRELOAD=/tmp/evil.so\n",
+            "quoted value": 'RELEASE_VERSION="1.2.5"\n',
+            "export prefix": "export RELEASE_VERSION=1.2.5\n",
+            "space in value": "RELEASE_VERSION=1.2.5 touch\n",
+            "variable expansion": "RELEASE_VERSION=${HOME}\n",
+            "CRLF line": "RELEASE_VERSION=1.2.5\r\n",
+            "duplicate key": "RELEASE_VERSION=1.2.5\nRELEASE_VERSION=1.2.6\n",
+        }
+        base = self.builder_release_env().replace(b"RELEASE_VERSION=1.2.5\n", b"")
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                result = self.parse(base + text.encode())
+                self.assertIn("RC=1", result.stdout, result.stderr)
+                self.assertIn("[ERROR] release.env", result.stderr)
+                self.assertFalse(self.marker.exists(), "release.env content was executed")
+                self.assertNotIn("PATHV=/tmp/evil", result.stdout)
+
+    def test_install_verifies_the_package_before_reading_release_env_and_never_sources_it(self):
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertNotIn('source "$RELEASE_ENV_FILE"', install)
+        self.assertNotIn('. "$RELEASE_ENV_FILE"', install)
+        body = install.split("run_install() {", 1)[1]
+        self.assertLess(body.index("verify_installer_payload || return 1"), body.index("load_release_metadata"))
+
+    def test_load_release_metadata_refuses_a_malicious_file(self):
+        installer = self.tmp / "installer"
+        shutil.copytree(ROOT, installer, ignore=shutil.ignore_patterns("tests", "windows", "__pycache__"))
+        (installer / "release.env").write_text(f"VMS_RELEASE_COMMIT=$(touch {bash_path(self.marker)})\n")
+        script = f"source {q(bash_path(installer / 'install.sh'))}; set +e; load_release_metadata; echo RC=$?"
+        result = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertFalse(self.marker.exists())
 
 
 class PayloadDigestParityTests(unittest.TestCase):

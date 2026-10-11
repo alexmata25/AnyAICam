@@ -298,13 +298,61 @@ _vms_preload_reject() {
     return 1
 }
 
+# Prints nothing; returns 0 when every filesystem involved in loading the
+# preloaded image has room (see load_preloaded_vms_image).
+_vms_preload_space_ok() {
+    local staging_root="$1" docker_root containerd_root dir dev need free i j found
+    local need_image=$(( VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_IMAGE_UNPACKED_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
+    local -a dirs=() kinds=() devs=() dev_need=() dev_dir=() dev_has_image=()
+    docker_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)"
+    [[ -n "$docker_root" && -d "$docker_root" ]] || docker_root=/var/lib/docker
+    [[ -d "$docker_root" ]] || docker_root=/var/lib
+    containerd_root="${ANYAICAM_CONTAINERD_ROOT:-/var/lib/containerd}"
+    dirs+=("$staging_root"); kinds+=(archive)
+    dirs+=("$docker_root"); kinds+=(image)
+    if [[ -d "$containerd_root" ]]; then
+        dirs+=("$containerd_root"); kinds+=(image)
+    fi
+    for i in "${!dirs[@]}"; do
+        dev="$(stat -c %d -- "${dirs[$i]}" 2>/dev/null)" || { _vms_preload_reject "cannot inspect ${dirs[$i]}"; return 1; }
+        found=-1
+        for j in "${!devs[@]}"; do [[ "${devs[$j]}" == "$dev" ]] && found=$j; done
+        if (( found < 0 )); then
+            found=${#devs[@]}
+            devs+=("$dev"); dev_need+=(0); dev_dir+=("${dirs[$i]}"); dev_has_image+=(0)
+        fi
+        if [[ "${kinds[$i]}" == archive ]]; then
+            dev_need[found]=$(( dev_need[found] + VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
+        elif [[ "${dev_has_image[$found]}" == 0 ]]; then
+            # The image lands in Docker's or containerd's root, never both on one disk.
+            dev_need[found]=$(( dev_need[found] + need_image )); dev_has_image[found]=1
+        fi
+    done
+    for i in "${!devs[@]}"; do
+        dir="${dev_dir[$i]}"; need="${dev_need[$i]}"
+        free="$(_vms_free_bytes "$dir")"
+        [[ "$free" =~ ^[0-9]+$ ]] || { _vms_preload_reject "free disk space at $dir could not be determined"; return 1; }
+        if (( free < need )); then
+            _vms_preload_reject "not enough free disk space to load it (need $(( need / 1048576 )) MiB on the filesystem of $dir, $(( free / 1048576 )) MiB free)"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Removes the preload name this run created; keeps one that existed before.
+_vms_preload_untag() {
+    [[ "$1" == "1" ]] && return 0
+    docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+}
+
 # $1 = staged build context (root-only), $2 = staging root, $3 = release tag.
 # Returns 0 only when $3 now names the verified preloaded image.
 load_preloaded_vms_image() {
     local staged="$1" staging_root="$2" image_tag="$3"
     local short="${VMS_RELEASE_COMMIT:0:12}" tar_rel tar_path bundle_root real_tar
     local load_timeout copy_dir copy sha actual_payload loaded_id label_commit label_payload
-    local need_staging need_docker docker_root free_staging free_docker arch expected_platform
+    local arch expected_platform preload_ref_existed=0
 
     if [[ "${ANYAICAM_VMS_PRELOAD:-1}" == "0" ]]; then
         log "ANYAICAM_VMS_PRELOAD=0: not using a preloaded VMS image."
@@ -353,24 +401,14 @@ load_preloaded_vms_image() {
     [[ "$actual_payload" == "$VMS_PRELOAD_IMAGE_PAYLOAD_SHA256" ]] \
         || { _vms_preload_reject "the staged VMS payload ($actual_payload) is not the one the image was built from"; return 1; }
 
-    # Space: a root-only copy of the archive; in Docker's storage the stored
-    # layer blobs (at most the archive's size) plus the extracted layers
-    # (VMS_PRELOAD_IMAGE_UNPACKED_BYTES, measured by the builder); a margin.
-    docker_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)"
-    [[ -n "$docker_root" && -d "$docker_root" ]] || docker_root=/var/lib/docker
-    [[ -d "$docker_root" ]] || docker_root=/var/lib
-    need_staging=$(( VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
-    need_docker=$(( VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_IMAGE_UNPACKED_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
-    free_staging="$(_vms_free_bytes "$staging_root")"
-    free_docker="$(_vms_free_bytes "$docker_root")"
-    [[ "$free_staging" =~ ^[0-9]+$ && "$free_docker" =~ ^[0-9]+$ ]] || { _vms_preload_reject "free disk space could not be determined"; return 1; }
-    if [[ "$(stat -c %d -- "$staging_root")" == "$(stat -c %d -- "$docker_root")" ]]; then
-        need_staging=$(( need_staging + need_docker )); need_docker=0
-    fi
-    if (( free_staging < need_staging || free_docker < need_docker )); then
-        _vms_preload_reject "not enough free disk space to load it (need $(( need_staging / 1048576 )) MiB at $staging_root and $(( need_docker / 1048576 )) MiB at $docker_root; free $(( free_staging / 1048576 )) / $(( free_docker / 1048576 )) MiB)"
-        return 1
-    fi
+    # Space: a root-only copy of the archive at the staging root; in Docker's
+    # storage the stored layer blobs (at most the archive's size) plus the
+    # extracted layers (VMS_PRELOAD_IMAGE_UNPACKED_BYTES, measured by the
+    # builder); a margin. With the containerd image store (Docker 29 on the
+    # Ryzen: overlayfs/io.containerd.snapshotter.v1) image content lives under
+    # containerd's root, not DockerRootDir, so BOTH are checked. Needs are
+    # summed per filesystem, so folders on the same disk count once each.
+    _vms_preload_space_ok "$staging_root" || return 1
 
     # Verify a root-only copy, then load exactly that copy.
     copy_dir="$(mktemp -d "$staging_root/image.XXXXXXXX")" || { _vms_preload_reject "no staging space for the archive"; return 1; }
@@ -385,12 +423,17 @@ load_preloaded_vms_image() {
         _vms_preload_reject "the image archive SHA-256 ($sha) does not match the release ($VMS_PRELOAD_IMAGE_SHA256); it was NOT loaded"
         return 1
     fi
+    # A tag of that name that already existed before this run (e.g. from an
+    # operator's own load) is never removed by this installer.
+    if docker image inspect "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1; then
+        preload_ref_existed=1
+    fi
     load_timeout="${ANYAICAM_VMS_LOAD_TIMEOUT:-1800}"
     [[ "$load_timeout" =~ ^[1-9][0-9]*$ ]] || load_timeout=1800
     log "Loading the verified preloaded VMS image ($(( VMS_PRELOAD_IMAGE_BYTES / 1048576 )) MiB, timeout ${load_timeout}s) ..."
     if ! timeout --kill-after=30s "${load_timeout}s" docker load -q -i "$copy"; then
         rm -rf -- "$copy_dir"
-        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_untag "$preload_ref_existed"
         _vms_preload_reject "docker load failed"; return 1
     fi
     rm -rf -- "$copy_dir" || log "WARNING: could not remove the temporary image archive copy in $copy_dir."
@@ -399,19 +442,19 @@ load_preloaded_vms_image() {
     label_commit="$(docker image inspect -f "{{index .Config.Labels \"$VMS_PRELOAD_LABEL_COMMIT\"}}" "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
     label_payload="$(docker image inspect -f "{{index .Config.Labels \"$VMS_PRELOAD_LABEL_PAYLOAD\"}}" "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
     if [[ -z "$loaded_id" || ( "$loaded_id" != "$VMS_PRELOAD_IMAGE_ID" && "$loaded_id" != "$VMS_PRELOAD_IMAGE_CONFIG_DIGEST" ) ]]; then
-        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_untag "$preload_ref_existed"
         _vms_preload_reject "the loaded image ID (${loaded_id:-none}) is not the release's ($VMS_PRELOAD_IMAGE_ID)"; return 1
     fi
     if [[ "$label_commit" != "$VMS_RELEASE_COMMIT" || "$label_payload" != "$VMS_PRELOAD_IMAGE_PAYLOAD_SHA256" ]]; then
-        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_untag "$preload_ref_existed"
         _vms_preload_reject "the loaded image's labels (commit ${label_commit:-none}, payload ${label_payload:-none}) do not match this release"; return 1
     fi
     # Tag by the verified ID, never by a name something else could move.
     if ! docker tag "$loaded_id" "$image_tag" || [[ "$(docker image inspect -f '{{.Id}}' "$image_tag" 2>/dev/null)" != "$loaded_id" ]]; then
-        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_untag "$preload_ref_existed"
         _vms_preload_reject "could not tag the verified image as $image_tag"; return 1
     fi
-    docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true   # untag only; $image_tag keeps it
+    _vms_preload_untag "$preload_ref_existed"   # untag only; $image_tag keeps it
     log "Verified preloaded VMS image $loaded_id loaded as $image_tag (no image build needed)."
     return 0
 }

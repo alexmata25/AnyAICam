@@ -1,6 +1,22 @@
 # Installer Artifact Manifest
 
-## Current status — disposable EC2 lifecycle validation PASSED
+## Current status — Linux 1.2.5 release candidate (2026-10-11)
+
+- Linux 1.2.5 is **installer-only**: it must never be published to Software
+  Update (the 1.2.4 applier cannot apply it safely).
+- Release candidate line: `green/rc-1.2.5-integration-20261011`. The installer
+  built from `92b0e32` passed the Orange targeted acceptance on 2026-10-10;
+  physical acceptance on customer hardware is still pending.
+- Optional preloaded VMS image (`--preload-vms-image`, below) and the
+  `release.env` data parser: added on
+  `green/installer-preloaded-image-20261011` for the RC, unit-tested and
+  end-to-end checked with real Docker on a development PC (containerd and
+  classic overlay2 image stores), **not yet acceptance-tested on an appliance**.
+  A 1.2.5 installer built without `--preload-vms-image` behaves as before
+  (builds the image on the appliance).
+- The section below is the historical 1.1.0 record and is kept unchanged.
+
+## Historical status (1.1.0) — disposable EC2 lifecycle validation PASSED
 
 Branch: `claude/customer-provisioning-phase1`
 
@@ -34,7 +50,12 @@ A built artifact contains:
 
 - the exact VMS payload selected from one 40-character commit or one
   SHA-256-verified release archive;
-- `release.env`, which pins the exact VMS commit and installer source commit;
+- `release.env`, which pins the exact VMS commit and installer source commit.
+  Since 2026-10-11 `install.sh` never `source`s it: the package is first
+  checked against `artifact-files.json`, then `release.env` is parsed as data
+  (`parse_release_env`: only the builder's known `KEY=VALUE` names, once each,
+  values limited to letters, digits and `. _ : / + -`; anything else refuses
+  the install without running it);
 - `release-manifest.json`, which records source hashes and service provenance;
 - `artifact-files.json`, which records per-file SHA-256/mode/size;
 - the appliance agent from the exact installer source commit;
@@ -71,15 +92,20 @@ new key or unsigned path. The installer additionally, before downtime:
 checks metadata/platform, that the archive is a regular file inside the
 installer folder (`ANYAICAM_VMS_IMAGE_TAR` may name another file, but only
 inside it), that the staged payload has the recorded payload digest, and free
-space (archive copy, plus archive size + extracted layer size in Docker's
-storage, + 1 GiB); copies the archive to a root-only
+space (archive copy at the staging root; archive size + extracted layer size +
+1 GiB on the filesystem of Docker's root AND of containerd's root
+(`/var/lib/containerd`, `ANYAICAM_CONTAINERD_ROOT`), which holds image content
+under the containerd image store; needs are summed per filesystem and the
+image is counted once per disk); copies the archive to a root-only
 staging folder and checks that copy's SHA-256 BEFORE `docker load`; after
 loading, checks the image ID (equal to `_ID` or `_CONFIG_DIGEST`: Docker's
 containerd image store reports the OCI index digest, the classic store the
 config digest) and both labels; then tags the verified ID as
 `anyaicam-vms:release-<commit12>` and skips `docker build`. Any failure is
 logged ("Preloaded VMS image not used: ...") and the normal build runs; a
-failed check never tags the image for use. `ANYAICAM_VMS_PRELOAD=0` forces the
+failed check never tags the image for use. The `anyaicam-vms-preload:<commit12>`
+name is removed afterwards only when this run created it; one that existed
+before the run is left alone. `ANYAICAM_VMS_PRELOAD=0` forces the
 build. Rollback points and Software Update's own build (apply_release.py) are
 unchanged. The archive makes the installer roughly 0.9 GB larger (measured for
 1.2.5: 827 MiB archive, 3.4 GB extracted image); zstd barely shrinks it because
