@@ -36651,6 +36651,155 @@ def _hls_read_frame_time(manifest: Path) -> datetime | None:
         return None
 
 
+# ---------------------------------------------------------------- AI frame source
+# (2026-10-11, video-pipeline P2a) -- see analytics_frames.py and
+# main_frame_grab.py.
+import analytics_frames
+import main_frame_grab
+
+
+def _record_describes_main(record: dict | None, main_url: str) -> bool:
+    import camera_capabilities
+    clean = camera_capabilities.split_credentials(main_url)[0]
+    return bool(record) and any(isinstance(s, dict) and s.get("uri") == clean for s in record.get("streams") or [])
+
+
+def analytics_source_spec(camera_number: int) -> "analytics_frames.SourceSpec | None":
+    """Where this camera's AI reader reads, at what size. Synchronous
+    (database, maybe one ffprobe); called from the reader thread only.
+    Measured profile first (video_profile: smallest stream >= 640 px wide,
+    else the main stream); before the camera has been measured, the
+    substream the motion reader uses (or the main stream), sized by one
+    ffprobe. Never logs a URL."""
+    import camera_capabilities
+    try:
+        main_url = camera_url(camera_number)
+    except Exception:
+        return None
+    _clean, username, password = camera_capabilities.split_credentials(main_url)
+    record = camera_video_profiles.record(camera_number)
+    profile = camera_profile(camera_number)
+    probe_ok = bool(record and (record.get("video_probe") or {}).get("status") == "ok")
+    if probe_ok and profile.analytics_uri and _record_describes_main(record, main_url):
+        url = camera_capabilities.with_credentials(profile.analytics_uri, username, password)
+        kind = "main" if profile.analytics_is_main else "substream"
+        if profile.analytics_size:
+            return analytics_frames.SourceSpec(url, profile.analytics_size[0], profile.analytics_size[1], kind)
+    else:
+        sub_url = motion_substream_url(camera_number)
+        url, kind = (sub_url, "substream") if sub_url else (main_url, "main")
+    measured = camera_video_probe.ffprobe_stream(url)
+    if measured is None and kind == "substream":
+        url, kind = main_url, "main"
+        measured = camera_video_probe.ffprobe_stream(url)
+    if measured is None:
+        return None
+    box = video_profile.box_for(video_profile.shape(measured["width"], measured["height"]), video_profile.ANALYTICS_BOX)
+    size = video_profile.fit(measured["width"], measured["height"], box)
+    return analytics_frames.SourceSpec(url, size[0], size[1], kind) if size else None
+
+
+ai_frames = analytics_frames.AnalyticsFrames(analytics_source_spec)
+_video_probe_listeners.append(ai_frames.restart)
+
+
+def _event_buffer_full_frame(camera_number: int):
+    """Event mode only: the newest frame of the pre-event buffer (no extra
+    camera session) -- lpr.latest_full_resolution_frame, as before."""
+    if _local_recording_settings(camera_number).get("mode") != "event":
+        return None
+    return lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME)
+
+
+def _main_url_or_none(camera_number: int) -> str | None:
+    try:
+        return camera_url(camera_number)
+    except Exception:
+        return None
+
+
+main_frame_grabber = main_frame_grab.MainFrameGrabber(_main_url_or_none, buffer_frame=_event_buffer_full_frame)
+
+
+def ai_full_resolution_frame(camera_number: int, result: dict):
+    """A main-stream frame for LPR/PPE/face crops, or None when the
+    analytics frame already is (near) full resolution. Blocking."""
+    frame = result.get("frame")
+    if frame is None:
+        return None
+    if result.get("frame_source") in (None, "hls", "main"):
+        return None  # the frame is the full-resolution picture already (HLS keeps the old LPR path)
+    main_width = camera_profile(camera_number).source.get("width")
+    if not main_frame_grab.needs_full_resolution(frame.shape[1], main_width):
+        return None
+    return main_frame_grabber.grab(camera_number)
+
+
+# One YOLO pass per shared frame: camera -> (frame seq, result).
+_ai_detection_cache: dict[int, tuple[int, dict]] = {}
+_ai_detection_cache_lock = threading.Lock()
+
+
+def _ai_detection_cache_get(camera_number: int, seq) -> dict | None:
+    if seq is None:
+        return None
+    with _ai_detection_cache_lock:
+        cached = _ai_detection_cache.get(camera_number)
+    if not cached or cached[0] != seq:
+        return None
+    result = dict(cached[1])
+    result["detections"] = [dict(item) for item in cached[1].get("detections") or []]
+    return result
+
+
+def _ai_detection_cache_put(camera_number: int, seq, result: dict) -> dict:
+    if seq is not None and result.get("ok"):
+        with _ai_detection_cache_lock:
+            _ai_detection_cache[camera_number] = (seq, result)
+        result = dict(result)
+        result["detections"] = [dict(item) for item in result.get("detections") or []]
+    return result
+
+
+def _read_hls_analytics_frame(camera_number: int):
+    """The previous AI frame source, unchanged: one frame of the camera's
+    live HLS playlist via cv2.VideoCapture. (frame, captured_at, None) or
+    (None, None, error result)."""
+    manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
+    # On-demand live HLS (live_hls_demand.py): this reader keeps the
+    # camera's live encoder running, and never analyses a stale playlist
+    # (an idle-stopped encoder leaves its last segments on disk).
+    if live_hls_demand.on_demand():
+        live_hls_demand.touch(camera_number, "analytics")
+        if not live_hls_demand.playlist_fresh(manifest):
+            return None, None, {
+                "ok": False,
+                "error": "Live HLS stream is starting.",
+                "detections": [],
+            }
+    if not manifest.exists():
+        return None, None, {
+            "ok": False,
+            "error": "Live HLS stream is not ready.",
+            "detections": [],
+        }
+    # When the frame read below actually happened (detection_timing.py).
+    frame_captured_at = _hls_read_frame_time(manifest)
+    capture = cv2.VideoCapture(str(manifest))
+    try:
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok or frame is None:
+        return None, None, {
+            "ok": False,
+            "error": "Could not read a live frame.",
+            "detections": [],
+        }
+    return frame, frame_captured_at, None
+
+
 def detect_objects_frame(camera_number: int) -> dict:
 
 
@@ -36723,169 +36872,32 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
-    manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
-    # On-demand live HLS (live_hls_demand.py): this reader keeps the
-    # camera's live encoder running, and never analyses a stale playlist
-    # (an idle-stopped encoder leaves its last segments on disk).
-    if live_hls_demand.on_demand():
-        live_hls_demand.touch(camera_number, "analytics")
-        if not live_hls_demand.playlist_fresh(manifest):
+    # AI frames (2026-10-11, video-pipeline P2a -- analytics_frames.py):
+    # the newest frame of the camera's analytics stream (substream), read by
+    # one persistent reader per camera and shared by every analytics worker.
+    # ANYAICAM_AI_SOURCE=hls, or the auto fallback after repeated reader
+    # failures, is the previous live-HLS read (_read_hls_analytics_frame),
+    # which also keeps the on-demand live encoder running.
+    shared = ai_frames.get_frame(camera_number)
+    if shared is None:
+        frame, frame_captured_at, error = _read_hls_analytics_frame(camera_number)
+        if error is not None:
+            return error
+        frame_source, frame_seq = "hls", None
+    else:
+        if not shared["ok"]:
             return {
                 "ok": False,
-                "error": "Live HLS stream is starting.",
+                "error": shared["error"],
                 "detections": [],
             }
-    if not manifest.exists():
-        return {
-            "ok": False,
-            "error": "Live HLS stream is not ready.",
-            "detections": [],
-        }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # When the frame read below actually happened (detection_timing.py).
-    frame_captured_at = _hls_read_frame_time(manifest)
-    capture = cv2.VideoCapture(str(manifest))
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-
-
-
-
-
-
-
-        ok, frame = capture.read()
-
-
-
-
-
-
-
-
-    finally:
-
-
-
-
-
-
-
-
-        capture.release()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    if not ok or frame is None:
-
-
-
-
-
-
-
-
-        return {
-
-
-
-
-
-
-
-
-            "ok": False,
-
-
-
-
-
-
-
-
-            "error": "Could not read a live frame.",
-
-
-
-
-
-
-
-
-            "detections": [],
-
-
-
-
-
-
-
-
-        }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        frame, frame_captured_at = shared["frame"], shared["captured_at"]
+        frame_source, frame_seq = shared["source"] or "substream", shared["seq"]
+        # Several workers (AI, People Counting, Smart Rules) may ask for the
+        # same shared frame: one YOLO pass per frame.
+        cached = _ai_detection_cache_get(camera_number, frame_seq)
+        if cached is not None:
+            return cached
     model = get_yolo_model()
 
 
@@ -37214,7 +37226,8 @@ def detect_objects_frame(camera_number: int) -> dict:
     # area the customer chose to ignore never reaches any analytic -- see
     # detection_exclusion.py. Cameras without one are unaffected.
     detections = detection_exclusion.filter_detections(camera_number, detections, frame)
-    return {
+    return _ai_detection_cache_put(camera_number, frame_seq, {
+        "frame_source": frame_source,
 
 
 
@@ -37260,7 +37273,7 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
-    }
+    })
 
 
 
@@ -37403,6 +37416,21 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         return []
+    # PPE / face crops (2026-10-11, video-pipeline P2a): on an analytics-
+    # stream frame, the person is cut from ONE main-stream frame grabbed on
+    # demand -- only when a PPE/face check actually crops a person. On a
+    # live-HLS frame (ANYAICAM_AI_SOURCE=hls) this is None and the crop is
+    # taken from the frame itself, as before.
+    _crop_frames: list = []
+
+    def _crop_full_frame():
+        if not _crop_frames:
+            try:
+                _crop_frames.append(ai_full_resolution_frame(camera_number, result))
+            except Exception:
+                _crop_frames.append(None)
+        return _crop_frames[0]
+
 
 
 
@@ -38191,7 +38219,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         person_detection["width"],
                         person_detection["height"],
                     )
-                    person_crop = frame[hy : hy + hh, hx : hx + hw]
+                    person_crop = main_frame_grab.full_resolution_crop(frame, (hx, hy, hw, hh), _crop_full_frame())
                     ppe_result = ppe.detect_ppe(person_crop, camera_number=camera_number)
                 except Exception as error:
                     ppe_result = None
@@ -38265,7 +38293,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         person_detection["width"],
                         person_detection["height"],
                     )
-                    person_crop_for_aac = frame[fy : fy + fh, fx : fx + fw]
+                    person_crop_for_aac = main_frame_grab.full_resolution_crop(frame, (fx, fy, fw, fh), _crop_full_frame())
                     from appliance_activation import active_appliance_id
                     from database_backend import connect as aac_connect
 
@@ -38535,7 +38563,15 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
     boxes = [(d["x"], d["y"], d["width"], d["height"]) for d in vehicles]
     full_frame = None
     if lpr.LPR_FULL_RES_FRAMES:
-        full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+        if result.get("frame_source") in (None, "hls"):
+            # ANYAICAM_AI_SOURCE=hls / fallback: the previous behaviour exactly.
+            full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+        elif boxes:
+            # Analytics-stream frame (video-pipeline P2a): one main-stream frame,
+            # grabbed only if LPR actually reads one of these vehicle boxes
+            # (Event-mode buffer first, else one RTSP frame -- also in
+            # Continuous mode). lpr.scan_frame() calls this at most once.
+            full_frame = lambda: ai_full_resolution_frame(camera_number, result)
     confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame)
     events = []
     from detection_timing import plate_event_span
@@ -40917,6 +40953,7 @@ async def lifespan(app: FastAPI):
             webrtc_publisher_task.cancel()
         if camera_video_probe_task:
             camera_video_probe_task.cancel()
+        ai_frames.stop_all()  # AI analytics-stream readers (analytics_frames.py)
         if local_storage_manager_task:
             local_storage_manager_task.cancel()
         if recording_upload_task:

@@ -553,6 +553,7 @@ def test_customer_local_playlist_served_while_fresh(tmp_path):
 
 def test_detect_objects_frame_on_demand_never_reads_stale_playlist(monkeypatch, tmp_path):
     live_hls_demand.configure(mode="on_demand", idle_seconds=60, clock=Clock())
+    monkeypatch.setattr(main.ai_frames, "mode", "hls")  # the live-HLS AI path (video-pipeline P2a: ANYAICAM_AI_SOURCE=hls)
     hls = tmp_path / "hls"
     hls.mkdir()
     monkeypatch.setattr(main, "HLS_FOLDER", hls)
