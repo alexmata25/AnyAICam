@@ -353,13 +353,14 @@ load_preloaded_vms_image() {
     [[ "$actual_payload" == "$VMS_PRELOAD_IMAGE_PAYLOAD_SHA256" ]] \
         || { _vms_preload_reject "the staged VMS payload ($actual_payload) is not the one the image was built from"; return 1; }
 
-    # Space: a root-only copy of the archive, plus the unpacked layers twice
-    # (content store + extracted snapshot), plus a margin.
+    # Space: a root-only copy of the archive; in Docker's storage the stored
+    # layer blobs (at most the archive's size) plus the extracted layers
+    # (VMS_PRELOAD_IMAGE_UNPACKED_BYTES, measured by the builder); a margin.
     docker_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)"
     [[ -n "$docker_root" && -d "$docker_root" ]] || docker_root=/var/lib/docker
     [[ -d "$docker_root" ]] || docker_root=/var/lib
     need_staging=$(( VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
-    need_docker=$(( 2 * VMS_PRELOAD_IMAGE_UNPACKED_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
+    need_docker=$(( VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_IMAGE_UNPACKED_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
     free_staging="$(_vms_free_bytes "$staging_root")"
     free_docker="$(_vms_free_bytes "$docker_root")"
     [[ "$free_staging" =~ ^[0-9]+$ && "$free_docker" =~ ^[0-9]+$ ]] || { _vms_preload_reject "free disk space could not be determined"; return 1; }

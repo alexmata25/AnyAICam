@@ -499,6 +499,31 @@ def read_saved_image_digests(raw: Path) -> tuple[str, str, list[str]]:
     return index_digest, config_digest, list(manifest[0].get("RepoTags") or [])
 
 
+def unpacked_layer_bytes(raw: Path) -> int:
+    """Extracted size of every layer of a single-image `docker save` archive:
+    what the appliance needs on disk after `docker load`, besides the archive.
+    Layers are usually gzip blobs (the containerd image store saves them
+    compressed), so they are decompressed and counted; an unrecognized
+    compression counts 4x its stored size (conservative)."""
+    total = 0
+    with tarfile.open(raw, "r:") as tf:
+        manifest = json.load(tf.extractfile(tf.getmember("manifest.json")))
+        for layer in manifest[0].get("Layers") or []:
+            member = tf.getmember(layer)
+            handle = tf.extractfile(member)
+            magic = handle.read(4)
+            handle.seek(0)
+            if magic[:2] == b"\x1f\x8b":
+                with gzip.GzipFile(fileobj=handle) as gz:
+                    for block in iter(lambda: gz.read(4 * 1024 * 1024), b""):
+                        total += len(block)
+            elif magic == b"\x28\xb5\x2f\xfd":
+                total += 4 * member.size
+            else:
+                total += member.size
+    return total
+
+
 def build_preloaded_vms_image(*, docker: str, context: Path, images_dir: Path, scratch: Path, vms_commit: str,
                               release_version: str, platform: str, compression: str, no_cache: bool) -> dict:
     """Builds, saves and compresses the VMS image from `context` (the final
@@ -537,7 +562,7 @@ def build_preloaded_vms_image(*, docker: str, context: Path, images_dir: Path, s
     images_dir.mkdir(parents=True, exist_ok=True)
     output = images_dir / f"anyaicam-vms-{vms_commit[:12]}{suffix}"
     _compress_image_archive(raw, output, compression)
-    unpacked = raw.stat().st_size
+    unpacked = unpacked_layer_bytes(raw)
     raw.unlink()
     return {
         "VMS_PRELOAD_IMAGE_FILE": output.relative_to(images_dir.parent).as_posix(),

@@ -347,10 +347,14 @@ class BuilderPreloadTests(unittest.TestCase):
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
                 tf.addfile(info, io.BytesIO(data))
+            layers = ["blobs/sha256/" + "3" * 64, "blobs/sha256/" + "4" * 64]
             add("manifest.json", json.dumps([{"Config": f"blobs/sha256/{config_hex}", "RepoTags": tags,
-                                               "Layers": []}] * images).encode())
+                                               "Layers": layers}] * images).encode())
             add("index.json", json.dumps({"schemaVersion": 2, "manifests": [{"digest": index_digest}]}).encode())
             add(f"blobs/sha256/{config_hex}", b"{}")
+            # One gzip layer (containerd store) of 100000 bytes, one plain of 500.
+            add(layers[0], gzip.compress(b"\0" * 100000))
+            add(layers[1], b"x" * 500)
 
     def run_builder(self, *, built_id=IMAGE_ID, labels=None, tags=None, compression="gzip"):
         calls = []
@@ -401,6 +405,8 @@ class BuilderPreloadTests(unittest.TestCase):
         with gzip.open(archive) as handle, tarfile.open(fileobj=handle) as tf:
             self.assertIn("manifest.json", tf.getnames())
         self.assertFalse((tmp / "vms-image.tar").exists())
+        # Extracted layer size (gzip layers decompressed), used for the disk check.
+        self.assertEqual(fields["VMS_PRELOAD_IMAGE_UNPACKED_BYTES"], str(100000 + 500))
 
     def test_classic_store_id_equal_to_config_digest_is_accepted(self):
         fields, *_ = self.run_builder(built_id=CONFIG_DIGEST)

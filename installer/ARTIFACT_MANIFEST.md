@@ -71,7 +71,8 @@ new key or unsigned path. The installer additionally, before downtime:
 checks metadata/platform, that the archive is a regular file inside the
 installer folder (`ANYAICAM_VMS_IMAGE_TAR` may name another file, but only
 inside it), that the staged payload has the recorded payload digest, and free
-space (archive copy + 2x unpacked + 1 GiB); copies the archive to a root-only
+space (archive copy, plus archive size + extracted layer size in Docker's
+storage, + 1 GiB); copies the archive to a root-only
 staging folder and checks that copy's SHA-256 BEFORE `docker load`; after
 loading, checks the image ID (equal to `_ID` or `_CONFIG_DIGEST`: Docker's
 containerd image store reports the OCI index digest, the classic store the
@@ -80,7 +81,9 @@ config digest) and both labels; then tags the verified ID as
 logged ("Preloaded VMS image not used: ...") and the normal build runs; a
 failed check never tags the image for use. `ANYAICAM_VMS_PRELOAD=0` forces the
 build. Rollback points and Software Update's own build (apply_release.py) are
-unchanged. The archive makes the installer roughly 1 GB larger.
+unchanged. The archive makes the installer roughly 0.9 GB larger (measured for
+1.2.5: 827 MiB archive, 3.4 GB extracted image); zstd barely shrinks it because
+the containerd image store saves layers already gzip-compressed.
 
 ## Preserved state
 
