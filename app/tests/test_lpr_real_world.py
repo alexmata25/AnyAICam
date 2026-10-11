@@ -140,3 +140,16 @@ def test_glyph_reader_handles_tilted_and_slanted_plates(angle, shear):
     text = "".join(rng.choice(list("ABCDEFHJKLMNPRSTUVWXYZ"), 3)) + "".join(rng.choice(list("0123456789"), 4))
     result = lpr.read_plate_glyphs(_synthetic_plate(text, angle, shear))
     assert result is not None and result[0] == text, (text, result)
+
+
+def test_slanted_plate_splits_a_pair_of_touching_glyphs():
+    # This deterministic shape used to merge F/W into a too-wide component,
+    # which the normal single-glyph aspect-ratio filter then discarded.
+    image = _synthetic_plate("AFW8430", -15, -0.2)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    scale = 240.0 / gray.shape[1]
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    labels, blobs = lpr._glyph_blobs(gray)
+    row = lpr._character_row(blobs)
+    assert len(row) == 7
+    assert len({blob[0] for blob in row}) == 7
