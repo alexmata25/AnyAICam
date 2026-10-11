@@ -839,7 +839,7 @@ def _camera_display_label(camera: dict) -> str:
     return f'Camera {number}' if number is not None else str(camera.get('id', 'Camera'))
 
 
-def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
+def _door_access_settings_panel(camera: dict, viewers: list[dict], face_access: bool = True) -> str:
     """The Camera Settings section of the single-camera live view page --
     door_access.py's GET/POST /api/customer/cameras/{id}/door-config
     routes already do the real authorization/validation/persistence;
@@ -865,6 +865,21 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
     # Shown in seconds (2026-09-25); stored and posted in milliseconds.
     pulse_seconds = f'{pulse_value / 1000:g}'
     door_enabled = bool(camera.get('door_access_enabled'))
+    # Face Access gate (2026-10-10, door_access.update_door_config()): an
+    # account without the add-on can set a door up (Face Access is billed
+    # per door), but it stays a requested door that unlocks nothing.
+    door_requested = bool(camera.get('door_access_requested')) and not door_enabled
+    door_shown = door_enabled or door_requested
+    if face_access:
+        face_access_notice = ''
+    else:
+        face_access_notice = (
+            '<div class="mock-banner" id="face-access-required" role="note" style="margin:10px 0">'
+            '<strong>Face Access add-on required.</strong> '
+            + ('This camera is saved as a door. ' if door_shown else 'You can set this camera up as a door now. ')
+            + 'Unlock and automatic Face Access stay off until the Face Access add-on is active '
+            '(billed per door) &mdash; <a href="/subscription-portal">add it on My subscription</a>.</div>'
+        )
 
     if not door_enabled:
         viewer_access_section = ''
@@ -897,13 +912,14 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         f'<div class="health-detail">Map this camera to a physical door\'s relay to enable automatic unlock '
         f'for recognized, authorized faces and manual unlock from the live tile. Rename this camera above '
         f'(e.g. "Front Door") so alerts and the live tile are easy to recognize.</div></div></div>'
-        f'<label><span><input id="door-access-enabled" type="checkbox" {"checked" if door_enabled else ""}> '
-        f'Enable Face Access for this camera</span></label>'
+        f'{face_access_notice}'
+        f'<label><span><input id="door-access-enabled" type="checkbox" {"checked" if door_shown else ""}> '
+        f'{"Enable Face Access for this camera" if face_access else "Set this camera up as a Face Access door"}</span></label>'
         f'<style>.face-access-field{{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:13px}}'
         f'.face-access-field select,.face-access-field input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);'
         f'border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}'
         f'#door-access-fields{{display:grid;gap:14px;max-width:360px;margin-top:12px}}#door-access-fields[hidden]{{display:none}}</style>'
-        f'<div id="door-access-fields" {"" if door_enabled else "hidden"}>'  # layout in the rule above, so [hidden] wins
+        f'<div id="door-access-fields" {"" if door_shown else "hidden"}>'  # layout in the rule above, so [hidden] wins
         f'<label class="face-access-field">Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
         f'<label class="face-access-field">Unlock duration (seconds)<input id="door-relay-pulse-seconds" type="number" min="0.5" max="60" step="0.5" '
         f'inputmode="decimal" value="{pulse_seconds}"></label>'
@@ -2280,6 +2296,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 else []
             )
 
+        from door_access import face_access_active
         camera_name = _camera_display_label(camera)
         panel_html, scripts = camera_live_panel(camera, identity)
         content = (
@@ -2288,7 +2305,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
             + _intrusion_alarm_banner(request, camera_id, identity)
             + panel_html
-            + (_door_access_settings_panel(camera, viewers) if identity.get('role') == 'customer_owner' else '')
+            + (_door_access_settings_panel(camera, viewers, face_access_active(identity['customer_id']))
+               if identity.get('role') == 'customer_owner' else '')
         )
 
         return page_shell(f'Live view · {camera_name}', 'live', content, scripts)

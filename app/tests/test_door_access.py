@@ -53,7 +53,7 @@ def _isolated_relay(monkeypatch):
     relay_control.reset_provider()
 
 
-def _seed(db_path, *, door_enabled=True, relay_channel=1, pulse_ms=2500):
+def _seed(db_path, *, door_enabled=True, relay_channel=1, pulse_ms=2500, face_access=True):
     now = datetime.now().isoformat()
     with override_target(sqlite_path=db_path):
         initialize_database()
@@ -78,6 +78,13 @@ def _seed(db_path, *, door_enabled=True, relay_channel=1, pulse_ms=2500):
                 "INSERT INTO cameras(id,customer_id,site_id,name,status,camera_number,created_at) VALUES('camera-plain','customer-a','site-a','Plain Camera','configured',2,?)",
                 (now,),
             )
+            if face_access:
+                # Configuring a door needs the Face Access add-on (2026-10-10).
+                db.execute(
+                    "INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,created_at) "
+                    "VALUES('fa-customer-a','customer-a',NULL,'facial_recognition','active',?)",
+                    (now,),
+                )
 
 
 def test_unlock_succeeds_for_customer_owner_and_activates_the_configured_relay(monkeypatch, db_path, _isolated_relay):

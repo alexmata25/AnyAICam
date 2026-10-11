@@ -449,6 +449,94 @@ def _recover_completed_result(claim: dict) -> dict | None:
     }
 
 
+def record_claim_activation(appliance_id: str, *, background: bool = False) -> bool:
+    """The claim flow's activation event (2026-10-11): a row claim/complete
+    created (activated_via='claim') has really enrolled -- its own credential
+    used and a heartbeat after it (appliance_readiness.enrollment_ready, the
+    same signal the portal uses). Recorded once (activated_at, conditional
+    UPDATE + audit in one transaction), then the account's deferred storage
+    plan starts through the same idempotent path token activation uses
+    (build_orders.on_appliance_activated: never raises, retried by the billing
+    worker). activation_status keeps its existing meaning (token activation
+    only). Rows claimed before this change carry no marker and are never
+    activated here. Returns True only for the call that recorded it.
+
+    background=True (the heartbeat): the start runs off the request path
+    (start_storage_in_background), so a slow Stripe call never delays the
+    heartbeat's answer; exactly-once still holds (build_orders claims the
+    plan row, fixed Idempotency-Key), and a start that never ran is picked
+    up by the billing worker (the activation is already recorded)."""
+    from appliance_readiness import enrollment_ready
+    appliance = row('SELECT id,customer_id,cloud_id,activated_via,activated_at,activation_status,state FROM appliances WHERE id=?',
+                    (appliance_id,))
+    if (not appliance or appliance.get('activated_via') != 'claim' or appliance.get('activated_at')
+            or appliance.get('activation_status') == 'released' or appliance.get('state') == 'revoked'):
+        return False
+    if not enrollment_ready(appliance_id):
+        return False
+    now = _now().isoformat()
+    with connection() as db:
+        changed = db.execute(
+            "UPDATE appliances SET activated_at=? WHERE id=? AND activated_via='claim' AND activated_at IS NULL "
+            "AND COALESCE(activation_status,'pending')!='released' AND COALESCE(state,'')!='revoked'",
+            (now, appliance_id),
+        ).rowcount
+        if changed == 1:
+            db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) '
+                       'VALUES(?,?,?,?,?,?,?)',
+                       (appliance['cloud_id'], 'appliance', 'appliance.activated', 'appliance', appliance_id,
+                        json.dumps({'via': 'claim', 'customer_id': appliance['customer_id']}), now))
+    if changed != 1:
+        return False
+    logger.info('Claimed appliance activated appliance_id=%s', appliance_id)
+    if background:
+        start_storage_in_background(appliance.get('customer_id'))
+    else:
+        from build_orders import on_appliance_activated
+        on_appliance_activated(appliance.get('customer_id'))
+    return True
+
+
+_storage_start_threads: list = []
+
+
+def start_storage_in_background(customer_id: str | None):
+    """build_orders.on_appliance_activated() on a daemon thread (it never
+    raises). Runs in a copy of the caller's context, so the same database
+    target is used. Returns the thread."""
+    import contextvars
+    import threading
+
+    def run():
+        from build_orders import on_appliance_activated
+        on_appliance_activated(customer_id)
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=context.run, args=(run,), name='storage-start', daemon=True)
+    _storage_start_threads[:] = [item for item in _storage_start_threads if item.is_alive()] + [thread]
+    thread.start()
+    return thread
+
+
+def wait_for_background_storage_starts(timeout: float = 10.0) -> None:
+    """For tests and orderly shutdown: wait for started background starts."""
+    for thread in list(_storage_start_threads):
+        thread.join(timeout)
+
+
+def record_pending_claim_activations(limit: int = 50) -> int:
+    """Billing-worker sweep: record_claim_activation() for claim-marked rows
+    that enrolled but whose heartbeat did not record it (e.g. an error)."""
+    recorded = 0
+    for candidate in rows("SELECT id FROM appliances WHERE activated_via='claim' AND activated_at IS NULL "
+                          "AND COALESCE(activation_status,'pending')!='released' AND COALESCE(state,'')!='revoked' "
+                          "AND last_check_in IS NOT NULL ORDER BY last_check_in DESC LIMIT ?", (limit,)):
+        try:
+            recorded += 1 if record_claim_activation(candidate['id']) else 0
+        except Exception:
+            logger.exception('claim_activation.record_failed appliance_id=%s', candidate['id'])
+    return recorded
+
+
 def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None) -> None:
     """`shell` is optional and only used by the customer-facing claim
     page (Phase 2A) -- every device-facing and JSON portal route below
@@ -730,9 +818,13 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 raise HTTPException(status_code=409, detail='Claim proof was already used.')
             appliance_id = secrets.token_hex(16)
             cloud_id = claim['device_id'].upper()
+            # activated_via='claim' (2026-10-11): this appliance activates
+            # through the claim flow. activation_status stays 'pending' and
+            # activated_at NULL until it has really enrolled -- see
+            # record_claim_activation() below.
             db.execute(
-                'INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)',
-                (appliance_id, claim['customer_id'], claim['site_id'], cloud_id, now.isoformat()),
+                'INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at,activated_via) VALUES(?,?,?,?,?,?)',
+                (appliance_id, claim['customer_id'], claim['site_id'], cloud_id, now.isoformat(), 'claim'),
             )
             # The installer UUID is provisional claim correlation, not the
             # permanent root identity. The cloud row receives its own

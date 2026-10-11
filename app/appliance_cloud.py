@@ -541,7 +541,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             changed=db.execute('UPDATE appliance_activation_tokens SET used_at=? WHERE id=? AND used_at IS NULL',(now_text,match['id'])).rowcount
             if changed!=1: raise HTTPException(status_code=409,detail='Activation token was already used.')
             db.execute('INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)',(credential_id,appliance['id'],password_hash(credential),now_text,'activation'))
-            db.execute("UPDATE appliances SET activation_status='activated',state='offline',partner_id=COALESCE(partner_id,(SELECT partner_id FROM customers WHERE id=appliances.customer_id)) WHERE id=?",(appliance['id'],))
+            db.execute("UPDATE appliances SET activation_status='activated',state='offline',activated_via=COALESCE(activated_via,'token'),activated_at=COALESCE(activated_at,?),partner_id=COALESCE(partner_id,(SELECT partner_id FROM customers WHERE id=appliances.customer_id)) WHERE id=?",(now_text,appliance['id']))
             # Bind the one-time installer UUID to the canonical cloud identity
             # only on initial activation. Re-enrollment/ownership changes need
             # the distinct global-admin transition below.
@@ -643,6 +643,18 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             wireguard_last_handshake_at=str(wireguard_last_handshake_at)[:40] if isinstance(wireguard_last_handshake_at,str) else None
             db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at),wireguard_status=COALESCE(?,wireguard_status),wireguard_last_handshake_at=COALESCE(?,wireguard_last_handshake_at) WHERE id=?',(state,state,now,sanitize_software_version(safe.get('software_version')),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,wireguard_status,wireguard_last_handshake_at,appliance['id']))
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
+        # Claim-flow activation (2026-10-11): the first heartbeat of an
+        # appliance claim/complete created proves it really enrolled -- record
+        # that once and start its deferred storage plan (appliance_claims.
+        # record_claim_activation; the Stripe start runs in the background,
+        # never on this request). Never fails the heartbeat; the billing
+        # worker's sweep records or retries anything missed here.
+        if appliance.get('activated_via')=='claim' and not appliance.get('activated_at'):
+            try:
+                from appliance_claims import record_claim_activation
+                record_claim_activation(appliance['id'],background=True)
+            except Exception:
+                logger.exception('claim_activation.heartbeat_record_failed appliance_id=%s',appliance['id'])
         return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}
 
     @app.post('/api/appliance/recordings/backlog')
@@ -798,6 +810,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         _modes: dict={}
         for item in camera_items:
             item['recording_mode']=_effective_camera_mode(appliance.get('customer_id'),item.get('recording_mode'),_modes)
+        # 2026-10-10: a plan-included analytic (Smart Motion) is reported as
+        # the plan allows it NOW -- cancelling Hybrid or moving to Basic Local
+        # turns it off at the edge; the customer's stored choice is kept, so
+        # re-subscribing restores it (analytics_entitlements.effective_camera_analytic).
+        from analytics_entitlements import effective_camera_analytic
+        _analytics: dict={}
+        with connection() as _db:
+            for item in camera_items:
+                item['smart_motion_enabled']=effective_camera_analytic(_db,appliance.get('customer_id'),item.get('site_id'),'smart_motion',item.get('smart_motion_enabled'),_analytics)
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)

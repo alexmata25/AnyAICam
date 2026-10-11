@@ -56,6 +56,10 @@ def _seed_activated_appliance(conn, appliance_id="appl-1", customer_id="cust-1")
         "INSERT INTO appliances(id,customer_id,site_id,cloud_id,activation_status,created_at) VALUES(?,?,?,?,?,?)",
         (appliance_id, customer_id, "site-1", f"AIC-{appliance_id}", "activated", "2026-01-01"),
     )
+    # Token activation always issues a credential (appliance_cloud.activate());
+    # readiness requires a non-revoked one (appliance_readiness._live).
+    conn.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)",
+                 (f"cred-{appliance_id}", appliance_id, "x", "2026-01-01", "activation"))
     conn.commit()
 
 

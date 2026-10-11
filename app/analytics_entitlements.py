@@ -69,6 +69,7 @@ never writes to customer_entitlements/hardware_orders tables.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import datetime
@@ -76,6 +77,8 @@ from typing import Optional
 
 from partner_db import connection, row, rows
 from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment, awaiting_payment_result
+
+logger = logging.getLogger("anyaicam.analytics_entitlements")
 
 # addon_key (the customer-billed SKU), display label, the tuple of
 # internal feature keys this SKU grants when purchased, Stripe Price ID
@@ -218,6 +221,8 @@ def upsert_analytics_subscription(
                 (subscription_id, customer_id, analytic_key, status,
                  stripe_customer_id, stripe_subscription_id, stripe_price_id, now, now),
             )
+    if analytic_key == "facial_recognition" and status != "cancelled":
+        promote_requested_doors(customer_id)
     return row("SELECT * FROM analytics_subscriptions WHERE id=?", (subscription_id,))
 
 
@@ -259,9 +264,28 @@ def face_access_size_for_customer(customer_id: str) -> str:
 
 
 def door_count_for_customer(customer_id: str) -> int:
-    """Doors for per-door Face Access billing: cameras set up with a door."""
-    doors = row("SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND door_access_enabled=1", (customer_id,))
+    """Doors for per-door Face Access billing: cameras set up with a door,
+    including a door set up before the add-on was bought
+    (door_access_requested -- see door_access.update_door_config())."""
+    doors = row("SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND "
+                "(door_access_enabled=1 OR COALESCE(door_access_requested,0)=1)", (customer_id,))
     return int((doors or {}).get("n") or 0)
+
+
+def promote_requested_doors(customer_id: str) -> int:
+    """Face Access is now held: the doors the owner set up while waiting for
+    it (door_access_requested=1, relay channel chosen) become real doors.
+    Called from upsert_analytics_subscription(); never raises."""
+    try:
+        with connection() as db:
+            return db.execute(
+                "UPDATE cameras SET door_access_enabled=1,door_access_requested=0 WHERE customer_id=? "
+                "AND COALESCE(door_access_requested,0)=1 AND door_relay_channel IS NOT NULL",
+                (customer_id,),
+            ).rowcount
+    except Exception:
+        logger.exception("face_access.promote_requested_doors_failed customer_id=%s", customer_id)
+        return 0
 
 
 def _grants_for(addon_key: str) -> tuple:
@@ -351,6 +375,44 @@ def account_wide_feature_active(db, customer_id: str, feature_key: str) -> bool:
         if feature_key in _grants_for(item["addon_key"]):
             return True
     return False
+
+
+def effective_camera_analytic(db, customer_id: str, site_id, analytic_key: str, stored, cache: dict | None = None):
+    """A camera's stored per-camera analytic flag (cameras.<key>_enabled) as
+    the appliance must act on it (2026-10-10).
+
+    The stored value is the customer's choice and is never rewritten here, so
+    re-subscribing restores it. For a billing-v2 (per-camera plan) customer a
+    PLAN-INCLUDED analytic (pricing_catalog.INCLUDED_FEATURE_KEYS: Smart
+    Motion) is reported enabled only while something still grants it -- the
+    same gate customer_analytics_panel.assign_entitlement() applies when it is
+    switched on: an active plan that includes it (account_wide_feature_active)
+    or a licence row in analytics_subscriptions that is not cancelled. A
+    cancelled Hybrid plan, or a downgrade to Basic Local, therefore turns it
+    off on the edge at the next configuration sync.
+
+    Unchanged (the stored value): People Counting, LPR and PPE (add-ons or an
+    administrator's explicit choice, never part of a plan) and every legacy /
+    partner-managed customer -- mirroring effective_cloud_recording_mode()."""
+    if not stored or analytic_key not in _catalog.INCLUDED_FEATURE_KEYS or not customer_id:
+        return stored
+    try:
+        import per_camera_billing
+        v2 = per_camera_billing.entitlement_for_customer(customer_id)
+    except Exception:
+        v2 = None
+    if not v2:
+        return stored
+    key = (str(customer_id), str(site_id or ""), analytic_key)
+    if cache is not None and key in cache:
+        allowed = cache[key]
+    else:
+        allowed = account_wide_feature_active(db, customer_id, analytic_key) or db.execute(
+            "SELECT 1 FROM analytics_subscriptions WHERE customer_id=? AND (site_id=? OR site_id IS NULL) "
+            "AND analytic_key=? AND status!='cancelled' LIMIT 1", (customer_id, site_id, analytic_key)).fetchone() is not None
+        if cache is not None:
+            cache[key] = allowed
+    return stored if allowed else 0
 
 
 def get_analytics_subscriptions_for_customer(customer_id: str) -> list[dict]:
