@@ -1,5 +1,11 @@
 # Edge CPU: motion on the substream, on-demand live HLS (2026-10-10)
 
+> **Superseded in part (2026-10-11):** `docs/video-pipeline-20261011.md` (branch
+> `green/video-pipeline-20261011`) moves AI frames off the live HLS playlist,
+> makes `ANYAICAM_LIVE_HLS_MODE=auto` the default (on demand when no always-on
+> consumer remains), implements the clip input seeking / 1080p option from
+> section 4C, and adds measured per-camera video profiles.
+
 Branch `green/perf-substream-hls-20261010` (base `823e983`). Not deployed anywhere.
 
 Line numbers are `app/main.py` at the base commit `823e983` unless marked "head".
