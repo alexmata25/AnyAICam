@@ -37558,7 +37558,10 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-    annotated = frame.copy()
+    # Thumbnail at the profile size (2026-10-11, video-pipeline P2d):
+    # ANYAICAM_THUMBNAIL_MAX_WIDTH (1280) wide at most, never upscaled; the
+    # boxes below are drawn in thumbnail coordinates.
+    annotated, thumb_factor = video_profile.thumbnail_image(frame)
 
 
 
@@ -37739,6 +37742,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         height = detection["height"]
+        x, y, width, height = video_profile.scale_box(x, y, width, height, thumb_factor)
 
 
 
@@ -38621,9 +38625,9 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             plate_filename = f"camera{camera_number}_{stamp}_plate_{event_id}.jpg"
             if cv2.imwrite(str(day_folder / plate_filename), plate_image):
                 plate_crop_url = media_base + quote(plate_filename)
-            annotated = frame.copy()
+            annotated, thumb_factor = video_profile.thumbnail_image(frame)  # profile size (P2d)
             if plate.get("vehicle_box"):
-                vx, vy, vw, vh = plate["vehicle_box"]
+                vx, vy, vw, vh = video_profile.scale_box(*plate["vehicle_box"], thumb_factor)
                 cv2.rectangle(annotated, (vx, vy), (vx + vw, vy + vh), (255, 177, 74), 2)
                 cv2.putText(annotated, plate["plate_number"], (vx, max(20, vy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 177, 74), 2)
             thumb_filename = f"camera{camera_number}_{stamp}_{event_id}.jpg"
@@ -38953,7 +38957,7 @@ async def people_counting_worker(camera_number: int) -> None:
                                     f"people_counting_{uuid.uuid4().hex[:12]}.jpg"
                                 )
                                 thumbnail_path = day_folder / thumbnail_filename
-                                if cv2.imwrite(str(thumbnail_path), frame):
+                                if cv2.imwrite(str(thumbnail_path), video_profile.thumbnail_image(frame)[0]):  # profile size (P2d)
                                     thumbnail_url = (
                                         f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
                                         f"{quote(thumbnail_filename)}"

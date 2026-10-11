@@ -54,7 +54,10 @@ LIVE_BOX = (_int_env("ANYAICAM_LIVE_MAX_LONG_SIDE", 1920, 320), _int_env("ANYAIC
 SQUARE_BOX_SIDE = _int_env("ANYAICAM_SQUARE_MAX_SIDE", 1440, 320)
 PANORAMIC_LONG_SIDE = _int_env("ANYAICAM_PANORAMIC_MAX_LONG_SIDE", 2560, 320)
 ANALYTICS_BOX = (_int_env("ANYAICAM_ANALYTICS_MAX_LONG_SIDE", 1280, 320), _int_env("ANYAICAM_ANALYTICS_MAX_SHORT_SIDE", 720, 180))
-THUMBNAIL_MAX_WIDTH = _int_env("ANYAICAM_THUMBNAIL_MAX_WIDTH", 1280, 160)
+# 0 = save AI thumbnails at the analytics frame's own size (no downscale).
+THUMBNAIL_MAX_WIDTH = _int_env("ANYAICAM_THUMBNAIL_MAX_WIDTH", 1280, 0)
+if 0 < THUMBNAIL_MAX_WIDTH < 160:
+    THUMBNAIL_MAX_WIDTH = 160
 CLIP_MIN_KBPS, CLIP_MAX_KBPS = 800, 8000
 # ~2 kbit per 1000 output pixels: 1920x1080 -> 4147 kbps, 1280x720 -> 1843.
 KBPS_PER_KILOPIXEL = 2.0
@@ -276,7 +279,7 @@ def thumbnail_scale(frame_width: int, max_width: int = THUMBNAIL_MAX_WIDTH) -> f
         width = int(frame_width)
     except (TypeError, ValueError):
         return 1.0
-    if width <= 0 or width <= max_width:
+    if width <= 0 or max_width <= 0 or width <= max_width:
         return 1.0
     return max_width / float(width)
 
@@ -324,3 +327,21 @@ def cloud_measured_columns(report) -> Optional[dict]:
         "measured_resolution_class": resolution_class(main["width"], main["height"]),
         "measured_shape": shape(main["width"], main["height"]),
     }
+
+
+def thumbnail_image(frame, max_width: int = None):
+    """(image to draw on and save, factor applied to frame coordinates).
+    Always a new, writable array; never upscaled."""
+    max_width = THUMBNAIL_MAX_WIDTH if max_width is None else max_width
+    factor = thumbnail_scale(frame.shape[1], max_width)
+    if factor >= 1.0:
+        return frame.copy(), 1.0
+    import cv2
+    size = (max(2, int(round(frame.shape[1] * factor))), max(2, int(round(frame.shape[0] * factor))))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA), factor
+
+
+def scale_box(x, y, w, h, factor: float) -> tuple[int, int, int, int]:
+    if factor >= 1.0:
+        return int(x), int(y), int(w), int(h)
+    return int(round(x * factor)), int(round(y * factor)), max(1, int(round(w * factor))), max(1, int(round(h * factor)))
