@@ -330,7 +330,7 @@ def test_motion_substream_reader_does_not_hold_encoder(monkeypatch, tmp_path):
         asyncio.run(main.motion_detector(3))
     clock.now += 61
     assert not live_hls_demand.wanted(3)
-    assert live_hls_demand.camera_reachable(3, recorder_running=False, within_seconds=120)
+    assert live_hls_demand.camera_reachable(3, receiving_video=False, within_seconds=120)
 
 
 # --------------------------------------------------------------- live_hls_demand
@@ -492,6 +492,9 @@ def test_supervisor_on_demand_writes_alive_while_idle_and_reachable(monkeypatch,
     live_hls_demand.configure(mode="on_demand", idle_seconds=60, clock=Clock())
     hls, started, real_sleep = _supervisor_env(monkeypatch, tmp_path)
     main.camera_process_state[camera]["recording"] = "running"
+    # Reachable = incoming frames (2026-10-11): a running recorder process
+    # alone no longer counts (test_alive_requires_incoming_video.py).
+    live_hls_demand.note_source_frame(camera)
 
     async def scenario():
         task = asyncio.create_task(main.process_supervisor(camera, "live"))

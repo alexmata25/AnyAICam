@@ -37,8 +37,9 @@ While a camera's encoder is idle its playlist goes stale, so readers that
 used playlist freshness as "camera online" (main.py _legacy_camera_status,
 the appliance agent's LocalVmsStatusReader) would report it offline. In
 on_demand mode the live supervisor therefore refreshes camera{N}.alive in
-the HLS folder while the camera is demonstrably reachable (its recorder is
-running, or the motion reader got a substream frame recently); both status
+the HLS folder while the camera is demonstrably sending video (a camera
+frame reached the motion or AI reader within 15 s, or the recorder's current
+file was written within 30 s -- never mere process liveness); both status
 readers accept that file as well. The file is never written in "always"
 mode."""
 from __future__ import annotations
@@ -244,11 +245,52 @@ def note_source_frame(camera_number: int) -> None:
         _last_source_frame[int(camera_number)] = _clock()
 
 
-def camera_reachable(camera_number: int, recorder_running: bool, within_seconds: float = 20.0) -> bool:
+# Evidence windows for "the camera is really sending video" (Codex review
+# 2026-10-11: a running-but-stalled recorder process is NOT evidence).
+REACHABLE_FRAME_SECONDS = 15.0
+RECORDER_ADVANCE_SECONDS = 30.0
+
+
+def recent_source_frame(camera_number: int, within_seconds: float = REACHABLE_FRAME_SECONDS) -> bool:
     with _lock:
         last = _last_source_frame.get(int(camera_number))
         now = _clock()
-    return bool(recorder_running) or (last is not None and now - last <= within_seconds)
+    return last is not None and now - last <= within_seconds
+
+
+def camera_reachable(camera_number: int, receiving_video: bool = False,
+                     within_seconds: float = REACHABLE_FRAME_SECONDS) -> bool:
+    """True only on INCOMING-video evidence: a frame from the camera within
+    within_seconds (motion reader -> note_source_frame()), or the caller's
+    own evidence (receiving_video: the AI reader got a frame recently, or
+    the recorder's current output file is actually growing). Mere process
+    liveness never counts."""
+    return bool(receiving_video) or recent_source_frame(camera_number, within_seconds)
+
+
+def recorder_output_advancing(folders, camera_number: int, now: Optional[float] = None,
+                              within_seconds: float = RECORDER_ADVANCE_SECONDS) -> bool:
+    """The camera's newest recording file (camera<N>_*.mkv / buf<N>_*.mkv in
+    the given folders) was written within within_seconds -- the recorder is
+    really receiving and writing video, not just alive."""
+    now = time.time() if now is None else now
+    prefixes = (f"camera{int(camera_number)}_", f"buf{int(camera_number)}_")
+    newest = None
+    for folder in folders:
+        try:
+            entries = os.scandir(folder)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                if not (entry.name.endswith(".mkv") and entry.name.startswith(prefixes)):
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                newest = mtime if newest is None else max(newest, mtime)
+    return newest is not None and 0 <= now - newest <= within_seconds
 
 
 def alive_path(hls_folder: Path, camera_number: int) -> Path:

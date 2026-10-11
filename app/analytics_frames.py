@@ -539,6 +539,15 @@ class AnalyticsFrames:
         for reader in readers:
             reader.stop()
 
+    def last_frame_age(self, camera_number: int) -> Optional[float]:
+        """Seconds since the camera's AI reader last received a frame, or None."""
+        with self._lock:
+            reader = self._readers.get(camera_number)
+        mono = getattr(reader, "_frame_mono", 0.0) if reader is not None else 0.0
+        if not mono:
+            return None
+        return max(0.0, self._clock() - mono)
+
     def state(self, camera_number: int) -> dict:
         with self._lock:
             reader = self._readers.get(camera_number)

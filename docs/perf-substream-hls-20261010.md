@@ -166,7 +166,7 @@ The camera's own credentials (from `camera_url()`) are re-applied only to the UR
 
 **Status.**
 
-- An idle encoder's playlist is stale by design. While the camera is demonstrably reachable (its recorder is running, or the motion reader got a substream frame in the last 20 s), the supervisor refreshes `HLS_FOLDER/camera{N}.alive` every 5 s, both while idle and while the encoder is starting.
+- An idle encoder's playlist is stale by design. While the camera is demonstrably sending video (since 2026-10-11: a frame reached the motion or AI reader within 15 s, or the recorder's current file was written within 30 s -- a running but stalled recorder process no longer counts), the supervisor refreshes `HLS_FOLDER/camera{N}.alive` every 5 s, both while idle and while the encoder is starting.
 - `_legacy_camera_status()` (head 52745) and the agent's `LocalVmsStatusReader` accept that file. The agent change in `camera_binding.py` ships in the appliance-agent package and must be deployed together with the VMS before `on_demand` is turned on.
 - In `always` the file is never written, and the local status ignores it.
 

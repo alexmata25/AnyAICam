@@ -17167,6 +17167,24 @@ LIVE_HLS_WATCHDOG_FROM_WORKER_START = os.environ.get(
     "ANYAICAM_LIVE_HLS_WATCHDOG_FROM_WORKER_START", "true").strip().lower() != "false"
 
 
+def camera_receiving_video(camera_number: int) -> bool:
+    """Incoming-video evidence for camera<N>.alive (never mere process
+    liveness): the AI reader got a frame within REACHABLE_FRAME_SECONDS, or
+    the recorder's current output file was written within
+    RECORDER_ADVANCE_SECONDS. (Motion-reader frames are checked by
+    live_hls_demand.camera_reachable() itself.) Blocking-cheap: one
+    directory scan of the camera's recording folders."""
+    try:
+        age = ai_frames.last_frame_age(camera_number)
+    except NameError:
+        age = None
+    if age is not None and age <= live_hls_demand.REACHABLE_FRAME_SECONDS:
+        return True
+    camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+    return live_hls_demand.recorder_output_advancing(
+        (camera_folder, camera_folder / EVENT_BUFFER_SUBFOLDER_NAME), camera_number)
+
+
 async def _wait_for_live_hls_demand(camera_number: int) -> None:
     """On-demand live HLS (live_hls_demand.py; ANYAICAM_LIVE_HLS_MODE=
     on_demand only): the camera's live encoder is not running and nothing
@@ -17179,8 +17197,10 @@ async def _wait_for_live_hls_demand(camera_number: int) -> None:
     while not live_hls_demand.wanted(camera_number):
         now = time.monotonic()
         if now >= next_alive:
-            recorder_running = camera_process_state[camera_number].get("recording") == "running"
-            if live_hls_demand.camera_reachable(camera_number, recorder_running):
+            # Incoming-frame evidence only: a recorder process that is up but
+            # stalled must let the camera go offline (Codex review 2026-10-11).
+            receiving = await asyncio.to_thread(camera_receiving_video, camera_number)
+            if live_hls_demand.camera_reachable(camera_number, receiving):
                 live_hls_demand.write_alive(HLS_FOLDER, camera_number)
             next_alive = now + 5
         await asyncio.sleep(live_hls_demand.IDLE_POLL_SECONDS)
@@ -17342,7 +17362,7 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                     # stop the encoder (not a failure: no reconnect count,
                     # no error, no backoff).
                     if live_hls_demand.on_demand() and live_hls_demand.camera_reachable(
-                            camera_number, camera_process_state[camera_number].get("recording") == "running"):
+                            camera_number, await asyncio.to_thread(camera_receiving_video, camera_number)):
                         live_hls_demand.write_alive(HLS_FOLDER, camera_number)
                     if live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
                         idle_stop = True

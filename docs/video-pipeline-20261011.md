@@ -107,7 +107,10 @@ AI reader (ffmpeg stopped), cached main-stream frames, profile and YOLO
 cache. The motion loop also checks `camera_in_service()` (5 s cache) every
 iteration and while reading, and returns -- its ffmpeg terminated, its HLS
 hold released. The AI reader never reads or demands HLS for a camera that
-is no longer configured. A camera map that cannot be read (database error,
+is no longer configured. `camera<N>.alive` (idle on-demand camera shown
+online) is refreshed only on incoming-video evidence -- a camera frame at the
+motion or AI reader within 15 s, or the recorder's current file written
+within 30 s; a running but stalled recorder lets the camera go offline. A camera map that cannot be read (database error,
 or no camera row ever provisioned) never retires anything.
 
 ### P2b -- on-demand live HLS by default when nothing else needs it
