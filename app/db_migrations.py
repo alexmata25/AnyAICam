@@ -1921,7 +1921,10 @@ def apply_migrations():
         for column, kind in (('measured_width', 'INTEGER'), ('measured_height', 'INTEGER'), ('measured_codec', 'TEXT'),
                              ('measured_fps', 'REAL'), ('measured_sub_width', 'INTEGER'), ('measured_sub_height', 'INTEGER'),
                              ('measured_sub_codec', 'TEXT'), ('measured_resolution_class', 'TEXT'), ('measured_shape', 'TEXT'),
-                             ('measured_video_at', 'TEXT')):
+                             ('measured_video_at', 'TEXT'),
+                             # 'measured' (ffprobe) or 'configured' (ONVIF only, shown as "configured
+                             # (not yet measured)"), and which stream AI uses (video_profile.ANALYTICS_CHOICES).
+                             ('measured_source', 'TEXT'), ('measured_analytics_choice', 'TEXT')):
             if camera_columns_now and column not in camera_columns_now:
                 db.execute(f'ALTER TABLE cameras ADD COLUMN {column} {kind}')
         provisioning_columns=_columns('camera_provisioning_requests')

@@ -149,31 +149,39 @@ def bitrate_kbps(size: Optional[tuple[int, int]], box: tuple[int, int]) -> int:
     return int(min(CLIP_MAX_KBPS, max(CLIP_MIN_KBPS, round(width * height / 1000.0 * KBPS_PER_KILOPIXEL))))
 
 
-def _stream_value(stream: dict, key: str):
-    measured = stream.get("measured") if isinstance(stream.get("measured"), dict) else {}
-    value = measured.get(key)
-    return value if value not in (None, "") else stream.get(key)
+def _fps_value(value) -> Optional[float]:
+    try:
+        fps = round(float(value), 2) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return fps if fps and 0 < fps <= 240 else None
 
 
 def stream_geometry(stream: Optional[dict]) -> dict:
-    """{width, height, codec, fps, measured_by} preferring the ffprobe
-    measurement over the ONVIF-configured values."""
+    """{width, height, codec, fps, source, measured_by} for one stream.
+
+    source says where the numbers come from -- never mixed:
+      "measured"    ffprobe measured the stream (stream["measured"]);
+      "configured"  only the camera's ONVIF encoder configuration is known
+                    (what the camera says it is set to, NOT a measurement);
+      None          nothing is known.
+    Anything that shows or reports the geometry must say "configured (not
+    yet measured)" for "configured" (Codex review, 2026-10-11)."""
+    empty = {"width": None, "height": None, "codec": None, "fps": None, "source": None, "measured_by": None}
     if not isinstance(stream, dict):
-        return {"width": None, "height": None, "codec": None, "fps": None, "measured_by": None}
+        return empty
     measured = stream.get("measured") if isinstance(stream.get("measured"), dict) else {}
-    codec = _stream_value(stream, "codec")
-    fps = _stream_value(stream, "fps")
-    try:
-        fps = round(float(fps), 2) if fps is not None else None
-    except (TypeError, ValueError):
-        fps = None
-    return {
-        "width": _positive(_stream_value(stream, "width")),
-        "height": _positive(_stream_value(stream, "height")),
-        "codec": str(codec).upper()[:16] if codec else None,
-        "fps": fps if fps and 0 < fps <= 240 else None,
-        "measured_by": measured.get("by") or (stream.get("discovered_by") if stream.get("width") else None),
-    }
+    width, height = _positive(measured.get("width")), _positive(measured.get("height"))
+    if width and height:
+        codec = measured.get("codec")
+        return {"width": width, "height": height, "codec": str(codec).upper()[:16] if codec else None,
+                "fps": _fps_value(measured.get("fps")), "source": "measured", "measured_by": measured.get("by") or "ffprobe"}
+    width, height = _positive(stream.get("width")), _positive(stream.get("height"))
+    if width and height:
+        codec = stream.get("codec")
+        return {"width": width, "height": height, "codec": str(codec).upper()[:16] if codec else None,
+                "fps": _fps_value(stream.get("fps")), "source": "configured", "measured_by": None}
+    return empty
 
 
 def main_stream(record: Optional[dict]) -> Optional[dict]:
@@ -182,21 +190,47 @@ def main_stream(record: Optional[dict]) -> Optional[dict]:
     return (mains or streams or [None])[0]
 
 
-def analytics_stream(record: Optional[dict], min_width: int = 640) -> Optional[dict]:
-    """The smallest stream at least min_width wide (camera_capabilities.
-    select_streams(record, "analytics") policy), using MEASURED widths;
-    a stream marked verified=False is skipped; else the main stream."""
+# Analytics stream policy (owner decision 2026-10-11): the smallest stream at
+# least ANALYTICS_MIN_WIDTH (640) wide; else, ONLY when
+# ANYAICAM_AI_ALLOW_480_SUBSTREAM is on, the best (widest) stream at least
+# ANALYTICS_FALLBACK_MIN_WIDTH (480) wide; else the main stream (decoded and
+# scaled to the analytics box). The default follows the accuracy validation
+# in docs/video-pipeline-20261011.md section 4.6.
+ANALYTICS_MIN_WIDTH = 640
+ANALYTICS_FALLBACK_MIN_WIDTH = 480
+ALLOW_480_SUBSTREAM = os.environ.get("ANYAICAM_AI_ALLOW_480_SUBSTREAM", "false").strip().lower() == "true"
+
+ANALYTICS_CHOICES = ("substream_640", "substream_480_fallback", "main_480_fallback_disabled", "main_no_usable_substream")
+
+
+def analytics_choice(record: Optional[dict], allow_480: Optional[bool] = None) -> tuple:
+    """(stream, reason): which stream AI frames come from and why. A stream
+    marked verified=False is skipped."""
+    allow_480 = ALLOW_480_SUBSTREAM if allow_480 is None else allow_480
     streams = [s for s in (record or {}).get("streams") or [] if isinstance(s, dict) and s.get("uri")]
     main = main_stream(record)
     subs = [s for s in streams if s is not main and s.get("role") != "main" and s.get("verified") is not False]
-    sized = sorted((s for s in subs if (stream_geometry(s)["width"] or 0) >= min_width),
-                   key=lambda s: stream_geometry(s)["width"])
-    return (sized or [main])[0]
+
+    def width(stream):
+        return stream_geometry(stream)["width"] or 0
+
+    preferred = sorted((s for s in subs if width(s) >= ANALYTICS_MIN_WIDTH), key=width)
+    if preferred:
+        return preferred[0], "substream_640"
+    fallback = sorted((s for s in subs if ANALYTICS_FALLBACK_MIN_WIDTH <= width(s) < ANALYTICS_MIN_WIDTH),
+                      key=width, reverse=True)
+    if fallback:
+        return (fallback[0], "substream_480_fallback") if allow_480 else (main, "main_480_fallback_disabled")
+    return main, "main_no_usable_substream"
+
+
+def analytics_stream(record: Optional[dict], allow_480: Optional[bool] = None) -> Optional[dict]:
+    return analytics_choice(record, allow_480)[0]
 
 
 @dataclass
 class Profile:
-    measured: bool
+    measured: bool          # True only when ffprobe MEASURED the main stream
     source: dict
     resolution_class: str
     shape: str
@@ -212,6 +246,8 @@ class Profile:
     analytics_box: tuple[int, int] = ANALYTICS_BOX
     analytics_size: Optional[tuple[int, int]] = None
     thumbnail_max_width: int = THUMBNAIL_MAX_WIDTH
+    geometry_source: str = "unknown"       # "measured" | "configured" | "unknown"
+    analytics_reason: str = "main_no_usable_substream"
 
     def clip_filter(self) -> str:
         return scale_filter(self.clip_box) + ",format=yuv420p"
@@ -224,11 +260,13 @@ class Profile:
         return {
             "schema": SCHEMA,
             "measured": self.measured,
+            "geometry_source": self.geometry_source,
+            "analytics_choice": self.analytics_reason,
             "resolution_class": self.resolution_class,
             "shape": self.shape,
-            "main": {k: self.source.get(k) for k in ("width", "height", "codec", "fps", "measured_by")},
+            "main": {k: self.source.get(k) for k in ("width", "height", "codec", "fps", "source", "measured_by")},
             "analytics": None if self.analytics_is_main else {
-                k: self.analytics_source.get(k) for k in ("width", "height", "codec", "fps", "measured_by")},
+                k: self.analytics_source.get(k) for k in ("width", "height", "codec", "fps", "source", "measured_by")},
             "clip": list(self.clip_size) if self.clip_size else None,
             "live": list(self.live_size) if self.live_size else None,
             "analytics_frame": list(self.analytics_size) if self.analytics_size else None,
@@ -242,7 +280,7 @@ def build(record: Optional[dict], live_max_kbps: int = 0) -> Profile:
     source = stream_geometry(main)
     width, height = source["width"], source["height"]
     stream_shape = shape(width, height)
-    measured = bool(width and height)
+    measured = source["source"] == "measured"
     clip_box = box_for(stream_shape, CLIP_BOX)
     live_box = box_for(stream_shape, LIVE_BOX)
     clip_size = fit(width, height, clip_box)
@@ -250,7 +288,7 @@ def build(record: Optional[dict], live_max_kbps: int = 0) -> Profile:
     live_kbps = bitrate_kbps(live_size, live_box)
     if live_max_kbps and live_max_kbps > 0:
         live_kbps = min(live_kbps, int(live_max_kbps))
-    analytics = analytics_stream(record) if isinstance(record, dict) else None
+    analytics, analytics_reason = analytics_choice(record) if isinstance(record, dict) else (None, "main_no_usable_substream")
     analytics_geometry = stream_geometry(analytics)
     analytics_is_main = analytics is None or analytics is main
     analytics_box = box_for(shape(analytics_geometry["width"], analytics_geometry["height"]), ANALYTICS_BOX)
@@ -270,6 +308,8 @@ def build(record: Optional[dict], live_max_kbps: int = 0) -> Profile:
         analytics_source=analytics_geometry,
         analytics_box=analytics_box,
         analytics_size=fit(analytics_geometry["width"], analytics_geometry["height"], analytics_box),
+        geometry_source=source["source"] or "unknown",
+        analytics_reason=analytics_reason,
     )
 
 
@@ -289,7 +329,7 @@ def thumbnail_scale(frame_width: int, max_width: int = THUMBNAIL_MAX_WIDTH) -> f
 MEASURED_COLUMNS = (
     "measured_width", "measured_height", "measured_codec", "measured_fps",
     "measured_sub_width", "measured_sub_height", "measured_sub_codec",
-    "measured_resolution_class", "measured_shape",
+    "measured_resolution_class", "measured_shape", "measured_source", "measured_analytics_choice",
 )
 
 
@@ -311,9 +351,12 @@ def _report_stream(value) -> Optional[dict]:
 def cloud_measured_columns(report) -> Optional[dict]:
     """cameras.measured_* values for an appliance's "video" report, or None
     (no report, a failed probe, or anything malformed). The class and shape
-    are recomputed here from the measured pixels -- never taken from the
-    report, and never from the sales label."""
-    if not isinstance(report, dict) or report.get("status") != "ok":
+    are recomputed here from the pixels -- never taken from the report, and
+    never from the sales label. measured_source is "measured" (status "ok":
+    ffprobe measured it) or "configured" (status "configured": only the
+    camera's ONVIF configuration is known); the route never lets a
+    configured report replace a measured one."""
+    if not isinstance(report, dict) or report.get("status") not in ("ok", "configured"):
         return None
     main = _report_stream(report.get("main"))
     if not main:
@@ -326,6 +369,8 @@ def cloud_measured_columns(report) -> Optional[dict]:
         "measured_sub_codec": sub.get("codec"),
         "measured_resolution_class": resolution_class(main["width"], main["height"]),
         "measured_shape": shape(main["width"], main["height"]),
+        "measured_source": "measured" if report.get("status") == "ok" else "configured",
+        "measured_analytics_choice": report.get("analytics_choice") if report.get("analytics_choice") in ANALYTICS_CHOICES else None,
     }
 
 
@@ -347,17 +392,67 @@ def scale_box(x, y, w, h, factor: float) -> tuple[int, int, int, int]:
     return int(round(x * factor)), int(round(y * factor)), max(1, int(round(w * factor))), max(1, int(round(h * factor)))
 
 
+NOT_MEASURED_TEXT = "Not yet measured"
+CONFIGURED_SUFFIX = " - configured (not yet measured)"
+# The cameras columns every camera view selects to show the video line.
+DISPLAY_COLUMNS = ("measured_width", "measured_height", "measured_codec", "measured_fps",
+                   "measured_resolution_class", "measured_source", "measured_video_at")
+
+
 def display_resolution(camera: dict) -> Optional[str]:
-    """Customer-facing text for a cameras row's MEASURED video, e.g.
-    "3840x2160 H265 (8MP)", or None when the appliance has not measured
-    it yet (the caller then shows "not measured yet" -- never the plan's
-    sales label as if it were the camera's real resolution)."""
+    """Text for a cameras row's video, e.g. "3840x2160 H265 20 fps (8MP)";
+    with " - configured (not yet measured)" appended when only the camera's
+    ONVIF configuration is known; None when nothing is known (callers then
+    show NOT_MEASURED_TEXT -- never the plan's sales label as if it were the
+    camera's real resolution)."""
     if not isinstance(camera, dict):
         return None
     width, height = _positive(camera.get("measured_width")), _positive(camera.get("measured_height"))
     if not width or not height:
         return None
     codec = camera.get("measured_codec")
+    fps = _fps_value(camera.get("measured_fps"))
     klass = camera.get("measured_resolution_class") or resolution_class(width, height)
     label = {"2mp": "2MP", "4mp": "4MP", "5mp": "5MP", "8mp": "8MP"}.get(klass, f"{width * height / 1e6:.1f}MP")
-    return f"{width}x{height}{' ' + str(codec) if codec else ''} ({label})"
+    text = f"{width}x{height}{' ' + str(codec) if codec else ''}{f' {fps:g} fps' if fps else ''} ({label})"
+    if camera.get("measured_source") == "configured":
+        text += CONFIGURED_SUFFIX
+    return text
+
+
+def display_video(camera: dict) -> str:
+    return display_resolution(camera) or NOT_MEASURED_TEXT
+
+
+ANALYTICS_CHOICE_TEXT = {
+    "substream_640": "substream (>= 640 px)",
+    "substream_480_fallback": "substream 480-639 px (fallback)",
+    "main_480_fallback_disabled": "main stream (480 px substream fallback disabled)",
+    "main_no_usable_substream": "main stream (no substream >= 480 px)",
+}
+
+
+def admin_camera_video_html(cameras, escape) -> str:
+    """Admin appliance card: one line per camera -- measured (or configured,
+    labelled) resolution/codec/fps and which stream AI analyses."""
+    lines = []
+    for camera in cameras or []:
+        if not isinstance(camera, dict) or camera.get("status") == "removed":
+            continue
+        choice = ANALYTICS_CHOICE_TEXT.get(camera.get("measured_analytics_choice"))
+        lines.append(f'<p>{escape(str(camera.get("name") or "Camera"))} &middot; {escape(display_video(camera))}'
+                     + (f' &middot; AI: {escape(choice)}' if choice else '') + '</p>')
+    return (f'<details style="margin-top:10px"><summary>Camera video ({len(lines)})</summary>{"".join(lines)}</details>'
+            if lines else '')
+
+
+ADMIN_CAMERA_VIDEO_SQL = ("SELECT name,status,camera_number,measured_width,measured_height,measured_codec,measured_fps,"
+                          "measured_resolution_class,measured_source,measured_analytics_choice FROM cameras "
+                          "WHERE appliance_id=? ORDER BY camera_number,name")
+
+
+def resolution_source(camera: dict) -> str:
+    """"measured" | "configured" | "not_measured" for a cameras row."""
+    if not display_resolution(camera):
+        return "not_measured"
+    return "configured" if camera.get("measured_source") == "configured" else "measured"

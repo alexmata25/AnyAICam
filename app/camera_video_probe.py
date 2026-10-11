@@ -154,7 +154,9 @@ def measure(record: dict, main_url_with_credentials: str, *, probe: Callable[[st
     main_geometry = video_profile.stream_geometry(main)
     record["video_probe"] = {
         "at": stamp,
-        "status": "ok" if main_geometry["width"] and main_geometry["height"] else "failed",
+        # "ok" only for a real measurement; ONVIF-configured values alone are
+        # "configured" (shown as "configured (not yet measured)").
+        "status": {"measured": "ok", "configured": "configured"}.get(main_geometry["source"], "failed"),
         "main": results.get("main", "skipped"),
         "sub": results.get("sub", "none"),
     }
@@ -235,7 +237,10 @@ def status_document(record: Optional[dict]) -> dict:
     info = (record or {}).get("video_probe") if isinstance((record or {}).get("video_probe"), dict) else {}
     summary = profile.summary()
     summary["probed_at"] = info.get("at")
-    summary["status"] = info.get("status") or ("ok" if profile.measured else "unknown")
+    status = info.get("status") or ("ok" if profile.measured else "unknown")
+    if status == "ok" and not profile.measured:
+        status = "configured" if profile.geometry_source == "configured" else "failed"
+    summary["status"] = status
     return summary
 
 

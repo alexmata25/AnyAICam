@@ -436,6 +436,7 @@ class LocalVmsStatusReader:
 VIDEO_STATUS_MAX_BYTES = 8192
 _VIDEO_CLASSES = {'2mp', '4mp', '5mp', '8mp', 'other', 'unknown'}
 _VIDEO_SHAPES = {'landscape', 'portrait', 'square', 'panoramic', 'unknown'}
+_VIDEO_ANALYTICS_CHOICES = {'substream_640', 'substream_480_fallback', 'main_480_fallback_disabled', 'main_no_usable_substream'}
 
 
 def _bounded_int(value, low: int, high: int):
@@ -472,7 +473,7 @@ def read_video_status(path: Path):
         return None
     if not isinstance(raw, dict):
         return None
-    status = raw.get('status') if raw.get('status') in {'ok', 'failed', 'unknown'} else 'unknown'
+    status = raw.get('status') if raw.get('status') in {'ok', 'configured', 'failed', 'unknown'} else 'unknown'
     probed_at = raw.get('probed_at') if isinstance(raw.get('probed_at'), str) else None
     return {
         'status': status,
@@ -481,6 +482,8 @@ def read_video_status(path: Path):
         'shape': raw.get('shape') if raw.get('shape') in _VIDEO_SHAPES else 'unknown',
         'main': _stream_geometry(raw.get('main')),
         'sub': _stream_geometry(raw.get('analytics')),
+        'geometry_source': raw.get('geometry_source') if raw.get('geometry_source') in {'measured', 'configured', 'unknown'} else 'unknown',
+        'analytics_choice': raw.get('analytics_choice') if raw.get('analytics_choice') in _VIDEO_ANALYTICS_CHOICES else None,
     }
 
 

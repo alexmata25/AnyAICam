@@ -16058,9 +16058,9 @@ def _video_probe_once(camera_number: int, previous_url: str | None) -> tuple[str
         main_info, sub_info = document.get("main") or {}, document.get("analytics") or {}
         sub_text = f"{sub_info.get('width')}x{sub_info.get('height')} {sub_info.get('codec')}" if sub_info else "main stream"
         print(
-            f"Camera {camera_number} measured video: main {main_info.get('width')}x{main_info.get('height')} "
+            f"Camera {camera_number} video ({document.get('geometry_source')}): main {main_info.get('width')}x{main_info.get('height')} "
             f"{main_info.get('codec')} {main_info.get('fps')} fps ({document.get('resolution_class')}, {document.get('shape')}); "
-            f"analytics {sub_text}; probe {document.get('status')}"
+            f"AI analytics stream: {sub_text} [{document.get('analytics_choice')}]; probe {document.get('status')}"
             f"{'; geometry changed' if geometry_changed and previous else ''}."
         )
     return main_url, geometry_changed
@@ -36662,10 +36662,12 @@ def _record_describes_main(record: dict | None, main_url: str) -> bool:
 def analytics_source_spec(camera_number: int) -> "analytics_frames.SourceSpec | None":
     """Where this camera's AI reader reads, at what size. Synchronous
     (database, maybe one ffprobe); called from the reader thread only.
-    Measured profile first (video_profile: smallest stream >= 640 px wide,
-    else the main stream); before the camera has been measured, the
-    substream the motion reader uses (or the main stream), sized by one
-    ffprobe. Never logs a URL."""
+    Measured profile first (video_profile.analytics_choice: the smallest
+    stream >= 640 px wide; a 480-639 px stream only with
+    ANYAICAM_AI_ALLOW_480_SUBSTREAM; else the main stream); before the camera
+    has been measured, the substream the motion reader uses, sized by one
+    ffprobe and held to the same width policy, else the main stream. The
+    returned spec says why (reason, logged by the reader). Never logs a URL."""
     import camera_capabilities
     try:
         main_url = camera_url(camera_number)
@@ -36679,19 +36681,31 @@ def analytics_source_spec(camera_number: int) -> "analytics_frames.SourceSpec | 
         url = camera_capabilities.with_credentials(profile.analytics_uri, username, password)
         kind = "main" if profile.analytics_is_main else "substream"
         if profile.analytics_size:
-            return analytics_frames.SourceSpec(url, profile.analytics_size[0], profile.analytics_size[1], kind)
+            return analytics_frames.SourceSpec(url, profile.analytics_size[0], profile.analytics_size[1], kind,
+                                               profile.analytics_reason)
+        url, kind, reason = url, kind, profile.analytics_reason
+        measured = camera_video_probe.ffprobe_stream(url)
     else:
         sub_url = motion_substream_url(camera_number)
-        url, kind = (sub_url, "substream") if sub_url else (main_url, "main")
-    measured = camera_video_probe.ffprobe_stream(url)
-    if measured is None and kind == "substream":
-        url, kind = main_url, "main"
-        measured = camera_video_probe.ffprobe_stream(url)
+        measured = camera_video_probe.ffprobe_stream(sub_url) if sub_url else None
+        reason = "main_no_usable_substream"
+        if measured and measured["width"] >= video_profile.ANALYTICS_MIN_WIDTH:
+            url, kind, reason = sub_url, "substream", "substream_640"
+        elif measured and measured["width"] >= video_profile.ANALYTICS_FALLBACK_MIN_WIDTH:
+            if video_profile.ALLOW_480_SUBSTREAM:
+                url, kind, reason = sub_url, "substream", "substream_480_fallback"
+            else:
+                measured, reason = None, "main_480_fallback_disabled"
+        else:
+            measured = None
+        if measured is None:
+            url, kind = main_url, "main"
+            measured = camera_video_probe.ffprobe_stream(url)
     if measured is None:
         return None
     box = video_profile.box_for(video_profile.shape(measured["width"], measured["height"]), video_profile.ANALYTICS_BOX)
     size = video_profile.fit(measured["width"], measured["height"], box)
-    return analytics_frames.SourceSpec(url, size[0], size[1], kind) if size else None
+    return analytics_frames.SourceSpec(url, size[0], size[1], kind, reason) if size else None
 
 
 ai_frames = analytics_frames.AnalyticsFrames(analytics_source_spec)
@@ -52354,6 +52368,9 @@ def operations_rdm_page(request: Request) -> str:
         )
         online_cameras = sum(1 for c in camera_status if c.get("online"))
         recording_cameras = sum(1 for c in camera_status if c.get("online") and c.get("recording"))
+        # Measured video per camera (2026-10-11, video_profile.py).
+        camera_video = video_profile.admin_camera_video_html(
+            partner_rows(video_profile.ADMIN_CAMERA_VIDEO_SQL, (item["id"],)), escape)
         actions = ""
         if can_act:
             actions = (
@@ -52374,6 +52391,7 @@ def operations_rdm_page(request: Request) -> str:
             f'<div class="health-row"><span>Cameras online / recording</span><strong>{online_cameras}/{len(camera_status)} · {recording_cameras} recording</strong></div>'
             f'<div class="health-row"><span>IP address</span><strong>{escape(item.get("ip_address") or "Unknown")}</strong></div>'
             f'{actions}'
+            f'{camera_video}'
             f'<details style="margin-top:10px"><summary>Recent diagnostics ({len(history)})</summary>'
             + "".join(
                 f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h.get("cpu") or 0}% · '
@@ -56366,7 +56384,8 @@ def ai_detection_status() -> dict:
 
 
 
-            {"camera": camera_number, **ai_detection_state[camera_number], "exclusion_zones": detection_exclusion.status(camera_number)}
+            {"camera": camera_number, **ai_detection_state[camera_number], "exclusion_zones": detection_exclusion.status(camera_number),
+             "frame_source": ai_frames.state(camera_number)}  # which analytics stream AI uses, and why (video-pipeline)
 
 
 

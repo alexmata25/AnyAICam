@@ -60,14 +60,38 @@ def _record(main=(None, None, None), sub=None, sub_kind="onvif_media", measured_
     (704, 576, "2mp", "landscape", (704, 576), (704, 576)),           # odd D1 aspect
 ])
 def test_profile_from_measured_geometry(width, height, klass, shape, clip, live):
-    profile = video_profile.build(_record(main=(width, height, "H265")))
-    assert profile.measured is True
+    profile = video_profile.build(_record(measured_main={"width": width, "height": height, "codec": "H265", "fps": 20.0}))
+    assert profile.measured is True and profile.geometry_source == "measured"
+    assert profile.source["source"] == "measured"
     assert profile.resolution_class == klass
     assert profile.shape == shape
     assert profile.clip_size == clip
     assert profile.live_size == live
     assert all(v % 2 == 0 for v in profile.clip_size)
     assert video_profile.CLIP_MIN_KBPS <= profile.clip_max_kbps <= video_profile.CLIP_MAX_KBPS
+
+
+def test_configured_only_geometry_is_never_called_measured():
+    # Codex review: ONVIF-configured width/height without a probe are used for
+    # the (downscale-only) boxes but are labelled "configured", not measured.
+    record = _record(main=(3840, 2160, "H265"), sub=(640, 360, "H265"))
+    profile = video_profile.build(record)
+    assert profile.measured is False and profile.geometry_source == "configured"
+    assert profile.source == {"width": 3840, "height": 2160, "codec": "H265", "fps": 20.0, "source": "configured", "measured_by": None}
+    assert profile.clip_size == (1920, 1080)                    # still a sensible box
+    summary = profile.summary()
+    assert summary["geometry_source"] == "configured" and summary["main"]["source"] == "configured"
+    record["video_probe"] = {"at": NOW.isoformat(), "status": "configured"}
+    doc = camera_video_probe.status_document(record)
+    assert doc["status"] == "configured"
+    # A stale "ok" status can never turn configured values into "measured".
+    record["video_probe"]["status"] = "ok"
+    assert camera_video_probe.status_document(record)["status"] == "configured"
+    # Measured and configured values are never mixed in one geometry.
+    mixed = {"uri": "x", "role": "main", "width": 1920, "height": 1080, "codec": "H264", "fps": 25,
+             "measured": {"width": 3840, "height": None}}
+    assert video_profile.stream_geometry(mixed)["source"] == "configured"
+    assert video_profile.stream_geometry(mixed)["width"] == 1920
 
 
 def test_measured_values_win_over_onvif_and_sales_label_is_never_used():
@@ -77,7 +101,7 @@ def test_measured_values_win_over_onvif_and_sales_label_is_never_used():
     profile = video_profile.build(record)
     assert profile.source["width"] == 3840 and profile.source["codec"] == "H265"
     assert profile.resolution_class == "8mp"
-    assert profile.source["measured_by"] == "ffprobe"
+    assert profile.source["measured_by"] == "ffprobe" and profile.source["source"] == "measured"
 
 
 @pytest.mark.parametrize("record", [None, {}, {"streams": "garbage"}, {"streams": [None, 7, "x"]},
@@ -198,8 +222,10 @@ def test_probe_raising_never_escapes():
         raise RuntimeError("camera exploded")
     record = _record(main=(1920, 1080, "H264"))
     camera_video_probe.measure(record, MAIN, probe=boom, now=NOW)
-    # ONVIF values still give a usable profile.
-    assert video_profile.build(record).measured is True
+    # ONVIF values still give a usable profile -- labelled configured, not measured.
+    profile = video_profile.build(record)
+    assert profile.measured is False and profile.geometry_source == "configured" and profile.clip_size == (1920, 1080)
+    assert record["video_probe"]["status"] == "configured"
 
 
 def test_reprobe_period_and_url_change(monkeypatch):
@@ -247,13 +273,15 @@ def test_rediscovery_keeps_webrtc_verified_flags_for_the_same_streams():
 
 
 def test_status_file_is_credential_free(tmp_path):
-    record = _record(main=(3840, 2160, "H265"), sub=(640, 360, "H265"))
+    record = _record(measured_main={"width": 3840, "height": 2160, "codec": "H265", "fps": 20.0}, sub=(None, None, None),
+                     measured_sub={"width": 640, "height": 360, "codec": "H265", "fps": 15.0})
     record["video_probe"] = {"at": NOW.isoformat(), "status": "ok"}
     camera_video_probe.write_status(tmp_path, 7, record)
     text = (tmp_path / "camera7.video.json").read_text()
     data = json.loads(text)
     assert data["main"]["width"] == 3840 and data["analytics"]["width"] == 640
-    assert data["resolution_class"] == "8mp" and data["status"] == "ok"
+    assert data["resolution_class"] == "8mp" and data["status"] == "ok" and data["geometry_source"] == "measured"
+    assert data["analytics_choice"] == "substream_640"
     assert "rtsp" not in text and "192.0.2" not in text and SECRET not in text
 
 
@@ -368,13 +396,19 @@ def test_small_camera_gets_a_lower_live_cap_and_copy_is_never_scaled(monkeypatch
 
 def test_agent_reports_whitelisted_video_status(tmp_path):
     from anyaicam_agent.camera_binding import LocalVmsStatusReader
-    record = _record(main=(3840, 2160, "H265"), sub=(640, 360, "H265"))
+    record = _record(measured_main={"width": 3840, "height": 2160, "codec": "H265", "fps": 20.0}, sub=(None, None, None),
+                     measured_sub={"width": 640, "height": 360, "codec": "H265", "fps": 15.0})
     record["video_probe"] = {"at": NOW.isoformat(), "status": "ok"}
     camera_video_probe.write_status(tmp_path, 3, record)
     status = LocalVmsStatusReader(tmp_path, tmp_path / "rec").status(3)
     assert status["video"]["main"] == {"width": 3840, "height": 2160, "codec": "H265", "fps": 20.0}
     assert status["video"]["sub"]["width"] == 640
     assert status["video"]["resolution_class"] == "8mp" and status["video"]["status"] == "ok"
+    assert status["video"]["geometry_source"] == "measured" and status["video"]["analytics_choice"] == "substream_640"
+    configured = _record(main=(1920, 1080, "H264"))
+    configured["video_probe"] = {"at": NOW.isoformat(), "status": "configured"}
+    camera_video_probe.write_status(tmp_path, 8, configured)
+    assert LocalVmsStatusReader(tmp_path, tmp_path / "rec").status(8)["video"]["status"] == "configured"
     assert "video" not in LocalVmsStatusReader(tmp_path, tmp_path / "rec").status(4)   # no file: key absent
     (tmp_path / "camera5.video.json").write_text('{"status":"ok","main":{"width":"9e9","height":"x"},'
                                                 '"resolution_class":"<script>","uri":"rtsp://a:b@c"}')
@@ -393,6 +427,12 @@ def test_cloud_columns_recompute_class_and_ignore_failed_or_malformed():
         "sub": {"width": 640, "height": 360, "codec": "H265", "fps": 15}})
     assert columns["measured_resolution_class"] == "8mp" and columns["measured_width"] == 3840
     assert columns["measured_sub_width"] == 640 and columns["measured_shape"] == "landscape"
+    assert columns["measured_source"] == "measured"
+    configured = video_profile.cloud_measured_columns({"status": "configured", "main": {"width": 1920, "height": 1080},
+                                                       "analytics_choice": "main_480_fallback_disabled"})
+    assert configured["measured_source"] == "configured" and configured["measured_analytics_choice"] == "main_480_fallback_disabled"
+    assert video_profile.cloud_measured_columns({"status": "ok", "main": {"width": 1920, "height": 1080},
+                                                 "analytics_choice": "<script>"})["measured_analytics_choice"] is None
     assert video_profile.cloud_measured_columns({"status": "failed", "main": {"width": 1920, "height": 1080}}) is None
     assert video_profile.cloud_measured_columns({"status": "ok", "main": {"width": "abc"}}) is None
     assert video_profile.cloud_measured_columns(None) is None
@@ -454,5 +494,21 @@ def test_cloud_stores_measured_geometry_separately_from_the_sales_label(tmp_path
             with connection() as db:
                 changed = dict(db.execute("SELECT * FROM cameras WHERE id='cam-1'").fetchone())
             assert changed["measured_resolution_class"] == "5mp" and changed["measured_width"] == 2592
+            assert changed["measured_source"] == "measured"
+            # A configured-only (ONVIF) report never replaces a real measurement...
+            client.post("/api/appliance/cameras", json={"cameras": [{"id": "cam-1", "video": {
+                "status": "configured", "main": {"width": 1280, "height": 720, "codec": "H264"}}}]}, headers=_headers())
+            with connection() as db:
+                kept = dict(db.execute("SELECT * FROM cameras WHERE id='cam-1'").fetchone())
+            assert kept["measured_width"] == 2592 and kept["measured_source"] == "measured"
+            # ...but is stored, labelled, for a camera never measured.
+            with connection() as db:
+                db.execute("UPDATE cameras SET measured_width=NULL,measured_height=NULL,measured_source=NULL WHERE id='cam-1'")
+            client.post("/api/appliance/cameras", json={"cameras": [{"id": "cam-1", "video": {
+                "status": "configured", "main": {"width": 1280, "height": 720, "codec": "H264"}}}]}, headers=_headers())
+            with connection() as db:
+                labelled = dict(db.execute("SELECT * FROM cameras WHERE id='cam-1'").fetchone())
+            assert labelled["measured_width"] == 1280 and labelled["measured_source"] == "configured"
+            assert video_profile.display_video(labelled).endswith("configured (not yet measured)")
     finally:
         ctx.__exit__(None, None, None)

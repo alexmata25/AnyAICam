@@ -76,13 +76,17 @@ def test_customer_camera_list_shows_measured_video(client, db_path):
     cameras = client.get("/api/customer/cameras", params={"appliance_id": "appl-1"},
                          cookies={"anyaicam_partner_session": _cookie()}).json()["cameras"]
     by_id = {c["id"]: c for c in cameras}
-    assert by_id["cam-1"]["video_resolution"] == "3840x2160 H265 (8MP)"
+    assert by_id["cam-1"]["video_resolution"] == "3840x2160 H265 20 fps (8MP)"
     assert by_id["cam-1"]["resolution_source"] == "measured" and by_id["cam-1"]["measured_width"] == 3840
-    assert by_id["cam-2"]["video_resolution"] is None and by_id["cam-2"]["resolution_source"] == "plan_label"
+    assert by_id["cam-2"]["video_resolution"] is None and by_id["cam-2"]["resolution_source"] == "not_measured"
+    assert by_id["cam-2"]["video_display"] == "Not yet measured"
 
 
 def test_display_resolution_helper():
     assert video_profile.display_resolution({"measured_width": 2592, "measured_height": 1944, "measured_codec": "H264"}) == "2592x1944 H264 (5MP)"
+    assert video_profile.display_resolution({"measured_width": 1920, "measured_height": 1080, "measured_codec": "H264", "measured_fps": 25,
+                                             "measured_source": "configured"}) == "1920x1080 H264 25 fps (2MP) - configured (not yet measured)"
+    assert video_profile.display_video({}) == "Not yet measured"
     assert video_profile.display_resolution({"measured_width": 4000, "measured_height": 3000}) == "4000x3000 (12.0MP)"
     assert video_profile.display_resolution({"resolution": "2mp"}) is None
     assert video_profile.display_resolution(None) is None

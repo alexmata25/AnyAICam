@@ -29,6 +29,7 @@ already-reviewed, unchanged routes.
 """
 
 import json
+import video_profile  # measured camera video line (2026-10-11)
 from datetime import datetime
 from html import escape
 from typing import Callable
@@ -778,6 +779,7 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
         cameras = [
             dict(camera) for camera in db.execute(
                 'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.door_access_enabled, c.appliance_id, '
+                'c.measured_width, c.measured_height, c.measured_codec, c.measured_fps, c.measured_resolution_class, c.measured_source, '
                 'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'LEFT JOIN appliances a ON a.id=c.appliance_id '
                 'WHERE c.customer_id=? AND c.camera_number IS NOT NULL'+(' AND c.appliance_id=?' if appliance_id else '')+
@@ -796,6 +798,7 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
         cameras = [
             dict(camera) for camera in db.execute(
                 'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.door_access_enabled, c.appliance_id, '
+                'c.measured_width, c.measured_height, c.measured_codec, c.measured_fps, c.measured_resolution_class, c.measured_source, '
                 'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'LEFT JOIN appliances a ON a.id=c.appliance_id '
@@ -1683,7 +1686,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                   <span class="signal">◉</span>
                   <strong id="live-grid-status-{escape(camera['id'], quote=True)}">{'Camera offline' if offline else 'Starting live view…'}</strong>
                 </div>
-                <div class="tile-name-overlay">{escape(_camera_display_label(camera))}</div>
+                <div class="tile-name-overlay" title="Video: {escape(video_profile.display_video(camera), quote=True)}">{escape(_camera_display_label(camera))}<small class="tile-video">{escape(video_profile.display_video(camera))}</small></div>
                 <div class="tile-controls-overlay">
                   {f'''<button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
                     data-camera-id="{escape(camera['id'], quote=True)}"
@@ -1765,6 +1768,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.camera-manage-actions{{display:flex;flex-wrap:wrap;gap:8px}}'
             f'.camera-capacity-message{{margin:4px 0 0;max-width:62ch}}'
             f'.remove-camera:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'.tile-video{{display:block;font-size:11px;font-weight:400;opacity:.8}}'
             f'</style>'
             f'{manage_bar}'
             f'<section class="live-grid">{tiles}</section>'
@@ -2284,7 +2288,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         panel_html, scripts = camera_live_panel(camera, identity)
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
-            f'<h1>{escape(camera_name)}</h1></div>'
+            f'<h1>{escape(camera_name)}</h1>'
+            f'<div class="health-detail camera-video-line">Video: {escape(video_profile.display_video(camera))}</div></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
             + _intrusion_alarm_banner(request, camera_id, identity)
             + panel_html

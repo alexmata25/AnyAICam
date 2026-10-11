@@ -83,6 +83,7 @@ class SourceSpec:
     width: int
     height: int
     kind: str  # "substream" | "main"
+    reason: str = ""  # video_profile.ANALYTICS_CHOICES: why this stream
 
 
 def reader_command(url: str, fps: float, width: int, height: int) -> list[str]:
@@ -139,6 +140,7 @@ class FrameReader:
         self._restart = False
         self.kind: Optional[str] = None
         self.size: Optional[tuple[int, int]] = None
+        self.reason: Optional[str] = None
         self.last_error: Optional[str] = None
 
     # ---------------------------------------------------------------- control
@@ -218,11 +220,12 @@ class FrameReader:
             if spec is None or not spec.width or not spec.height:
                 error = error or "no analytics stream"
             else:
-                if (self.kind, self.size) != (spec.kind, (spec.width, spec.height)):
+                if (self.kind, self.size, self.reason) != (spec.kind, (spec.width, spec.height), spec.reason):
                     self._log(f"Camera {self.camera_number} AI frames: reading the camera "
                               f"{'substream' if spec.kind == 'substream' else 'main stream'} "
-                              f"at {self._fps:g} fps, {spec.width}x{spec.height}.")
-                self.kind, self.size = spec.kind, (spec.width, spec.height)
+                              f"at {self._fps:g} fps, {spec.width}x{spec.height}"
+                              f"{f' ({spec.reason})' if spec.reason else ''}.")
+                self.kind, self.size, self.reason = spec.kind, (spec.width, spec.height), spec.reason
                 frames, error = self._read(spec)
             self.last_error = error
             if self._on_run_end is not None:
@@ -393,4 +396,5 @@ class AnalyticsFrames:
             failures = self._failures.get(camera_number, 0)
         return {"mode": self.mode, "uses_hls": self.uses_hls(camera_number), "failures": failures,
                 "kind": getattr(reader, "kind", None), "size": getattr(reader, "size", None),
+                "reason": getattr(reader, "reason", None),
                 "last_error": getattr(reader, "last_error", None)}
