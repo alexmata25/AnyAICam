@@ -61,20 +61,34 @@ publisher, and nothing in the video pipeline read it.
   ("3840x2160 H265 (8MP)") and `resolution_source`; the setup wizard shows a
   "Video (measured)" column.
 
-### P2a -- AI detection from the analytics stream
+### P2a -- AI detection off the live HLS playlist
 
-* `analytics_frames.py`: ONE persistent ffmpeg per camera reads the profile's
-  analytics stream at `ANYAICAM_AI_READER_FPS` (2) as raw BGR at the profile
-  analytics size. The newest frame is shared by `ai_person_detector`, People
+**AI source decision (owner, 2026-10-11 -- never silently sacrifice
+detection quality):**
+
+| `ANYAICAM_AI_SOURCE` | Reads | Status | Detection quality vs today (4.8, 4.6) |
+|---|---|---|---|
+| `main` | camera main stream, native resolution (persistent reader) | **RC default** | identical: 501/501 frames pixel-identical, 394/394 boxes, same confidences |
+| `auto` | substream >= 640 px (480-639 px only with `ANYAICAM_AI_ALLOW_480_SUBSTREAM`), else main | opt-in after the on-appliance soak | ~86 % box recall at threshold, ~95 % person-frame presence (proxy) |
+| `substream` | as auto, never falls back to HLS | opt-in | as auto |
+| `hls` | cv2 on the 4K live HLS playlist (previous) | exact rollback | today |
+
+`ANYAICAM_AI_MAIN_READER_SIZE=analytics` (scale the main stream into
+1280x720) exists but is not quality-neutral (~85 % box agreement, 4.8).
+
+* `analytics_frames.py`: ONE persistent ffmpeg per camera reads the chosen
+  stream at `ANYAICAM_AI_READER_FPS` (2) as raw BGR (main: native size;
+  substream: the profile analytics size). The newest frame is shared by `ai_person_detector`, People
   Counting and Smart Rules; `detect_objects_frame()` runs one YOLO pass per
   shared frame (cached by frame sequence). Stalled runs are killed (15 s),
   idle readers stop (120 s), the reader restarts when the measured geometry
   changes. The HLS "touch" now happens only on the HLS path.
-* `ANYAICAM_AI_SOURCE=auto` (default): after 3 failed reader runs the camera
-  uses the previous live-HLS read for 30 min, then retries. `substream`:
-  never falls back. `hls`: previous behaviour exactly.
-* LPR / PPE / face crops (`main_frame_grab.py`): when the frame is an
-  analytics-stream frame, ONE main-stream frame is fetched on demand -- the
+* `main` (default) and `auto`: after 3 failed reader runs the camera uses the
+  previous live-HLS read for 30 min, then retries. `substream`: never falls
+  back. `hls`: previous behaviour exactly.
+* LPR / PPE / face crops (`main_frame_grab.py`): a native main frame is
+  already full resolution (no grab). When the frame is a scaled or
+  substream frame, ONE main-stream frame is fetched on demand -- the
   Event-mode pre-event buffer first, else a single-frame RTSP read (so it
   works in Continuous mode too) -- only when a vehicle/person box is
   actually processed on an entitled camera. `lpr.scan_frame` takes it lazily
@@ -141,7 +155,9 @@ analytics-frame coordinates; plate crops stay native. `0` = full frame.
 | `ANYAICAM_VIDEO_PROBE_SECONDS` / `_RETRY_SECONDS` / `_TIMEOUT_SECONDS` | 21600 / 600 / 15 | (probe is read-only; no rollback needed) |
 | `ANYAICAM_LIVE_SCALE` | `profile` | `full` |
 | `ANYAICAM_CLIP_MAX_LONG_SIDE` / `_SHORT_SIDE`, `ANYAICAM_LIVE_MAX_LONG_SIDE` / `_SHORT_SIDE`, `ANYAICAM_SQUARE_MAX_SIDE`, `ANYAICAM_PANORAMIC_MAX_LONG_SIDE`, `ANYAICAM_ANALYTICS_MAX_LONG_SIDE` / `_SHORT_SIDE` | 1920/1080, 1920/1080, 1440, 2560, 1280/720 | -- |
-| `ANYAICAM_AI_SOURCE` | `auto` | `hls` |
+| `ANYAICAM_AI_SOURCE` | `main` (RC default; `auto`/`substream` opt-in after soak) | `hls` |
+| `ANYAICAM_AI_MAIN_READER_SIZE` | `native` | (`analytics` = scaled, not quality-neutral) |
+| `ANYAICAM_AI_READER_SCALE_FLAGS` | `area` (scaled readers only) | -- |
 | `ANYAICAM_AI_ALLOW_480_SUBSTREAM` | `false` (480-639 px substreams: main stream is analysed instead) | -- |
 | `ANYAICAM_AI_READER_FPS` | 2 | -- |
 | `ANYAICAM_AI_READER_STALL_SECONDS` / `_IDLE_SECONDS` / `_MAX_FAILURES` / `_RETRY_SECONDS` | 15 / 120 / 3 / 1800 | -- |
@@ -250,7 +266,7 @@ workload 60 s; CPU = user+sys of the process.
 |---|---|---|---|
 | Live HLS encoder, no viewer | 1.89 cores (4K x264) | **0** (auto, idle) | -1.89 |
 | Live HLS encoder, while watched | 1.89 cores | 1.18 cores (1080p x264) | -38 % |
-| AI frame source | 0.10 core (cv2 4K HLS read every 5 s) **+ the forced encoder** | 0.034 core (substream reader 2 fps) | -0.07 core and the encoder can stop |
+| AI frame source | 0.10 core (cv2 4K HLS read every 5 s) **+ the forced encoder** | 0.034 core (substream reader 2 fps, `auto` opt-in); default `main` native reader 0.58-0.63 core (4.8) | the encoder can stop |
 | AI frame source, camera without a substream | same | 0.43 core (main-stream reader 2 fps, 4K decode) | -- |
 | Motion reader (2ad5814) | 0.285 core | 0.034 core | -0.25 |
 | YOLO per scan (imgsz 640, 2 torch threads) | 0.30 CPU-s (4K frame) | 0.29 CPU-s (640 frame) | ~same (YOLO resizes to 640 anyway) |
@@ -271,10 +287,10 @@ The Samsung measured 3.3 cores for the same 4K encode the dev PC does in
 | No viewer, AI on, one 8MP camera | 2ad5814 (measured on appliance) | This branch (estimate) |
 |---|---|---|
 | Live HLS encoder | 3.3-3.5 | 0 with the new agent (auto); ~2.1 while someone watches HLS |
-| AI frame read | ~0.18 + forced encoder | ~0.06 |
+| AI frame read | ~0.14 + forced encoder | `main` (default): ~1.0-1.1 (native 4K reader, 2 fps, 0.58-0.63 dev-PC cores x1.75); `auto`: ~0.06 |
 | Event clip build | 1.25-1.7 cores for 20-60 s per clip | ~10-20 CPU-s per clip (~5-6 s at 2 threads) |
 | Thumbnails | 3840x2160 JPEG (~1-2 MB) | 1280x720 / 640x360 |
-| **Steady-state saving** | | **~3.4 cores** of 8 when idle, plus much shorter clip bursts |
+| **Steady-state saving** | | **`main` default: ~2.4 cores** of 8 when idle (3.3-3.5 + 0.14 -> ~1.05); with `auto` after the soak ~3.4; plus much shorter clip bursts |
 
 ### 4.5 Test suites, base 2ad5814 vs head (Docker `anyaicam-citest:035eaa1`)
 
@@ -290,6 +306,12 @@ customer live page auth / face-access UI, appliance cloud recording status):
 **base 2ad5814: 1307 passed, 2 failed** (1128 + 106 + 73) vs **head: 1427
 passed, 2 failed** (the same files plus the 8 new test files, in one run).
 appliance-agent `tests/`: 922 passed, 4 failed on both.
+
+After the `main`-default commit (1adbbea): head 1450 passed, 2 failed, 4
+skipped (same 88 files + 9 new test files, one run); appliance-agent 922
+passed, 4 failed. (One parallel run also failed
+`test_webrtc_publisher::test_an_unanswered_add_during_restart_recovery_...`;
+it passes 3/3 when run alone -- timing under concurrent Docker load.)
 
 The failures are identical on base and head (pre-existing):
 `test_lpr_real_world.py::test_glyph_reader_handles_tilted_and_slanted_plates[-15--0.2]`,
@@ -381,6 +403,56 @@ admin appliance cards and returned by `/api/ai/status`
   admin appliance cards on `/operations/rdm` and
   `/partner/appliance-dashboard` ("Camera video" with the AI stream).
 
+### 4.8 `ANYAICAM_AI_SOURCE=main` validation (MEASURED offline + Docker, 2026-10-11)
+
+Third sample: 20 event clips of the protected test camera (SSO admin role
+checked; kept only in `video-eval-data`; deleted afterwards), H.264
+3840x2160 20 fps, 501 frames (1 per second), YOLOv8n imgsz 640, threshold
+0.35 both sides, match = same class IoU >= 0.5. Reference = the 4K frame
+decoded by OpenCV and given straight to YOLO (today's per-scan path, minus
+the HLS re-encode).
+
+| Path vs reference | Box recall | Precision | conf delta median | person frames both / only ref / only path | person clips both / only ref / only path |
+|---|---|---|---|---|---|
+| **main reader, native (default)** vs 4K | **100 % (394/394)** | **100 %** | **0.000 (max abs 0.000)** | 279 / 0 / 0 | 14 / 0 / 0 |
+| (frames pixel-identical: 501/501) | | | | | |
+| today's HLS-like input (4K libx264 veryfast 4 Mbps) vs 4K | 91.4 % | 91.1 % | +0.003 | 261 / 18 / 7 | 14 / 0 / 1 |
+| main reader, native vs HLS-like | 91.1 % | 91.4 % | -0.003 | 261 / 7 / 18 | 14 / 1 / 0 |
+| main scaled 1280x720 bicubic vs 4K | 85.5 % | 79.3 % | +0.002 | 251 / 28 / 8 | 11 / 3 / 0 |
+| ... bilinear | 84.8 % | 79.5 % | +0.000 | 251 / 28 / 8 | 11 / 3 / 0 |
+| ... area | 84.3 % | 80.0 % | +0.001 | 251 / 28 / 8 | 11 / 3 / 0 |
+| ... neighbor | 85.8 % | 78.6 % | +0.005 | 254 / 25 / 9 | 13 / 1 / 0 |
+| ... fast_bilinear | 85.5 % | 78.9 % | +0.003 | 251 / 28 / 9 | 12 / 2 / 0 |
+| OpenCV INTER_LINEAR to 1280x720 (YOLO's own interpolation) vs 4K | 85.0 % | 79.4 % | +0.005 | 253 / 26 / 9 | 13 / 1 / 0 |
+
+Why the scaled reader is not near-identical: it is not the interpolation
+(OpenCV's own INTER_LINEAR differs as much as every swscale flag). YOLO
+letterboxes a 3840x2160 frame to 640x360 with a single INTER_LINEAR resize,
+which at 6x samples only 2x2 source pixels per output pixel (an aliased
+image); any pre-downscale to 1280x720 averages more pixels first, giving
+YOLO a different (smoother) image. With many persons near the 0.35
+threshold, ~15 % of boxes flip. Fix implemented: the main reader delivers
+the native frame (`ANYAICAM_AI_MAIN_READER_SIZE=native`, default) -- the
+exact frame -- and YOLO's resize is unchanged. Note that today's real input
+(the 4K HLS x264 re-encode) itself only agrees 91 % with the camera's own
+4K frame; the native main reader removes that re-encode loss.
+
+CPU (MEASURED in Docker, dev PC; MediaMTX RTSP; real 4K test clip looped;
+60 s each; python + ffmpeg of the reader, polled like the AI workers):
+
+| AI frame source | H.265 4K | H.264 4K |
+|---|---|---|
+| main reader 2 fps, native 3840x2160 (default) | 0.577 core | 0.627 core |
+| main reader 2 fps, scaled 1280x720 (area) | 0.488 core | 0.546 core |
+| old: cv2 on the 4K live HLS every 5 s (excluding its forced encoder) | 0.081 core | 0.085 core |
+| old forced 4K x264 live encoder (4.3, H.265 source) | 1.89 cores | -- |
+
+So the default costs ~0.6 core per 4K camera (continuous 4K decode at 20 fps,
+2 fps converted) instead of ~0.08 + 1.89 for the forced encoder: ~1.4 cores
+less per camera on the dev PC when nobody watches live (ESTIMATE on the
+appliance x1.75: ~2.4 cores less). `auto` (substream) would save a further
+~0.55 core per camera once the soak validates it.
+
 ## 5. Deployment steps (when approved -- NOT done)
 
 1. Cloud first: deploy the cloud build (additive `cameras.measured_*`
@@ -388,7 +460,8 @@ admin appliance cards and returned by `/api/ai/status`
 2. Appliance (lab first, then Samsung): install VMS + appliance agent from
    the same release (the agent writes the marker and reports `video`).
    Phase 1 env: `ANYAICAM_LIVE_HLS_MODE=always` for the first soak (AI on the
-   substream, clips/thumbnails/live scale on, encoder still always on).
+   main-stream reader -- the default --, clips/thumbnails/live scale on,
+   encoder still always on).
    Phase 2: unset it (auto) once phase 1 passes.
 3. Check: `docker logs <vms> | grep -E "measured video|AI frames:|Live HLS \(auto\)|AI frame reader failed|not needed for"`,
    cloud `cameras.measured_*` populated, `/api/customer/cameras` shows
@@ -400,7 +473,9 @@ As in `perf-substream-hls-20261010.md` section 8 (idle, scripted events
 every 5 min, WebRTC viewer, HLS viewer + 10 open/close cycles), plus:
 
 * **AI parity:** same 2 h of scripted walk-throughs (and a vehicle pass if
-  the camera sees a driveway) with `ANYAICAM_AI_SOURCE=hls` and then `auto`:
+  the camera sees a driveway) with `ANYAICAM_AI_SOURCE=hls`, then `main`
+  (default; expected equal or better), then -- to decide whether the
+  substream can become the default -- `auto`:
   person events within +-10 %, every scripted pass detected, AI event
   timestamps ~1 s after the real motion (not ~11 s), clip shows the person
   entering.
@@ -409,7 +484,7 @@ every 5 min, WebRTC viewer, HLS viewer + 10 open/close cycles), plus:
   are present (count RTSP sessions / log lines); no grabs for a parked car
   after its attempts are used up.
 * **CPU:** per-process cores (`pidstat -C ffmpeg 10`, python): live encoder
-  0 while idle (auto), AI reader < 0.1 core, clip builds short bursts; load
+  0 while idle (auto), AI reader ~0.6 core x1.75 (`main`) / < 0.1 core (`auto`), clip builds short bursts; load
   average < 6.
 * **Profile:** `camera<N>.video.json` and cloud `measured_*` = 3840x2160 H265 /
   640x360 H265; change the camera's main resolution once during the soak and
@@ -426,13 +501,17 @@ every 5 min, WebRTC viewer, HLS viewer + 10 open/close cycles), plus:
 
 **Risks**
 
-* **Substream AI accuracy is not verified on the real substream** (4.1 is a
-  proxy; no vehicles in the sample; no small/distant persons). Rollback:
+* **Default AI source is `main`** (native main stream): quality-identical
+  to the 4K frame offline (4.8), but ~0.6 core per 4K camera (dev PC) for the
+  continuous main-stream decode, and one more main-stream RTSP session per
+  camera (next to the recorder). Substream AI (`auto`) is cheaper but not
+  verified on the real substream (proxy: ~86 % box recall at threshold, no
+  vehicles, no small persons) -- opt-in only after the soak. Rollback:
   `ANYAICAM_AI_SOURCE=hls`.
-* **More RTSP sessions per camera:** the AI reader is a second substream
-  session next to the motion reader (+ recorder on main, WebRTC on demand,
+* **More RTSP sessions per camera:** the AI reader (default `main`: a second main-stream session next to the recorder; `auto`: a second substream
+  session next to the motion reader) (+ recorder on main, WebRTC on demand,
   short main grabs). A camera with a low session limit may refuse one; the AI
-  reader then falls back to HLS after 3 failures (auto). Merging motion and
+  reader then falls back to HLS after 3 failures (main/auto). Merging motion and
   AI into one substream reader is a follow-up.
 * **Main-stream grab cost/latency:** ~1.2 CPU-s and ~2 s per grab (4K HEVC,
   dev PC); the crop is taken 1-2 s after the analytics frame, so a fast
