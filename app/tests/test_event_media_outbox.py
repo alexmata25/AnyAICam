@@ -50,6 +50,68 @@ def test_restart_resume_and_temporary_failure_use_bounded_backoff(tmp_path, monk
     assert saved["next_attempt_at"]  # later normal ticks will not hot-loop
 
 
+def test_a_malformed_job_is_abandoned_and_reported_after_the_attempt_limit(tmp_path, monkeypatch):
+    """2026-10-11: two real jobs stayed 'invalid_job' forever."""
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 3)
+    bad = {**_job("inverted"), "event_start": "2026-01-01T00:00:10", "event_end": "2026-01-01T00:00:01"}
+    outbox.save([bad])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+
+    def upload(**kwargs):
+        from event_clips import compute_clip_window
+        compute_clip_window(kwargs["event_start"], kwargs["event_end"])
+        return True
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", upload)
+    for expected_attempts in (1, 2):
+        uploader.retry_pending_event_media()
+        job = outbox.load()[0]
+        assert job["attempts"] == expected_attempts and job["last_error"] == "invalid_job:inverted_window"
+        outbox.replace("inverted", {**job, "next_attempt_at": None})
+    assert reported == []
+    uploader.retry_pending_event_media()
+    assert outbox.load() == []
+    assert reported == [{"event_id": "inverted", "camera_number": 1, "reason": "clip_unavailable"}]
+
+
+@pytest.mark.parametrize("error", [KeyError("camera"), TypeError("None"), ValueError("parse")])
+def test_errors_while_processing_a_well_formed_job_are_never_terminal(tmp_path, monkeypatch, error):
+    """The real Samsung case: two well-formed jobs raised for hours after a
+    restart, then uploaded on their own. They must never be abandoned."""
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 1)
+    outbox.save([_job("transient")])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+
+    def upload(**_):
+        raise error
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", upload)
+    for _ in range(5):
+        uploader.retry_pending_event_media()
+        job = outbox.load()[0]
+        outbox.replace("transient", {**job, "next_attempt_at": None})
+    job = outbox.load()[0]
+    assert job["attempts"] == 5 and job["last_error"] == "processing_error:" + type(error).__name__
+    assert reported == []
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", lambda **kw: outbox.remove(kw["event_id"]) or True)
+    assert uploader.retry_pending_event_media()["completed"] == 1
+
+
+def test_an_abandoned_job_without_a_camera_is_dropped_without_a_report(tmp_path, monkeypatch):
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 1)
+    outbox.save([{"event_id": "broken"}])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+    uploader.retry_pending_event_media()
+    assert outbox.load() == [] and reported == []
+
+
 def test_malformed_item_does_not_block_later_completed_item(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
     outbox.save([{"event_id": "broken"}, {"event_id": "good", "camera_number": 1, "event_start": "2026-01-01T00:00:00", "event_end": "2026-01-01T00:00:01", "clip_url": "/recordings/a.mp4", "thumbnail_url": None}])
@@ -57,7 +119,7 @@ def test_malformed_item_does_not_block_later_completed_item(tmp_path, monkeypatc
     summary = uploader.retry_pending_event_media()
     assert summary["completed"] == 1
     assert outbox.load()[0]["event_id"] == "broken"
-    assert outbox.load()[0]["last_error"] == "invalid_job"
+    assert outbox.load()[0]["last_error"].startswith("invalid_job:missing_")
 
 
 def _job(event_id):
@@ -155,3 +217,17 @@ def test_outbox_file_default_is_the_writable_data_config_directory_not_the_read_
     back under /var/lib/anyaicam."""
     assert str(outbox.OUTBOX_FILE).replace("\\", "/") == "/opt/anyaicam/data/config/event_media_outbox.json"
     assert not str(outbox.OUTBOX_FILE).replace("\\", "/").startswith("/var/lib/anyaicam")
+
+
+def test_the_terminal_failure_reason_is_one_the_cloud_accepts(tmp_path, monkeypatch):
+    """Codex review (d37054a): the cloud's /media/failed route rejects any
+    reason outside its allowlist with 400, which would leave the event
+    pending. Pin the edge's reason to that allowlist."""
+    import appliance_cloud
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 1)
+    outbox.save([{**_job("inverted"), "event_start": "2026-01-01T00:00:10", "event_end": "2026-01-01T00:00:01"}])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+    uploader.retry_pending_event_media()
+    assert reported and reported[0]["reason"] in appliance_cloud.MEDIA_FAILURE_REASONS
