@@ -28,9 +28,12 @@ def _appliance(db_path, appliance_id):
 
 
 def _heartbeat(client, body):
+    import appliance_claims
     appliance_cloud.request_limiter.events.clear()
-    return client.post("/api/appliance/heartbeat", headers=_appliance_auth_headers(body["appliance_id"], body["credential"]),
-                       json={"uptime_seconds": 120, "cpu": 5, "memory": 10})
+    response = client.post("/api/appliance/heartbeat", headers=_appliance_auth_headers(body["appliance_id"], body["credential"]),
+                           json={"uptime_seconds": 120, "cpu": 5, "memory": 10})
+    appliance_claims.wait_for_background_storage_starts()  # the start runs off the request path
+    return response
 
 
 def test_claim_complete_marks_the_row_and_the_first_heartbeat_activates_it_once(client, db_path, starts):

@@ -125,7 +125,7 @@ def test_sign_in_lands_on_the_account_not_setup(http_client, db_path, stripe_cal
     assert account.status_code == 200, account.headers.get("location")
     dashboard = http_client.get("/dashboard", follow_redirects=True)
     assert dashboard.status_code == 200 and "/customer/setup" not in str(dashboard.url)
-    assert stripe_calls["post"] == []
+    assert stripe_calls == {"post": [], "get": []}  # no Stripe request of any kind
 
 
 def test_readiness_does_not_depend_on_the_older_identity(http_client, db_path):
@@ -154,7 +154,7 @@ def test_the_wizard_reaches_step_7_and_confirm_completes_it(http_client, db_path
     completed_at, step = conn.execute("SELECT completed_at,current_step FROM customer_setup_drafts WHERE customer_id='cust-1'").fetchone()
     conn.close()
     assert completed_at and step == 7
-    assert stripe_calls["post"] == []
+    assert stripe_calls == {"post": [], "get": []}  # no Stripe request of any kind
 
 
 def test_revoking_the_appliance_offers_setup_again(http_client, db_path, stripe_calls):
@@ -173,7 +173,7 @@ def test_revoking_the_appliance_offers_setup_again(http_client, db_path, stripe_
         assert per_camera_billing._setup_needed("cust-1") is True
     response = http_client.get("/customer-account", cookies=_owner_cookie())
     assert response.status_code == 303 and response.headers["location"] == "/customer/setup"
-    assert stripe_calls["post"] == []
+    assert stripe_calls == {"post": [], "get": []}  # no Stripe request of any kind
 
 
 def test_no_path_calls_stripe_for_this_customer(http_client, db_path, stripe_calls):
@@ -211,4 +211,66 @@ def test_a_pre_cutover_claimed_customer_with_a_pending_storage_order_is_never_au
         assert build_orders.retry_storage_starts() == 0
         assert build_orders.on_appliance_activated("cust-1")["status"] == "ignored"
         assert build_orders.storage_plan("cust-1")["state"] == expected
-    assert stripe_calls["post"] == [] and not any(path.startswith("/v1/subscriptions") for path in stripe_calls["get"])
+    assert stripe_calls == {"post": [], "get": []}  # no Stripe request of any kind
+
+
+# ------------------------------------------------------------ setup confirmation uses appliance_readiness (Codex, 6627c1b)
+
+def _confirm(http_client, appliance_id="appl-new"):
+    return http_client.post("/api/customer/setup/confirm", cookies=_owner_cookie(), json={"appliance_id": appliance_id})
+
+
+def _completed(db_path):
+    conn = sqlite3.connect(db_path)
+    found = conn.execute("SELECT completed_at FROM customer_setup_drafts WHERE customer_id='cust-1'").fetchone()[0]
+    conn.close()
+    return found
+
+
+def _sql(db_path, *statements):
+    conn = sqlite3.connect(db_path)
+    for statement, args in statements:
+        conn.execute(statement, args)
+    conn.commit()
+    conn.close()
+
+
+def test_a_revoked_token_activated_appliance_cannot_confirm_setup(http_client, db_path, stripe_calls):
+    _seed(db_path, old_revoked=True)
+    revoked = datetime.now().isoformat()
+    _sql(db_path, ("UPDATE appliances SET activation_status='activated' WHERE id='appl-new'", ()),  # token-activated
+         ("UPDATE appliance_credentials SET revoked_at=? WHERE appliance_id='appl-new'", (revoked,)),
+         ("UPDATE appliances SET state='revoked',online_status='revoked',credential_revoked_at=? WHERE id='appl-new'", (revoked,)))
+    assert _confirm(http_client).status_code == 409 and _completed(db_path) is None
+    # Credential revoked but state not yet updated: still refused.
+    _sql(db_path, ("UPDATE appliances SET state='online' WHERE id='appl-new'", ()))
+    assert _confirm(http_client).status_code == 409 and _completed(db_path) is None
+    assert stripe_calls == {"post": [], "get": []}
+
+
+def test_a_claimed_appliance_whose_credential_was_never_used_cannot_confirm_setup(http_client, db_path, stripe_calls):
+    _seed(db_path, old_revoked=True)
+    _sql(db_path, ("UPDATE appliance_credentials SET last_used_at=NULL WHERE appliance_id='appl-new'", ()))
+    assert _confirm(http_client).status_code == 409 and _completed(db_path) is None
+    # ...nor one whose only heartbeat predates the credential (enrollment rolled back).
+    _sql(db_path, ("UPDATE appliance_credentials SET last_used_at=? WHERE appliance_id='appl-new'", (_ago(minutes=1),)),
+         ("UPDATE appliances SET last_check_in=? WHERE id='appl-new'", (_ago(days=2),)))
+    assert _confirm(http_client).status_code == 409 and _completed(db_path) is None
+    assert stripe_calls == {"post": [], "get": []}
+
+
+def test_the_production_case_still_confirms(http_client, db_path, stripe_calls):
+    _seed(db_path)  # exactly as reported, the non-revoked older identity included
+    assert _confirm(http_client).status_code == 200 and _completed(db_path)
+    assert stripe_calls == {"post": [], "get": []}
+
+
+def test_token_recovery_is_refused_for_claimed_and_revoked_appliances(http_client, db_path, stripe_calls):
+    _seed(db_path, old_revoked=True)
+    for appliance_id in ("appl-new", "appl-old"):  # claimed and in use; revoked
+        response = http_client.post(f"/api/customer/appliances/{appliance_id}/activation-token/recover", cookies=_owner_cookie())
+        assert response.status_code == 409, (appliance_id, response.text)
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM appliance_activation_tokens").fetchone()[0] == 0
+    conn.close()
+    assert stripe_calls == {"post": [], "get": []}

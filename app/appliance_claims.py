@@ -449,7 +449,7 @@ def _recover_completed_result(claim: dict) -> dict | None:
     }
 
 
-def record_claim_activation(appliance_id: str) -> bool:
+def record_claim_activation(appliance_id: str, *, background: bool = False) -> bool:
     """The claim flow's activation event (2026-10-11): a row claim/complete
     created (activated_via='claim') has really enrolled -- its own credential
     used and a heartbeat after it (appliance_readiness.enrollment_ready, the
@@ -459,7 +459,13 @@ def record_claim_activation(appliance_id: str) -> bool:
     (build_orders.on_appliance_activated: never raises, retried by the billing
     worker). activation_status keeps its existing meaning (token activation
     only). Rows claimed before this change carry no marker and are never
-    activated here. Returns True only for the call that recorded it."""
+    activated here. Returns True only for the call that recorded it.
+
+    background=True (the heartbeat): the start runs off the request path
+    (start_storage_in_background), so a slow Stripe call never delays the
+    heartbeat's answer; exactly-once still holds (build_orders claims the
+    plan row, fixed Idempotency-Key), and a start that never ran is picked
+    up by the billing worker (the activation is already recorded)."""
     from appliance_readiness import enrollment_ready
     appliance = row('SELECT id,customer_id,cloud_id,activated_via,activated_at,activation_status,state FROM appliances WHERE id=?',
                     (appliance_id,))
@@ -483,9 +489,38 @@ def record_claim_activation(appliance_id: str) -> bool:
     if changed != 1:
         return False
     logger.info('Claimed appliance activated appliance_id=%s', appliance_id)
-    from build_orders import on_appliance_activated
-    on_appliance_activated(appliance.get('customer_id'))
+    if background:
+        start_storage_in_background(appliance.get('customer_id'))
+    else:
+        from build_orders import on_appliance_activated
+        on_appliance_activated(appliance.get('customer_id'))
     return True
+
+
+_storage_start_threads: list = []
+
+
+def start_storage_in_background(customer_id: str | None):
+    """build_orders.on_appliance_activated() on a daemon thread (it never
+    raises). Runs in a copy of the caller's context, so the same database
+    target is used. Returns the thread."""
+    import contextvars
+    import threading
+
+    def run():
+        from build_orders import on_appliance_activated
+        on_appliance_activated(customer_id)
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=context.run, args=(run,), name='storage-start', daemon=True)
+    _storage_start_threads[:] = [item for item in _storage_start_threads if item.is_alive()] + [thread]
+    thread.start()
+    return thread
+
+
+def wait_for_background_storage_starts(timeout: float = 10.0) -> None:
+    """For tests and orderly shutdown: wait for started background starts."""
+    for thread in list(_storage_start_threads):
+        thread.join(timeout)
 
 
 def record_pending_claim_activations(limit: int = 50) -> int:

@@ -88,3 +88,20 @@ def customer_has_activated_appliance(customer_id: str) -> bool:
         (customer_id,),
     )
     return any(appliance_activated(candidate) for candidate in candidates)
+
+
+def activation_token_recovery_allowed(appliance: dict | None) -> bool:
+    """A new one-time activation token (customer self-service recovery) only
+    for an appliance that was never set up and is still in service: not
+    token-activated, not released, not revoked, and holding no live
+    credential (a claimed appliance has one from claim/complete). Anything
+    else would hand out a way to take the appliance over."""
+    if not appliance:
+        return False
+    if str(appliance.get('activation_status') or '') in ('activated', 'released'):
+        return False
+    current = row("SELECT state FROM appliances WHERE id=?", (str(appliance.get('id') or ''),))
+    if not current or str(current.get('state') or '') == 'revoked':
+        return False
+    return not row('SELECT id FROM appliance_credentials WHERE appliance_id=? AND revoked_at IS NULL LIMIT 1',
+                   (str(appliance.get('id') or ''),))

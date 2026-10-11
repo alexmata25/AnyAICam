@@ -641,12 +641,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # Claim-flow activation (2026-10-11): the first heartbeat of an
         # appliance claim/complete created proves it really enrolled -- record
         # that once and start its deferred storage plan (appliance_claims.
-        # record_claim_activation). Never fails the heartbeat; the billing
-        # worker's sweep records anything missed here.
+        # record_claim_activation; the Stripe start runs in the background,
+        # never on this request). Never fails the heartbeat; the billing
+        # worker's sweep records or retries anything missed here.
         if appliance.get('activated_via')=='claim' and not appliance.get('activated_at'):
             try:
                 from appliance_claims import record_claim_activation
-                record_claim_activation(appliance['id'])
+                record_claim_activation(appliance['id'],background=True)
             except Exception:
                 logger.exception('claim_activation.heartbeat_record_failed appliance_id=%s',appliance['id'])
         return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}

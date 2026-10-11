@@ -1028,12 +1028,12 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             )
         return {'message':'Appliance linked to customer account.','appliance_id':appliance['id'],'camera_slots_purchased':total_camera_slots(identity['customer_id'])}
 
-    def _appliance_activated(appliance: dict) -> bool:
-        """Device-confirmed: the appliance redeemed a token and holds a
-        credential (appliance_cloud.activate()), never a wizard step."""
-        if appliance.get('activation_status')=='activated':
-            return True
-        return row('SELECT id FROM appliance_credentials WHERE appliance_id=? AND revoked_at IS NULL LIMIT 1',(appliance['id'],)) is not None
+    # Readiness has one source of truth (Codex review of 6627c1b):
+    # appliance_readiness. Setup completion needs a device-confirmed,
+    # in-service appliance (token-activated, or claimed and really enrolled;
+    # never revoked/released, never a credential that was not used); token
+    # recovery only for an appliance never set up.
+    from appliance_readiness import activation_token_recovery_allowed, appliance_activated as _appliance_activated
 
     @app.post('/api/customer/appliances/{appliance_id}/activation-token/recover')
     def recover_customer_activation_token(request: Request,appliance_id: str) -> dict:
@@ -1048,7 +1048,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         appliance=row('SELECT * FROM appliances WHERE id=? AND customer_id=?',(appliance_id,identity['customer_id']))
         if not appliance:
             raise HTTPException(status_code=404,detail='Appliance not found.')
-        if _appliance_activated(appliance):
+        if not activation_token_recovery_allowed(appliance):
             raise HTTPException(status_code=409,detail='This appliance is already activated. A new activation token is not needed.')
         with connection() as db:
             token,expires_at=_rotate_activation_token(db,appliance_id,identity.get('email') or 'customer')
@@ -1107,7 +1107,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             # old token -- only while the appliance is still pending.
             return {'status':'already_provisioned','message':'An appliance has already been provisioned for this account.',
                     'appliance_id':existing['id'],'cloud_id':existing['cloud_id'],'site_id':existing['site_id'],
-                    'activation_pending':not _appliance_activated(existing)}
+                    'activation_pending':activation_token_recovery_allowed(existing)}
 
         from hardware_orders import get_orders_for_customer
         if not any(o['status']=='paid' for o in get_orders_for_customer(customer_id)):

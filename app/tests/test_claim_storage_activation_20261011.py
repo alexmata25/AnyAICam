@@ -74,12 +74,18 @@ def _claimed_appliance(db_path, customer_id, *, appliance_id="app-claim", marked
     return credential
 
 
-def _heartbeat(client, appliance_id, credential):
+def _heartbeat(client, appliance_id, credential, *, wait=True):
+    """An authenticated heartbeat; waits for the background storage start
+    it may have scheduled (off the request path)."""
+    import appliance_claims
     import appliance_cloud
     appliance_cloud.request_limiter.events.clear()
-    return client.post("/api/appliance/heartbeat", json={"uptime_seconds": 120, "cpu": 1, "memory": 1},
-                       headers={"X-Appliance-Id": appliance_id, "X-Request-Timestamp": str(int(time.time())),
-                                "X-Request-Nonce": secrets.token_hex(16), "Authorization": f"Bearer {credential}"})
+    response = client.post("/api/appliance/heartbeat", json={"uptime_seconds": 120, "cpu": 1, "memory": 1},
+                           headers={"X-Appliance-Id": appliance_id, "X-Request-Timestamp": str(int(time.time())),
+                                    "X-Request-Nonce": secrets.token_hex(16), "Authorization": f"Bearer {credential}"})
+    if wait:
+        appliance_claims.wait_for_background_storage_starts()
+    return response
 
 
 def _deploy_migration(db_path):
@@ -145,6 +151,35 @@ def test_a_new_claim_starts_the_storage_plan_once_when_it_really_enrolls(shop, d
     with override_target(sqlite_path=str(db_path)):
         assert build_orders.on_appliance_activated(customer_id)["status"] == "ignored"
     assert len(stripe_subscriptions["created"]) == 1 and len(_audits(db_path, "appliance.activated", "app-claim")) == 1
+
+
+def test_a_slow_stripe_call_never_delays_the_heartbeat(shop, db_path, stripe_subscriptions, monkeypatch):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "claim-slow@example.test", APPLIANCE, captured)
+    credential = _claimed_appliance(db_path, customer_id)
+    import threading
+
+    import appliance_claims
+    import main
+    release, reached = threading.Event(), threading.Event()
+    stripe_post = main.stripe_api_post
+
+    def slow_post(path, fields, idempotency_key=None):
+        reached.set()
+        assert release.wait(20), "Stripe was never released"
+        return stripe_post(path, fields, idempotency_key=idempotency_key)
+    monkeypatch.setattr(main, "stripe_api_post", slow_post)
+    started = time.monotonic()
+    response = _heartbeat(client, "app-claim", credential, wait=False)
+    elapsed = time.monotonic() - started
+    assert response.status_code == 200 and elapsed < 5
+    assert reached.wait(10)  # the start runs in the background, after the answer
+    assert _appliance(db_path, "app-claim")["activated_at"]  # the activation was recorded in the request
+    assert _storage(db_path, customer_id)["state"] == "starting"
+    assert _worker(db_path) == 0  # a start in progress is never started twice
+    release.set()
+    appliance_claims.wait_for_background_storage_starts()
+    assert _storage(db_path, customer_id)["state"] == "started" and len(stripe_subscriptions["created"]) == 1
 
 
 def test_a_lost_stripe_answer_on_a_claim_start_is_retried_by_the_worker(shop, db_path, stripe_subscriptions):
