@@ -68,12 +68,38 @@ def test_a_malformed_job_is_abandoned_and_reported_after_the_attempt_limit(tmp_p
     for expected_attempts in (1, 2):
         uploader.retry_pending_event_media()
         job = outbox.load()[0]
-        assert job["attempts"] == expected_attempts and job["last_error"] == "invalid_job"
+        assert job["attempts"] == expected_attempts and job["last_error"] == "invalid_job:inverted_window"
         outbox.replace("inverted", {**job, "next_attempt_at": None})
     assert reported == []
     uploader.retry_pending_event_media()
     assert outbox.load() == []
     assert reported == [{"event_id": "inverted", "camera_number": 1, "reason": "invalid_job"}]
+
+
+@pytest.mark.parametrize("error", [KeyError("camera"), TypeError("None"), ValueError("parse")])
+def test_errors_while_processing_a_well_formed_job_are_never_terminal(tmp_path, monkeypatch, error):
+    """The real Samsung case: two well-formed jobs raised for hours after a
+    restart, then uploaded on their own. They must never be abandoned."""
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 1)
+    outbox.save([_job("transient")])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+
+    def upload(**_):
+        raise error
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", upload)
+    for _ in range(5):
+        uploader.retry_pending_event_media()
+        job = outbox.load()[0]
+        outbox.replace("transient", {**job, "next_attempt_at": None})
+    job = outbox.load()[0]
+    assert job["attempts"] == 5 and job["last_error"] == "processing_error:" + type(error).__name__
+    assert reported == []
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", lambda **kw: outbox.remove(kw["event_id"]) or True)
+    assert uploader.retry_pending_event_media()["completed"] == 1
 
 
 def test_an_abandoned_job_without_a_camera_is_dropped_without_a_report(tmp_path, monkeypatch):
@@ -93,7 +119,7 @@ def test_malformed_item_does_not_block_later_completed_item(tmp_path, monkeypatc
     summary = uploader.retry_pending_event_media()
     assert summary["completed"] == 1
     assert outbox.load()[0]["event_id"] == "broken"
-    assert outbox.load()[0]["last_error"] == "invalid_job"
+    assert outbox.load()[0]["last_error"].startswith("invalid_job:missing_")
 
 
 def _job(event_id):
