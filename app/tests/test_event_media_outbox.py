@@ -50,6 +50,42 @@ def test_restart_resume_and_temporary_failure_use_bounded_backoff(tmp_path, monk
     assert saved["next_attempt_at"]  # later normal ticks will not hot-loop
 
 
+def test_a_malformed_job_is_abandoned_and_reported_after_the_attempt_limit(tmp_path, monkeypatch):
+    """2026-10-11: two real jobs stayed 'invalid_job' forever."""
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 3)
+    bad = {**_job("inverted"), "event_start": "2026-01-01T00:00:10", "event_end": "2026-01-01T00:00:01"}
+    outbox.save([bad])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+
+    def upload(**kwargs):
+        from event_clips import compute_clip_window
+        compute_clip_window(kwargs["event_start"], kwargs["event_end"])
+        return True
+
+    monkeypatch.setattr(uploader, "upload_motion_event_media", upload)
+    for expected_attempts in (1, 2):
+        uploader.retry_pending_event_media()
+        job = outbox.load()[0]
+        assert job["attempts"] == expected_attempts and job["last_error"] == "invalid_job"
+        outbox.replace("inverted", {**job, "next_attempt_at": None})
+    assert reported == []
+    uploader.retry_pending_event_media()
+    assert outbox.load() == []
+    assert reported == [{"event_id": "inverted", "camera_number": 1, "reason": "invalid_job"}]
+
+
+def test_an_abandoned_job_without_a_camera_is_dropped_without_a_report(tmp_path, monkeypatch):
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 1)
+    outbox.save([{"event_id": "broken"}])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+    uploader.retry_pending_event_media()
+    assert outbox.load() == [] and reported == []
+
+
 def test_malformed_item_does_not_block_later_completed_item(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
     outbox.save([{"event_id": "broken"}, {"event_id": "good", "camera_number": 1, "event_start": "2026-01-01T00:00:00", "event_end": "2026-01-01T00:00:01", "clip_url": "/recordings/a.mp4", "thumbnail_url": None}])

@@ -74,6 +74,11 @@ EVENT_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
 RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
 RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
 RETRY_MAX_JOBS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_JOBS", "10")))
+# A malformed job (missing field, unparsable or inverted event window) can
+# never succeed by being retried. After this many attempts it leaves the
+# outbox and the cloud is told no clip will come (2026-10-11: two Samsung
+# jobs sat as 'invalid_job' forever, the portal showing them as pending).
+INVALID_JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_INVALID_JOB_MAX_ATTEMPTS", "3")))
 # Cloud answers to .../media/shared that no quick retry can change.
 SHARED_REGISTRATION_REFUSED = frozenset({400, 403})
 event_media_retry_state = {"worker_status": "not_started", "last_summary": None, "last_error": None}
@@ -673,6 +678,26 @@ def _upload_error_code(error: BaseException) -> str:
     return type(error).__name__
 
 
+def _abandon_invalid_job(job: dict, attempts: int) -> None:
+    """Terminal outcome for a job that cannot be processed: drop it from
+    the outbox, then report the clip as failed so the portal shows "no
+    clip" instead of pending forever. report_media_failed() refuses while
+    the job is still queued, hence the order."""
+    event_id = str(job.get("event_id") or "")
+    event_media_outbox.remove(event_id)
+    logger.warning("event_media.job_abandoned event_id=%s camera=%s attempts=%s reason=invalid_job",
+                   event_id, job.get("camera_number"), attempts)
+    try:
+        camera_number = int(job.get("camera_number"))
+    except (TypeError, ValueError):
+        return  # nothing identifies the camera; the cloud event stays without media
+    if event_id:
+        try:
+            report_media_failed(event_id=event_id, camera_number=camera_number, reason="invalid_job")
+        except Exception as error:  # best effort, like every other report
+            logger.warning("event_media.failure_report_failed event_id=%s error=%s", event_id, type(error).__name__)
+
+
 def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     """Retry durable jobs on the next local worker tick; never contacts a
     service unless the normal event-media feature gate is enabled."""
@@ -715,6 +740,9 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
             # item cannot cause a tight loop or block later jobs.
             attempts = int(job.get("attempts", 0)) + 1
             delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
+            if attempts >= INVALID_JOB_MAX_ATTEMPTS:
+                _abandon_invalid_job(job, attempts)
+                continue
             event_media_outbox.replace(str(job.get("event_id")), {**job, "attempts": attempts, "last_error": "invalid_job", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
         except Exception as error:
             # 2026-10-10: an S3 or STS failure (e.g. AccessDenied from an
