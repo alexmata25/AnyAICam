@@ -432,11 +432,21 @@ load_preloaded_vms_image() {
     # A tag of that name that already existed before this run (e.g. from an
     # operator's own load) is never removed: its image ID is recorded and the
     # name is restored to it afterwards, whatever happens.
-    preload_ref_previous="$(docker image inspect -f '{{.Id}}' "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)" \
-        || preload_ref_previous=""
-    if [[ -n "$preload_ref_previous" && ! "$preload_ref_previous" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    # Fail closed (Codex review of 8e1164d): only "the listing worked and the
+    # name is absent" counts as no prior tag; a failed listing, or a tag
+    # whose ID cannot be read, skips the preload and builds instead.
+    local preload_ref_listing
+    if ! preload_ref_listing="$(docker image ls -q --no-trunc "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"; then
         rm -rf -- "$copy_dir"
-        _vms_preload_reject "the existing $VMS_PRELOAD_IMAGE_REF has an unreadable image ID"; return 1
+        _vms_preload_reject "could not check for an existing $VMS_PRELOAD_IMAGE_REF"; return 1
+    fi
+    preload_ref_previous=""
+    if [[ -n "$preload_ref_listing" ]]; then
+        preload_ref_previous="$(docker image inspect -f '{{.Id}}' "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)" || preload_ref_previous=""
+        if [[ ! "$preload_ref_previous" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            rm -rf -- "$copy_dir"
+            _vms_preload_reject "the existing $VMS_PRELOAD_IMAGE_REF has an unreadable image ID"; return 1
+        fi
     fi
     load_timeout="${ANYAICAM_VMS_LOAD_TIMEOUT:-1800}"
     [[ "$load_timeout" =~ ^[1-9][0-9]*$ ]] || load_timeout=1800

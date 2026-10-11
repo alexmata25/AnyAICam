@@ -60,8 +60,17 @@ DOCKER_STUB = textwrap.dedent(r'''\
         [[ "${PL_LOAD:-ok}" == ok ]] || { echo 'simulated load failure' >&2; exit 1; }
         touch "$PL_LOADED_MARK"; echo "Loaded image: $PL_REF"; exit 0 ;;
       image)
+        if [[ "$2" == ls ]]; then
+          [[ "${PL_LS_FAIL:-0}" == 1 ]] && exit 1
+          if [[ ! -f "$PL_LOADED_MARK" ]]; then
+            [[ "${PL_PREEXISTING:-0}" == 1 ]] && echo "$PL_PREEXISTING_ID"
+            exit 0
+          fi
+          echo "$PL_LOADED_ID"; exit 0
+        fi
         if [[ "$2" == inspect ]]; then
           if [[ ! -f "$PL_LOADED_MARK" ]]; then
+            [[ "${PL_PREEXISTING_UNREADABLE:-0}" == 1 ]] && exit 1
             # Before any load: only a pre-existing preload tag exists, on another image.
             [[ "${PL_PREEXISTING:-0}" == 1 ]] || exit 1
             printf '%s\n' "$PL_PREEXISTING_ID"; exit 0
@@ -332,6 +341,17 @@ class PreloadedImageInstallerTests(unittest.TestCase):
                 if not stub:   # success: the release tag still names the verified image
                     self.assertIn(f"docker tag {IMAGE_ID} anyaicam-vms:release-{SHORT}", calls)
                     self.assertNotIn("docker build", calls)
+
+    def test_a_failed_tag_listing_skips_the_preload_and_builds(self):
+        """Codex review of 8e1164d: fail closed when the prior tag cannot be checked."""
+        result, calls = self.run_prepare(PL_LS_FAIL="1")
+        self.assert_built_not_loaded(result, calls)
+
+    def test_an_existing_tag_whose_id_cannot_be_read_skips_the_preload_and_builds(self):
+        result, calls = self.run_prepare(PL_PREEXISTING="1", PL_PREEXISTING_ID="sha256:" + "5" * 64,
+                                         PL_PREEXISTING_UNREADABLE="1")
+        self.assert_built_not_loaded(result, calls)
+        self.assertNotIn("docker image rm", calls)
 
     def test_a_preload_tag_created_by_this_run_is_removed_on_load_failure(self):
         result, calls = self.run_prepare(PL_LOAD="fail")
