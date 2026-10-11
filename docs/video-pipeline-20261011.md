@@ -142,6 +142,7 @@ analytics-frame coordinates; plate crops stay native. `0` = full frame.
 | `ANYAICAM_LIVE_SCALE` | `profile` | `full` |
 | `ANYAICAM_CLIP_MAX_LONG_SIDE` / `_SHORT_SIDE`, `ANYAICAM_LIVE_MAX_LONG_SIDE` / `_SHORT_SIDE`, `ANYAICAM_SQUARE_MAX_SIDE`, `ANYAICAM_PANORAMIC_MAX_LONG_SIDE`, `ANYAICAM_ANALYTICS_MAX_LONG_SIDE` / `_SHORT_SIDE` | 1920/1080, 1920/1080, 1440, 2560, 1280/720 | -- |
 | `ANYAICAM_AI_SOURCE` | `auto` | `hls` |
+| `ANYAICAM_AI_ALLOW_480_SUBSTREAM` | `false` (480-639 px substreams: main stream is analysed instead) | -- |
 | `ANYAICAM_AI_READER_FPS` | 2 | -- |
 | `ANYAICAM_AI_READER_STALL_SECONDS` / `_IDLE_SECONDS` / `_MAX_FAILURES` / `_RETRY_SECONDS` | 15 / 120 / 3 / 1800 | -- |
 | `ANYAICAM_AI_FRAME_MAX_AGE_SECONDS` / `ANYAICAM_AI_FIRST_FRAME_WAIT_SECONDS` | 3 / 8 | -- |
@@ -180,7 +181,15 @@ YOLOv8n `imgsz=640` on CPU, threshold 0.35 (production `YOLO_CONFIDENCE`),
 person = `person`, vehicle = car/truck/bus/motorcycle/bicycle; a match is the
 same group with IoU >= 0.5 (low-res boxes mapped back x6).
 
-| Test input vs reference (a) = the 4K frame | TP | FN (missed) | extra | recall vs 4K | precision vs 4K | conf delta mean / median / p10 / p90 |
+**Correction (2026-10-11, second run, 4.6):** the "recall" below counted a
+4K box as found when ANY low-resolution box overlapped it (IoU >= 0.5) at
+confidence >= 0.10 -- box presence, not detection at the production
+threshold. Re-measured at the threshold (both sides >= 0.35) on a second
+20-clip sample, 640x360 box recall vs 4K is ~86 %, frame-level person
+presence recall 95 % and clip-level 12/13 -- see 4.6. The table is kept as
+originally reported.
+
+| Test input vs reference (a) = the 4K frame | TP | FN (missed) | extra | box presence (any conf >= 0.10) vs 4K | precision vs 4K | conf delta mean / median / p10 / p90 |
 |---|---|---|---|---|---|---|
 | (b) 640x360 INTER_AREA downscale | 637 | 1 | 185 | 99.84 % | 77.5 % | -0.023 / -0.010 / -0.122 / +0.071 |
 | (c) 640x360 + H.265 512 kbps re-encode (substream-like) | 637 | 1 | 189 | 99.84 % | 77.1 % | -0.023 / -0.007 / -0.136 / +0.077 |
@@ -275,12 +284,102 @@ The Samsung measured 3.3 cores for the same 4K encode the dev PC does in
 | 7 extra files (live copy/transport, talk-down, camera migration, multi-appliance isolation, camera count, cameras tab) | 106 passed | 110 passed (+1 new live-scale test, +3 customer-surface tests) |
 | appliance-agent `tests/` | 922 passed, 4 failed, 4 skipped | 922 passed, 4 failed, 4 skipped |
 
+Re-run after the owner-decision commit (9d3169b), same image: 76 related
+files + 7 extra files + 5 more (admin customer management, /operations/rdm,
+customer live page auth / face-access UI, appliance cloud recording status):
+**base 2ad5814: 1307 passed, 2 failed** (1128 + 106 + 73) vs **head: 1427
+passed, 2 failed** (the same files plus the 8 new test files, in one run).
+appliance-agent `tests/`: 922 passed, 4 failed on both.
+
 The failures are identical on base and head (pre-existing):
 `test_lpr_real_world.py::test_glyph_reader_handles_tilted_and_slanted_plates[-15--0.2]`,
 `test_webrtc_publisher.py::test_recording_and_live_hls_still_use_the_main_stream_only`
 (a source-grep test already broken by 2ad5814's `motion_substream_url`), and
 in the agent `test_agent_file_helpers.py` (3) and
 `test_capacity_accept.py` (1).
+
+### 4.6 480 px analytics fallback and corrected metric (MEASURED offline, 2026-10-11)
+
+Owner decision: prefer the smallest stream >= 640 px; a 480-639 px
+substream only as a fallback, validated first. Second sample: 20 other event
+clips of the same protected test camera (same rules: SSO admin role checked,
+read-only, kept only in `video-eval-data`, deleted afterwards), H.264
+3840x2160 20 fps; 470 frames (1 per second); YOLOv8n imgsz 640, threshold
+0.35 on BOTH sides; match = same class, IoU >= 0.5. "area" = clean
+INTER_AREA downscale; "h265" = downscale + H.265 re-encode at a
+substream-like bitrate (640x360: 512 kbps, 480x270: 300 kbps).
+
+Box-level (each 4K person box >= 0.35 must be found >= 0.35):
+
+| Test vs reference | TP | FN | extra | recall | precision | conf delta median (p10 / p90) |
+|---|---|---|---|---|---|---|
+| 640 area vs 4K | 356 | 66 | 99 | 84.4 % | 78.2 % | +0.005 (-0.066 / +0.076) |
+| 640 h265 vs 4K | 362 | 60 | 90 | 85.8 % | 80.1 % | +0.006 (-0.071 / +0.087) |
+| 480 area vs 4K | 356 | 66 | 102 | 84.4 % | 77.7 % | +0.006 (-0.101 / +0.088) |
+| 480 h265 vs 4K | 361 | 61 | 108 | 85.6 % | 77.0 % | +0.009 (-0.088 / +0.087) |
+| 480 area vs 640 area | 420 | 35 | 38 | 92.3 % | 91.7 % | +0.002 (-0.053 / +0.046) |
+| 480 h265 vs 640 h265 | 405 | 47 | 64 | 89.6 % | 86.4 % | -0.000 (-0.063 / +0.053) |
+
+Presence (what opens an AI event: any person >= 0.35 in the frame / clip):
+
+| Variant | frames both / only 4K / only low-res | clips both / only 4K / only low-res / neither |
+|---|---|---|
+| 640 area | 265 / 13 / 0 | 12 / 1 / 0 / 7 |
+| 640 h265 | 265 / 13 / 0 | 12 / 1 / 0 / 7 |
+| 480 area | 265 / 13 / 0 | 12 / 1 / 0 / 7 |
+| 480 h265 | 266 / 12 / 4 | 12 / 1 / **3** / 4 |
+
+Box presence at any confidence (the first run's metric): 99.5 % for 640
+and 480 area/h265, 99.8 % for 480 h265.
+
+Findings:
+
+* 480x270 recall vs 4K is the same as 640x360 (85.6 vs 85.8 % box-level,
+  identical frame/clip presence); misses are threshold/box jitter of
+  persons 4K itself sees at 0.35-0.65 (e.g. a 914x1232 px person: 4K
+  0.48-0.65, 480 0.21-0.34), in both directions.
+* But the 480 H.265 proxy produced person detections in **3 clips where the
+  4K frame had none** (640: 0) -- possible extra (false) AI events -- and the
+  smallest persons disagree most at 480 (26x27 px and 40x85 px boxes at 480
+  among the 480-vs-640 misses).
+* Still no vehicles in either sample; small/distant persons are rare. The
+  real 480 substream is a different camera-side encode.
+* Also important for the approved 640 default: at the production threshold,
+  640x360 misses person presence in 13 of 278 person frames (4.7 %) and 1 of
+  13 person clips vs 4K on this sample (the first sample's 99.84 % was the
+  lenient box-presence metric, see the correction in 4.1).
+
+**Decision implemented:** recall does not drop materially, but precision
+(extra clips) and small objects are not validated, so the 480 path stays
+**behind `ANYAICAM_AI_ALLOW_480_SUBSTREAM` (default `false`)**: a camera whose
+only substream is 480-639 px wide is analysed from the main stream (decoded
+and scaled to 1280x720; ~0.43 core per 4K camera measured in 4.3) and logs
+`main_480_fallback_disabled`. Enable per appliance only after an on-appliance
+soak on such a camera. Every camera's choice (`substream_640`,
+`substream_480_fallback`, `main_480_fallback_disabled`,
+`main_no_usable_substream`) is logged by the AI reader and the probe,
+reported to the cloud (`cameras.measured_analytics_choice`), shown on the
+admin appliance cards and returned by `/api/ai/status`
+(`cameras[].frame_source`).
+
+### 4.7 Measured vs configured geometry, and where it is shown
+
+* `video_profile.stream_geometry()` takes a stream's numbers from exactly one
+  source: `measured` (ffprobe) or `configured` (ONVIF encoder settings only);
+  `Profile.measured` is true only for a measurement (`geometry_source` says
+  which). Configured values still pick the downscale-only boxes (safe), but
+  the probe status is `configured`, not `ok`.
+* Cloud: `cameras.measured_source` = `measured` | `configured`; a configured
+  report never replaces a measured one. Text everywhere comes from
+  `video_profile.display_video()`: "3840x2160 H265 20 fps (8MP)",
+  "... - configured (not yet measured)", or "Not yet measured" -- never the
+  plan's sales label (`cameras.resolution`, still written by onboarding and
+  the setup wizard, is not displayed as the camera's resolution).
+* Shown in: customer Live tiles, single-camera page, setup wizard (Step 5),
+  `GET /api/customer/cameras` (`video_resolution`, `video_display`,
+  `resolution_source`); partner customer detail page (Cameras table);
+  admin appliance cards on `/operations/rdm` and
+  `/partner/appliance-dashboard` ("Camera video" with the AI stream).
 
 ## 5. Deployment steps (when approved -- NOT done)
 
@@ -340,12 +439,13 @@ every 5 min, WebRTC viewer, HLS viewer + 10 open/close cycles), plus:
   vehicle can move out of the mapped box (15 % margin). Grabs only happen when
   LPR actually reads a vehicle (max 4 attempts per position) or PPE/face crop a
   person, cached 2.5 s, 60 s back-off on failure.
-* **Live view is now 1080p for 4K cameras** (`ANYAICAM_LIVE_SCALE=profile`).
-  At the 4 Mbps live cap this is sharper than 4K was, but it is a visible
-  product change; `full` restores 4K.
-* **Event clips are now 1080p** (4K before): smaller uploads/storage, but
-  less detail for zooming into an event clip. Manual exports stay full
-  resolution. Product decision to confirm.
+* **Live view and automatic event clips are 1080p for 4K cameras** (owner
+  approved). `ANYAICAM_LIVE_SCALE=full` / `ANYAICAM_EVENT_CLIP_SCALE=full`
+  restore 4K. Recordings and manual exports keep native resolution.
+* **Substream detection quality** (4.6): ~5 % of person frames and 1 of 13
+  person clips missed vs 4K at the production threshold in the proxy test;
+  the 480 px path additionally showed extra detections in 3 clips (hence
+  default off).
 * **auto live HLS needs the new agent:** without the marker the encoder
   stays always on (safe, no saving). An agent rolled back leaves the marker
   to go stale within 15 min, after which the VMS goes back to always on.
@@ -361,15 +461,19 @@ every 5 min, WebRTC viewer, HLS viewer + 10 open/close cycles), plus:
 * The working tree of the clone uses CRLF (core.autocrlf=true); all committed
   blobs are LF as in the repository.
 
-**Open questions (owner)**
+**Owner decisions (2026-10-11)** -- 1: 4K live HLS and automatic event
+clips default to 1080p (kept; native recordings unchanged). 2: manual /
+exported clips stay original resolution (kept). 3: 480 px fallback behind a
+flag, validated (4.6; default off). 4: measured video shown in customer,
+partner and admin views (4.7). 5: soak plan approved for planning (phase 1
+always-on HLS; phase 2 auto after phase 1 passes, with the compatible agent).
 
-1. Accept 1080p event clips and 1080p live HLS for 4K cameras by default?
-2. Should manual (customer-requested) clips also be scaled (`ANYAICAM_MANUAL_CLIP_SCALE=profile`)?
-3. Analytics stream minimum width is 640 (task spec); cameras whose only
-   substream is 352x240/480x270 fall back to decoding the MAIN stream for AI
-   (0.43 core per 4K camera measured). Lower the minimum to 480?
-4. Cloud UI: `measured_*` is stored and returned by `/api/customer/cameras`
-   and shown in the setup wizard; partner/admin camera pages still show the
-   plan label. Extend?
-5. Phase 2 of the soak (`ANYAICAM_LIVE_HLS_MODE` unset = auto) only after
-   phase 1 passes, and only with the matching appliance-agent installed.
+**Open questions**
+
+1. Substream AI misses ~5 % of person frames vs 4K at threshold 0.35 on the
+   second sample (4.6); consider a slightly lower YOLO threshold for
+   substream frames (e.g. 0.30) -- to be decided from the soak, not changed
+   here.
+2. Enable `ANYAICAM_AI_ALLOW_480_SUBSTREAM` for a specific appliance only
+   after a soak on a real 480 px substream camera (extra-event rate and
+   vehicles).
