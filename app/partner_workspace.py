@@ -18,6 +18,7 @@ from partner_db import audit, authorize_appliance_tenant, authorize_customer_ten
 from email_service import get_email_service
 from provisioning_service import get_provisioning_backend, ProvisioningBackendUnavailable
 import runtime_paths
+import video_profile
 
 CUSTOMERS_FILE = runtime_paths.recordings_path('partner_customers.json')
 ACCOUNT_FILE = runtime_paths.recordings_path('account_management.json')
@@ -770,7 +771,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # that single column is what distinguishes the two here, same
         # signal /api/customer/cameras already uses for its own configured
         # count.
-        camera_rows=''.join(f'<tr><td>{escape(c["name"])}</td><td><input class="setup-camera-name" data-id="{c["id"]}" value="{escape(c["name"],quote=True)}"></td><td><select class="setup-camera-site">'+''.join(f'<option value="{s["id"]}" {"selected" if s["id"]==c["site_id"] else ""}>{escape(s["name"])}</option>' for s in sites)+'</select></td><td>'+(f'<span class="pill">Licensed slot &middot; not yet discovered</span>' if not c.get('device_key') else escape(c.get('status') or 'pending'))+'</td></tr>' for c in cameras) or '<tr><td colspan="4">No cameras discovered or preconfigured yet.</td></tr>'
+        camera_rows=''.join(f'<tr><td>{escape(c["name"])}</td><td><input class="setup-camera-name" data-id="{c["id"]}" value="{escape(c["name"],quote=True)}"></td><td><select class="setup-camera-site">'+''.join(f'<option value="{s["id"]}" {"selected" if s["id"]==c["site_id"] else ""}>{escape(s["name"])}</option>' for s in sites)+'</select></td><td>'+(f'<span class="pill">Licensed slot &middot; not yet discovered</span>' if not c.get('device_key') else escape(c.get('status') or 'pending'))+'</td><td>'+escape(video_profile.display_resolution(c) or 'Not measured yet')+'</td></tr>' for c in cameras) or '<tr><td colspan="5">No cameras discovered or preconfigured yet.</td></tr>'
         # Self-service Cloud ID provisioning bridge (2026-09-12): precomputed
         # as its own variable, not inlined into the f-string below, purely to
         # avoid nesting a second triple-quoted string inside content's own
@@ -845,7 +846,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         <label>Cloud ID<input id="customer-cloud-id" name="cloud-id-not-email" placeholder="AIC-XXXXXXXX" autocomplete="off" data-lpignore="true" data-form-type="other"></label><label>Activation token<input id="customer-activation-token" type="password" name="activation-token-not-account-password" autocomplete="new-password" data-lpignore="true" data-form-type="other"></label><label>Or scan a provisioning QR image<input id="customer-qr-file" type="file" accept="image/*"></label><button class="action-button" id="link-customer-appliance">Link appliance</button><p id="link-message" class="health-detail"></p></div>
         <div class="customer-setup-step" data-step="3" hidden><h2>Appliance status</h2><select id="customer-appliance">{appliance_options}</select><div id="appliance-status" class="panel" style="margin-top:14px"></div></div>
         <div class="customer-setup-step" data-step="4" hidden><h2>Discover cameras</h2><p>The selected appliance performs discovery. This page only submits the job and displays its progress.</p><button class="action-button" id="start-camera-scan"{"" if selected_ready else " disabled"}>Request appliance scan</button>{"" if selected_ready else '<p class="health-detail" id="scan-not-ready">Camera discovery is available once this appliance has finished linking (see its status in step 3).</p>'}<div class="storage-bar"><span id="scan-progress" style="width:0%"></span></div><p id="scan-message" class="health-detail"></p><div id="scan-results"></div></div>
-        <div class="customer-setup-step" data-step="5" hidden><h2>Camera setup</h2><p class="health-detail" id="camera-progress"></p><div style="overflow:auto"><table class="data-table"><thead><tr><th>Camera</th><th>Rename</th><th>Location/site</th><th>Status</th></tr></thead><tbody>{camera_rows}</tbody></table></div><p class="health-detail">Recording, retention, analytics, and notifications use the selected customer plan. Per-camera overrides can be added after activation.</p><button class="ghost-button" id="save-camera-setup">Save camera setup</button></div>
+        <div class="customer-setup-step" data-step="5" hidden><h2>Camera setup</h2><p class="health-detail" id="camera-progress"></p><div style="overflow:auto"><table class="data-table"><thead><tr><th>Camera</th><th>Rename</th><th>Location/site</th><th>Status</th><th>Video (measured)</th></tr></thead><tbody>{camera_rows}</tbody></table></div><p class="health-detail">Recording, retention, analytics, and notifications use the selected customer plan. Per-camera overrides can be added after activation.</p><button class="ghost-button" id="save-camera-setup">Save camera setup</button></div>
         <div class="customer-setup-step" data-step="6" hidden><h2>Review your account</h2>
         <div id="customer-subscription-review" class="panel"><h3 style="margin-top:0">Licensing &amp; billing &middot; from Stripe</h3><p>Hardware: {hardware_summary}</p><p>Camera plan: {camera_plan_summary}</p><p>Analytics: {analytics_summary}</p><p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p><div id="camera-plan-purchase"{' hidden' if (camera_entitlement or v2_plan_active) else ''}><p class="health-detail">Choose Basic Local, AI Local or Hybrid and your camera count.</p><a class="action-button" href="/subscription-portal">Choose a camera plan</a></div>{friends_family_panel}
         <div class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local recording configuration</h3><p>{escape(str(plan.get('resolution','—')).upper())} &middot; {escape(str(plan.get('recording_mode','—')))} &middot; retention up to {plan.get('retention_days','—')} days</p><p class="health-detail">Recording length depends on your appliance's available storage, not a separate charge -- this is a configuration setting, not a purchased product.</p></div></div>
@@ -1393,10 +1394,16 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         if appliance_id:
             appliance=row('SELECT id FROM appliances WHERE id=? AND customer_id=?',(appliance_id,identity['customer_id']))
             if not appliance: raise HTTPException(status_code=404,detail='Appliance not found.')
-            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? AND appliance_id=? AND status!='removed' ORDER BY created_at",(identity['customer_id'],appliance_id))
+            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at,measured_width,measured_height,measured_codec,measured_fps,measured_resolution_class,measured_video_at FROM cameras WHERE customer_id=? AND appliance_id=? AND status!='removed' ORDER BY created_at",(identity['customer_id'],appliance_id))
         else:
-            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? AND status!='removed' ORDER BY created_at",(identity['customer_id'],))
+            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at,measured_width,measured_height,measured_codec,measured_fps,measured_resolution_class,measured_video_at FROM cameras WHERE customer_id=? AND status!='removed' ORDER BY created_at",(identity['customer_id'],))
         for camera in cameras: camera['credentials_configured']=bool(row('SELECT 1 FROM camera_credentials WHERE camera_id=?',(camera['id'],)))
+        # Measured video (2026-10-11, video_profile.py): "resolution" stays the
+        # plan's sales label for compatibility; video_resolution is what the
+        # appliance actually measured on the camera (None until it has).
+        for camera in cameras:
+            camera['video_resolution']=video_profile.display_resolution(camera)
+            camera['resolution_source']='measured' if camera['video_resolution'] else 'plan_label'
         # Provisioning audit fix: this used to read plans.camera_quantity --
         # a legacy, partner-quoted, per-camera-subscription estimate that
         # predates the Local/Hybrid camera-slot architecture and is never

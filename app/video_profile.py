@@ -345,3 +345,19 @@ def scale_box(x, y, w, h, factor: float) -> tuple[int, int, int, int]:
     if factor >= 1.0:
         return int(x), int(y), int(w), int(h)
     return int(round(x * factor)), int(round(y * factor)), max(1, int(round(w * factor))), max(1, int(round(h * factor)))
+
+
+def display_resolution(camera: dict) -> Optional[str]:
+    """Customer-facing text for a cameras row's MEASURED video, e.g.
+    "3840x2160 H265 (8MP)", or None when the appliance has not measured
+    it yet (the caller then shows "not measured yet" -- never the plan's
+    sales label as if it were the camera's real resolution)."""
+    if not isinstance(camera, dict):
+        return None
+    width, height = _positive(camera.get("measured_width")), _positive(camera.get("measured_height"))
+    if not width or not height:
+        return None
+    codec = camera.get("measured_codec")
+    klass = camera.get("measured_resolution_class") or resolution_class(width, height)
+    label = {"2mp": "2MP", "4mp": "4MP", "5mp": "5MP", "8mp": "8MP"}.get(klass, f"{width * height / 1e6:.1f}MP")
+    return f"{width}x{height}{' ' + str(codec) if codec else ''} ({label})"
