@@ -239,9 +239,187 @@ VMS_CONTAINER="${ANYAICAM_VMS_CONTAINER:-anyaicam-vms}"
 VMS_DATABASE_NAME="partner_portal.db"
 PREPARED_VMS_IMAGE_TAG=""
 
+# ---------------------------------------------------------------- preloaded VMS image
+# (2026-10-11) A release built with build_release_installer.py
+# --preload-vms-image carries the VMS image already built from exactly this
+# payload (images/anyaicam-vms-<commit12>.tar.zst|.tar.gz) and records it in
+# release.env: archive SHA-256 and size, image ID and config digest, payload
+# digest, platform. release.env and the archive are both listed in
+# artifact-files.json, which verify_installer_payload checked before anything
+# changed (and, for Software Update, the signed manifest covers the whole
+# package). The appliance then only runs `docker load` -- no CPU-heavy build,
+# no package or model downloads -- but only after every check below passes:
+#   - the archive is a regular file inside this installer folder;
+#   - the staged build context has the payload digest the image was built from;
+#   - enough free space for a root-only copy of the archive and the load;
+#   - the root-only copy has the recorded SHA-256 (checked BEFORE loading, so
+#     an archive swapped after the start-up check is never loaded);
+#   - the loaded image has the recorded ID and the release's labels.
+# Anything else is logged and the existing `docker build` path runs instead:
+# an unverified image is never tagged for use. ANYAICAM_VMS_PRELOAD=0 skips
+# the preloaded image. Everything here still runs before downtime.
+VMS_PRELOAD_LABEL_COMMIT="com.anyaicam.vms.release-commit"
+VMS_PRELOAD_LABEL_PAYLOAD="com.anyaicam.vms.payload-sha256"
+VMS_PRELOAD_MARGIN_BYTES=$(( 1024 * 1024 * 1024 ))
+
+# Prints the payload digest of a staged VMS build context. Byte-for-byte the
+# same definition as build_release_installer.py vms_payload_digest().
+vms_payload_digest() {
+    python3 - "$1" <<'PYEOF'
+import hashlib, os, sys
+root = sys.argv[1]
+rows = []
+for directory, dirs, files in os.walk(root):
+    for name in dirs + files:
+        path = os.path.join(directory, name)
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        if os.path.islink(path):
+            sys.exit(f"symlink in the staged VMS payload: {rel}")
+        if name in files and os.path.isfile(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            rows.append((rel.encode("utf-8"), digest.hexdigest()))
+rows.sort()
+total = hashlib.sha256()
+for rel, digest in rows:
+    total.update(digest.encode("ascii") + b"  " + rel + b"\n")
+print(total.hexdigest())
+PYEOF
+}
+
+_vms_free_bytes() {
+    df --output=avail -B1 "$1" 2>/dev/null | tail -n 1 | tr -d ' '
+}
+
+_vms_preload_reject() {
+    log "Preloaded VMS image not used: $* -- building the image on this machine instead."
+    return 1
+}
+
+# $1 = staged build context (root-only), $2 = staging root, $3 = release tag.
+# Returns 0 only when $3 now names the verified preloaded image.
+load_preloaded_vms_image() {
+    local staged="$1" staging_root="$2" image_tag="$3"
+    local short="${VMS_RELEASE_COMMIT:0:12}" tar_rel tar_path bundle_root real_tar
+    local load_timeout copy_dir copy sha actual_payload loaded_id label_commit label_payload
+    local need_staging need_docker docker_root free_staging free_docker arch expected_platform
+
+    if [[ "${ANYAICAM_VMS_PRELOAD:-1}" == "0" ]]; then
+        log "ANYAICAM_VMS_PRELOAD=0: not using a preloaded VMS image."
+        return 1
+    fi
+    tar_rel="${VMS_PRELOAD_IMAGE_FILE:-}"
+    if [[ -z "$tar_rel" && -z "${ANYAICAM_VMS_IMAGE_TAR:-}" ]]; then
+        return 1   # this release ships no preloaded image: build as before
+    fi
+    log "Checking the preloaded VMS image shipped with this release ..."
+    # The recorded metadata (release.env, verified at start-up) must be complete.
+    [[ "$tar_rel" =~ ^images/anyaicam-vms-[0-9a-f]{12}\.tar\.(zst|gz)$ && "$tar_rel" == "images/anyaicam-vms-$short."* ]] \
+        || { _vms_preload_reject "the release does not record a valid preloaded image for $short"; return 1; }
+    [[ "${VMS_PRELOAD_IMAGE_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { _vms_preload_reject "no valid recorded archive SHA-256"; return 1; }
+    [[ "${VMS_PRELOAD_IMAGE_PAYLOAD_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { _vms_preload_reject "no valid recorded payload digest"; return 1; }
+    [[ "${VMS_PRELOAD_IMAGE_ID:-}" =~ ^sha256:[0-9a-f]{64}$ && "${VMS_PRELOAD_IMAGE_CONFIG_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || { _vms_preload_reject "no valid recorded image ID"; return 1; }
+    [[ "${VMS_PRELOAD_IMAGE_BYTES:-}" =~ ^[1-9][0-9]{0,14}$ && "${VMS_PRELOAD_IMAGE_UNPACKED_BYTES:-}" =~ ^[1-9][0-9]{0,14}$ ]] \
+        || { _vms_preload_reject "no valid recorded archive size"; return 1; }
+    [[ "${VMS_PRELOAD_IMAGE_REF:-}" == "anyaicam-vms-preload:$short" ]] || { _vms_preload_reject "unexpected recorded image name"; return 1; }
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64) expected_platform="linux/amd64" ;;
+        aarch64) expected_platform="linux/arm64" ;;
+        *) expected_platform="unknown" ;;
+    esac
+    [[ "${VMS_PRELOAD_IMAGE_PLATFORM:-}" == "$expected_platform" ]] \
+        || { _vms_preload_reject "it was built for ${VMS_PRELOAD_IMAGE_PLATFORM:-an unknown platform}, this machine is $arch"; return 1; }
+
+    # Only a file inside this verified installer folder is ever considered.
+    [[ -n "${INSTALLER_DIR:-}" ]] || { _vms_preload_reject "the installer folder is unknown"; return 1; }
+    bundle_root="$(realpath -e -- "$INSTALLER_DIR" 2>/dev/null)" || { _vms_preload_reject "the installer folder cannot be resolved"; return 1; }
+    tar_path="${ANYAICAM_VMS_IMAGE_TAR:-$INSTALLER_DIR/$tar_rel}"
+    if [[ ! -e "$tar_path" ]]; then
+        _vms_preload_reject "the image archive $tar_path is missing"; return 1
+    fi
+    if [[ -L "$tar_path" || ! -f "$tar_path" ]]; then
+        _vms_preload_reject "$tar_path is not a regular file"; return 1
+    fi
+    real_tar="$(realpath -e -- "$tar_path" 2>/dev/null)" || { _vms_preload_reject "$tar_path cannot be resolved"; return 1; }
+    [[ "$real_tar" == "$bundle_root/"* ]] || { _vms_preload_reject "$tar_path is outside the verified installer folder $bundle_root"; return 1; }
+    [[ "$(stat -c %s -- "$real_tar")" == "$VMS_PRELOAD_IMAGE_BYTES" ]] || { _vms_preload_reject "the image archive has the wrong size"; return 1; }
+
+    # The image must have been built from exactly the context staged here.
+    actual_payload="$(vms_payload_digest "$staged")" || { _vms_preload_reject "the staged payload digest could not be computed"; return 1; }
+    [[ "$actual_payload" == "$VMS_PRELOAD_IMAGE_PAYLOAD_SHA256" ]] \
+        || { _vms_preload_reject "the staged VMS payload ($actual_payload) is not the one the image was built from"; return 1; }
+
+    # Space: a root-only copy of the archive, plus the unpacked layers twice
+    # (content store + extracted snapshot), plus a margin.
+    docker_root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)"
+    [[ -n "$docker_root" && -d "$docker_root" ]] || docker_root=/var/lib/docker
+    [[ -d "$docker_root" ]] || docker_root=/var/lib
+    need_staging=$(( VMS_PRELOAD_IMAGE_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
+    need_docker=$(( 2 * VMS_PRELOAD_IMAGE_UNPACKED_BYTES + VMS_PRELOAD_MARGIN_BYTES ))
+    free_staging="$(_vms_free_bytes "$staging_root")"
+    free_docker="$(_vms_free_bytes "$docker_root")"
+    [[ "$free_staging" =~ ^[0-9]+$ && "$free_docker" =~ ^[0-9]+$ ]] || { _vms_preload_reject "free disk space could not be determined"; return 1; }
+    if [[ "$(stat -c %d -- "$staging_root")" == "$(stat -c %d -- "$docker_root")" ]]; then
+        need_staging=$(( need_staging + need_docker )); need_docker=0
+    fi
+    if (( free_staging < need_staging || free_docker < need_docker )); then
+        _vms_preload_reject "not enough free disk space to load it (need $(( need_staging / 1048576 )) MiB at $staging_root and $(( need_docker / 1048576 )) MiB at $docker_root; free $(( free_staging / 1048576 )) / $(( free_docker / 1048576 )) MiB)"
+        return 1
+    fi
+
+    # Verify a root-only copy, then load exactly that copy.
+    copy_dir="$(mktemp -d "$staging_root/image.XXXXXXXX")" || { _vms_preload_reject "no staging space for the archive"; return 1; }
+    chmod 0700 "$copy_dir" || { rm -rf -- "$copy_dir"; _vms_preload_reject "could not secure the archive staging folder"; return 1; }
+    copy="$copy_dir/${tar_rel##*/}"
+    if ! cp -- "$real_tar" "$copy"; then
+        rm -rf -- "$copy_dir"; _vms_preload_reject "could not copy the image archive"; return 1
+    fi
+    sha="$(sha256sum -- "$copy" | awk '{print $1}')"
+    if [[ "$sha" != "$VMS_PRELOAD_IMAGE_SHA256" ]]; then
+        rm -rf -- "$copy_dir"
+        _vms_preload_reject "the image archive SHA-256 ($sha) does not match the release ($VMS_PRELOAD_IMAGE_SHA256); it was NOT loaded"
+        return 1
+    fi
+    load_timeout="${ANYAICAM_VMS_LOAD_TIMEOUT:-1800}"
+    [[ "$load_timeout" =~ ^[1-9][0-9]*$ ]] || load_timeout=1800
+    log "Loading the verified preloaded VMS image ($(( VMS_PRELOAD_IMAGE_BYTES / 1048576 )) MiB, timeout ${load_timeout}s) ..."
+    if ! timeout --kill-after=30s "${load_timeout}s" docker load -q -i "$copy"; then
+        rm -rf -- "$copy_dir"
+        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_reject "docker load failed"; return 1
+    fi
+    rm -rf -- "$copy_dir" || log "WARNING: could not remove the temporary image archive copy in $copy_dir."
+
+    loaded_id="$(docker image inspect -f '{{.Id}}' "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
+    label_commit="$(docker image inspect -f "{{index .Config.Labels \"$VMS_PRELOAD_LABEL_COMMIT\"}}" "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
+    label_payload="$(docker image inspect -f "{{index .Config.Labels \"$VMS_PRELOAD_LABEL_PAYLOAD\"}}" "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
+    if [[ -z "$loaded_id" || ( "$loaded_id" != "$VMS_PRELOAD_IMAGE_ID" && "$loaded_id" != "$VMS_PRELOAD_IMAGE_CONFIG_DIGEST" ) ]]; then
+        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_reject "the loaded image ID (${loaded_id:-none}) is not the release's ($VMS_PRELOAD_IMAGE_ID)"; return 1
+    fi
+    if [[ "$label_commit" != "$VMS_RELEASE_COMMIT" || "$label_payload" != "$VMS_PRELOAD_IMAGE_PAYLOAD_SHA256" ]]; then
+        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_reject "the loaded image's labels (commit ${label_commit:-none}, payload ${label_payload:-none}) do not match this release"; return 1
+    fi
+    # Tag by the verified ID, never by a name something else could move.
+    if ! docker tag "$loaded_id" "$image_tag" || [[ "$(docker image inspect -f '{{.Id}}' "$image_tag" 2>/dev/null)" != "$loaded_id" ]]; then
+        docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
+        _vms_preload_reject "could not tag the verified image as $image_tag"; return 1
+    fi
+    docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true   # untag only; $image_tag keeps it
+    log "Verified preloaded VMS image $loaded_id loaded as $image_tag (no image build needed)."
+    return 0
+}
+
 # Build from a root-only copy of the verified release payload before changing
 # any live VMS files or rollback metadata. The image build downloads OS/Python
 # packages and model assets, so it must complete while the current VMS is up.
+# When the release ships a verified preloaded image (load_preloaded_vms_image
+# above), that image is loaded instead and no build runs.
 prepare_vms_image() {
     local build_timeout staging_root staging_dir image_tag build_status
     build_timeout="${ANYAICAM_VMS_BUILD_TIMEOUT:-5400}"
@@ -281,6 +459,15 @@ prepare_vms_image() {
         rm -rf -- "$staging_dir"
         echo "[ERROR] Could not stage the verified VMS release; the running VMS was not changed." >&2
         return 1
+    fi
+
+    if load_preloaded_vms_image "$staging_dir" "$staging_root" "$image_tag"; then
+        rm -rf -- "$staging_dir" || {
+            echo "[ERROR] Could not remove the temporary VMS build context: $staging_dir" >&2
+            return 1
+        }
+        PREPARED_VMS_IMAGE_TAG="$image_tag"
+        return 0
     fi
 
     log "Preparing the VMS image before downtime (timeout ${build_timeout}s, tag $image_tag) ..."

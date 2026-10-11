@@ -410,6 +410,149 @@ def write_deterministic_tar(source: Path, output: Path, mtime: int, executable_p
                         tf.addfile(info)
 
 
+# ---------------------------------------------------------------- preloaded VMS image
+# (2026-10-11) Optional: build the VMS image once on the release machine from
+# exactly the payload the installer would stage, so an appliance only runs
+# `docker load` instead of a CPU-heavy `docker build` that downloads OS/Python
+# packages and model assets (Orange acceptance finding N1; the target Ryzen
+# 5 3500U already runs near 90 C). The image archive ships inside the
+# installer package at images/, so artifact-files.json (and, for Software
+# Update, the signed manifest's package SHA-256) covers it like every other
+# file; release.env/release-manifest.json record what 06-deploy-vms.sh must
+# verify before it trusts the archive. There is no separate trust path.
+PRELOAD_IMAGE_REPOSITORY = "anyaicam-vms-preload"
+PRELOAD_LABEL_COMMIT = "com.anyaicam.vms.release-commit"
+PRELOAD_LABEL_PAYLOAD = "com.anyaicam.vms.payload-sha256"
+PRELOAD_LABEL_VERSION = "com.anyaicam.vms.release-version"
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def vms_payload_digest(root: Path) -> str:
+    """SHA-256 identifying a VMS build context: one "<sha256>  <path>\n" line
+    per regular file, sorted by POSIX path (byte order). 06-deploy-vms.sh
+    computes the same value over the copy it stages (tests keep the two
+    implementations identical). Symlinks are refused: never part of a payload."""
+    lines = []
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise SystemExit(f"Symlink in VMS build context: {path.relative_to(root).as_posix()}")
+        if path.is_file():
+            lines.append((path.relative_to(root).as_posix().encode("utf-8"), sha256_file(path)))
+    lines.sort()
+    h = hashlib.sha256()
+    for rel, digest in lines:
+        h.update(digest.encode("ascii") + b"  " + rel + b"\n")
+    return h.hexdigest()
+
+
+def _zstd_compressor():
+    """('cli', path) for the zstd command, ('module', module) for Python's
+    compression.zstd (3.14+), or None."""
+    cli = shutil.which("zstd")
+    if cli:
+        return ("cli", cli)
+    try:
+        from compression import zstd  # type: ignore[import-not-found]
+        return ("module", zstd)
+    except ImportError:
+        return None
+
+
+def _compress_image_archive(raw: Path, output: Path, compression: str) -> None:
+    if compression == "gzip":
+        with raw.open("rb") as src, output.open("wb") as out_raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=out_raw, mtime=0, compresslevel=6) as gz:
+                shutil.copyfileobj(src, gz, 4 * 1024 * 1024)
+        return
+    kind, tool = _zstd_compressor() or (None, None)
+    if kind == "cli":
+        subprocess.run([tool, "-q", "-T0", "-10", "-f", "-o", str(output), str(raw)], check=True)
+    elif kind == "module":
+        with raw.open("rb") as src, tool.open(output, "wb", level=10) as out:
+            shutil.copyfileobj(src, out, 4 * 1024 * 1024)
+    else:
+        raise SystemExit("zstd compression requested but neither the zstd command nor Python's compression.zstd exists.")
+
+
+def read_saved_image_digests(raw: Path) -> tuple[str, str, list[str]]:
+    """(top-level OCI index digest or "", image config digest, RepoTags) of a
+    single-image `docker save` archive. Exactly one image is accepted."""
+    manifest = index = None
+    with tarfile.open(raw, "r:") as tf:
+        for member in tf:
+            if member.name in ("manifest.json", "./manifest.json") and member.isfile():
+                manifest = json.load(tf.extractfile(member))
+            elif member.name in ("index.json", "./index.json") and member.isfile():
+                index = json.load(tf.extractfile(member))
+    if not isinstance(manifest, list) or len(manifest) != 1:
+        raise SystemExit("docker save produced an archive that is not exactly one image (manifest.json).")
+    config = str(manifest[0].get("Config", ""))
+    match = re.fullmatch(r"(?:blobs/sha256/([0-9a-f]{64}))|(?:([0-9a-f]{64})\.json)", config)
+    if not match:
+        raise SystemExit(f"Unrecognized image config reference in the saved image: {config!r}")
+    config_digest = "sha256:" + (match.group(1) or match.group(2))
+    index_digest = ""
+    if isinstance(index, dict) and len(index.get("manifests") or []) == 1:
+        candidate = str(index["manifests"][0].get("digest", ""))
+        if DIGEST_RE.fullmatch(candidate):
+            index_digest = candidate
+    return index_digest, config_digest, list(manifest[0].get("RepoTags") or [])
+
+
+def build_preloaded_vms_image(*, docker: str, context: Path, images_dir: Path, scratch: Path, vms_commit: str,
+                              release_version: str, platform: str, compression: str, no_cache: bool) -> dict:
+    """Builds, saves and compresses the VMS image from `context` (the final
+    payload/vms). Returns the release.env fields describing it."""
+    if compression == "auto":
+        compression = "zstd" if _zstd_compressor() else "gzip"
+    if compression not in ("zstd", "gzip"):
+        raise SystemExit(f"Unsupported image compression: {compression}")
+    payload_sha = vms_payload_digest(context)
+    ref = f"{PRELOAD_IMAGE_REPOSITORY}:{vms_commit[:12]}"
+    build = [docker, "build", "--platform", platform, "--provenance=false",
+             "--label", f"{PRELOAD_LABEL_COMMIT}={vms_commit}",
+             "--label", f"{PRELOAD_LABEL_PAYLOAD}={payload_sha}",
+             "--label", f"{PRELOAD_LABEL_VERSION}={release_version}",
+             "-t", ref]
+    if no_cache:
+        build.append("--no-cache")
+    subprocess.run(build + [str(context)], check=True)
+    if vms_payload_digest(context) != payload_sha:
+        raise SystemExit("The VMS payload changed while its image was being built.")
+    built_id = subprocess.run([docker, "image", "inspect", "-f", "{{.Id}}", ref], check=True,
+                              stdout=subprocess.PIPE, text=True).stdout.strip()
+    labels = json.loads(subprocess.run([docker, "image", "inspect", "-f", "{{json .Config.Labels}}", ref],
+                                       check=True, stdout=subprocess.PIPE, text=True).stdout or "{}") or {}
+    if labels.get(PRELOAD_LABEL_COMMIT) != vms_commit or labels.get(PRELOAD_LABEL_PAYLOAD) != payload_sha:
+        raise SystemExit("The built VMS image does not carry the expected release labels.")
+    raw = scratch / "vms-image.tar"
+    subprocess.run([docker, "save", "-o", str(raw), ref], check=True)
+    index_digest, config_digest, repo_tags = read_saved_image_digests(raw)
+    if repo_tags != [ref]:
+        raise SystemExit(f"The saved VMS image carries unexpected tags: {repo_tags}")
+    if built_id not in (index_digest, config_digest):
+        raise SystemExit(f"The saved VMS image ({index_digest or config_digest}) is not the image just built ({built_id}).")
+    image_id = index_digest or config_digest
+    suffix = ".tar.zst" if compression == "zstd" else ".tar.gz"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    output = images_dir / f"anyaicam-vms-{vms_commit[:12]}{suffix}"
+    _compress_image_archive(raw, output, compression)
+    unpacked = raw.stat().st_size
+    raw.unlink()
+    return {
+        "VMS_PRELOAD_IMAGE_FILE": output.relative_to(images_dir.parent).as_posix(),
+        "VMS_PRELOAD_IMAGE_SHA256": sha256_file(output),
+        "VMS_PRELOAD_IMAGE_BYTES": str(output.stat().st_size),
+        "VMS_PRELOAD_IMAGE_UNPACKED_BYTES": str(unpacked),
+        "VMS_PRELOAD_IMAGE_COMPRESSION": compression,
+        "VMS_PRELOAD_IMAGE_REF": ref,
+        "VMS_PRELOAD_IMAGE_ID": image_id,
+        "VMS_PRELOAD_IMAGE_CONFIG_DIGEST": config_digest,
+        "VMS_PRELOAD_IMAGE_PAYLOAD_SHA256": payload_sha,
+        "VMS_PRELOAD_IMAGE_PLATFORM": platform,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--vms-commit", required=True, help="Exact approved 40-character VMS commit")
@@ -463,6 +606,17 @@ def main() -> int:
     parser.add_argument("--no-entitlement-signing-keys", action="store_true",
                         help="Explicitly build an installer that provisions no entitlement keyset: a fresh install "
                              "denies every paid feature until a release that carries one is installed.")
+    parser.add_argument("--preload-vms-image", action="store_true",
+                        help="Also build the VMS image from exactly this release's payload and ship it (docker save, "
+                             "compressed) inside the installer, recorded in release.env/release-manifest.json and "
+                             "artifact-files.json. Appliances verify it and run `docker load` instead of `docker "
+                             "build`; any mismatch falls back to building. Requires Docker on the build machine.")
+    parser.add_argument("--vms-image-platform", default="linux/amd64", choices=("linux/amd64", "linux/arm64"),
+                        help="Target platform of the preloaded image (default linux/amd64)")
+    parser.add_argument("--vms-image-compression", default="auto", choices=("auto", "zstd", "gzip"),
+                        help="auto = zstd when available (zstd command or Python 3.14+), otherwise gzip")
+    parser.add_argument("--vms-image-no-cache", action="store_true", help="Build the preloaded image with --no-cache")
+    parser.add_argument("--docker", default="docker", help="Docker CLI used for --preload-vms-image")
     parser.add_argument("--output-dir", default="dist")
     args = parser.parse_args()
 
@@ -573,6 +727,15 @@ def main() -> int:
         identity_path.write_text(json.dumps({"product": "AnyAiCam VMS", "version": release_version,
                                              "build_id": vms_commit}, sort_keys=True) + "\n",
                                  encoding="utf-8", newline="\n")
+        # payload/vms is final from here on: the preloaded image is built from
+        # exactly this directory, the context 06-deploy-vms.sh would stage.
+        preload: dict[str, str] = {}
+        if args.preload_vms_image:
+            preload = build_preloaded_vms_image(
+                docker=args.docker, context=package / "payload/vms", images_dir=package / "images",
+                scratch=temp, vms_commit=vms_commit, release_version=release_version,
+                platform=args.vms_image_platform, compression=args.vms_image_compression,
+                no_cache=args.vms_image_no_cache)
         update_key_sha256 = ""
         if update_key_bytes:
             key_dest = package / "payload/keys/update-signing-public-key.pem"
@@ -637,6 +800,7 @@ def main() -> int:
             f"UPDATE_SIGNING_KEY_SHA256={update_key_sha256}\n"
             f"ENTITLEMENT_SIGNING_KEYS_SHA256={entitlement_keys_sha256}\n"
         )
+        release_env += "".join(f"{key}={value}\n" for key, value in preload.items())
         (package / "release.env").write_text(release_env, encoding="utf-8", newline="\n")
 
         scan_payload_for_secrets(package / "payload")
@@ -660,6 +824,10 @@ def main() -> int:
             "mediamtx_included": mediamtx_included,
             "mediamtx_sha256": mediamtx_sha256_value,
         }
+        if preload:
+            # Absent when the release ships no preloaded image (appliances build it).
+            manifest["vms_preloaded_image"] = {key[len("VMS_PRELOAD_IMAGE_"):].lower(): value
+                                               for key, value in preload.items()}
         (package / "release-manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
         )
@@ -701,6 +869,8 @@ def main() -> int:
         print(f"mediamtx_included={'true' if mediamtx_included else 'false'}")
         if mediamtx_included:
             print(f"mediamtx_sha256={mediamtx_sha256_value}")
+        for key, value in preload.items():
+            print(f"{key.lower()}={value}")
         return 0
 
 

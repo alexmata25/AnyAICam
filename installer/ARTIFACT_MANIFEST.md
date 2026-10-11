@@ -43,6 +43,45 @@ A built artifact contains:
 Runtime install does not read `app/`, Dockerfiles, compose, requirements, agent
 code, or service files from a surrounding repository checkout.
 
+## Optional preloaded VMS image (`--preload-vms-image`, 2026-10-11)
+
+By default the appliance builds the VMS image itself (`docker build` in
+`06-deploy-vms.sh` `prepare_vms_image`, before downtime): CPU-heavy, and it
+downloads OS/Python packages and model assets (Orange finding N1). A release
+built with `--preload-vms-image` instead ships that image already built:
+
+- built on the release machine from exactly `payload/vms` -- the context the
+  installer would stage -- with labels `com.anyaicam.vms.release-commit`
+  (= `VMS_RELEASE_COMMIT`), `com.anyaicam.vms.payload-sha256` (payload digest:
+  SHA-256 over sorted `"<sha256>  <path>
+"` lines of every payload file) and
+  `com.anyaicam.vms.release-version`; `--platform` defaults to `linux/amd64`;
+- `docker save`d as `anyaicam-vms-preload:<commit12>` and compressed to
+  `images/anyaicam-vms-<commit12>.tar.zst` (zstd when the `zstd` command or
+  Python 3.14+ is available, otherwise `.tar.gz`; `--vms-image-compression`);
+- recorded in `release.env` (`VMS_PRELOAD_IMAGE_FILE`, `_SHA256`, `_BYTES`,
+  `_UNPACKED_BYTES`, `_COMPRESSION`, `_REF`, `_ID` (image ID as the builder's
+  Docker reports it), `_CONFIG_DIGEST`, `_PAYLOAD_SHA256`, `_PLATFORM`) and in
+  `release-manifest.json` under `vms_preloaded_image`.
+
+Trust: the archive and `release.env` are both listed in `artifact-files.json`,
+which `verify_installer_payload` checks before anything changes; for Software
+Update the signed manifest's package SHA-256 covers the whole installer. No
+new key or unsigned path. The installer additionally, before downtime:
+checks metadata/platform, that the archive is a regular file inside the
+installer folder (`ANYAICAM_VMS_IMAGE_TAR` may name another file, but only
+inside it), that the staged payload has the recorded payload digest, and free
+space (archive copy + 2x unpacked + 1 GiB); copies the archive to a root-only
+staging folder and checks that copy's SHA-256 BEFORE `docker load`; after
+loading, checks the image ID (equal to `_ID` or `_CONFIG_DIGEST`: Docker's
+containerd image store reports the OCI index digest, the classic store the
+config digest) and both labels; then tags the verified ID as
+`anyaicam-vms:release-<commit12>` and skips `docker build`. Any failure is
+logged ("Preloaded VMS image not used: ...") and the normal build runs; a
+failed check never tags the image for use. `ANYAICAM_VMS_PRELOAD=0` forces the
+build. Rollback points and Software Update's own build (apply_release.py) are
+unchanged. The archive makes the installer roughly 1 GB larger.
+
 ## Preserved state
 
 Default reinstall/repair and uninstall preserve:

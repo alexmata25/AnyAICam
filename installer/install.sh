@@ -48,6 +48,20 @@ UPDATE_SIGNING_KEY_SHA256=""
 # Paid-feature entitlements (2026-10-05): SHA-256 of the packaged
 # entitlement-signing PUBLIC keyset (empty = none).
 ENTITLEMENT_SIGNING_KEYS_SHA256=""
+# Preloaded VMS image (2026-10-11, build_release_installer.py
+# --preload-vms-image): empty unless this release's release.env records one.
+# Reset here so nothing but the verified release.env can supply them;
+# 06-deploy-vms.sh load_preloaded_vms_image() validates every value.
+VMS_PRELOAD_IMAGE_FILE=""
+VMS_PRELOAD_IMAGE_SHA256=""
+VMS_PRELOAD_IMAGE_BYTES=""
+VMS_PRELOAD_IMAGE_UNPACKED_BYTES=""
+VMS_PRELOAD_IMAGE_COMPRESSION=""
+VMS_PRELOAD_IMAGE_REF=""
+VMS_PRELOAD_IMAGE_ID=""
+VMS_PRELOAD_IMAGE_CONFIG_DIGEST=""
+VMS_PRELOAD_IMAGE_PAYLOAD_SHA256=""
+VMS_PRELOAD_IMAGE_PLATFORM=""
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
