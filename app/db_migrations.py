@@ -1913,6 +1913,17 @@ def apply_migrations():
         camera_columns_now=_columns('cameras')
         if camera_columns_now and 'former_camera_number' not in camera_columns_now:
             db.execute('ALTER TABLE cameras ADD COLUMN former_camera_number INTEGER')
+        # Measured stream geometry (2026-10-11, video_profile.py /
+        # camera_video_probe.py): what the appliance measured on the camera's
+        # main and analytics streams, reported with the camera status.
+        # cameras.resolution stays the plan's sales label; these columns are
+        # NULL until a probe succeeds. Additive.
+        for column, kind in (('measured_width', 'INTEGER'), ('measured_height', 'INTEGER'), ('measured_codec', 'TEXT'),
+                             ('measured_fps', 'REAL'), ('measured_sub_width', 'INTEGER'), ('measured_sub_height', 'INTEGER'),
+                             ('measured_sub_codec', 'TEXT'), ('measured_resolution_class', 'TEXT'), ('measured_shape', 'TEXT'),
+                             ('measured_video_at', 'TEXT')):
+            if camera_columns_now and column not in camera_columns_now:
+                db.execute(f'ALTER TABLE cameras ADD COLUMN {column} {kind}')
         provisioning_columns=_columns('camera_provisioning_requests')
         if provisioning_columns and 'failure_code' not in provisioning_columns:  # only where the table exists
             db.execute('ALTER TABLE camera_provisioning_requests ADD COLUMN failure_code TEXT')

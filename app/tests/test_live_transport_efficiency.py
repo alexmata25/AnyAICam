@@ -39,10 +39,26 @@ def test_the_live_encode_is_bitrate_capped_by_default(captured_command, monkeypa
 
 
 def test_the_cap_keeps_native_resolution_and_the_existing_encode_settings(captured_command, monkeypatch):
+    # video-pipeline (2026-10-11): ANYAICAM_LIVE_SCALE=full keeps the previous
+    # native-resolution encode exactly (analytics no longer read these frames
+    # by default -- see video_profile.py and the next test).
     monkeypatch.setattr(main, "LIVE_MAX_BITRATE_KBPS", 4000)
+    monkeypatch.setattr(main, "LIVE_SCALE_MODE", "full")
     main.start_live_stream(1)
     command = captured_command()
-    assert "-vf" not in command and "-s" not in command  # no downscale: analytics read these frames
+    assert "-vf" not in command and "-s" not in command
+    for setting in ("libx264", "veryfast", "zerolatency", "-hls_time"):
+        assert setting in command
+
+
+def test_the_default_profile_scale_only_ever_downscales(captured_command, monkeypatch):
+    monkeypatch.setattr(main, "LIVE_MAX_BITRATE_KBPS", 4000)
+    monkeypatch.setattr(main, "LIVE_SCALE_MODE", "profile")
+    main.start_live_stream(1)
+    command = captured_command()
+    vf = command[command.index("-vf") + 1]
+    assert "min(" in vf and "force_original_aspect_ratio=decrease" in vf
+    assert int(command[command.index("-maxrate") + 1].rstrip("k")) <= 4000
     for setting in ("libx264", "veryfast", "zerolatency", "-hls_time"):
         assert setting in command
 

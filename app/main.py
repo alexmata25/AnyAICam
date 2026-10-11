@@ -15964,6 +15964,136 @@ def live_bitrate_cap_args() -> list[str]:
     return ["-maxrate", f"{LIVE_MAX_BITRATE_KBPS}k", "-bufsize", f"{LIVE_MAX_BITRATE_KBPS * 2}k"]
 
 
+# Measured per-camera video profile (2026-10-11, video-pipeline): see
+# video_profile.py and camera_video_probe.py. cameras.resolution is a sales
+# label and is never read here; the camera's real main/sub stream geometry
+# is measured (ONVIF + ffprobe) by camera_video_probe_worker() below and
+# drives the live encode size/bitrate, event clip size/bitrate, the AI
+# analytics stream and frame size, and thumbnail size.
+import camera_video_probe
+import video_profile
+
+# ANYAICAM_LIVE_SCALE=profile (default): the live HLS libx264 encode is
+# downscaled into the camera's profile box (1920x1080 for a 4K camera) with
+# a bitrate cap from the output size. "full" keeps the camera's own
+# resolution (the previous behaviour). Stream copy is never scaled.
+LIVE_SCALE_MODE = "full" if os.environ.get("ANYAICAM_LIVE_SCALE", "profile").strip().lower() == "full" else "profile"
+
+
+def camera_capability_key(camera_number: int) -> str:
+    """The capability record key: the camera's id, or a local key for a
+    legacy env-configured camera that has no cameras row."""
+    try:
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute("SELECT id FROM cameras WHERE camera_number=?", (camera_number,)).fetchone()
+        if row and row["id"]:
+            return str(row["id"])
+    except Exception:
+        pass
+    return f"local-camera-{int(camera_number)}"
+
+
+def _load_camera_capability_record(camera_number: int) -> dict | None:
+    import camera_capabilities
+    from partner_db import connection
+    with connection() as db:
+        return camera_capabilities.load(db, camera_capability_key(camera_number))
+
+
+camera_video_profiles = camera_video_probe.ProfileCache(
+    _load_camera_capability_record, ttl=60.0, live_max_kbps=lambda: LIVE_MAX_BITRATE_KBPS,
+)
+
+
+def camera_profile(camera_number: int) -> "video_profile.Profile":
+    """This camera's processing profile (safe defaults when unmeasured)."""
+    return camera_video_profiles.profile(camera_number)
+
+
+def live_scale_args(camera_number: int | None) -> list[str]:
+    """-vf for the live x264 encode, and its bitrate cap (replacing the
+    flat ANYAICAM_LIVE_MAX_BITRATE_KBPS cap only by a LOWER one)."""
+    if camera_number is None or LIVE_SCALE_MODE != "profile":
+        return [*live_bitrate_cap_args()]
+    profile = camera_profile(camera_number)
+    cap = profile.live_max_kbps if LIVE_MAX_BITRATE_KBPS > 0 else 0
+    rate = ["-maxrate", f"{cap}k", "-bufsize", f"{cap * 2}k"] if cap > 0 else []
+    return ["-vf", profile.live_filter(), *rate]
+
+
+def _video_probe_once(camera_number: int, previous_url: str | None) -> tuple[str | None, bool]:
+    """Measure one camera if due (blocking; run in a thread). Returns
+    (main url it used, geometry changed). Never logs a URL."""
+    import camera_capabilities
+    from partner_db import connection
+    try:
+        main_url = camera_url(camera_number)
+    except Exception:
+        return None, False
+    key = camera_capability_key(camera_number)
+    with connection() as db:
+        previous = camera_capabilities.load(db, key)
+    force = previous_url is not None and previous_url != main_url
+    try:
+        record, changed = camera_video_probe.refresh(
+            main_url, previous, soap_call=webrtc_publisher._onvif_soap_call(),
+            url_candidates=webrtc_publisher.substream_candidates, force=force,
+        )
+    except Exception as error:
+        print(f"Camera {camera_number} video probe failed: {type(error).__name__}")
+        return main_url, False
+    status_file = camera_video_probe.status_path(HLS_FOLDER, camera_number)
+    if changed and record is not None:
+        with connection() as db:
+            camera_capabilities.save(db, key, record)
+    if changed or not status_file.exists():
+        camera_video_probe.write_status(HLS_FOLDER, camera_number, record)
+    geometry_changed = changed and camera_video_probe.geometry_changed(previous, record)
+    if changed:
+        camera_video_profiles.invalidate(camera_number)
+        document = camera_video_probe.status_document(record)
+        main_info, sub_info = document.get("main") or {}, document.get("analytics") or {}
+        sub_text = f"{sub_info.get('width')}x{sub_info.get('height')} {sub_info.get('codec')}" if sub_info else "main stream"
+        print(
+            f"Camera {camera_number} measured video: main {main_info.get('width')}x{main_info.get('height')} "
+            f"{main_info.get('codec')} {main_info.get('fps')} fps ({document.get('resolution_class')}, {document.get('shape')}); "
+            f"analytics {sub_text}; probe {document.get('status')}"
+            f"{'; geometry changed' if geometry_changed and previous else ''}."
+        )
+    return main_url, geometry_changed
+
+
+# Called with a camera number when its measured geometry changes (the AI
+# frame reader restarts with the new size).
+_video_probe_listeners: list = []
+
+
+async def camera_video_probe_worker() -> None:
+    """Measures every camera's streams on start, every
+    ANYAICAM_VIDEO_PROBE_SECONDS, sooner after a failure, and when a
+    camera's main URL changes; independent of WebRTC/P2P."""
+    last_urls: dict[int, str | None] = {}
+    await asyncio.sleep(10)
+    while True:
+        for camera_number in sorted(set(get_camera_numbers())):
+            try:
+                url, geometry_changed = await asyncio.to_thread(
+                    _video_probe_once, camera_number, last_urls.get(camera_number))
+            except Exception as error:
+                print(f"Camera {camera_number} video probe skipped: {type(error).__name__}")
+                continue
+            if url:
+                last_urls[camera_number] = url
+            if geometry_changed:
+                for listener in list(_video_probe_listeners):
+                    try:
+                        listener(camera_number)
+                    except Exception:
+                        pass
+        await asyncio.sleep(60)
+
+
 # Live-view video stream copy (2026-10-05, Ryzen LPR test only; off by
 # default). The x264 encode below runs continuously for every camera,
 # because analytics read these same HLS segments. When the camera already
@@ -16006,8 +16136,11 @@ def live_copy_allowed(camera_number: int) -> bool:
 def live_video_args(camera_number: int | None = None) -> list[str]:
     if camera_number is not None and live_copy_allowed(camera_number):
         return ["-c:v", "copy"]
+    # Measured profile (2026-10-11): scale into the camera's live box and cap
+    # the bitrate by output size; ANYAICAM_LIVE_SCALE=full = the old args.
+    scale_and_rate = live_scale_args(camera_number)
     return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *live_bitrate_cap_args()]
+            "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *scale_and_rate]
 
 
 async def probe_camera_video_codec(url: str, timeout: float = LIVE_VIDEO_COPY_PROBE_TIMEOUT_SECONDS) -> str | None:
@@ -40520,6 +40653,13 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
+    # Measured camera video geometry (2026-10-11, camera_video_probe.py):
+    # independent of P2P; feeds video_profile.py and the cloud report.
+    camera_video_probe_task = (
+        asyncio.create_task(camera_video_probe_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # recording_start/cloud_recording_s3_key are main.py's own filename-
     # parsing/catalog-key functions -- injected rather than imported by
     # local_storage_manager.py for the same circular-import-avoidance
@@ -40775,6 +40915,8 @@ async def lifespan(app: FastAPI):
             access_control_task.cancel()
         if webrtc_publisher_task:
             webrtc_publisher_task.cancel()
+        if camera_video_probe_task:
+            camera_video_probe_task.cancel()
         if local_storage_manager_task:
             local_storage_manager_task.cancel()
         if recording_upload_task:
@@ -40895,6 +41037,8 @@ async def lifespan(app: FastAPI):
             pending.append(access_control_task)
         if webrtc_publisher_task:
             pending.append(webrtc_publisher_task)
+        if camera_video_probe_task:
+            pending.append(camera_video_probe_task)
         if local_storage_manager_task:
             pending.append(local_storage_manager_task)
         if recording_upload_task:

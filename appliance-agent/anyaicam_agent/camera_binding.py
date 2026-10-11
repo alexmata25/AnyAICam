@@ -391,7 +391,7 @@ class LocalVmsStatusReader:
         # while the camera is reachable. The VMS never writes that file when
         # the encoder is always on, so this changes nothing there.
         alive = self.hls_path / f'camera{camera_number}.alive'
-        return {
+        result = {
             'online': (self._fresh(manifest, self.stream_freshness_seconds, now)
                        or self._fresh(alive, self.stream_freshness_seconds, now)),
             'recording': newest is not None,
@@ -400,6 +400,66 @@ class LocalVmsStatusReader:
                 if newest else None
             ),
         }
+        video = read_video_status(self.hls_path / f'camera{camera_number}.video.json')
+        if video is not None:
+            result['video'] = video
+        return result
+
+
+# Measured stream geometry (2026-10-11, VMS app/camera_video_probe.py): the VMS
+# writes camera<N>.video.json (credential-free) after it probes the camera;
+# it is reported with the camera status so the cloud stores the REAL
+# resolution, separate from the sales label. Only whitelisted, bounded values
+# leave the appliance; anything malformed is dropped.
+VIDEO_STATUS_MAX_BYTES = 8192
+_VIDEO_CLASSES = {'2mp', '4mp', '5mp', '8mp', 'other', 'unknown'}
+_VIDEO_SHAPES = {'landscape', 'portrait', 'square', 'panoramic', 'unknown'}
+
+
+def _bounded_int(value, low: int, high: int):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if low <= number <= high else None
+
+
+def _stream_geometry(value):
+    if not isinstance(value, dict):
+        return None
+    codec = value.get('codec')
+    codec = str(codec).upper()[:16] if isinstance(codec, str) and codec.replace('_', '').isalnum() else None
+    try:
+        fps = round(float(value.get('fps')), 2) if value.get('fps') is not None else None
+    except (TypeError, ValueError):
+        fps = None
+    geometry = {'width': _bounded_int(value.get('width'), 16, 16384),
+                'height': _bounded_int(value.get('height'), 16, 16384),
+                'codec': codec, 'fps': fps if fps and 0 < fps <= 240 else None}
+    return geometry if geometry['width'] and geometry['height'] else None
+
+
+def read_video_status(path: Path):
+    try:
+        if not path.is_file() or path.stat().st_size > VIDEO_STATUS_MAX_BYTES:
+            return None
+        raw = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    status = raw.get('status') if raw.get('status') in {'ok', 'failed', 'unknown'} else 'unknown'
+    probed_at = raw.get('probed_at') if isinstance(raw.get('probed_at'), str) else None
+    return {
+        'status': status,
+        'probed_at': probed_at[:40] if probed_at else None,
+        'resolution_class': raw.get('resolution_class') if raw.get('resolution_class') in _VIDEO_CLASSES else 'unknown',
+        'shape': raw.get('shape') if raw.get('shape') in _VIDEO_SHAPES else 'unknown',
+        'main': _stream_geometry(raw.get('main')),
+        'sub': _stream_geometry(raw.get('analytics')),
+    }
 
 
 def reconcile_cloud_cameras(cloud_cameras: list[dict], discovered_cameras: list[dict],

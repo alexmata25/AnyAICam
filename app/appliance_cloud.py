@@ -22,6 +22,7 @@ from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
 from event_media_policy import allows_event_media, effective_cloud_recording_mode, motion_event_policy
 import product_mode
+import video_profile
 import runtime_paths
 
 try:
@@ -689,6 +690,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     metadata=talk_down.get('metadata')
                     metadata_json=json.dumps(metadata) if isinstance(metadata,dict) else None
                     db.execute('UPDATE cameras SET talk_down_supported=?,talk_down_metadata=?,talk_down_verified_at=? WHERE id=? AND appliance_id=?',(supported,metadata_json,now,camera_id,appliance['id']))
+                # Measured stream geometry (2026-10-11, video_profile.py): the
+                # edge's real main/sub width/height/codec/fps, stored in
+                # measured_* columns -- never in cameras.resolution, which is
+                # the plan's sales label. Only a successful probe is stored; an
+                # older appliance that sends no "video" changes nothing.
+                measured=video_profile.cloud_measured_columns(item.get('video'))
+                if measured:
+                    columns=sorted(measured)
+                    db.execute('UPDATE cameras SET '+','.join(f'{name}=?' for name in columns)+',measured_video_at=? WHERE id=? AND appliance_id=?',
+                               (*[measured[name] for name in columns],now,camera_id,appliance['id']))
         return {'status':'accepted','camera_count':len(items),'credentials_received':False}
 
     @app.get('/api/appliance/configuration')
