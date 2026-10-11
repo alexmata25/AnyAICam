@@ -787,6 +787,21 @@ def notify_payment_failed(invoice_id: str) -> dict:
                 "AND status IN ('active','suspended')", (subscription_id,))
     label = _plan_label(held[0]["label_key"]) + " plan" if held else ""
     if not held:
+        # Per-camera (billing v2) plans: the same failed renewal, the same
+        # once-per-invoice email (2026-10-10: these were never looked up, so a
+        # v2 customer in grace was never told).
+        try:
+            held = rows("SELECT customer_id,plan_key AS label_key,payment_failed_at FROM camera_plan_entitlements_v2 "
+                        "WHERE stripe_subscription_id=? AND status IN ('active','suspended')", (subscription_id,))
+        except Exception:
+            held = []  # database predates the additive per-camera billing-v2 migration
+        if held:
+            try:
+                from per_camera_billing import PLANS
+                label = PLANS[held[0]["label_key"]]["display_name"] + " plan"
+            except Exception:
+                label = "camera plan"
+    if not held:
         held = rows("SELECT customer_id,addon_key AS label_key,payment_failed_at FROM addon_subscriptions WHERE stripe_subscription_id=? "
                     "AND status IN ('active','suspended')", (subscription_id,))
         if held:

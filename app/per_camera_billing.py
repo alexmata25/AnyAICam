@@ -254,6 +254,37 @@ def has_camera_plan(customer_id: str) -> bool:
                     "AND status IN ('active','suspended') LIMIT 1", (customer_id,)))
 
 
+GRACE_STRIPE_STATUSES = ("past_due", "unpaid")
+
+
+def payment_problem(entitlement: dict | None) -> dict | None:
+    """A failed renewal of this (raw camera_plan_entitlements_v2) plan that
+    is still unresolved, or None. While Stripe retries the charge the plan
+    stays 'active' for the 7-day grace (billing_status.py) with
+    payment_failed_at set; after it, 'suspended' with reason payment_failed.
+    {"state": "grace"|"suspended", "grace_ends_at": datetime | None}."""
+    if not entitlement:
+        return None
+    status = str(entitlement.get("status") or "")
+    if status == "suspended" and entitlement.get("suspended_reason") == "payment_failed":
+        return {"state": "suspended", "grace_ends_at": None}
+    if status == "active" and (entitlement.get("payment_failed_at")
+                               or str(entitlement.get("stripe_status") or "") in GRACE_STRIPE_STATUSES):
+        import billing_status
+        return {"state": "grace", "grace_ends_at": billing_status.grace_ends_at(entitlement.get("payment_failed_at"))}
+    return None
+
+
+def _grace_deadline_html(problem: dict) -> str:
+    """The grace end as a readable date (viewer's time zone via
+    <time data-local-date>), or a generic phrase when it is unknown."""
+    grace_end = problem.get("grace_ends_at")
+    if not grace_end:
+        return "for a few more days"
+    from datetime import timezone
+    return f"until {_local_date_html(grace_end.astimezone(timezone.utc).timestamp())}"
+
+
 def deferred_storage_plan(customer_id: str) -> dict | None:
     """An appliance order's storage plan recorded by the verified webhook,
     starting at activation (build_orders.py)."""
@@ -326,6 +357,20 @@ def purchase_progress_banner(customer_id: str, path: str = "") -> str:
     """The notice on every customer VMS page while a Build Your System
     purchase is unfinished: back to the order summary until paid, then to
     setup (not repeated on the setup page itself)."""
+    problem = payment_problem(entitlement_for_customer(customer_id)) if customer_id else None
+    if problem:
+        # A failed renewal outranks every purchase-progress prompt ("Payment
+        # complete" would be false). My subscription shows its own, fuller
+        # notice with the Update payment method action.
+        if path.rstrip("/") == PURCHASE_INTENT_PATH:
+            return ""
+        if problem["state"] == "grace":
+            message = (f'<strong>Payment failed</strong> — We could not collect your latest subscription payment. '
+                       f'Your plan stays active {_grace_deadline_html(problem)}. ')
+        else:
+            message = '<strong>Plan paused</strong> — Your subscription payment failed. '
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="alert">' + message +
+                f'<a href="{PURCHASE_INTENT_PATH}">Update payment method</a></div>')
     deferred = deferred_storage_plan(customer_id)
     if deferred and deferred["state"] == "payment_failed":
         # The appliance is activated but its storage plan's first payment was
@@ -466,6 +511,12 @@ def _upsert_current(subscription: dict, *, session: dict | None = None) -> dict:
         conflict = stripe_state.conflicting_subscription(existing.get("stripe_subscription_id"), subscription)
         if conflict:
             return {"status": "ignored", "reason": conflict}
+    # The account's one row (customer_id is UNIQUE) is taken over by a new
+    # subscription only once the one it was bound to has ended (above). That
+    # ended subscription's own billing state -- a failed-payment grace start,
+    # a scheduled renewal change -- belongs to it and never carries over.
+    rebinding = bool(existing and existing.get("stripe_subscription_id") != sub_id)
+    prior = {} if rebinding else (existing or {})
     status = str(subscription.get("status") or "")
     if status in {"canceled", "incomplete_expired"}:
         # Keep the last purchased quantity for history; capacity readers ignore canceled rows.
@@ -506,7 +557,7 @@ def _upsert_current(subscription: dict, *, session: dict | None = None) -> dict:
     if status not in {"active", "trialing", "past_due", "unpaid"}:
         return {"status": "ignored", "reason": "subscription status does not grant service"}
     if status in {"past_due", "unpaid"}:
-        failed_at = (existing or {}).get("payment_failed_at") or _now()
+        failed_at = prior.get("payment_failed_at") or _now()
         entitlement_status, reason = "active", None  # existing 7-day grace keeps service active
     else:
         failed_at = None
@@ -519,9 +570,9 @@ def _upsert_current(subscription: dict, *, session: dict | None = None) -> dict:
             entitlement_status, reason = "suspended", reversal
     schedule = subscription.get("schedule")
     schedule_id = str((schedule.get("id") if isinstance(schedule, dict) else schedule) or "") or None
-    scheduled_key = (existing or {}).get("scheduled_plan_key")
-    scheduled_quantity = (existing or {}).get("scheduled_camera_quantity")
-    scheduled_at = (existing or {}).get("scheduled_at")
+    scheduled_key = prior.get("scheduled_plan_key")
+    scheduled_quantity = prior.get("scheduled_camera_quantity")
+    scheduled_at = prior.get("scheduled_at")
     if scheduled_key == plan["plan_key"] and int(scheduled_quantity or 0) == quantity:
         # Stripe has applied the next phase; remove the obsolete local schedule.
         scheduled_key = scheduled_quantity = scheduled_at = None
@@ -760,6 +811,28 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     is_active = bool(payload and payload.get("status") == "active")
     plan_key = payload.get("plan_key") if payload else ""
     billing_note = ""
+    problem = payment_problem(entitlement)
+    payment_alert = ""
+    if problem:
+        # A failed renewal (Stripe past_due/unpaid): service continues for the
+        # grace period, then pauses. Say so plainly, with the deadline and the
+        # one action that fixes it (the Stripe billing portal).
+        if is_owner and customer_billing.portal_enabled() and customer_billing.stripe_customer_ids_for_customer(customer_id):
+            fix = '<button class="action-button" id="v2-update-payment">Update payment method</button>'
+        elif is_owner:
+            fix = '<p class="health-detail">Contact AnyAiCam support to update your payment method.</p>'
+        else:
+            fix = '<p class="health-detail">Ask the account owner to update the payment method.</p>'
+        if problem["state"] == "grace":
+            headline = "Payment failed"
+            detail = (f"We couldn't collect your latest subscription payment. Your plan stays active "
+                      f"{_grace_deadline_html(problem)}; update your payment method before then to keep your cameras "
+                      "recording and your AnyAiCam services running.")
+        else:
+            headline = "Plan paused: payment failed"
+            detail = "Your subscription payment could not be collected, so your plan is paused. Update your payment method to restore it."
+        payment_alert = (f'<section class="panel license-warning-banner" id="v2-payment-failed" role="alert"><h2>{headline}</h2>'
+                         f'<p class="health-detail">{detail}</p>{fix}</section>')
     if payload and payload.get("status") == "suspended":
         billing_note = '<p class="health-detail">Your plan is paused because of a billing problem. Update your payment method or contact AnyAiCam support.</p>'
     elif payload and payload.get("cancel_at_period_end"):
@@ -860,7 +933,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     if _main is not None and hasattr(_main, "_vms_installer_download_html"):
         license_card += _main._vms_installer_download_html(customer_id, customer_entitlements.product_mode_for_customer(customer_id), is_owner)
     setup_next = ""
-    if is_owner and is_active and _setup_needed(customer_id):
+    if is_owner and is_active and not problem and _setup_needed(customer_id):
         # Purchase comes first, then setup (2026-10-05): once the plan is
         # active and no appliance is activated yet, setup is the next step.
         setup_next = ('<section class="panel" id="v2-setup-next"><h2>Payment complete — Set up your AnyAiCam system</h2>'
@@ -877,7 +950,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     else:
         scripts_focus += "try{sessionStorage.removeItem('v2ActivationTries')}catch(e){}"
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
-    {activating}{setup_next}
+    {payment_alert}{activating}{setup_next}
     <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{billing_note}{action_html}</section>
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
@@ -894,7 +967,9 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     const changeButton=document.getElementById('v2-change-button');if(changeButton)changeButton.onclick=async()=>{{const message=document.getElementById('v2-message');if(!confirm('Apply this plan or camera-count change?'))return;changeButton.disabled=true;const response=await fetch('/api/v2/customer/subscription/change',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2ChangePlan.value,camera_quantity:Number(v2ChangeQty.value)}})}});const data=await response.json();if(!response.ok){{changeButton.disabled=false;message.textContent=data.detail||'The change could not be completed.';return;}}message.textContent=data.message||'The subscription was updated.';setTimeout(()=>location.reload(),1000);}};
     const cancelButton=document.getElementById('v2-cancel-plan');if(cancelButton)cancelButton.onclick=async()=>{{if(!confirm('Cancel at the end of the paid period?'))return;const response=await fetch('/api/v2/customer/subscription/cancel',{{method:'POST'}}),data=await response.json();document.getElementById('v2-message').textContent=data.detail||'Your plan will stay active through the paid period.';if(response.ok)setTimeout(()=>location.reload(),1000);}};
     document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;const response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}}),data=await response.json();if(!response.ok){{button.disabled=false;message.textContent=data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
-    const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=async()=>{{const response=await fetch('/api/customer/billing-portal',{{method:'POST'}}),data=await response.json();if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}};
+    async function v2OpenBillingPortal(){{const response=await fetch('/api/customer/billing-portal',{{method:'POST'}}),data=await response.json();if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}}
+    const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=v2OpenBillingPortal;
+    const updatePayment=document.getElementById('v2-update-payment');if(updatePayment)updatePayment.onclick=v2OpenBillingPortal;
     document.querySelectorAll('time[data-local-date]').forEach(t=>{{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {{dateStyle:'medium'}})}});
     {scripts_focus}
     </script>'''
@@ -1050,9 +1125,12 @@ def register_routes(app: FastAPI) -> None:
         if not price_id:
             raise HTTPException(status_code=503, detail=f"No Stripe Price is configured for {plan_key}.")
         customer_id = identity["customer_id"]
-        if entitlement_for_customer(customer_id) or row(
-                "SELECT id FROM customer_entitlements WHERE customer_id=? AND product IN ('camera_slots_local','camera_slots_hybrid') "
-                "AND status IN ('active','suspended') LIMIT 1", (customer_id,)):
+        # Only a CURRENT plan (active, or suspended for billing; v2 or legacy
+        # camera slots) routes the owner to plan change. A plan Stripe has
+        # ended (status 'cancelled', kept for history) does not: the customer
+        # may buy again, and the verified webhook rebinds the account's row to
+        # the new subscription (_upsert_current, stripe_state.conflicting_subscription).
+        if has_camera_plan(customer_id):
             raise HTTPException(status_code=409, detail="This account already has a camera plan. Use its plan-change action instead.")
         if deferred_storage_plan(customer_id):
             # Paid with the appliance order; it starts at activation (build_orders.py).

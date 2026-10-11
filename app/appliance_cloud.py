@@ -793,6 +793,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         _modes: dict={}
         for item in camera_items:
             item['recording_mode']=_effective_camera_mode(appliance.get('customer_id'),item.get('recording_mode'),_modes)
+        # 2026-10-10: a plan-included analytic (Smart Motion) is reported as
+        # the plan allows it NOW -- cancelling Hybrid or moving to Basic Local
+        # turns it off at the edge; the customer's stored choice is kept, so
+        # re-subscribing restores it (analytics_entitlements.effective_camera_analytic).
+        from analytics_entitlements import effective_camera_analytic
+        _analytics: dict={}
+        with connection() as _db:
+            for item in camera_items:
+                item['smart_motion_enabled']=effective_camera_analytic(_db,appliance.get('customer_id'),item.get('site_id'),'smart_motion',item.get('smart_motion_enabled'),_analytics)
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)
