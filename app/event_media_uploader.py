@@ -722,7 +722,7 @@ def _abandon_invalid_job(job: dict, attempts: int, defect: str) -> None:
         return  # nothing identifies the camera; the cloud event stays without media
     if event_id:
         try:
-            report_media_failed(event_id=event_id, camera_number=camera_number, reason="invalid_job")
+            report_media_failed(event_id=event_id, camera_number=camera_number, reason="clip_unavailable")  # a reason every cloud version accepts (appliance_cloud allowlist); the defect itself is in the job_abandoned log line
         except Exception as error:  # best effort, like every other report
             logger.warning("event_media.failure_report_failed event_id=%s error=%s", event_id, type(error).__name__)
 

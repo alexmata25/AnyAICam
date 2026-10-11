@@ -73,7 +73,7 @@ def test_a_malformed_job_is_abandoned_and_reported_after_the_attempt_limit(tmp_p
     assert reported == []
     uploader.retry_pending_event_media()
     assert outbox.load() == []
-    assert reported == [{"event_id": "inverted", "camera_number": 1, "reason": "invalid_job"}]
+    assert reported == [{"event_id": "inverted", "camera_number": 1, "reason": "clip_unavailable"}]
 
 
 @pytest.mark.parametrize("error", [KeyError("camera"), TypeError("None"), ValueError("parse")])
@@ -217,3 +217,17 @@ def test_outbox_file_default_is_the_writable_data_config_directory_not_the_read_
     back under /var/lib/anyaicam."""
     assert str(outbox.OUTBOX_FILE).replace("\\", "/") == "/opt/anyaicam/data/config/event_media_outbox.json"
     assert not str(outbox.OUTBOX_FILE).replace("\\", "/").startswith("/var/lib/anyaicam")
+
+
+def test_the_terminal_failure_reason_is_one_the_cloud_accepts(tmp_path, monkeypatch):
+    """Codex review (d37054a): the cloud's /media/failed route rejects any
+    reason outside its allowlist with 400, which would leave the event
+    pending. Pin the edge's reason to that allowlist."""
+    import appliance_cloud
+    monkeypatch.setattr(outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    monkeypatch.setattr(uploader, "INVALID_JOB_MAX_ATTEMPTS", 1)
+    outbox.save([{**_job("inverted"), "event_start": "2026-01-01T00:00:10", "event_end": "2026-01-01T00:00:01"}])
+    reported = []
+    monkeypatch.setattr(uploader, "report_media_failed", lambda **kw: reported.append(kw) or True)
+    uploader.retry_pending_event_media()
+    assert reported and reported[0]["reason"] in appliance_cloud.MEDIA_FAILURE_REASONS
