@@ -34866,6 +34866,7 @@ def _probe_motion_clip_candidates(
 # the event loop, dispatching ffmpeg via asyncio.create_subprocess_exec.
 EVENT_CLIP_ENCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_EVENT_CLIP_ENCODE_MAX_CONCURRENCY", "1")))
 event_clip_encode_semaphore = asyncio.Semaphore(EVENT_CLIP_ENCODE_MAX_CONCURRENCY)
+import clip_encode  # video-pipeline P2c: event/manual clip ffmpeg commands
 
 
 
@@ -35003,23 +35004,15 @@ async def build_motion_event_clip(
             encoding="utf-8",
         )
 
-        command = [
-            "ffmpeg",
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(list_file),
-            "-ss", str(offset_seconds),
-            "-t", str(duration_seconds),
-            "-map", "0:v:0",
-            "-map", "0:a:0?",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-c:a", "aac",
-            "-b:a", "96k",
-            "-movflags", "+faststart",
-            str(temp_path),
-        ]
+        # 2026-10-11 (video-pipeline P2c, clip_encode.py): input seeking (the
+        # single covering file read directly), scaled into the camera's
+        # measured profile box as browser-playable H.264, threads capped.
+        # ANYAICAM_EVENT_CLIP_ENCODE=legacy = the previous command exactly.
+        clip_profile = await asyncio.to_thread(camera_profile, camera_number)
+        command = clip_encode.event_clip_command(
+            [source for _, _, source in candidates], list_file, offset_seconds, duration_seconds,
+            temp_path, clip_profile,
+        )
 
         # Only the actual encode -- never the pre-roll wait above, the
         # shortlist/ffprobe candidate search above that, or the list-
@@ -60409,52 +60402,14 @@ async def build_manual_clip(
 
 
 
-        command = [
-
-
-
-
-
-
-
-
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-
-
-
-
-
-
-
-
-            "-ss", str(offset_seconds), "-t", str(duration_seconds), "-an",
-
-
-
-
-
-
-
-
-            "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart",
-
-
-
-
-
-
-
-
-            str(output_path),
-
-
-
-
-
-
-
-
-        ]
+        # 2026-10-11 (video-pipeline P2c, clip_encode.py): input seeking and a
+        # thread cap; full resolution unless ANYAICAM_MANUAL_CLIP_SCALE=profile.
+        # ANYAICAM_EVENT_CLIP_ENCODE=legacy = the previous command exactly.
+        clip_profile = await asyncio.to_thread(camera_profile, camera_number)
+        command = clip_encode.manual_clip_command(
+            [source for _, source in candidates], list_file, offset_seconds, duration_seconds,
+            output_path, clip_profile,
+        )
 
 
 
