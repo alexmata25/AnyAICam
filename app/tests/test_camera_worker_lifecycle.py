@@ -20,6 +20,10 @@ import main
 import main_frame_grab
 
 
+def _motion_holds(number):
+    return sum(1 for owner in live_hls_demand.state(number)["holds"] if owner.startswith("motion:"))
+
+
 @pytest.fixture(autouse=True)
 def _reset():
     live_hls_demand.configure(mode="on_demand", idle_seconds=60)
@@ -198,12 +202,12 @@ def test_removed_camera_motion_loop_ends_stops_ffmpeg_and_releases_hls(monkeypat
     async def scenario():
         tasks = {n: asyncio.create_task(main.motion_detector(n)) for n in (3, 4)}
         await asyncio.sleep(0.3)
-        assert live_hls_demand.state(4)["holds"] == ["motion"] and live_hls_demand.wanted(4)
+        assert _motion_holds(4) == 1 and live_hls_demand.wanted(4)
         configured.discard(4)                                        # camera 4 removed
         await asyncio.wait_for(tasks[4], timeout=2)                  # ends within one check
         assert processes[4][-1].terminated                           # its ffmpeg was stopped
         assert live_hls_demand.state(4)["holds"] == [] and forgotten == [4]
-        assert not tasks[3].done() and live_hls_demand.state(3)["holds"] == ["motion"]   # camera 3 unaffected
+        assert not tasks[3].done() and _motion_holds(3) == 1   # camera 3 unaffected
         assert not processes[3][-1].terminated
         tasks[3].cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -230,7 +234,7 @@ def test_cancelled_motion_task_releases_its_hls_hold(monkeypatch, tmp_path):
     async def scenario():
         task = asyncio.create_task(main.motion_detector(5))
         await asyncio.sleep(0.2)
-        assert live_hls_demand.state(5)["holds"] == ["motion"]
+        assert _motion_holds(5) == 1
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -289,3 +293,262 @@ def test_main_frame_grabber_forget():
     grabber._failed_until[3] = 1e18
     grabber.forget(3)
     assert 3 not in grabber._cache and 3 not in grabber._failed_until
+
+
+# ---------------------------------------------------------------- races (Codex re-review of 4473cf2)
+
+def test_stale_yolo_result_is_never_delivered_after_retire_and_re_add(monkeypatch):
+    """A detect_objects_frame() running while the camera is retired and
+    re-added (new reader, seq restarting at 1) must not cache or deliver
+    its stale result to the new reader's frame 1."""
+    import types
+    frame = np.zeros((360, 640, 3), np.uint8)
+    reader_generation = {"value": 0}
+
+    class Frames:
+        mode = "main"
+
+        def forget(self, camera_number):
+            pass
+
+        def get_frame(self, camera_number, wait=None):
+            return {"ok": True, "frame": frame, "captured_at": None, "seq": 1,
+                    "generation": reader_generation["value"], "source": "main", "error": None}
+
+    monkeypatch.setattr(main, "ai_frames", Frames())
+    monkeypatch.setattr(main, "YOLO", object())
+    calls = []
+
+    def box(x):
+        tensor = lambda values: [types.SimpleNamespace(item=lambda v=values: v, tolist=lambda v=values: v)]
+        return types.SimpleNamespace(cls=tensor(0), conf=tensor(0.9), xyxy=tensor([x, 10, x + 20, 60]))
+
+    def predict(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            main.retire_camera_pipeline(7)        # retired (and re-added) while YOLO runs
+            reader_generation["value"] = 1
+        return [types.SimpleNamespace(names={0: "person"}, boxes=[box(100 if len(calls) == 1 else 300)])]
+
+    monkeypatch.setattr(main, "get_yolo_model", lambda: types.SimpleNamespace(predict=predict))
+    stale = main.detect_objects_frame(7)
+    assert stale["ok"] is False                                  # not delivered
+    assert 7 not in main._ai_detection_cache                     # not cached
+    fresh = main.detect_objects_frame(7)                         # the new reader's seq 1
+    assert fresh["ok"] and fresh["detections"][0]["x"] == 300 and len(calls) == 2
+
+
+def test_get_frame_never_creates_a_reader_after_retirement():
+    created = []
+
+    class Reader:
+        kind, last_error = "main", None
+
+        def ensure_running(self):
+            pass
+
+        def latest(self, max_age=None, wait=0.0):
+            return None
+
+        def stop(self):
+            pass
+
+    frames = analytics_frames.AnalyticsFrames(lambda n: None, mode="main", start_housekeeping=False,
+                                              reader_factory=lambda n: created.append(n) or Reader())
+    generation = frames.generation(3)
+    frames.forget(3)                                             # retired after the caller's service check
+    assert frames._reader(3, generation) is None and created == []
+    assert frames._reader(3, frames.generation(3)) is not None and created == [3]
+
+    frames2 = analytics_frames.AnalyticsFrames(lambda n: None, mode="main", start_housekeeping=False)
+
+    class Retiring(Reader):
+        def latest(self, max_age=None, wait=0.0):
+            frames2.forget(4)                                    # retired while waiting for the frame
+            return (np.zeros((2, 2, 3), np.uint8), None, 1)
+
+    frames2._custom_factory = lambda n: Retiring()
+    assert frames2.get_frame(4, wait=0)["ok"] is False
+
+
+def test_reader_thread_never_spawns_for_a_removed_camera():
+    spawned = []
+    reader = analytics_frames.FrameReader(5, lambda n: analytics_frames.SourceSpec("rtsp://x", 8, 6, "main"),
+                                          popen=lambda *a, **k: spawned.append(1), log=lambda m: None,
+                                          in_service=lambda n: False)
+    reader.ensure_running()
+    reader._thread.join(timeout=5)
+    assert not reader._thread.is_alive() and spawned == []
+
+
+def test_housekeeping_forgets_readers_of_removed_cameras():
+    stopped = []
+
+    class Reader:
+        def stop(self):
+            stopped.append(1)
+
+        def housekeeping(self):
+            pass
+
+    frames = analytics_frames.AnalyticsFrames(lambda n: None, mode="main", start_housekeeping=False,
+                                              in_service=lambda n: n != 2)
+    frames._readers[2] = Reader()
+    frames.housekeeping()
+    assert stopped == [1] and 2 not in frames._readers and frames.generation(2) == 1
+
+
+def test_reader_kills_an_ffmpeg_that_started_while_it_was_being_stopped():
+    class Proc:
+        stdout = None
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    procs = []
+    holder = {}
+
+    def popen(*a, **k):
+        holder["reader"].stop()                                  # stop() races the spawn: nothing to kill yet
+        procs.append(Proc())
+        return procs[-1]
+
+    reader = analytics_frames.FrameReader(6, lambda n: analytics_frames.SourceSpec("rtsp://x", 8, 6, "main"),
+                                          popen=popen, log=lambda m: None)
+    holder["reader"] = reader
+    reader.ensure_running()
+    reader._thread.join(timeout=5)
+    assert procs and procs[0].returncode == -9 and reader._process is None
+
+
+def test_old_motion_finalizer_cannot_release_the_replacement_hold():
+    live_hls_demand.hold(4, "motion:old")
+    live_hls_demand.hold(4, "motion:new")
+    live_hls_demand.release(4, "motion:old")                     # the old task's finally
+    assert live_hls_demand.state(4)["holds"] == ["motion:new"] and live_hls_demand.wanted(4)
+
+
+def test_each_motion_task_holds_with_its_own_token(monkeypatch, tmp_path):
+    hls = tmp_path / "hls"
+    hls.mkdir()
+    (hls / "camera4.m3u8").write_text("#EXTM3U\n")
+    monkeypatch.setattr(main, "HLS_FOLDER", hls)
+    monkeypatch.setattr(main._motion_source_selector, "mode", "hls")
+    monkeypatch.setattr(main, "get_event_settings", lambda n: main.EventSettingsModel(camera=4, enabled=False))
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", lambda *a, **k: _spawn())
+    monkeypatch.setattr(main, "camera_in_service", lambda number: True)
+
+    async def _make():
+        return _Process()
+
+    def _spawn():
+        return _make()
+
+    async def scenario():
+        old = asyncio.create_task(main.motion_detector(4))
+        new = asyncio.create_task(main.motion_detector(4))
+        await asyncio.sleep(0.2)
+        holds = live_hls_demand.state(4)["holds"]
+        assert len(holds) == 2 and len(set(holds)) == 2
+        old.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await old
+        assert _motion_holds(4) == 1 and live_hls_demand.wanted(4)     # the new task still holds
+        new.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await new
+        assert _motion_holds(4) == 0
+
+    asyncio.run(scenario())
+
+
+def test_replacement_waits_until_the_cancelled_task_has_finished(monkeypatch):
+    started = []
+
+    async def slow_cleanup_worker(number):
+        started.append(number)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await gate.wait()                                    # still cleaning up
+            raise
+
+    monkeypatch.setattr(main, "motion_detector", slow_cleanup_worker)
+    monkeypatch.setattr(main, "MOTION_DETECTION_ENABLED", True)
+    monkeypatch.setattr(main, "AI_PERSON_DETECTION_ENABLED", False)
+    monkeypatch.setattr(main, "retire_camera_pipeline", lambda number: None)
+
+    async def scenario():
+        global gate
+        gate = asyncio.Event()
+        main.reconcile_camera_workers([4])
+        await asyncio.sleep(0)
+        main.reconcile_camera_workers([])                        # removed
+        await asyncio.sleep(0)
+        assert main.reconcile_camera_workers([4])["started"] == {}   # re-added: old task still cleaning up
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert main.reconcile_camera_workers([4])["started"] == {"motion": [4]}
+        await asyncio.sleep(0)
+        assert started == [4, 4]
+        for task in main.camera_worker_tasks():
+            task.cancel()
+        await asyncio.gather(*main.camera_worker_tasks(), return_exceptions=True)
+
+    asyncio.run(scenario())
+    for registry in main._camera_worker_retiring.values():
+        registry.clear()
+
+
+def test_cancel_during_ffmpeg_spawn_leaves_no_process(monkeypatch):
+    class Proc:
+        returncode = None
+        killed = False
+        reaped = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.reaped = True
+            return self.returncode
+
+    proc = Proc()
+
+    async def slow_exec(*cmd, **kwargs):
+        await asyncio.sleep(0.2)                                 # ffmpeg still starting
+        return proc
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", slow_exec)
+
+    async def scenario():
+        task = asyncio.create_task(main.spawn_process_cancellation_safe("ffmpeg"))
+        await asyncio.sleep(0.05)
+        task.cancel()                                            # cancelled during the spawn
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.killed and proc.reaped                       # it started anyway: killed and reaped
+
+    asyncio.run(scenario())
+
+
+def test_main_frame_grab_started_before_retirement_is_not_cached():
+    import types
+    holder = {}
+
+    def run(args, **kwargs):
+        holder["grabber"].forget(2)                              # retired during the grab
+        return types.SimpleNamespace(returncode=0, stdout=b"x")
+
+    grabber = main_frame_grab.MainFrameGrabber(lambda n: "rtsp://x", run=run, decode=lambda raw: np.zeros((4, 4, 3)),
+                                               enabled=True)
+    holder["grabber"] = grabber
+    assert grabber.grab(2) is None and 2 not in grabber._cache

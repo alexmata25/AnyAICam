@@ -317,7 +317,7 @@ def test_motion_hls_reader_holds_on_demand_encoder(monkeypatch, tmp_path):
     monkeypatch.setattr(live_hls_demand, "hold", recording_hold)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(main.motion_detector(3))
-    assert held and held[0] == (3, "motion", True)   # the HLS reader held the encoder while reading
+    assert held and held[0][0] == 3 and held[0][1].startswith("motion:") and held[0][2] is True  # held while reading
     # 2026-10-11 (camera lifecycle fix): a motion task that ends releases its hold.
     assert live_hls_demand.state(3)["holds"] == []
 

@@ -143,8 +143,11 @@ class FrameReader:
     def __init__(self, camera_number: int, resolve: Callable[[int], Optional[SourceSpec]], *,
                  popen: Callable = subprocess.Popen, fps: float = None, clock: Callable[[], float] = time.monotonic,
                  wall_clock: Callable[[], datetime] = datetime.now, on_run_end: Callable = None,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print, in_service: Callable[[int], bool] = None,
+                 generation: int = 0):
         self.camera_number = int(camera_number)
+        self._in_service = in_service
+        self.generation = generation
         self._resolve = resolve
         self._popen = popen
         self._fps = READER_FPS if fps is None else fps
@@ -230,12 +233,25 @@ class FrameReader:
                 self._lock.wait(min(remaining, 0.5))
 
     # ---------------------------------------------------------------- thread
+    def _still_in_service(self) -> bool:
+        if self._in_service is None:
+            return True
+        try:
+            return bool(self._in_service(self.camera_number))
+        except Exception:
+            return True
+
     def _run(self) -> None:
         while True:
             with self._lock:
                 if self._stop:
                     return
                 self._restart = False
+            # Camera removed (2026-10-11 race fix): never (re)spawn for it.
+            if not self._still_in_service():
+                with self._lock:
+                    self._stop = True
+                return
             frames, error = 0, None
             spec = None
             try:
@@ -276,6 +292,19 @@ class FrameReader:
             self._process = process
             self._run_started = self._clock()
             self._frame_mono = 0.0
+            # stop()/restart() may have run while Popen was starting (it saw
+            # no process to kill): never leave that ffmpeg running.
+            abandon = self._stop or self._restart
+        if abandon:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+            with self._lock:
+                self._process = None
+                self._run_started = 0.0
+            return 0, "stopped"
         frames = 0
         error = None
         try:
@@ -327,19 +356,43 @@ class AnalyticsFrames:
         self._resolve = resolve
         self._clock = clock
         self._log = log
-        self._factory = reader_factory or (lambda number: FrameReader(
-            number, self._resolve, clock=clock, on_run_end=self._note_run, log=log))
+        self._custom_factory = reader_factory
         self._readers: dict[int, FrameReader] = {}
+        # Bumped by forget() (camera retired): a reader, a failure count or a
+        # frame from an older generation is never used for the camera again.
+        self._generation: dict[int, int] = {}
         self._failures: dict[int, int] = {}
         self._hls_until: dict[int, float] = {}
         self._lock = threading.Lock()
         self._housekeeping_started = not start_housekeeping
 
-    def _reader(self, camera_number: int) -> FrameReader:
+    def generation(self, camera_number: int) -> int:
         with self._lock:
+            return self._generation.get(camera_number, 0)
+
+    def _make_reader(self, camera_number: int, generation: int):
+        if self._custom_factory is not None:
+            reader = self._custom_factory(camera_number)
+        else:
+            reader = FrameReader(camera_number, self._resolve, clock=self._clock, log=self._log,
+                                 on_run_end=lambda n, frames, error, g=generation: self._note_run(n, frames, error, g),
+                                 in_service=self._in_service, generation=generation)
+        try:
+            reader.generation = generation
+        except Exception:
+            pass
+        return reader
+
+    def _reader(self, camera_number: int, generation: Optional[int] = None) -> Optional[FrameReader]:
+        """The camera's reader, created if needed -- unless the camera was
+        retired since `generation` was read (then None: nothing is created)."""
+        with self._lock:
+            current = self._generation.get(camera_number, 0)
+            if generation is not None and generation != current:
+                return None
             reader = self._readers.get(camera_number)
             if reader is None:
-                reader = self._readers[camera_number] = self._factory(camera_number)
+                reader = self._readers[camera_number] = self._make_reader(camera_number, current)
             start_thread = not self._housekeeping_started
             self._housekeeping_started = True
         if start_thread:
@@ -353,14 +406,20 @@ class AnalyticsFrames:
 
     def housekeeping(self) -> None:
         with self._lock:
-            readers = list(self._readers.values())
-        for reader in readers:
+            readers = list(self._readers.items())
+        for number, reader in readers:
             try:
+                if self._in_service is not None and not self._in_service(number):
+                    self.forget(number)
+                    continue
                 reader.housekeeping()
             except Exception:
                 pass
 
-    def _note_run(self, camera_number: int, frames: int, error: Optional[str]) -> None:
+    def _note_run(self, camera_number: int, frames: int, error: Optional[str], generation: Optional[int] = None) -> None:
+        with self._lock:
+            if generation is not None and generation != self._generation.get(camera_number, 0):
+                return  # a retired reader's run: never counts for the camera again
         if frames >= HEALTHY_FRAMES and error in (None, "stream ended"):
             # A long healthy run that ended (camera reboot, network blip).
             with self._lock:
@@ -390,9 +449,12 @@ class AnalyticsFrames:
 
     def get_frame(self, camera_number: int, wait: float = None) -> Optional[dict]:
         """None: use the live HLS playlist (mode hls, or auto fallback).
-        Else {"ok", "frame", "captured_at", "seq", "source", "error"}.
+        Else {"ok", "frame", "captured_at", "seq", "generation", "source", "error"}.
         A camera that is no longer configured gets an error -- its reader is
         stopped and forgotten, and HLS is never read or demanded for it."""
+        generation = self.generation(camera_number)
+        gone = {"ok": False, "frame": None, "captured_at": None, "seq": None, "generation": generation,
+                "source": None, "error": "Camera is not configured."}
         if self._in_service is not None:
             try:
                 in_service = self._in_service(camera_number)
@@ -404,17 +466,23 @@ class AnalyticsFrames:
                         "error": "Camera is not configured."}
         if self.uses_hls(camera_number):
             return None
-        reader = self._reader(camera_number)
+        reader = self._reader(camera_number, generation)
+        if reader is None:
+            return gone  # retired after the service check: never create a reader for it
         reader.ensure_running()
         got = reader.latest(wait=FIRST_FRAME_WAIT_SECONDS if wait is None else wait)
+        if self.generation(camera_number) != generation:
+            return gone  # retired while we waited: its frame is not delivered
         if self.uses_hls(camera_number):
             return None  # it just fell back while we waited
         if got is None:
-            return {"ok": False, "frame": None, "captured_at": None, "seq": None, "source": reader.kind,
+            return {"ok": False, "frame": None, "captured_at": None, "seq": None, "generation": generation,
+                    "source": reader.kind,
                     "error": "Analytics stream is starting." if not reader.last_error
                     else f"Analytics stream unavailable ({reader.last_error})."}
         frame, captured_at, seq = got
-        return {"ok": True, "frame": frame, "captured_at": captured_at, "seq": seq, "source": reader.kind, "error": None}
+        return {"ok": True, "frame": frame, "captured_at": captured_at, "seq": seq, "generation": generation,
+                "source": reader.kind, "error": None}
 
     def restart(self, camera_number: int) -> None:
         with self._lock:
@@ -423,8 +491,10 @@ class AnalyticsFrames:
             reader.restart()
 
     def forget(self, camera_number: int) -> None:
-        """Stop the camera's reader (its ffmpeg) and drop all its state."""
+        """Stop the camera's reader (its ffmpeg), drop all its state and
+        start a new generation for the camera."""
         with self._lock:
+            self._generation[camera_number] = self._generation.get(camera_number, 0) + 1
             reader = self._readers.pop(camera_number, None)
             self._failures.pop(camera_number, None)
             self._hls_until.pop(camera_number, None)

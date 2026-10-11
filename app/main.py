@@ -35819,6 +35819,11 @@ def motion_substream_url(camera_number: int) -> str | None:
 CAMERA_IN_SERVICE_CACHE_SECONDS = 5.0
 _camera_in_service_cache: list = [-1e18, None]  # [checked at (monotonic), frozenset or None]
 _camera_worker_tasks: dict[str, dict[int, asyncio.Task]] = {"motion": {}, "ai": {}}
+# Cancelled tasks still cleaning up: no replacement starts before they end.
+_camera_worker_retiring: dict[str, dict[int, asyncio.Task]] = {"motion": {}, "ai": {}}
+# Bumped on retire: a YOLO result computed for an older generation is never
+# cached or delivered for the camera again.
+_camera_generation: dict[int, int] = {}
 
 
 def current_camera_numbers() -> "frozenset[int] | None":
@@ -35854,6 +35859,12 @@ def retire_camera_pipeline(camera_number: int) -> None:
     holds, the motion source bookkeeping, the AI frame reader (its ffmpeg is
     stopped), cached main-stream frames, the profile and the YOLO cache."""
     number = int(camera_number)
+    try:
+        with _ai_detection_cache_lock:
+            _camera_generation[number] = _camera_generation.get(number, 0) + 1
+            _ai_detection_cache.pop(number, None)
+    except NameError:  # defined further down in this module
+        _camera_generation[number] = _camera_generation.get(number, 0) + 1
     live_hls_demand.forget(number)
     _motion_source_selector.forget(number)
     try:
@@ -35881,16 +35892,21 @@ def reconcile_camera_workers(numbers) -> dict:
     for kind, enabled, factory in (("motion", MOTION_DETECTION_ENABLED, motion_detector),
                                    ("ai", AI_PERSON_DETECTION_ENABLED, ai_person_detector)):
         registry = _camera_worker_tasks[kind]
+        retiring = _camera_worker_retiring[kind]
+        for number, task in list(retiring.items()):
+            if task.done():
+                retiring.pop(number)
         for number, task in list(registry.items()):
             if task.done():
                 registry.pop(number)
             elif want is not None and number not in want:
                 task.cancel()
                 registry.pop(number)
+                retiring[number] = task  # until its cleanup has finished
                 retired.add(number)
         if not enabled or want is None:
             continue
-        for number in sorted(want - set(registry)):
+        for number in sorted(want - set(registry) - set(retiring)):
             if kind == "ai":
                 ai_detection_state.setdefault(number, _new_ai_state())
                 ai_person_last_event.setdefault(number, 0.0)
@@ -35903,22 +35919,48 @@ def reconcile_camera_workers(numbers) -> dict:
 
 
 def camera_worker_tasks() -> list:
-    return [task for registry in _camera_worker_tasks.values() for task in registry.values()]
+    return [task for registries in (_camera_worker_tasks, _camera_worker_retiring)
+            for registry in registries.values() for task in registry.values()]
 
 
 async def motion_detector(camera_number: int) -> None:
     """One camera's motion reader. Ends cleanly (ffmpeg stopped, HLS demand
     released, per-camera state dropped) when the camera is removed, or when
     the task is cancelled by reconcile_camera_workers()."""
+    # A per-task hold token (race fix): a finishing old task can only ever
+    # release its own HLS hold, never a replacement task's.
+    hold_owner = f"motion:{uuid.uuid4().hex[:12]}"
     try:
-        await _motion_detector_loop(camera_number)
+        await _motion_detector_loop(camera_number, hold_owner)
     finally:
-        live_hls_demand.release(camera_number, "motion")
+        live_hls_demand.release(camera_number, hold_owner)
         if not camera_in_service(camera_number):
             retire_camera_pipeline(camera_number)
 
 
-async def _motion_detector_loop(camera_number: int) -> None:
+async def spawn_process_cancellation_safe(*command, **kwargs):
+    """asyncio.create_subprocess_exec() that never leaks the process when
+    the caller is cancelled while it is starting: the spawn is shielded,
+    and on cancellation the started process is killed and reaped before
+    the CancelledError propagates."""
+    spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(*command, **kwargs))
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        try:
+            process = await spawn
+        except BaseException:
+            raise asyncio.CancelledError()
+        try:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+        except (ProcessLookupError, OSError):
+            pass
+        raise
+
+
+async def _motion_detector_loop(camera_number: int, hold_owner: str = "motion") -> None:
 
 
 
@@ -36027,9 +36069,9 @@ async def _motion_detector_loop(camera_number: int) -> None:
         # HLS playlist it keeps the live encoder running; no-ops when the
         # encoder is always on (the default).
         if source_kind == "hls":
-            live_hls_demand.hold(camera_number, "motion")
+            live_hls_demand.hold(camera_number, hold_owner)
         else:
-            live_hls_demand.release(camera_number, "motion")
+            live_hls_demand.release(camera_number, hold_owner)
         if source_kind == "hls" and not manifest.exists():
             await asyncio.sleep(5)
             continue
@@ -36043,7 +36085,7 @@ async def _motion_detector_loop(camera_number: int) -> None:
                 command = motion_source.substream_command(source_url)
             else:
                 command = motion_source.hls_command(str(manifest))
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn_process_cancellation_safe(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -36924,9 +36966,12 @@ _ai_detection_cache_lock = threading.Lock()
 
 
 def _ai_detection_cache_get(camera_number: int, seq) -> dict | None:
+    """seq: (camera generation, reader generation, frame seq) or None."""
     if seq is None:
         return None
     with _ai_detection_cache_lock:
+        if seq[0] != _camera_generation.get(camera_number, 0):
+            return None
         cached = _ai_detection_cache.get(camera_number)
     if not cached or cached[0] != seq:
         return None
@@ -36938,6 +36983,9 @@ def _ai_detection_cache_get(camera_number: int, seq) -> dict | None:
 def _ai_detection_cache_put(camera_number: int, seq, result: dict) -> dict:
     if seq is not None and result.get("ok"):
         with _ai_detection_cache_lock:
+            if seq[0] != _camera_generation.get(camera_number, 0):
+                # Retired while YOLO ran: never cache (or deliver) it.
+                return {"ok": False, "error": "Camera is not configured.", "detections": []}
             _ai_detection_cache[camera_number] = (seq, result)
         result = dict(result)
         result["detections"] = [dict(item) for item in result.get("detections") or []]
@@ -37061,6 +37109,7 @@ def detect_objects_frame(camera_number: int) -> dict:
     # ANYAICAM_AI_SOURCE=hls, or the auto fallback after repeated reader
     # failures, is the previous live-HLS read (_read_hls_analytics_frame),
     # which also keeps the on-demand live encoder running.
+    camera_generation = _camera_generation.get(camera_number, 0)
     shared = ai_frames.get_frame(camera_number)
     if shared is None:
         frame, frame_captured_at, error = _read_hls_analytics_frame(camera_number)
@@ -37075,7 +37124,8 @@ def detect_objects_frame(camera_number: int) -> dict:
                 "detections": [],
             }
         frame, frame_captured_at = shared["frame"], shared["captured_at"]
-        frame_source, frame_seq = shared["source"] or "substream", shared["seq"]
+        frame_source = shared["source"] or "substream"
+        frame_seq = (camera_generation, shared.get("generation", 0), shared["seq"]) if shared["seq"] is not None else None
         # Several workers (AI, People Counting, Smart Rules) may ask for the
         # same shared frame: one YOLO pass per frame.
         cached = _ai_detection_cache_get(camera_number, frame_seq)

@@ -76,6 +76,7 @@ class MainFrameGrabber:
         self._failed_until: dict[int, float] = {}
         self._locks: dict[int, threading.Lock] = {}
         self._guard = threading.Lock()
+        self._generation: dict[int, int] = {}
         self.grabs = 0
 
     def _lock_for(self, camera_number: int) -> threading.Lock:
@@ -94,6 +95,8 @@ class MainFrameGrabber:
         worker thread). Never raises."""
         if not self.enabled:
             return None
+        with self._guard:
+            generation = self._generation.get(camera_number, 0)
         with self._lock_for(camera_number):
             now = self._clock()
             cached = self._cache.get(camera_number)
@@ -110,14 +113,18 @@ class MainFrameGrabber:
             if frame is None:
                 frame = self._grab_rtsp(camera_number)
             now = self._clock()
-            if frame is None:
-                self._failed_until[camera_number] = now + FAILURE_BACKOFF_SECONDS
-            self._cache[camera_number] = (now, frame)
+            with self._guard:
+                if self._generation.get(camera_number, 0) != generation:
+                    return None  # the camera was retired during the grab: never cache or use it
+                if frame is None:
+                    self._failed_until[camera_number] = now + FAILURE_BACKOFF_SECONDS
+                self._cache[camera_number] = (now, frame)
             return frame
 
     def forget(self, camera_number: int) -> None:
         """Drop the camera's cached frame and back-off (camera removed)."""
         with self._guard:
+            self._generation[camera_number] = self._generation.get(camera_number, 0) + 1
             self._cache.pop(camera_number, None)
             self._failed_until.pop(camera_number, None)
 
