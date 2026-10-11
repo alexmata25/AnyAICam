@@ -727,9 +727,17 @@ def test_the_choice_is_probed_once_and_redecided_when_the_camera_url_changes(mon
 
 
 def test_recording_and_live_hls_still_use_the_main_stream_only():
+    # 1.2.5 RC: the motion reader deliberately uses the substream elsewhere in
+    # main.py, so the old whole-file grep no longer expresses the intent. The
+    # intent is precise: recording, the event buffer and live HLS take the
+    # camera's main stream and never the WebRTC/substream selection.
+    import inspect
     import main
-    source = open(main.__file__, encoding="utf-8").read()
-    assert "p2p_source_for" not in source and "substream_candidates" not in source
+    for builder in (main.start_recording, main.start_event_recording_buffer, main.start_live_stream):
+        source = inspect.getsource(builder)
+        assert "camera_url(" in source, builder.__name__
+        for forbidden in ("p2p_source_for", "substream_candidates", "motion_substream_url", "select_streams"):
+            assert forbidden not in source, (builder.__name__, forbidden)
 
 
 # ------------------------------------------------ LAN ICE candidates
