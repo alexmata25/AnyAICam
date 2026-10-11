@@ -320,8 +320,10 @@ class AnalyticsFrames:
 
     def __init__(self, resolve: Callable[[int], Optional[SourceSpec]], *, mode: str = None,
                  reader_factory: Callable = None, clock: Callable[[], float] = time.monotonic,
-                 log: Callable[[str], None] = print, start_housekeeping: bool = True):
+                 log: Callable[[str], None] = print, start_housekeeping: bool = True,
+                 in_service: Callable[[int], bool] = None):
         self.mode = configured_mode(mode) if mode is not None else AI_SOURCE
+        self._in_service = in_service
         self._resolve = resolve
         self._clock = clock
         self._log = log
@@ -388,7 +390,18 @@ class AnalyticsFrames:
 
     def get_frame(self, camera_number: int, wait: float = None) -> Optional[dict]:
         """None: use the live HLS playlist (mode hls, or auto fallback).
-        Else {"ok", "frame", "captured_at", "seq", "source", "error"}."""
+        Else {"ok", "frame", "captured_at", "seq", "source", "error"}.
+        A camera that is no longer configured gets an error -- its reader is
+        stopped and forgotten, and HLS is never read or demanded for it."""
+        if self._in_service is not None:
+            try:
+                in_service = self._in_service(camera_number)
+            except Exception:
+                in_service = True
+            if not in_service:
+                self.forget(camera_number)
+                return {"ok": False, "frame": None, "captured_at": None, "seq": None, "source": None,
+                        "error": "Camera is not configured."}
         if self.uses_hls(camera_number):
             return None
         reader = self._reader(camera_number)
@@ -408,6 +421,15 @@ class AnalyticsFrames:
             reader = self._readers.get(camera_number)
         if reader is not None:
             reader.restart()
+
+    def forget(self, camera_number: int) -> None:
+        """Stop the camera's reader (its ffmpeg) and drop all its state."""
+        with self._lock:
+            reader = self._readers.pop(camera_number, None)
+            self._failures.pop(camera_number, None)
+            self._hls_until.pop(camera_number, None)
+        if reader is not None:
+            reader.stop()
 
     def stop_all(self) -> None:
         with self._lock:

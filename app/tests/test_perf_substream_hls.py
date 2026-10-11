@@ -307,10 +307,19 @@ def test_motion_hls_reader_holds_on_demand_encoder(monkeypatch, tmp_path):
     live_hls_demand.configure(mode="on_demand", idle_seconds=60, clock=Clock())
     hls, commands, _ = _motion_env(monkeypatch, tmp_path, "auto", [[FRAME]], resolver=lambda n: None)
     (hls / "camera3.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+    held = []
+    real_hold = live_hls_demand.hold
+
+    def recording_hold(number, owner):
+        real_hold(number, owner)
+        held.append((number, owner, live_hls_demand.wanted(number)))
+
+    monkeypatch.setattr(live_hls_demand, "hold", recording_hold)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(main.motion_detector(3))
-    assert live_hls_demand.state(3)["holds"] == ["motion"]
-    assert live_hls_demand.wanted(3)
+    assert held and held[0] == (3, "motion", True)   # the HLS reader held the encoder while reading
+    # 2026-10-11 (camera lifecycle fix): a motion task that ends releases its hold.
+    assert live_hls_demand.state(3)["holds"] == []
 
 
 def test_motion_substream_reader_does_not_hold_encoder(monkeypatch, tmp_path):

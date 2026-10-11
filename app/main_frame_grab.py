@@ -115,6 +115,12 @@ class MainFrameGrabber:
             self._cache[camera_number] = (now, frame)
             return frame
 
+    def forget(self, camera_number: int) -> None:
+        """Drop the camera's cached frame and back-off (camera removed)."""
+        with self._guard:
+            self._cache.pop(camera_number, None)
+            self._failed_until.pop(camera_number, None)
+
     def _grab_rtsp(self, camera_number: int):
         try:
             url = self._resolve_url(camera_number)

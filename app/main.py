@@ -3101,6 +3101,13 @@ async def camera_supervisor_watcher(tasks: list) -> None:
             started = start_camera_supervisors(numbers, tasks)
             if started:
                 structured_log("camera.supervisors_started", camera_numbers=started)
+            # Motion / AI workers follow the camera map both ways (added cameras
+            # get a fresh task; removed cameras' tasks stop) -- see
+            # reconcile_camera_workers(). An unknown map only starts.
+            current = await asyncio.to_thread(current_camera_numbers)
+            workers = reconcile_camera_workers(numbers if current is not None else None)
+            if workers["started"] or workers["retired"]:
+                structured_log("camera.workers_reconciled", started=workers["started"], retired=workers["retired"])
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -35801,7 +35808,117 @@ def motion_substream_url(camera_number: int) -> str | None:
 
 
 
+# ---------------------------------------------------------------- per-camera worker lifecycle
+# (2026-10-11, Codex blocker: a removed camera's motion reader kept running
+# forever -- seen live on Ryzen 1.2.4 for removed camera 4 -- and a camera
+# added later never got a motion task.) Motion and AI-detector tasks are
+# kept in one registry, reconciled against the current camera map by
+# camera_supervisor_watcher() (startup uses the same path); each motion loop
+# also checks camera_in_service() every iteration and while reading, and
+# retire_camera_pipeline() drops everything this branch keeps per camera.
+CAMERA_IN_SERVICE_CACHE_SECONDS = 5.0
+_camera_in_service_cache: list = [-1e18, None]  # [checked at (monotonic), frozenset or None]
+_camera_worker_tasks: dict[str, dict[int, asyncio.Task]] = {"motion": {}, "ai": {}}
+
+
+def current_camera_numbers() -> "frozenset[int] | None":
+    """The camera_numbers configured now (get_camera_numbers()' rule), or
+    None when that cannot be told: the database failed, or no camera row
+    exists at all (nothing was ever provisioned -- legacy/env installs and
+    bare test databases keep their workers). A removed camera keeps its row
+    with camera_number NULL, so removing the last camera still counts."""
+    try:
+        from partner_db import connection
+        with connection() as db:
+            rows = db.execute("SELECT camera_number FROM cameras").fetchall()
+    except Exception:
+        return None
+    if not rows:
+        legacy = legacy_camera_numbers_in_use()
+        return frozenset(legacy) if legacy else None
+    return frozenset(int(row["camera_number"]) for row in rows if row["camera_number"] is not None)
+
+
+def camera_in_service(camera_number: int) -> bool:
+    """False only when the camera map positively no longer has this number.
+    Cached CAMERA_IN_SERVICE_CACHE_SECONDS; blocking (database)."""
+    now = time.monotonic()
+    if now - _camera_in_service_cache[0] >= CAMERA_IN_SERVICE_CACHE_SECONDS:
+        _camera_in_service_cache[:] = [now, current_camera_numbers()]
+    numbers = _camera_in_service_cache[1]
+    return numbers is None or int(camera_number) in numbers
+
+
+def retire_camera_pipeline(camera_number: int) -> None:
+    """Drop every per-camera resource this pipeline keeps: HLS demand and
+    holds, the motion source bookkeeping, the AI frame reader (its ffmpeg is
+    stopped), cached main-stream frames, the profile and the YOLO cache."""
+    number = int(camera_number)
+    live_hls_demand.forget(number)
+    _motion_source_selector.forget(number)
+    try:
+        ai_frames.forget(number)
+        main_frame_grabber.forget(number)
+        _ai_detection_cache.pop(number, None)
+    except NameError:  # defined further down in this module
+        pass
+    camera_video_profiles.invalidate(number)
+
+
+def _new_ai_state() -> dict:
+    return {"status": "starting", "last_checked": None, "last_detection": None, "detections": 0, "error": None}
+
+
+def reconcile_camera_workers(numbers) -> dict:
+    """Start motion / AI-detector tasks for configured cameras without one
+    (a camera added -- or re-added with the same number -- gets a fresh
+    task), cancel the tasks of cameras no longer configured and retire their
+    pipeline. numbers=None (camera map unknown) only starts, never retires.
+    Returns {"started": {...}, "retired": [...]} (camera numbers)."""
+    want = None if numbers is None else set(_valid_camera_numbers(numbers))
+    started: dict[str, list[int]] = {}
+    retired: set[int] = set()
+    for kind, enabled, factory in (("motion", MOTION_DETECTION_ENABLED, motion_detector),
+                                   ("ai", AI_PERSON_DETECTION_ENABLED, ai_person_detector)):
+        registry = _camera_worker_tasks[kind]
+        for number, task in list(registry.items()):
+            if task.done():
+                registry.pop(number)
+            elif want is not None and number not in want:
+                task.cancel()
+                registry.pop(number)
+                retired.add(number)
+        if not enabled or want is None:
+            continue
+        for number in sorted(want - set(registry)):
+            if kind == "ai":
+                ai_detection_state.setdefault(number, _new_ai_state())
+                ai_person_last_event.setdefault(number, 0.0)
+            registry[number] = asyncio.create_task(factory(number))
+            started.setdefault(kind, []).append(number)
+    for number in sorted(retired):
+        retire_camera_pipeline(number)
+        print(f"Camera {number} is no longer configured; its motion/AI workers were stopped.")
+    return {"started": started, "retired": sorted(retired)}
+
+
+def camera_worker_tasks() -> list:
+    return [task for registry in _camera_worker_tasks.values() for task in registry.values()]
+
+
 async def motion_detector(camera_number: int) -> None:
+    """One camera's motion reader. Ends cleanly (ffmpeg stopped, HLS demand
+    released, per-camera state dropped) when the camera is removed, or when
+    the task is cancelled by reconcile_camera_workers()."""
+    try:
+        await _motion_detector_loop(camera_number)
+    finally:
+        live_hls_demand.release(camera_number, "motion")
+        if not camera_in_service(camera_number):
+            retire_camera_pipeline(camera_number)
+
+
+async def _motion_detector_loop(camera_number: int) -> None:
 
 
 
@@ -35888,7 +36005,13 @@ async def motion_detector(camera_number: int) -> None:
     # see motion_source.py. Frames are scaled to exactly 160x90 gray
     # either way, so the thresholds below do not depend on the source.
     # ANYAICAM_MOTION_SOURCE=hls restores the previous behaviour exactly.
+    next_service_check = 0.0
     while True:
+        # Removed camera (Codex blocker 2026-10-11): stop here -- the caller
+        # releases the HLS demand and drops per-camera state.
+        if not await asyncio.to_thread(camera_in_service, camera_number):
+            print(f"Camera {camera_number} is no longer configured; motion detector stopped.")
+            return
         if _motion_source_selector.mode == "hls":
             source_kind, source_url = "hls", None
         else:
@@ -35942,6 +36065,12 @@ async def motion_detector(camera_number: int) -> None:
                 else:
                     frame = await process.stdout.readexactly(frame_size)
                 frames_read += 1
+                if time.monotonic() >= next_service_check:
+                    next_service_check = time.monotonic() + CAMERA_IN_SERVICE_CACHE_SECONDS
+                    if not await asyncio.to_thread(camera_in_service, camera_number):
+                        # The finally below terminates this ffmpeg.
+                        print(f"Camera {camera_number} is no longer configured; motion detector stopped.")
+                        return
 
 
 
@@ -36734,7 +36863,7 @@ def analytics_source_spec(camera_number: int) -> "analytics_frames.SourceSpec | 
     return analytics_frames.SourceSpec(url, size[0], size[1], kind, reason) if size else None
 
 
-ai_frames = analytics_frames.AnalyticsFrames(analytics_source_spec)
+ai_frames = analytics_frames.AnalyticsFrames(analytics_source_spec, in_service=camera_in_service)
 _video_probe_listeners.append(ai_frames.restart)
 
 
@@ -40527,18 +40656,8 @@ async def lifespan(app: FastAPI):
 
 
 
-            motion_tasks = [
-
-
-
-
-
-
-
-
-                asyncio.create_task(motion_detector(camera_number))
-                for camera_number in camera_numbers
-            ]
+            reconcile_camera_workers(camera_numbers)  # registry: see reconcile_camera_workers()
+            motion_tasks = list(_camera_worker_tasks["motion"].values())
             # 2026-09-20: one janitor per camera slot, started
             # unconditionally alongside motion detection -- each one is
             # a cheap no-op for any camera not currently in Event mode
@@ -40581,10 +40700,8 @@ async def lifespan(app: FastAPI):
 
 
 
-            ai_tasks = [
-                asyncio.create_task(ai_person_detector(camera_number))
-                for camera_number in camera_numbers
-            ]
+            reconcile_camera_workers(camera_numbers)
+            ai_tasks = list(_camera_worker_tasks["ai"].values())
 
         if PEOPLE_COUNTING_ENABLED:
             # One task spawned per camera, exactly like ai_tasks above --
@@ -40962,7 +41079,7 @@ async def lifespan(app: FastAPI):
 
 
 
-        for task in supervisor_tasks + motion_tasks + ai_tasks:
+        for task in supervisor_tasks + motion_tasks + ai_tasks + camera_worker_tasks():
 
 
 
@@ -41086,6 +41203,7 @@ async def lifespan(app: FastAPI):
 
 
         pending.extend(motion_tasks)
+        pending.extend(task for task in camera_worker_tasks() if task not in motion_tasks and task not in ai_tasks)
 
 
 

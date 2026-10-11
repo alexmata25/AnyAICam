@@ -185,6 +185,19 @@ def release(camera_number: int, owner: str) -> None:
             _last_demand[int(camera_number)] = _clock()  # idle timer starts now
 
 
+def forget(camera_number: int) -> None:
+    """Drop every demand, hold and source-frame record of a camera that is
+    no longer configured (its encoder then idles in on_demand mode)."""
+    try:
+        number = int(camera_number)
+    except (TypeError, ValueError):
+        return
+    with _lock:
+        _last_demand.pop(number, None)
+        _holds.pop(number, None)
+        _last_source_frame.pop(number, None)
+
+
 def add_provider(provider: Callable[[], Iterable[int]]) -> None:
     """provider() -> camera numbers that currently need live HLS (e.g. the
     relay uploader's active cameras). Must be cheap and must not raise."""

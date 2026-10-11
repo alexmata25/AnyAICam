@@ -195,6 +195,12 @@ class MotionSourceSelector:
             return None  # the previous behaviour, previous logs
         return f"Camera {camera_number} motion detector source: {'camera substream' if kind == 'substream' else 'live HLS stream'}."
 
+    def forget(self, camera_number: int) -> None:
+        """Drop the camera's failure count, HLS fallback window and last kind."""
+        self._failures.pop(camera_number, None)
+        self._hls_until.pop(camera_number, None)
+        self._last_kind.pop(camera_number, None)
+
     def failures(self, camera_number: int) -> int:
         return self._failures.get(camera_number, 0)
 

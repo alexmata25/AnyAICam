@@ -96,6 +96,20 @@ detection quality):**
   skipped. Cached 2.5 s per camera (one grab serves LPR, PPE and face), 60 s
   back-off after a failed grab. `ANYAICAM_AI_MAIN_GRAB=false` disables it.
 
+### Per-camera worker lifecycle (Codex blocker fix, 2026-10-11)
+
+Motion and AI-detector tasks are kept in one registry and reconciled against
+the camera map (`reconcile_camera_workers()`) at startup and every 15 s by
+`camera_supervisor_watcher()`: a camera added -- or re-added with the same
+number -- gets fresh tasks; a removed camera's tasks are cancelled and
+`retire_camera_pipeline()` drops its HLS demand/holds, motion source state,
+AI reader (ffmpeg stopped), cached main-stream frames, profile and YOLO
+cache. The motion loop also checks `camera_in_service()` (5 s cache) every
+iteration and while reading, and returns -- its ffmpeg terminated, its HLS
+hold released. The AI reader never reads or demands HLS for a camera that
+is no longer configured. A camera map that cannot be read (database error,
+or no camera row ever provisioned) never retires anything.
+
 ### P2b -- on-demand live HLS by default when nothing else needs it
 
 `ANYAICAM_LIVE_HLS_MODE=auto` is the new default: on demand while
@@ -313,6 +327,11 @@ passed, 4 failed. (One parallel run also failed
 `test_webrtc_publisher::test_an_unanswered_add_during_restart_recovery_...`;
 it passes 3/3 when run alone -- timing under concurrent Docker load.)
 
+After the camera-lifecycle fix: the same files plus 8 camera add/remove,
+supervisor and motion-detector files -- base 2ad5814: 1396 passed, 2 failed
+(1307 + 89); head: 1548 passed, 2 failed, 4 skipped (plus the 10 new test
+files); appliance-agent 922 passed, 4 failed on both.
+
 The failures are identical on base and head (pre-existing):
 `test_lpr_real_world.py::test_glyph_reader_handles_tilted_and_slanted_plates[-15--0.2]`,
 `test_webrtc_publisher.py::test_recording_and_live_hls_still_use_the_main_stream_only`
@@ -493,9 +512,16 @@ every 5 min, WebRTC viewer, HLS viewer + 10 open/close cycles), plus:
 * **Status:** camera never shown offline (local, cloud), no stream_offline /
   camera_offline alerts while the encoder is idle.
 * **Logs:** no credentials (`://user:` patterns, the camera password).
-* **Camera RTSP sessions:** motion reader + AI reader on the substream,
-  recorder on main, WebRTC on demand, main grabs on demand -- confirm the
-  camera's session limit is not reached.
+* **Camera RTSP sessions (RC default):** motion reader on the substream;
+  AI reader on the MAIN stream at native resolution (`ANYAICAM_AI_SOURCE=main`)
+  next to the recorder on main; WebRTC on demand. (With `auto` after the soak:
+  AI reader on the substream next to the motion reader, plus short main grabs
+  for LPR/PPE/face.) Confirm the camera's session limit is not reached.
+* **Camera removal / re-add:** remove one camera during the soak: within
+  ~15 s its motion and AI workers stop (log "is no longer configured"), no
+  ffmpeg for it remains (`ps`), its live HLS encoder goes idle (`on_demand`)
+  and nothing writes its `camera<N>.alive`; the other cameras keep running.
+  Re-add it (same number): fresh workers start within ~15 s.
 
 ## 7. Risks and open questions
 
