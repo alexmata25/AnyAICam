@@ -331,10 +331,62 @@ def _glyph_blobs(gray):
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
     height, _ = gray.shape
     blobs = []
+
+    def append_blob(index, x, y, w, h, cx, cy):
+        area = int(np.count_nonzero(labels[y:y + h, x:x + w] == index))
+        if 0.10 * height <= h <= 0.65 * height and 0.12 <= w / float(h) <= 1.2 and area >= 0.15 * w * h and h >= 8:
+            blobs.append((index, x, y, w, h, cx, cy))
+
+    def split_touching_glyphs(index, x, y, w, h):
+        """Split a clearly joined pair only when its vertical projection has a deep valley."""
+        if h < 8 or w / float(h) < 1.25 or w / float(h) > 1.85:
+            return False
+        component = labels[y:y + h, x:x + w] == index
+        projection = component.sum(axis=0).astype(np.float32)
+        # Smooth one-pixel scan noise without erasing narrow character gaps.
+        smooth = np.convolve(projection, np.array([1, 2, 1], dtype=np.float32) / 4.0, mode="same")
+        low, high = int(0.28 * w), int(0.72 * w)
+        if high <= low:
+            return False
+        split_x = min(range(low, high + 1), key=lambda column: smooth[column])
+        valley = float(smooth[split_x])
+        left_peak = float(smooth[max(0, split_x - max(3, w // 4)):split_x].max(initial=0))
+        right_peak = float(smooth[split_x + 1:min(w, split_x + 1 + max(3, w // 4))].max(initial=0))
+        if min(left_peak, right_peak) < 1 or valley > 0.55 * min(left_peak, right_peak):
+            return False
+
+        pieces = []
+        for x0, x1 in ((0, split_x), (split_x, w)):
+            yy, xx = np.where(component[:, x0:x1])
+            if len(xx) == 0:
+                return False
+            px, py = int(xx.min() + x + x0), int(yy.min() + y)
+            pw, ph = int(xx.max() - xx.min() + 1), int(yy.max() - yy.min() + 1)
+            area = len(xx)
+            if not (8 <= ph <= 0.65 * height and 0.12 <= pw / float(ph) <= 1.2 and area >= 0.15 * pw * ph):
+                return False
+            pieces.append((px, py, pw, ph))
+
+        # Give each half a distinct label while leaving every other pixel intact.
+        first_index, second_index = int(labels.max()) + 1, int(labels.max()) + 2
+        left_mask = component.copy()
+        left_mask[:, split_x:] = False
+        right_mask = component.copy()
+        right_mask[:, :split_x] = False
+        labels[y:y + h, x:x + w][left_mask] = first_index
+        labels[y:y + h, x:x + w][right_mask] = second_index
+        for new_index, (px, py, pw, ph) in zip((first_index, second_index), pieces):
+            component_mask = labels[py:py + ph, px:px + pw] == new_index
+            ys, xs = np.where(component_mask)
+            append_blob(new_index, px, py, pw, ph, px + float(xs.mean()), py + float(ys.mean()))
+        return True
+
     for index in range(1, count):
         x, y, w, h, area = stats[index]
         if 0.10 * height <= h <= 0.65 * height and 0.12 <= w / float(h) <= 1.2 and area >= 0.15 * w * h and h >= 8:
             blobs.append((index, x, y, w, h, centroids[index][0], centroids[index][1]))
+        elif split_touching_glyphs(index, int(x), int(y), int(w), int(h)):
+            continue
     return labels, blobs
 
 
