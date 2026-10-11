@@ -231,8 +231,10 @@ def status_path(hls_folder, camera_number: int) -> Path:
     return Path(hls_folder) / f"camera{int(camera_number)}{STATUS_SUFFIX}"
 
 
-def status_document(record: Optional[dict]) -> dict:
-    """What the agent reports to the cloud: geometry only, no URI."""
+def status_document(record: Optional[dict], analytics_choice: Optional[str] = None) -> dict:
+    """What the agent reports to the cloud: geometry only, no URI.
+    analytics_choice overrides the profile's substream policy when the AI
+    source is configured otherwise (ANYAICAM_AI_SOURCE=main -> main_by_config)."""
     profile = video_profile.build(record)
     info = (record or {}).get("video_probe") if isinstance((record or {}).get("video_probe"), dict) else {}
     summary = profile.summary()
@@ -241,14 +243,16 @@ def status_document(record: Optional[dict]) -> dict:
     if status == "ok" and not profile.measured:
         status = "configured" if profile.geometry_source == "configured" else "failed"
     summary["status"] = status
+    if analytics_choice in video_profile.ANALYTICS_CHOICES:
+        summary["analytics_choice"] = analytics_choice
     return summary
 
 
-def write_status(hls_folder, camera_number: int, record: Optional[dict]) -> None:
+def write_status(hls_folder, camera_number: int, record: Optional[dict], analytics_choice: Optional[str] = None) -> None:
     path = status_path(hls_folder, camera_number)
     temp = path.with_name(path.name + ".tmp")
     try:
-        temp.write_text(json.dumps(status_document(record), sort_keys=True), encoding="utf-8")
+        temp.write_text(json.dumps(status_document(record, analytics_choice), sort_keys=True), encoding="utf-8")
         os.replace(temp, path)
     except OSError:
         try:

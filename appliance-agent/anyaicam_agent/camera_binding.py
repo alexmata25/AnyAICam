@@ -436,7 +436,8 @@ class LocalVmsStatusReader:
 VIDEO_STATUS_MAX_BYTES = 8192
 _VIDEO_CLASSES = {'2mp', '4mp', '5mp', '8mp', 'other', 'unknown'}
 _VIDEO_SHAPES = {'landscape', 'portrait', 'square', 'panoramic', 'unknown'}
-_VIDEO_ANALYTICS_CHOICES = {'substream_640', 'substream_480_fallback', 'main_480_fallback_disabled', 'main_no_usable_substream'}
+_VIDEO_ANALYTICS_CHOICES = {'substream_640', 'substream_480_fallback', 'main_480_fallback_disabled', 'main_no_usable_substream',
+                            'main_by_config'}
 
 
 def _bounded_int(value, low: int, high: int):

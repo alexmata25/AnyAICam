@@ -200,7 +200,8 @@ ANALYTICS_MIN_WIDTH = 640
 ANALYTICS_FALLBACK_MIN_WIDTH = 480
 ALLOW_480_SUBSTREAM = os.environ.get("ANYAICAM_AI_ALLOW_480_SUBSTREAM", "false").strip().lower() == "true"
 
-ANALYTICS_CHOICES = ("substream_640", "substream_480_fallback", "main_480_fallback_disabled", "main_no_usable_substream")
+ANALYTICS_CHOICES = ("substream_640", "substream_480_fallback", "main_480_fallback_disabled", "main_no_usable_substream",
+                     "main_by_config")
 
 
 def analytics_choice(record: Optional[dict], allow_480: Optional[bool] = None) -> tuple:
@@ -429,6 +430,7 @@ ANALYTICS_CHOICE_TEXT = {
     "substream_480_fallback": "substream 480-639 px (fallback)",
     "main_480_fallback_disabled": "main stream (480 px substream fallback disabled)",
     "main_no_usable_substream": "main stream (no substream >= 480 px)",
+    "main_by_config": "main stream (ANYAICAM_AI_SOURCE=main)",
 }
 
 

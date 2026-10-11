@@ -60,6 +60,7 @@ def test_480_fallback_is_off_by_default():
 
 def test_unmeasured_camera_480_substream_follows_the_flag(monkeypatch):
     import main
+    monkeypatch.setattr(main.ai_frames, "mode", "auto")  # opt-in substream policy
     monkeypatch.setattr(main, "camera_url", lambda n: MAIN_URL)
     monkeypatch.setattr(main, "camera_video_profiles", types.SimpleNamespace(
         record=lambda n: None, profile=lambda n: video_profile.build(None)))

@@ -76,7 +76,7 @@ def _reset():
 
 # ---------------------------------------------------------------- modes / command
 
-@pytest.mark.parametrize("value,expected", [(None, "auto"), ("auto", "auto"), ("SUBSTREAM", "substream"),
+@pytest.mark.parametrize("value,expected", [(None, "main"), ("main", "main"), ("auto", "auto"), ("SUBSTREAM", "substream"),
                                             ("hls", "hls"), ("bogus", "hls"), ("", "hls")])
 def test_ai_source_mode_parsing(monkeypatch, value, expected):
     monkeypatch.delenv("ANYAICAM_AI_SOURCE", raising=False)
@@ -87,7 +87,7 @@ def test_reader_command_low_fps_raw_bgr_over_tcp():
     command = analytics_frames.reader_command(SUB_URL, 2.0, 640, 360)
     assert command[:8] == ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-fflags", "nobuffer"]
     assert command[command.index("-i") + 1] == SUB_URL
-    assert command[command.index("-vf") + 1] == "fps=2,scale=640:360"
+    assert command[command.index("-vf") + 1] == f"fps=2,scale=640:360:flags={analytics_frames.READER_SCALE_FLAGS}"
     assert command[-5:] == ["-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
 
 
@@ -443,12 +443,16 @@ def test_ai_full_resolution_frame_skips_when_frame_is_already_full_res(monkeypat
     small = {"frame": np.zeros((360, 640, 3), np.uint8), "frame_source": "substream"}
     assert main.ai_full_resolution_frame(1, small) == "GRABBED"
     assert main.ai_full_resolution_frame(1, dict(small, frame_source="hls")) is None
-    assert main.ai_full_resolution_frame(1, dict(small, frame_source="main")) is None
+    # A main-stream READER frame is scaled (<= 1280x720): crops still get the full frame.
+    assert main.ai_full_resolution_frame(1, dict(small, frame_source="main")) == "GRABBED"
+    full = {"frame": np.zeros((2160, 3840, 3), np.uint8), "frame_source": "main"}
+    assert main.ai_full_resolution_frame(1, full) is None
     monkeypatch.setattr(main, "camera_profile", lambda n: types.SimpleNamespace(source={"width": 704}))
     assert main.ai_full_resolution_frame(1, small) is None
 
 
 def test_analytics_source_spec_uses_measured_substream_with_credentials(monkeypatch):
+    monkeypatch.setattr(main.ai_frames, "mode", "auto")  # substream policy is opt-in (ANYAICAM_AI_SOURCE=auto)
     import camera_capabilities
     import video_profile
     clean_main = camera_capabilities.split_credentials(MAIN_URL)[0]
@@ -465,6 +469,7 @@ def test_analytics_source_spec_uses_measured_substream_with_credentials(monkeypa
 
 
 def test_analytics_source_spec_unmeasured_camera_probes_the_substream_then_main(monkeypatch):
+    monkeypatch.setattr(main.ai_frames, "mode", "auto")
     monkeypatch.setattr(main, "camera_url", lambda n: MAIN_URL)
     monkeypatch.setattr(main, "camera_video_profiles", types.SimpleNamespace(
         record=lambda n: None, profile=lambda n: main.video_profile.build(None)))

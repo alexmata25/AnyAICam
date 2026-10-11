@@ -16050,11 +16050,11 @@ def _video_probe_once(camera_number: int, previous_url: str | None) -> tuple[str
         with connection() as db:
             camera_capabilities.save(db, key, record)
     if changed or not status_file.exists():
-        camera_video_probe.write_status(HLS_FOLDER, camera_number, record)
+        camera_video_probe.write_status(HLS_FOLDER, camera_number, record, _effective_analytics_choice())
     geometry_changed = changed and camera_video_probe.geometry_changed(previous, record)
     if changed:
         camera_video_profiles.invalidate(camera_number)
-        document = camera_video_probe.status_document(record)
+        document = camera_video_probe.status_document(record, _effective_analytics_choice())
         main_info, sub_info = document.get("main") or {}, document.get("analytics") or {}
         sub_text = f"{sub_info.get('width')}x{sub_info.get('height')} {sub_info.get('codec')}" if sub_info else "main stream"
         print(
@@ -16064,6 +16064,14 @@ def _video_probe_once(camera_number: int, previous_url: str | None) -> tuple[str
             f"{'; geometry changed' if geometry_changed and previous else ''}."
         )
     return main_url, geometry_changed
+
+
+def _effective_analytics_choice() -> str | None:
+    """The AI stream choice to report when it is not the substream policy."""
+    try:
+        return "main_by_config" if ai_frames.mode == "main" else None
+    except NameError:
+        return None
 
 
 # Called with a camera number when its measured geometry changes (the AI
@@ -36677,6 +36685,24 @@ def analytics_source_spec(camera_number: int) -> "analytics_frames.SourceSpec | 
     record = camera_video_profiles.record(camera_number)
     profile = camera_profile(camera_number)
     probe_ok = bool(record and (record.get("video_probe") or {}).get("status") == "ok")
+    if ai_frames.mode == "main":
+        # ANYAICAM_AI_SOURCE=main (default): the camera's main stream -- at its
+        # own resolution by default (ANYAICAM_AI_MAIN_READER_SIZE=native), the
+        # exact frame YOLO gets today; or scaled into the analytics box.
+        # A native read must know the true size, so it always uses a fresh
+        # measurement (ffprobe) when the stored one is not a measurement.
+        native = analytics_frames.MAIN_READER_SIZE == "native"
+        if probe_ok and profile.measured and _record_describes_main(record, main_url):
+            width, height = profile.source["width"], profile.source["height"]
+        else:
+            measured = camera_video_probe.ffprobe_stream(main_url)
+            if measured is None:
+                return None
+            width, height = measured["width"], measured["height"]
+        if native:
+            return analytics_frames.SourceSpec(main_url, width, height, "main", "main_by_config", native=True)
+        size = video_profile.fit(width, height, video_profile.box_for(video_profile.shape(width, height), video_profile.ANALYTICS_BOX))
+        return analytics_frames.SourceSpec(main_url, size[0], size[1], "main", "main_by_config") if size else None
     if probe_ok and profile.analytics_uri and _record_describes_main(record, main_url):
         url = camera_capabilities.with_credentials(profile.analytics_uri, username, password)
         kind = "main" if profile.analytics_is_main else "substream"
@@ -36753,8 +36779,10 @@ def ai_full_resolution_frame(camera_number: int, result: dict):
     frame = result.get("frame")
     if frame is None:
         return None
-    if result.get("frame_source") in (None, "hls", "main"):
-        return None  # the frame is the full-resolution picture already (HLS keeps the old LPR path)
+    if result.get("frame_source") in (None, "hls"):
+        return None  # the HLS frame is the full-resolution picture already (and keeps the old LPR path)
+    # A main-stream reader frame is scaled to <= 1280x720: LPR/PPE/face still
+    # need the full-resolution frame for their crops (never a quality loss).
     main_width = camera_profile(camera_number).source.get("width")
     if not main_frame_grab.needs_full_resolution(frame.shape[1], main_width):
         return None

@@ -18,11 +18,20 @@ every analytics consumer (ai_person_detector, people counting, Smart
 Rules); main.detect_objects_frame() also reuses one YOLO pass per frame.
 
 ANYAICAM_AI_SOURCE:
-  auto       (default) the analytics-stream reader; after MAX_FAILURES failed
+  main       (default, owner decision 2026-10-11: never silently sacrifice
+             detection quality) the same persistent reader, but on the
+             camera's MAIN stream, scaled to the profile analytics size
+             (fits 1280x720, never upscaled) -- YOLO gets the same full field
+             of view at the same effective resolution as from the 4K HLS
+             frame (it letterboxes to 640 either way), without the live HLS
+             encoder. Falls back to HLS after repeated failures, like auto.
+  auto       the analytics-stream reader (substream >= 640 px; 480-639 px only
+             with ANYAICAM_AI_ALLOW_480_SUBSTREAM); after MAX_FAILURES failed
              reader runs the camera's frames come from the live HLS playlist
              (the previous path, which keeps the encoder running) for
-             RETRY_SECONDS, then the reader is tried again.
-  substream  the reader only (failures never switch to HLS).
+             RETRY_SECONDS, then the reader is tried again. Opt-in until the
+             on-appliance soak validates substream detection quality.
+  substream  the analytics-stream reader only (failures never switch to HLS).
   hls        the previous behaviour exactly: cv2.VideoCapture on the live
              HLS playlist for every scan.
 An unrecognised value means "hls".
@@ -44,11 +53,25 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 
-AI_SOURCE_MODES = ("auto", "substream", "hls")
+AI_SOURCE_MODES = ("main", "auto", "substream", "hls")
+# Reader scale interpolation (ffmpeg swscale flags). See
+# docs/video-pipeline-20261011.md 4.8: chosen to match what YOLO sees today.
+READER_SCALE_FLAGS = (os.environ.get("ANYAICAM_AI_READER_SCALE_FLAGS", "area").strip().lower() or "area")
+if READER_SCALE_FLAGS not in ("area", "bilinear", "bicubic", "fast_bilinear", "lanczos", "neighbor"):
+    READER_SCALE_FLAGS = "area"
+# ANYAICAM_AI_SOURCE=main frame size. "native" (default): the main stream's
+# own resolution -- YOLO gets exactly the frame it gets today (its own
+# letterbox does the 4K -> 640 resize), and LPR/PPE/face crop from it with no
+# extra grab. Validated: any pre-downscale (even to 1280x720, with any
+# interpolation, including OpenCV's own INTER_LINEAR) changed ~15 % of person
+# boxes at the 0.35 threshold vs the 4K frame (docs/video-pipeline-20261011.md
+# 4.8). "analytics": scale into the analytics box (<= 1280x720), cheaper
+# conversion/pipe, not quality-neutral.
+MAIN_READER_SIZE = "analytics" if os.environ.get("ANYAICAM_AI_MAIN_READER_SIZE", "native").strip().lower() == "analytics" else "native"
 
 
 def configured_mode(value: Optional[str] = None) -> str:
-    raw = os.environ.get("ANYAICAM_AI_SOURCE", "auto") if value is None else value
+    raw = os.environ.get("ANYAICAM_AI_SOURCE", "main") if value is None else value
     mode = (raw or "").strip().lower()
     return mode if mode in AI_SOURCE_MODES else "hls"
 
@@ -84,9 +107,10 @@ class SourceSpec:
     height: int
     kind: str  # "substream" | "main"
     reason: str = ""  # video_profile.ANALYTICS_CHOICES: why this stream
+    native: bool = False  # read at the stream's own size (width/height = stream size)
 
 
-def reader_command(url: str, fps: float, width: int, height: int) -> list[str]:
+def reader_command(url: str, fps: float, width: int, height: int, flags: str = None, native: bool = False) -> list[str]:
     args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
     if url.lower().startswith(("rtsp://", "rtsps://")):
         # Same input options as the motion reader's substream command. (No
@@ -95,7 +119,8 @@ def reader_command(url: str, fps: float, width: int, height: int) -> list[str]:
     return args + [
         "-i", url,
         "-an", "-sn", "-dn",
-        "-vf", f"fps={fps:g},scale={int(width)}:{int(height)}",
+        # native: no scaling at all; the frame size must equal the stream's.
+        "-vf", f"fps={fps:g}" if native else f"fps={fps:g},scale={int(width)}:{int(height)}:flags={flags or READER_SCALE_FLAGS}",
         "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
     ]
 
@@ -242,7 +267,7 @@ class FrameReader:
     def _read(self, spec: SourceSpec) -> tuple[int, Optional[str]]:
         size = spec.width * spec.height * 3
         try:
-            process = self._popen(reader_command(spec.url, self._fps, spec.width, spec.height),
+            process = self._popen(reader_command(spec.url, self._fps, spec.width, spec.height, native=spec.native),
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                                   bufsize=size)
         except (OSError, ValueError) as exc:
@@ -342,7 +367,7 @@ class AnalyticsFrames:
         with self._lock:
             failures = self._failures.get(camera_number, 0) + 1
             self._failures[camera_number] = failures
-            fall_back = self.mode == "auto" and failures >= MAX_FAILURES
+            fall_back = self.mode in ("auto", "main") and failures >= MAX_FAILURES
             if fall_back:
                 self._failures[camera_number] = 0
                 self._hls_until[camera_number] = self._clock() + RETRY_SECONDS
@@ -356,7 +381,7 @@ class AnalyticsFrames:
     def uses_hls(self, camera_number: int) -> bool:
         if self.mode == "hls":
             return True
-        if self.mode == "auto":
+        if self.mode in ("auto", "main"):
             with self._lock:
                 return self._clock() < self._hls_until.get(camera_number, 0.0)
         return False
