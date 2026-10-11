@@ -262,6 +262,91 @@ def test_token_activation_still_starts_the_plan_and_is_recorded(shop, db_path, s
     assert _storage(db_path, customer_id)["state"] == "started" and len(stripe_subscriptions["created"]) == 1
 
 
+# ------------------------------------------------------------ an appliance out of service never charges (Codex, fb3c50f)
+
+def _revoke(db_path, appliance_id):
+    """As appliance_cloud's revoke does: every credential revoked,
+    state='revoked'; activation_status / activated_at left as they were."""
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE appliance_credentials SET revoked_at=? WHERE appliance_id=?", (now, appliance_id))
+    conn.execute("UPDATE appliances SET state='revoked',online_status='revoked',credential_revoked_at=? WHERE id=?", (now, appliance_id))
+    conn.commit()
+    conn.close()
+
+
+def test_a_claim_revoked_after_a_failed_start_never_charges_on_retry(shop, db_path, stripe_subscriptions):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "claim-revoked-retry@example.test", APPLIANCE, captured)
+    credential = _claimed_appliance(db_path, customer_id)
+    stripe_subscriptions["fail"].append(_Refused("card_declined"))  # refused: nothing made at Stripe
+    assert _heartbeat(client, "app-claim", credential).status_code == 200
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE deferred_storage_plans SET state='failed' WHERE customer_id=?", (customer_id,))  # a transient failure
+    conn.commit()
+    conn.close()
+    _revoke(db_path, "app-claim")
+    keys_before = list(stripe_subscriptions["keys"])
+    assert _worker(db_path) == 0
+    assert _start(db_path, customer_id)["status"] == "ignored"
+    assert stripe_subscriptions["keys"] == keys_before and stripe_subscriptions["made"] == {}
+    assert _appliance(db_path, "app-claim")["activated_at"]  # the recorded activation alone is not enough
+
+
+def test_a_token_appliance_revoked_after_a_failed_start_never_charges_on_retry(shop, db_path, stripe_subscriptions):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "token-revoked-retry@example.test", APPLIANCE, captured)
+    _activate_appliance(db_path, customer_id)
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE deferred_storage_plans SET state='failed' WHERE customer_id=?", (customer_id,))
+    conn.commit()
+    conn.close()
+    _revoke(db_path, "app-build")  # activation_status stays 'activated'
+    assert _worker(db_path) == 0
+    assert _start(db_path, customer_id)["status"] == "ignored"
+    assert stripe_subscriptions["keys"] == [] and stripe_subscriptions["created"] == []
+
+
+def test_a_revocation_during_the_start_stops_it_before_stripe(shop, db_path, stripe_subscriptions, monkeypatch):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "claim-revoked-midway@example.test", APPLIANCE, captured)
+    _activate_appliance(db_path, customer_id)
+    import build_orders
+    real = build_orders._default_payment_method
+
+    def revoke_then_lookup(plan):  # the appliance is revoked while the start is being prepared
+        _revoke(db_path, "app-build")
+        return real(plan)
+    monkeypatch.setattr(build_orders, "_default_payment_method", revoke_then_lookup)
+    assert _start(db_path, customer_id)["status"] == "ignored"
+    assert stripe_subscriptions["keys"] == [] and stripe_subscriptions["created"] == []
+    storage = _storage(db_path, customer_id)
+    assert storage["state"] == "awaiting_activation" and storage["last_error"] == "no appliance in service"
+    assert _worker(db_path) == 0 and stripe_subscriptions["keys"] == []
+
+
+def test_a_released_appliance_never_charges(shop, db_path, stripe_subscriptions):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "released-token@example.test", APPLIANCE, captured)
+    _activate_appliance(db_path, customer_id)
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE appliances SET activation_status='released' WHERE id='app-build'")
+    conn.commit()
+    conn.close()
+    assert _worker(db_path) == 0 and _start(db_path, customer_id)["status"] == "ignored"
+    claimed = _paid(client, mail, db_path, "released-claim@example.test", APPLIANCE, captured)
+    credential = _claimed_appliance(db_path, claimed, appliance_id="app-claim-released")
+    assert _heartbeat(client, "app-claim-released", credential).status_code == 200
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE deferred_storage_plans SET state='failed' WHERE customer_id=?", (claimed,))
+    conn.execute("UPDATE appliances SET activation_status='released' WHERE id='app-claim-released'")
+    conn.commit()
+    conn.close()
+    keys_before = list(stripe_subscriptions["keys"])
+    assert _worker(db_path) == 0 and _start(db_path, claimed)["status"] == "ignored"
+    assert stripe_subscriptions["keys"] == keys_before
+
+
 # ------------------------------------------------------------ existing claimed customers are never auto-charged
 
 def test_existing_claimed_customers_are_held_for_the_owner_and_never_auto_charged(shop, db_path, stripe_subscriptions):
@@ -396,6 +481,40 @@ def test_the_admin_start_refuses_without_an_enrolled_appliance_or_a_paid_order(s
     assert refused.status_code == 409 and stripe_subscriptions["created"] == []
     assert _storage(db_path, customer_id)["state"] == "owner_review" and not _audits(db_path, "storage_start.owner_approved")
     assert client.post("/api/admin/storage-starts/no-such-customer/start", json={"confirm": True}, cookies=admin).status_code == 404
+
+
+def test_the_admin_start_is_refused_for_an_account_whose_appliances_are_all_revoked(shop, db_path, stripe_subscriptions):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "claim-revoked-admin@example.test", APPLIANCE, captured)
+    _claimed_appliance(db_path, customer_id, marked=False, enrolled=True)
+    _deploy_migration(db_path)
+    _revoke(db_path, "app-claim")
+    admin = _admin_cookie(db_path)
+    listing = client.get("/api/admin/storage-starts", cookies=admin).json()["storage_starts"]
+    assert listing[0]["appliance_enrolled"] is False
+    refused = client.post(f"/api/admin/storage-starts/{customer_id}/start", json={"confirm": True}, cookies=admin)
+    assert refused.status_code == 409 and stripe_subscriptions["keys"] == []
+    assert _storage(db_path, customer_id)["state"] == "owner_review" and not _audits(db_path, "storage_start.owner_approved")
+
+
+def test_an_approved_start_whose_appliance_is_revoked_before_the_retry_never_charges(shop, db_path, stripe_subscriptions):
+    client, captured, mail, _, _ = shop
+    customer_id = _paid(client, mail, db_path, "claim-approved-revoked@example.test", APPLIANCE, captured)
+    _claimed_appliance(db_path, customer_id, marked=False, enrolled=True)
+    _deploy_migration(db_path)
+    stripe_subscriptions["fail"].append(_Refused("card_declined"))
+    admin = _admin_cookie(db_path)
+    assert client.post(f"/api/admin/storage-starts/{customer_id}/start", json={"confirm": True}, cookies=admin).json()["status"] == "payment_failed"
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE deferred_storage_plans SET state='failed' WHERE customer_id=?", (customer_id,))
+    conn.commit()
+    conn.close()
+    _revoke(db_path, "app-claim")
+    keys_before = list(stripe_subscriptions["keys"])
+    assert _worker(db_path) == 0
+    refused = client.post(f"/api/admin/storage-starts/{customer_id}/start", json={"confirm": True}, cookies=admin)
+    assert refused.status_code == 409
+    assert stripe_subscriptions["keys"] == keys_before and stripe_subscriptions["made"] == {}
 
 
 # ------------------------------------------------------------ fulfillment shows claim activation

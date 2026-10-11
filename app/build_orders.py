@@ -358,16 +358,36 @@ def _grant_vms_license(session: dict, customer_id: str, metadata: dict) -> dict:
 # ------------------------------------------------------------------ activation
 
 def _appliance_activated(customer_id: str) -> bool:
-    """Activated for billing: token-activated (activation_status='activated',
-    appliance_cloud.activate()), or claimed after claim-flow activation shipped
-    and really enrolled -- activated_at, recorded once by appliance_claims.
-    record_claim_activation() on the row claim/complete marked
-    activated_via='claim'. An appliance claimed before that change has no
-    marker and never counts here: its account's start waits for an explicit
-    owner/admin decision instead (STORAGE_HELD)."""
-    return bool(row("SELECT id FROM appliances WHERE customer_id=? AND (activation_status='activated' OR "
-                    "(activated_via='claim' AND activated_at IS NOT NULL AND COALESCE(activation_status,'pending')!='released')) "
-                    "LIMIT 1", (customer_id,)))
+    """Activated for billing: an appliance that went through an activation
+    event -- token activation (activation_status='activated',
+    appliance_cloud.activate()), or, after claim-flow activation shipped, the
+    claim flow's recorded activation (activated_at on a row claim/complete
+    marked activated_via='claim', appliance_claims.record_claim_activation())
+    -- AND is still in service right now by appliance_readiness (the single
+    source of truth: not revoked or released, a working credential; a
+    claimed one also really enrolled). Revocation leaves activation_status
+    and activated_at as they were, so neither alone is enough (Codex review
+    of fb3c50f). An appliance claimed before that change has no marker and
+    never counts here: its account's start waits for an explicit owner/admin
+    decision instead (STORAGE_HELD)."""
+    from appliance_readiness import appliance_activated
+    candidates = rows("SELECT id,activation_status,state FROM appliances WHERE customer_id=? AND (activation_status='activated' OR "
+                      "(activated_via='claim' AND activated_at IS NOT NULL))", (customer_id,))
+    return any(appliance_activated(candidate) for candidate in candidates)
+
+
+def _start_allowed(customer_id: str, plan: dict) -> bool:
+    """May this account's storage start reach Stripe now? An activation
+    event on an appliance still in service (_appliance_activated), or an
+    owner/admin approval (admin_start_held_storage) while an appliance on the
+    account is still in service (appliance_readiness). Checked before the
+    start is claimed and again right before each Stripe request."""
+    if _appliance_activated(customer_id):
+        return True
+    if plan.get("owner_approved_at"):
+        from appliance_readiness import customer_has_activated_appliance
+        return customer_has_activated_appliance(customer_id)
+    return False
 
 
 def _hardware_still_paid(plan: dict) -> bool:
@@ -438,8 +458,9 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
     if plan["state"] == STORAGE_HELD:
         return {"status": "ignored", "reason": "held for an owner decision"}
     # An owner/admin-approved start (admin_start_held_storage) is its own
-    # activation signal, so a transient failure after approval is retried.
-    if not (_appliance_activated(customer_id) or plan.get("owner_approved_at")):
+    # activation signal, so a transient failure after approval is retried --
+    # but, like every start, only while an appliance is still in service.
+    if not _start_allowed(customer_id, plan):
         return {"status": "ignored", "reason": "appliance not activated"}
     if billing.has_camera_plan(customer_id):
         _finish(customer_id, STORAGE_SUPERSEDED)
@@ -452,6 +473,17 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
     import main
     import stripe_state
     key = _idempotency_key(plan)
+
+    def still_allowed() -> bool:
+        # Re-checked right before each Stripe request: the appliance may have
+        # been revoked or released since the start was claimed.
+        if _start_allowed(customer_id, plan):
+            return True
+        _finish(customer_id, STORAGE_AWAITING, error="no appliance in service")
+        logger.warning("build_order.storage_start_skipped_not_in_service customer_id=%s", customer_id)
+        return False
+    if not still_allowed():
+        return {"status": "ignored", "reason": "appliance not activated"}
     try:
         subscription = _existing_subscription(plan)
         if not subscription:
@@ -472,6 +504,8 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
             coupon = friends_family.checkout_discount(customer_id, "base").get("coupon")
             if coupon:
                 fields.append(("discounts[0][coupon]", coupon))
+            if not still_allowed():
+                return {"status": "ignored", "reason": "appliance not activated"}
             subscription = main.stripe_api_post("/v1/subscriptions", fields, idempotency_key=key)
     except Exception as error:
         refused = getattr(error, "stripe_outcome", None) == "rejected"
