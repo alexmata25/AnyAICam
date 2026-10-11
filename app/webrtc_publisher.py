@@ -96,6 +96,7 @@ exact real bug (a literal, real "m=<mid>" media line, e.g. "m=0",
 rejected with a real 400) this surfaced and fixed."""
 
 import json
+import re
 import logging
 import appliance_config_cache
 import camera_capabilities
@@ -107,6 +108,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import product_mode
@@ -344,6 +346,14 @@ def render_mediamtx_config() -> str:
         "webrtc: yes",
         "webrtcAddress: 127.0.0.1:8889",
         "webrtcLocalUDPAddress: :8189",
+        # Loopback-only RTSP, TCP only, used solely by the on-demand H.265 ->
+        # H.264 transcoder to publish into its path (no UDP RTP/RTCP ports).
+        "rtsp: yes",
+        "rtspAddress: 127.0.0.1:8554",
+        "rtspTransports: [tcp]",
+        "rtmp: no",
+        "hls: no",
+        "srt: no",
     ]
     hosts = advertised_hosts()
     if hosts:
@@ -614,19 +624,88 @@ def substream_candidates(main_url: str) -> list[str]:
     return candidates
 
 
-def _probe_video_stream(url: str) -> bool:
-    """True when the URL answers with a real video stream. Never logs or
-    returns the (credentialed) URL."""
+# Codecs a browser can receive over WebRTC from MediaMTX (ffprobe codec_name).
+# Measured on the real stream, never taken from ONVIF metadata: ONVIF Media
+# (v1) cannot express H.265, so a camera whose substream is set to H.265 can
+# still report "H264" in GetProfiles (seen live 2026-10-10: MediaMTX answered
+# "codecs not supported by client" for a substream ONVIF called H264).
+WEBRTC_VIDEO_CODECS = frozenset({"h264"})
+_CODEC_ALIASES = {"avc": "h264", "avc1": "h264", "hevc": "h265", "hev1": "h265", "hvc1": "h265"}
+
+
+def normalize_codec(value) -> str | None:
+    """One spelling for observed codecs, shared with the camera-lifecycle
+    work (stream_codec / onvif_media._codec_name): lower-case, "h264" and
+    "h265" (hevc/hev1/hvc1), anything else lower-cased, empty -> None."""
+    text = str(value or "").strip().lower()
+    return _CODEC_ALIASES.get(text, text) or None
+
+# On-demand H.265 -> H.264 transcoding for WebRTC (2026-10-10), used only when
+# no camera stream is H.264. "auto" (default) enables it; "off" disables it
+# (P2P then keeps the main stream and records the compatibility warning).
+P2P_TRANSCODE = os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE", "auto").strip().lower()
+P2P_TRANSCODE_MAX_WIDTH = max(320, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_MAX_WIDTH", "1280")))
+P2P_TRANSCODE_FPS = max(5, min(30, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_FPS", "15"))))
+P2P_TRANSCODE_KBPS = max(200, min(4000, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_KBPS", "1000"))))
+MEDIAMTX_RTSP_LOOPBACK = "rtsp://127.0.0.1:8554"
+# At most this many cameras may be configured for transcoding at once
+# (each runs one ffmpeg only while it has viewers); beyond it, a camera
+# falls back to warn-only so one appliance cannot be overloaded.
+P2P_TRANSCODE_MAX_CAMERAS = max(0, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCODE_MAX_CAMERAS", "2")))
+# A cached WebRTC source decision is re-checked on the capability re-probe
+# schedule even when the camera's main URL is unchanged (profile/codec
+# changes on the camera itself).
+P2P_SOURCE_RECHECK_SECONDS = float(camera_capabilities.REPROBE_SECONDS)
+
+
+def transcode_command(source_url: str) -> str:
+    """The runOnDemand command MediaMTX starts when the first WebRTC viewer
+    asks for a transcoded path and stops runOnDemandCloseAfter after the last
+    one leaves: decode the camera stream (substream preferred by the caller),
+    re-encode video only to browser-safe H.264 (baseline, no B-frames,
+    yuv420p, short GOP, capped width/fps/bitrate) and publish it back into
+    the same path over loopback RTSP. Recording and live HLS never use this.
+    Every argument is shell-quoted; $MTX_PATH is expanded by MediaMTX."""
+    import shlex
+    video_filter = f"scale=w=min(iw\\,{P2P_TRANSCODE_MAX_WIDTH}):h=-2,fps={P2P_TRANSCODE_FPS}"
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-rtsp_transport", "tcp", "-i", source_url,
+            "-an", "-vf", video_filter,
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-bf", "0", "-g", str(P2P_TRANSCODE_FPS * 2),
+            "-b:v", f"{P2P_TRANSCODE_KBPS}k", "-maxrate", f"{int(P2P_TRANSCODE_KBPS * 1.2)}k",
+            "-bufsize", f"{P2P_TRANSCODE_KBPS * 2}k",
+            "-f", "rtsp", "-rtsp_transport", "tcp"]
+    return " ".join(shlex.quote(a) for a in args) + f" {MEDIAMTX_RTSP_LOOPBACK}/$MTX_PATH"
+
+
+def path_config_for(source_url: str, kind: str) -> dict:
+    """MediaMTX path config for one camera: a direct on-demand RTSP source,
+    or (kind "transcode") a publisher path fed by transcode_command()."""
+    if kind == "transcode":
+        return {"source": "publisher", "runOnDemand": transcode_command(source_url),
+                "runOnDemandRestart": True, "runOnDemandStartTimeout": "15s", "runOnDemandCloseAfter": "10s"}
+    return {"source": source_url, "sourceOnDemand": True}
+
+
+def _probe_video_codec(url: str) -> str | None:
+    """The actual codec of the URL's first real video stream as ffprobe
+    names it ("h264", "hevc", ...), or None when the stream cannot be
+    opened or has no video. Never logs or returns the (credentialed) URL."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
-             "-show_entries", "stream=codec_type,width,height", "-of", "json", url],
+             "-show_entries", "stream=codec_type,codec_name,width,height", "-of", "json", url],
             capture_output=True, text=True, timeout=P2P_SUBSTREAM_PROBE_TIMEOUT_SECONDS, check=False,
         )
-        streams = json.loads(result.stdout or "{}").get("streams") or []
-        return result.returncode == 0 and any(s.get("codec_type") == "video" and (s.get("width") or 0) > 0 for s in streams)
+        if result.returncode != 0:
+            return None
+        for stream in json.loads(result.stdout or "{}").get("streams") or []:
+            if stream.get("codec_type") == "video" and (stream.get("width") or 0) > 0:
+                return normalize_codec(stream.get("codec_name"))
+        return None
     except (OSError, subprocess.SubprocessError, ValueError):
-        return False
+        return None
 
 
 # camera_id -> (main_url, chosen P2P source). Re-decided only when the
@@ -663,33 +742,157 @@ def _save_capabilities(camera_id: str, record: dict) -> None:
 
 
 def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
-    """(source URL for MediaMTX, "substream"|"main"), chosen from the
-    camera's discovered capabilities (camera_capabilities.py: ONVIF media
-    profiles first, the URL-convention guess only as a fallback), and
-    verified with a real probe before use. Runs network calls, so it must
-    only be called off the event loop (sync_camera_paths() already is)."""
+    """(source URL for MediaMTX, "substream"|"main") for browser WebRTC.
+
+    Every stream the camera advertises (ONVIF profiles, else the
+    URL-convention guess) is probed with ffprobe using the camera's own
+    credentials, and the codec actually observed is recorded next to the
+    advertised one (stream["observed_codec"] vs stream["codec"]) -- ONVIF
+    Media v1 cannot express H.265, so its "H264" is not trusted. Selection
+    uses only the observed codec: a verified H.264 substream first, else the
+    main stream when it is H.264, else the main stream with an actionable
+    warning recorded (record["webrtc"]) and logged: P2P cannot play it, and
+    the browser falls back to the relay, whose HLS is transcoded to H.264
+    by the live encoder (the only approved transcoding path). Camera
+    encoding settings are never changed here.
+
+    Re-decided when the camera's main URL changes (re-provisioning), when
+    the stored capabilities are due for a re-probe, and after MediaMTX
+    rejects an offer for codec reasons (see _revalidate_after_codec_rejection).
+    Runs network calls, so only call it off the event loop."""
     cached = _p2p_source_choice.get(camera_id)
-    if cached and cached[0] == main_url:
-        return cached[1], ("main" if cached[1] == main_url else "substream")
+    if cached and cached[0] == main_url and not _choice_expired(cached):
+        kind = cached[2] if len(cached) > 2 else ("main" if cached[1] == main_url else "substream")
+        return cached[1], kind
     chosen = main_url
-    if P2P_STREAM_PREFERENCE != "main":
+    transcode = False
+    if P2P_STREAM_PREFERENCE == "main":
+        # Main stream by preference -- still decided by its observed codec,
+        # so an H.265 main stream is transcoded rather than sent as-is.
+        main_codec = normalize_codec(_probe_video_codec(main_url))
+        if main_codec is not None and main_codec not in WEBRTC_VIDEO_CODECS:
+            if P2P_TRANSCODE != "off" and _transcode_budget_allows(camera_id):
+                transcode = True
+                logger.info("webrtc_publisher.p2p_transcode camera_id=%s from=main", camera_id)
+            else:
+                logger.warning("webrtc_publisher.no_webrtc_compatible_stream camera_id=%s main_codec=%s sub_codecs=none "
+                               "action=set_one_camera_stream_to_h264_or_use_relay", camera_id, main_codec)
+    else:
         _clean, username, password = camera_capabilities.split_credentials(main_url)
         record = _load_capabilities(camera_id)
         if camera_capabilities.needs_reprobe(record, main_url):
             record = camera_capabilities.discover(main_url, soap_call=_onvif_soap_call(), url_candidates=substream_candidates)
-        for stream in camera_capabilities.select_streams(record, "live_p2p"):
-            if stream.get("role") == "main":
+        ordered = camera_capabilities.select_streams(record, "live_p2p")
+        ordered += [s for s in record.get("streams") or [] if s not in ordered]
+        subs = [s for s in ordered if s.get("role") != "main"]
+        main_streams = [s for s in ordered if s.get("role") == "main"]
+        observed_at = datetime.now(timezone.utc).isoformat()
+
+        def observe(stream: dict, url: str) -> str | None:
+            codec = normalize_codec(_probe_video_codec(url))
+            stream["observed_codec"] = normalize_codec(codec)
+            # Field names shared with the camera-lifecycle work (stream_codec.py):
+            stream["stream_role"] = "main" if stream.get("role") == "main" else "substream"
+            stream["advertised_codec"] = normalize_codec(stream.get("codec"))
+            stream["verified"] = codec is not None
+            stream["observed_at"] = observed_at
+            return codec
+
+        source_role, sub_codecs = None, []
+        for stream in subs:
+            codec = observe(stream, camera_capabilities.with_credentials(stream["uri"], username, password))
+            sub_codecs.append(codec)
+            if codec in WEBRTC_VIDEO_CODECS:
+                chosen, source_role = camera_capabilities.with_credentials(stream["uri"], username, password), "sub"
                 break
-            candidate = camera_capabilities.with_credentials(stream["uri"], username, password)
-            stream["verified"] = _probe_video_stream(candidate)
-            if stream["verified"]:
-                chosen = candidate
-                break
+            if codec is not None:
+                logger.info("webrtc_publisher.substream_codec_unsupported camera_id=%s codec=%s", camera_id, codec)
+        main_codec = None
+        if main_streams:
+            main_codec = observe(main_streams[0], main_url)
+        elif source_role is None:
+            main_codec = normalize_codec(_probe_video_codec(main_url))
+        if source_role is None and main_codec in WEBRTC_VIDEO_CODECS:
+            source_role = "main"
+        incompatible = source_role is None and (main_codec is not None or any(c is not None for c in sub_codecs))
+        if incompatible and P2P_TRANSCODE != "off" and not _transcode_budget_allows(camera_id):
+            logger.warning("webrtc_publisher.p2p_transcode_limit_reached camera_id=%s max=%s", camera_id, P2P_TRANSCODE_MAX_CAMERAS)
+        if incompatible and P2P_TRANSCODE != "off" and _transcode_budget_allows(camera_id):
+            # Transcode the smallest stream that could actually be opened.
+            openable = [(s, camera_capabilities.with_credentials(s["uri"], username, password)) for s in subs if s.get("verified")]
+            if main_streams and main_streams[0].get("verified") or (not main_streams and main_codec):
+                openable.append((main_streams[0] if main_streams else {"width": None}, main_url))
+            openable.sort(key=lambda pair: pair[0].get("width") or 10**6)
+            if openable:
+                chosen, transcode = openable[0][1], True
+                source_role = "transcode"
+                logger.info("webrtc_publisher.p2p_transcode camera_id=%s from=%s", camera_id,
+                            "main" if chosen == main_url else "substream")
+        if incompatible and not transcode:
+            logger.warning("webrtc_publisher.no_webrtc_compatible_stream camera_id=%s main_codec=%s sub_codecs=%s "
+                           "action=set_one_camera_stream_to_h264_or_use_relay", camera_id, main_codec,
+                           ",".join(c or "unavailable" for c in sub_codecs) or "none")
+        record["webrtc"] = {
+            "compatible": not incompatible or transcode,
+            "source_role": source_role or "main",
+            "transcoded": transcode,
+            "main_observed_codec": main_codec,
+            "warning": ("No H.264 stream on this camera: WebRTC live view is transcoded to H.264 on the appliance "
+                        "(extra CPU). Setting a camera stream to H.264 avoids that." if transcode else
+                        "No H.264 stream on this camera: browsers cannot play it over WebRTC. Set the camera's "
+                        "substream (or main stream) to H.264, or view it through the relay." if incompatible else None),
+            "checked_at": observed_at,
+        }
         _save_capabilities(camera_id, record)
-    _p2p_source_choice[camera_id] = (main_url, chosen)
-    kind = "main" if chosen == main_url else "substream"
+    kind = "transcode" if transcode else ("main" if chosen == main_url else "substream")
+    _p2p_source_choice[camera_id] = (main_url, chosen, kind, time.monotonic())
     logger.info("webrtc_publisher.p2p_source camera_id=%s stream=%s", camera_id, kind)
     return chosen, kind
+
+
+def _choice_expired(cached) -> bool:
+    """A cached decision without a timestamp (older format) or older than
+    P2P_SOURCE_RECHECK_SECONDS is re-decided."""
+    return len(cached) < 4 or time.monotonic() - cached[3] >= P2P_SOURCE_RECHECK_SECONDS
+
+
+def _transcode_budget_allows(camera_id: str) -> bool:
+    """Counts other cameras currently configured for transcoding: only
+    unexpired decisions of cameras still in the camera map consume budget."""
+    with _lock:
+        known = set(_camera_map)
+    others = sum(1 for cid, entry in _p2p_source_choice.items()
+                 if cid != camera_id and cid in known and len(entry) > 2 and entry[2] == "transcode"
+                 and not _choice_expired(entry))
+    return others < P2P_TRANSCODE_MAX_CAMERAS
+
+
+# camera_id -> monotonic time of the last codec-triggered revalidation.
+_codec_revalidated_at: dict = {}
+CODEC_REVALIDATE_MIN_SECONDS = 300.0
+
+
+def _revalidate_after_codec_rejection(camera_id: str) -> bool:
+    """MediaMTX refused an offer because the path's codec is not playable by
+    the browser: forget the cached choice, mark the stored capabilities due
+    for a re-probe, and re-add this camera's path on the next sync (add falls
+    back to replace when the path exists). Rate-limited per camera so an
+    H.265-only camera cannot cause a probe loop. Returns True if scheduled."""
+    global _paths_resync_pending
+    now = time.monotonic()
+    last = _codec_revalidated_at.get(camera_id)
+    if last is not None and now - last < CODEC_REVALIDATE_MIN_SECONDS:
+        return False
+    _codec_revalidated_at[camera_id] = now
+    _p2p_source_choice.pop(camera_id, None)
+    record = _load_capabilities(camera_id)
+    if isinstance(record, dict):
+        record["probed_at"] = "1970-01-01T00:00:00+00:00"
+        _save_capabilities(camera_id, record)
+    _known_paths.discard(camera_id)
+    _paths_resync_pending = True
+    logger.info("webrtc_publisher.codec_revalidation_scheduled camera_id=%s", camera_id)
+    return True
 
 
 def sync_camera_paths(camera_url_fn) -> None:
@@ -721,11 +924,30 @@ def sync_camera_paths(camera_url_fn) -> None:
         status, _ = _config_request("DELETE", f"/v3/config/paths/delete/{camera_id}")
         if status in (200, 404):
             _known_paths.discard(camera_id)
+            _p2p_source_choice.pop(camera_id, None)
         else:
             logger.warning("webrtc_publisher.path_delete_failed camera_id=%s status=%s", camera_id, status)
 
     for camera_id in set(_path_add_retries) - desired:
         _path_add_retries.pop(camera_id, None)
+    for camera_id in desired & _known_paths:
+        cached = _p2p_source_choice.get(camera_id)
+        if cached is None or not _choice_expired(cached):
+            continue
+        try:
+            main_url = camera_url_fn(camera_map[camera_id])
+        except Exception as error:
+            logger.warning("webrtc_publisher.camera_url_unavailable camera_id=%s error=%s", camera_id, error)
+            continue
+        previous = (cached[1], cached[2] if len(cached) > 2 else None)
+        source, stream_kind = p2p_source_for(camera_id, main_url)
+        if (source, stream_kind) != previous:
+            status, _ = _config_request("POST", f"/v3/config/paths/replace/{camera_id}", path_config_for(source, stream_kind))
+            if status not in (200, 201):
+                logger.warning("webrtc_publisher.path_replace_failed camera_id=%s status=%s", camera_id, status)
+                _known_paths.discard(camera_id)  # re-added on the next sync
+            else:
+                logger.info("webrtc_publisher.p2p_source_changed camera_id=%s stream=%s", camera_id, stream_kind)
 
     for camera_id in desired - _known_paths:
         camera_number = camera_map[camera_id]
@@ -734,8 +956,8 @@ def sync_camera_paths(camera_url_fn) -> None:
         except Exception as error:
             logger.warning("webrtc_publisher.camera_url_unavailable camera_id=%s error=%s", camera_id, error)
             continue
-        source, _stream_kind = p2p_source_for(camera_id, source)
-        path_config = {"source": source, "sourceOnDemand": True}
+        source, stream_kind = p2p_source_for(camera_id, source)
+        path_config = path_config_for(source, stream_kind)
         status, _ = _config_request("POST", f"/v3/config/paths/add/{camera_id}", path_config)
         if status == 0 and _defer_path_add(camera_id):
             # MediaMTX never answered (2026-09-25, Ryzen: a timeout right
@@ -769,6 +991,33 @@ def _resolve_location(location: str) -> str:
     return MEDIAMTX_WEBRTC_BASE + (location if location.startswith("/") else f"/{location}")
 
 
+def _whep_error_reason(error) -> str:
+    """MediaMTX's own rejection reason (its JSON {"error": ...} body), made
+    safe to log: RTSP URLs, ICE credentials, fingerprints, candidates and
+    any SDP are removed, and the text is capped."""
+    try:
+        body = error.read(2048).decode("utf-8", errors="replace")
+    except Exception:
+        return "unavailable"
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            body = parsed["error"]
+    except ValueError:
+        pass
+    body = re.sub(r"rtsps?://\S*", "<rtsp-url>", body)
+    body = re.sub(r"fingerprint[:=]\s*\S+(\s+[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2})*)?", "fingerprint:<redacted>", body, flags=re.IGNORECASE)
+    body = re.sub(r"(ice-pwd|ice-ufrag)[:=]\s*\S+", r"\1:<redacted>", body, flags=re.IGNORECASE)
+    body = re.sub(r"candidate:[^\r\n\"]*?\btyp\s+\S+", "candidate:<redacted>", body)
+    body = re.sub(r"candidate:\S+", "candidate:<redacted>", body)
+    body = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", body)
+    body = re.sub(r"\[?(?<![0-9A-Fa-f:])(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+                  r"|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)"
+                  r"(?:%[\w.-]+)?(?![0-9A-Fa-f:])\]?", "<ip>", body)
+    body = re.sub(r"v=0.*", "<sdp-redacted>", body, flags=re.DOTALL)
+    return " ".join(body.split())[:200] or "empty"
+
+
 def whep_offer(path_name: str, sdp_offer: str) -> tuple[str, str] | None:
     """POSTs a complete (non-trickle -- see module docstring) SDP offer to
     MediaMTX's local WHEP endpoint for one camera's path. Returns
@@ -791,7 +1040,10 @@ def whep_offer(path_name: str, sdp_offer: str) -> tuple[str, str] | None:
                 return None
             return _resolve_location(location), answer_sdp
     except urllib.error.HTTPError as error:
-        logger.warning("webrtc_publisher.whep_offer_rejected path=%s status=%s", path_name, error.code)
+        reason = _whep_error_reason(error)
+        logger.warning("webrtc_publisher.whep_offer_rejected path=%s status=%s reason=%s", path_name, error.code, reason)
+        if error.code == 400 and "codec" in reason.lower():
+            _revalidate_after_codec_rejection(path_name)
         return None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         logger.warning("webrtc_publisher.whep_offer_unreachable path=%s error=%s", path_name, error)
