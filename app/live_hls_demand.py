@@ -6,9 +6,20 @@ browser-playable HLS) ran for every camera all the time. Measured on the
 Samsung appliance with one 8MP H.265 camera and no viewer: 3.26 cores.
 
 ANYAICAM_LIVE_HLS_MODE:
-  always     (default) the encoder runs all the time -- the previous
-             behaviour exactly; every function below that changes behaviour
-             is a no-op in this mode.
+  auto       (default since 2026-10-11, video-pipeline P2b) on_demand while
+             NO always-on consumer of the live HLS output remains, else
+             always; re-evaluated every AUTO_RECHECK_SECONDS by the policy
+             main.py registers (set_auto_policy): AI frames and motion are
+             not read from HLS (ANYAICAM_AI_SOURCE / ANYAICAM_MOTION_SOURCE
+             not "hls"), and the appliance agent has advertised (fresh
+             AGENT_MARKER in the HLS folder) that it reads camera<N>.alive --
+             an older agent would report an idle camera offline. Per-camera
+             HLS fallbacks (motion/AI after reader failures) keep that
+             camera's encoder running through hold()/touch(), which are
+             recorded in auto mode too.
+  always     the encoder runs all the time -- the previous behaviour
+             exactly; every function below that changes behaviour is a
+             no-op in this mode.
   on_demand  the encoder runs only while something needs it:
                * a browser/proxy request for the camera's playlist or a
                  segment (/static/hls/..., the customer live playlist,
@@ -38,11 +49,16 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-LIVE_HLS_MODES = ("always", "on_demand")
+LIVE_HLS_MODES = ("always", "on_demand", "auto")
+# Written by the appliance agent (anyaicam_agent.camera_binding) into the HLS
+# folder while it runs a status reader that accepts camera<N>.alive.
+AGENT_MARKER = "agent-reads-alive.marker"
+AGENT_MARKER_FRESH_SECONDS = 900.0
+AUTO_RECHECK_SECONDS = 30.0
 
 
 def configured_mode(value: Optional[str] = None) -> str:
-    raw = os.environ.get("ANYAICAM_LIVE_HLS_MODE", "always") if value is None else value
+    raw = os.environ.get("ANYAICAM_LIVE_HLS_MODE", "auto") if value is None else value
     mode = (raw or "").strip().lower().replace("-", "_")
     return mode if mode in LIVE_HLS_MODES else "always"
 
@@ -72,6 +88,12 @@ _last_demand: dict[int, float] = {}
 _holds: dict[int, set[str]] = {}
 _providers: list[Callable[[], Iterable[int]]] = []
 _last_source_frame: dict[int, float] = {}
+_auto_policy: Optional[Callable[[], bool]] = None
+_auto_log: Callable[[str], None] = lambda message: None
+_auto_state: list = [None, -1e18]  # [last decision, evaluated at]
+# When auto mode switched to on demand: every running encoder gets a full
+# IDLE_SECONDS from then (a viewer mid-stream is never cut off by the switch).
+_auto_on_demand_since: list = [None]
 
 
 def configure(mode: Optional[str] = None, idle_seconds: Optional[float] = None,
@@ -86,20 +108,57 @@ def configure(mode: Optional[str] = None, idle_seconds: Optional[float] = None,
         _holds.clear()
         _providers.clear()
         _last_source_frame.clear()
+        _auto_state[:] = [None, -1e18]
+        _auto_on_demand_since[0] = None
 
 
 def mode() -> str:
     return _mode
 
 
+def set_auto_policy(policy: Optional[Callable[[], bool]], log: Callable[[str], None] = None) -> None:
+    """main.py: policy() -> True when no always-on HLS consumer remains."""
+    global _auto_policy, _auto_log
+    _auto_policy = policy
+    if log is not None:
+        _auto_log = log
+    _auto_state[:] = [None, -1e18]
+
+
 def on_demand() -> bool:
-    return _mode == "on_demand"
+    if _mode == "on_demand":
+        return True
+    if _mode != "auto" or _auto_policy is None:
+        return False
+    now = _clock()
+    if _auto_state[0] is not None and now - _auto_state[1] < AUTO_RECHECK_SECONDS:
+        return _auto_state[0]
+    try:
+        decision = bool(_auto_policy())
+    except Exception:
+        decision = False
+    if decision and not _auto_state[0]:
+        _auto_on_demand_since[0] = now
+    if decision != _auto_state[0]:
+        _auto_log("Live HLS (auto): " + ("on demand -- no always-on consumer remains." if decision
+                                         else "always on -- a consumer still needs it."))
+    _auto_state[:] = [decision, now]
+    return decision
+
+
+def effective_mode() -> str:
+    return "on_demand" if on_demand() else "always"
+
+
+def agent_marker_fresh(hls_folder: Path, now: Optional[float] = None) -> bool:
+    age = file_age(Path(hls_folder) / AGENT_MARKER, now)
+    return age is not None and age <= AGENT_MARKER_FRESH_SECONDS
 
 
 def touch(camera_number: int, reason: str = "request") -> None:
     """Something needs this camera's live HLS now (keeps it running for
     IDLE_SECONDS more). Cheap; safe from any thread; no-op in "always"."""
-    if _mode != "on_demand":
+    if _mode == "always":
         return
     try:
         number = int(camera_number)
@@ -111,7 +170,7 @@ def touch(camera_number: int, reason: str = "request") -> None:
 
 def hold(camera_number: int, owner: str) -> None:
     """A long-lived internal reader keeps the encoder running until release()."""
-    if _mode != "on_demand":
+    if _mode == "always":
         return
     with _lock:
         _holds.setdefault(int(camera_number), set()).add(owner)
@@ -148,7 +207,7 @@ def _provided(camera_number: int) -> bool:
 
 def wanted(camera_number: int) -> bool:
     """True when the encoder for this camera should be running."""
-    if _mode != "on_demand":
+    if not on_demand():
         return True
     number = int(camera_number)
     with _lock:
@@ -156,6 +215,9 @@ def wanted(camera_number: int) -> bool:
             return True
         last = _last_demand.get(number)
         now = _clock()
+    since = _auto_on_demand_since[0] if _mode == "auto" else None
+    if since is not None and (last is None or since > last):
+        last = since
     if last is not None and now - last < _idle_seconds:
         return True
     return _provided(number)
@@ -163,7 +225,7 @@ def wanted(camera_number: int) -> bool:
 
 def note_source_frame(camera_number: int) -> None:
     """The motion reader received a frame straight from the camera."""
-    if _mode != "on_demand":
+    if _mode == "always":
         return
     with _lock:
         _last_source_frame[int(camera_number)] = _clock()
@@ -181,7 +243,7 @@ def alive_path(hls_folder: Path, camera_number: int) -> Path:
 
 
 def write_alive(hls_folder: Path, camera_number: int) -> None:
-    if _mode != "on_demand":
+    if not on_demand():
         return
     path = alive_path(hls_folder, camera_number)
     try:
@@ -240,5 +302,5 @@ def state(camera_number: int) -> dict:
         holds = sorted(_holds.get(int(camera_number), ()))
         last = _last_demand.get(int(camera_number))
         now = _clock()
-    return {"mode": _mode, "holds": holds,
+    return {"mode": _mode, "effective": effective_mode(), "holds": holds,
             "seconds_since_demand": None if last is None else round(now - last, 1)}

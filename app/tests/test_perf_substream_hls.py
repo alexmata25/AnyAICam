@@ -337,8 +337,9 @@ def test_always_mode_is_inert(tmp_path):
     assert not live_hls_demand.alive_path(tmp_path, 1).exists()
 
 
-@pytest.mark.parametrize("value,expected", [(None, "always"), ("on_demand", "on_demand"), ("on-demand", "on_demand"),
-                                            ("ALWAYS", "always"), ("x", "always")])
+# video-pipeline P2b (2026-10-11): the default is now "auto" (test_live_hls_auto_mode.py).
+@pytest.mark.parametrize("value,expected", [(None, "auto"), ("on_demand", "on_demand"), ("on-demand", "on_demand"),
+                                            ("ALWAYS", "always"), ("x", "always"), ("auto", "auto")])
 def test_live_hls_mode_parsing(monkeypatch, value, expected):
     monkeypatch.delenv("ANYAICAM_LIVE_HLS_MODE", raising=False)
     assert live_hls_demand.configured_mode(value) == expected

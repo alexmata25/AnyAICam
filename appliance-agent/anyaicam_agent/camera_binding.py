@@ -370,6 +370,27 @@ class LocalVmsStatusReader:
         self.stream_freshness_seconds = stream_freshness_seconds
         self.recording_freshness_seconds = recording_freshness_seconds
 
+    # VMS ANYAICAM_LIVE_HLS_MODE=auto (app/live_hls_demand.py AGENT_MARKER,
+    # 2026-10-11): the VMS lets its live encoder go idle only while this
+    # marker is fresh, i.e. while an agent that accepts camera<N>.alive (this
+    # reader) is running. An older agent never writes it, so the VMS keeps the
+    # encoder always on and the playlist fresh for it.
+    ALIVE_SUPPORT_MARKER = 'agent-reads-alive.marker'
+    ALIVE_SUPPORT_REFRESH_SECONDS = 60
+
+    def advertise_alive_support(self, now: float | None = None) -> None:
+        now = datetime.now(timezone.utc).timestamp() if now is None else now
+        if now - getattr(self, '_marker_written_at', -1e18) < self.ALIVE_SUPPORT_REFRESH_SECONDS:
+            return
+        marker = self.hls_path / self.ALIVE_SUPPORT_MARKER
+        try:
+            if self.hls_path.is_dir():
+                marker.touch(exist_ok=True)
+                os.utime(marker, None)
+                self._marker_written_at = now
+        except OSError:
+            pass
+
     @staticmethod
     def _fresh(path: Path, threshold: int, now: float) -> bool:
         try:
@@ -391,6 +412,7 @@ class LocalVmsStatusReader:
         # while the camera is reachable. The VMS never writes that file when
         # the encoder is always on, so this changes nothing there.
         alive = self.hls_path / f'camera{camera_number}.alive'
+        self.advertise_alive_support(now)
         result = {
             'online': (self._fresh(manifest, self.stream_freshness_seconds, now)
                        or self._fresh(alive, self.stream_freshness_seconds, now)),

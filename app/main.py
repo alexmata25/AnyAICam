@@ -558,7 +558,9 @@ HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).paren
 
 HLS_URL_PREFIX = "/static/hls"
 # On-demand live HLS (2026-10-10, perf-substream-hls): see live_hls_demand.py.
-# ANYAICAM_LIVE_HLS_MODE=always (the default) keeps the previous behaviour.
+# ANYAICAM_LIVE_HLS_MODE=auto (the default since 2026-10-11, video-pipeline P2b)
+# runs the encoder on demand only when no always-on consumer remains
+# (_live_hls_auto_policy()); always keeps the previous behaviour.
 import live_hls_demand
 
 HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
@@ -36703,6 +36705,23 @@ ai_frames = analytics_frames.AnalyticsFrames(analytics_source_spec)
 _video_probe_listeners.append(ai_frames.restart)
 
 
+def _live_hls_auto_policy() -> bool:
+    """ANYAICAM_LIVE_HLS_MODE=auto (live_hls_demand.py, video-pipeline P2b):
+    the live encoder may run on demand only when no always-on consumer of
+    the HLS output remains -- see docs/video-pipeline-20261011.md for the
+    consumer list. Motion and AI frames must not be configured to read HLS
+    (their per-camera fallbacks hold/touch the encoder themselves), and the
+    appliance agent must have advertised that it reads camera<N>.alive."""
+    if MOTION_DETECTION_ENABLED and _motion_source_selector.mode == "hls":
+        return False
+    if ai_frames.mode == "hls":
+        return False
+    return live_hls_demand.agent_marker_fresh(HLS_FOLDER)
+
+
+live_hls_demand.set_auto_policy(_live_hls_auto_policy, log=print)
+
+
 def _event_buffer_full_frame(camera_number: int):
     """Event mode only: the newest frame of the pre-event buffer (no extra
     camera session) -- lpr.latest_full_resolution_frame, as before."""
@@ -41892,7 +41911,7 @@ async def forwarded_https_middleware(request: Request, call_next):
 
     # On-demand live HLS (live_hls_demand.py): a player or the WireGuard
     # proxy asking for a camera's playlist/segment is live-video demand.
-    if live_hls_demand.on_demand() and request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
+    if live_hls_demand.mode() != "always" and request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
         demanded_camera = live_hls_demand.camera_number_from_hls_path(request.url.path)
         if demanded_camera is not None:
             live_hls_demand.touch(demanded_camera, "http")
