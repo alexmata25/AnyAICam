@@ -238,7 +238,8 @@ def purchase_intent_next(raw) -> str | None:
 def _setup_needed(customer_id: str) -> bool:
     """No activated appliance yet: the same test /customer-account uses
     before sending an owner to /customer/setup."""
-    return not row("SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated' LIMIT 1", (customer_id,))
+    from appliance_readiness import customer_has_activated_appliance
+    return not customer_has_activated_appliance(customer_id)
 
 
 BUILD_PENDING = "pending_checkout"

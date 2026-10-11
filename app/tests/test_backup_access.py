@@ -318,6 +318,10 @@ def test_feedback_plays_only_where_turned_on_and_audible(monkeypatch):
 
 
 def test_door_feedback_setting_is_owner_controlled_and_off_with_the_door(home, db_path):
+    # A working door needs the Face Access add-on (2026-10-10, door_access.py).
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,created_at) "
+                     "VALUES('fa-cust-1','cust-1',NULL,'facial_recognition','active','2026-10-10T00:00:00')")
     assert home.get("/api/customer/cameras/cam-3/door-config", cookies=_cookie(*OWNER)).json()["door_feedback_enabled"] == 0
     saved = home.post("/api/customer/cameras/cam-3/door-config", cookies=_cookie(*OWNER),
                       json={"door_access_enabled": True, "door_relay_channel": 1, "door_feedback_enabled": True})

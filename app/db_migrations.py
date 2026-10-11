@@ -1447,6 +1447,14 @@ def apply_migrations():
         if 'door_access_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_access_enabled INTEGER')
         if 'door_relay_channel' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_relay_channel INTEGER')
         if 'door_relay_pulse_ms' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_relay_pulse_ms INTEGER')
+        # A door the owner set up BEFORE holding Face Access (2026-10-10):
+        # Face Access is billed per door, so the door has to exist to be
+        # bought, but it must not unlock anything until the add-on is
+        # active. door_access_requested=1 holds that door (relay channel and
+        # duration included) with door_access_enabled left 0, so every door
+        # consumer stays off; analytics_entitlements promotes it when Face
+        # Access is granted. NULL/0 on every existing row.
+        if 'door_access_requested' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_access_requested INTEGER')
         # Local Event-mode recording (2026-09-20): same no-hidden-default
         # convention as cloud_recording_mode above, deliberately kept as a
         # completely separate column/concept -- cloud_recording_mode gates

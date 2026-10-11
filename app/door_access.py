@@ -31,6 +31,26 @@ from partner_db import audit, connection
 from partner_portal import partner_identity
 
 
+def face_access_active(customer_id: str | None) -> bool:
+    """Whether this account holds the Face Access add-on: the same
+    account-level facial_recognition analytic /aac/people gates on
+    (facial_recognition_ui._customer_facial_context, main._face_access_active).
+    Fail-closed: no customer, or an error reading entitlements, is "no"."""
+    if not customer_id:
+        return False
+    try:
+        from analytics_entitlements import get_active_analytics_for_customer
+        return 'facial_recognition' in get_active_analytics_for_customer(customer_id)
+    except Exception:
+        return False
+
+
+FACE_ACCESS_REQUIRED_MESSAGE = (
+    "{name} is saved as a door. Unlock and automatic Face Access stay off until the Face Access "
+    "add-on is active -- add it on My subscription (it is billed per door)."
+)
+
+
 def _customer_identity(request: Request) -> dict:
     identity = partner_identity(request)
     if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
@@ -421,12 +441,16 @@ def register_door_access_routes(app: FastAPI) -> None:
         identity = _customer_identity(request)
         with connection() as db:
             camera = db.execute(
-                'SELECT id,name,door_access_enabled,door_relay_channel,door_relay_pulse_ms,door_feedback_enabled FROM cameras WHERE id=? AND customer_id=?',
+                'SELECT id,name,door_access_enabled,door_relay_channel,door_relay_pulse_ms,door_feedback_enabled,'
+                'door_access_requested FROM cameras WHERE id=? AND customer_id=?',
                 (camera_id, identity['customer_id']),
             ).fetchone()
         if not camera:
             raise HTTPException(status_code=404, detail='Camera not found.')
-        return dict(camera)
+        result = dict(camera)
+        result['door_access_requested'] = bool(result.get('door_access_requested'))
+        result['face_access_active'] = face_access_active(identity['customer_id'])
+        return result
 
     @app.post('/api/customer/cameras/{camera_id}/door-config')
     def update_door_config(request: Request, camera_id: str, payload: dict) -> dict:
@@ -461,22 +485,41 @@ def register_door_access_routes(app: FastAPI) -> None:
             # stale channel for a camera that is no longer a door.
             relay_channel = None
             pulse_ms = None
+        # Face Access gate (2026-10-10): a door unlocks (manually, from AACO,
+        # a Voice Call or a recognized face) only for an account holding the
+        # Face Access add-on. Without it the door is kept as REQUESTED
+        # (door_access_requested=1, door_access_enabled=0): Face Access is
+        # billed per door, so the door must exist before it can be bought
+        # (analytics_entitlements.NO_DOORS_REASON), but nothing reads it as
+        # a door -- not the appliance configuration, the live tile, AACO or
+        # the unlock routes -- until the add-on is granted, which promotes
+        # it (analytics_entitlements.promote_requested_doors). Turning a
+        # door off never needs the add-on.
+        requested = False
+        if enabled and not face_access_active(identity['customer_id']):
+            requested, enabled, feedback = True, False, False
         with connection() as db:
             camera = db.execute('SELECT id,name FROM cameras WHERE id=? AND customer_id=?', (camera_id, identity['customer_id'])).fetchone()
             if not camera:
                 raise HTTPException(status_code=404, detail='Camera not found.')
             db.execute(
-                'UPDATE cameras SET door_access_enabled=?,door_relay_channel=?,door_relay_pulse_ms=?,door_feedback_enabled=? WHERE id=?',
-                (1 if enabled else 0, relay_channel, pulse_ms, 1 if feedback else 0, camera_id),
+                'UPDATE cameras SET door_access_enabled=?,door_access_requested=?,door_relay_channel=?,door_relay_pulse_ms=?,door_feedback_enabled=? WHERE id=?',
+                (1 if enabled else 0, 1 if requested else 0, relay_channel, pulse_ms, 1 if feedback else 0, camera_id),
             )
         audit(
             identity, 'camera.door_access_configured', 'camera', camera_id,
-            {'door_access_enabled': enabled, 'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms,
-             'door_feedback_enabled': feedback},
+            {'door_access_enabled': enabled, 'door_access_requested': requested, 'door_relay_channel': relay_channel,
+             'door_relay_pulse_ms': pulse_ms, 'door_feedback_enabled': feedback},
         )
+        if requested:
+            message = FACE_ACCESS_REQUIRED_MESSAGE.format(name=camera['name'])
+        else:
+            message = f"Door access {'enabled' if enabled else 'disabled'} for {camera['name']}."
         return {
-            'message': f"Door access {'enabled' if enabled else 'disabled'} for {camera['name']}.",
-            'door_access_enabled': enabled, 'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms,
+            'message': message,
+            'door_access_enabled': enabled, 'door_access_requested': requested,
+            'face_access_required': requested,
+            'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms,
             'door_feedback_enabled': feedback,
         }
 

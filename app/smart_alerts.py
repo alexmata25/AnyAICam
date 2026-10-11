@@ -97,6 +97,37 @@ def _time_label(timestamp: str | None, tz) -> str:
     return parsed.astimezone(tz).strftime("%b %d · %I:%M %p").replace(" 0", " ")
 
 
+_LOCAL_TIME_FALLBACK = {
+    "datetime": "%b %d, %Y · %I:%M:%S %p UTC",
+    "short": "%b %d · %I:%M %p UTC",
+    "time": "%I:%M %p UTC",
+}
+
+
+def local_time_html(timestamp: str | None, style: str = "datetime") -> str:
+    """A <time> element the page's LOCAL_TIME_SCRIPT formats in the VIEWER's
+    own time zone (2026-10-10). Events and Alerts used to format on the
+    server in a fixed America/Chicago, while Investigate and Playback use
+    the browser's zone, so one event showed two different times to anyone
+    outside Central time. datetime= carries the exact UTC instant; the text
+    inside is an explicit-UTC fallback for a browser without script."""
+    parsed = _parse(timestamp)
+    if not parsed:
+        return escape(str(timestamp or "Unknown time"))
+    utc = parsed.astimezone(timezone.utc)
+    style = style if style in _LOCAL_TIME_FALLBACK else "datetime"
+    fallback = utc.strftime(_LOCAL_TIME_FALLBACK[style]).replace(" 0", " ")
+    return (f'<time datetime="{utc.strftime("%Y-%m-%dT%H:%M:%SZ")}" data-local-time="{style}">'
+            f'{escape(fallback)}</time>')
+
+
+# Formats every <time data-local-time> from local_time_html() in the viewer's
+# zone, with the same options Investigate uses for an event time.
+LOCAL_TIME_SCRIPT = """<script>(function(){var o={datetime:{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit'},short:{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'},time:{hour:'numeric',minute:'2-digit'}};
+function run(root){(root||document).querySelectorAll('time[data-local-time]').forEach(function(el){var d=new Date(el.getAttribute('datetime')||'');if(isNaN(d.getTime()))return;el.textContent=d.toLocaleString([],o[el.getAttribute('data-local-time')]||o.datetime);el.title=d.toISOString().replace('.000Z','Z')+' (UTC)';});}
+window.anyaicamLocalTimes=run;run(document);})();</script>"""
+
+
 def _thumb(group: dict) -> str:
     latest = group["latest"]
     camera_id, event_id = latest.get("camera_id"), latest.get("event_id")
@@ -124,9 +155,10 @@ def render_inbox(groups: list[dict], *, view: str, tz, alert_text: Callable[[dic
         camera_id = latest.get("camera_id")
         camera_name = latest.get("camera_name") or "System"
         title, message = alert_text(latest)
-        when = _time_label(latest.get("timestamp"), tz)
+        # Viewer's own time zone (local_time_html); `tz` is kept for callers.
+        when_html = local_time_html(latest.get("timestamp"), "short")
         if group["count"] > 1:
-            when = f'{_time_label(group["items"][-1].get("timestamp"), tz)} – {when.split(" · ")[-1]}'
+            when_html = f'{local_time_html(group["items"][-1].get("timestamp"), "short")} – {local_time_html(latest.get("timestamp"), "time")}'
         is_saved = any(item.get("bookmarked_at") for item in group["items"])
         actions = []
         if group["event_type"] == "aac_voice_call" and latest.get("event_id"):
@@ -156,7 +188,7 @@ def render_inbox(groups: list[dict], *, view: str, tz, alert_text: Callable[[dic
         attrs = (f'data-sa-card data-category="{group["category"]}" data-event-type="{escape(group["event_type"], quote=True)}" '
                  f'data-ids="{_ids(group)}"')
         head = (f'{_thumb(group)}<div class="sa-text"><strong>{escape(title)} {count_badge}</strong>'
-                f'<span>{escape(camera_name)} · {escape(when)}</span>'
+                f'<span>{escape(camera_name)} · {when_html}</span>'
                 f'{f"<span class=sa-msg>{escape(message)}</span>" if message and message != title else ""}</div>')
         body = f'<div class="sa-actions">{"".join(actions)}</div>'
         if group["pinned"]:
@@ -183,7 +215,7 @@ def render_inbox(groups: list[dict], *, view: str, tz, alert_text: Callable[[dic
 {f'<p class="health-detail" id="sa-capped">Showing your latest {capped_at} alerts. Older ones are in <a href="/events">Events</a>.</p>' if capped_at else ''}
 <section class="sa-list" id="sa-list">{"".join(cards) or f'<div class="empty-stage" id="sa-empty">{empty}</div>'}</section>
 <div class="empty-stage" id="sa-filter-empty" hidden>No alerts in this category.</div>'''
-    return content, SMART_ALERTS_SCRIPT
+    return content, LOCAL_TIME_SCRIPT + SMART_ALERTS_SCRIPT
 
 
 SMART_ALERTS_CSS = '''<style>

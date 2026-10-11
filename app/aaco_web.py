@@ -320,7 +320,11 @@ def render_aaco_floating_widget() -> str:
 @media (max-width:480px){{.aaco-float-root{{right:10px;bottom:10px}}.aaco-float-panel{{right:10px;bottom:70px}}}}
 /* Phones with the portal's bottom tab bar (<=760px): sit above the bar so
    the button never covers its last tab (2026-09-25). */
-@media (max-width:760px){{body:has(.mobile-nav) .aaco-float-root{{bottom:84px}}body:has(.mobile-nav) .aaco-float-panel{{bottom:146px;max-height:min(60vh,520px)}}}}
+/* The bar is not always one row: at 390px the customer bar wraps to two
+   rows and the button sat on "Playback" (2026-10-10). The script below
+   measures the bar and sets --aaco-nav-clearance to its real height;
+   84px is only the fallback for a one-row bar. */
+@media (max-width:760px){{body:has(.mobile-nav) .aaco-float-root{{bottom:var(--aaco-nav-clearance,84px)}}body:has(.mobile-nav) .aaco-float-panel{{bottom:calc(var(--aaco-nav-clearance,84px) + 62px);max-height:min(60vh,520px)}}}}
 /* Pages whose primary actions sit at the bottom right (e.g. the setup
    wizard's "Save and continue") give the button a place in their own
    action row: an element marked data-aaco-dock-slot. The button moves
@@ -342,6 +346,21 @@ var toggle=document.getElementById('aaco-float-toggle'),panel=document.getElemen
 if(!toggle||!panel)return;
 var slot=document.querySelector('[data-aaco-dock-slot]'),root=toggle.parentElement;
 if(slot&&root){{slot.appendChild(root);root.classList.add('aaco-docked');}}
+var navObserved=false;
+function clearMobileNav(){{
+var nav=document.querySelector('.mobile-nav');
+if(!nav)return;
+if(!navObserved&&window.ResizeObserver){{navObserved=true;new ResizeObserver(clearMobileNav).observe(nav);}}
+var rect=nav.getBoundingClientRect(),view=window.innerHeight||document.documentElement.clientHeight;
+var shown=getComputedStyle(nav).display!=='none'&&rect.height>0&&rect.top>view/2;
+if(shown)document.documentElement.style.setProperty('--aaco-nav-clearance',Math.ceil(view-rect.top+12)+'px');
+else document.documentElement.style.removeProperty('--aaco-nav-clearance');
+}}
+clearMobileNav();
+window.addEventListener('resize',clearMobileNav);
+window.addEventListener('orientationchange',clearMobileNav);
+document.addEventListener('DOMContentLoaded',clearMobileNav);
+window.addEventListener('load',clearMobileNav);
 function setOpen(open){{
 panel.hidden=!open;
 toggle.setAttribute('aria-expanded',open?'true':'false');
