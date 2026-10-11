@@ -61,7 +61,11 @@ DOCKER_STUB = textwrap.dedent(r'''\
         touch "$PL_LOADED_MARK"; echo "Loaded image: $PL_REF"; exit 0 ;;
       image)
         if [[ "$2" == inspect ]]; then
-          [[ -f "$PL_LOADED_MARK" || "${PL_PREEXISTING:-0}" == 1 ]] || exit 1
+          if [[ ! -f "$PL_LOADED_MARK" ]]; then
+            # Before any load: only a pre-existing preload tag exists, on another image.
+            [[ "${PL_PREEXISTING:-0}" == 1 ]] || exit 1
+            printf '%s\n' "$PL_PREEXISTING_ID"; exit 0
+          fi
           case "$4" in
             *release-commit*) printf '%s\n' "$PL_LABEL_COMMIT" ;;
             *payload-sha256*) printf '%s\n' "$PL_LABEL_PAYLOAD" ;;
@@ -312,14 +316,22 @@ class PreloadedImageInstallerTests(unittest.TestCase):
         result, calls = self.run_prepare(release, PL_FREE_BYTES=str(exact - 1))
         self.assert_built_not_loaded(result, calls)
 
-    def test_a_preload_tag_that_existed_before_this_run_is_never_removed(self):
-        for stub in ({"PL_LOAD": "fail"}, {"PL_LOADED_ID": "sha256:" + "9" * 64}, {}):
+    def test_a_preload_tag_that_existed_before_this_run_is_restored_to_its_image(self):
+        previous = "sha256:" + "5" * 64   # the operator's own image, not the release's
+        cases = ({"PL_LOAD": "fail"}, {"PL_LOADED_ID": "sha256:" + "9" * 64},
+                 {"PL_LABEL_COMMIT": "d" * 40}, {})
+        for stub in cases:
             with self.subTest(stub=stub):
                 self.log.unlink(missing_ok=True)
                 self.loaded_mark.unlink(missing_ok=True)
-                result, calls = self.run_prepare(PL_PREEXISTING="1", **stub)
+                result, calls = self.run_prepare(PL_PREEXISTING="1", PL_PREEXISTING_ID=previous, **stub)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("docker image rm", calls)
+                after_load = calls.split("docker load", 1)[1]
+                self.assertIn(f"docker tag {previous} anyaicam-vms-preload:{SHORT}", after_load)
+                if not stub:   # success: the release tag still names the verified image
+                    self.assertIn(f"docker tag {IMAGE_ID} anyaicam-vms:release-{SHORT}", calls)
+                    self.assertNotIn("docker build", calls)
 
     def test_a_preload_tag_created_by_this_run_is_removed_on_load_failure(self):
         result, calls = self.run_prepare(PL_LOAD="fail")

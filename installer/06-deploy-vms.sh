@@ -340,9 +340,15 @@ _vms_preload_space_ok() {
     return 0
 }
 
-# Removes the preload name this run created; keeps one that existed before.
+# Removes the preload name this run created. A name that existed before the
+# run ($1 = its image ID then) is pointed back at that image: docker load
+# moves the name to the loaded image.
 _vms_preload_untag() {
-    [[ "$1" == "1" ]] && return 0
+    if [[ -n "$1" ]]; then
+        docker tag "$1" "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 \
+            || log "WARNING: could not restore $VMS_PRELOAD_IMAGE_REF to its previous image $1."
+        return 0
+    fi
     docker image rm "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1 || true
 }
 
@@ -352,7 +358,7 @@ load_preloaded_vms_image() {
     local staged="$1" staging_root="$2" image_tag="$3"
     local short="${VMS_RELEASE_COMMIT:0:12}" tar_rel tar_path bundle_root real_tar
     local load_timeout copy_dir copy sha actual_payload loaded_id label_commit label_payload
-    local arch expected_platform preload_ref_existed=0
+    local arch expected_platform preload_ref_previous=""
 
     if [[ "${ANYAICAM_VMS_PRELOAD:-1}" == "0" ]]; then
         log "ANYAICAM_VMS_PRELOAD=0: not using a preloaded VMS image."
@@ -424,16 +430,20 @@ load_preloaded_vms_image() {
         return 1
     fi
     # A tag of that name that already existed before this run (e.g. from an
-    # operator's own load) is never removed by this installer.
-    if docker image inspect "$VMS_PRELOAD_IMAGE_REF" >/dev/null 2>&1; then
-        preload_ref_existed=1
+    # operator's own load) is never removed: its image ID is recorded and the
+    # name is restored to it afterwards, whatever happens.
+    preload_ref_previous="$(docker image inspect -f '{{.Id}}' "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)" \
+        || preload_ref_previous=""
+    if [[ -n "$preload_ref_previous" && ! "$preload_ref_previous" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        rm -rf -- "$copy_dir"
+        _vms_preload_reject "the existing $VMS_PRELOAD_IMAGE_REF has an unreadable image ID"; return 1
     fi
     load_timeout="${ANYAICAM_VMS_LOAD_TIMEOUT:-1800}"
     [[ "$load_timeout" =~ ^[1-9][0-9]*$ ]] || load_timeout=1800
     log "Loading the verified preloaded VMS image ($(( VMS_PRELOAD_IMAGE_BYTES / 1048576 )) MiB, timeout ${load_timeout}s) ..."
     if ! timeout --kill-after=30s "${load_timeout}s" docker load -q -i "$copy"; then
         rm -rf -- "$copy_dir"
-        _vms_preload_untag "$preload_ref_existed"
+        _vms_preload_untag "$preload_ref_previous"
         _vms_preload_reject "docker load failed"; return 1
     fi
     rm -rf -- "$copy_dir" || log "WARNING: could not remove the temporary image archive copy in $copy_dir."
@@ -442,19 +452,19 @@ load_preloaded_vms_image() {
     label_commit="$(docker image inspect -f "{{index .Config.Labels \"$VMS_PRELOAD_LABEL_COMMIT\"}}" "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
     label_payload="$(docker image inspect -f "{{index .Config.Labels \"$VMS_PRELOAD_LABEL_PAYLOAD\"}}" "$VMS_PRELOAD_IMAGE_REF" 2>/dev/null)"
     if [[ -z "$loaded_id" || ( "$loaded_id" != "$VMS_PRELOAD_IMAGE_ID" && "$loaded_id" != "$VMS_PRELOAD_IMAGE_CONFIG_DIGEST" ) ]]; then
-        _vms_preload_untag "$preload_ref_existed"
+        _vms_preload_untag "$preload_ref_previous"
         _vms_preload_reject "the loaded image ID (${loaded_id:-none}) is not the release's ($VMS_PRELOAD_IMAGE_ID)"; return 1
     fi
     if [[ "$label_commit" != "$VMS_RELEASE_COMMIT" || "$label_payload" != "$VMS_PRELOAD_IMAGE_PAYLOAD_SHA256" ]]; then
-        _vms_preload_untag "$preload_ref_existed"
+        _vms_preload_untag "$preload_ref_previous"
         _vms_preload_reject "the loaded image's labels (commit ${label_commit:-none}, payload ${label_payload:-none}) do not match this release"; return 1
     fi
     # Tag by the verified ID, never by a name something else could move.
     if ! docker tag "$loaded_id" "$image_tag" || [[ "$(docker image inspect -f '{{.Id}}' "$image_tag" 2>/dev/null)" != "$loaded_id" ]]; then
-        _vms_preload_untag "$preload_ref_existed"
+        _vms_preload_untag "$preload_ref_previous"
         _vms_preload_reject "could not tag the verified image as $image_tag"; return 1
     fi
-    _vms_preload_untag "$preload_ref_existed"   # untag only; $image_tag keeps it
+    _vms_preload_untag "$preload_ref_previous"   # untag only; $image_tag keeps it
     log "Verified preloaded VMS image $loaded_id loaded as $image_tag (no image build needed)."
     return 0
 }

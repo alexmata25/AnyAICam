@@ -2,6 +2,11 @@
 # AnyAiCam customer-ready appliance installer -- entrypoint/orchestrator.
 # Runtime installers are built artifacts: VMS payload + release metadata are
 # embedded at build time from one exact approved release commit/archive.
+#
+# Root of trust: the SHA-256 of the installer tarball, checked out of band
+# BEFORE extraction. verify_installer_payload (artifact-files.json) catches a
+# corrupted or mixed folder, but it is not tamper-proofing: whoever can edit
+# this folder can edit this script. See ARTIFACT_MANIFEST.md.
 set -euo pipefail
 
 INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

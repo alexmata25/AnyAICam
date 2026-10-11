@@ -111,6 +111,19 @@ unchanged. The archive makes the installer roughly 0.9 GB larger (measured for
 1.2.5: 827 MiB archive, 3.4 GB extracted image); zstd barely shrinks it because
 the containerd image store saves layers already gzip-compressed.
 
+## Root of trust for a manual install
+
+The manual installer's root of trust is the **SHA-256 of the installer
+tarball, checked out of band BEFORE it is extracted** (the value published
+with the release; Software Update checks the same value from its signed
+manifest). `artifact-files.json` and `verify_installer_payload` are a
+corruption and consistency check (truncated download, mixed or partly edited
+folder), not tamper-proofing: someone who can change files in the extracted
+folder can change `install.sh` itself, which runs that check. Every trust
+decision inside the folder -- `release.env` values, the preloaded image's
+SHA-256 -- rests on that out-of-band tarball check. `release.env` is parsed
+as data, never sourced, so a corrupted file is refused rather than executed.
+
 ## Preserved state
 
 Default reinstall/repair and uninstall preserve:
