@@ -22,6 +22,7 @@ from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy, recording_session_tags
 from event_media_policy import allows_event_media, effective_cloud_recording_mode, motion_event_policy
 import product_mode
+import video_profile
 import runtime_paths
 
 try:
@@ -706,6 +707,18 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     metadata=talk_down.get('metadata')
                     metadata_json=json.dumps(metadata) if isinstance(metadata,dict) else None
                     db.execute('UPDATE cameras SET talk_down_supported=?,talk_down_metadata=?,talk_down_verified_at=? WHERE id=? AND appliance_id=?',(supported,metadata_json,now,camera_id,appliance['id']))
+                # Measured stream geometry (2026-10-11, video_profile.py): the
+                # edge's real main/sub width/height/codec/fps, stored in
+                # measured_* columns -- never in cameras.resolution, which is
+                # the plan's sales label. Only a successful probe is stored; an
+                # older appliance that sends no "video" changes nothing.
+                measured=video_profile.cloud_measured_columns(item.get('video'))
+                if measured:
+                    columns=sorted(measured)
+                    # A "configured" (ONVIF-only) report never replaces a real measurement.
+                    db.execute('UPDATE cameras SET '+','.join(f'{name}=?' for name in columns)+',measured_video_at=? WHERE id=? AND appliance_id=? '
+                               "AND (?='measured' OR COALESCE(measured_source,'')<>'measured')",
+                               (*[measured[name] for name in columns],now,camera_id,appliance['id'],measured['measured_source']))
         return {'status':'accepted','camera_count':len(items),'credentials_received':False}
 
     @app.get('/api/appliance/configuration')
@@ -2682,6 +2695,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         cards=[]
         for item in appliances:
             history=rows('SELECT * FROM appliance_health_history WHERE appliance_id=? ORDER BY created_at DESC LIMIT 5',(item['id'],)); camera_status=rows('SELECT * FROM appliance_camera_status WHERE appliance_id=?',(item['id'],)); warnings=[]
+            camera_video=video_profile.admin_camera_video_html(rows(video_profile.ADMIN_CAMERA_VIDEO_SQL,(item['id'],)),escape)  # measured video per camera
             if item.get('disk_capacity') and float(item.get('disk') or 0)/float(item['disk_capacity'])>=.9: warnings.append('Low disk')
             if float(item.get('cpu') or 0)>=90: warnings.append('High CPU')
             if any(not c['online'] for c in camera_status): warnings.append('Camera offline')
@@ -2701,7 +2715,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             backlog_text=f'{pending_count} pending · {quarantined_count} quarantined' if pending_count is not None else 'Not yet reported'
             storage_free_percent=item.get('storage_free_percent')
             storage_text=f'{(storage_state or "healthy").replace("_"," ").title()} · {storage_free_percent:.1f}% free' if storage_state is not None and storage_free_percent is not None else 'Not yet reported'
-            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Local storage</span><strong>{escape(storage_text)}</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
+            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Local storage</span><strong>{escape(storage_text)}</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div>{camera_video}<details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
         # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
         # this query previously had no tenant predicate at all, so any
         # partner-scoped administrator saw every other partner's queued

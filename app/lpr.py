@@ -772,9 +772,25 @@ def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: flo
     """One LPR pass over one analytics frame. vehicle_boxes are (x, y, w, h)
     vehicle detections on that frame. Returns the plates confirmed by this
     pass: dicts with plate_number, confidence, region (coordinates inside
-    `crop`), crop (the image the region refers to), vehicle_box, source."""
+    `crop`), crop (the image the region refers to), vehicle_box, source.
+
+    full_frame may also be a zero-argument callable (2026-10-11,
+    video-pipeline: main.py grabs one main-stream frame on demand); it is
+    called at most once, and only when a vehicle box is actually read --
+    never for a parked vehicle that is being skipped, and never for the
+    no-vehicle full-frame fallback."""
     if not LPR_ENABLED or frame is None or not is_camera_enabled(camera_number):
         return []
+    provider = full_frame if callable(full_frame) else None
+    resolved = [] if provider is not None else [full_frame]
+
+    def _full():
+        if not resolved:
+            try:
+                resolved.append(provider())
+            except Exception:
+                resolved.append(None)
+        return resolved[0]
     now = time.monotonic() if now is None else now
     if not _due(_last_scan, camera_number, LPR_SCAN_SECONDS, now):
         return []
@@ -789,7 +805,7 @@ def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: flo
             continue
         x, y, w, h = box
         analytics_crop = frame[y : y + h, x : x + w]
-        full_crop = full_resolution_vehicle_crop(frame, box, full_frame)
+        full_crop = full_resolution_vehicle_crop(frame, box, _full())
         result = recognize_plate(full_crop, camera_number=camera_number) if full_crop is not None else None
         crop = full_crop if result is not None else analytics_crop
         if result is None:
@@ -803,6 +819,7 @@ def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: flo
             mark_vehicle_read(camera_number, box)
             confirmed.append(dict(result, crop=crop, vehicle_box=box, source="vehicle"))
     if not vehicle_boxes and LPR_FULL_FRAME_FALLBACK and _due(_last_full_frame, camera_number, LPR_FULL_FRAME_SECONDS, now):
+        full_frame = None if provider is not None else _full()
         use_full = full_frame is not None and full_frame.shape[1] >= frame.shape[1] * 1.3
         for plate in detect_plates_full_frame(frame):
             px, py, pw, ph = plate["region"]

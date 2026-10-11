@@ -240,7 +240,10 @@ def save_rule_event_thumbnail(camera_number: int, frame, now: datetime, tag: str
         day_folder.mkdir(parents=True, exist_ok=True)
         thumbnail_filename = f"camera{camera_number}_{now.strftime('%H-%M-%S')}_{tag}_{uuid.uuid4().hex[:12]}.jpg"
         thumbnail_path = day_folder / thumbnail_filename
-        if cv2.imwrite(str(thumbnail_path), frame):
+        import video_profile
+        # Profile size (2026-10-11, video-pipeline P2d): at most
+        # ANYAICAM_THUMBNAIL_MAX_WIDTH wide, never upscaled.
+        if cv2.imwrite(str(thumbnail_path), video_profile.thumbnail_image(frame)[0]):
             return f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/{quote(thumbnail_filename)}"
     except Exception as error:
         logger.warning("customer_analytics_rule_worker.thumbnail_save_failed camera=%s error=%s", camera_number, error)

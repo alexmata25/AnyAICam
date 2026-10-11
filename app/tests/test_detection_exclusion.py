@@ -152,6 +152,7 @@ def test_detect_objects_frame_applies_the_zone_for_every_downstream_analytic(db,
         (tmp_path / f"camera{number}.m3u8").write_text("#EXTM3U")
     monkeypatch.setattr(main, "HLS_FOLDER", tmp_path)
     monkeypatch.setattr(main, "YOLO", object())
+    monkeypatch.setattr(main.ai_frames, "mode", "hls")  # frames from the live HLS playlist (ANYAICAM_AI_SOURCE=hls)
 
     class Capture:
         def __init__(self, *a): pass

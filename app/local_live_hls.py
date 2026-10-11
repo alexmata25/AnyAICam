@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 from fastapi import HTTPException
+import live_hls_demand
 
 
 def require_local_camera(camera, identity, runtime_role, db):
@@ -18,6 +19,8 @@ def require_local_camera(camera, identity, runtime_role, db):
 
 
 def segment_path(folder, camera_number, name):
+    # On-demand live HLS (live_hls_demand.py): a segment request is demand.
+    live_hls_demand.touch(camera_number, 'segment')
     # The separator is mandatory: camera1 must never match camera10.
     if not isinstance(name,str) or not re.fullmatch(rf'camera{int(camera_number)}_[0-9]+[.]ts',name):
         raise HTTPException(status_code=404, detail='Segment not found.')
@@ -29,6 +32,10 @@ def segment_path(folder, camera_number, name):
 
 
 def local_playlist(folder,camera_number,camera_id,stale_seconds=20):
+    # On-demand live HLS (live_hls_demand.py): the live page polls this
+    # playlist until it lists segments, so the first poll starts an idle
+    # encoder and a later poll gets video (no-op when always on).
+    live_hls_demand.touch(camera_number, 'playlist')
     folder=Path(folder).resolve()
     path=(folder/f'camera{int(camera_number)}.m3u8').resolve()
     empty='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n'

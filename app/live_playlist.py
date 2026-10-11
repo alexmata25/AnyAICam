@@ -233,6 +233,10 @@ def register_live_playlist_routes(app: FastAPI, *, hls_folder=None, local_identi
                         segment_bytes = None
         else:
             camera, camera_number = local_context(request, camera_id)
+            # On-demand live HLS: asking for a still is live-video demand
+            # (the 503 below already says to try again in a few seconds).
+            import live_hls_demand
+            live_hls_demand.touch(camera_number, 'still')
             import re as _re
             from pathlib import Path as _Path
             folder = _Path(hls_folder)

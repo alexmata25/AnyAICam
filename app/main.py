@@ -557,6 +557,11 @@ STATIC_FOLDER = runtime_paths.STATIC_ROOT
 HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).parent / "static" / "hls") if os.name == "nt" else "/app/static/hls"))
 
 HLS_URL_PREFIX = "/static/hls"
+# On-demand live HLS (2026-10-10, perf-substream-hls): see live_hls_demand.py.
+# ANYAICAM_LIVE_HLS_MODE=auto (the default since 2026-10-11, video-pipeline P2b)
+# runs the encoder on demand only when no always-on consumer remains
+# (_live_hls_auto_policy()); always keeps the previous behaviour.
+import live_hls_demand
 
 HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
 
@@ -3096,6 +3101,13 @@ async def camera_supervisor_watcher(tasks: list) -> None:
             started = start_camera_supervisors(numbers, tasks)
             if started:
                 structured_log("camera.supervisors_started", camera_numbers=started)
+            # Motion / AI workers follow the camera map both ways (added cameras
+            # get a fresh task; removed cameras' tasks stop) -- see
+            # reconcile_camera_workers(). An unknown map only starts.
+            current = await asyncio.to_thread(current_camera_numbers)
+            workers = reconcile_camera_workers(numbers if current is not None else None)
+            if workers["started"] or workers["retired"]:
+                structured_log("camera.workers_reconciled", started=workers["started"], retired=workers["retired"])
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -15961,6 +15973,144 @@ def live_bitrate_cap_args() -> list[str]:
     return ["-maxrate", f"{LIVE_MAX_BITRATE_KBPS}k", "-bufsize", f"{LIVE_MAX_BITRATE_KBPS * 2}k"]
 
 
+# Measured per-camera video profile (2026-10-11, video-pipeline): see
+# video_profile.py and camera_video_probe.py. cameras.resolution is a sales
+# label and is never read here; the camera's real main/sub stream geometry
+# is measured (ONVIF + ffprobe) by camera_video_probe_worker() below and
+# drives the live encode size/bitrate, event clip size/bitrate, the AI
+# analytics stream and frame size, and thumbnail size.
+import camera_video_probe
+import video_profile
+
+# ANYAICAM_LIVE_SCALE=profile (default): the live HLS libx264 encode is
+# downscaled into the camera's profile box (1920x1080 for a 4K camera) with
+# a bitrate cap from the output size. "full" keeps the camera's own
+# resolution (the previous behaviour). Stream copy is never scaled.
+LIVE_SCALE_MODE = "full" if os.environ.get("ANYAICAM_LIVE_SCALE", "profile").strip().lower() == "full" else "profile"
+
+
+def camera_capability_key(camera_number: int) -> str:
+    """The capability record key: the camera's id, or a local key for a
+    legacy env-configured camera that has no cameras row."""
+    try:
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute("SELECT id FROM cameras WHERE camera_number=?", (camera_number,)).fetchone()
+        if row and row["id"]:
+            return str(row["id"])
+    except Exception:
+        pass
+    return f"local-camera-{int(camera_number)}"
+
+
+def _load_camera_capability_record(camera_number: int) -> dict | None:
+    import camera_capabilities
+    from partner_db import connection
+    with connection() as db:
+        return camera_capabilities.load(db, camera_capability_key(camera_number))
+
+
+camera_video_profiles = camera_video_probe.ProfileCache(
+    _load_camera_capability_record, ttl=60.0, live_max_kbps=lambda: LIVE_MAX_BITRATE_KBPS,
+)
+
+
+def camera_profile(camera_number: int) -> "video_profile.Profile":
+    """This camera's processing profile (safe defaults when unmeasured)."""
+    return camera_video_profiles.profile(camera_number)
+
+
+def live_scale_args(camera_number: int | None) -> list[str]:
+    """-vf for the live x264 encode, and its bitrate cap (replacing the
+    flat ANYAICAM_LIVE_MAX_BITRATE_KBPS cap only by a LOWER one)."""
+    if camera_number is None or LIVE_SCALE_MODE != "profile":
+        return [*live_bitrate_cap_args()]
+    profile = camera_profile(camera_number)
+    cap = profile.live_max_kbps if LIVE_MAX_BITRATE_KBPS > 0 else 0
+    rate = ["-maxrate", f"{cap}k", "-bufsize", f"{cap * 2}k"] if cap > 0 else []
+    return ["-vf", profile.live_filter(), *rate]
+
+
+def _video_probe_once(camera_number: int, previous_url: str | None) -> tuple[str | None, bool]:
+    """Measure one camera if due (blocking; run in a thread). Returns
+    (main url it used, geometry changed). Never logs a URL."""
+    import camera_capabilities
+    from partner_db import connection
+    try:
+        main_url = camera_url(camera_number)
+    except Exception:
+        return None, False
+    key = camera_capability_key(camera_number)
+    with connection() as db:
+        previous = camera_capabilities.load(db, key)
+    force = previous_url is not None and previous_url != main_url
+    try:
+        record, changed = camera_video_probe.refresh(
+            main_url, previous, soap_call=webrtc_publisher._onvif_soap_call(),
+            url_candidates=webrtc_publisher.substream_candidates, force=force,
+        )
+    except Exception as error:
+        print(f"Camera {camera_number} video probe failed: {type(error).__name__}")
+        return main_url, False
+    status_file = camera_video_probe.status_path(HLS_FOLDER, camera_number)
+    if changed and record is not None:
+        with connection() as db:
+            camera_capabilities.save(db, key, record)
+    if changed or not status_file.exists():
+        camera_video_probe.write_status(HLS_FOLDER, camera_number, record, _effective_analytics_choice())
+    geometry_changed = changed and camera_video_probe.geometry_changed(previous, record)
+    if changed:
+        camera_video_profiles.invalidate(camera_number)
+        document = camera_video_probe.status_document(record, _effective_analytics_choice())
+        main_info, sub_info = document.get("main") or {}, document.get("analytics") or {}
+        sub_text = f"{sub_info.get('width')}x{sub_info.get('height')} {sub_info.get('codec')}" if sub_info else "main stream"
+        print(
+            f"Camera {camera_number} video ({document.get('geometry_source')}): main {main_info.get('width')}x{main_info.get('height')} "
+            f"{main_info.get('codec')} {main_info.get('fps')} fps ({document.get('resolution_class')}, {document.get('shape')}); "
+            f"AI analytics stream: {sub_text} [{document.get('analytics_choice')}]; probe {document.get('status')}"
+            f"{'; geometry changed' if geometry_changed and previous else ''}."
+        )
+    return main_url, geometry_changed
+
+
+def _effective_analytics_choice() -> str | None:
+    """The AI stream choice to report when it is not the substream policy."""
+    try:
+        return "main_by_config" if ai_frames.mode == "main" else None
+    except NameError:
+        return None
+
+
+# Called with a camera number when its measured geometry changes (the AI
+# frame reader restarts with the new size).
+_video_probe_listeners: list = []
+
+
+async def camera_video_probe_worker() -> None:
+    """Measures every camera's streams on start, every
+    ANYAICAM_VIDEO_PROBE_SECONDS, sooner after a failure, and when a
+    camera's main URL changes; independent of WebRTC/P2P."""
+    last_urls: dict[int, str | None] = {}
+    await asyncio.sleep(10)
+    while True:
+        for camera_number in sorted(set(get_camera_numbers())):
+            try:
+                url, geometry_changed = await asyncio.to_thread(
+                    _video_probe_once, camera_number, last_urls.get(camera_number))
+            except Exception as error:
+                print(f"Camera {camera_number} video probe skipped: {type(error).__name__}")
+                continue
+            if url:
+                last_urls[camera_number] = url
+            if geometry_changed:
+                for listener in list(_video_probe_listeners):
+                    try:
+                        listener(camera_number)
+                    except Exception:
+                        pass
+        await asyncio.sleep(60)
+
+
 # Live-view video stream copy (2026-10-05, Ryzen LPR test only; off by
 # default). The x264 encode below runs continuously for every camera,
 # because analytics read these same HLS segments. When the camera already
@@ -16003,8 +16153,11 @@ def live_copy_allowed(camera_number: int) -> bool:
 def live_video_args(camera_number: int | None = None) -> list[str]:
     if camera_number is not None and live_copy_allowed(camera_number):
         return ["-c:v", "copy"]
+    # Measured profile (2026-10-11): scale into the camera's live box and cap
+    # the bitrate by output size; ANYAICAM_LIVE_SCALE=full = the old args.
+    scale_and_rate = live_scale_args(camera_number)
     return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *live_bitrate_cap_args()]
+            "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *scale_and_rate]
 
 
 async def probe_camera_video_codec(url: str, timeout: float = LIVE_VIDEO_COPY_PROBE_TIMEOUT_SECONDS) -> str | None:
@@ -17010,6 +17163,49 @@ def _bounded_camera_error(stderr_tail: list[str]) -> str:
     return _redact_camera_stream_error(joined)[:CAMERA_ERROR_MAX_CHARS]
 
 
+LIVE_HLS_WATCHDOG_FROM_WORKER_START = os.environ.get(
+    "ANYAICAM_LIVE_HLS_WATCHDOG_FROM_WORKER_START", "true").strip().lower() != "false"
+
+
+def camera_receiving_video(camera_number: int) -> bool:
+    """Incoming-video evidence for camera<N>.alive (never mere process
+    liveness): the AI reader got a frame within REACHABLE_FRAME_SECONDS, or
+    the recorder's current output file was written within
+    RECORDER_ADVANCE_SECONDS. (Motion-reader frames are checked by
+    live_hls_demand.camera_reachable() itself.) Blocking-cheap: one
+    directory scan of the camera's recording folders."""
+    try:
+        age = ai_frames.last_frame_age(camera_number)
+    except NameError:
+        age = None
+    if age is not None and age <= live_hls_demand.REACHABLE_FRAME_SECONDS:
+        return True
+    camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+    return live_hls_demand.recorder_output_advancing(
+        (camera_folder, camera_folder / EVENT_BUFFER_SUBFOLDER_NAME), camera_number)
+
+
+async def _wait_for_live_hls_demand(camera_number: int) -> None:
+    """On-demand live HLS (live_hls_demand.py; ANYAICAM_LIVE_HLS_MODE=
+    on_demand only): the camera's live encoder is not running and nothing
+    needs it. Waits until something does, re-checking every
+    IDLE_POLL_SECONDS, and meanwhile keeps camera{N}.alive fresh while the
+    camera is demonstrably reachable, so status readers that used the
+    playlist's freshness as "online" do not report an idle camera offline."""
+    camera_process_state[camera_number]["live"] = "idle"
+    next_alive = 0.0
+    while not live_hls_demand.wanted(camera_number):
+        now = time.monotonic()
+        if now >= next_alive:
+            # Incoming-frame evidence only: a recorder process that is up but
+            # stalled must let the camera go offline (Codex review 2026-10-11).
+            receiving = await asyncio.to_thread(camera_receiving_video, camera_number)
+            if live_hls_demand.camera_reachable(camera_number, receiving):
+                live_hls_demand.write_alive(HLS_FOLDER, camera_number)
+            next_alive = now + 5
+        await asyncio.sleep(live_hls_demand.IDLE_POLL_SECONDS)
+
+
 async def process_supervisor(camera_number: int, mode: str, *, stagger_index: int | None = None) -> None:
     """Keep one camera worker alive and retry when a camera is unavailable.
     stagger_index: the startup-stagger slot (start_camera_supervisors()
@@ -17059,14 +17255,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
 
     while True:
-
-
-
-
-
-
-
-
+        if mode == "live" and live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
+            await _wait_for_live_hls_demand(camera_number)
         camera_process_state[camera_number][mode] = "connecting"
         live_copy_used = False
         if mode == "live":
@@ -17158,13 +17348,34 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
         completed = False
         watchdog_restart = False
+        idle_stop = False
         try:
             if mode == "live":
                 playlist_path = HLS_FOLDER / f"camera{camera_number}.m3u8"
                 watchdog_started = time.monotonic()
-
+                watchdog_started_wall = time.time()
                 while process.poll() is None:
                     await asyncio.sleep(5)
+                    # On-demand live HLS only: keep camera{N}.alive fresh
+                    # (status) while this encoder starts up; and once nothing
+                    # has needed this camera's live video for IDLE_SECONDS,
+                    # stop the encoder (not a failure: no reconnect count,
+                    # no error, no backoff).
+                    if live_hls_demand.on_demand() and live_hls_demand.camera_reachable(
+                            camera_number, await asyncio.to_thread(camera_receiving_video, camera_number)):
+                        live_hls_demand.write_alive(HLS_FOLDER, camera_number)
+                    if live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
+                        idle_stop = True
+                        print(
+                            f"Camera {camera_number} live HLS not needed for "
+                            f"{live_hls_demand.IDLE_SECONDS:.0f}s; stopping the encoder until it is."
+                        )
+                        process.terminate()
+                        try:
+                            await asyncio.to_thread(process.wait, timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        break
 
                     # Give a newly-started RTSP/HLS pipeline time to connect,
                     # decode and write its first playlist before judging it.
@@ -17172,7 +17383,20 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         continue
 
                     try:
-                        playlist_age = time.time() - playlist_path.stat().st_mtime
+                        playlist_mtime = playlist_path.stat().st_mtime
+                        # Restart churn (2026-10-10, perf-substream-hls): with
+                        # append_list the PREVIOUS worker's playlist is still
+                        # on disk, so a new worker that had not yet written its
+                        # first segment after the 30 s grace was judged by its
+                        # predecessor's stale mtime and killed at the very
+                        # first check (a ~40 s restart loop: 30 s + TERM +
+                        # 10 s backoff). Its age now counts from this
+                        # worker's own start at the earliest.
+                        # ANYAICAM_LIVE_HLS_WATCHDOG_FROM_WORKER_START=false
+                        # restores the previous rule.
+                        if LIVE_HLS_WATCHDOG_FROM_WORKER_START:
+                            playlist_mtime = max(playlist_mtime, watchdog_started_wall)
+                        playlist_age = time.time() - playlist_mtime
                     except OSError:
                         playlist_age = time.monotonic() - watchdog_started
 
@@ -17221,13 +17445,14 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
             return_code = await asyncio.to_thread(process.wait)
             completed = True
-            if mode == "live":
+            if mode == "live" and not idle_stop:
                 note_live_copy_run(camera_number, live_copy_used, time.monotonic() - worker_started, watchdog_restart)
-
             if drain_task is not None:
                 await drain_task
-
-            if mode == "live":
+            if idle_stop:
+                live_hls_demand.mark_playlist_stale(playlist_path)
+                camera_process_state[camera_number][mode] = "idle"
+            elif mode == "live":
                 camera_process_state[camera_number]["last_exit_code"] = return_code
                 camera_process_state[camera_number]["last_error"] = (
                     "HLS playlist stopped advancing; worker restarted automatically."
@@ -17238,13 +17463,13 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                     datetime.now().isoformat()
                 )
 
-            camera_reconnect_counts[camera_number] += 1
-            camera_process_state[camera_number][mode] = "retrying"
-
-            print(
-                f"Camera {camera_number} {mode} process exited with "
-                f"code {return_code}; retrying in 10 seconds."
-            )
+            if not idle_stop:
+                camera_reconnect_counts[camera_number] += 1
+                camera_process_state[camera_number][mode] = "retrying"
+                print(
+                    f"Camera {camera_number} {mode} process exited with "
+                    f"code {return_code}; retrying in 10 seconds."
+                )
         finally:
             if completed:
                 try:
@@ -17257,14 +17482,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         ffmpeg_processes.remove(process)
                     except ValueError:
                         pass
-
-
-
-
-
-
-
-
+        if idle_stop:
+            continue  # straight back to waiting for demand
         await asyncio.sleep(10)
 
 
@@ -34269,97 +34488,33 @@ async def create_motion_thumbnail(
 
 
 
-    if manifest.exists():
-
-
-
-
-
-
-
-
+    thumbnail_input = ["-i", str(manifest)] if manifest.exists() else None
+    thumbnail_from_substream = False
+    # On-demand live HLS (live_hls_demand.py): when the live encoder is idle
+    # its playlist is stale, so the color frame comes from the camera's
+    # substream instead (same field of view, 640 px wide). Never logged.
+    if live_hls_demand.on_demand() and not live_hls_demand.playlist_fresh(manifest):
+        substream_url = await asyncio.to_thread(motion_substream_url, camera_number)
+        thumbnail_input = ["-rtsp_transport", "tcp", "-i", substream_url] if substream_url else None
+        thumbnail_from_substream = bool(substream_url)
+    if thumbnail_input:
         try:
-
-
-
-
-
-
-
-
             process = await asyncio.create_subprocess_exec(
-
-
-
-
-
-
-
-
                 "ffmpeg", "-loglevel", "error", "-y",
-
-
-
-
-
-
-
-
-                "-i", str(manifest),
-
-
-
-
-
-
-
-
+                *thumbnail_input,
                 "-frames:v", "1", "-vf", "scale=640:-2",
-
-
-
-
-
-
-
-
                 "-q:v", "3", str(output_path),
-
-
-
-
-
-
-
-
                 stdout=asyncio.subprocess.DEVNULL,
-
-
-
-
-
-
-
-
                 stderr=asyncio.subprocess.DEVNULL,
-
-
-
-
-
-
-
-
             )
-
-
-
-
-
-
-
-
-            await process.wait()
+            if thumbnail_from_substream:
+                try:
+                    await asyncio.wait_for(process.wait(), 20)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            else:
+                await process.wait()
 
 
 
@@ -34746,6 +34901,7 @@ def _probe_motion_clip_candidates(
 # the event loop, dispatching ffmpeg via asyncio.create_subprocess_exec.
 EVENT_CLIP_ENCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_EVENT_CLIP_ENCODE_MAX_CONCURRENCY", "1")))
 event_clip_encode_semaphore = asyncio.Semaphore(EVENT_CLIP_ENCODE_MAX_CONCURRENCY)
+import clip_encode  # video-pipeline P2c: event/manual clip ffmpeg commands
 
 
 
@@ -34883,23 +35039,15 @@ async def build_motion_event_clip(
             encoding="utf-8",
         )
 
-        command = [
-            "ffmpeg",
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(list_file),
-            "-ss", str(offset_seconds),
-            "-t", str(duration_seconds),
-            "-map", "0:v:0",
-            "-map", "0:a:0?",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-c:a", "aac",
-            "-b:a", "96k",
-            "-movflags", "+faststart",
-            str(temp_path),
-        ]
+        # 2026-10-11 (video-pipeline P2c, clip_encode.py): input seeking (the
+        # single covering file read directly), scaled into the camera's
+        # measured profile box as browser-playable H.264, threads capped.
+        # ANYAICAM_EVENT_CLIP_ENCODE=legacy = the previous command exactly.
+        clip_profile = await asyncio.to_thread(camera_profile, camera_number)
+        command = clip_encode.event_clip_command(
+            [source for _, _, source in candidates], list_file, offset_seconds, duration_seconds,
+            temp_path, clip_profile,
+        )
 
         # Only the actual encode -- never the pre-roll wait above, the
         # shortlist/ffprobe candidate search above that, or the list-
@@ -35645,7 +35793,194 @@ def _compare_motion_frames(
 
 
 
+# Motion source selection (2026-10-10, perf-substream-hls) -- see
+# motion_source.py. One selector for the whole process: it keeps each
+# camera's substream failure count and HLS fallback window.
+import motion_source
+_motion_source_selector = motion_source.MotionSourceSelector()
+
+
+def motion_substream_url(camera_number: int) -> str | None:
+    """Credentialed RTSP URL of this camera's substream for the motion
+    reader, or None when it has no distinct one (or is not configured).
+    Synchronous (database + camera_url()); always called off the event
+    loop. Never logs the URL."""
+    try:
+        main_url = camera_url(camera_number)
+    except Exception:
+        return None
+    record = None
+    try:
+        import camera_capabilities
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute("SELECT id FROM cameras WHERE camera_number=?", (camera_number,)).fetchone()
+            if row:
+                record = camera_capabilities.load(db, row["id"])
+    except Exception:
+        record = None
+    try:
+        import webrtc_publisher as _publisher
+        url_candidates = _publisher.substream_candidates
+    except Exception:
+        url_candidates = None
+    return motion_source.resolve_substream_url(main_url, record, url_candidates)
+
+
+
+# ---------------------------------------------------------------- per-camera worker lifecycle
+# (2026-10-11, Codex blocker: a removed camera's motion reader kept running
+# forever -- seen live on Ryzen 1.2.4 for removed camera 4 -- and a camera
+# added later never got a motion task.) Motion and AI-detector tasks are
+# kept in one registry, reconciled against the current camera map by
+# camera_supervisor_watcher() (startup uses the same path); each motion loop
+# also checks camera_in_service() every iteration and while reading, and
+# retire_camera_pipeline() drops everything this branch keeps per camera.
+CAMERA_IN_SERVICE_CACHE_SECONDS = 5.0
+_camera_in_service_cache: list = [-1e18, None]  # [checked at (monotonic), frozenset or None]
+_camera_worker_tasks: dict[str, dict[int, asyncio.Task]] = {"motion": {}, "ai": {}}
+# Cancelled tasks still cleaning up: no replacement starts before they end.
+_camera_worker_retiring: dict[str, dict[int, asyncio.Task]] = {"motion": {}, "ai": {}}
+# Bumped on retire: a YOLO result computed for an older generation is never
+# cached or delivered for the camera again.
+_camera_generation: dict[int, int] = {}
+
+
+def current_camera_numbers() -> "frozenset[int] | None":
+    """The camera_numbers configured now (get_camera_numbers()' rule), or
+    None when that cannot be told: the database failed, or no camera row
+    exists at all (nothing was ever provisioned -- legacy/env installs and
+    bare test databases keep their workers). A removed camera keeps its row
+    with camera_number NULL, so removing the last camera still counts."""
+    try:
+        from partner_db import connection
+        with connection() as db:
+            rows = db.execute("SELECT camera_number FROM cameras").fetchall()
+    except Exception:
+        return None
+    if not rows:
+        legacy = legacy_camera_numbers_in_use()
+        return frozenset(legacy) if legacy else None
+    return frozenset(int(row["camera_number"]) for row in rows if row["camera_number"] is not None)
+
+
+def camera_in_service(camera_number: int) -> bool:
+    """False only when the camera map positively no longer has this number.
+    Cached CAMERA_IN_SERVICE_CACHE_SECONDS; blocking (database)."""
+    now = time.monotonic()
+    if now - _camera_in_service_cache[0] >= CAMERA_IN_SERVICE_CACHE_SECONDS:
+        _camera_in_service_cache[:] = [now, current_camera_numbers()]
+    numbers = _camera_in_service_cache[1]
+    return numbers is None or int(camera_number) in numbers
+
+
+def retire_camera_pipeline(camera_number: int) -> None:
+    """Drop every per-camera resource this pipeline keeps: HLS demand and
+    holds, the motion source bookkeeping, the AI frame reader (its ffmpeg is
+    stopped), cached main-stream frames, the profile and the YOLO cache."""
+    number = int(camera_number)
+    try:
+        with _ai_detection_cache_lock:
+            _camera_generation[number] = _camera_generation.get(number, 0) + 1
+            _ai_detection_cache.pop(number, None)
+    except NameError:  # defined further down in this module
+        _camera_generation[number] = _camera_generation.get(number, 0) + 1
+    live_hls_demand.forget(number)
+    _motion_source_selector.forget(number)
+    try:
+        ai_frames.forget(number)
+        main_frame_grabber.forget(number)
+        _ai_detection_cache.pop(number, None)
+    except NameError:  # defined further down in this module
+        pass
+    camera_video_profiles.invalidate(number)
+
+
+def _new_ai_state() -> dict:
+    return {"status": "starting", "last_checked": None, "last_detection": None, "detections": 0, "error": None}
+
+
+def reconcile_camera_workers(numbers) -> dict:
+    """Start motion / AI-detector tasks for configured cameras without one
+    (a camera added -- or re-added with the same number -- gets a fresh
+    task), cancel the tasks of cameras no longer configured and retire their
+    pipeline. numbers=None (camera map unknown) only starts, never retires.
+    Returns {"started": {...}, "retired": [...]} (camera numbers)."""
+    want = None if numbers is None else set(_valid_camera_numbers(numbers))
+    started: dict[str, list[int]] = {}
+    retired: set[int] = set()
+    for kind, enabled, factory in (("motion", MOTION_DETECTION_ENABLED, motion_detector),
+                                   ("ai", AI_PERSON_DETECTION_ENABLED, ai_person_detector)):
+        registry = _camera_worker_tasks[kind]
+        retiring = _camera_worker_retiring[kind]
+        for number, task in list(retiring.items()):
+            if task.done():
+                retiring.pop(number)
+        for number, task in list(registry.items()):
+            if task.done():
+                registry.pop(number)
+            elif want is not None and number not in want:
+                task.cancel()
+                registry.pop(number)
+                retiring[number] = task  # until its cleanup has finished
+                retired.add(number)
+        if not enabled or want is None:
+            continue
+        for number in sorted(want - set(registry) - set(retiring)):
+            if kind == "ai":
+                ai_detection_state.setdefault(number, _new_ai_state())
+                ai_person_last_event.setdefault(number, 0.0)
+            registry[number] = asyncio.create_task(factory(number))
+            started.setdefault(kind, []).append(number)
+    for number in sorted(retired):
+        retire_camera_pipeline(number)
+        print(f"Camera {number} is no longer configured; its motion/AI workers were stopped.")
+    return {"started": started, "retired": sorted(retired)}
+
+
+def camera_worker_tasks() -> list:
+    return [task for registries in (_camera_worker_tasks, _camera_worker_retiring)
+            for registry in registries.values() for task in registry.values()]
+
+
 async def motion_detector(camera_number: int) -> None:
+    """One camera's motion reader. Ends cleanly (ffmpeg stopped, HLS demand
+    released, per-camera state dropped) when the camera is removed, or when
+    the task is cancelled by reconcile_camera_workers()."""
+    # A per-task hold token (race fix): a finishing old task can only ever
+    # release its own HLS hold, never a replacement task's.
+    hold_owner = f"motion:{uuid.uuid4().hex[:12]}"
+    try:
+        await _motion_detector_loop(camera_number, hold_owner)
+    finally:
+        live_hls_demand.release(camera_number, hold_owner)
+        if not camera_in_service(camera_number):
+            retire_camera_pipeline(camera_number)
+
+
+async def spawn_process_cancellation_safe(*command, **kwargs):
+    """asyncio.create_subprocess_exec() that never leaks the process when
+    the caller is cancelled while it is starting: the spawn is shielded,
+    and on cancellation the started process is killed and reaped before
+    the CancelledError propagates."""
+    spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(*command, **kwargs))
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        try:
+            process = await spawn
+        except BaseException:
+            raise asyncio.CancelledError()
+        try:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+        except (ProcessLookupError, OSError):
+            pass
+        raise
+
+
+async def _motion_detector_loop(camera_number: int, hold_owner: str = "motion") -> None:
 
 
 
@@ -35727,186 +36062,77 @@ async def motion_detector(camera_number: int) -> None:
 
 
     manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
-
-
-
-
-
-
-
-
+    # Motion source (2026-10-10, perf-substream-hls): the camera's own
+    # substream when it has a distinct one, else this live HLS playlist --
+    # see motion_source.py. Frames are scaled to exactly 160x90 gray
+    # either way, so the thresholds below do not depend on the source.
+    # ANYAICAM_MOTION_SOURCE=hls restores the previous behaviour exactly.
+    next_service_check = 0.0
     while True:
-
-
-
-
-
-
-
-
-        if not manifest.exists():
-
-
-
-
-
-
-
-
-            await asyncio.sleep(5)
-
-
-
-
-
-
-
-
-            continue
-
-
-
-
-
-
-
-
-        process = None
-
-
-
-
-
-
-
-
-        try:
-
-
-
-
-
-
-
-
-            command = [
-
-
-
-
-
-
-
-
-                "ffmpeg", "-loglevel", "error", "-fflags", "nobuffer",
-
-
-
-
-
-
-
-
-                "-i", str(manifest), "-an", "-vf", "fps=1,scale=160:90,format=gray",
-
-
-
-
-
-
-
-
-                "-f", "rawvideo", "pipe:1",
-
-
-
-
-
-
-
-
-            ]
-
-
-
-
-
-
-
-
-            process = await asyncio.create_subprocess_exec(
-
-
-
-
-
-
-
-
-                *command,
-
-
-
-
-
-
-
-
-                stdout=asyncio.subprocess.PIPE,
-
-
-
-
-
-
-
-
-                stderr=asyncio.subprocess.DEVNULL,
-
-
-
-
-
-
-
-
+        # Removed camera (Codex blocker 2026-10-11): stop here -- the caller
+        # releases the HLS demand and drops per-camera state.
+        if not await asyncio.to_thread(camera_in_service, camera_number):
+            print(f"Camera {camera_number} is no longer configured; motion detector stopped.")
+            return
+        if _motion_source_selector.mode == "hls":
+            source_kind, source_url = "hls", None
+        else:
+            source_kind, source_url = await asyncio.to_thread(
+                _motion_source_selector.choose, camera_number, motion_substream_url
             )
-
-
-
-
-
-
-
-
+        source_message = _motion_source_selector.note_kind(camera_number, source_kind)
+        if source_message:
+            print(source_message)
+            # Never compare frames from two different sources.
+            previous_frame = None
+        # On-demand live HLS (live_hls_demand.py): while motion reads the
+        # HLS playlist it keeps the live encoder running; no-ops when the
+        # encoder is always on (the default).
+        if source_kind == "hls":
+            live_hls_demand.hold(camera_number, hold_owner)
+        else:
+            live_hls_demand.release(camera_number, hold_owner)
+        if source_kind == "hls" and not manifest.exists():
+            await asyncio.sleep(5)
+            continue
+        process = None
+        frames_read = 0
+        stalled = False
+        try:
+            if source_kind == "substream":
+                # The URL carries the camera's credentials: stderr is
+                # discarded below and the command is never logged.
+                command = motion_source.substream_command(source_url)
+            else:
+                command = motion_source.hls_command(str(manifest))
+            process = await spawn_process_cancellation_safe(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
             if process.stdout is None:
-
-
-
-
-
-
-
-
                 raise RuntimeError("Motion detector could not read video frames.")
-
-
-
-
-
-
-
-
             while True:
-
-
-
-
-
-
-
-
-                frame = await process.stdout.readexactly(frame_size)
+                if source_kind == "substream":
+                    try:
+                        frame = await asyncio.wait_for(
+                            process.stdout.readexactly(frame_size),
+                            motion_source.SUBSTREAM_STALL_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        stalled = True
+                        previous_frame = None
+                        raise RuntimeError("the camera substream stopped sending frames")
+                    live_hls_demand.note_source_frame(camera_number)
+                else:
+                    frame = await process.stdout.readexactly(frame_size)
+                frames_read += 1
+                if time.monotonic() >= next_service_check:
+                    next_service_check = time.monotonic() + CAMERA_IN_SERVICE_CACHE_SECONDS
+                    if not await asyncio.to_thread(camera_in_service, camera_number):
+                        # The finally below terminates this ffmpeg.
+                        print(f"Camera {camera_number} is no longer configured; motion detector stopped.")
+                        return
 
 
 
@@ -36349,7 +36575,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-            print(f"Camera {camera_number} motion detector retrying: {error}")
+            print(f"Camera {camera_number} motion detector retrying: {_redact_stream_credentials(str(error))}")
 
 
 
@@ -36413,6 +36639,10 @@ async def motion_detector(camera_number: int) -> None:
 
 
                     process.kill()
+            # Substream bookkeeping (motion_source.py); never logs a URL.
+            fallback_message = _motion_source_selector.note_run(camera_number, source_kind, frames_read, stalled)
+            if fallback_message:
+                print(fallback_message)
 
 
 
@@ -36615,6 +36845,212 @@ def _hls_read_frame_time(manifest: Path) -> datetime | None:
         return None
 
 
+# ---------------------------------------------------------------- AI frame source
+# (2026-10-11, video-pipeline P2a) -- see analytics_frames.py and
+# main_frame_grab.py.
+import analytics_frames
+import main_frame_grab
+
+
+def _record_describes_main(record: dict | None, main_url: str) -> bool:
+    import camera_capabilities
+    clean = camera_capabilities.split_credentials(main_url)[0]
+    return bool(record) and any(isinstance(s, dict) and s.get("uri") == clean for s in record.get("streams") or [])
+
+
+def analytics_source_spec(camera_number: int) -> "analytics_frames.SourceSpec | None":
+    """Where this camera's AI reader reads, at what size. Synchronous
+    (database, maybe one ffprobe); called from the reader thread only.
+    Measured profile first (video_profile.analytics_choice: the smallest
+    stream >= 640 px wide; a 480-639 px stream only with
+    ANYAICAM_AI_ALLOW_480_SUBSTREAM; else the main stream); before the camera
+    has been measured, the substream the motion reader uses, sized by one
+    ffprobe and held to the same width policy, else the main stream. The
+    returned spec says why (reason, logged by the reader). Never logs a URL."""
+    import camera_capabilities
+    try:
+        main_url = camera_url(camera_number)
+    except Exception:
+        return None
+    _clean, username, password = camera_capabilities.split_credentials(main_url)
+    record = camera_video_profiles.record(camera_number)
+    profile = camera_profile(camera_number)
+    probe_ok = bool(record and (record.get("video_probe") or {}).get("status") == "ok")
+    if ai_frames.mode == "main":
+        # ANYAICAM_AI_SOURCE=main (default): the camera's main stream -- at its
+        # own resolution by default (ANYAICAM_AI_MAIN_READER_SIZE=native), the
+        # exact frame YOLO gets today; or scaled into the analytics box.
+        # A native read must know the true size, so it always uses a fresh
+        # measurement (ffprobe) when the stored one is not a measurement.
+        native = analytics_frames.MAIN_READER_SIZE == "native"
+        if probe_ok and profile.measured and _record_describes_main(record, main_url):
+            width, height = profile.source["width"], profile.source["height"]
+        else:
+            measured = camera_video_probe.ffprobe_stream(main_url)
+            if measured is None:
+                return None
+            width, height = measured["width"], measured["height"]
+        if native:
+            return analytics_frames.SourceSpec(main_url, width, height, "main", "main_by_config", native=True)
+        size = video_profile.fit(width, height, video_profile.box_for(video_profile.shape(width, height), video_profile.ANALYTICS_BOX))
+        return analytics_frames.SourceSpec(main_url, size[0], size[1], "main", "main_by_config") if size else None
+    if probe_ok and profile.analytics_uri and _record_describes_main(record, main_url):
+        url = camera_capabilities.with_credentials(profile.analytics_uri, username, password)
+        kind = "main" if profile.analytics_is_main else "substream"
+        if profile.analytics_size:
+            return analytics_frames.SourceSpec(url, profile.analytics_size[0], profile.analytics_size[1], kind,
+                                               profile.analytics_reason)
+        url, kind, reason = url, kind, profile.analytics_reason
+        measured = camera_video_probe.ffprobe_stream(url)
+    else:
+        sub_url = motion_substream_url(camera_number)
+        measured = camera_video_probe.ffprobe_stream(sub_url) if sub_url else None
+        reason = "main_no_usable_substream"
+        if measured and measured["width"] >= video_profile.ANALYTICS_MIN_WIDTH:
+            url, kind, reason = sub_url, "substream", "substream_640"
+        elif measured and measured["width"] >= video_profile.ANALYTICS_FALLBACK_MIN_WIDTH:
+            if video_profile.ALLOW_480_SUBSTREAM:
+                url, kind, reason = sub_url, "substream", "substream_480_fallback"
+            else:
+                measured, reason = None, "main_480_fallback_disabled"
+        else:
+            measured = None
+        if measured is None:
+            url, kind = main_url, "main"
+            measured = camera_video_probe.ffprobe_stream(url)
+    if measured is None:
+        return None
+    box = video_profile.box_for(video_profile.shape(measured["width"], measured["height"]), video_profile.ANALYTICS_BOX)
+    size = video_profile.fit(measured["width"], measured["height"], box)
+    return analytics_frames.SourceSpec(url, size[0], size[1], kind, reason) if size else None
+
+
+ai_frames = analytics_frames.AnalyticsFrames(analytics_source_spec, in_service=camera_in_service)
+_video_probe_listeners.append(ai_frames.restart)
+
+
+def _live_hls_auto_policy() -> bool:
+    """ANYAICAM_LIVE_HLS_MODE=auto (live_hls_demand.py, video-pipeline P2b):
+    the live encoder may run on demand only when no always-on consumer of
+    the HLS output remains -- see docs/video-pipeline-20261011.md for the
+    consumer list. Motion and AI frames must not be configured to read HLS
+    (their per-camera fallbacks hold/touch the encoder themselves), and the
+    appliance agent must have advertised that it reads camera<N>.alive."""
+    if MOTION_DETECTION_ENABLED and _motion_source_selector.mode == "hls":
+        return False
+    if ai_frames.mode == "hls":
+        return False
+    return live_hls_demand.agent_marker_fresh(HLS_FOLDER)
+
+
+live_hls_demand.set_auto_policy(_live_hls_auto_policy, log=print)
+
+
+def _event_buffer_full_frame(camera_number: int):
+    """Event mode only: the newest frame of the pre-event buffer (no extra
+    camera session) -- lpr.latest_full_resolution_frame, as before."""
+    if _local_recording_settings(camera_number).get("mode") != "event":
+        return None
+    return lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME)
+
+
+def _main_url_or_none(camera_number: int) -> str | None:
+    try:
+        return camera_url(camera_number)
+    except Exception:
+        return None
+
+
+main_frame_grabber = main_frame_grab.MainFrameGrabber(_main_url_or_none, buffer_frame=_event_buffer_full_frame)
+
+
+def ai_full_resolution_frame(camera_number: int, result: dict):
+    """A main-stream frame for LPR/PPE/face crops, or None when the
+    analytics frame already is (near) full resolution. Blocking."""
+    frame = result.get("frame")
+    if frame is None:
+        return None
+    if result.get("frame_source") in (None, "hls"):
+        return None  # the HLS frame is the full-resolution picture already (and keeps the old LPR path)
+    # A main-stream reader frame is scaled to <= 1280x720: LPR/PPE/face still
+    # need the full-resolution frame for their crops (never a quality loss).
+    main_width = camera_profile(camera_number).source.get("width")
+    if not main_frame_grab.needs_full_resolution(frame.shape[1], main_width):
+        return None
+    return main_frame_grabber.grab(camera_number)
+
+
+# One YOLO pass per shared frame: camera -> (frame seq, result).
+_ai_detection_cache: dict[int, tuple[int, dict]] = {}
+_ai_detection_cache_lock = threading.Lock()
+
+
+def _ai_detection_cache_get(camera_number: int, seq) -> dict | None:
+    """seq: (camera generation, reader generation, frame seq) or None."""
+    if seq is None:
+        return None
+    with _ai_detection_cache_lock:
+        if seq[0] != _camera_generation.get(camera_number, 0):
+            return None
+        cached = _ai_detection_cache.get(camera_number)
+    if not cached or cached[0] != seq:
+        return None
+    result = dict(cached[1])
+    result["detections"] = [dict(item) for item in cached[1].get("detections") or []]
+    return result
+
+
+def _ai_detection_cache_put(camera_number: int, seq, result: dict) -> dict:
+    if seq is not None and result.get("ok"):
+        with _ai_detection_cache_lock:
+            if seq[0] != _camera_generation.get(camera_number, 0):
+                # Retired while YOLO ran: never cache (or deliver) it.
+                return {"ok": False, "error": "Camera is not configured.", "detections": []}
+            _ai_detection_cache[camera_number] = (seq, result)
+        result = dict(result)
+        result["detections"] = [dict(item) for item in result.get("detections") or []]
+    return result
+
+
+def _read_hls_analytics_frame(camera_number: int):
+    """The previous AI frame source, unchanged: one frame of the camera's
+    live HLS playlist via cv2.VideoCapture. (frame, captured_at, None) or
+    (None, None, error result)."""
+    manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
+    # On-demand live HLS (live_hls_demand.py): this reader keeps the
+    # camera's live encoder running, and never analyses a stale playlist
+    # (an idle-stopped encoder leaves its last segments on disk).
+    if live_hls_demand.on_demand():
+        live_hls_demand.touch(camera_number, "analytics")
+        if not live_hls_demand.playlist_fresh(manifest):
+            return None, None, {
+                "ok": False,
+                "error": "Live HLS stream is starting.",
+                "detections": [],
+            }
+    if not manifest.exists():
+        return None, None, {
+            "ok": False,
+            "error": "Live HLS stream is not ready.",
+            "detections": [],
+        }
+    # When the frame read below actually happened (detection_timing.py).
+    frame_captured_at = _hls_read_frame_time(manifest)
+    capture = cv2.VideoCapture(str(manifest))
+    try:
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok or frame is None:
+        return None, None, {
+            "ok": False,
+            "error": "Could not read a live frame.",
+            "detections": [],
+        }
+    return frame, frame_captured_at, None
+
+
 def detect_objects_frame(camera_number: int) -> dict:
 
 
@@ -36687,206 +37123,34 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
-    manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
-
-
-
-
-
-
-
-
-    if not manifest.exists():
-
-
-
-
-
-
-
-
-        return {
-
-
-
-
-
-
-
-
-            "ok": False,
-
-
-
-
-
-
-
-
-            "error": "Live HLS stream is not ready.",
-
-
-
-
-
-
-
-
-            "detections": [],
-
-
-
-
-
-
-
-
-        }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # When the frame read below actually happened (detection_timing.py).
-    frame_captured_at = _hls_read_frame_time(manifest)
-    capture = cv2.VideoCapture(str(manifest))
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-
-
-
-
-
-
-
-        ok, frame = capture.read()
-
-
-
-
-
-
-
-
-    finally:
-
-
-
-
-
-
-
-
-        capture.release()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    if not ok or frame is None:
-
-
-
-
-
-
-
-
-        return {
-
-
-
-
-
-
-
-
-            "ok": False,
-
-
-
-
-
-
-
-
-            "error": "Could not read a live frame.",
-
-
-
-
-
-
-
-
-            "detections": [],
-
-
-
-
-
-
-
-
-        }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # AI frames (2026-10-11, video-pipeline P2a -- analytics_frames.py):
+    # the newest frame of the camera's analytics stream (substream), read by
+    # one persistent reader per camera and shared by every analytics worker.
+    # ANYAICAM_AI_SOURCE=hls, or the auto fallback after repeated reader
+    # failures, is the previous live-HLS read (_read_hls_analytics_frame),
+    # which also keeps the on-demand live encoder running.
+    camera_generation = _camera_generation.get(camera_number, 0)
+    shared = ai_frames.get_frame(camera_number)
+    if shared is None:
+        frame, frame_captured_at, error = _read_hls_analytics_frame(camera_number)
+        if error is not None:
+            return error
+        frame_source, frame_seq = "hls", None
+    else:
+        if not shared["ok"]:
+            return {
+                "ok": False,
+                "error": shared["error"],
+                "detections": [],
+            }
+        frame, frame_captured_at = shared["frame"], shared["captured_at"]
+        frame_source = shared["source"] or "substream"
+        frame_seq = (camera_generation, shared.get("generation", 0), shared["seq"]) if shared["seq"] is not None else None
+        # Several workers (AI, People Counting, Smart Rules) may ask for the
+        # same shared frame: one YOLO pass per frame.
+        cached = _ai_detection_cache_get(camera_number, frame_seq)
+        if cached is not None:
+            return cached
     model = get_yolo_model()
 
 
@@ -37215,7 +37479,8 @@ def detect_objects_frame(camera_number: int) -> dict:
     # area the customer chose to ignore never reaches any analytic -- see
     # detection_exclusion.py. Cameras without one are unaffected.
     detections = detection_exclusion.filter_detections(camera_number, detections, frame)
-    return {
+    return _ai_detection_cache_put(camera_number, frame_seq, {
+        "frame_source": frame_source,
 
 
 
@@ -37261,7 +37526,7 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
-    }
+    })
 
 
 
@@ -37404,6 +37669,21 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         return []
+    # PPE / face crops (2026-10-11, video-pipeline P2a): on an analytics-
+    # stream frame, the person is cut from ONE main-stream frame grabbed on
+    # demand -- only when a PPE/face check actually crops a person. On a
+    # live-HLS frame (ANYAICAM_AI_SOURCE=hls) this is None and the crop is
+    # taken from the frame itself, as before.
+    _crop_frames: list = []
+
+    def _crop_full_frame():
+        if not _crop_frames:
+            try:
+                _crop_frames.append(ai_full_resolution_frame(camera_number, result))
+            except Exception:
+                _crop_frames.append(None)
+        return _crop_frames[0]
+
 
 
 
@@ -37519,7 +37799,10 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-    annotated = frame.copy()
+    # Thumbnail at the profile size (2026-10-11, video-pipeline P2d):
+    # ANYAICAM_THUMBNAIL_MAX_WIDTH (1280) wide at most, never upscaled; the
+    # boxes below are drawn in thumbnail coordinates.
+    annotated, thumb_factor = video_profile.thumbnail_image(frame)
 
 
 
@@ -37700,6 +37983,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         height = detection["height"]
+        x, y, width, height = video_profile.scale_box(x, y, width, height, thumb_factor)
 
 
 
@@ -38192,7 +38476,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         person_detection["width"],
                         person_detection["height"],
                     )
-                    person_crop = frame[hy : hy + hh, hx : hx + hw]
+                    person_crop = main_frame_grab.full_resolution_crop(frame, (hx, hy, hw, hh), _crop_full_frame())
                     ppe_result = ppe.detect_ppe(person_crop, camera_number=camera_number)
                 except Exception as error:
                     ppe_result = None
@@ -38266,7 +38550,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         person_detection["width"],
                         person_detection["height"],
                     )
-                    person_crop_for_aac = frame[fy : fy + fh, fx : fx + fw]
+                    person_crop_for_aac = main_frame_grab.full_resolution_crop(frame, (fx, fy, fw, fh), _crop_full_frame())
                     from appliance_activation import active_appliance_id
                     from database_backend import connect as aac_connect
 
@@ -38536,7 +38820,15 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
     boxes = [(d["x"], d["y"], d["width"], d["height"]) for d in vehicles]
     full_frame = None
     if lpr.LPR_FULL_RES_FRAMES:
-        full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+        if result.get("frame_source") in (None, "hls"):
+            # ANYAICAM_AI_SOURCE=hls / fallback: the previous behaviour exactly.
+            full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+        elif boxes:
+            # Analytics-stream frame (video-pipeline P2a): one main-stream frame,
+            # grabbed only if LPR actually reads one of these vehicle boxes
+            # (Event-mode buffer first, else one RTSP frame -- also in
+            # Continuous mode). lpr.scan_frame() calls this at most once.
+            full_frame = lambda: ai_full_resolution_frame(camera_number, result)
     confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame)
     events = []
     from detection_timing import plate_event_span
@@ -38574,9 +38866,9 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             plate_filename = f"camera{camera_number}_{stamp}_plate_{event_id}.jpg"
             if cv2.imwrite(str(day_folder / plate_filename), plate_image):
                 plate_crop_url = media_base + quote(plate_filename)
-            annotated = frame.copy()
+            annotated, thumb_factor = video_profile.thumbnail_image(frame)  # profile size (P2d)
             if plate.get("vehicle_box"):
-                vx, vy, vw, vh = plate["vehicle_box"]
+                vx, vy, vw, vh = video_profile.scale_box(*plate["vehicle_box"], thumb_factor)
                 cv2.rectangle(annotated, (vx, vy), (vx + vw, vy + vh), (255, 177, 74), 2)
                 cv2.putText(annotated, plate["plate_number"], (vx, max(20, vy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 177, 74), 2)
             thumb_filename = f"camera{camera_number}_{stamp}_{event_id}.jpg"
@@ -38906,7 +39198,7 @@ async def people_counting_worker(camera_number: int) -> None:
                                     f"people_counting_{uuid.uuid4().hex[:12]}.jpg"
                                 )
                                 thumbnail_path = day_folder / thumbnail_filename
-                                if cv2.imwrite(str(thumbnail_path), frame):
+                                if cv2.imwrite(str(thumbnail_path), video_profile.thumbnail_image(frame)[0]):  # profile size (P2d)
                                     thumbnail_url = (
                                         f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
                                         f"{quote(thumbnail_filename)}"
@@ -40434,18 +40726,8 @@ async def lifespan(app: FastAPI):
 
 
 
-            motion_tasks = [
-
-
-
-
-
-
-
-
-                asyncio.create_task(motion_detector(camera_number))
-                for camera_number in camera_numbers
-            ]
+            reconcile_camera_workers(camera_numbers)  # registry: see reconcile_camera_workers()
+            motion_tasks = list(_camera_worker_tasks["motion"].values())
             # 2026-09-20: one janitor per camera slot, started
             # unconditionally alongside motion detection -- each one is
             # a cheap no-op for any camera not currently in Event mode
@@ -40488,10 +40770,8 @@ async def lifespan(app: FastAPI):
 
 
 
-            ai_tasks = [
-                asyncio.create_task(ai_person_detector(camera_number))
-                for camera_number in camera_numbers
-            ]
+            reconcile_camera_workers(camera_numbers)
+            ai_tasks = list(_camera_worker_tasks["ai"].values())
 
         if PEOPLE_COUNTING_ENABLED:
             # One task spawned per camera, exactly like ai_tasks above --
@@ -40607,6 +40887,9 @@ async def lifespan(app: FastAPI):
 
 
     cloud_upload_task = asyncio.create_task(cloud_upload_worker_placeholder())
+    # On-demand live HLS: a camera relayed to a cloud viewer keeps its
+    # live encoder running (no-op when the encoder is always on).
+    live_hls_demand.add_provider(live_relay_uploader.active_camera_numbers)
     live_relay_task = (
         asyncio.create_task(live_relay_uploader.live_relay_worker(HLS_FOLDER))
         if RUNTIME_ROLE in {"edge", "combined"} and live_relay_uploader.LIVE_RELAY_ENABLED
@@ -40648,6 +40931,13 @@ async def lifespan(app: FastAPI):
     # effect until that flag is explicitly turned on.
     webrtc_publisher_task = (
         asyncio.create_task(webrtc_publisher.webrtc_publisher_worker(camera_url))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    # Measured camera video geometry (2026-10-11, camera_video_probe.py):
+    # independent of P2P; feeds video_profile.py and the cloud report.
+    camera_video_probe_task = (
+        asyncio.create_task(camera_video_probe_worker())
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
@@ -40859,7 +41149,7 @@ async def lifespan(app: FastAPI):
 
 
 
-        for task in supervisor_tasks + motion_tasks + ai_tasks:
+        for task in supervisor_tasks + motion_tasks + ai_tasks + camera_worker_tasks():
 
 
 
@@ -40906,6 +41196,9 @@ async def lifespan(app: FastAPI):
             access_control_task.cancel()
         if webrtc_publisher_task:
             webrtc_publisher_task.cancel()
+        if camera_video_probe_task:
+            camera_video_probe_task.cancel()
+        ai_frames.stop_all()  # AI analytics-stream readers (analytics_frames.py)
         if local_storage_manager_task:
             local_storage_manager_task.cancel()
         if recording_upload_task:
@@ -40980,6 +41273,7 @@ async def lifespan(app: FastAPI):
 
 
         pending.extend(motion_tasks)
+        pending.extend(task for task in camera_worker_tasks() if task not in motion_tasks and task not in ai_tasks)
 
 
 
@@ -41026,6 +41320,8 @@ async def lifespan(app: FastAPI):
             pending.append(access_control_task)
         if webrtc_publisher_task:
             pending.append(webrtc_publisher_task)
+        if camera_video_probe_task:
+            pending.append(camera_video_probe_task)
         if local_storage_manager_task:
             pending.append(local_storage_manager_task)
         if recording_upload_task:
@@ -41840,15 +42136,13 @@ async def forwarded_https_middleware(request: Request, call_next):
 
 
 
+    # On-demand live HLS (live_hls_demand.py): a player or the WireGuard
+    # proxy asking for a camera's playlist/segment is live-video demand.
+    if live_hls_demand.mode() != "always" and request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
+        demanded_camera = live_hls_demand.camera_number_from_hls_path(request.url.path)
+        if demanded_camera is not None:
+            live_hls_demand.touch(demanded_camera, "http")
     response = await call_next(request)
-
-
-
-
-
-
-
-
     # Live playlists are rewritten every second and reference a three-segment
     # rolling window. Reusing an old manifest makes the player request
     # segments that FFmpeg has already deleted.
@@ -49371,7 +49665,7 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';if(Hls.isSupported()){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';function loadDetailHls(attempt){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});hls.on(Hls.Events.ERROR,(_,data)=>{{if(!data.fatal)return;hls.destroy();if(attempt<20)setTimeout(()=>loadDetailHls(attempt+1),3000)}})}}if(Hls.isSupported()){{loadDetailHls(0)}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
 
 
 
@@ -52290,6 +52584,9 @@ def operations_rdm_page(request: Request) -> str:
         )
         online_cameras = sum(1 for c in camera_status if c.get("online"))
         recording_cameras = sum(1 for c in camera_status if c.get("online") and c.get("recording"))
+        # Measured video per camera (2026-10-11, video_profile.py).
+        camera_video = video_profile.admin_camera_video_html(
+            partner_rows(video_profile.ADMIN_CAMERA_VIDEO_SQL, (item["id"],)), escape)
         actions = ""
         if can_act:
             actions = (
@@ -52310,6 +52607,7 @@ def operations_rdm_page(request: Request) -> str:
             f'<div class="health-row"><span>Cameras online / recording</span><strong>{online_cameras}/{len(camera_status)} · {recording_cameras} recording</strong></div>'
             f'<div class="health-row"><span>IP address</span><strong>{escape(item.get("ip_address") or "Unknown")}</strong></div>'
             f'{actions}'
+            f'{camera_video}'
             f'<details style="margin-top:10px"><summary>Recent diagnostics ({len(history)})</summary>'
             + "".join(
                 f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h.get("cpu") or 0}% · '
@@ -52872,6 +53170,11 @@ def _legacy_camera_status() -> dict:
 
 
         streaming = manifest_age is not None and manifest_age < 15
+        # On-demand live HLS: an idle encoder's playlist is stale by design;
+        # camera{N}.alive (refreshed while the camera is reachable) counts.
+        if not streaming and live_hls_demand.on_demand():
+            alive_age = live_hls_demand.file_age(live_hls_demand.alive_path(HLS_FOLDER, camera_number), now)
+            streaming = alive_age is not None and alive_age < 15
 
 
 
@@ -56297,7 +56600,8 @@ def ai_detection_status() -> dict:
 
 
 
-            {"camera": camera_number, **ai_detection_state[camera_number], "exclusion_zones": detection_exclusion.status(camera_number)}
+            {"camera": camera_number, **ai_detection_state[camera_number], "exclusion_zones": detection_exclusion.status(camera_number),
+             "frame_source": ai_frames.state(camera_number)}  # which analytics stream AI uses, and why (video-pipeline)
 
 
 
@@ -60337,52 +60641,14 @@ async def build_manual_clip(
 
 
 
-        command = [
-
-
-
-
-
-
-
-
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-
-
-
-
-
-
-
-
-            "-ss", str(offset_seconds), "-t", str(duration_seconds), "-an",
-
-
-
-
-
-
-
-
-            "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart",
-
-
-
-
-
-
-
-
-            str(output_path),
-
-
-
-
-
-
-
-
-        ]
+        # 2026-10-11 (video-pipeline P2c, clip_encode.py): input seeking and a
+        # thread cap; full resolution unless ANYAICAM_MANUAL_CLIP_SCALE=profile.
+        # ANYAICAM_EVENT_CLIP_ENCODE=legacy = the previous command exactly.
+        clip_profile = await asyncio.to_thread(camera_profile, camera_number)
+        command = clip_encode.manual_clip_command(
+            [source for _, source in candidates], list_file, offset_seconds, duration_seconds,
+            output_path, clip_profile,
+        )
 
 
 
@@ -73057,7 +73323,7 @@ function toggleAnalytics(n){
 
 
 
-function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}document.querySelectorAll('video[id^="camera"]').forEach(v=>{const n=Number(v.id.slice(6));if(n)connectCamera(n)});
+function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){loadCameraHls(n,video,source,0)}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}function loadCameraHls(n,video,source,attempt){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(!data.fatal)return;setState(n,'Waiting for camera');hls.destroy();if(attempt<20)setTimeout(()=>loadCameraHls(n,video,source,attempt+1),3000)})}document.querySelectorAll('video[id^="camera"]').forEach(v=>{const n=Number(v.id.slice(6));if(n)connectCamera(n)});
 
 
 
@@ -79610,7 +79876,7 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 
 
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const type='{analytic_type}',canvas=document.getElementById('rule-canvas'),context=canvas.getContext('2d'),points=[];function draw(){{context.clearRect(0,0,canvas.width,canvas.height);if(!points.length)return;context.strokeStyle='#42e4dc';context.fillStyle='rgba(66,228,220,.16)';context.lineWidth=5;context.beginPath();points.forEach((point,index)=>index?context.lineTo(point.x*canvas.width,point.y*canvas.height):context.moveTo(point.x*canvas.width,point.y*canvas.height));if(type==='intrusion'&&points.length>2){{context.closePath();context.fill()}}context.stroke();points.forEach(point=>{{context.beginPath();context.arc(point.x*canvas.width,point.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}canvas.addEventListener('click',event=>{{const rect=canvas.getBoundingClientRect();if(type==='line_crossing'&&points.length>=2)points.length=0;points.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});draw()}});document.getElementById('clear-rule').addEventListener('click',()=>{{points.length=0;draw()}});const camera=document.getElementById('rule-camera'),video=document.getElementById('rule-preview');function connectPreview(){{const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.ruleHls)window.ruleHls.destroy();if(Hls.isSupported()){{window.ruleHls=new Hls();window.ruleHls.loadSource(source);window.ruleHls.attachMedia(video)}}else video.src=source}}camera.addEventListener('change',connectPreview);connectPreview();document.getElementById('analytic-rule-form').addEventListener('submit',async event=>{{event.preventDefault();if(points.length<(type==='line_crossing'?2:3)){{showToast('Draw the required line or zone first.');return}}const payload={{camera:Number(camera.value),name:document.getElementById('rule-name').value,analytic_type:type,enabled:document.getElementById('rule-enabled').checked,direction:document.getElementById('rule-direction').value,sensitivity:Number(document.getElementById('rule-sensitivity').value),confidence_threshold:Number(document.getElementById('rule-confidence').value),schedule_start:document.getElementById('rule-start').value,schedule_end:document.getElementById('rule-end').value,retention_days:Number(document.getElementById('rule-retention').value),alerts_enabled:document.getElementById('rule-alerts').checked,geometry:points}},response=await fetch('/api/analytics/rules',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();showToast(result.message)}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const type='{analytic_type}',canvas=document.getElementById('rule-canvas'),context=canvas.getContext('2d'),points=[];function draw(){{context.clearRect(0,0,canvas.width,canvas.height);if(!points.length)return;context.strokeStyle='#42e4dc';context.fillStyle='rgba(66,228,220,.16)';context.lineWidth=5;context.beginPath();points.forEach((point,index)=>index?context.lineTo(point.x*canvas.width,point.y*canvas.height):context.moveTo(point.x*canvas.width,point.y*canvas.height));if(type==='intrusion'&&points.length>2){{context.closePath();context.fill()}}context.stroke();points.forEach(point=>{{context.beginPath();context.arc(point.x*canvas.width,point.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}canvas.addEventListener('click',event=>{{const rect=canvas.getBoundingClientRect();if(type==='line_crossing'&&points.length>=2)points.length=0;points.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});draw()}});document.getElementById('clear-rule').addEventListener('click',()=>{{points.length=0;draw()}});const camera=document.getElementById('rule-camera'),video=document.getElementById('rule-preview');function connectPreview(attempt){{attempt=typeof attempt==='number'?attempt:0;const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.ruleHls)window.ruleHls.destroy();window.ruleHls=null;if(Hls.isSupported()){{const hls=new Hls();window.ruleHls=hls;hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal&&window.ruleHls===hls&&attempt<20)setTimeout(()=>{{if(window.ruleHls===hls)connectPreview(attempt+1)}},3000)}})}}else video.src=source}}camera.addEventListener('change',()=>connectPreview(0));connectPreview(0);document.getElementById('analytic-rule-form').addEventListener('submit',async event=>{{event.preventDefault();if(points.length<(type==='line_crossing'?2:3)){{showToast('Draw the required line or zone first.');return}}const payload={{camera:Number(camera.value),name:document.getElementById('rule-name').value,analytic_type:type,enabled:document.getElementById('rule-enabled').checked,direction:document.getElementById('rule-direction').value,sensitivity:Number(document.getElementById('rule-sensitivity').value),confidence_threshold:Number(document.getElementById('rule-confidence').value),schedule_start:document.getElementById('rule-start').value,schedule_end:document.getElementById('rule-end').value,retention_days:Number(document.getElementById('rule-retention').value),alerts_enabled:document.getElementById('rule-alerts').checked,geometry:points}},response=await fetch('/api/analytics/rules',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();showToast(result.message)}});</script>"""
 
 
 
@@ -147545,6 +147811,7 @@ const monitorData = {monitor_data};
 
 
 const videos = new Map();
+const streamRetries = new Map();
 
 
 
@@ -147805,7 +148072,16 @@ function attachStream(camera) {{
 
 
 
-      hls.on(Hls.Events.ERROR, (_, data) => console.warn(`Camera ${{camera}} HLS error`, data));
+      hls.on(Hls.Events.ERROR, (_, data) => {{
+        console.warn(`Camera ${{camera}} HLS error`, data);
+        // A camera whose live encoder starts on demand needs a few
+        // seconds: retry a fatal error (bounded) instead of staying dead.
+        if (!data.fatal || videos.get(camera) !== hls) return;
+        hls.destroy();
+        videos.delete(camera);
+        streamRetries.set(camera, (streamRetries.get(camera) || 0) + 1);
+        if (streamRetries.get(camera) <= 20) setTimeout(() => {{ if (!videos.has(camera)) attachStream(camera); }}, 3000);
+      }});
 
 
 
