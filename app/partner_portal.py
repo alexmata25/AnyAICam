@@ -320,9 +320,14 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         forced=bool(record and record['must_change_password'])
         current='' if forced else '<label>Current password<input id="current-password" type="password" autocomplete="current-password" required></label>'
         heading='Create your permanent password' if forced else 'Change your password'
-        content=f'''<header class="topbar"><div><p class="eyebrow">Account activation</p><h1>{heading}</h1></div></header><section class="panel" style="max-width:560px;margin:auto"><form id="activation-password" class="rule-form">{current}<label>New password<input id="new-password" type="password" minlength="12" autocomplete="new-password" required></label>{terms}<button class="action-button">{'Activate account' if forced else 'Change password'}</button></form></section>'''
+        # A customer (or a partner user who is only changing a password) is
+        # not "activating a partner account" (2026-10-10).
+        is_partner=identity['role'] in PARTNER_ROLES
+        page_title=('Activate partner account' if is_partner else 'Activate your account') if forced else 'Change password'
+        eyebrow='Account activation' if forced else 'Account security'
+        content=f'''<header class="topbar"><div><p class="eyebrow">{eyebrow}</p><h1>{heading}</h1></div></header><section class="panel" style="max-width:560px;margin:auto"><form id="activation-password" class="rule-form">{current}<label>New password<input id="new-password" type="password" minlength="12" autocomplete="new-password" required></label>{terms}<button class="action-button">{'Activate account' if forced else 'Change password'}</button></form></section>'''
         scripts='''<script>document.getElementById('activation-password').addEventListener('submit',async e=>{e.preventDefault();const currentField=document.getElementById('current-password');const response=await fetch('/api/partner/activate-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('new-password').value,current_password:currentField?currentField.value:undefined,accept_terms:document.getElementById('accept-terms').checked})}),result=await response.json();if(!response.ok)return showToast(result.detail);showToast(result.message);setTimeout(()=>location.href=result.destination,500)})</script>'''
-        return shell('Activate partner account','partner-login',content,scripts)
+        return shell(page_title,'partner-login',content,scripts)
 
     @app.post('/api/partner/activate-account')
     def activate_partner_account(request: Request,payload: dict):
@@ -345,11 +350,25 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
                 audit(identity,'password.change_denied','partner_user',user['id'],{'reason':'current_password_mismatch'})
                 raise HTTPException(status_code=403,detail='Your current password is incorrect.')
             user_id=user['id']; db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0,terms_accepted_at=? WHERE id=?',(password_hash(password),now,user_id))
+            # A new password signs out every OTHER session of this user, as a
+            # reset already does (cloud_security.consume_password_reset):
+            # a session stolen with the old password must not outlive it.
+            # This request's own session stays signed in (2026-10-10).
+            forced_change=bool(user['must_change_password'])
+            current_session=str(identity.get('session_id') or '')
+            if current_session:
+                db.execute('UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL AND id!=?',(now,user_id,current_session))
+            else:
+                db.execute('UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',(now,user_id))
             db.execute("UPDATE invitations SET status='accepted' WHERE lower(email)=? AND status='pending'",(identity['email'].lower(),))
             if identity['role'] in PARTNER_ROLES: db.execute('INSERT INTO partner_terms_acceptances(id,user_id,terms_version,accepted_at,ip_address) VALUES(?,?,?,?,?)',(secrets.token_hex(8),user_id,'2026-08-01',now,request.client.host if request.client else None))
         if identity['role'] in PARTNER_ROLES: audit(identity,'partner_terms.accepted','partner_user',user_id,{'version':'2026-08-01'})
         audit(identity,'password.changed','partner_user',user_id)
-        return {'message':'Your partner account is active.','destination':destination_for_role(identity['role'])}
+        if not forced_change:
+            message='Your password has been changed. Any other signed-in sessions were signed out.'
+        else:
+            message='Your partner account is active.' if identity['role'] in PARTNER_ROLES else 'Your account is active.'
+        return {'message':message,'destination':destination_for_role(identity['role'])}
 
     @app.get('/api/partner-pricing')
     def partner_prices_api(request: Request) -> dict:

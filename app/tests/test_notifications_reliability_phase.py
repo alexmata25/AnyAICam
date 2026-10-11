@@ -367,8 +367,11 @@ def test_alerts_page_converts_utc_timestamp_to_appliance_timezone(monkeypatch, d
         conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity())
         result = main._render_customer_alerts(object())
-    assert "6:00 PM" not in result  # the old, unconverted bug's raw-UTC output
-    assert "1:00 PM" in result
+    # 2026-10-10: the exact UTC instant goes to the browser, which shows it
+    # in the viewer's own zone (smart_alerts.local_time_html); the visible
+    # server text is an explicit-UTC fallback, never unlabeled raw UTC.
+    assert '<time datetime="2026-08-22T18:00:00Z" data-local-time="short">Aug 22 · 6:00 PM UTC</time>' in result
+    assert "anyaicamLocalTimes" in result
 
 
 def test_alerts_page_deep_links_to_the_specific_event_when_a_clip_exists(monkeypatch, db_path):

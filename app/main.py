@@ -121731,6 +121731,7 @@ def _render_customer_events(request: Request) -> str:
         for camera in cameras
     )
 
+    import smart_alerts
     rows = []
     for event in events_list[:200]:
         raw_timestamp = str(event.get("timestamp") or "")
@@ -121748,13 +121749,17 @@ def _render_customer_events(request: Request) -> str:
             # once for display, the same "one correct conversion" this
             # investigation already applied on the Playback page's own
             # timeline/tooltips (playbackDate()).
-            occurred_at_utc = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
-            if occurred_at_utc.tzinfo is None:
-                occurred_at_utc = occurred_at_utc.replace(tzinfo=timezone.utc)
-            occurred_at = occurred_at_utc.astimezone(APPLIANCE_TIMEZONE)
-            timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
+            #
+            # 2026-10-10: shown in the VIEWER's own time zone, like
+            # Investigate and Playback (which format in the browser); the
+            # fixed APPLIANCE_TIMEZONE here showed a customer outside
+            # Central time a different time for the same event on this
+            # page. The server sends the exact UTC instant in a <time>
+            # element and smart_alerts.LOCAL_TIME_SCRIPT formats it.
+            datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            timestamp_html = smart_alerts.local_time_html(raw_timestamp, "datetime")
         except ValueError:
-            timestamp_label = raw_timestamp or "Unknown time"
+            timestamp_html = escape(raw_timestamp or "Unknown time")
         thumb_img = (
             # 2026-09-16: loading="lazy" -- found live, real production
             # data now has enough accumulated events (multi-thousand
@@ -121852,7 +121857,7 @@ def _render_customer_events(request: Request) -> str:
             f'data-event-timestamp="{escape(raw_timestamp, quote=True)}" '
             f'data-event-has-clip="{"1" if event.get("has_event_clip") else "0"}" '
             f'data-media-state="{media_state}">'
-            f'<td>{escape(timestamp_label)}</td>'
+            f'<td>{timestamp_html}</td>'
             f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
             f'<td class="event-thumbnail-cell">{thumbnail}</td>'
             f'<td><span class="pill">{escape(type_label)}</span></td>'
@@ -122159,7 +122164,7 @@ def _render_customer_events(request: Request) -> str:
     const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
     const confidence=event.confidence;
     const confidencePercent=(confidence===null||confidence===undefined)?'—':`${(confidence<=1?confidence*100:confidence).toFixed(1)}%`;
-    row.innerHTML=`<td>${desktopEventDate(event.timestamp).toLocaleString()}</td>`+
+    row.innerHTML=`<td>${desktopEventDate(event.timestamp).toLocaleString([],{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit'})}</td>`+
       `<td>${AnyAiCamEventMedia.escape(event.camera_name||(event.camera?`Camera ${event.camera}`:'—'))}</td>`+
       `<td class="event-thumbnail-cell">${thumbHtml}</td>`+
       `<td><span class="pill">${AnyAiCamEventMedia.escape(typeLabel)}</span></td>`+
@@ -122323,7 +122328,7 @@ def _render_customer_events(request: Request) -> str:
 </script>"""
 
     import customer_analytics_workspace
-    return page_shell("Events", "events", content, customer_analytics_workspace.versioned('<script src="/static/event_media.js"></script>') + scripts)
+    return page_shell("Events", "events", content, customer_analytics_workspace.versioned('<script src="/static/event_media.js"></script>') + smart_alerts.LOCAL_TIME_SCRIPT + scripts)
 
 
 def _customer_alert_text(notification: dict) -> tuple[str, str]:
@@ -142264,7 +142269,7 @@ def _recording_read_credentials(role_arn: str, region: str) -> dict | None:
         return _recording_read_credentials_cache
 
 
-def _generate_presigned_recording_url(s3_key: str) -> str | None:
+def _generate_presigned_recording_url(s3_key: str, download_filename: str | None = None) -> str | None:
     """R4 (recording-pipeline roadmap): signs a short-lived GET URL for
     one recording object. Fails closed (returns None) whenever the
     read-capable role isn't configured -- see
@@ -142306,7 +142311,15 @@ def _generate_presigned_recording_url(s3_key: str) -> str | None:
             aws_secret_access_key=creds['secret_access_key'],
             aws_session_token=creds['session_token'],
         )
-        return s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': s3_key}, ExpiresIn=900)
+        params = {'Bucket': bucket, 'Key': s3_key}
+        if download_filename:
+            # A same-origin download link that redirects here: S3 answers
+            # with Content-Disposition: attachment, the only thing that
+            # makes a browser save a cross-origin object (<a download> is
+            # ignored across origins). See customer_event_media_download().
+            params['ResponseContentDisposition'] = f'attachment; filename="{download_filename}"'
+            params['ResponseContentType'] = 'video/mp4'
+        return s3.generate_presigned_url('get_object', Params=params, ExpiresIn=900)
     except Exception:
         logging.getLogger('anyaicam.recording_read').exception('recording_read.presign_failed')
         return None
@@ -143371,6 +143384,78 @@ def customer_event_media_direct(camera_id: str, event_id: str, request: Request)
     if not url:
         raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
     return RedirectResponse(url, status_code=302)
+
+
+def _event_clip_download_filename(camera_id: str, event_id: str) -> str:
+    """ASCII-only, header-safe file name for a downloaded event clip:
+    anyaicam-<camera>-<UTC time>-<event type>.mp4."""
+    from partner_db import connection
+    with connection() as db:
+        event = db.execute(
+            "SELECT de.event_type, de.event_timestamp, c.name AS camera_name FROM detection_events de "
+            "LEFT JOIN cameras c ON c.id=de.camera_id WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+    event = dict(event) if event else {}
+    def safe(value: object, limit: int = 40) -> str:
+        text = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "")).strip("-").lower()
+        return text[:limit].strip("-")
+    stamp = ""
+    raw = str(event.get("event_timestamp") or "")
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            stamp = parsed.strftime("%Y%m%dT%H%M%SZ")
+        except ValueError:
+            stamp = ""
+    parts = ["anyaicam", safe(event.get("camera_name")) or safe(camera_id), stamp, safe(event.get("event_type"), 24)]
+    return "-".join(part for part in parts if part) + ".mp4"
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/media/download")
+def customer_event_media_download(camera_id: str, event_id: str, request: Request):
+    """Playback's Download button for an event clip (2026-10-10). The clip
+    plays from a presigned, cross-origin S3/CloudFront URL, where the
+    browser ignores <a download>, and the button was never enabled for an
+    event clip at all. This same-origin route answers with the file as an
+    attachment: over WireGuard straight from the appliance when that path
+    is eligible (served here with Content-Disposition), otherwise a 302 to
+    a URL presigned with ResponseContentDisposition=attachment. The same
+    customer camera authorization as /media/url and /media/direct, checked
+    on every request; the clip is looked up scoped to that camera."""
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    row = _event_media_direct_row(camera_id, event_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+    filename = _event_clip_download_filename(camera_id, event_id)
+    disposition = f'attachment; filename="{filename}"'
+    from live_view_wireguard import local_relative_path_allowed
+    peer = _event_media_active_peer(row["appliance_id"]) if local_relative_path_allowed(row["local_relative_path"]) else None
+    if peer:
+        import appliance_media_fetch
+        from live_view_wireguard import GATEWAY_APPLIANCE_PORT, GatewayUnavailable, _fetch_via_gateway
+        expires, token = appliance_media_fetch.mint(peer["media_fetch_secret"], row["local_relative_path"])
+        forward_path = "/api/appliance/media-fetch?" + urlencode({
+            "path": row["local_relative_path"], "expires": expires, "token": token,
+        })
+        try:
+            body = _fetch_via_gateway(peer["tunnel_address"], GATEWAY_APPLIANCE_PORT, forward_path)
+        except GatewayUnavailable:
+            body = None
+        if body is not None and appliance_media_fetch.response_looks_like_real_video(body, expected_size=row["size_bytes"]):
+            _log_event_media_fetch(row["media_id"], "wireguard", len(body), "download_direct_success")
+            return Response(content=body, media_type="video/mp4",
+                            headers={"Content-Disposition": disposition, "Cache-Control": "private, no-store"})
+    if not row.get("s3_key"):
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+    url = _generate_presigned_recording_url(row["s3_key"], download_filename=filename)
+    if not url:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+    _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "download_redirect")
+    return RedirectResponse(url, status_code=302, headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/appliance/media-fetch")
@@ -144824,8 +144909,20 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // than any recording in currentClips -- the recording-timeline
     // playhead has nothing real to point at during event playback, so
     // it's hidden rather than left showing a stale recording position.
-    placeholder.hidden=true;selectedClip=null;playheadEl.hidden=true;timelinePlayButton.disabled=false;skipBackButton.disabled=false;skipForwardButton.disabled=false;revealClipPanel();
+    placeholder.hidden=true;selectedClip=null;playheadEl.hidden=true;timelinePlayButton.disabled=false;skipBackButton.disabled=false;skipForwardButton.disabled=false;downloadButton.disabled=!selectedEventClip;revealClipPanel();
   }}}});
+  // Download for event clips (2026-10-10): remember which event clip the
+  // player holds (every start and cancel goes through these two) so the
+  // Download button can ask the same-origin attachment route for it --
+  // the clip itself plays from a cross-origin presigned URL, where
+  // <a download> is ignored.
+  let selectedEventClip=null;
+  const startEventMedia=eventPlayer.start,cancelEventMedia=eventPlayer.cancel;
+  eventPlayer.start=(cameraId,eventId,autoplay)=>{{selectedEventClip={{cameraId,eventId}};downloadButton.disabled=true;return startEventMedia(cameraId,eventId,autoplay)}};
+  eventPlayer.cancel=()=>{{selectedEventClip=null;return cancelEventMedia()}};
+  function eventClipDownloadUrl(clip){{
+    return `/api/customer/events/${{encodeURIComponent(clip.cameraId)}}/${{encodeURIComponent(clip.eventId)}}/media/download`;
+  }}
   window.addEventListener('pagehide',()=>{{eventPlayer.cancel();stopMobileEventPoll();}});
 
   // ?t= is now built server-side as an unambiguous UTC epoch-ms integer
@@ -146167,6 +146264,16 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   }});
 
   downloadButton.addEventListener('click',()=>{{
+    if(!selectedClip&&selectedEventClip){{
+      // Same-origin route answering Content-Disposition: attachment.
+      const eventLink=document.createElement('a');
+      eventLink.href=eventClipDownloadUrl(selectedEventClip);
+      eventLink.download='';
+      document.body.appendChild(eventLink);
+      eventLink.click();
+      eventLink.remove();
+      return;
+    }}
     if(!video.currentSrc||!selectedClip)return;
     const link=document.createElement('a');
     link.href=video.currentSrc;

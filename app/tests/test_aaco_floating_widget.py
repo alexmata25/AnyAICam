@@ -301,5 +301,8 @@ def test_floating_button_sits_above_the_phone_tab_bar(client):
     above it, and the Analytics submenu opens above the button."""
     html = client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
     assert "mobile-nav" in html
-    assert "@media (max-width:760px){body:has(.mobile-nav) .aaco-float-root{bottom:84px}" in html
+    # 2026-10-10: above the bar's measured height (it wraps to two rows on a
+    # 390px phone); 84px is only the one-row fallback.
+    assert "@media (max-width:760px){body:has(.mobile-nav) .aaco-float-root{bottom:var(--aaco-nav-clearance,84px)}" in html
+    assert "--aaco-nav-clearance" in html
     assert ".mobile-analytics-sheet{position:fixed;z-index:10000;" in html or "mobile-analytics-sheet" not in html
