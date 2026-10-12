@@ -429,7 +429,10 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         # Simulate a valid accepted authorization made while the appliance
         # clock was correct, then stepped back by more than the validator's
         # five-minute future tolerance before an offline repair.
-        future = NOW + dt.timedelta(days=1)
+        # The CLI path uses the real appliance clock, so keep this timestamp
+        # in the future relative to the test run instead of the fixed NOW
+        # fixture (which eventually becomes historical).
+        future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
         snapshot = make_snapshot(self.private, issued=future, expires=future + dt.timedelta(days=1),
                                  **CLOUD_IDENTITY)
         accepted_state, outcome = _advance(snapshot, {"cloud-key": self.public}, CLOUD_IDENTITY,
