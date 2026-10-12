@@ -114120,12 +114120,25 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     _expected_cents = _catalog_addon["monthly_cents"] if _catalog_addon else _catalog_face["monthly_cents_per_door"]
     require_stripe_price_matches_catalog(price_id, _expected_cents, "month")
     import friends_family
-    try:
-        friends_family.checkout_discount(customer_id, item["discount_class"])
-    except friends_family.CheckoutHeld as held:
-        raise HTTPException(status_code=409, detail=str(held))
-    except RuntimeError as missing:
-        raise HTTPException(status_code=503, detail=str(missing))
+    import founder_discount
+    founder_eligible = founder_discount.eligible_for(customer_id, addon_key)
+    if founder_eligible:
+        # A pending Friends & Family request continues to hold analytics
+        # checkout. Otherwise the separately authorized Founder program is
+        # applied instead of stacking with Friends & Family.
+        if friends_family.status_for(customer_id) == friends_family.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail=("Your Friends & Family request is waiting for administrator approval. "
+                        "You can check out as soon as it is decided."),
+            )
+    else:
+        try:
+            friends_family.checkout_discount(customer_id, item["discount_class"])
+        except friends_family.CheckoutHeld as held:
+            raise HTTPException(status_code=409, detail=str(held))
+        except RuntimeError as missing:
+            raise HTTPException(status_code=503, detail=str(missing))
     fields = [
         ("mode", "subscription"),
         ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?analytics_addon_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
@@ -114144,7 +114157,16 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         ("subscription_data[metadata][anyaicam_product_class]", "addon"),
         ("subscription_data[metadata][anyaicam_addon_key]", addon_key),
     ]
-    friends_family.apply_to_checkout_fields(fields, customer_id, item["discount_class"])
+    founder_audit = None
+    if founder_eligible:
+        try:
+            founder_audit = founder_discount.apply_to_checkout_fields(
+                fields, customer_id=customer_id, addon_key=addon_key, price_id=price_id,
+            )
+        except founder_discount.FounderDiscountConfigurationError as error:
+            raise HTTPException(status_code=503, detail=str(error))
+    else:
+        friends_family.apply_to_checkout_fields(fields, customer_id, item["discount_class"])
     import checkout_guard
     fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
     session = checkout_guard.create_session(customer_id, f"addon:{addon_key}", price_id=price_id, quantity=quantity, fields=fields)
@@ -114158,8 +114180,11 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         customer_id=customer_id,
         addon_key=addon_key,
         analytic_keys=list(analytic_keys),
+        discount_program=(founder_audit or {}).get("program", "friends_family_or_standard"),
+        discount_duration=(founder_audit or {}).get("duration"),
+        discount_duration_months=(founder_audit or {}).get("duration_months"),
     )
-    return {
+    response = {
         "status": "complete",
         "session_id": session_id,
         "checkout_url": checkout_url,
@@ -114169,6 +114194,11 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         "billing_type": "recurring",
         "message": "Stripe Checkout Session created.",
     }
+    if founder_audit:
+        response["discount"] = {"program": founder_audit["program"], "percent_off": 100,
+                                "duration": founder_audit["duration"],
+                                "duration_months": founder_audit["duration_months"]}
+    return response
 
 
 

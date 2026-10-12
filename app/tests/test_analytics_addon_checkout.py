@@ -20,7 +20,11 @@ stripe_api_post() (the actual network call to Stripe) is monkeypatched
 to capture the `fields` list instead of making a real HTTP request --
 matching test_camera_slot_checkout.py's own established convention.
 """
+import hashlib
+import hmac
+import json
 import sqlite3
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -49,6 +53,9 @@ def client(db_path, tmp_path, monkeypatch, fake_stripe_prices):
         monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")
         monkeypatch.setattr(main, "SESSIONS_FILE", tmp_path / "sessions.json")
         monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://app.example.test")
+        monkeypatch.setattr(main, "STRIPE_WEBHOOK_SECRET", "whsec_founder_test")
+        monkeypatch.setattr(main, "PAYMENT_WEBHOOK_EVENTS_FILE", tmp_path / "payment_webhook_events.json")
+        monkeypatch.setattr(main, "PAYMENT_SESSIONS_FILE", tmp_path / "payment_sessions.json")
         monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS", "price_test_advanced_analytics")
         monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION", "price_test_facial_recognition")
         monkeypatch.delenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN", raising=False)
@@ -72,6 +79,18 @@ def _fields_dict(fields):
     return dict(fields)
 
 
+def _post_signed_webhook(test_client, event):
+    payload = json.dumps(event).encode("utf-8")
+    timestamp = int(time.time())
+    signature = hmac.new(
+        b"whsec_founder_test", str(timestamp).encode("utf-8") + b"." + payload, hashlib.sha256,
+    ).hexdigest()
+    return test_client.post(
+        "/api/payments/stripe/webhook", content=payload,
+        headers={"stripe-signature": f"t={timestamp},v1={signature}", "content-type": "application/json"},
+    )
+
+
 def _owner_cookie(customer_id="cust-1", email="signedin@example.test"):
     import partner_portal
     return partner_portal._token(email, "customer_owner", None, customer_id, None)
@@ -86,6 +105,37 @@ def _seed_tenant(db_path, customer_id="cust-1", email="signedin@example.test", p
             (customer_id, partner_id, "Customer", email, "active", "2026-01-01"),
         )
         conn.commit()
+
+
+def _configure_founder_lpr(monkeypatch, *, customer_ids="cust-founder", duration="once", months=None):
+    import main
+
+    monkeypatch.setenv("ANYAICAM_FOUNDER_LPR_CUSTOMER_IDS", customer_ids)
+    monkeypatch.setenv("ANYAICAM_STRIPE_COUPON_FOUNDER_LPR", "coupon_founder_lpr")
+    monkeypatch.setenv("ANYAICAM_FOUNDER_LPR_COUPON_DURATION", duration)
+    if months is None:
+        monkeypatch.delenv("ANYAICAM_FOUNDER_LPR_COUPON_DURATION_MONTHS", raising=False)
+        months_value = None
+    else:
+        monkeypatch.setenv("ANYAICAM_FOUNDER_LPR_COUPON_DURATION_MONTHS", months)
+        months_value = int(months)
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE", "price_test_vehicle_intelligence")
+    original_get = main.stripe_api_get
+
+    def stripe_get(path):
+        if path.startswith("/v1/coupons/coupon_founder_lpr"):
+            return {
+                "id": "coupon_founder_lpr", "valid": True, "percent_off": 100,
+                "amount_off": None, "duration": duration,
+                "duration_in_months": months_value,
+                "applies_to": {"products": ["prod_vehicle_intelligence"]},
+            }
+        if path == "/v1/prices/price_test_vehicle_intelligence":
+            price = original_get(path)
+            return {**price, "product": "prod_vehicle_intelligence"}
+        return original_get(path)
+
+    monkeypatch.setattr(main, "stripe_api_get", stripe_get)
 
 
 # ------------------------------------------------------------ happy path
@@ -245,6 +295,7 @@ def test_webhook_grants_every_advanced_analytics_key_from_one_purchase(client, d
 
     with override_target(sqlite_path=str(db_path)):
         import analytics_entitlements as ae
+        from partner_db import connection
         monkeypatch.setattr(ae, "ANALYTICS_PRICE_MAP", ae._load_price_map())
         event = {
             "id": "evt_test_1",
@@ -264,6 +315,275 @@ def test_webhook_grants_every_advanced_analytics_key_from_one_purchase(client, d
         assert set(result["analytic_keys"]) == {"people_counting", "lpr", "ppe"}
         assert len(result["subscription_ids"]) == 3
         assert ae.get_active_analytics_for_customer("cust-1") == ["lpr", "people_counting", "ppe"]
+
+
+def test_founder_allowlisted_owner_gets_verified_zero_dollar_lpr_checkout(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+
+    response = test_client.post(
+        "/api/customer/analytics/checkout",
+        json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["analytic_keys"] == ["lpr"]
+    assert response.json()["discount"] == {
+        "program": "founder_lpr_testing", "percent_off": 100,
+        "duration": "once", "duration_months": None,
+    }
+    fields = _fields_dict(captured["fields"])
+    assert fields["line_items[0][price]"] == "price_test_vehicle_intelligence"
+    assert fields["discounts[0][coupon]"] == "coupon_founder_lpr"
+    assert fields["allow_promotion_codes"] == "false"
+    assert fields["metadata[anyaicam_discount_program]"] == "founder_lpr_testing"
+    assert fields["subscription_data[metadata][anyaicam_discount_program]"] == "founder_lpr_testing"
+    assert fields["metadata[anyaicam_customer_id]"] == "cust-founder"
+
+
+def test_unallowlisted_customer_cannot_request_founder_pricing(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-other", email="other@example.test")
+    _configure_founder_lpr(monkeypatch, customer_ids="cust-founder")
+
+    response = test_client.post(
+        "/api/customer/analytics/checkout",
+        json={"addon_key": "vehicle_intelligence", "founder": True, "coupon_id": "coupon_founder_lpr"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-other", email="other@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    fields = _fields_dict(captured["fields"])
+    assert "discounts[0][coupon]" not in fields
+    assert fields["allow_promotion_codes"] == "true"
+    assert "metadata[anyaicam_discount_program]" not in fields
+
+
+def test_allowlisted_founder_discount_does_not_extend_to_other_analytics(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+
+    response = test_client.post(
+        "/api/customer/analytics/checkout",
+        json={"addon_key": "advanced_analytics"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    fields = _fields_dict(captured["fields"])
+    assert fields["line_items[0][price]"] == "price_test_advanced_analytics"
+    assert "discounts[0][coupon]" not in fields
+    assert fields["allow_promotion_codes"] == "true"
+    assert "metadata[anyaicam_discount_program]" not in fields
+
+
+def test_founder_coupon_must_match_lpr_product_percent_and_duration(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+    import main
+    original_get = main.stripe_api_get
+
+    def wrong_product_coupon(path):
+        if path.startswith("/v1/coupons/coupon_founder_lpr"):
+            return {"id": "coupon_founder_lpr", "valid": True, "percent_off": 100,
+                    "amount_off": None, "duration": "once", "duration_in_months": None,
+                    "applies_to": {"products": ["prod_unrelated"]}}
+        if path == "/v1/prices/price_test_vehicle_intelligence":
+            return {**original_get(path), "product": "prod_vehicle_intelligence"}
+        return original_get(path)
+
+    monkeypatch.setattr(main, "stripe_api_get", wrong_product_coupon)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 503
+    assert "path" not in captured, "an unverified coupon must never create a Stripe session"
+
+
+def test_founder_coupon_duration_is_once_and_months_are_unset(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch, duration="once", months=None)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    assert _fields_dict(captured["fields"])["discounts[0][coupon]"] == "coupon_founder_lpr"
+
+
+@pytest.mark.parametrize(("duration", "months"), [("repeating", "2"), ("forever", None), ("once", "1")])
+def test_founder_rejects_non_once_or_months_configuration_before_checkout(
+    duration, months, client, db_path, monkeypatch,
+):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch, duration=duration, months=months)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 503
+    assert "once" in response.json()["detail"] or "months" in response.json()["detail"]
+    assert "path" not in captured, "invalid duration configuration must never create a Stripe session"
+
+
+@pytest.mark.parametrize("missing", ["allowlist", "coupon", "duration", "price"])
+def test_missing_founder_configuration_fails_closed(missing, client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+    if missing == "allowlist":
+        monkeypatch.delenv("ANYAICAM_FOUNDER_LPR_CUSTOMER_IDS")
+    elif missing == "coupon":
+        monkeypatch.delenv("ANYAICAM_STRIPE_COUPON_FOUNDER_LPR")
+    elif missing == "price":
+        monkeypatch.delenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE")
+    else:
+        monkeypatch.delenv("ANYAICAM_FOUNDER_LPR_COUPON_DURATION")
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    if missing == "allowlist":
+        assert response.status_code == 200
+        assert "discounts[0][coupon]" not in _fields_dict(captured["fields"])
+    else:
+        assert response.status_code == 503
+        assert "path" not in captured
+
+
+def test_founder_does_not_stack_with_approved_friends_family_discount(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+    import friends_family
+    monkeypatch.setattr(friends_family, "status_for", lambda customer_id: friends_family.APPROVED)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    fields = _fields_dict(captured["fields"])
+    assert fields["discounts[0][coupon]"] == "coupon_founder_lpr"
+    assert fields["metadata[anyaicam_friends_family]"] == "none"
+    assert fields["metadata[anyaicam_discount_program]"] == "founder_lpr_testing"
+    import pricing_catalog
+    assert pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF["analytics"] == 25
+
+
+@pytest.mark.parametrize("coupon_change", [
+    {"valid": False},
+    {"percent_off": 99},
+    {"amount_off": 100},
+    {"duration": "repeating"},
+])
+def test_invalid_founder_coupon_fails_closed(coupon_change, client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+    import main
+    original_get = main.stripe_api_get
+
+    def changed_coupon(path):
+        if path.startswith("/v1/coupons/coupon_founder_lpr"):
+            return {
+                "id": "coupon_founder_lpr", "valid": True, "percent_off": 100,
+                "amount_off": None, "duration": "once", "duration_in_months": None,
+                "applies_to": {"products": ["prod_vehicle_intelligence"]},
+                **coupon_change,
+            }
+        if path == "/v1/prices/price_test_vehicle_intelligence":
+            return {**original_get(path), "product": "prod_vehicle_intelligence"}
+        return original_get(path)
+
+    monkeypatch.setattr(main, "stripe_api_get", changed_coupon)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 503
+    assert "path" not in captured
+
+
+def test_founder_checkout_keeps_catalog_renewal_price_at_1499_cents(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    fields = _fields_dict(captured["fields"])
+    assert fields["mode"] == "subscription"
+    assert fields["line_items[0][price]"] == "price_test_vehicle_intelligence"
+    assert fields["line_items[0][quantity]"] == "1"
+    import pricing_catalog
+    vehicle = next(a for a in pricing_catalog.addons() if a["addon_key"] == "vehicle_intelligence")
+    assert vehicle["monthly_cents"] == 1499
+
+
+def test_zero_dollar_founder_checkout_activates_idempotent_lpr_entitlement_and_renewal(client, db_path, monkeypatch):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
+    _configure_founder_lpr(monkeypatch, duration="once", months=None)
+    response = test_client.post(
+        "/api/customer/analytics/checkout", json={"addon_key": "vehicle_intelligence"},
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    fields = _fields_dict(captured["fields"])
+    with override_target(sqlite_path=str(db_path)):
+        import analytics_entitlements as ae
+        from partner_db import connection
+        monkeypatch.setattr(ae, "ANALYTICS_PRICE_MAP", ae._load_price_map())
+        with connection() as db:
+            db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-founder','cust-founder','Test Site','2026-01-01')")
+            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) "
+                       "VALUES('appl-founder','cust-founder','site-founder','AIC-FOUNDER','2026-01-01')")
+            db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,name,created_at) "
+                       "VALUES('cam-founder','cust-founder','site-founder','appl-founder',1,'Test Camera','2026-01-01')")
+        event = {"id": "evt_founder_zero", "type": "checkout.session.completed", "data": {"object": {
+            "id": "cs_founder_zero", "mode": "subscription", "subscription": "sub_founder_lpr",
+            "payment_status": "no_payment_required", "amount_total": 0,
+            "customer": "cus_test_cust-founder", "customer_details": {"email": "founder@example.test"},
+            "metadata": {"anyaicam_stripe_price_id": fields["metadata[anyaicam_stripe_price_id]"],
+                         "anyaicam_customer_id": "cust-founder", "anyaicam_addon_key": "vehicle_intelligence"},
+        }}}
+        webhook_response = _post_signed_webhook(test_client, event)
+        assert webhook_response.status_code == 200, webhook_response.text
+        assert ae.get_active_analytics_for_customer("cust-founder") == ["lpr"]
+
+        renewed = {"id": "sub_founder_lpr", "type": "customer.subscription.updated", "data": {"object": {
+            "id": "sub_founder_lpr", "customer": "cus_test_cust-founder", "status": "active",
+            "metadata": {"anyaicam_customer_id": "cust-founder"},
+            "items": {"data": [{"price": {"id": fields["metadata[anyaicam_stripe_price_id]"]}, "quantity": 1}]},
+        }}}
+        renewal_result = ae.sync_analytics_from_stripe_event(renewed)
+        assert renewal_result["status"] == "analytics_subscription_updated"
+        replay_response = _post_signed_webhook(test_client, event)
+        assert replay_response.status_code == 200, replay_response.text
+        assert ae.get_active_analytics_for_customer("cust-founder") == ["lpr"]
+        with connection() as db:
+            assert db.execute("SELECT COUNT(*) FROM analytics_subscriptions WHERE customer_id=? AND analytic_key='lpr'",
+                              ("cust-founder",)).fetchone()[0] == 1
+
+    assignment = test_client.post(
+        "/api/customer/cameras/cam-founder/analytics/lpr",
+        cookies={"anyaicam_partner_session": _owner_cookie(customer_id="cust-founder", email="founder@example.test")},
+    )
+    assert assignment.status_code == 200, assignment.text
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            camera_entitlement = db.execute(
+                "SELECT status FROM camera_analytics_entitlements WHERE camera_id='cam-founder' AND analytic_key='lpr'"
+            ).fetchone()
+            enabled = db.execute("SELECT lpr_enabled FROM cameras WHERE id='cam-founder'").fetchone()
+    assert camera_entitlement["status"] == "active"
+    assert enabled["lpr_enabled"] == 1
 
 
 def test_cancelling_advanced_analytics_cancels_all_its_keys_together(client, db_path, monkeypatch):
