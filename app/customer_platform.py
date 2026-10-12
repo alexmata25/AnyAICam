@@ -199,6 +199,7 @@ def register_customer_platform_routes(
             {household_link}
             <a class="setting-link" id="change-password-link" href="/change-password"><div><strong>Change password</strong><div class="health-detail">Choose a new password. Your other signed-in devices are signed out.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/customer-app-settings"><div><strong>Camera analytics and alerts</strong><div class="health-detail">Enable paid analytics, email alerts, push alerts, schedules, and quiet hours.</div></div><span>Open →</span></a>
+            <a class="setting-link" href="/analytics-control-center"><div><strong>Analytics Control Center</strong><div class="health-detail">Choose which analytics run on each camera. Purchased entitlements are managed separately.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/customer/voice-call-settings"><div><strong>Visitor Voice Call</strong><div class="health-detail">Greet visitors at your door and get a call you can answer live.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/aac/people"><div><strong>Facial Recognition</strong><div class="health-detail">People, face enrollment and door access (Face Access add-on).</div></div><span>Open →</span></a>
             <a class="setting-link" href="/customer/aaco-settings"><div><strong>AACO assistant</strong><div class="health-detail">Turn the assistant on or off and choose which cameras and actions it may use.</div></div><span>Open →</span></a>
@@ -235,6 +236,7 @@ def register_customer_platform_routes(
         <header class="topbar customer-app-settings-header">
           <div><p class="eyebrow">Settings</p><h1>Camera analytics and alerts</h1></div>
           <a class="ghost-button" href="/settings/notifications">Notification settings</a>
+          <a class="ghost-button" href="/analytics-control-center">Analytics Control Center</a>
           <a class="ghost-button" href="/customer-portal">Back to customer portal</a>
         </header>
         <section class="panel">

@@ -387,6 +387,8 @@ def _refresh_camera_map() -> None:
             "smart_motion_enabled": bool(item.get("smart_motion_enabled")),
             "lpr_enabled": bool(item.get("lpr_enabled")),
             "ppe_enabled": bool(item.get("ppe_enabled")),
+            "facial_recognition_enabled": bool(item.get("facial_recognition_enabled")),
+            "analytics_lab_leases": item.get("analytics_lab_leases") if isinstance(item.get("analytics_lab_leases"), dict) else {},
         }
     cloud_policy = response.get("cloud_policy")
     daily_cloud_seconds = (
@@ -409,7 +411,31 @@ def _known_camera_numbers() -> list[int]:
 
 def _camera_identity(camera_number: int) -> dict | None:
     with _lock:
-        return _camera_map.get(camera_number)
+        identity = _camera_map.get(camera_number)
+        if identity is None:
+            return None
+        # Test Lab leases are signed, expiring authorization. The cached
+        # configuration may outlive connectivity; enforce the lease locally
+        # so an offline edge cannot keep a lab-only analytic enabled.
+        leases = identity.get("analytics_lab_leases") or {}
+        if not leases:
+            return identity
+        import copy
+        from datetime import datetime, timezone
+        effective = copy.copy(identity)
+        now = datetime.now(timezone.utc)
+        fields = {"smart_motion": "smart_motion_enabled", "people_counting": "people_counting_enabled",
+                  "lpr": "lpr_enabled", "ppe": "ppe_enabled", "facial_recognition": "facial_recognition_enabled"}
+        for analytic, field in fields.items():
+            if analytic not in leases:
+                continue
+            try:
+                expires = datetime.fromisoformat(str(leases[analytic]).replace("Z", "+00:00"))
+                if expires.tzinfo is None or now >= expires.astimezone(timezone.utc):
+                    effective[field] = False
+            except (TypeError, ValueError, OverflowError):
+                effective[field] = False
+        return effective
 
 
 def _current_daily_cloud_seconds() -> int:

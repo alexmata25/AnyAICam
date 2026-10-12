@@ -1311,6 +1311,21 @@ def apply_migrations():
             for statement in [item.strip() for item in script.split(';') if item.strip()]: db.execute(statement)
             db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(version,datetime.now().isoformat())); logger.info('Applied database migration %s',version)
 
+        # VMS 1.2.6 Analytics Control Center. Operational switches are
+        # deliberately separate from commercial subscription and per-camera
+        # entitlement tables. Missing switch rows preserve legacy behavior
+        # (ON when commercially enabled); explicit OFF remains durable.
+        db.execute('CREATE TABLE IF NOT EXISTS camera_analytics_operations('
+                   'camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,enabled INTEGER NOT NULL,'
+                   'updated_at TEXT NOT NULL,updated_by TEXT,PRIMARY KEY(camera_id,analytic_key))')
+        db.execute('CREATE TABLE IF NOT EXISTS test_lab_grants('
+                   'grant_id TEXT PRIMARY KEY,payload_json TEXT NOT NULL,signature TEXT NOT NULL,'
+                   'status TEXT NOT NULL DEFAULT \'active\',imported_at TEXT NOT NULL,imported_by TEXT,revoked_at TEXT,revoked_by TEXT)')
+        db.execute('CREATE TABLE IF NOT EXISTS test_lab_analytics_assignments('
+                   'grant_id TEXT NOT NULL,camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,'
+                   'updated_at TEXT NOT NULL,PRIMARY KEY(grant_id,camera_id,analytic_key))')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_test_lab_assignments_camera ON test_lab_analytics_assignments(camera_id,analytic_key,enabled)')
+
         # These additive columns are checked independently so both existing SQLite
         # installations and future PostgreSQL deployments receive the same schema.
         from database_backend import backend
@@ -1433,6 +1448,8 @@ def apply_migrations():
         if 'smart_motion_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN smart_motion_enabled INTEGER')
         if 'lpr_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN lpr_enabled INTEGER')
         if 'ppe_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN ppe_enabled INTEGER')
+        if 'facial_recognition_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN facial_recognition_enabled INTEGER')
+        if 'analytics_lab_leases_json' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN analytics_lab_leases_json TEXT')
         # Face Access -- Door/Relay Control (2026-09-17): fail-closed like
         # every sibling *_enabled column above -- NULL/0 means this camera
         # is not a door and must never show the live-tile Unlock button or

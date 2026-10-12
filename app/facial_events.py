@@ -179,11 +179,28 @@ def _camera_tenant_context(db, camera_number: int, appliance_id: str | None) -> 
 
 
 def _is_entitled(db, *, camera_id: str) -> bool:
+    # The entitlement row is commercial assignment state; the separate
+    # operational switch is mirrored as a fail-closed camera runtime flag.
+    # NULL retains compatibility for databases before the control-center
+    # migration, while an explicit 0 always stops face processing.
+    camera = db.execute("SELECT id,customer_id,site_id,appliance_id,facial_recognition_enabled FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    if camera is None:
+        return False
+    if camera["facial_recognition_enabled"] is not None and not bool(camera["facial_recognition_enabled"]):
+        return False
     row = db.execute(
         "SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=? AND status='active'",
         (camera_id, ANALYTIC_KEY),
     ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+    # Test Lab authorizes a separately assigned camera lease, not a
+    # commercial entitlement row. Revalidate the signed grant on every
+    # check so expired/revoked leases fail closed at the event boundary.
+    from analytics_control_center import active_lab_grant, lab_assignment_enabled
+    camera_data = dict(camera)
+    return bool(active_lab_grant(db, camera_data, ANALYTIC_KEY)
+                and lab_assignment_enabled(db, camera_id, ANALYTIC_KEY))
 
 
 def _save_face_thumbnail(face_crop_bgr, *, event_id: str) -> str | None:

@@ -828,10 +828,33 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # turns it off at the edge; the customer's stored choice is kept, so
         # re-subscribing restores it (analytics_entitlements.effective_camera_analytic).
         from analytics_entitlements import effective_camera_analytic
+        from analytics_control_center import active_lab_grant, operational_enabled
         _analytics: dict={}
         with connection() as _db:
             for item in camera_items:
-                item['smart_motion_enabled']=effective_camera_analytic(_db,appliance.get('customer_id'),item.get('site_id'),'smart_motion',item.get('smart_motion_enabled'),_analytics)
+                camera={**item,'customer_id':appliance.get('customer_id'),'appliance_id':appliance.get('id')}
+                paid={
+                    'smart_motion':effective_camera_analytic(_db,appliance.get('customer_id'),item.get('site_id'),'smart_motion',item.get('smart_motion_enabled'),_analytics),
+                    'people_counting':bool(item.get('people_counting_enabled')),
+                    'lpr':bool(item.get('lpr_enabled')),
+                    'ppe':bool(item.get('ppe_enabled')),
+                    'facial_recognition':bool(_db.execute("SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key='facial_recognition' AND status='active'",(item['id'],)).fetchone()),
+                }
+                lab_leases={}
+                for key in ('smart_motion','people_counting','lpr','ppe','facial_recognition'):
+                    grant=active_lab_grant(_db,camera,key) if not paid[key] else None
+                    if grant and _db.execute("SELECT 1 FROM test_lab_analytics_assignments WHERE grant_id=? AND camera_id=? AND analytic_key=? AND enabled=1",
+                                             (grant['grant_id'],item['id'],key)).fetchone():
+                        lab_leases[key]=grant['expires_at']
+                    authorized=paid[key] or key in lab_leases
+                    effective=authorized and operational_enabled(_db,item['id'],key)
+                    field={'smart_motion':'smart_motion_enabled','people_counting':'people_counting_enabled','lpr':'lpr_enabled',
+                           'ppe':'ppe_enabled','facial_recognition':'facial_recognition_enabled'}[key]
+                    item[field]=bool(effective)
+                item['analytics_lab_leases']=lab_leases
+        from analytics_control_center import filter_rule_items
+        with connection() as _db:
+            analytics_rule_items=filter_rule_items(_db, analytics_rule_items, camera_items)
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)

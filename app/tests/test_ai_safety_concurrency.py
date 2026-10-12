@@ -64,6 +64,10 @@ def _reset_ai_globals(monkeypatch):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(main, "torch", fake_torch)
     monkeypatch.setattr(main, "YOLO", _FakeYOLO)
+    # Detector-loop tests exercise an entitled/operational camera. The
+    # Control Center now intentionally pauses inference for all-OFF cameras.
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity",
+                        lambda _camera: {"smart_motion_enabled": True})
     yield fake_torch
 
 

@@ -39408,113 +39408,9 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
-    state["status"] = "loading"
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        await asyncio.to_thread(get_yolo_model)
-
-
-
-
-
-
-
-
-    except Exception as error:
-
-
-
-
-
-
-
-
-        state.update(
-
-
-
-
-
-
-
-
-            status="error",
-
-
-
-
-
-
-
-
-            error=f"Could not load {YOLO_MODEL_NAME}: {error}"[:240],
-
-
-
-
-
-
-
-
-            last_checked=datetime.now().isoformat(),
-
-
-
-
-
-
-
-
-        )
-
-
-
-
-
-
-
-
-        return
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    state["status"] = "running"
-
-
-
-
-
-
-
+    # Avoid loading the shared AI model on cameras that have no active
+    # analytic assignment. Recording and live video use separate workers.
+    model_loaded = False
 
     while True:
 
@@ -39534,6 +39430,27 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
+            # The Control Center's operational switches are independent of
+            # recording/live capture. Do not run the shared detector at all
+            # when this camera has no effective analytics authorization;
+            # recording and video workers are separate tasks and continue.
+            runtime_identity = recording_uploader._camera_identity(camera_number)
+            if not runtime_identity or not any(bool(runtime_identity.get(flag)) for flag in (
+                    "smart_motion_enabled", "people_counting_enabled", "lpr_enabled", "ppe_enabled",
+                    "facial_recognition_enabled")):
+                state.update(status="paused", error=None, pause_reason="analytics_disabled")
+                await asyncio.sleep(AI_DETECTION_INTERVAL_SECONDS)
+                continue
+            if not model_loaded:
+                state.update(status="loading", error=None, pause_reason=None)
+                try:
+                    await asyncio.to_thread(get_yolo_model)
+                except Exception as error:
+                    state.update(status="error", error=f"Could not load {YOLO_MODEL_NAME}: {error}"[:240],
+                                 last_checked=datetime.now().isoformat())
+                    return
+                model_loaded = True
+            state.update(status="running", error=None, pause_reason=None)
             # At most one camera's inference runs at a time, appliance-
             # wide -- released automatically on the way out of this
             # block whether detect_objects_frame() succeeds, raises, or
@@ -49402,6 +49319,8 @@ from partner_portal import partner_identity as _analytics_partner_identity
 register_customer_analytics_routes(app, lambda request: _customer_playback_cameras(request), _analytics_partner_identity)
 from customer_analytics_rules import register_customer_analytics_rules_routes
 register_customer_analytics_rules_routes(app, page_shell)
+from analytics_control_center import register_routes as register_analytics_control_center_routes
+register_analytics_control_center_routes(app, page_shell)
 register_live_view_p2p_customer_routes(app)
 register_live_view_p2p_appliance_routes(app)
 from live_view_wireguard import register_live_view_wireguard_routes
