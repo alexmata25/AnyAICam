@@ -14,13 +14,13 @@ Configure these values in the same Stripe mode used by the cloud checkout:
 |---|---|
 | `ANYAICAM_FOUNDER_LPR_CUSTOMER_IDS` | Comma-separated exact customer account IDs authorized by the owner. Leave unset for no eligible accounts. |
 | `ANYAICAM_STRIPE_COUPON_FOUNDER_LPR` | ID of a pre-created Stripe coupon in the configured Stripe mode. It must be valid, 100% off, have no fixed-amount discount, and apply only to the Stripe Product behind the configured Vehicle Intelligence Price. |
-| `ANYAICAM_FOUNDER_LPR_COUPON_DURATION` | Explicit Stripe coupon duration: `once`, `repeating`, or `forever`. There is no default. |
-| `ANYAICAM_FOUNDER_LPR_COUPON_DURATION_MONTHS` | Positive month count required only for `repeating`; unset for `once` or `forever`. |
+| `ANYAICAM_FOUNDER_LPR_COUPON_DURATION` | Must be explicitly set to `once`; other durations are rejected. |
+| `ANYAICAM_FOUNDER_LPR_COUPON_DURATION_MONTHS` | Must be unset or empty. |
 
 The application does not create or modify Stripe coupons. At checkout it
 retrieves the configured Price and Coupon from Stripe and fails closed unless
 the coupon's percentage, validity, duration, and exact Product restriction
-match configuration. The server attaches the coupon to the existing
+match configuration, including a 100% first-invoice-only discount. The server attaches the coupon to the existing
 subscription Checkout Session and disables customer-entered promotion codes.
 
 ## Eligibility and fulfillment
@@ -44,7 +44,7 @@ intended camera through the existing camera analytics workflow.
 ## Deployment sequence (owner approval required)
 
 1. Create the coupon in the intended Stripe mode with the exact product scope
-   and explicitly approved duration.
+   and `duration=once`.
 2. Configure the four server variables for the approved customer account IDs.
 3. Deploy this cloud checkout/webhook source and restart only the approved
    cloud application service as its normal release procedure requires.

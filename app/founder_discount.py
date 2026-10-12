@@ -36,23 +36,17 @@ def eligible_for(customer_id: str, addon_key: str) -> bool:
 def _configured_duration() -> tuple[str, int | None]:
     duration = os.environ.get(DURATION_ENV, "").strip().lower()
     months_raw = os.environ.get(DURATION_MONTHS_ENV, "").strip()
-    if duration not in {"once", "repeating", "forever"}:
-        raise FounderDiscountConfigurationError("Founder discount duration is not configured.")
-    if duration == "repeating":
-        try:
-            months = int(months_raw)
-        except (TypeError, ValueError) as exc:
-            raise FounderDiscountConfigurationError(
-                "Founder discount duration months are not configured."
-            ) from exc
-        if months < 1:
-            raise FounderDiscountConfigurationError("Founder discount duration months are invalid.")
-        return duration, months
+    # Owner-approved Founder pricing applies to the first invoice only.
+    # Fail closed if configuration drifts to repeating or forever.
+    if duration != "once":
+        raise FounderDiscountConfigurationError(
+            "Founder discount duration must be configured as once."
+        )
     if months_raw:
         raise FounderDiscountConfigurationError(
-            "Founder discount duration months must be unset unless duration is repeating."
+            "Founder discount duration months must be unset for a once-only coupon."
         )
-    return duration, None
+    return "once", None
 
 
 def _stripe_id(value) -> str:
@@ -60,8 +54,7 @@ def _stripe_id(value) -> str:
     return str(raw or "").strip()
 
 
-def _verify_coupon(*, price_id: str, coupon_id: str, expected_duration: str,
-                   expected_months: int | None) -> None:
+def _verify_coupon(*, price_id: str, coupon_id: str, expected_duration: str) -> None:
     """Fail closed unless Stripe confirms a valid, exact 100% product coupon."""
     import main
 
@@ -87,7 +80,7 @@ def _verify_coupon(*, price_id: str, coupon_id: str, expected_duration: str,
     }
     actual_duration = str(coupon.get("duration") or "").strip().lower()
     actual_months = coupon.get("duration_in_months")
-    valid_months = (actual_months == expected_months) if expected_duration == "repeating" else actual_months is None
+    valid_months = actual_months is None
     if (
         coupon.get("valid") is not True
         or percent != 100.0
@@ -116,8 +109,7 @@ def apply_to_checkout_fields(fields: list[tuple[str, str]], *, customer_id: str,
     if not coupon_id:
         raise FounderDiscountConfigurationError("Founder Stripe coupon is not configured.")
     duration, months = _configured_duration()
-    _verify_coupon(price_id=price_id, coupon_id=coupon_id,
-                   expected_duration=duration, expected_months=months)
+    _verify_coupon(price_id=price_id, coupon_id=coupon_id, expected_duration=duration)
 
     fields[:] = [
         item for item in fields
