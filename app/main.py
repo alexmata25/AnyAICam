@@ -41713,7 +41713,10 @@ async def maintenance_mode_middleware(request: Request, call_next):
 
 
 
-    state = load_maintenance_state()
+    # Health and readiness endpoints use this middleware too. Keep filesystem
+    # latency off the ASGI event loop so a slow recordings/config mount cannot
+    # stall every request.
+    state = await asyncio.to_thread(load_maintenance_state)
 
 
 
