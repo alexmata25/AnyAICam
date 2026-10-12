@@ -209,8 +209,15 @@ def _stage_snapshot(path: Path, snapshot: dict) -> bool:
     finally:
         try:
             if directory_fd is not None:
-                os.unlink(temporary, dir_fd=directory_fd)
-                os.close(directory_fd)
+                try:
+                    os.unlink(temporary, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    # After a successful os.replace(), the temporary name is
+                    # gone already. Treat that as normal cleanup while still
+                    # closing the directory descriptor below.
+                    pass
+                finally:
+                    os.close(directory_fd)
             elif isinstance(temporary, str) and os.path.isabs(temporary):
                 os.unlink(temporary)
         except OSError:
