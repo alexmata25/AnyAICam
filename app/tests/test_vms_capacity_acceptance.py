@@ -1,6 +1,7 @@
 """VMS-side contract for staged versus root-accepted camera capacity."""
 import base64
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
@@ -78,6 +79,35 @@ def test_unsigned_legacy_capacity_and_staging_snapshot_never_grant_capacity(capa
     snapshot = signed_snapshot(capacity_state, 8)
     assert vms_capacity.apply_sync({"camera_slot_quantity": 8}, snapshot) == "staged"
     assert vms_capacity.load_capacity() is None  # systemd/root acceptance has not promoted it
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/proc/self/fd").is_dir() or
+    os.open not in getattr(os, "supports_dir_fd", set()),
+    reason="requires POSIX dir_fd support and /proc/self/fd descriptor inspection",
+)
+def test_repeated_snapshot_staging_closes_config_directory_descriptors(capacity_state):
+    """Successful atomic staging must not leak its config-directory fd."""
+    config_dir = vms_capacity.SIGNED_FILE.parent
+
+    def open_fds_for_config_dir():
+        count = 0
+        with os.scandir("/proc/self/fd") as descriptors:
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor.path)
+                except OSError:
+                    # A descriptor can disappear between scandir and readlink.
+                    continue
+                if target == str(config_dir):
+                    count += 1
+        return count
+
+    before = open_fds_for_config_dir()
+    snapshot = signed_snapshot(capacity_state, 8)
+    for _ in range(64):
+        assert vms_capacity.apply_sync({"camera_slot_quantity": 8}, snapshot) == "staged"
+    assert open_fds_for_config_dir() == before
 
 
 def test_only_verified_accepted_state_grants_capacity_and_remains_offline_after_expiry(capacity_state):
