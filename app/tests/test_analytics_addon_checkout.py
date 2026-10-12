@@ -430,7 +430,7 @@ def test_founder_rejects_non_once_or_months_configuration_before_checkout(
     assert "path" not in captured, "invalid duration configuration must never create a Stripe session"
 
 
-@pytest.mark.parametrize("missing", ["allowlist", "coupon", "duration"])
+@pytest.mark.parametrize("missing", ["allowlist", "coupon", "duration", "price"])
 def test_missing_founder_configuration_fails_closed(missing, client, db_path, monkeypatch):
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-founder", email="founder@example.test")
@@ -439,6 +439,8 @@ def test_missing_founder_configuration_fails_closed(missing, client, db_path, mo
         monkeypatch.delenv("ANYAICAM_FOUNDER_LPR_CUSTOMER_IDS")
     elif missing == "coupon":
         monkeypatch.delenv("ANYAICAM_STRIPE_COUPON_FOUNDER_LPR")
+    elif missing == "price":
+        monkeypatch.delenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE")
     else:
         monkeypatch.delenv("ANYAICAM_FOUNDER_LPR_COUPON_DURATION")
     response = test_client.post(
