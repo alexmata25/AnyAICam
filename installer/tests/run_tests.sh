@@ -15,6 +15,11 @@
 #
 # Usage: bash installer/tests/run_tests.sh
 set -uo pipefail
+# Ubuntu login sessions may use umask 0002. Match the installer's safe
+# 0640/0750 fixture expectations regardless of whether this test is launched
+# directly or through sudo; otherwise shell-created legacy env fixtures are
+# group-writable and the production-safe writer correctly refuses them.
+umask 022
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_DIR="$(cd "$TESTS_DIR/.." && pwd)"
@@ -23,8 +28,19 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# This harness tests the installer with its own fixture paths, never with
+# caller/appliance configuration. In particular, `sudo -E` can preserve
+# ANYAICAM_* overrides that the installer intentionally honors (image name,
+# containerd root, preload archive, rollback bypass, etc.). Drop those before
+# sourcing installer modules so a privileged run cannot read or mutate host
+# state or silently skip a test. Tests that need an override set it explicitly
+# after reset_fixture().
+while IFS= read -r inherited_name; do
+    [[ -n "$inherited_name" ]] && unset "$inherited_name"
+done < <(compgen -e | grep '^ANYAICAM_' || true)
+
 # --- fixture root -----------------------------------------------------
-FIXTURE_ROOT="$(mktemp -d)"
+FIXTURE_ROOT="$(TMPDIR=/tmp mktemp -d)"
 trap 'rm -rf "$FIXTURE_ROOT"' EXIT
 ORIGINAL_PATH="$PATH"
 
@@ -76,6 +92,19 @@ GUARDED_CHOWN
     QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
     UPDATE_STATE_DIR="$FIXTURE_ROOT/var/lib/anyaicam-update"
     ROLLBACK_DIR="$UPDATE_STATE_DIR/rollback"
+    ROLLBACK_TOOL="$FIXTURE_ROOT/usr/local/sbin/anyaicam-rollback"
+    VMS_IMAGE="anyaicam-vms"
+    VMS_CONTAINER="anyaicam-vms"
+    unset ANYAICAM_SKIP_ROLLBACK_POINT ANYAICAM_VMS_IMAGE_TAR ANYAICAM_VMS_IMAGE \
+        ANYAICAM_VMS_CONTAINER ANYAICAM_VMS_BUILD_TIMEOUT ANYAICAM_VMS_LOAD_TIMEOUT \
+        ANYAICAM_LIVE_P2P_ENABLED ANYAICAM_IPTABLES ANYAICAM_AGENT_WHEELHOUSE
+    ANYAICAM_ROLLBACK_DIR="$ROLLBACK_DIR"
+    ANYAICAM_ROLLBACK_TOOL="$ROLLBACK_TOOL"
+    ANYAICAM_CONTAINERD_ROOT="$FIXTURE_ROOT/var/lib/containerd"
+    ANYAICAM_AGENT_WHEELHOUSE="$FIXTURE_ROOT/wheelhouse"
+    ANYAICAM_VMS_PRELOAD=0
+    export ANYAICAM_ROLLBACK_DIR ANYAICAM_ROLLBACK_TOOL ANYAICAM_CONTAINERD_ROOT \
+        ANYAICAM_AGENT_WHEELHOUSE ANYAICAM_VMS_PRELOAD
     ANYAICAM_INSTALLER_STAGING_ROOT="$UPDATE_STATE_DIR/installer-staging"
     # Release-driven deploy_vms() constants (installer: make VMS payload
     # release-driven) -- same fixture-redirection pattern as every other
@@ -128,6 +157,41 @@ GUARDED_CHOWN
     rm -f "$SYSTEMCTL_CALL_LOG"
     USERDEL_CALL_LOG="$FIXTURE_ROOT/.userdel-calls"
     rm -f "$USERDEL_CALL_LOG"
+}
+
+# The production env writer resolves owner=anyaicam through the system passwd
+# database when running as root. Full installation creates that account before
+# ensure_vms_env(), but this isolated function harness deliberately does not
+# create system users. For only the helper invocation under test, supply a
+# synthetic numeric owner in a Python startup shim; never modify /etc/passwd or
+# weaken _named_owner() in production. Root can chown fixture files to this
+# unused UID and still exercises the real atomic write and ownership path.
+python3() {
+    local is_agent_file=0 arg shim_dir="$FIXTURE_ROOT/python-sitecustomize"
+    if [[ "$EUID" -eq 0 && "${1:-}" == "-c" ]]; then
+        for arg in "$@"; do
+            [[ "$arg" == *"apply_release.agent_file_main()"* ]] && is_agent_file=1
+        done
+    fi
+    if [[ "$is_agent_file" -eq 1 ]]; then
+        mkdir -p "$shim_dir"
+        cat > "$shim_dir/sitecustomize.py" <<'PY_SHIM'
+import pwd
+from types import SimpleNamespace
+
+_system_getpwnam = pwd.getpwnam
+
+def _fixture_getpwnam(name):
+    if name == "anyaicam":
+        return SimpleNamespace(pw_uid=65534, pw_gid=65534)
+    return _system_getpwnam(name)
+
+pwd.getpwnam = _fixture_getpwnam
+PY_SHIM
+        PYTHONPATH="$shim_dir" command python3 "$@"
+    else
+        command python3 "$@"
+    fi
 }
 
 # A minimal fake built appliance-agent release payload for
@@ -556,6 +620,9 @@ reset_fixture
 ensure_vms_env >/dev/null 2>&1
 assert_eq "ANYAICAM_ENV=production is written to a fresh env file" "1" "$(grep -c '^ANYAICAM_ENV=production$' "$VMS_ENV_FILE" 2>/dev/null)"
 assert_eq "the old, never-read ANYAICAM_ENVIRONMENT key is never written" "0" "$(grep -c '^ANYAICAM_ENVIRONMENT=' "$VMS_ENV_FILE" 2>/dev/null)"
+if [[ "$EUID" -eq 0 ]]; then
+    assert_eq "root harness writes the env file to its synthetic fixture owner without creating a system account" "65534" "$(stat -c %u "$VMS_ENV_FILE" 2>/dev/null)"
+fi
 
 # 14d. An operator-customized ANYAICAM_ENV (e.g. staging) is never
 #      overwritten by a reinstall/repair -- same never-clobber contract
@@ -977,9 +1044,27 @@ OLD_FILE="$FIXTURE_ROOT/legacy4/.env"
 NEW_FILE="$FIXTURE_ROOT/persistent4/vms.env"
 mkdir -p "$FIXTURE_ROOT/legacy4"
 echo "ANYAICAM_ENVIRONMENT=production" > "$OLD_FILE"
+LEGACY_ENV_HASH="$(sha256sum "$OLD_FILE" | cut -d' ' -f1)"
 migrate_legacy_persistent_file "$OLD_FILE" "$NEW_FILE" "VMS env" >/dev/null 2>&1
 assert_eq "legacy .env content moved to the new persistent location" "ANYAICAM_ENVIRONMENT=production" "$(cat "$NEW_FILE" 2>/dev/null)"
+assert_eq "legacy .env is byte-identical at the persistent destination" "$LEGACY_ENV_HASH" "$(sha256sum "$NEW_FILE" 2>/dev/null | cut -d' ' -f1)"
 assert_exit "legacy .env removed after migration" 1 test -f "$OLD_FILE"
+
+# 21b. If the symlink-safe writer refuses a legacy copy, the old .env must
+#     remain in place and installation must fail before any service downtime.
+reset_fixture
+OLD_FILE="$VMS_INSTALL_ROOT/.env"
+NEW_FILE="$VMS_ENV_FILE"
+mkdir -p "$VMS_INSTALL_ROOT" "$CONFIG_DIR"
+printf 'LEGACY_SETTING=preserve-me\n' > "$OLD_FILE"
+agent_file() { return 73; }
+migration_status=0
+migrate_legacy_persistent_file "$OLD_FILE" "$NEW_FILE" "VMS env" >/dev/null 2>&1 || migration_status=$?
+unset -f agent_file
+source "$INSTALLER_DIR/06-deploy-vms.sh"
+assert_eq "failed legacy .env copy aborts migration" "1" "$migration_status"
+assert_eq "failed legacy .env copy preserves the original configuration" "LEGACY_SETTING=preserve-me" "$(cat "$OLD_FILE" 2>/dev/null)"
+assert_exit "failed legacy .env copy does not create a destination" 1 test -e "$NEW_FILE"
 
 # 22. migrate_legacy_persistent_file never overwrites a differing
 #     existing destination config.

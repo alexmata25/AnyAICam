@@ -32,7 +32,14 @@ migrate_legacy_persistent_file() {
     if [[ ! -f "$new" ]]; then
         log "Found legacy $label at $old -- migrating to $new ..."
         mkdir -p "$(dirname "$new")"
-        printf 'op copy\nsource %s\npath %s\nmode 0640\nowner anyaicam\n' "$old" "$new" | agent_file
+        if ! printf 'op copy\nsource %s\npath %s\nmode 0640\nowner anyaicam\n' "$old" "$new" | agent_file; then
+            log "WARNING: could not safely copy legacy $label from $old -- preserving the original."
+            return 1
+        fi
+        if ! cmp -s "$old" "$new"; then
+            log "WARNING: could not verify migrated $label at $new -- preserving the original at $old."
+            return 1
+        fi
         rm -f "$old"
     elif cmp -s "$old" "$new"; then
         rm -f "$old"
