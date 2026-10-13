@@ -84,15 +84,15 @@ INCLUDED_FEATURE_KEYS = tuple(key for key, _ in INCLUDED_FEATURES)
 ADDONS = [
     # addon_key, label, cents, grants, unit, env_var, discount_class, sellable_reason
     ("ai_essentials", "AI Essentials", _cents("7.99"), ("people_counting",),
-     "per_account", "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS", "analytics", None),
+     "per_camera", "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS", "analytics", None),
     ("ai_professional", "AI Professional", _cents("14.99"), ("people_counting", "ppe"),
-     "per_account", "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_PROFESSIONAL", "analytics", None),
+     "per_camera", "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_PROFESSIONAL", "analytics", None),
     ("vehicle_intelligence", "Vehicle Intelligence", _cents("14.99"), ("lpr",),
-     "per_account", "ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE", "analytics", None),
-    # A FLAT bundle added to the base plan: never multiplied by camera
-    # slots and never the sum of the individual packages.
+     "per_camera", "ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE", "analytics", None),
+    # Each purchased bundle quantity grants that many assignable seats for
+    # every included analytic; each feature consumes its own camera seat.
     ("advanced_analytics", "Advanced Analytics", _cents("24.99"), ("people_counting", "lpr", "ppe"),
-     "per_account", "ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS", "analytics", None),
+     "per_camera", "ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS", "analytics", None),
     # Talk Down includes AAC Voice Call -- one charge, both entitlements.
     ("talk_down", "Talk Down (includes AAC Voice Call)", _cents("4.99"), ("talk_down", "voice_call"),
      "per_site", "ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN", "analytics", None),

@@ -29,6 +29,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from database_backend import lock_customer_camera_capacity
+
 # analytic_key (as stored in analytics_subscriptions, matching the exact
 # addon checkbox values Wizard A's "What you're buying" step already
 # submits) -> (display label, the detection_events.event_type values that
@@ -53,6 +55,9 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     "people_counting": ("People Counting", ("people_counting", "people_counting_in", "people_counting_out")),
     "lpr": ("LPR", ("lpr", "plate")),
     "ppe": ("PPE", ("ppe",)),
+    "line_crossing": ("Line Crossing", ("line_crossing", "people_counting_in", "people_counting_out")),
+    "intrusion": ("Intrusion", ("intrusion",)),
+    "loitering": ("Loitering", ("loitering",)),
     # AAC (facial recognition / access-control), Phase 1: gated per-camera
     # through this exact same camera_analytics_entitlements mechanism as
     # every other analytic -- see facial_events.py's record_facial_events(),
@@ -129,6 +134,46 @@ def licensed_quantity_exceeded(*, licensed_quantity: int, currently_entitled_cou
     return currently_entitled_count >= licensed_quantity
 
 
+def analytics_license_summary(db, customer_id: str, site_id: str | None, analytic_key: str) -> dict:
+    """Return the purchased/assigned/available counts for one analytic.
+
+    Site-scoped subscriptions take precedence over the customer's account-wide
+    subscription, matching ``assign_entitlement``. Plan-included features are
+    reported as included rather than inventing a purchased seat quantity.
+    """
+    if analytic_key not in ANALYTIC_LABELS:
+        raise ValueError("Unknown analytic_key")
+    subscription = db.execute(
+        "SELECT site_id,licensed_quantity FROM analytics_subscriptions "
+        "WHERE customer_id=? AND (site_id=? OR site_id IS NULL) AND analytic_key=? AND status='active' "
+        "ORDER BY site_id IS NULL LIMIT 1",
+        (customer_id, site_id, analytic_key),
+    ).fetchone()
+    included = False
+    if not subscription:
+        from analytics_entitlements import plan_included_feature_active
+        included = bool(plan_included_feature_active(db, customer_id, analytic_key))
+    if subscription and subscription["site_id"] is not None:
+        assigned = db.execute(
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "WHERE c.customer_id=? AND c.site_id=? AND e.analytic_key=? AND e.status='active'",
+            (customer_id, site_id, analytic_key),
+        ).fetchone()["n"]
+    else:
+        assigned = db.execute(
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "WHERE c.customer_id=? AND e.analytic_key=? AND e.status='active'",
+            (customer_id, analytic_key),
+        ).fetchone()["n"]
+    if included:
+        return {"purchase_kind": "included", "purchased_quantity": None,
+                "assigned_quantity": int(assigned), "available_quantity": None}
+    quantity = int(subscription["licensed_quantity"] or 0) if subscription else 0
+    return {"purchase_kind": "licensed" if quantity else "not_purchased",
+            "purchased_quantity": quantity, "assigned_quantity": int(assigned),
+            "available_quantity": max(0, quantity - int(assigned))}
+
+
 # 2026-09-16: maps each real, appliance-enforceable analytic_key to the
 # matching cameras.<analytic>_enabled column (db_migrations.py) that
 # recording_uploader._refresh_camera_map() exposes to the appliance and
@@ -150,7 +195,8 @@ _APPLIANCE_ENFORCEMENT_COLUMN: dict[str, str] = {
 }
 
 
-def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
+def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str,
+                       customer_lock_held: bool = False) -> None:
     """Turns on one analytic for exactly one camera -- never touches any
     other camera, even another one at the same site or owned by the same
     customer. Idempotent: assigning an already-active entitlement just
@@ -167,10 +213,16 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
     if not camera:
         raise LookupError(f"Camera not found: {camera_id!r}")
     site_id, customer_id = camera["site_id"], camera["customer_id"]
+    # Every entry point uses this shared transaction lock. The count and
+    # assignment below therefore serialize across customer and administrator
+    # routes, preventing two concurrent requests from consuming the same last
+    # analytic seat.
+    if not customer_lock_held and not lock_customer_camera_capacity(db, customer_id):
+        raise LookupError("Camera customer not found")
 
     subscription = db.execute(
-        "SELECT licensed_quantity FROM analytics_subscriptions "
-        "WHERE customer_id=? AND (site_id=? OR site_id IS NULL) AND analytic_key=? AND status!='cancelled' "
+        "SELECT site_id,licensed_quantity FROM analytics_subscriptions "
+        "WHERE customer_id=? AND (site_id=? OR site_id IS NULL) AND analytic_key=? AND status='active' "
         "ORDER BY site_id IS NULL LIMIT 1",
         (customer_id, site_id, analytic_key),
     ).fetchone()
@@ -180,8 +232,8 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
     # plan) and features from a flat analytics package cover every camera
     # on the account -- they are never per-camera licences. Anything else
     # keeps the per-site licensed_quantity rule below unchanged.
-    from analytics_entitlements import account_wide_feature_active
-    if account_wide_feature_active(db, customer_id, analytic_key):
+    from analytics_entitlements import plan_included_feature_active
+    if plan_included_feature_active(db, customer_id, analytic_key):
         _activate_camera_analytic(db, camera_id, analytic_key, now=now)
         return
 
@@ -190,11 +242,18 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
         (camera_id, analytic_key),
     ).fetchone() is not None
 
-    currently_entitled_count = db.execute(
-        "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
-        "WHERE c.site_id=? AND e.analytic_key=? AND e.status='active'",
-        (site_id, analytic_key),
-    ).fetchone()["n"]
+    if subscription and subscription["site_id"] is None:
+        currently_entitled_count = db.execute(
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "WHERE c.customer_id=? AND e.analytic_key=? AND e.status='active'",
+            (customer_id, analytic_key),
+        ).fetchone()["n"]
+    else:
+        currently_entitled_count = db.execute(
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "WHERE c.site_id=? AND e.analytic_key=? AND e.status='active'",
+            (site_id, analytic_key),
+        ).fetchone()["n"]
 
     if licensed_quantity_exceeded(
         licensed_quantity=licensed_quantity,
@@ -226,11 +285,17 @@ def _activate_camera_analytic(db, camera_id: str, analytic_key: str, *, now: str
         db.execute(f"UPDATE cameras SET {column}=1 WHERE id=?", (camera_id,))
 
 
-def remove_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
+def remove_entitlement(db, camera_id: str, analytic_key: str, *, now: str,
+                       customer_lock_held: bool = False) -> None:
     """Turns off one analytic for exactly one camera. Soft-remove (status
     set to 'cancelled', row kept) rather than DELETE, matching
     analytics_subscriptions' own convention elsewhere in this codebase --
     enabled_analytics() already treats status='cancelled' as not enabled."""
+    camera = db.execute("SELECT customer_id FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    if not camera:
+        raise LookupError(f"Camera not found: {camera_id!r}")
+    if not customer_lock_held and not lock_customer_camera_capacity(db, camera["customer_id"]):
+        raise LookupError("Camera customer not found")
     db.execute(
         "UPDATE camera_analytics_entitlements SET status='cancelled',updated_at=? WHERE camera_id=? AND analytic_key=?",
         (now, camera_id, analytic_key),

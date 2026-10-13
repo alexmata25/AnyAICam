@@ -250,6 +250,8 @@ def test_refresh_camera_map_includes_all_four_entitlement_keys(monkeypatch):
         "smart_motion_enabled": False,
         "lpr_enabled": True,
         "ppe_enabled": False,
+        "facial_recognition_enabled": False,
+        "analytics_lab_leases": {},
     }
 
 

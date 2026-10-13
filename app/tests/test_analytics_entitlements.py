@@ -81,8 +81,9 @@ def _seed_customer(db_path, customer_id="cust-1", email="real-customer@example.t
         conn.commit()
 
 
-def _checkout_event(event_id, price_id, *, email="real-customer@example.test", stripe_customer="cus_1", customer_id=None):
+def _checkout_event(event_id, price_id, *, email="real-customer@example.test", stripe_customer="cus_1", customer_id=None, quantity=1):
     metadata = {"anyaicam_stripe_price_id": price_id}
+    metadata["anyaicam_quantity"] = str(quantity)
     if customer_id:
         metadata["anyaicam_customer_id"] = customer_id
     return {
@@ -103,7 +104,7 @@ def _subscription_event(event_id, event_type, price_id, *, stripe_customer="cus_
         "id": event_id, "type": event_type,
         "data": {"object": {
             "id": subscription_id, "customer": stripe_customer, "status": status, "metadata": metadata,
-            "items": {"data": [{"price": {"id": price_id}}]},
+            "items": {"data": [{"price": {"id": price_id}, "quantity": 1}]},
         }},
     }
 
@@ -164,6 +165,28 @@ def test_checkout_completed_grants_all_four_advanced_analytics_keys(db_path, _an
         assert set(result["analytic_keys"]) == {"smart_motion", "people_counting", "lpr", "ppe"}
         assert len(result["subscription_ids"]) == 4
         assert ae.get_active_analytics_for_customer("cust-1") == ["lpr", "people_counting", "ppe", "smart_motion"]
+        assert {row["licensed_quantity"] for row in ae.get_analytics_subscriptions_for_customer("cust-1")} == {1}
+
+
+def test_stripe_subscription_quantity_becomes_per_analytic_camera_license_quantity(db_path, _analytics_price_map):
+    _seed_customer(db_path)
+    with override_target(sqlite_path=db_path):
+        result = ae.sync_analytics_from_stripe_event(_checkout_event("evt_qty", ADVANCED_ANALYTICS_TEST_PRICE, quantity=5))
+        assert result["status"] == "analytics_subscription_updated"
+        rows = ae.get_analytics_subscriptions_for_customer("cust-1")
+        assert {item["analytic_key"] for item in rows} == {"smart_motion", "people_counting", "lpr", "ppe"}
+        assert {item["licensed_quantity"] for item in rows} == {5}
+        # A later authoritative quantity update replaces all bundle feature limits.
+        changed = _subscription_event("evt_qty_update", "customer.subscription.updated", ADVANCED_ANALYTICS_TEST_PRICE)
+        changed["data"]["object"]["items"]["data"][0]["quantity"] = 3
+        ae.sync_analytics_from_stripe_event(changed)
+        assert {item["licensed_quantity"] for item in ae.get_analytics_subscriptions_for_customer("cust-1")} == {3}
+
+
+def test_stripe_quantity_metadata_cannot_override_an_unmatched_subscription_price():
+    current = {"items": {"data": [{"price": {"id": "price-unmapped"}, "quantity": 5}]}}
+    assert ae._stripe_subscription_quantity(
+        current, ADVANCED_ANALYTICS_TEST_PRICE, fallback="5") == 0
 
 
 def test_subscription_deleted_revokes_all_four_advanced_analytics_keys_together(db_path, _analytics_price_map):
@@ -321,12 +344,14 @@ def test_an_advanced_analytics_purchase_under_an_unknown_email_creates_one_pendi
     key from this single purchase."""
     with override_target(sqlite_path=db_path):
         result = ae.sync_analytics_from_stripe_event(
-            _checkout_event("evt_1", ADVANCED_ANALYTICS_TEST_PRICE, email="brand-new@example.test")
+            _checkout_event("evt_1", ADVANCED_ANALYTICS_TEST_PRICE, email="brand-new@example.test", quantity=5)
         )
         assert result["status"] == "pending_link_created"
         assert result["addon_key"] == "advanced_analytics"
         assert len(result["pending_link_ids"]) == 4
         assert set(result["analytic_keys"]) == {"smart_motion", "people_counting", "lpr", "ppe"}
+        assert {row[0] for row in sqlite3.connect(db_path).execute(
+            "SELECT licensed_quantity FROM pending_analytics_links").fetchall()} == {5}
 
 
 def test_resolving_pending_advanced_analytics_links_grants_all_four_entitlements(db_path, _analytics_price_map):
@@ -335,7 +360,7 @@ def test_resolving_pending_advanced_analytics_links_grants_all_four_entitlements
     # under the same email, exactly like a real checkout-before-
     # registration website visitor.
     with override_target(sqlite_path=db_path):
-        ae.sync_analytics_from_stripe_event(_checkout_event("evt_1", ADVANCED_ANALYTICS_TEST_PRICE, email="brand-new@example.test"))
+        ae.sync_analytics_from_stripe_event(_checkout_event("evt_1", ADVANCED_ANALYTICS_TEST_PRICE, email="brand-new@example.test", quantity=5))
         assert ae.get_active_analytics_for_customer("cust-2") == []
 
     _seed_customer(db_path, customer_id="cust-2", email="brand-new@example.test")
@@ -343,6 +368,7 @@ def test_resolving_pending_advanced_analytics_links_grants_all_four_entitlements
         resolved = ae.resolve_pending_links_for_customer("cust-2", "brand-new@example.test")
         assert len(resolved) == 4
         assert ae.get_active_analytics_for_customer("cust-2") == ["lpr", "people_counting", "ppe", "smart_motion"]
+        assert {row["licensed_quantity"] for row in ae.get_analytics_subscriptions_for_customer("cust-2")} == {5}
 
 
 def test_a_hardware_purchase_grants_no_analytics(db_path, _analytics_price_map, monkeypatch):

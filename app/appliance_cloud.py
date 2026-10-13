@@ -827,7 +827,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # the plan allows it NOW -- cancelling Hybrid or moving to Basic Local
         # turns it off at the edge; the customer's stored choice is kept, so
         # re-subscribing restores it (analytics_entitlements.effective_camera_analytic).
-        from analytics_entitlements import effective_camera_analytic
+        from analytics_entitlements import effective_camera_analytic, commercial_camera_analytic_authorized
         from analytics_control_center import active_lab_grant, operational_enabled
         _analytics: dict={}
         with connection() as _db:
@@ -840,6 +840,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     'ppe':bool(item.get('ppe_enabled')),
                     'facial_recognition':bool(_db.execute("SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key='facial_recognition' AND status='active'",(item['id'],)).fetchone()),
                 }
+                # The persisted camera flag is operational configuration, not
+                # commercial authorization. Every feature also needs an active
+                # per-camera assignment and enough current purchased seats.
+                for key in tuple(paid):
+                    paid[key] = bool(paid[key]) and commercial_camera_analytic_authorized(
+                        _db, customer_id=appliance.get('customer_id'), site_id=item.get('site_id'),
+                        camera_id=item['id'], analytic_key=key)
                 lab_leases={}
                 for key in ('smart_motion','people_counting','lpr','ppe','facial_recognition'):
                     grant=active_lab_grant(_db,camera,key) if not paid[key] else None

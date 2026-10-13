@@ -187,6 +187,7 @@ def upsert_analytics_subscription(
     stripe_customer_id: Optional[str] = None,
     stripe_subscription_id: Optional[str] = None,
     stripe_price_id: Optional[str] = None,
+    licensed_quantity: Optional[int] = None,
 ) -> dict:
     """Idempotent per (customer_id, analytic_key) at site_id=NULL --
     updates the SAME licensing row in place on a repeat purchase/upgrade/
@@ -195,7 +196,11 @@ def upsert_analytics_subscription(
     design. A field left as None on an update never blanks out a
     previously-recorded Stripe reference (COALESCE), since not every event
     carries every field (a subscription-cancelled event has no new price
-    id, for instance)."""
+    id, for instance). Stripe quantities are copied into each per-analytic
+    license count. Missing quantities preserve existing values and default
+    new legacy/manual rows to one."""
+    if licensed_quantity is not None and (isinstance(licensed_quantity, bool) or int(licensed_quantity) < 1 or int(licensed_quantity) > 256):
+        raise ValueError("licensed_quantity must be between 1 and 256")
     existing = row(
         "SELECT * FROM analytics_subscriptions WHERE customer_id=? AND analytic_key=? AND site_id IS NULL",
         (customer_id, analytic_key),
@@ -208,8 +213,9 @@ def upsert_analytics_subscription(
                 "stripe_customer_id=COALESCE(?,stripe_customer_id),"
                 "stripe_subscription_id=COALESCE(?,stripe_subscription_id),"
                 "stripe_price_id=COALESCE(?,stripe_price_id),"
+                "licensed_quantity=COALESCE(?,licensed_quantity),"
                 "updated_at=? WHERE id=?",
-                (status, stripe_customer_id, stripe_subscription_id, stripe_price_id, now, existing["id"]),
+                (status, stripe_customer_id, stripe_subscription_id, stripe_price_id, licensed_quantity, now, existing["id"]),
             )
             subscription_id = existing["id"]
         else:
@@ -217,9 +223,9 @@ def upsert_analytics_subscription(
             db.execute(
                 "INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,"
                 "monthly_retail,monthly_partner,licensed_quantity,stripe_customer_id,stripe_subscription_id,"
-                "stripe_price_id,created_at,updated_at) VALUES(?,?,NULL,?,?,NULL,NULL,1,?,?,?,?,?)",
+                "stripe_price_id,created_at,updated_at) VALUES(?,?,NULL,?,?,NULL,NULL,?,?,?,?,?,?)",
                 (subscription_id, customer_id, analytic_key, status,
-                 stripe_customer_id, stripe_subscription_id, stripe_price_id, now, now),
+                 licensed_quantity or 1, stripe_customer_id, stripe_subscription_id, stripe_price_id, now, now),
             )
     if analytic_key == "facial_recognition" and status != "cancelled":
         promote_requested_doors(customer_id)
@@ -331,6 +337,16 @@ def feature_granted_by_other_addon(customer_id: str, feature_key: str, *, exclud
     return any(feature_key in _grants_for(key) for key in active_addon_keys(customer_id) if key != excluding)
 
 
+def licensed_quantity_for_feature(customer_id: str, feature_key: str) -> int:
+    """Sum active purchased package quantities that grant one feature."""
+    total = 0
+    for item in rows("SELECT addon_key,quantity FROM addon_subscriptions WHERE customer_id=? AND status='active'",
+                     (customer_id,)):
+        if feature_key in _grants_for(item["addon_key"]):
+            total += _positive_int(item.get("quantity")) or 1
+    return min(256, total)
+
+
 def account_wide_feature_active(db, customer_id: str, feature_key: str) -> bool:
     """True when this feature covers every camera on the account: an
     INCLUDED feature (Smart Motion, ...) while the customer holds an
@@ -377,6 +393,81 @@ def account_wide_feature_active(db, customer_id: str, feature_key: str) -> bool:
     return False
 
 
+def plan_included_feature_active(db, customer_id: str, feature_key: str) -> bool:
+    """Return only base-plan inclusion, excluding paid analytics add-ons.
+
+    Paid analytics subscriptions carry a finite ``licensed_quantity`` and
+    are assigned per camera. ``account_wide_feature_active`` intentionally
+    also answers whether a flat add-on grants a feature for legacy callers;
+    the Analytics Control Center must use this narrower predicate so an
+    add-on purchase cannot silently authorize every camera.
+    """
+    try:
+        import per_camera_billing
+        entitlement = per_camera_billing.entitlement_for_customer(customer_id)
+    except Exception:
+        entitlement = None
+    if entitlement and entitlement.get("status") == "active":
+        plan = per_camera_billing.PLANS.get(entitlement.get("plan_key"), {})
+        feature = {"smart_motion": "smart_motion", "talk_down": "supported_talk_down",
+                   "aaco": "core_aaco_retrieval"}.get(feature_key)
+        return bool(feature and feature in set(plan.get("features") or []))
+    if feature_key in _catalog.INCLUDED_FEATURE_KEYS:
+        return bool(db.execute(
+            "SELECT 1 FROM customer_entitlements WHERE customer_id=? AND status='active' "
+            "AND camera_slot_quantity>0 AND product IN ('camera_slots_local','camera_slots_hybrid') LIMIT 1",
+            (customer_id,),
+        ).fetchone())
+    return False
+
+
+def commercial_camera_analytic_authorized(db, *, customer_id: str, site_id: str | None,
+                                          camera_id: str, analytic_key: str) -> bool:
+    """Fail-closed per-camera authorization against the purchased seat count.
+
+    A subscription alone never activates every camera. The camera must have
+    an active assignment row, and the customer's active assignment count
+    must fit the applicable site- or account-scoped license quantity.
+    Base-plan Smart Motion is unlimited only for cameras explicitly assigned
+    in ``camera_analytics_entitlements``.
+    """
+    assigned = db.execute(
+        "SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=? AND status='active'",
+        (camera_id, analytic_key),
+    ).fetchone()
+    if not assigned:
+        return False
+    if plan_included_feature_active(db, customer_id, analytic_key):
+        return True
+    subscription = db.execute(
+        "SELECT site_id,licensed_quantity FROM analytics_subscriptions "
+        "WHERE customer_id=? AND (site_id=? OR site_id IS NULL) AND analytic_key=? AND status='active' "
+        "ORDER BY site_id IS NULL LIMIT 1",
+        (customer_id, site_id, analytic_key),
+    ).fetchone()
+    if not subscription:
+        return False
+    quantity = int(subscription["licensed_quantity"] or 0)
+    if quantity < 1:
+        return False
+    if subscription["site_id"] is not None:
+        count = db.execute(
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "WHERE c.customer_id=? AND c.site_id=? AND e.analytic_key=? AND e.status='active'",
+            (customer_id, site_id, analytic_key),
+        ).fetchone()["n"]
+    else:
+        count = db.execute(
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "WHERE c.customer_id=? AND e.analytic_key=? AND e.status='active'",
+            (customer_id, analytic_key),
+        ).fetchone()["n"]
+    # No arbitrary camera ordering when licenses are reduced. Fail closed for
+    # the affected analytic until the owner restores seats or reassigns the
+    # excess seats; this cannot silently choose a different customer camera.
+    return int(count) <= quantity
+
+
 def effective_camera_analytic(db, customer_id: str, site_id, analytic_key: str, stored, cache: dict | None = None):
     """A camera's stored per-camera analytic flag (cameras.<key>_enabled) as
     the appliance must act on it (2026-10-10).
@@ -407,7 +498,7 @@ def effective_camera_analytic(db, customer_id: str, site_id, analytic_key: str, 
     if cache is not None and key in cache:
         allowed = cache[key]
     else:
-        allowed = account_wide_feature_active(db, customer_id, analytic_key) or db.execute(
+        allowed = plan_included_feature_active(db, customer_id, analytic_key) or db.execute(
             "SELECT 1 FROM analytics_subscriptions WHERE customer_id=? AND (site_id=? OR site_id IS NULL) "
             "AND analytic_key=? AND status!='cancelled' LIMIT 1", (customer_id, site_id, analytic_key)).fetchone() is not None
         if cache is not None:
@@ -426,6 +517,7 @@ def create_pending_link(
     *, email: str, stripe_price_id: str, analytic_key: str,
     stripe_customer_id: Optional[str] = None,
     stripe_checkout_session_id: Optional[str] = None, raw_event: dict,
+    licensed_quantity: int = 1,
 ) -> dict:
     """Same checkout-before-registration safety net as customer_
     entitlements.create_pending_link() and hardware_orders.create_pending_
@@ -439,10 +531,10 @@ def create_pending_link(
     with connection() as db:
         db.execute(
             "INSERT INTO pending_analytics_links(id,normalized_email,stripe_customer_id,"
-            "stripe_checkout_session_id,stripe_price_id,analytic_key,raw_event_json,status,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "stripe_checkout_session_id,stripe_price_id,analytic_key,licensed_quantity,raw_event_json,status,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (link_id, (email or "").strip().lower(), stripe_customer_id, stripe_checkout_session_id,
-             stripe_price_id, analytic_key, json.dumps(raw_event), "pending", datetime.now().isoformat()),
+             stripe_price_id, analytic_key, licensed_quantity, json.dumps(raw_event), "pending", datetime.now().isoformat()),
         )
     return row("SELECT * FROM pending_analytics_links WHERE id=?", (link_id,))
 
@@ -459,6 +551,7 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list[str
         upsert_analytics_subscription(
             customer_id=customer_id, analytic_key=link["analytic_key"], status="active",
             stripe_customer_id=link["stripe_customer_id"], stripe_price_id=link["stripe_price_id"],
+            licensed_quantity=int(link.get("licensed_quantity") or 1),
         )
         with connection() as db:
             db.execute(
@@ -470,6 +563,7 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list[str
         if addon:
             upsert_addon_subscription(
                 customer_id=customer_id, addon_key=addon["addon_key"], status="active",
+                quantity=int(link.get("licensed_quantity") or 1),
                 stripe_customer_id=link["stripe_customer_id"], stripe_price_id=link["stripe_price_id"],
             )
     return resolved_ids
@@ -488,10 +582,12 @@ def apply_addon_state(addon: dict, *, status: str, suspended_reason: str | None)
         feature_status = "active" if status == "active" else "cancelled"
         if feature_status == "cancelled" and feature_granted_by_other_addon(addon["customer_id"], analytic_key, excluding=addon["addon_key"]):
             feature_status = "active"
+        aggregate_quantity = licensed_quantity_for_feature(addon["customer_id"], analytic_key)
         upsert_analytics_subscription(customer_id=addon["customer_id"], analytic_key=analytic_key, status=feature_status,
                                       stripe_customer_id=addon.get("stripe_customer_id"),
                                       stripe_subscription_id=addon.get("stripe_subscription_id"),
-                                      stripe_price_id=addon.get("stripe_price_id"))
+                                      stripe_price_id=addon.get("stripe_price_id"),
+                                      licensed_quantity=aggregate_quantity or None)
 
 
 def get_active_analytics_for_customer(customer_id: str) -> list[str]:
@@ -529,6 +625,29 @@ def _positive_int(value) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def _stripe_subscription_quantity(subscription_obj: dict, price_id: str, fallback=None) -> int:
+    """Read the purchased item quantity from Stripe's current subscription.
+
+    Checkout metadata is only a compatibility fallback for old test and
+    legacy webhook fixtures. When Stripe includes a matching line item, its
+    quantity is authoritative and malformed/zero values fail closed.
+    """
+    items = ((subscription_obj.get("items") or {}).get("data") or [])
+    matching = [item for item in items if isinstance(item, dict)
+                and str((item.get("price") or {}).get("id") or "") == str(price_id)]
+    if matching:
+        raw = matching[0].get("quantity")
+        quantity = _positive_int(raw)
+        return quantity or 0
+    # If Stripe supplied line items but none maps to this entitlement's
+    # configured price, metadata must not stand in for a purchased quantity.
+    # This can occur during a price change or with a malformed/mixed
+    # subscription object; fail closed rather than granting a seat.
+    if items:
+        return 0
+    return _positive_int(fallback) or 1
 
 
 def _sync_checkout_completed(event: dict) -> dict:
@@ -573,6 +692,10 @@ def _sync_checkout_completed(event: dict) -> dict:
         return {"status": "not_granted", "reason": "subscription is no longer active in Stripe"}
     if current.get("status") == "incomplete":  # first payment not completed: no service (finding 5)
         return {"status": "not_granted", "reason": "the first payment has not completed"}
+    quantity = _stripe_subscription_quantity(
+        current, fields["price_id"], (session_obj.get("metadata") or {}).get("anyaicam_quantity"))
+    if not quantity:
+        return {"status": "not_granted", "reason": "the Stripe subscription has an invalid analytics quantity"}
     held_addon = row("SELECT * FROM addon_subscriptions WHERE customer_id=? AND addon_key=?",
                      (customer["id"], addon["addon_key"])) if customer else None
     if held_addon:
@@ -598,6 +721,7 @@ def _sync_checkout_completed(event: dict) -> dict:
             link = create_pending_link(
                 email=fields["email"], stripe_price_id=fields["price_id"], analytic_key=analytic_key,
                 stripe_customer_id=fields["stripe_customer_id"], raw_event=event,
+                licensed_quantity=quantity,
             )
             link_ids.append(link["id"])
         return {"status": "pending_link_created", "pending_link_ids": link_ids, "addon_key": addon["addon_key"], "analytic_keys": list(addon["analytic_keys"])}
@@ -607,7 +731,7 @@ def _sync_checkout_completed(event: dict) -> dict:
         and held_addon.get("suspended_reason") != "payment_incomplete") else None
     package = upsert_addon_subscription(
         customer_id=customer["id"], addon_key=addon["addon_key"], status="active",
-        quantity=_positive_int((session_obj.get("metadata") or {}).get("anyaicam_quantity")),
+        quantity=quantity,
         stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
         stripe_subscription_id=subscription_id,
     )
@@ -616,6 +740,7 @@ def _sync_checkout_completed(event: dict) -> dict:
         subscription = upsert_analytics_subscription(
             customer_id=customer["id"], analytic_key=analytic_key, status="active",
             stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
+            licensed_quantity=quantity,
         )
         subscription_ids.append(subscription["id"])
     if reversal or keep_reason:
@@ -694,8 +819,9 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         reversal = subscription_payment_reversal(subscription_obj)  # finding 4
         if reversal:
             new_status, new_reason = "suspended", reversal
-    items = ((subscription_obj.get("items") or {}).get("data") or [])
-    quantity = _positive_int(items[0].get("quantity")) if items and isinstance(items[0], dict) else None
+    quantity = _stripe_subscription_quantity(subscription_obj, price_id)
+    if not quantity:
+        return {"status": "rejected", "reason": "Stripe subscription has an invalid analytics quantity"}
     subscription_ids = []
     granted_keys = []
     package_customer_id = None
@@ -736,7 +862,7 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         subscription = upsert_analytics_subscription(
             customer_id=customer_id, analytic_key=analytic_key, status=feature_status,
             stripe_customer_id=stripe_customer_id, stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
-            stripe_price_id=price_id,
+            stripe_price_id=price_id, licensed_quantity=quantity,
         )
         subscription_ids.append(subscription["id"])
         granted_keys.append(analytic_key)

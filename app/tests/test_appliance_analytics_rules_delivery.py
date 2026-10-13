@@ -12,7 +12,9 @@ helper, same override_target()-before-import constraint).
 """
 
 import json
+import os
 import secrets
+import tempfile
 import time
 
 import pytest
@@ -21,7 +23,11 @@ from fastapi.testclient import TestClient
 
 from database_backend import override_target
 
-with override_target(sqlite_path="/tmp/test_appliance_analytics_rules_delivery.db"):
+# Import-time schema initialization must use a writable per-process path on
+# both Linux and Windows (the old literal /tmp path resolved to a protected
+# root directory on Windows).
+_IMPORT_DB = os.path.join(tempfile.gettempdir(), f"anyaicam-rules-import-{os.getpid()}.sqlite3")
+with override_target(sqlite_path=_IMPORT_DB):
     import appliance_cloud
     from partner_db import connection, password_hash
 
@@ -37,6 +43,23 @@ def _seed_appliance(db, appliance_id, cloud_id, credential, camera_id, *, custom
     # This test exercises ownership and rule serialization, so seed the
     # current enabled state explicitly instead of relying on an unset column.
     db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (camera_id, customer_id, site_id, appliance_id, "Camera", camera_number, "configured", 1, now))
+    _seed_smart_motion_assignment(db, camera_id, customer_id)
+
+
+def _seed_smart_motion_assignment(db, camera_id, customer_id):
+    """Seed current commercial authorization, not just the legacy camera flag."""
+    now = "2026-09-21T00:00:00"
+    db.execute(
+        "INSERT OR IGNORE INTO analytics_subscriptions "
+        "(id,customer_id,site_id,analytic_key,status,monthly_retail,monthly_partner,created_at,licensed_quantity,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (f"smart-motion-{customer_id}", customer_id, None, "smart_motion", "active", 0, 0, now, 64, now),
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO camera_analytics_entitlements "
+        "(camera_id,analytic_key,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+        (camera_id, "smart_motion", "active", now, now),
+    )
 
 
 def _seed_rule(db, rule_id, *, customer_id, site_id, appliance_id, camera_id, rule_type="line_crossing", direction="both", enabled=1, geometry=None, name="Test rule"):
@@ -131,6 +154,7 @@ def test_rules_for_two_cameras_on_the_same_appliance_are_both_scoped_correctly(c
                 "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 ("cam-2", "cust-1", "site-1", "appl-1", "Camera 2", 2, "configured", 1, "2026-09-21T00:00:00"),
             )
+            _seed_smart_motion_assignment(db, "cam-2", "cust-1")
             _seed_rule(db, "rule-1", customer_id="cust-1", site_id="site-1", appliance_id="appl-1", camera_id="cam-1")
             _seed_rule(
                 db, "rule-2", customer_id="cust-1", site_id="site-1", appliance_id="appl-1", camera_id="cam-2",

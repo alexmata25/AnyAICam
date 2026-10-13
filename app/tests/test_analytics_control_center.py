@@ -126,7 +126,7 @@ def test_control_center_page_exposes_eight_controls_and_guardian_is_hard_off(cli
     assert "Analytics Control Center" in response.text
     assert "Turn All OFF" in response.text
     assert "Turn OFF all eight analytics for this camera?" in response.text
-    assert "playback will continue" in response.text
+    assert "playback continue" in response.text.lower()
     assert "Master state: OFF" in response.text
     assert "No Guardian workers are contacted" in response.text
     assert 'id="guardian-master"' not in response.text
@@ -185,15 +185,107 @@ def test_operational_toggle_survives_application_recreation(client, db_path):
     assert next(item for item in state["analytics"] if item["key"] == "lpr")["enabled"] is False
 
 
+def test_assignment_counts_reassignment_and_customer_off_preserve_paid_seat(client, db_path):
+    before = _call(client, "GET", "/api/customer/analytics-control/cameras/cam-1", cookies=_cookie()).json()
+    lpr = next(item for item in before["analytics"] if item["key"] == "lpr")
+    assert lpr["license"] == {"purchase_kind": "licensed", "purchased_quantity": 1,
+                               "assigned_quantity": 1, "available_quantity": 0}
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/lpr/assignment",
+                 payload={"assigned": True}, cookies=_cookie()).status_code == 409
+
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/lpr",
+                 payload={"enabled": False}, cookies=_cookie()).status_code == 200
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            assert db.execute("SELECT status FROM camera_analytics_entitlements WHERE camera_id='cam-1' AND analytic_key='lpr'").fetchone()[0] == "active"
+            assert acc.operational_enabled(db, "cam-1", "lpr") is False
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/lpr/assignment",
+                 payload={"assigned": False}, cookies=_cookie()).status_code == 200
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/lpr/assignment",
+                 payload={"assigned": True}, cookies=_cookie()).status_code == 200
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            assert db.execute("SELECT status FROM analytics_subscriptions WHERE id='sub'").fetchone()[0] == "active"
+            assert db.execute("SELECT lpr_enabled FROM cameras WHERE id='cam-1'").fetchone()[0] == 0
+            assert db.execute("SELECT lpr_enabled FROM cameras WHERE id='cam-2'").fetchone()[0] == 1
+            assert acc.operational_enabled(db, "cam-1", "lpr") is False
+
+
+def test_system_pause_is_separate_audited_and_does_not_clear_customer_choice(client, db_path):
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/lpr",
+                 payload={"enabled": False}, cookies=_cookie()).status_code == 200
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            acc.set_system_pause(db, "cam-1", "lpr", paused=True, reason="resource governor")
+            paused = acc.operational_status(db, "cam-1", "lpr")
+            assert paused == {"customer_enabled": False, "system_paused": True,
+                              "system_pause_reason": "resource governor", "effective_enabled": False}
+            acc.set_system_pause(db, "cam-1", "lpr", paused=False)
+            resumed = acc.operational_status(db, "cam-1", "lpr")
+            assert resumed == {"customer_enabled": False, "system_paused": False,
+                               "system_pause_reason": None, "effective_enabled": False}
+            assert [r["action"] for r in db.execute("SELECT action FROM audit_logs WHERE entity_id='cam-1' ORDER BY id").fetchall()] == [
+                "analytics.operational_toggle_changed", "analytics.system_paused", "analytics.system_pause_cleared"]
+
+
+def test_commercial_seat_assignment_is_atomic_across_cameras(client, db_path):
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,licensed_quantity,created_at) "
+                       "VALUES('ppe-sub','c','s','ppe','active',1,'x')")
+
+    def assign(camera_id):
+        return _call(client, "PUT", f"/api/customer/analytics-control/cameras/{camera_id}/ppe/assignment",
+                     payload={"assigned": True}, cookies=_cookie()).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(assign, ("cam-1", "cam-2")))
+    assert sorted(statuses) == [200, 409]
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            assert db.execute("SELECT COUNT(*) AS n FROM camera_analytics_entitlements WHERE analytic_key='ppe' AND status='active'").fetchone()["n"] == 1
+
+
+def test_reduced_or_revoked_quantity_pauses_processing_until_assignments_fit(client, db_path):
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
+                       "VALUES('cam-2','lpr','active','x','x')")
+            db.execute("UPDATE cameras SET lpr_enabled=1 WHERE id='cam-2'")
+    state = _call(client, "GET", "/api/customer/analytics-control/cameras/cam-1", cookies=_cookie()).json()
+    lpr = next(item for item in state["analytics"] if item["key"] == "lpr")
+    assert lpr["system_paused"] is True
+    assert "quantity is below" in lpr["system_pause_reason"].lower()
+    assert lpr["assigned"] is True and lpr["customer_enabled"] is True
+    assert lpr["enabled"] is False
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/lpr",
+                 payload={"enabled": True}, cookies=_cookie()).status_code == 409
+
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/lpr/assignment",
+                 payload={"assigned": False}, cookies=_cookie()).status_code == 200
+    recovered = _call(client, "GET", "/api/customer/analytics-control/cameras/cam-1", cookies=_cookie()).json()
+    lpr = next(item for item in recovered["analytics"] if item["key"] == "lpr")
+    assert lpr["system_paused"] is False
+    assert lpr["assigned"] is True and lpr["customer_enabled"] is True
+    assert lpr["enabled"] is True
+
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("UPDATE analytics_subscriptions SET status='cancelled' WHERE id='sub'")
+    revoked = _call(client, "GET", "/api/customer/analytics-control/cameras/cam-1", cookies=_cookie()).json()
+    lpr = next(item for item in revoked["analytics"] if item["key"] == "lpr")
+    assert lpr["system_paused"] is True and lpr["enabled"] is False
+
+
 def test_unentitled_enable_is_rejected_but_disable_is_allowed(client):
     assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/lpr", payload={"enabled": True}, cookies=_cookie()).status_code == 403
     assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/lpr", payload={"enabled": False}, cookies=_cookie()).status_code == 200
 
 
 def test_rule_analytic_requires_smart_motion_parent_and_existing_rule(client):
-    response = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/line_crossing", payload={"enabled": True}, cookies=_cookie())
-    assert response.status_code == 200
-    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/line_crossing", payload={"enabled": True}, cookies=_cookie()).status_code == 409
+    response = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/line_crossing/assignment", payload={"assigned": True}, cookies=_cookie())
+    assert response.status_code == 409  # Smart Motion does not grant a separate Line Crossing seat.
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/line_crossing", payload={"enabled": True}, cookies=_cookie()).status_code == 403
 
 
 def test_rule_delivery_honors_individual_switches_preserves_exclusion_and_fails_closed_for_unknown(client, db_path):
@@ -243,6 +335,8 @@ def test_test_lab_grant_is_signed_scoped_expiring_and_does_not_create_subscripti
                 acc.import_signed_grant(db, envelope, {"role": "customer_owner"})
             acc.import_signed_grant(db, envelope, {"role": "administrator", "email": "admin@example.test"})
             assert db.execute("SELECT COUNT(*) AS n FROM analytics_subscriptions").fetchone()["n"] == 1
+    assigned = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/ppe/assignment", payload={"assigned": True}, cookies=_cookie())
+    assert assigned.status_code == 200
     enabled = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/ppe", payload={"enabled": True}, cookies=_cookie())
     assert enabled.status_code == 200
     denied = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/ppe", payload={"enabled": True}, cookies=_cookie())
@@ -277,12 +371,12 @@ def test_test_lab_quota_is_atomic_under_concurrent_camera_assignments(client, db
             acc.import_signed_grant(db, envelope, {"role": "administrator", "email": "admin@example.test"})
 
     def enable(camera_id):
-        return _call(client, "PUT", f"/api/customer/analytics-control/cameras/{camera_id}/ppe",
-                     payload={"enabled": True}, cookies=_cookie()).status_code
+        return _call(client, "PUT", f"/api/customer/analytics-control/cameras/{camera_id}/ppe/assignment",
+                     payload={"assigned": True}, cookies=_cookie()).status_code
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = list(pool.map(enable, ("cam-1", "cam-2")))
-    assert sorted(statuses) == [200, 403]
+    assert sorted(statuses) == [200, 409]
     with override_target(sqlite_path=db_path):
         with connection() as db:
             assert db.execute("SELECT COUNT(*) AS n FROM test_lab_analytics_assignments WHERE grant_id='grant-1' AND analytic_key='ppe' AND enabled=1").fetchone()["n"] == 1
@@ -294,6 +388,8 @@ def test_test_lab_revocation_stops_runtime_authorization_without_erasing_prefere
     with override_target(sqlite_path=db_path):
         with connection() as db:
             acc.import_signed_grant(db, envelope, actor)
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/ppe/assignment",
+                 payload={"assigned": True}, cookies=_cookie()).status_code == 200
     assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/ppe",
                  payload={"enabled": True}, cookies=_cookie()).status_code == 200
     with override_target(sqlite_path=db_path):
@@ -311,6 +407,8 @@ def test_test_lab_lease_expiry_fails_closed_after_grant_import(client, db_path, 
     with override_target(sqlite_path=db_path):
         with connection() as db:
             acc.import_signed_grant(db, envelope, {"role": "administrator", "email": "admin@example.test"})
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/ppe/assignment",
+                 payload={"assigned": True}, cookies=_cookie()).status_code == 200
     assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/ppe",
                  payload={"enabled": True}, cookies=_cookie()).status_code == 200
     expiry = acc._utc(envelope["payload"]["expires_at"])
@@ -325,6 +423,8 @@ def test_test_lab_facial_assignment_reaches_runtime_guard_and_turns_off(client, 
     with override_target(sqlite_path=db_path):
         with connection() as db:
             acc.import_signed_grant(db, envelope, {"role": "administrator", "email": "admin@example.test"})
+    assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/facial_recognition/assignment",
+                 payload={"assigned": True}, cookies=_cookie()).status_code == 200
     assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/facial_recognition",
                  payload={"enabled": True}, cookies=_cookie()).status_code == 200
     import facial_events
@@ -335,7 +435,8 @@ def test_test_lab_facial_assignment_reaches_runtime_guard_and_turns_off(client, 
                  payload={"enabled": False}, cookies=_cookie()).status_code == 200
     with override_target(sqlite_path=db_path):
         with connection() as db:
-            assert facial_events._is_entitled(db, camera_id="cam-2") is False
+            assert facial_events._is_entitled(db, camera_id="cam-2") is True
+            assert acc.operational_enabled(db, "cam-2", "facial_recognition") is False
 
 
 def test_only_authenticated_administrator_can_import_or_revoke_signed_grants(client, db_path, monkeypatch):

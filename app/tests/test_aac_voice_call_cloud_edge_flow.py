@@ -21,6 +21,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import os
+import tempfile
 from datetime import datetime, timedelta
 
 import pytest
@@ -29,7 +31,9 @@ from fastapi.testclient import TestClient
 
 from database_backend import override_target
 
-with override_target(sqlite_path="/tmp/test_aac_voice_call_cloud_edge_flow_import.db"):
+# Keep import-time schema initialization writable on Windows as well as Linux.
+_IMPORT_DB = os.path.join(tempfile.gettempdir(), f"anyaicam-voice-flow-import-{os.getpid()}.sqlite3")
+with override_target(sqlite_path=_IMPORT_DB):
     import aac_voice_call
     import aac_voice_call_events as store
     import aac_voice_call_greeting

@@ -387,6 +387,7 @@ CREATE TABLE IF NOT EXISTS pending_analytics_links(
 );
 CREATE INDEX IF NOT EXISTS idx_pending_analytics_links_email_status ON pending_analytics_links(normalized_email,status);
 '''),
+    ('20261012_pending_analytics_license_quantity','ALTER TABLE pending_analytics_links ADD COLUMN licensed_quantity INTEGER NOT NULL DEFAULT 1'),
     ('20260910_appliance_update_results','''
 CREATE TABLE IF NOT EXISTS appliance_update_results(
     update_id TEXT NOT NULL,
@@ -1317,7 +1318,18 @@ def apply_migrations():
         # (ON when commercially enabled); explicit OFF remains durable.
         db.execute('CREATE TABLE IF NOT EXISTS camera_analytics_operations('
                    'camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,enabled INTEGER NOT NULL,'
+                   'system_paused INTEGER NOT NULL DEFAULT 0,system_pause_reason TEXT,system_paused_at TEXT,'
                    'updated_at TEXT NOT NULL,updated_by TEXT,PRIMARY KEY(camera_id,analytic_key))')
+        # Additive upgrade for databases created by early 1.2.6 builds. A
+        # system pause is separate from the customer's enabled preference.
+        from database_backend import backend
+        operation_columns=({item['name'] for item in db.execute('PRAGMA table_info(camera_analytics_operations)').fetchall()}
+                           if backend()=='sqlite' else
+                           {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='camera_analytics_operations'").fetchall()})
+        for name,definition in (('system_paused','INTEGER NOT NULL DEFAULT 0'),
+                                ('system_pause_reason','TEXT'),('system_paused_at','TEXT')):
+            if name not in operation_columns:
+                db.execute(f'ALTER TABLE camera_analytics_operations ADD COLUMN {name} {definition}')
         db.execute('CREATE TABLE IF NOT EXISTS test_lab_grants('
                    'grant_id TEXT PRIMARY KEY,payload_json TEXT NOT NULL,signature TEXT NOT NULL,'
                    'status TEXT NOT NULL DEFAULT \'active\',imported_at TEXT NOT NULL,imported_by TEXT,revoked_at TEXT,revoked_by TEXT)')

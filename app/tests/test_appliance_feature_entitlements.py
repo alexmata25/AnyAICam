@@ -28,6 +28,14 @@ from test_runtime_feature_enforcement import PRICES, _addon, _grant, _plan
 pytestmark = pytest.mark.real_entitlements
 
 
+@pytest.fixture(autouse=True)
+def isolated_product_mode_state(tmp_path, monkeypatch):
+    """Cloud sync persists mode under the real data root by default; tests
+    must redirect this mutable state to their own temporary directory."""
+    import product_mode
+    monkeypatch.setattr(product_mode, "STATE_FILE", tmp_path / "product_mode.json")
+
+
 # This appliance's persisted activation identity, as the cloud knows it
 # (_seed_cloud names the appliance's cloud_id "AIC-<appliance id>").
 EDGE_IDENTITY = {**IDENTITY, "cloud_id": f"AIC-{APPLIANCE_ID}"}

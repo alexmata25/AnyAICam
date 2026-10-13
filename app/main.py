@@ -7733,16 +7733,15 @@ class HardwareCheckoutCreateModel(BaseModel):
     sku: str
     quantity: int = 1
 class AnalyticsAddonCheckoutModel(BaseModel):
-    # Each analytics package (pricing_catalog.ADDONS) is ONE recurring,
-    # customer-billed add-on that unlocks its features together (Advanced
-    # Analytics: people_counting/lpr/ppe as of 2026-09-30; Smart Motion is
-    # included with every plan); Face Access is sold per door by size. The customer selects one catalog
+    # Each analytics package is recurring and has a bounded license quantity.
+    # A bundle quantity grants that many seats for each included feature;
+    # Face Access is sold per door by size. The customer selects one catalog
     # addon_key (analytics_entitlements.ANALYTICS_CATALOG), never a
     # Stripe Price ID and never an internal analytic_key directly.
     addon_key: str
-    # Only for per-site / per-door items (Talk Down sites, Face Access
-    # doors); bounded server-side. Packages are flat and ignore it.
-    quantity: int = 1
+    # Per-camera analytics seats, per-site Talk Down, and per-door Face
+    # Access all use a server-bounded quantity.
+    quantity: int = Field(default=1, ge=1, le=256)
 
 
 class VmsLicenseCheckoutModel(BaseModel):
@@ -114015,7 +114014,7 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     if not item["sellable"]:
         raise HTTPException(status_code=400, detail=item["unavailable_reason"] or "This add-on is not available yet.")
     quantity = 1
-    if item["unit"] == "per_site":
+    if item["unit"] in {"per_camera", "per_site"}:
         quantity = max(1, min(int(payload.quantity or 1), 256))
     elif item["unit"] == "per_door":
         # Billed for every door the customer has set up, decided server-side.
@@ -114067,8 +114066,8 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?analytics_addon_payment=cancelled"),
         ("client_reference_id", customer_id),
         ("line_items[0][price]", price_id),
-        # Flat packages are always exactly one; only per-site (Talk Down)
-        # and per-door (Face Access) items take a server-bounded quantity.
+        # Quantity is resolved by the server-side catalog unit and bounded
+        # model; the browser never supplies a Stripe price.
         ("line_items[0][quantity]", str(quantity)),
         ("metadata[anyaicam_stripe_price_id]", price_id),
         ("metadata[anyaicam_customer_id]", customer_id),

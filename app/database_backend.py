@@ -88,7 +88,13 @@ def lock_customer_camera_capacity(db, customer_id: str) -> bool:
         return db.execute(
             'SELECT id FROM customers WHERE id=? FOR UPDATE', (customer_id,)
         ).fetchone() is not None
-    db.execute('BEGIN IMMEDIATE')
+    # Callers such as migration/service helpers may already have performed a
+    # write on this SQLite connection. Such a transaction already owns the
+    # write reservation; BEGIN IMMEDIATE would fail with "within a
+    # transaction" and is unnecessary. Fresh transactions still acquire the
+    # immediate lock before reading seat counts.
+    if not getattr(db, 'in_transaction', False):
+        db.execute('BEGIN IMMEDIATE')
     return db.execute(
         'SELECT id FROM customers WHERE id=?', (customer_id,)
     ).fetchone() is not None

@@ -159,12 +159,12 @@ def _cancel_event(event_id, price_id, stripe_customer="cus_1"):
         "items": {"data": [{"price": {"id": price_id}, "quantity": 1}]}, "metadata": {"anyaicam_customer_id": "cust-1"}}}}
 
 
-def test_a_flat_package_covers_every_camera_not_one(db_path, monkeypatch):
+def test_analytics_bundle_quantity_controls_each_feature_camera_seat(db_path, monkeypatch):
     _seed(db_path)
     _stripe_maps(monkeypatch, ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS="price_adv")
     with override_target(sqlite_path=str(db_path)):
         import analytics_entitlements as ae
-        ae.sync_analytics_from_stripe_event(_checkout_event("evt_adv", "price_adv"))
+        ae.sync_analytics_from_stripe_event(_checkout_event("evt_adv", "price_adv", quantity=3))
     for camera in ("cam-1", "cam-2", "cam-3"):
         _assign(db_path, camera, "lpr")
         _assign(db_path, camera, "people_counting")
@@ -288,9 +288,9 @@ def test_talk_down_checkout_is_billed_per_site(portal, db_path):
     response = client.post("/api/customer/analytics/checkout", json={"addon_key": "talk_down", "quantity": 3}, cookies=_cookie(*OWNER))
     assert response.status_code == 200
     assert captured[-1]["line_items[0][quantity]"] == "3"
-    flat = client.post("/api/customer/analytics/checkout", json={"addon_key": "advanced_analytics", "quantity": 64}, cookies=_cookie(*OWNER))
-    assert flat.status_code == 200
-    assert captured[-1]["line_items[0][quantity]"] == "1"  # never multiplied by cameras
+    camera_bundle = client.post("/api/customer/analytics/checkout", json={"addon_key": "advanced_analytics", "quantity": 5}, cookies=_cookie(*OWNER))
+    assert camera_bundle.status_code == 200
+    assert captured[-1]["line_items[0][quantity]"] == "5"
 
 
 def test_unsellable_items_cannot_be_checked_out(portal, db_path, monkeypatch):

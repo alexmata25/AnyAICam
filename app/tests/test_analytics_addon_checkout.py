@@ -175,6 +175,21 @@ def test_advanced_analytics_creates_one_recurring_session_for_the_bundle(client,
     assert fields["customer"] == "cus_test_cust-1" and "customer_email" not in fields
 
 
+def test_analytics_checkout_quantity_is_server_bounded_camera_license_quantity(client, db_path):
+    test_client, captured = client
+    _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
+    response = test_client.post(
+        "/api/customer/analytics/checkout",
+        json={"addon_key": "advanced_analytics", "quantity": 5},
+        cookies={"anyaicam_partner_session": _owner_cookie(email="owner@example.test")},
+    )
+    assert response.status_code == 200, response.text
+    fields = _fields_dict(captured["fields"])
+    assert fields["line_items[0][quantity]"] == "5"
+    assert fields["metadata[anyaicam_quantity]"] == "5"
+    assert fields["subscription_data[metadata][anyaicam_customer_id]"] == "cust-1"
+
+
 def test_old_single_price_face_access_sku_is_no_longer_sold(client, db_path):
     """2026-09-30: Face Access is sold per door by size (enrolled people).
     The old single-price SKU still resolves for existing subscriptions
@@ -617,7 +632,7 @@ def test_cancelling_advanced_analytics_cancels_all_its_keys_together(client, db_
             "id": "evt_cancel", "type": "customer.subscription.deleted",
             "data": {"object": {
                 "id": "sub_1", "customer": "cus_test_1", "status": "canceled",
-                "items": {"data": [{"price": {"id": fields["metadata[anyaicam_stripe_price_id]"]}}]},
+                "items": {"data": [{"price": {"id": fields["metadata[anyaicam_stripe_price_id]"]}, "quantity": 1}]},
                 "metadata": {},
             }},
         }
