@@ -593,6 +593,7 @@ class RollbackSafetyTests(unittest.TestCase):
                     self.assert_files(self.RESTORED)  # the current files, all three, as they were
                     self.assertEqual(self.sentinel.read_text(), "protected root-owned file")
 
+    @unittest.skipUnless(AS_ROOT, "requires root to create a service-user-owned recordings directory")
     def test_the_service_user_cannot_replace_the_saved_original_while_it_is_moved(self):
         for suffix in ("", "-wal", "-shm"):
             with self.subTest(suffix or "database"):

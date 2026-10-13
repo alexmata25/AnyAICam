@@ -22,16 +22,45 @@ INSTALLER_DIR="$(cd "$TESTS_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
+SKIP=0
 
 # --- fixture root -----------------------------------------------------
 FIXTURE_ROOT="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_ROOT"' EXIT
+ORIGINAL_PATH="$PATH"
 
 reset_fixture() {
     ANYAICAM_PRODUCT_MODE=local
     PRODUCT_MODE_LEGACY=false
     rm -rf "$FIXTURE_ROOT"
     mkdir -p "$FIXTURE_ROOT"
+    export FIXTURE_ROOT
+    if [[ "$EUID" -ne 0 ]]; then
+        # Simulate ownership changes only for disposable fixture paths. The
+        # actual root-ownership checks remain in the root-required test pass.
+        local rootless_bin="$FIXTURE_ROOT/rootless-bin"
+        mkdir -p "$rootless_bin"
+        cat > "$rootless_bin/chown" <<'ROOTLESS_CHOWN'
+#!/usr/bin/env bash
+set -euo pipefail
+owner_seen=0
+for arg in "$@"; do
+    [[ "$arg" == "-h" || "$arg" == "-R" || "$arg" == "-f" ]] && continue
+    if [[ "$owner_seen" -eq 0 ]]; then owner_seen=1; continue; fi
+    case "$arg" in
+        "$FIXTURE_ROOT"|"$FIXTURE_ROOT"/*) ;;
+        *) echo "rootless chown stub refused non-fixture target" >&2; exit 97 ;;
+    esac
+done
+[[ "$owner_seen" -eq 1 ]]
+ROOTLESS_CHOWN
+        chmod 0755 "$rootless_bin/chown"
+        PATH="$rootless_bin:$ORIGINAL_PATH"
+        export PATH
+    else
+        PATH="$ORIGINAL_PATH"
+        export PATH
+    fi
     # Redirect every path constant the two functions under test read or
     # write into the disposable fixture root.
     CONFIG_DIR="$FIXTURE_ROOT/etc/anyaicam"
@@ -48,6 +77,7 @@ reset_fixture() {
     VMS_ENV_FILE="$CONFIG_DIR/vms.env"
     QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
     UPDATE_STATE_DIR="$FIXTURE_ROOT/var/lib/anyaicam-update"
+    ROLLBACK_DIR="$UPDATE_STATE_DIR/rollback"
     ANYAICAM_INSTALLER_STAGING_ROOT="$UPDATE_STATE_DIR/installer-staging"
     # Release-driven deploy_vms() constants (installer: make VMS payload
     # release-driven) -- same fixture-redirection pattern as every other
@@ -294,6 +324,38 @@ assert_exit() {
     local actual_exit=0
     ( "$@" ) >/dev/null 2>&1 || actual_exit=$?
     assert_eq "$description" "$expected_exit" "$actual_exit"
+}
+
+skip_test() {
+    local name="$1" reason="$2"
+    SKIP=$((SKIP + 1))
+    echo "SKIP: $name ($reason)"
+}
+
+# Root-owned install operations are redirected to FIXTURE_ROOT. On a
+# non-root run, strip only the ownership flags so copy/mode behavior can be
+# tested safely; actual ownership verification remains root-only.
+install() {
+    if [[ "$EUID" -eq 0 ]]; then
+        command install "$@"
+        return $?
+    fi
+    local -a safe_args=()
+    local owner_option=false
+    while (($#)); do
+        case "$1" in
+            -o|-g) owner_option=true; (($# >= 2)) || return 97; shift 2 ;;
+            *) safe_args+=("$1"); shift ;;
+        esac
+    done
+    if [[ "$owner_option" == true ]]; then
+        local target="${safe_args[-1]}"
+        case "$target" in
+            "$FIXTURE_ROOT"|"$FIXTURE_ROOT"/*) ;;
+            *) echo "rootless install stub refused non-fixture target" >&2; return 97 ;;
+        esac
+    fi
+    command install "${safe_args[@]}"
 }
 
 echo "== detect_install_state() =="
@@ -640,9 +702,19 @@ echo "== install_agent() =="
 #     one assertion.
 reset_fixture
 make_fake_agent_payload
-assert_exit "install_agent succeeds (prereq installed before the wrapped script ran)" 0 install_agent clean
-assert_exit "python3.12-venv was apt-get installed" 0 test -f "$APT_PYTHON_VENV_MARKER"
-assert_exit "the wrapped appliance-agent install.sh ran" 0 test -f "$FAKE_AGENT_INSTALL_MARKER"
+if [[ "$EUID" -eq 0 ]]; then
+    assert_exit "install_agent succeeds (prereq installed before the wrapped script ran)" 0 install_agent clean
+    assert_exit "python3.12-venv was apt-get installed" 0 test -f "$APT_PYTHON_VENV_MARKER"
+    assert_exit "the wrapped appliance-agent install.sh ran" 0 test -f "$FAKE_AGENT_INSTALL_MARKER"
+else
+    # The installed source must be root-owned before any privileged agent
+    # code runs. Do not fake that trust check in a rootless shell harness.
+    local_agent_status=0
+    install_agent clean || local_agent_status=$?
+    assert_eq "rootless install_agent refuses to execute non-root-owned agent source" "1" "$local_agent_status"
+    assert_exit "python3.12-venv was prepared before the root-ownership gate" 0 test -f "$APT_PYTHON_VENV_MARKER"
+    skip_test "the wrapped appliance-agent install.sh ran" "requires a genuinely root-owned installed source tree"
+fi
 
 echo
 echo "== install_mediamtx() =="
@@ -1341,5 +1413,5 @@ assert_exit "install.sh runs the port preflight right after preflight_checks, be
 assert_exit "validate.sh runs the port-ownership check" 0 grep -q 'check "WebRTC media port (UDP 8189) is published by the VMS container and by nothing else" webrtc_port_owned_by_vms' "$INSTALLER_DIR/validate.sh"
 
 echo
-echo "== summary: $PASS passed, $FAIL failed =="
+echo "== summary: $PASS passed, $FAIL failed, $SKIP skipped =="
 [[ "$FAIL" -eq 0 ]]
