@@ -33,7 +33,10 @@ def _seed_appliance(db, appliance_id, cloud_id, credential, camera_id, *, custom
     db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (site_id, customer_id, "Test Site", now))
     db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", (appliance_id, customer_id, site_id, cloud_id, now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", (f"cred-{appliance_id}", appliance_id, password_hash(credential), now))
-    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) VALUES(?,?,?,?,?,?,?,?)", (camera_id, customer_id, site_id, appliance_id, "Camera", camera_number, "configured", now))
+    # Rule delivery is gated by the camera's Smart Motion entitlement/flag.
+    # This test exercises ownership and rule serialization, so seed the
+    # current enabled state explicitly instead of relying on an unset column.
+    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (camera_id, customer_id, site_id, appliance_id, "Camera", camera_number, "configured", 1, now))
 
 
 def _seed_rule(db, rule_id, *, customer_id, site_id, appliance_id, camera_id, rule_type="line_crossing", direction="both", enabled=1, geometry=None, name="Test rule"):
@@ -125,8 +128,8 @@ def test_rules_for_two_cameras_on_the_same_appliance_are_both_scoped_correctly(c
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1", "cam-1", camera_number=1)
             db.execute(
-                "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                ("cam-2", "cust-1", "site-1", "appl-1", "Camera 2", 2, "configured", "2026-09-21T00:00:00"),
+                "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("cam-2", "cust-1", "site-1", "appl-1", "Camera 2", 2, "configured", 1, "2026-09-21T00:00:00"),
             )
             _seed_rule(db, "rule-1", customer_id="cust-1", site_id="site-1", appliance_id="appl-1", camera_id="cam-1")
             _seed_rule(

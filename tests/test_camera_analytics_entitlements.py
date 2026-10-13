@@ -27,8 +27,24 @@ from customer_analytics_panel import (  # noqa: E402
 SCHEMA = """
 CREATE TABLE customers(id TEXT PRIMARY KEY);
 CREATE TABLE sites(id TEXT PRIMARY KEY, customer_id TEXT);
-CREATE TABLE cameras(id TEXT PRIMARY KEY, customer_id TEXT, site_id TEXT, name TEXT);
+CREATE TABLE cameras(
+    id TEXT PRIMARY KEY, customer_id TEXT, site_id TEXT, name TEXT,
+    smart_motion_enabled INTEGER NOT NULL DEFAULT 0,
+    people_counting_enabled INTEGER NOT NULL DEFAULT 0,
+    lpr_enabled INTEGER NOT NULL DEFAULT 0,
+    ppe_enabled INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE analytics_subscriptions(id TEXT PRIMARY KEY, customer_id TEXT, site_id TEXT, analytic_key TEXT, status TEXT, licensed_quantity INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE customer_entitlements(
+    id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, product TEXT NOT NULL,
+    status TEXT NOT NULL, camera_slot_quantity INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE addon_subscriptions(
+    id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, addon_key TEXT NOT NULL,
+    status TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+    stripe_customer_id TEXT, stripe_subscription_id TEXT, stripe_price_id TEXT,
+    created_at TEXT, updated_at TEXT, UNIQUE(customer_id, addon_key)
+);
 CREATE TABLE camera_analytics_entitlements(
     camera_id TEXT NOT NULL, analytic_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -48,7 +64,10 @@ def fresh_db():
 
 def make_cameras(db, n):
     for index in range(1, n + 1):
-        db.execute("INSERT INTO cameras VALUES(?,?,?,?)", (f"cam-{index}", "cust-1", "site-1", f"Camera {index}"))
+        db.execute(
+            "INSERT INTO cameras(id,customer_id,site_id,name) VALUES(?,?,?,?)",
+            (f"cam-{index}", "cust-1", "site-1", f"Camera {index}"),
+        )
     db.commit()
 
 

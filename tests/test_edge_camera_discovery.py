@@ -1,181 +1,99 @@
-import json
-import tempfile
+"""Isolated tests for the appliance-agent's implemented camera scanner.
+
+The scanner lives in ``appliance-agent/anyaicam_agent/discovery.py``. There
+is no ``app.edge.camera_discovery`` package in this release; the cloud VMS
+does not perform LAN discovery. Probe functions are replaced in these tests
+so no network traffic is sent to cameras or other hosts.
+"""
+import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from app.edge.camera_discovery import (
-    CameraDiscoveryService,
-    DiscoveryOptions,
-    _safe_onvif_url,
-    _safe_rtsp_url,
-    parse_ws_discovery,
-    private_network,
-)
-from app.edge.camera_inventory import CameraInventoryStore
-from app.edge.cloud_inventory import CloudInventoryReporter
+ROOT = Path(__file__).resolve().parents[1]
+AGENT_ROOT = ROOT / "appliance-agent"
+sys.path.insert(0, str(AGENT_ROOT))
+
+from anyaicam_agent import discovery  # noqa: E402
 
 
 ONVIF_RESPONSE = b"""<?xml version="1.0"?>
 <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
- xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"
- xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
- <e:Body><d:ProbeMatches><d:ProbeMatch>
-  <a:EndpointReference><a:Address>urn:uuid:camera-one</a:Address></a:EndpointReference>
-  <d:Scopes>onvif://www.onvif.org/name/Front_Door onvif://www.onvif.org/hardware/DS-2CD2043G2</d:Scopes>
-  <d:XAddrs>http://192.168.50.1/onvif/device_service</d:XAddrs>
- </d:ProbeMatch></d:ProbeMatches></e:Body>
-</e:Envelope>"""
-
-
-class FakeResponse:
-    def __init__(self, payload):
-        self.payload = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-    def read(self):
-        return json.dumps(self.payload).encode("utf-8")
+ xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+ <e:Header><a:MessageID>uuid:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa</a:MessageID></e:Header>
+ <e:Body><a:EndpointReference><a:Address>urn:uuid:11111111-2222-4333-8444-555555555555</a:Address>
+ </a:EndpointReference></e:Body></e:Envelope>"""
 
 
 class EdgeCameraDiscoveryTests(unittest.TestCase):
-    def test_discovery_accepts_only_bounded_rfc1918_networks(self):
-        self.assertEqual(str(private_network("192.168.50.0/24")), "192.168.50.0/24")
-        for network in ("8.8.8.0/24", "127.0.0.0/30", "169.254.0.0/24"):
-            with self.subTest(network=network), self.assertRaises(ValueError):
-                private_network(network)
-        with self.assertRaises(ValueError):
-            private_network("10.0.0.0/16")
-
-    def test_onvif_response_exposes_device_identity_and_scopes(self):
-        device = parse_ws_discovery(ONVIF_RESPONSE)
-        self.assertEqual(device["device_uuid"], "urn:uuid:camera-one")
+    def test_endpoint_uuid_uses_device_identity_not_probe_message_id(self):
         self.assertEqual(
-            device["xaddrs"], ["http://192.168.50.1/onvif/device_service"]
+            discovery._endpoint_uuid(ONVIF_RESPONSE.decode("utf-8")),
+            "urn:uuid:11111111-2222-4333-8444-555555555555",
         )
-        self.assertIn("onvif://www.onvif.org/name/Front_Door", device["scopes"])
 
-    def test_scan_combines_onvif_rtsp_vendor_model_and_sanitized_stream_url(self):
-        device = parse_ws_discovery(ONVIF_RESPONSE)
+    def test_invalid_or_nil_endpoint_uuid_is_rejected(self):
+        for value in ("not-a-uuid", "00000000-0000-0000-0000-000000000000"):
+            xml = ONVIF_RESPONSE.decode("utf-8").replace(
+                "11111111-2222-4333-8444-555555555555", value
+            )
+            with self.subTest(value=value):
+                self.assertIsNone(discovery._endpoint_uuid(xml))
 
-        def port_probe(host, _ports, _timeout):
-            return [80, 554] if host == "192.168.50.1" else []
-
-        discovery = CameraDiscoveryService(
-            ws_probe=lambda _timeout: [device],
-            port_probe=port_probe,
-            metadata_probe=lambda _url, _timeout: {
-                "manufacturer": "Hikvision",
-                "model": "DS-2CD2043G2",
-                "stream_urls": ["rtsp://admin:secret@192.168.50.1:554/live"],
-            },
+    def test_scan_uses_onvif_identity_and_scope_metadata_without_network_io(self):
+        scopes = (
+            "onvif://www.onvif.org/name/Front_Door "
+            "onvif://www.onvif.org/manufacturer/Hikvision "
+            "onvif://www.onvif.org/model/DS-2CD2043G2"
         )
-        cameras = discovery.scan(DiscoveryOptions("192.168.50.0/30"))
+        onvif = {
+            "192.168.50.1": {
+                "scopes": scopes,
+                "endpoint": "urn:uuid:11111111-2222-4333-8444-555555555555",
+            }
+        }
+
+        def port(ip, port, _timeout=0.25):
+            return ip == "192.168.50.1" and port == 554
+
+        with (
+            patch.object(discovery, "_onvif_probe", return_value=onvif),
+            patch.object(discovery, "arp_table", return_value={}),
+            patch.object(discovery, "_port", side_effect=port),
+        ):
+            cameras = discovery.scan(["192.168.50.0/30"], max_hosts=8)
 
         self.assertEqual(len(cameras), 1)
         camera = cameras[0]
-        self.assertEqual(camera["name"], "Front Door")
+        self.assertEqual(camera["name"], "Camera 192.168.50.1")
         self.assertEqual(camera["manufacturer"], "Hikvision")
         self.assertEqual(camera["model"], "DS-2CD2043G2")
-        self.assertTrue(camera["onvif"])
-        self.assertTrue(camera["rtsp"])
-        self.assertEqual(camera["stream_urls"], ["rtsp://192.168.50.1:554/live"])
-
-    def test_rtsp_url_sanitizer_never_persists_userinfo(self):
         self.assertEqual(
-            _safe_rtsp_url("rtsp://admin:password@192.168.1.5:554/live?profile=1"),
-            "rtsp://192.168.1.5:554/live?profile=1",
+            camera["device_key"],
+            "urn:uuid:11111111-2222-4333-8444-555555555555",
         )
-        self.assertIsNone(_safe_rtsp_url("https://192.168.1.5/live"))
-        self.assertEqual(
-            _safe_onvif_url("http://admin:password@192.168.1.5/onvif/device_service"),
-            "http://192.168.1.5/onvif/device_service",
-        )
+        self.assertTrue(camera["onvif_support"])
+        self.assertTrue(camera["rtsp_support"])
+        self.assertEqual(camera["rtsp_port"], 554)
 
-    def test_inventory_persists_discovery_and_marks_missing_camera_offline(self):
-        camera = {
-            "id": "camera-one",
-            "name": "Front Door",
-            "ip_address": "192.168.50.1",
-            "manufacturer": "Hikvision",
-            "model": "DS-2CD2043G2",
-            "onvif": True,
-            "rtsp": True,
-            "stream_urls": ["rtsp://192.168.50.1/live"],
-            "password": "must-not-persist",
-            "camera_token": "must-also-not-persist",
-        }
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "camera_inventory.json"
-            store = CameraInventoryStore(path)
-            first = store.reconcile("192.168.50.0/24", [camera])
-            second = store.reconcile("192.168.50.0/24", [])
+    def test_scan_falls_back_to_hashed_mac_identity_and_detects_alternate_rtsp_port(self):
+        with (
+            patch.object(discovery, "_onvif_probe", return_value={}),
+            patch.object(discovery, "arp_table", return_value={"192.168.50.1": "AA:BB:CC:DD:EE:FF"}),
+            patch.object(
+                discovery,
+                "_port",
+                side_effect=lambda ip, port, _timeout=0.25: ip == "192.168.50.1" and port == 8554,
+            ),
+        ):
+            cameras = discovery.scan(["192.168.50.0/30"], max_hosts=8)
 
-            self.assertTrue(path.exists())
-            self.assertEqual(first["cameras"][0]["status"], "online")
-            self.assertEqual(second["cameras"][0]["status"], "offline")
-            self.assertNotIn("must-not-persist", path.read_text(encoding="utf-8"))
-            self.assertNotIn("must-also-not-persist", path.read_text(encoding="utf-8"))
-
-    def test_cloud_report_uses_existing_endpoint_without_private_camera_data(self):
-        captured = {}
-
-        def opener(request, timeout):
-            captured["url"] = request.full_url
-            captured["headers"] = dict(request.header_items())
-            captured["payload"] = json.loads(request.data.decode("utf-8"))
-            captured["timeout"] = timeout
-            return FakeResponse({"status": "accepted", "credentials_received": False})
-
-        reporter = CloudInventoryReporter(
-            "https://cloud.example.test",
-            "appliance-one",
-            "registration-credential",
-            opener=opener,
-        )
-        result = reporter.report({
-            "cameras": [{
-                "id": "camera-one",
-                "name": "Front Door",
-                "status": "online",
-                "manufacturer": "Hikvision",
-                "model": "DS-2CD2043G2",
-                "onvif": True,
-                "rtsp": True,
-                "ip_address": "192.168.50.1",
-                "stream_urls": ["rtsp://192.168.50.1/live"],
-            }]
-        })
-
-        self.assertEqual(captured["url"], "https://cloud.example.test/api/appliance/cameras")
-        self.assertEqual(result["status"], "reported")
-        serialized = json.dumps(captured["payload"])
-        self.assertNotIn("192.168.50.1", serialized)
-        self.assertNotIn("stream_urls", serialized)
-        self.assertNotIn("credential", serialized)
-        self.assertEqual(captured["payload"]["cameras"][0]["protocols"], ["onvif", "rtsp"])
-
-    def test_unregistered_appliance_skips_cloud_report(self):
-        result = CloudInventoryReporter("", "", "").report({"cameras": []})
-        self.assertEqual(result["status"], "skipped")
-
-
-class EdgeDiscoveryIntegrationSourceTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.root = Path(__file__).resolve().parents[1]
-        cls.main = (cls.root / "app" / "main.py").read_text(encoding="utf-8")
-        cls.routes = (cls.root / "app" / "edge" / "routes.py").read_text(encoding="utf-8")
-
-    def test_edge_routes_are_registered_without_cloud_api_changes(self):
-        self.assertIn("register_edge_discovery_routes(", self.main)
-        self.assertIn('runtime_role=RUNTIME_ROLE', self.main)
-        self.assertIn('@app.post("/api/edge/cameras/discover")', self.routes)
-        self.assertIn('@app.get("/api/edge/cameras/inventory")', self.routes)
-        self.assertIn('@app.post("/api/edge/cameras/inventory/report")', self.routes)
+        self.assertEqual(len(cameras), 1)
+        camera = cameras[0]
+        self.assertTrue(camera["rtsp_support"])
+        self.assertEqual(camera["rtsp_port"], 8554)
+        self.assertTrue(camera["device_key"].startswith("mac-"))
+        self.assertNotIn("AA:BB:CC:DD:EE:FF", camera["device_key"])
 
 
 if __name__ == "__main__":

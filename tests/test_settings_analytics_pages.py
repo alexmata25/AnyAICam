@@ -100,6 +100,7 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
             escape=escape,
             current_user=lambda _request: {"role": "administrator"},
             has_permission=lambda _user, _permission: True,
+            _customer_playback_cameras=lambda _request: None,
             record_audit=lambda *_args: None,
             page_shell=lambda _title, _active, content, _scripts="": content,
         )
@@ -132,6 +133,7 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
             get_camera_numbers=lambda: [1, 2, 3, 4],
             current_user=lambda _request: {"role": "administrator"},
             has_permission=lambda _user, _permission: True,
+            _customer_playback_cameras=lambda _request: None,
             permission_denied_page=lambda _title, _active, _permission: "denied",
             page_shell=lambda _title, _active, content, _scripts="": content,
         )

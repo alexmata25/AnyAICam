@@ -372,6 +372,11 @@ def test_all_analytics_off_skips_model_load_and_inference_without_touching_recor
     loaded, inferred = [], []
     monkeypatch.setattr(main, "get_yolo_model", lambda: loaded.append(True))
     monkeypatch.setattr(main, "detect_objects_frame", lambda camera: inferred.append(camera))
+    # Production startup creates per-camera detector state in
+    # reconcile_camera_workers() before scheduling ai_person_detector().
+    # The direct-generator test bypasses that lifecycle, so seed the same
+    # state with the production factory rather than relying on test order.
+    monkeypatch.setitem(main.ai_detection_state, 1, main._new_ai_state())
     monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda camera: {
         "smart_motion_enabled": False, "people_counting_enabled": False, "lpr_enabled": False,
         "ppe_enabled": False, "facial_recognition_enabled": False,

@@ -95,11 +95,16 @@ class UpgradeCardContentTests(unittest.TestCase):
 
 class EventTypesForAnalyticTests(unittest.TestCase):
     def test_smart_motion_covers_motion_person_and_vehicle(self):
-        self.assertEqual(event_types_for_analytic("smart_motion"), ("motion", "person", "vehicle"))
+        self.assertEqual(event_types_for_analytic("smart_motion"), (
+            "motion", "smart_motion", "person", "vehicle", "car", "truck", "bus",
+            "motorcycle", "bicycle", "intrusion", "line_crossing", "loitering",
+        ))
 
-    def test_lpr_and_people_counting_and_ppe_are_their_own_single_type(self):
-        self.assertEqual(event_types_for_analytic("lpr"), ("lpr",))
-        self.assertEqual(event_types_for_analytic("people_counting"), ("people_counting",))
+    def test_lpr_and_people_counting_include_stored_event_aliases(self):
+        self.assertEqual(event_types_for_analytic("lpr"), ("lpr", "plate"))
+        self.assertEqual(event_types_for_analytic("people_counting"), (
+            "people_counting", "people_counting_in", "people_counting_out",
+        ))
         self.assertEqual(event_types_for_analytic("ppe"), ("ppe",))
 
     def test_unknown_analytic_raises(self):
@@ -175,7 +180,7 @@ class FocusedLiveViewWiringTests(unittest.TestCase):
     def test_disabled_analytics_render_an_upgrade_card_not_a_blank_panel(self):
         self.assertIn("if(!analyticsByKey[key].enabled){{renderUpgradeCard(key);return}}", LIVE_VIEW_SOURCE)
         self.assertIn("function renderUpgradeCard(key){{", LIVE_VIEW_SOURCE)
-        for cta in ("Request Upgrade", "Add to This Camera", "Learn More"):
+        for cta in ("View plans", "Add to This Camera"):
             self.assertIn(cta, LIVE_VIEW_SOURCE)
 
     def test_video_element_is_not_touched_by_analytics_switching(self):
@@ -209,8 +214,14 @@ class FocusedLiveViewWiringTests(unittest.TestCase):
 
     def test_analytics_summary_route_never_returns_more_than_the_camera_scoped_query(self):
         start = LIVE_VIEW_SOURCE.index("def customer_camera_analytics_summary")
-        body = LIVE_VIEW_SOURCE[start:start + 1600]
-        self.assertIn("WHERE camera_id=? AND customer_id=?", body)
+        end = LIVE_VIEW_SOURCE.find("\n    @app.", start)
+        body = LIVE_VIEW_SOURCE[start:end if end >= 0 else None]
+        # The route performs the authenticated customer/camera permission
+        # check first, then scopes the event query with the explicit alias.
+        self.assertIn("camera = _authorized_camera(db, camera_id, identity)", body)
+        self.assertIn("de.camera_id=?", body)
+        self.assertIn("de.customer_id=?", body)
+        self.assertIn("(camera_id, identity['customer_id']", body)
 
 
 if __name__ == "__main__":
