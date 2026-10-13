@@ -35,9 +35,11 @@ SKIP=0
 # sourcing installer modules so a privileged run cannot read or mutate host
 # state or silently skip a test. Tests that need an override set it explicitly
 # after reset_fixture().
+inherited_anyaicam_vars="$(compgen -e | grep '^ANYAICAM_' || true)"
 while IFS= read -r inherited_name; do
     [[ -n "$inherited_name" ]] && unset "$inherited_name"
-done < <(compgen -e | grep '^ANYAICAM_' || true)
+done <<< "$inherited_anyaicam_vars"
+unset inherited_anyaicam_vars
 
 # --- fixture root -----------------------------------------------------
 FIXTURE_ROOT="$(TMPDIR=/tmp mktemp -d)"
