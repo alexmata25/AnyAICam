@@ -82,6 +82,24 @@ class FakeHost:
 
 class ApplierTestCase(unittest.TestCase):
     def setUp(self):
+        # The disposable release-test VM deliberately has no appliance
+        # service account installed. Root-run tests must not create a host
+        # account just to exercise ownership checks: map the appliance name
+        # to the synthetic UID/GID used by the fixture files (1000) for this
+        # test process only.
+        if os.name == "posix":
+            import pwd
+            real_getpwnam = pwd.getpwnam
+
+            def fixture_getpwnam(name):
+                if name == "anyaicam":
+                    return SimpleNamespace(pw_name="anyaicam", pw_uid=1000, pw_gid=1000)
+                return real_getpwnam(name)
+
+            self._service_account_lookup = mock.patch("pwd.getpwnam", side_effect=fixture_getpwnam)
+            self._service_account_lookup.start()
+            self.addCleanup(self._service_account_lookup.stop)
+
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.paths = ar.Paths(staged=self.tmp / "var/lib/anyaicam/updates/staged", root_state=self.tmp / "var/lib/anyaicam-update",
@@ -111,6 +129,11 @@ class ApplierTestCase(unittest.TestCase):
         self.host = FakeHost(self.paths)
         self.host.run(["systemctl", "start", "anyaicam-vms.service"], 1)  # release 1.1.0 is running
         self.host.calls.clear()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX account lookup")
+    def test_service_account_lookup_is_synthetic_and_does_not_require_host_user(self):
+        self.assertEqual(ar._agent_uid(), 1000)
+        self.assertEqual(ar._named_owner("anyaicam"), (1000, 1000) if os.geteuid() == 0 else None)
 
     def _install_live(self, version, build, migrations=MIGRATIONS_V1):
         files = release_files(version, build, migrations=migrations)

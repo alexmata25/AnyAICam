@@ -3,10 +3,27 @@ installer, the agent installer and rollback.sh use for files in
 /etc/anyaicam (system/apply_release.py agent_file_main and friends)."""
 import io
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from test_software_update_root_applier import ar
+
+
+@pytest.fixture
+def synthetic_service_account(monkeypatch):
+    """Use a numeric test principal instead of requiring a host account."""
+    if os.name != "posix":
+        return
+    import pwd
+    real_getpwnam = pwd.getpwnam
+
+    def fixture_getpwnam(name):
+        if name == "anyaicam":
+            return SimpleNamespace(pw_name="anyaicam", pw_uid=1000, pw_gid=1000)
+        return real_getpwnam(name)
+
+    monkeypatch.setattr(pwd, "getpwnam", fixture_getpwnam)
 
 
 def request(*lines, content=None):
@@ -23,7 +40,7 @@ def symlink_or_skip(target, link):
         pytest.skip("symlinks unavailable here")
 
 
-def test_update_env_adds_defaults_only_when_absent_and_overrides_in_place(tmp_path):
+def test_update_env_adds_defaults_only_when_absent_and_overrides_in_place(tmp_path, synthetic_service_account):
     env = tmp_path / "vms.env"
     env.write_text("# comment\nKEEP=1\nANYAICAM_VMS_COMMIT=old\nANYAICAM_VMS_COMMIT=dup\nGONE=x\n")
     code = ar.agent_file_main(request("op update_env", f"path {env}", "mode 0640", "owner anyaicam",
@@ -32,7 +49,7 @@ def test_update_env_adds_defaults_only_when_absent_and_overrides_in_place(tmp_pa
     assert env.read_text().splitlines() == ["# comment", "KEEP=1", "ANYAICAM_VMS_COMMIT=abc", "NEW=3"]
 
 
-def test_a_missing_env_file_starts_from_the_template(tmp_path):
+def test_a_missing_env_file_starts_from_the_template(tmp_path, synthetic_service_account):
     template = tmp_path / "vms.env.template"
     template.write_text("FROM_TEMPLATE=yes\n")
     env = tmp_path / "vms.env"
@@ -40,7 +57,7 @@ def test_a_missing_env_file_starts_from_the_template(tmp_path):
     assert env.read_text() == "FROM_TEMPLATE=yes\nA=1\n"
 
 
-def test_write_if_missing_never_replaces_an_existing_file(tmp_path):
+def test_write_if_missing_never_replaces_an_existing_file(tmp_path, synthetic_service_account):
     identity = tmp_path / "appliance_identity.json"
     assert ar.agent_file_main(request("op write", f"path {identity}", "mode 0600", "if_missing", content='{"a": 1}\n')) == 0
     assert ar.agent_file_main(request("op write", f"path {identity}", "mode 0600", "if_missing", content='{"b": 2}\n')) == 0

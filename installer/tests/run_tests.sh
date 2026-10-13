@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local, non-destructive, non-root test harness for the installer's
+# Local, non-destructive test harness for the installer's
 # decision logic: detect_install_state() and storage_preflight().
 #
 # This sources the REAL production functions from ../03-detect-install.sh,
@@ -9,10 +9,9 @@
 # tmpdir via the same path constants install.sh already defines
 # ($CONFIG_DIR, $VMS_INSTALL_ROOT, $VERSION_MARKER, $VMS_SERVICE_FILE)
 # -- nothing under the real /etc, /opt, or /var is read or written.
-# `id`, `docker`, and `df` (the external commands these functions call)
-# are shadowed with shell functions of the same name so each scenario
-# can fake their output without root and without a real Docker/systemd
-# present.
+# External service/package commands are stubbed. Filesystem writes and
+# ownership changes are constrained to the disposable fixture, including
+# when the harness is run as root.
 #
 # Usage: bash installer/tests/run_tests.sh
 set -uo pipefail
@@ -35,12 +34,11 @@ reset_fixture() {
     rm -rf "$FIXTURE_ROOT"
     mkdir -p "$FIXTURE_ROOT"
     export FIXTURE_ROOT
-    if [[ "$EUID" -ne 0 ]]; then
-        # Simulate ownership changes only for disposable fixture paths. The
-        # actual root-ownership checks remain in the root-required test pass.
-        local rootless_bin="$FIXTURE_ROOT/rootless-bin"
-        mkdir -p "$rootless_bin"
-        cat > "$rootless_bin/chown" <<'ROOTLESS_CHOWN'
+    # Guard chown even in a root run: it may mutate fixture paths only.
+    # Non-root runs validate the same target boundary but cannot change owner.
+    local guarded_bin="$FIXTURE_ROOT/guarded-bin"
+    mkdir -p "$guarded_bin"
+    cat > "$guarded_bin/chown" <<'GUARDED_CHOWN'
 #!/usr/bin/env bash
 set -euo pipefail
 owner_seen=0
@@ -49,18 +47,18 @@ for arg in "$@"; do
     if [[ "$owner_seen" -eq 0 ]]; then owner_seen=1; continue; fi
     case "$arg" in
         "$FIXTURE_ROOT"|"$FIXTURE_ROOT"/*) ;;
-        *) echo "rootless chown stub refused non-fixture target" >&2; exit 97 ;;
+        *) echo "chown guard refused non-fixture target" >&2; exit 97 ;;
     esac
 done
 [[ "$owner_seen" -eq 1 ]]
-ROOTLESS_CHOWN
-        chmod 0755 "$rootless_bin/chown"
-        PATH="$rootless_bin:$ORIGINAL_PATH"
-        export PATH
-    else
-        PATH="$ORIGINAL_PATH"
-        export PATH
-    fi
+if [[ "$EUID" -eq 0 ]]; then
+    exec /usr/bin/chown "$@"
+fi
+GUARDED_CHOWN
+    chmod 0755 "$guarded_bin/chown"
+    PATH="$guarded_bin:$ORIGINAL_PATH"
+    export PATH
+
     # Redirect every path constant the two functions under test read or
     # write into the disposable fixture root.
     CONFIG_DIR="$FIXTURE_ROOT/etc/anyaicam"
@@ -213,7 +211,8 @@ docker() {
     if [[ "$1" == "image" && "$2" == "rm" ]]; then
         return 0
     fi
-    command docker "$@"
+    echo "test harness refused unmocked docker command: $*" >&2
+    return 97
 }
 # The shell harness uses a fake docker function, so keep calls routed
 # through the function. The Python resilience tests exercise GNU timeout
@@ -243,7 +242,8 @@ apt-get() {
         done
         return 0
     fi
-    command apt-get "$@"
+    echo "test harness refused unmocked apt-get command: $*" >&2
+    return 97
 }
 userdel() {
     # run_uninstall()'s --purge-all branch only needs this to not fail;
@@ -336,25 +336,28 @@ skip_test() {
 # non-root run, strip only the ownership flags so copy/mode behavior can be
 # tested safely; actual ownership verification remains root-only.
 install() {
+    local -a safe_args=()
     if [[ "$EUID" -eq 0 ]]; then
+        local -a root_args=("$@")
+        local target="${root_args[-1]}"
+        case "$target" in
+            "$FIXTURE_ROOT"|"$FIXTURE_ROOT"/*) ;;
+            *) echo "install guard refused non-fixture target" >&2; return 97 ;;
+        esac
         command install "$@"
         return $?
     fi
-    local -a safe_args=()
-    local owner_option=false
     while (($#)); do
         case "$1" in
-            -o|-g) owner_option=true; (($# >= 2)) || return 97; shift 2 ;;
+            -o|-g) (($# >= 2)) || return 97; shift 2 ;;
             *) safe_args+=("$1"); shift ;;
         esac
     done
-    if [[ "$owner_option" == true ]]; then
-        local target="${safe_args[-1]}"
-        case "$target" in
-            "$FIXTURE_ROOT"|"$FIXTURE_ROOT"/*) ;;
-            *) echo "rootless install stub refused non-fixture target" >&2; return 97 ;;
-        esac
-    fi
+    local target="${safe_args[-1]}"
+    case "$target" in
+        "$FIXTURE_ROOT"|"$FIXTURE_ROOT"/*) ;;
+        *) echo "install guard refused non-fixture target" >&2; return 97 ;;
+    esac
     command install "${safe_args[@]}"
 }
 
