@@ -354,3 +354,37 @@ def test_viewing_the_dashboard_does_not_alter_stripe_entitlements(http_client, d
     check = sqlite3.connect(db_path)
     row = check.execute("SELECT camera_slot_quantity, status FROM customer_entitlements WHERE customer_id='cust-1'").fetchone()
     assert row == (8, "active")
+
+
+# ======================================================= Add camera from free slots
+#
+# 1.2.6 customer acceptance (2026-10-14, real edge): after the owner removed
+# their only camera on the Cameras (Live) tab, /customer-live redirected here
+# and the free slot showed "Waiting for appliance discovery" with no way to
+# add a camera again.
+
+
+def test_owner_with_a_free_slot_gets_add_camera_to_the_discovery_step(http_client, db_path):
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    _seed_activated_appliance(conn)
+    _seed_camera_slot_entitlement(conn, camera_slot_quantity=1)
+
+    response = http_client.get("/customer-account", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert 'id="customer-account-add-camera"' in response.text
+    assert 'href="/customer/setup?step=4&amp;appliance=appl-1"' in response.text
+    assert response.text.count("Waiting for appliance discovery") == 1  # slots render unchanged
+
+
+def test_no_add_camera_when_every_slot_is_used_or_for_a_viewer(http_client, db_path):
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    _seed_activated_appliance(conn)
+    _seed_camera_slot_entitlement(conn, camera_slot_quantity=1)
+    _seed_camera(conn, "real-1", camera_number=1, name="Front Door", status="configured", device_key="urn:uuid:real-device-1")
+
+    full = http_client.get("/customer-account", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert full.status_code == 200 and "customer-account-add-camera" not in full.text
+    viewer = http_client.get("/customer-account", cookies={partner_portal.SESSION_COOKIE: _viewer_cookie()})
+    assert "customer-account-add-camera" not in viewer.text
