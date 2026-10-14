@@ -61,7 +61,7 @@ def test_a_finished_local_mkv_recording_is_served_as_playable_mp4(playback):
     response = client.get(f"/api/customer/recordings/cam-1/{rec}/media")
     assert response.status_code == 200
     assert response.headers["content-type"] == "video/mp4"
-    out = recordings / "_media_cache" / f"{rec}.mp4"
+    out = next((recordings / "_media_cache").glob(f"local-{rec}-*.mp4"))
     probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=format_name:stream=codec_name", "-of", "csv=p=0", str(out)],
                            capture_output=True, text=True).stdout
     assert "mp4" in probe and "h264" in probe
@@ -73,7 +73,7 @@ def test_a_segment_still_being_written_keeps_the_local_passthrough(playback):
     rec = _segment(recordings, db_path, "camera1_2026-10-14_10-05-00.mkv", age_seconds=0)
     response = client.get(f"/api/customer/recordings/cam-1/{rec}/media")
     assert response.status_code == 302 and response.headers["location"].endswith(f"/{rec}/local")
-    assert not (recordings / "_media_cache" / f"{rec}.mp4").exists()
+    assert not list((recordings / "_media_cache").glob(f"local-{rec}-*.mp4"))
 
 
 def test_another_cameras_recording_is_still_refused(playback):
@@ -91,3 +91,51 @@ def test_removing_a_camera_is_refused_on_the_appliance(playback, monkeypatch):
     client.cookies.set("anyaicam_csrf", csrf)
     response = client.delete("/api/customer/cameras/cam-1", headers={"X-CSRF-Token": csrf})
     assert response.status_code == 409 and "AnyAiCam portal" in response.json()["detail"]  # never a local-only removal
+
+
+
+def test_remux_is_bounded_and_busy_requests_get_503(playback, monkeypatch):
+    import threading
+    client, db_path, recordings = playback
+    rec = _segment(recordings, db_path, "camera1_2026-10-14_10-10-00.mkv", age_seconds=600)
+    monkeypatch.setattr(main, "LOCAL_RECORDING_REMUX_SLOTS", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(main, "LOCAL_RECORDING_REMUX_WAIT_SECONDS", 0.1)
+    main.LOCAL_RECORDING_REMUX_SLOTS.acquire()  # another remux is running
+    try:
+        busy = client.get(f"/api/customer/recordings/cam-1/{rec}/media")
+        assert busy.status_code == 503 and busy.headers.get("retry-after") == "5"
+    finally:
+        main.LOCAL_RECORDING_REMUX_SLOTS.release()
+    assert client.get(f"/api/customer/recordings/cam-1/{rec}/media").status_code == 200
+
+
+def test_a_writer_that_resumes_never_leaves_a_stale_cached_mp4(playback):
+    client, db_path, recordings = playback
+    name = "camera1_2026-10-14_10-20-00.mkv"
+    rec = _segment(recordings, db_path, name, age_seconds=600)
+    assert client.get(f"/api/customer/recordings/cam-1/{rec}/media").status_code == 200
+    first = sorted(p.name for p in (recordings / "_media_cache").glob("local-*.mp4"))
+    source = recordings / "camera1" / name  # the writer resumed: the file changed size and mtime
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10", "-t", "4",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)], check=True)
+    old = time.time() - 600
+    os.utime(source, (old, old))
+    assert client.get(f"/api/customer/recordings/cam-1/{rec}/media").status_code == 200
+    second = sorted(p.name for p in (recordings / "_media_cache").glob("local-*.mp4"))
+    assert len(second) == 2 and first[0] in second  # a new, matching copy; never the stale one for the new source
+
+
+def test_all_cloud_account_camera_and_appliance_changes_are_refused_on_the_appliance(playback, monkeypatch):
+    client, _, _ = playback
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
+    from token_security import sign
+    csrf = sign("csrf", 28800)
+    client.cookies.set("anyaicam_csrf", csrf)
+    h = {"X-CSRF-Token": csrf}
+    for method, path in (("post", "/api/customer/appliances/link"), ("post", "/api/customer/appliances/provision"),
+                         ("post", "/api/customer/appliances/appl-1/scan"), ("post", "/api/customer/appliances/appl-1/activation-token/recover"),
+                         ("post", "/api/customer/cameras/provision"), ("put", "/api/customer/cameras"),
+                         ("delete", "/api/customer/cameras/cam-1"), ("put", "/api/customer/cameras/1/name")):
+        kwargs = {"headers": h} if method == "delete" else {"headers": h, "json": {}}
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 409, (method, path, response.status_code, response.text[:120])

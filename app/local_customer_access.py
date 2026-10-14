@@ -30,11 +30,14 @@ This module reuses the existing appliance identity contract
   (ANYAICAM_OFFLINE_GRACE_HOURS, the identity contract's existing setting).
 
 * Revocation: every verified manifest (periodic worker, online sign-in)
-  revokes the appliance password and open sessions of a user whose customer
-  grant was revoked, whose account was disabled, or whose authorization
-  version changed (a grant change or a cloud password reset). A re-claim to a
-  different customer invalidates it by the customer binding. The owner can
-  turn it off; setting it again replaces it.
+  revokes the appliance password AND every open customer session (with or
+  without an appliance password) of a user whose customer grant was revoked,
+  whose account was disabled, or whose authorization version changed (a grant
+  change, a cloud password reset or change). A verified manifest for another
+  customer, or the cloud answering that it no longer knows this appliance, is
+  authoritative: all local customer access is revoked (never treated as an
+  outage). The owner can turn it off; setting it again replaces it. Revoked
+  hashes are overwritten.
 
 Scope (conservative, see the acceptance report): only the account owner
 (customer_owner) gets local access. Household viewers' per-camera
@@ -70,6 +73,12 @@ OFFLINE_REFUSED = ("AnyAiCam can't be reached right now, and the email or applia
 
 class CloudUnavailable(Exception):
     """The cloud could not be reached (or answered with a server error)."""
+
+
+class Reassigned(Exception):
+    """A VERIFIED manifest says this appliance now belongs to another customer
+    (or the cloud no longer knows it): authoritative, so local customer access
+    is revoked -- never treated like an outage."""
 
 
 class AccessDenied(Exception):
@@ -115,6 +124,8 @@ def _request(method: str, path: str, identity: dict, payload: dict | None = None
     except urllib.error.HTTPError as error:
         if error.code >= 500:
             raise CloudUnavailable(f"HTTP {error.code}") from error
+        if error.code in (404, 410):
+            raise Reassigned(f"HTTP {error.code}") from error
         raise AccessDenied(403, "This appliance is not authorized by AnyAiCam right now.", "appliance_rejected") from error
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
         raise CloudUnavailable(type(error).__name__) from error
@@ -171,7 +182,7 @@ def fetch_verified_manifest(identity: dict) -> dict:
         logger.warning("local_customer_access.manifest_rejected error=%s", error)
         raise CloudUnavailable("manifest rejected") from error
     if (manifest.get("appliance") or {}).get("customer_id") != identity.get("customer_id"):
-        raise CloudUnavailable("manifest is for a different customer")
+        raise Reassigned("verified manifest is for a different customer")
     return manifest
 
 
@@ -203,14 +214,27 @@ def _revoke(user_ids: list[str], reason: str) -> int:
     from partner_db import connection
     now = datetime.now().isoformat()
     marks = ",".join("?" for _ in user_ids)
+    from partner_db import password_hash
     with connection() as db:
-        changed = db.execute(f"UPDATE local_customer_credentials SET revoked_at=?,revoked_reason=? WHERE revoked_at IS NULL AND user_id IN ({marks})",
-                             (now, reason, *user_ids)).rowcount
+        # The hash is overwritten, not kept: a revoked appliance password is gone.
+        changed = db.execute(f"UPDATE local_customer_credentials SET revoked_at=?,revoked_reason=?,password_hash=? "
+                             f"WHERE revoked_at IS NULL AND user_id IN ({marks})",
+                             (now, reason, password_hash(secrets.token_urlsafe(32)), *user_ids)).rowcount
         db.execute(f"UPDATE user_sessions SET revoked_at=? WHERE revoked_at IS NULL AND user_id IN ({marks})", (now, *user_ids))
     _disable_local_accounts(user_ids)
     if changed:
         logger.warning("local_customer_access.revoked count=%s reason=%s", changed, reason)
     return changed
+
+
+def revoke_all(reason: str) -> int:
+    """Every local customer credential, customer session and cached account."""
+    from partner_db import connection
+    with connection() as db:
+        users = {r["user_id"] for r in db.execute("SELECT user_id FROM local_customer_credentials WHERE revoked_at IS NULL")}
+        users |= {r["user_id"] for r in db.execute("SELECT DISTINCT user_id FROM user_sessions WHERE revoked_at IS NULL "
+                                                   "AND role IN ('customer_owner','customer_viewer') AND user_id IS NOT NULL")}
+    return _revoke(sorted(users), reason) if users else 0
 
 
 def _mark_verified(user_id: str, authorization_version: int) -> None:
@@ -258,7 +282,17 @@ def reconcile(manifest: dict, identity: dict) -> dict:
     for r in rows:
         if r["user_id"] not in stale:
             _mark_verified(r["user_id"], r["authorization_version"])
-    return {"revoked": revoked, "confirmed": len(rows) - len(stale)}
+    # Signed-in customers without an appliance password too: every open
+    # customer session must still match the manifest (grant, account, version).
+    with connection() as db:
+        sessions = [dict(r) for r in db.execute(
+            "SELECT DISTINCT user_id,authorization_version_at_login AS v FROM user_sessions WHERE revoked_at IS NULL "
+            "AND role IN ('customer_owner','customer_viewer') AND user_id IS NOT NULL")]
+    dropped = sorted({x["user_id"] for x in sessions if x["v"] is None or not authorized_in_manifest(
+        manifest, user_id=x["user_id"], authorization_version=int(x["v"]), customer_id=identity.get("customer_id"))} - set(stale))
+    if dropped:
+        _revoke(dropped, "no_longer_authorized")
+    return {"revoked": revoked, "confirmed": len(rows) - len(stale), "sessions_revoked_for": len(dropped)}
 
 
 # ------------------------------------------------------------------ local account cache
@@ -310,13 +344,17 @@ def sign_in(email: str, password: str) -> dict:
     email = email.strip().lower()
     try:
         assertion = delegated_authenticate(email, password, identity)
+    except Reassigned:
+        revoke_all("appliance_reassigned")
+        raise AccessDenied(403, "This appliance is no longer linked to this AnyAiCam account.", "appliance_reassigned")
     except CloudUnavailable:
         credential = _row(email=email)
-        if (_usable(credential, identity) and verify_password(password, credential["password_hash"])
-                and _within_grace(credential.get("last_verified_at"))):
+        usable = _usable(credential, identity)
+        # Always exactly one password check, so timing does not reveal accounts.
+        matches = verify_password(password, credential["password_hash"] if usable else _dummy_hash())
+        if usable and matches and _within_grace(credential.get("last_verified_at")):
             return _result(credential["user_id"], email, identity, credential["authorization_version"], "offline")
-        if (_usable(credential, identity) and verify_password(password, credential["password_hash"])
-                and not _within_grace(credential.get("last_verified_at"))):
+        if usable and matches and not _within_grace(credential.get("last_verified_at")):
             raise AccessDenied(503, "This appliance has not been able to reach AnyAiCam for too long to allow offline sign-in. "
                                     "Reconnect it to the internet and try again.", "offline_grace_expired")
         # One answer for every other offline failure (unknown email, no appliance
@@ -332,6 +370,9 @@ def sign_in(email: str, password: str) -> dict:
             raise
         try:
             manifest = fetch_verified_manifest(identity)
+        except Reassigned:
+            revoke_all("appliance_reassigned")
+            raise AccessDenied(403, "This appliance is no longer linked to this AnyAiCam account.", "appliance_reassigned")
         except CloudUnavailable:
             if _within_grace(credential.get("last_verified_at")):
                 return _result(credential["user_id"], email, identity, credential["authorization_version"], "appliance_password")
@@ -346,6 +387,16 @@ def sign_in(email: str, password: str) -> dict:
     else:
         _mark_verified(assertion["user_id"], assertion["authorization_version"])
     return _result(assertion["user_id"], email, identity, assertion["authorization_version"], "online")
+
+
+_DUMMY_HASH: list[str] = []
+
+
+def _dummy_hash() -> str:
+    from partner_db import password_hash
+    if not _DUMMY_HASH:
+        _DUMMY_HASH.append(password_hash(secrets.token_urlsafe(32)))
+    return _DUMMY_HASH[0]
 
 
 def _result(user_id: str, email: str, identity: dict, authorization_version: int, mode: str) -> dict:
@@ -372,6 +423,9 @@ def enroll(session: dict, cloud_password: str, new_password: str, *, user_id: st
     except CloudUnavailable as error:
         raise AccessDenied(503, "Setting an appliance password needs the internet: reconnect the appliance and try again.",
                            "cloud_unavailable") from error
+    except Reassigned as error:
+        revoke_all("appliance_reassigned")
+        raise AccessDenied(403, "This appliance is no longer linked to this AnyAiCam account.", "appliance_reassigned") from error
     if assertion["user_id"] != user_id:
         raise AccessDenied(403, "Sign in again and retry.", "session_mismatch")
     now = datetime.now().isoformat()
@@ -389,10 +443,11 @@ def disable(session: dict, *, user_id: str) -> dict:
     identity = appliance_identity()
     if not identity or session.get("role") not in LOCAL_ROLES or session.get("customer_id") != identity.get("customer_id"):
         raise AccessDenied(403, "Only the owner of this appliance can change appliance sign-in.", "not_owner")
-    from partner_db import connection
+    from partner_db import connection, password_hash
     with connection() as db:
-        changed = db.execute("UPDATE local_customer_credentials SET revoked_at=?,revoked_reason='turned_off_by_owner' "
-                             "WHERE user_id=? AND revoked_at IS NULL", (datetime.now().isoformat(), user_id)).rowcount
+        changed = db.execute("UPDATE local_customer_credentials SET revoked_at=?,revoked_reason='turned_off_by_owner',password_hash=? "
+                             "WHERE user_id=? AND revoked_at IS NULL",
+                             (datetime.now().isoformat(), password_hash(secrets.token_urlsafe(32)), user_id)).rowcount
     return {"status": "disabled" if changed else "not_enrolled"}
 
 
@@ -413,22 +468,19 @@ async def reconcile_worker() -> None:
         await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
         try:
             identity = appliance_identity()
-            if identity and _row_count():
+            if identity:  # also with no appliance password: online customer sessions are reconciled too
                 manifest = await asyncio.to_thread(fetch_verified_manifest, identity)
                 result = await asyncio.to_thread(reconcile, manifest, identity)
-                logger.info("local_customer_access.reconciled revoked=%s confirmed=%s", result["revoked"], result["confirmed"])
+                logger.info("local_customer_access.reconciled %s", result)
+        except Reassigned as error:
+            revoked = await asyncio.to_thread(revoke_all, "appliance_reassigned")
+            logger.warning("local_customer_access.appliance_reassigned reason=%s revoked=%s", error, revoked)
         except CloudUnavailable as error:
             logger.info("local_customer_access.reconcile_skipped reason=%s", error)
         except AccessDenied as error:
             logger.warning("local_customer_access.reconcile_refused reason=%s", error.reason)
         except Exception:
             logger.exception("local_customer_access.reconcile_failed")
-
-
-def _row_count() -> int:
-    from partner_db import connection
-    with connection() as db:
-        return db.execute("SELECT count(*) AS n FROM local_customer_credentials WHERE revoked_at IS NULL").fetchone()["n"]
 
 
 # ------------------------------------------------------------------ routes (edge only)
@@ -465,8 +517,19 @@ def register_routes(app, shell) -> None:
 
     @app.post("/api/customer/appliance-sign-in")
     def appliance_sign_in_set(request: Request, payload: dict) -> dict:
+        from cloud_security import clear_login_failures, login_blocked, record_login_failure
         session, user_id = _owner(request)
-        return _call(lambda: enroll(session, str(payload.get("cloud_password") or ""), str(payload.get("new_password") or ""), user_id=user_id))
+        email = str(session.get("email") or "")
+        if login_blocked(email):  # the cloud-password re-check counts toward the same lockout
+            raise HTTPException(status_code=429, detail="Too many attempts. Try again later or reset your password.")
+        try:
+            result = enroll(session, str(payload.get("cloud_password") or ""), str(payload.get("new_password") or ""), user_id=user_id)
+        except AccessDenied as denied:
+            if denied.reason == "invalid":
+                record_login_failure(email)
+            raise HTTPException(status_code=denied.status, detail=denied.detail) from denied
+        clear_login_failures(email)
+        return result
 
     @app.post("/api/customer/appliance-sign-in/disable")
     def appliance_sign_in_disable(request: Request) -> dict:

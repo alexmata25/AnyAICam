@@ -370,3 +370,139 @@ def test_a_revoked_grant_is_reported_as_no_longer_authorized(env):
     cloud.sql("UPDATE identity_grants SET revoked_at='2026-10-14' WHERE user_id='u-owner'")
     lca.reconcile(lca.fetch_verified_manifest(identity), identity)
     assert lca.status("u-owner")["revoked_reason"] == "no_longer_authorized"
+
+
+
+# ------------------------------------------------------------------ Red review of c912efe
+def test_m1_a_verified_manifest_for_another_customer_revokes_everything(env):
+    cloud, identity = env
+    lca.enroll(OWNER_SESSION, OWNER_PW, APPLIANCE_PW, user_id="u-owner")
+    with connection() as db:
+        db.execute("INSERT INTO user_sessions(id,user_id,email,role,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) "
+                   "VALUES('s-on','u-owner',?,'customer_owner','cookie','now','now','2999-01-01',99)", (OWNER_EMAIL,))
+    cloud.sql("UPDATE appliances SET customer_id='cust-2' WHERE id='appl-1'")  # the cloud reassigned the appliance
+    with pytest.raises(lca.Reassigned):
+        lca.fetch_verified_manifest(identity)
+    with pytest.raises(lca.AccessDenied) as denied:
+        lca.sign_in(OWNER_EMAIL, APPLIANCE_PW)  # never falls back to the offline grace window
+    assert denied.value.reason in ("appliance_reassigned", "not_owner")
+    lca.revoke_all("appliance_reassigned")  # what the reconcile worker does on Reassigned
+    assert lca.status("u-owner")["enrolled"] is False
+    assert _edge_rows("SELECT revoked_at FROM user_sessions WHERE id='s-on'")[0]["revoked_at"]
+
+
+def test_m1_the_cloud_answering_404_is_a_revocation_not_an_outage(env, monkeypatch):
+    import io, urllib.error, urllib.request
+    cloud, identity = env
+    monkeypatch.setenv("ANYAICAM_CLOUD_URL", "http://cloud.invalid")
+
+    def not_activated(*a, **k):
+        raise urllib.error.HTTPError("http://cloud.invalid", 404, "Not Found", {}, io.BytesIO(b"{}"))
+    monkeypatch.setattr(urllib.request, "urlopen", not_activated)
+    with pytest.raises(lca.Reassigned):
+        _REAL_REQUEST("GET", "/x", identity)
+
+
+def test_m2_online_sessions_without_an_appliance_password_are_reconciled(env):
+    cloud, identity = env
+    lca.sign_in(OWNER_EMAIL, OWNER_PW)  # online, no appliance password
+    with override_target(sqlite_path=cloud.path):
+        version = _edge_rows("SELECT authorization_version v FROM partner_users WHERE id='u-owner'")[0]["v"]
+    with connection() as db:
+        db.execute("INSERT INTO user_sessions(id,user_id,email,role,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) "
+                   "VALUES('s-online','u-owner',?,'customer_owner','cookie','now','now','2999-01-01',?)", (OWNER_EMAIL, version))
+    assert lca.reconcile(lca.fetch_verified_manifest(identity), identity)["sessions_revoked_for"] == 0
+    cloud.sql("UPDATE identity_grants SET revoked_at='2026-10-14' WHERE user_id='u-owner'")
+    assert lca.reconcile(lca.fetch_verified_manifest(identity), identity)["sessions_revoked_for"] == 1
+    assert _edge_rows("SELECT revoked_at FROM user_sessions WHERE id='s-online'")[0]["revoked_at"]
+    assert _edge_rows("SELECT account_status FROM partner_users WHERE id='u-owner'")[0]["account_status"] == "revoked"
+
+
+def test_a_tampered_or_expired_manifest_is_rejected_and_revokes_nothing(env, monkeypatch):
+    cloud, identity = env
+    lca.enroll(OWNER_SESSION, OWNER_PW, APPLIANCE_PW, user_id="u-owner")
+    good = cloud.request
+
+    def tampered(method, path, ident, payload=None):
+        body = good(method, path, ident, payload)
+        if path.endswith("/identity-manifest"):
+            body = dict(body, identities=[])  # signature no longer matches
+        return body
+    monkeypatch.setattr(lca, "_request", tampered)
+    with pytest.raises(lca.CloudUnavailable):
+        lca.fetch_verified_manifest(identity)
+
+    def expired(method, path, ident, payload=None):
+        if path.endswith("/identity-manifest"):
+            with override_target(sqlite_path=cloud.path):
+                with connection() as db:
+                    return appliance_identity.build_manifest(db, cloud_id=CLOUD_ID, ttl_minutes=-1)
+        return good(method, path, ident, payload)
+    monkeypatch.setattr(lca, "_request", expired)
+    with pytest.raises(lca.CloudUnavailable):
+        lca.fetch_verified_manifest(identity)
+    assert lca.status("u-owner")["enrolled"] is True
+
+
+def test_revoked_and_disabled_hashes_are_overwritten(env):
+    from partner_db import verify_password
+    lca.enroll(OWNER_SESSION, OWNER_PW, APPLIANCE_PW, user_id="u-owner")
+    lca.disable(OWNER_SESSION, user_id="u-owner")
+    assert not verify_password(APPLIANCE_PW, _edge_rows("SELECT password_hash FROM local_customer_credentials")[0]["password_hash"])
+
+
+def test_offline_sign_in_runs_exactly_one_password_check(env, monkeypatch):
+    import partner_db
+    cloud, _ = env
+    lca.enroll(OWNER_SESSION, OWNER_PW, APPLIANCE_PW, user_id="u-owner")
+    cloud.online = False
+    calls = []
+    real = partner_db.verify_password
+    monkeypatch.setattr(partner_db, "verify_password", lambda p, h: calls.append(1) or real(p, h))
+    for email, pw in ((OWNER_EMAIL, "wrong-guess-123"), ("nobody@example.test", "x-y-z-123456")):
+        calls.clear()
+        with pytest.raises(lca.AccessDenied):
+            lca.sign_in(email, pw)
+        assert len(calls) == 1
+
+
+def test_a_cloud_password_change_also_bumps_the_authorization_version(env, monkeypatch, tmp_path):
+    cloud, _ = env
+    from token_security import sign
+    monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")
+    with override_target(sqlite_path=cloud.path):
+        before = _edge_rows("SELECT authorization_version v FROM partner_users WHERE id='u-owner'")[0]["v"]
+        with TestClient(main.app) as client:
+            token = partner_portal._token(OWNER_EMAIL, "customer_owner", None, "cust-1", None)
+            csrf = sign("csrf", 28800)
+            client.cookies.set(partner_portal.SESSION_COOKIE, token)
+            client.cookies.set("anyaicam_csrf", csrf)
+            response = client.post("/api/partner/activate-account", headers={"X-CSRF-Token": csrf},
+                                   json={"password": "Changed-Cloud-Pass-77", "current_password": OWNER_PW})
+            assert response.status_code == 200, response.text
+        after = _edge_rows("SELECT authorization_version v FROM partner_users WHERE id='u-owner'")[0]["v"]
+    assert after == before + 1
+
+
+def test_http_lockout_trips_to_429_including_appliance_password_setup(edge_client):
+    client, cloud = edge_client
+    statuses = [_login(client, OWNER_EMAIL, f"wrong-password-{i}").status_code for i in range(7)]
+    assert statuses[0] == 403 and 429 in statuses
+    from cloud_security import clear_login_failures
+    clear_login_failures(OWNER_EMAIL)
+    assert _login(client, OWNER_EMAIL, OWNER_PW).status_code == 303
+    token = client.cookies.get("anyaicam_csrf")
+    codes = [client.post("/api/customer/appliance-sign-in", json={"cloud_password": f"bad-cloud-{i}", "new_password": APPLIANCE_PW},
+                         headers={"X-CSRF-Token": token}).status_code for i in range(7)]
+    assert codes[0] == 403 and codes[-1] == 429
+
+
+def test_http_new_posts_require_csrf_when_enabled(edge_client, monkeypatch):
+    client, cloud = edge_client
+    assert _login(client, OWNER_EMAIL, OWNER_PW).status_code == 303
+    monkeypatch.setattr(cloud_security, "settings", dataclasses.replace(cloud_security.settings, csrf_enabled=True))
+    for path in ("/api/customer/appliance-sign-in", "/api/customer/appliance-sign-in/disable"):
+        assert client.post(path, json={"cloud_password": OWNER_PW, "new_password": APPLIANCE_PW}).status_code == 403
+
+
+_REAL_REQUEST = lca._request

@@ -388,6 +388,9 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
                 audit(identity,'password.change_denied','partner_user',user['id'],{'reason':'current_password_mismatch'})
                 raise HTTPException(status_code=403,detail='Your current password is incorrect.')
             user_id=user['id']; db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0,terms_accepted_at=? WHERE id=?',(password_hash(password),now,user_id))
+            # A changed password also bumps the authorization version, so appliance
+            # sessions and offline appliance passwords follow it (local_customer_access.py).
+            db.execute('UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id=?',(user_id,))
             # A new password signs out every OTHER session of this user, as a
             # reset already does (cloud_security.consume_password_reset):
             # a session stolen with the old password must not outlive it.

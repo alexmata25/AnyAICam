@@ -361,6 +361,7 @@ def register_customer_platform_routes(
 
     @app.put("/api/customer/cameras/{camera_id}/name")
     def update_customer_camera_name(camera_id: int, payload: CameraNameUpdate, request: Request):
+        from partner_workspace import cloud_account_only; cloud_account_only()
         """Renames one of this customer's own cameras. Reuses the same
         cameras.name column every other customer-facing page already
         reads (_portal_customer_camera_names(), live_view_page.py's
