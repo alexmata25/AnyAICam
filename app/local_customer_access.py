@@ -64,6 +64,10 @@ REQUEST_TIMEOUT_SECONDS = 8
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("ANYAICAM_LOCAL_ACCESS_RECONCILE_SECONDS", "900") or 900)
 
 
+OFFLINE_REFUSED = ("AnyAiCam can't be reached right now, and the email or appliance password is incorrect. Offline, sign in with "
+                   "the appliance password you set up under Appliance sign-in while this appliance was online.")
+
+
 class CloudUnavailable(Exception):
     """The cloud could not be reached (or answered with a server error)."""
 
@@ -258,7 +262,12 @@ def ensure_local_account(user_id: str, email: str, customer_id: str, role: str) 
     unusable = password_hash(secrets.token_urlsafe(32))
     now = datetime.now().isoformat()
     with connection() as db:
-        existing = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()
+        existing = db.execute("SELECT id,role FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()
+        if existing and existing["role"] not in ("customer_owner", "customer_viewer"):
+            # Never turn a local operator account (e.g. the appliance's own
+            # administrator) into a customer, or sign a customer in as one.
+            raise AccessDenied(409, "This email is also an administrator account on this appliance. "
+                                    "Use a different email for the customer account.", "operator_email_conflict")
         if existing:
             db.execute("UPDATE partner_users SET role=?,customer_id=?,partner_id=NULL,approved=1,account_status='active',"
                        "password_hash=?,must_change_password=0 WHERE id=?", (role, customer_id, unusable, existing["id"]))
@@ -295,13 +304,13 @@ def sign_in(email: str, password: str) -> dict:
         if (_usable(credential, identity) and verify_password(password, credential["password_hash"])
                 and _within_grace(credential.get("last_verified_at"))):
             return _result(credential["user_id"], email, identity, credential["authorization_version"], "offline")
-        if _usable(credential, identity) and _within_grace(credential.get("last_verified_at")):
-            raise AccessDenied(403, "The email or appliance password is incorrect.", "invalid_offline")
-        if _usable(credential, identity) and not _within_grace(credential.get("last_verified_at")):
+        if (_usable(credential, identity) and verify_password(password, credential["password_hash"])
+                and not _within_grace(credential.get("last_verified_at"))):
             raise AccessDenied(503, "This appliance has not been able to reach AnyAiCam for too long to allow offline sign-in. "
                                     "Reconnect it to the internet and try again.", "offline_grace_expired")
-        raise AccessDenied(503, "AnyAiCam can't be reached right now. Sign in with your appliance password "
-                                "(set it up under Appliance sign-in while the appliance is online).", "cloud_unavailable")
+        # One answer for every other offline failure (unknown email, no appliance
+        # password, wrong password): never reveal which accounts have one.
+        raise AccessDenied(503, OFFLINE_REFUSED, "invalid_offline")
     except AccessDenied as denied:
         if denied.reason != "invalid":
             raise
