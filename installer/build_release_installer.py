@@ -348,13 +348,21 @@ def git_export_paths(repo: Path, commit: str, paths: tuple[str, ...], destinatio
 
 
 def ensure_lf_and_modes(package_root: Path) -> tuple[int, list[str]]:
-    shell_files = sorted(package_root.glob("*.sh"))
+    # Scan the entire package, including nested agent/runtime payloads. A
+    # nested CRLF script is just as unusable on Linux as install.sh, and must
+    # prevent archive creation rather than slipping past a top-level-only
+    # check.
+    shell_files = sorted(package_root.rglob("*.sh"))
     failures: list[str] = []
     for path in shell_files:
         data = path.read_bytes()
         if b"\r" in data:
-            failures.append(f"CR byte found: {path.relative_to(package_root)}")
-        os.chmod(path, 0o755)
+            failures.append(f"CR byte found: {path.relative_to(package_root).as_posix()}")
+        # Preserve existing behavior: top-level installer scripts are made
+        # executable here; nested scripts retain their declared packaging
+        # mode and are checked only for line-ending safety.
+        if path.parent == package_root:
+            os.chmod(path, 0o755)
     return len(shell_files), failures
 
 

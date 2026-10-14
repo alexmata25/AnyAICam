@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from build_release_installer import (AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS,
                                      REQUIRED_RELEASE_PATHS, copy_release, file_manifest,
-                                     is_test_only_release_path, run_git, write_deterministic_tar)  # noqa: E402
+                                     ensure_lf_and_modes, is_test_only_release_path, run_git,
+                                     write_deterministic_tar)  # noqa: E402
 
 
 class ReleasePayloadHygieneAndManifestTests(unittest.TestCase):
@@ -108,6 +109,42 @@ class RunGitAutocrlfOverrideTests(unittest.TestCase):
             archive = run_git(repo, "archive", "--format=tar", "HEAD", "--", "script.sh")
 
         self.assertNotIn(b"\r", archive, "run_git()'s archive output must be LF-clean regardless of the repo's own core.autocrlf setting")
+
+
+class PackagedShellLineEndingGuardTests(unittest.TestCase):
+    def test_repository_attributes_force_lf_for_all_shell_scripts(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        attributes = (repo_root / ".gitattributes").read_text(encoding="utf-8")
+        self.assertRegex(attributes, r"(?m)^\*\.sh\s+text\s+eol=lf\s*$")
+
+    def test_lf_only_shell_scripts_pass_and_top_level_installer_script_is_made_executable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            top_level = root / "install.sh"
+            nested = root / "payload" / "agent" / "install.sh"
+            nested.parent.mkdir(parents=True)
+            top_level.write_bytes(b"#!/usr/bin/env bash\necho ok\n")
+            nested.write_bytes(b"#!/usr/bin/env bash\necho ok\n")
+
+            count, failures = ensure_lf_and_modes(root)
+
+            self.assertEqual(count, 2)
+            self.assertEqual(failures, [])
+            if os.name != "nt":
+                self.assertTrue(top_level.stat().st_mode & 0o111)
+                self.assertFalse(nested.stat().st_mode & 0o111)
+
+    def test_nested_crlf_script_blocks_packaging(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            nested = root / "payload" / "agent" / "install.sh"
+            nested.parent.mkdir(parents=True)
+            nested.write_bytes(b"#!/usr/bin/env bash\r\necho broken\r\n")
+
+            count, failures = ensure_lf_and_modes(root)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(failures, ["CR byte found: payload/agent/install.sh"])
 
 
 class DeterministicTarExecutableBitTests(unittest.TestCase):
