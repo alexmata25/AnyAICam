@@ -32,6 +32,11 @@ EMAIL_TYPES={
     # confirm-your-address link, and the note sent instead when the address
     # already has an account. Additive only.
     'email_verification',
+    # Customer acceptance 1.2.6 (2026-10-14): types already sent through
+    # purchase_notifications._send_once (failed renewal) and friends_family.py
+    # but never registered here, so the preview backend refused them and the
+    # retry worker re-queued them forever. SMTP does not check this set.
+    'payment_failed','friends_family_request','friends_family_decision',
 }
 
 
