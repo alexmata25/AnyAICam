@@ -1,6 +1,7 @@
 """Release wiring tests for the protected Linux camera-capacity acceptance helper."""
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import sys
@@ -101,13 +102,22 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
             # Redirect every fixed installation path into this temporary
             # fixture; the real host /opt, /etc, and systemd are untouched.
             library = (ROOT / "appliance-agent/scripts/lib-capacity-accept.sh").read_text(encoding="utf-8")
-            library = library.replace("/opt/anyaicam-agent/privileged", bash_path(opt / "anyaicam-agent/privileged"))
-            library = library.replace("/opt/anyaicam-agent", bash_path(opt / "anyaicam-agent"))
-            library = library.replace("/opt", bash_path(opt))
-            library = library.replace("/etc/systemd/system", bash_path(etc / "systemd/system"))
-            library = library.replace("/etc/systemd", bash_path(etc / "systemd"))
-            library = library.replace("/etc", bash_path(etc))
-            library = library.replace("/usr/bin/openssl", bash_path(openssl))
+            path_replacements = {
+                "/opt/anyaicam-agent/privileged": bash_path(opt / "anyaicam-agent/privileged"),
+                "/opt/anyaicam-agent": bash_path(opt / "anyaicam-agent"),
+                "/opt": bash_path(opt),
+                "/etc/systemd/system": bash_path(etc / "systemd/system"),
+                "/etc/systemd": bash_path(etc / "systemd"),
+                "/etc": bash_path(etc),
+                "/usr/bin/openssl": bash_path(openssl),
+            }
+            path_pattern = re.compile("|".join(
+                re.escape(path) for path in sorted(path_replacements, key=len, reverse=True)
+            ))
+            # Substitute only matches from the original source string. A
+            # replacement path can itself contain /opt or /etc and must not
+            # be rewritten by a later replacement pass.
+            library = path_pattern.sub(lambda match: path_replacements[match.group(0)], library)
             library_path = root / "lib-capacity-accept.sh"
             library_path.write_text(library, encoding="utf-8")
 
@@ -143,6 +153,7 @@ caller
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "var/lib/anyaicam/vms/data-config"
+            identity_file = root / "etc/anyaicam/appliance_identity.json"
             agent_scripts = root / "agent/scripts"
             agent_scripts.mkdir(parents=True)
             (agent_scripts / "lib-capacity-accept.sh").write_text("""\
@@ -152,6 +163,7 @@ install_capacity_accept() { [[ -d "$VMS_DATA_CONFIG_DIR" ]] && [[ ! -L "$VMS_DAT
             script = f'''\
 set -euo pipefail
 VMS_DATA_CONFIG_DIR={shlex.quote(bash_path(data_dir))}
+IDENTITY_FILE={shlex.quote(bash_path(identity_file))}
 AGENT_PAYLOAD_DIR={shlex.quote(bash_path(root / "agent"))}
 INSTALL_STATE=clean
 systemctl() {{
