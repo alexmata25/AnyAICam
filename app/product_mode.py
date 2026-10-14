@@ -70,7 +70,9 @@ PRODUCT_MODE_ENV = "ANYAICAM_PRODUCT_MODE"
 # The installer's first-run choice (2026-10-01): used only until the cloud
 # tells this appliance its mode, so a later Local->Hybrid upgrade or
 # Hybrid->Local change from the cloud actually takes effect. An air-gapped
-# Local appliance never hears from the cloud and keeps its bootstrap mode.
+# Local appliance never hears from the cloud and keeps its bootstrap mode
+# (the MODE only: camera capacity still needs one claim and sync -- see
+# docs/local-offline-licensing-options-2026-10-14.md).
 BOOTSTRAP_MODE_ENV = "ANYAICAM_PRODUCT_MODE_BOOTSTRAP"
 VALID_MODES = ("local", "hybrid")
 
