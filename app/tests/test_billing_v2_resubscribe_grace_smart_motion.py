@@ -333,6 +333,14 @@ def _seed_appliance(db):
         db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,smart_motion_enabled,"
                    "people_counting_enabled,lpr_enabled,ppe_enabled,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'online',?)",
                    (f"cam-{n}", "cust-1", "site-1", "appl-1", f"Camera {n}", n, *flags, now))
+    # Per-camera analytics authorization (2026-10-12, analytics_entitlements.
+    # commercial_camera_analytic_authorized) is fail-closed: a stored flag
+    # counts only for a camera with an active assignment, which is what the
+    # customer's own switch (customer_analytics_panel.assign_entitlement)
+    # writes together with the flag. cam-1 was switched on that way.
+    for key in ("smart_motion", "people_counting", "lpr", "ppe"):
+        db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
+                   "VALUES('cam-1',?,'active',?,?)", (key, now, now))
 
 
 def _v2_plan(db, plan_key="hybrid", status="active"):
@@ -381,7 +389,7 @@ def test_smart_motion_is_reported_only_while_the_plan_includes_it(appliance):
     appliance["plan"]("hybrid", "cancelled")
     cameras = appliance["config"]()
     assert cameras["cam-1"]["smart_motion_enabled"] == 0
-    assert cameras["cam-2"]["smart_motion_enabled"] is None  # never enabled: unchanged
+    assert not cameras["cam-2"]["smart_motion_enabled"]  # never enabled: stays off
     # The customer's preference is kept ...
     assert _stored(appliance)["smart_motion_enabled"] == 1
     # ... so buying again restores it.
@@ -398,6 +406,12 @@ def test_a_downgrade_to_basic_local_turns_smart_motion_off_at_the_edge(appliance
 
 
 def test_add_on_and_admin_analytics_are_not_plan_gated(appliance):
+    # Add-ons are licensed on their own (analytics_subscriptions), so ending
+    # the camera plan leaves them running.
+    with connection() as db:
+        for key in ("people_counting", "lpr", "ppe"):
+            db.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,licensed_quantity,created_at) "
+                       "VALUES(?,'cust-1',NULL,?,'active',1,'2026-09-01')", (f"as-{key}", key))
     appliance["plan"]("hybrid", "cancelled")
     camera = appliance["config"]()["cam-1"]
     assert (camera["people_counting_enabled"], camera["lpr_enabled"], camera["ppe_enabled"]) == (1, 1, 1)
@@ -412,7 +426,25 @@ def test_an_existing_smart_motion_licence_still_counts(appliance):
 
 
 def test_a_customer_outside_billing_v2_keeps_the_stored_value(appliance):
-    assert appliance["config"]()["cam-1"]["smart_motion_enabled"] == 1  # no v2 row: legacy / partner-managed
+    # No v2 row: a legacy customer, whose active camera-slot entitlement
+    # includes Smart Motion (analytics_entitlements.plan_included_feature_active).
+    with connection() as db:
+        db.execute("INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,created_at,updated_at) "
+                   "VALUES('ent-legacy','cust-1','camera_slots_local',8,'active','2026-09-01','2026-09-01')")
+    assert appliance["config"]()["cam-1"]["smart_motion_enabled"] == 1
+
+
+def test_a_stored_flag_without_an_assignment_is_never_reported(appliance):
+    """Fail-closed: cam-2 gets every flag stored as on but was never assigned,
+    so even an active plan and add-on licences report it off."""
+    appliance["plan"]("hybrid", "active")
+    with connection() as db:
+        db.execute("UPDATE cameras SET smart_motion_enabled=1,people_counting_enabled=1,lpr_enabled=1,ppe_enabled=1 WHERE id='cam-2'")
+        for key in ("people_counting", "lpr", "ppe"):
+            db.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,licensed_quantity,created_at) "
+                       "VALUES(?,'cust-1',NULL,?,'active',5,'2026-09-01')", (f"as-{key}", key))
+    camera = appliance["config"]()["cam-2"]
+    assert not any(camera[f] for f in ("smart_motion_enabled", "people_counting_enabled", "lpr_enabled", "ppe_enabled"))
 
 
 def test_effective_camera_analytic_unit(appliance):

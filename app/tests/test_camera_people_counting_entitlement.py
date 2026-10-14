@@ -186,7 +186,21 @@ def test_nonexistent_camera_is_404(client, db_path):
 # ----------------------------------------------- GET /api/appliance/configuration exposure
 
 
+def _license_people_counting(db_path, camera_id="cam-1"):
+    """What the customer's own purchase and switch write (2026-10-12,
+    analytics_entitlements.commercial_camera_analytic_authorized): an active
+    People Counting licence and this camera's assignment. The administrator
+    switch below is operational configuration, necessary but not sufficient."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,licensed_quantity,created_at) "
+                       "VALUES('as-pc','cust-1',NULL,'people_counting','active',1,'2026-10-01')")
+            db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
+                       "VALUES(?,'people_counting','active','2026-10-01','2026-10-01')", (camera_id,))
+
+
 def test_configuration_route_exposes_people_counting_enabled_true(client, seeded_db_path):
+    _license_people_counting(seeded_db_path)
     client.post("/api/admin/cameras/cam-1/people-counting", cookies={partner_portal.SESSION_COOKIE: _admin_cookie()}, json={"people_counting_enabled": True})
 
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
@@ -207,6 +221,7 @@ def test_configuration_route_reports_falsy_when_unset(client, seeded_db_path):
 def test_configuration_route_carries_both_cloud_recording_mode_and_people_counting_independently(client, seeded_db_path):
     """Proves the two per-camera flags are genuinely independent fields
     -- setting one never touches the other."""
+    _license_people_counting(seeded_db_path)
     client.post("/api/admin/cameras/cam-1/cloud-recording-mode", cookies={partner_portal.SESSION_COOKIE: _admin_cookie()}, json={"cloud_recording_mode": "motion"})
     client.post("/api/admin/cameras/cam-1/people-counting", cookies={partner_portal.SESSION_COOKIE: _admin_cookie()}, json={"people_counting_enabled": True})
 
@@ -215,3 +230,12 @@ def test_configuration_route_carries_both_cloud_recording_mode_and_people_counti
     camera = response.json()["cameras"][0]
     assert camera["recording_mode"] == "motion"
     assert camera["people_counting_enabled"] == 1
+
+
+def test_the_administrator_switch_alone_never_reaches_the_appliance(client, seeded_db_path):
+    """Fail-closed per-camera authorization: without a licence and an
+    assignment, People Counting stays off at the edge whatever the stored flag."""
+    client.post("/api/admin/cameras/cam-1/people-counting", cookies={partner_portal.SESSION_COOKIE: _admin_cookie()}, json={"people_counting_enabled": True})
+    assert _camera_entitlement(seeded_db_path, "cam-1") == 1  # stored
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert not response.json()["cameras"][0]["people_counting_enabled"]
