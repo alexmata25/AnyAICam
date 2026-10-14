@@ -144099,7 +144099,14 @@ def _fix_cloud_recording_audio_for_playback(recording_id: str, s3_key: str) -> P
                     pass
 
 
-LOCAL_RECORDING_SETTLED_SECONDS = 20  # a segment still being written is never cached
+# Local-recording remux limits (Red review of f2fa2ac): at most two ffmpeg
+# remuxes at once on the recording box; a busy request gets 503 + Retry-After.
+LOCAL_RECORDING_REMUX_SLOTS = threading.BoundedSemaphore(2)
+LOCAL_RECORDING_REMUX_WAIT_SECONDS = 5
+
+
+class RemuxBusy(Exception):
+    pass
 
 
 def _customer_local_recording_path(s3_key: str, camera_number) -> Path | None:
@@ -144114,43 +144121,57 @@ def _customer_local_recording_path(s3_key: str, camera_number) -> Path | None:
 def _local_recording_mp4_for_playback(recording_id: str, local_path: Path) -> Path | None:
     """Browser-playable MP4 of a finished local MKV segment: video stream
     copy, audio (if any) to 48 kHz AAC aligned to t=0 (the same audio fix as
-    _fix_cloud_recording_audio_for_playback), cached by recording_id."""
+    _fix_cloud_recording_audio_for_playback). "Finished" is the catalog's own
+    rule (unchanged for CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS). The cache key carries
+    the source's size and mtime, so a writer that stalled and resumed can never
+    leave a stale, truncated MP4 being served. Raises RemuxBusy when the
+    appliance is already running its maximum number of remuxes."""
     try:
-        if time.time() - local_path.stat().st_mtime < LOCAL_RECORDING_SETTLED_SECONDS:
-            return None  # still recording: /local serves it as is
+        stat = local_path.stat()
     except OSError:
         return None
+    if time.time() - stat.st_mtime < CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS:
+        return None  # still recording: /local serves it as is
     RECORDING_MEDIA_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
-    cache_path = RECORDING_MEDIA_CACHE_FOLDER / f"{recording_id}.mp4"
+    cache_path = RECORDING_MEDIA_CACHE_FOLDER / f"local-{recording_id}-{stat.st_size}-{int(stat.st_mtime)}.mp4"
     if cache_path.is_file() and cache_path.stat().st_size > 0:
         return cache_path
-    with _recording_media_cache_lock(recording_id):
-        if cache_path.is_file() and cache_path.stat().st_size > 0:
-            return cache_path
-        tmp_out = cache_path.with_name(cache_path.name + ".tmp")
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-v", "error", "-i", str(local_path), "-map", "0:v:0", "-map", "0:a:0?",
-                 "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-af", "aresample=async=1:first_pts=0",
-                 "-movflags", "+faststart", "-f", "mp4", str(tmp_out)],
-                capture_output=True, timeout=120,
-            )
-            if result.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
-                logging.getLogger("anyaicam.recording_media").error(
-                    "recording_media.local_remux_failed recording_id=%s stderr=%s",
-                    recording_id, result.stderr.decode("utf-8", "replace")[-2000:])
-                return None
-            os.replace(tmp_out, cache_path)
-            _evict_recording_media_cache_if_full()
-            return cache_path
-        except Exception:
-            logging.getLogger("anyaicam.recording_media").exception("recording_media.local_remux_error recording_id=%s", recording_id)
+    if not LOCAL_RECORDING_REMUX_SLOTS.acquire(timeout=LOCAL_RECORDING_REMUX_WAIT_SECONDS):
+        raise RemuxBusy()
+    try:
+        with _recording_media_cache_lock(recording_id):
+            return _remux_local_recording(recording_id, local_path, cache_path)
+    finally:
+        LOCAL_RECORDING_REMUX_SLOTS.release()
+
+
+def _remux_local_recording(recording_id: str, local_path: Path, cache_path: Path) -> Path | None:
+    if cache_path.is_file() and cache_path.stat().st_size > 0:
+        return cache_path
+    tmp_out = cache_path.with_name(cache_path.name + ".tmp")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(local_path), "-map", "0:v:0", "-map", "0:a:0?",
+             "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-af", "aresample=async=1:first_pts=0",
+             "-movflags", "+faststart", "-f", "mp4", str(tmp_out)],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+            logging.getLogger("anyaicam.recording_media").error(
+                "recording_media.local_remux_failed recording_id=%s stderr=%s",
+                recording_id, result.stderr.decode("utf-8", "replace")[-2000:])
             return None
-        finally:
-            try:
-                tmp_out.unlink()
-            except FileNotFoundError:
-                pass
+        os.replace(tmp_out, cache_path)
+        _evict_recording_media_cache_if_full()
+        return cache_path
+    except Exception:
+        logging.getLogger("anyaicam.recording_media").exception("recording_media.local_remux_error recording_id=%s", recording_id)
+        return None
+    finally:
+        try:
+            tmp_out.unlink()
+        except FileNotFoundError:
+            pass
 
 
 @app.get("/api/customer/recordings/{camera_id}/{recording_id}/media")
@@ -144204,7 +144225,11 @@ def customer_recording_media(camera_id: str, recording_id: str, request: Request
     # to MP4 (video stream copy) through the same cache; fail open to /local.
     if row and row["s3_key"] and str(row["s3_key"]).lower().endswith(".mkv") and row["camera_number"] is not None:
         local_path = _customer_local_recording_path(row["s3_key"], row["camera_number"])
-        mp4_path = _local_recording_mp4_for_playback(recording_id, local_path) if local_path else None
+        try:
+            mp4_path = _local_recording_mp4_for_playback(recording_id, local_path) if local_path else None
+        except RemuxBusy:
+            raise HTTPException(status_code=503, detail="This recording is being prepared; try again in a few seconds.",
+                                headers={"Retry-After": "5"})
         if mp4_path is not None:
             return FileResponse(mp4_path, media_type="video/mp4", filename=f"{recording_id}.mp4",
                                 content_disposition_type="inline")

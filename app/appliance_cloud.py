@@ -1036,7 +1036,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         appliance=authenticate_appliance(request)
         if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
         from appliance_identity import get_cloud_identity_backend, reconcile_sessions_against_manifest
-        manifest=get_cloud_identity_backend().fetch_manifest(cloud_id=appliance['cloud_id'])
+        try:
+            manifest=get_cloud_identity_backend().fetch_manifest(cloud_id=appliance['cloud_id'])
+        except ValueError as error:  # no activated appliance for this Cloud ID: authoritative, not an outage
+            raise HTTPException(status_code=404,detail='This appliance is not activated.') from error
         # Reconciliation runs on every fetch, not on a separate schedule --
         # in this mock/dev setup the 'cloud' database the manifest was
         # just built from and the local session table live in the same
@@ -1066,7 +1069,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
         email=str(payload.get('email','')); password=str(payload.get('password','')); portal=payload.get('portal')
         from appliance_identity import get_cloud_identity_backend
-        result=get_cloud_identity_backend().authenticate_operator(email=email,password=password,portal=portal,cloud_id=appliance['cloud_id'])
+        try:
+            result=get_cloud_identity_backend().authenticate_operator(email=email,password=password,portal=portal,cloud_id=appliance['cloud_id'])
+        except ValueError as error:  # no activated appliance for this Cloud ID: authoritative, not an outage
+            raise HTTPException(status_code=404,detail='This appliance is not activated.') from error
         outcome='login.delegated_succeeded' if result.get('status')=='ok' else 'login.delegated_denied'
         audit({'email':email,'role':'appliance'},outcome,'appliance',appliance['id'],{'portal':portal,'reason':result.get('reason')})
         return result
