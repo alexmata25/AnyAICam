@@ -5,9 +5,13 @@ docker_daemon_ready() {
     docker info >/dev/null 2>&1
 }
 
+# 30 x 2 s: a first start on a slow VM (containerd + daemon init) can take
+# well over 20 s even after systemctl reports the unit started.
+DOCKER_READY_ATTEMPTS=30
+
 wait_for_docker_daemon() {
     local attempt
-    for ((attempt = 1; attempt <= 10; attempt++)); do
+    for ((attempt = 1; attempt <= DOCKER_READY_ATTEMPTS; attempt++)); do
         docker_daemon_ready && return 0
         sleep 2
     done
@@ -47,7 +51,7 @@ start_docker_daemon() {
         return 1
     }
     if ! wait_for_docker_daemon; then
-        echo "[ERROR] Docker service started, but 'docker info' did not become ready after 10 attempts; inspect systemctl status docker docker.socket and journalctl -u docker." >&2
+        echo "[ERROR] Docker service started, but 'docker info' did not become ready after $DOCKER_READY_ATTEMPTS attempts; inspect systemctl status docker docker.socket and journalctl -u docker." >&2
         return 1
     fi
 }
@@ -55,7 +59,13 @@ start_docker_daemon() {
 ensure_docker_daemon_ready() {
     if docker_daemon_ready; then
         # Keep an already-working daemon enabled across reboot without
-        # interrupting its containers or restarting it.
+        # interrupting its containers or restarting it. A working daemon
+        # that is not managed by docker.service (e.g. the Docker snap,
+        # snap.docker.dockerd.service) keeps its own boot management.
+        if ! systemctl cat docker.service >/dev/null 2>&1; then
+            log "Docker responds, but is not managed by docker.service; leaving its service management unchanged."
+            return 0
+        fi
         systemctl enable docker.service || {
             echo "[ERROR] Docker responds, but systemd could not enable docker.service." >&2
             return 1

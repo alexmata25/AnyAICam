@@ -72,8 +72,12 @@ RUN mkdir -p /opt/anyaicam-lpr-model \
 # Vosk small English model (Apache-2.0), checksum-pinned; used by
 # app/aac_voice_call_listen.py. Baked outside /app for the same bind-mount
 # reason as the models above; listening is skipped if it is missing.
+# A transfer slower than 10 KB/s for 60 s counts as stalled and is retried,
+# so the whole fetch stays well inside the installer's image-build timeout
+# (ANYAICAM_VMS_BUILD_TIMEOUT, 5400 s). The pinned SHA-256 is always checked.
 RUN mkdir -p /opt/anyaicam-stt-model \
-    && curl -fL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 3600 --connect-timeout 30 --max-time 1800 \
+    && curl -fL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 2400 \
+        --connect-timeout 30 --speed-limit 10240 --speed-time 60 --max-time 1200 \
         -o /tmp/vosk-model.zip "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" \
     && echo "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498  /tmp/vosk-model.zip" | sha256sum -c - \
     && python -c "import zipfile; zipfile.ZipFile('/tmp/vosk-model.zip').extractall('/opt/anyaicam-stt-model')" \
