@@ -5,3 +5,7 @@
 # Linux installer and runtime shell scripts must remain LF-only on every
 # developer checkout, regardless of core.autocrlf on Windows.
 *.sh text eol=lf
+
+# Dockerfile.production predates the LF policy and is stored with CRLF; tell
+# diff checks that its CR is a line terminator rather than trailing content.
+Dockerfile.production whitespace=cr-at-eol
