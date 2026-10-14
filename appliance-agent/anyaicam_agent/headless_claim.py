@@ -124,6 +124,10 @@ class HeadlessClaim:
         # service's step loop; one lock keeps them from opening two claims.
         self._lock = threading.RLock()
         self._opened_code = None
+        # Why the last link_code() returned None, for the setup page's message
+        # (2026-10-14): 'already_provisioned', 'claim_open', 'confirming' or
+        # 'unreachable'; None after a code was returned.
+        self.link_failure: str | None = None
 
     @classmethod
     def for_config(cls, config: AgentConfig, log, **kwargs):
@@ -231,11 +235,14 @@ class HeadlessClaim:
         except PortalError as error:
             status = getattr(error, 'status_code', None)
             if status == 409 and 'already provisioned' in str(error):
+                self.link_failure = 'already_provisioned'
                 self._note('The AnyAiCam cloud already has this appliance; it must be re-enrolled by support.')
                 return float(PROVISIONED_RETRY_SECONDS)
             if status == 409:
+                self.link_failure = 'claim_open'
                 self._note('A claim for this appliance is still open on the AnyAiCam cloud; waiting for it to expire.')
                 return float(IN_PROGRESS_RETRY_SECONDS)
+            self.link_failure = 'unreachable'
             self.log.warning('Could not open a claim with the AnyAiCam cloud (HTTP %s); retrying.', status or 'unreachable')
             return self._backoff()
         state = {'device_id': device_id, 'claim_session_id': session['claim_session_id'],
@@ -312,12 +319,20 @@ class HeadlessClaim:
         already provisioned, or a confirmation is already being redeemed.
         Never raises; never logs the code."""
         if self.done:
+            self.link_failure = 'already_provisioned'
             return None
         try:
             with self._lock:
-                return self._link_code()
+                self.link_failure = None
+                code = self._link_code()
+                if code:
+                    self.link_failure = None
+                elif self.link_failure is None:
+                    self.link_failure = 'unreachable'  # e.g. a malformed code from the cloud
+                return code
         except Exception as error:
             self.log.warning('Could not prepare the account link (%s).', type(error).__name__)
+            self.link_failure = 'unreachable'
             return None
 
     def _link_code(self) -> str | None:
@@ -329,6 +344,7 @@ class HeadlessClaim:
             clear_claim_state(self.config)
             state = None
         if state and state.get('claim_proof'):
+            self.link_failure = 'confirming'
             return None  # already confirmed by the owner; the step loop is finishing it
         if not state:
             self._opened_code = None
@@ -338,8 +354,10 @@ class HeadlessClaim:
         try:
             session = self._claim_begin(device_id, state['device_secret'])
         except PortalError as error:
-            self.log.warning('Could not refresh the claim for the account link (HTTP %s).',
-                             getattr(error, 'status_code', None) or 'unreachable')
+            status = getattr(error, 'status_code', None)
+            self.link_failure = ('already_provisioned' if status == 409 and 'already provisioned' in str(error)
+                                 else 'unreachable')
+            self.log.warning('Could not refresh the claim for the account link (HTTP %s).', status or 'unreachable')
             return None
         if self.on_demand and session.get('label_verifier_cleared') and not state.get('label_cleared'):
             state['label_cleared'] = True

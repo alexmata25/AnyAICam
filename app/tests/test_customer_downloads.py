@@ -263,3 +263,44 @@ def test_steps_escape_the_portal_address():
     finally:
         main.PUBLIC_BASE_URL = original
     assert "<script>" not in steps
+
+
+def test_the_primary_link_step_is_the_zero_terminal_setup_page():
+    """2026-10-14: the installer ends with "open AnyAiCam Setup ... Link this
+    appliance. No codes to copy." The download page must say the same; the
+    terminal claim command is only the no-desktop fallback, after the steps."""
+    import main
+    original = main.PUBLIC_BASE_URL
+    try:
+        main.PUBLIC_BASE_URL = "https://portal.anyaicam.com"
+        steps = main._installer_steps_html("hybrid")
+    finally:
+        main.PUBLIC_BASE_URL = original
+    ordered = steps[:steps.index("</ol>")]
+    assert "AnyAiCam Setup" in ordered and "Link this appliance" in ordered and "No codes to copy" in ordered
+    assert "anyaicam-setup --claim" not in ordered
+    fallback = steps[steps.index("</ol>"):]
+    assert 'id="vms-installer-no-desktop"' in fallback and "without a desktop" in fallback
+    assert "anyaicam-setup --claim --portal-url=https://portal.anyaicam.com" in fallback
+
+
+def test_the_install_command_points_the_appliance_at_this_portal():
+    """The setup page links to the cloud the installer configured
+    (https://app.anyaicam.com unless --portal-url), so another portal puts
+    its address on install.sh -- never a non-https or local one, which
+    install.sh refuses."""
+    import main
+    cases = {
+        "https://portal-staging.anyaicam.com": "sudo ./install.sh --product-mode=local --portal-url=https://portal-staging.anyaicam.com</code>",
+        "https://app.anyaicam.com": "sudo ./install.sh --product-mode=local</code>",
+        "http://portal.example": "sudo ./install.sh --product-mode=local</code>",
+        "http://localhost:8000": "sudo ./install.sh --product-mode=local</code>",
+        "": "sudo ./install.sh --product-mode=local</code>",
+    }
+    original = main.PUBLIC_BASE_URL
+    try:
+        for portal, expected in cases.items():
+            main.PUBLIC_BASE_URL = portal
+            assert expected in main._installer_steps_html("local"), portal
+    finally:
+        main.PUBLIC_BASE_URL = original

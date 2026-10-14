@@ -104716,7 +104716,8 @@ def _vms_installer_download_html(customer_id: str, mode: str | None, is_owner: b
         f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk) &middot; '
         f'{customer_downloads.human_size(int(_installer["size_bytes"]))}</span></span>'
         f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
-        '<p class="health-detail" style="margin:8px 0 0">Install it on your PC, then link the PC to this account on '
+        '<p class="health-detail" style="margin:8px 0 0">Install it on your PC, then open <strong>AnyAiCam Setup</strong> on that PC and choose '
+        '<strong>Link this appliance</strong> to connect it to this account (no codes to copy). If you have a claim code instead, enter it on '
         '<a href="/customer/claim-appliance">Claim an appliance</a>. The step-by-step commands are in the technical details below.</p>'
         '<details id="vms-installer-technical" style="margin-top:10px"><summary>Technical details and install commands</summary>'
         f'<p class="health-detail" style="margin:8px 0 0">Build {escape(_installer["commit"][:7])}'
@@ -104728,16 +104729,25 @@ def _vms_installer_download_html(customer_id: str, mode: str | None, is_owner: b
 def _installer_steps_html(mode: str | None, filename: str = "", sha256: str = "") -> str:
     """Install-and-activate steps under the installer download (2026-10-01).
 
-    The customer path is the claim flow: `anyaicam-setup --claim` prints a
-    code the owner enters on /customer/claim-appliance. Plain `anyaicam-setup`
-    is the administrator flow (Cloud ID + activation token) a customer never
-    receives, and its Portal URL default is the appliance's own local VMS, so
-    the command carries this portal's address. The installer's product mode
-    matches the plan the customer bought; with no plan on record the
-    installer asks."""
+    The customer path (2026-10-14) is the zero-terminal link the installer
+    itself points to: the desktop "AnyAiCam Setup" page's "Link this
+    appliance" opens this portal's claim page; no code to copy. The installer
+    links to https://app.anyaicam.com unless given --portal-url, so a portal
+    at another address puts its own address on the install command. The
+    terminal `anyaicam-setup --claim` flow stays only as the fallback for a
+    computer without a desktop (it prints a code for
+    /customer/claim-appliance; its Portal URL default is the appliance's own
+    local VMS, so that command carries this portal's address). Plain
+    `anyaicam-setup` is the administrator flow and is never offered. The
+    installer's product mode matches the plan the customer bought; with no
+    plan on record the installer asks."""
     product_flag = f" --product-mode={mode}" if mode in ("local", "hybrid") else ""
     portal = PUBLIC_BASE_URL if PUBLIC_BASE_URL.startswith(("https://", "http://")) and "localhost" not in PUBLIC_BASE_URL and "127.0.0.1" not in PUBLIC_BASE_URL else ""
     portal_flag = f" --portal-url={portal}" if portal else ""
+    # install.sh accepts only an https cloud address and already defaults to
+    # the production cloud.
+    install_portal_flag = (f" --portal-url={portal}"
+                           if portal.startswith("https://") and portal != "https://app.anyaicam.com" else "")
     mode_note = "" if product_flag else " Choose <strong>local</strong> or <strong>hybrid</strong> when asked, matching your plan."
     portal_note = "" if portal_flag else " When asked for the Portal URL, enter the address of this portal, and <strong>production</strong> for the mode."
     # Verify before anything runs as root, then unpack into a NEW folder named
@@ -104757,10 +104767,15 @@ def _installer_steps_html(mode: str | None, filename: str = "", sha256: str = ""
     return (
         '<ol class="health-detail" id="vms-installer-steps" style="margin:10px 0 0;padding-left:20px;line-height:1.7">'
         + verify_step + unpack_step +
-        f'<li>Install: <code>sudo ./install.sh{escape(product_flag)}</code>, then check it with <code>sudo ./validate.sh</code>.{mode_note}</li>'
-        f'<li>Link it to this account: <code style="word-break:break-all">sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup --claim{escape(portal_flag)}</code>.{portal_note} It shows a claim code.</li>'
-        '<li>Enter that code on <a href="/customer/claim-appliance">Claim an appliance</a> and choose the site. The appliance finishes activating by itself.</li>'
+        f'<li>Install: <code style="word-break:break-all">sudo ./install.sh{escape(product_flag)}{escape(install_portal_flag)}</code>, then check it with <code>sudo ./validate.sh</code>.{mode_note}</li>'
+        '<li>Link it to this account: open <strong>AnyAiCam Setup</strong> from the computer&#39;s applications menu '
+        '(it also opens by itself the next time you sign in to the computer) and choose <strong>Link this appliance</strong>. '
+        'Sign in to this account if asked, choose the site and confirm. No codes to copy. '
+        'The appliance finishes activating by itself.</li>'
         '</ol>'
+        '<p class="health-detail" id="vms-installer-no-desktop" style="margin:8px 0 0">On a computer without a desktop, link it from a terminal instead: '
+        f'<code style="word-break:break-all">sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup --claim{escape(portal_flag)}</code>.{portal_note} '
+        'It shows a claim code; enter it on <a href="/customer/claim-appliance">Claim an appliance</a> and choose the site.</p>'
     )
 
 

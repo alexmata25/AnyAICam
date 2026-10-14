@@ -280,7 +280,7 @@ def _open_or_resume_claim(client:PortalClient,config:AgentConfig,device_id:str) 
     except PortalError as error:
         if getattr(error,'status_code',None)==409 and 'in progress' in str(error):
             raise SystemExit('A claim for this appliance is already waiting on the AnyAiCam cloud from an earlier setup run. '
-                             'It expires within an hour; run anyaicam-setup --claim again after that.') from error
+                             'It expires within 15 minutes; run anyaicam-setup --claim again after that.') from error
         raise SystemExit(f'Could not start the claim: {error}') from error
     state={'device_id':device_id,'claim_session_id':session['claim_session_id'],'device_secret':device_secret,
            'portal_origin':origin,'opened_at':datetime.now().isoformat()}

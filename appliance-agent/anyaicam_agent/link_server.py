@@ -42,6 +42,23 @@ from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_PORT = 8790
 LINK_LIMIT, LINK_WINDOW_SECONDS = 6, 60
+# What "Link this appliance" shows when no code could be prepared, by
+# HeadlessClaim.link_failure (2026-10-14): an appliance the cloud already has
+# used to get the "could not be reached / check internet" page, which sent the
+# owner to debug a working network. Static text only; nothing here is user data.
+LINK_FAILURE_PAGES = {
+    'unreachable': (503, 'AnyAiCam could not be reached just now. Check that this appliance is connected to the '
+                         'internet, then <a href="/">try again</a>.'),
+    'already_provisioned': (409, 'This appliance is already registered with an AnyAiCam account, so it cannot be '
+                                 'linked again from here. If it is yours, sign in to your AnyAiCam account: it is '
+                                 'listed with your appliances. To move it to a different account, contact AnyAiCam '
+                                 'support.'),
+    'claim_open': (409, 'A link for this appliance is already waiting to be confirmed. Finish it in the browser '
+                        'where you started it, or wait 15 minutes for it to expire and then '
+                        '<a href="/">try again</a>.'),
+    'confirming': (409, 'You have already confirmed this link. This appliance is finishing it now; wait a minute, '
+                        'then <a href="/">reload this page</a>.'),
+}
 
 
 class _LoopbackServer(ThreadingHTTPServer):
@@ -212,10 +229,11 @@ class LinkServer:
                 claim = server.headless()
                 code = claim.link_code() if claim is not None else None
                 if not code:
+                    status, message = LINK_FAILURE_PAGES.get(getattr(claim, 'link_failure', None),
+                                                             LINK_FAILURE_PAGES['unreachable'])
                     page = ('<!doctype html><meta charset="utf-8"><title>AnyAiCam Setup</title>'
-                            '<p>AnyAiCam could not be reached just now. Check that this appliance is connected to the '
-                            'internet, then <a href="/">try again</a>.</p>').encode()
-                    return self._send(503, page)
+                            f'<p>{message}</p>').encode()
+                    return self._send(status, page)
                 server.log.info('Setup page: sent the owner to AnyAiCam to link this appliance.')
                 return self._send(303, location=f'{server.portal}/claim#code={code}')
 

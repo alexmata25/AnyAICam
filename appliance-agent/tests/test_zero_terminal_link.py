@@ -302,3 +302,98 @@ class LateProvisioningTests(Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ====================================================================== why no link (2026-10-14)
+class LinkFailureReasonTests(Base):
+    """link_code() says why it returned None, so the setup page never tells
+    the owner of an appliance the cloud already has to check the internet."""
+
+    def test_already_provisioned(self):
+        self.portal.begin_answers = [_http(409, 'This device is already provisioned. Use the existing activation flow.')]
+        claim = self.claim()
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_failure, 'already_provisioned')
+
+    def test_a_claim_still_open_elsewhere(self):
+        self.portal.begin_answers = [_http(409, 'A claim is already in progress for this device.')]
+        claim = self.claim()
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_failure, 'claim_open')
+
+    def test_a_confirmation_being_redeemed(self):
+        save_claim_state(self.config, {'device_id': DEVICE_ID, 'claim_session_id': 'sess-1', 'device_secret': 'secret-1',
+                                       'portal_origin': PORTAL, 'headless': True, 'claim_proof': 'proof'})
+        claim = self.claim()
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_failure, 'confirming')
+
+    def test_unreachable_and_malformed_codes(self):
+        self.portal.begin_answers = [_http(503, 'down'), {'claim_session_id': 'sess-1', 'claim_code': 'not a code!'}]
+        claim = self.claim()
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_failure, 'unreachable')
+        save_claim_state(self.config, {'device_id': DEVICE_ID, 'claim_session_id': 'sess-1', 'device_secret': 'secret-1',
+                                       'portal_origin': PORTAL, 'headless': True})
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_failure, 'unreachable')
+
+    def test_a_refresh_refused_as_already_provisioned(self):
+        save_claim_state(self.config, {'device_id': DEVICE_ID, 'claim_session_id': 'sess-1', 'device_secret': 'secret-1',
+                                       'portal_origin': PORTAL, 'headless': True})
+        self.portal.begin_answers = [_http(409, 'This device is already provisioned.')]
+        claim = self.claim()
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_failure, 'already_provisioned')
+
+    def test_a_returned_code_clears_the_reason(self):
+        self.portal.begin_answers = [_http(503, 'down'), {'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234'}]
+        claim = self.claim()
+        self.assertIsNone(claim.link_code())
+        self.assertEqual(claim.link_code(), 'ABCD1234')
+        self.assertIsNone(claim.link_failure)
+
+
+class LinkFailurePageTests(LinkServerBase):
+    def failed_link(self, reason):
+        self.fake.code = None
+        self.fake.link_failure = reason
+        return self.link()
+
+    def test_an_already_registered_appliance_is_never_told_to_check_the_internet(self):
+        response, page = self.failed_link('already_provisioned')
+        self.assertEqual(response.status, 409)
+        self.assertIn('already registered with an AnyAiCam account', page)
+        self.assertIn('contact AnyAiCam support', page)
+        self.assertNotIn('internet', page)
+
+    def test_an_open_claim_and_a_confirmation_in_progress(self):
+        response, page = self.failed_link('claim_open')
+        self.assertEqual(response.status, 409)
+        self.assertIn('15 minutes', page)
+        response, page = self.failed_link('confirming')
+        self.assertEqual(response.status, 409)
+        self.assertIn('already confirmed', page)
+
+    def test_unknown_or_missing_reasons_keep_the_retry_page(self):
+        for reason in ('unreachable', None, 'something new'):
+            response, page = self.failed_link(reason)
+            self.assertEqual(response.status, 503, reason)
+            self.assertIn('try again', page)
+
+
+class ClaimExpiryWordingTests(unittest.TestCase):
+    """Agent copy that names the claim lifetime must match the cloud's
+    CLAIM_SESSION_TTL_MINUTES (the setup wizard used to say "within an hour")."""
+
+    def test_agent_wording_matches_the_cloud_claim_lifetime(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2]
+        cloud = (root / 'app' / 'appliance_claims.py').read_text(encoding='utf-8')
+        minutes = int(re.search(r'^CLAIM_SESSION_TTL_MINUTES = (\d+)', cloud, re.M).group(1))
+        agent = root / 'appliance-agent' / 'anyaicam_agent'
+        for name in ('setup_wizard.py', 'link_server.py', 'headless_claim.py'):
+            text = (agent / name).read_text(encoding='utf-8')
+            self.assertNotIn('within an hour', text, name)
+            for stated in re.findall(r'(\d+) minutes', text):
+                self.assertEqual(int(stated), minutes, name)
