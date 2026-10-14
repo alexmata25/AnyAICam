@@ -240,10 +240,21 @@ def reconcile(manifest: dict, identity: dict) -> dict:
     from partner_db import connection
     with connection() as db:
         rows = [dict(r) for r in db.execute("SELECT user_id,customer_id,authorization_version FROM local_customer_credentials WHERE revoked_at IS NULL")]
-    stale = [r["user_id"] for r in rows
-             if r["customer_id"] != identity.get("customer_id")
-             or not authorized_in_manifest(manifest, user_id=r["user_id"], authorization_version=r["authorization_version"], customer_id=r["customer_id"])]
-    revoked = _revoke(stale, "no_longer_authorized")
+    stale, changed = [], []
+    for r in rows:
+        if r["customer_id"] == identity.get("customer_id") and authorized_in_manifest(
+                manifest, user_id=r["user_id"], authorization_version=r["authorization_version"], customer_id=r["customer_id"]):
+            continue
+        current = next((i for i in manifest.get("identities", []) if i.get("user_id") == r["user_id"]), None)
+        still_owner = (r["customer_id"] == identity.get("customer_id") and current is not None
+                       and authorized_in_manifest(manifest, user_id=r["user_id"],
+                                                  authorization_version=int(current.get("authorization_version", -1)),
+                                                  customer_id=r["customer_id"]))
+        (changed if still_owner else stale).append(r["user_id"])
+    # Still the owner, only the authorization version moved (e.g. a password
+    # reset): say so, so the owner knows to set a new appliance password.
+    revoked = _revoke(changed, "authorization_changed") + _revoke(stale, "no_longer_authorized")
+    stale = stale + changed
     for r in rows:
         if r["user_id"] not in stale:
             _mark_verified(r["user_id"], r["authorization_version"])
