@@ -40934,6 +40934,13 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
+    # Local customer access (2026-10-14): re-confirms offline appliance passwords
+    # against the cloud's signed identity manifest (local_customer_access.py).
+    local_customer_access_task = (
+        asyncio.create_task(local_customer_access.reconcile_worker())
+        if RUNTIME_ROLE == "edge"
+        else None
+    )
     talk_down_discovery_task = (
         asyncio.create_task(talk_down_discovery.talk_down_discovery_worker())
         if RUNTIME_ROLE in {"edge", "combined"}
@@ -41129,6 +41136,8 @@ async def lifespan(app: FastAPI):
             notification_retry_task.cancel()
         if camera_config_sync_task:
             camera_config_sync_task.cancel()
+        if local_customer_access_task:
+            local_customer_access_task.cancel()
         if talk_down_discovery_task:
             talk_down_discovery_task.cancel()
         if talk_audio_relay_client_task:
@@ -41252,6 +41261,8 @@ async def lifespan(app: FastAPI):
             pending.append(notification_retry_task)
         if camera_config_sync_task:
             pending.append(camera_config_sync_task)
+        if local_customer_access_task:
+            pending.append(local_customer_access_task)
         if talk_down_discovery_task:
             pending.append(talk_down_discovery_task)
         if talk_audio_relay_client_task:
@@ -49245,6 +49256,9 @@ register_pricing_routes(app, page_shell)
 
 
 register_partner_routes(app, page_shell)
+# Local customer access (2026-10-14): owner sign-in and offline appliance password on a claimed edge.
+import local_customer_access
+local_customer_access.register_routes(app, page_shell)
 
 register_customer_registration_routes(app, page_shell, current_user, is_master_admin)
 
