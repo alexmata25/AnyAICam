@@ -10,7 +10,7 @@ install_capacity_accept() {
     local helper_src="$source_dir/capacity_accept.py"
     local path_src="$source_dir/anyaicam-capacity-accept.path"
     local service_src="$source_dir/anyaicam-capacity-accept.service"
-    local source
+    local source owner directory_mode file_mode
     for source in "$helper_src" "$path_src" "$service_src"; do
         if [[ ! -f "$source" || -L "$source" ]]; then
             echo "[ERROR] Missing or unsafe capacity-accept payload: $source" >&2
@@ -26,18 +26,17 @@ install_capacity_accept() {
             [[ -d "$source" && "$(stat -c '%u' "$source")" == 0 ]] || {
                 echo "[ERROR] Unsafe owner/type for $source" >&2; return 1;
             }
-            mode="$(stat -c '%a' "$source")"
-            (( (8#$mode & 8#022) == 0 )) || { echo "[ERROR] Unsafe permissions for $source" >&2; return 1; }
+            directory_mode="$(stat -c '%a' "$source")"
+            (( (8#$directory_mode & 8#022) == 0 )) || { echo "[ERROR] Unsafe permissions for $source" >&2; return 1; }
         fi
     done
     install -d -m 0755 -o root -g root /opt/anyaicam-agent
     install -d -m 0700 -o root -g root "$privileged_dir"
     for source in "$privileged_dir" "$systemd_dir"; do
         [[ -d "$source" ]] || { echo "[ERROR] Missing capacity-accept directory: $source" >&2; return 1; }
-        local owner mode
-        owner="$(stat -c '%u' "$source")"; mode="$(stat -c '%a' "$source")"
+        owner="$(stat -c '%u' "$source")"; directory_mode="$(stat -c '%a' "$source")"
         [[ "$owner" == 0 ]] || { echo "[ERROR] Unsafe owner for $source" >&2; return 1; }
-        (( (8#$mode & 8#022) == 0 )) || { echo "[ERROR] Unsafe permissions for $source" >&2; return 1; }
+        (( (8#$directory_mode & 8#022) == 0 )) || { echo "[ERROR] Unsafe permissions for $source" >&2; return 1; }
     done
     if [[ ! -x /usr/bin/openssl ]]; then
         apt-get update -y
@@ -51,8 +50,8 @@ install_capacity_accept() {
         if [[ -e "$source" ]]; then
             [[ -f "$source" && ! -L "$source" ]] || { echo "[ERROR] Unsafe existing capacity-accept file: $source" >&2; return 1; }
             [[ "$(stat -c '%u:%h' "$source")" == "0:1" ]] || { echo "[ERROR] Unsafe owner/link count: $source" >&2; return 1; }
-            mode="$(stat -c '%a' "$source")"
-            (( (8#$mode & 8#022) == 0 )) || { echo "[ERROR] Unsafe permissions: $source" >&2; return 1; }
+            file_mode="$(stat -c '%a' "$source")"
+            (( (8#$file_mode & 8#022) == 0 )) || { echo "[ERROR] Unsafe permissions: $source" >&2; return 1; }
         fi
     done
     install -m 0700 -o root -g root "$helper_src" "$privileged_dir/capacity_accept.py"

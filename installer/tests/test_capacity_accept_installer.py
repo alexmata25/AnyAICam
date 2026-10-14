@@ -12,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "installer"))
 from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES  # noqa: E402
 
-BASH = os.environ.get("TEST_BASH") or shutil.which("bash")
+# On Windows, System32\bash.exe is a WSL launcher, not a shell. A Linux
+# shell integration test must be explicitly supplied or run on Linux; the
+# launcher can exist while WSL execution is denied by the host policy.
+BASH = os.environ.get("TEST_BASH") or (shutil.which("bash") if os.name != "nt" else None)
 
 
 def bash_path(path):
@@ -62,6 +65,112 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         self.assertIn("ExecStart=/usr/bin/python3 -I /opt/anyaicam-agent/privileged/capacity_accept.py\n", unit)
         self.assertNotIn("--accept-migrated-snapshot", unit)
 
+    def test_capacity_data_config_exists_before_capacity_service_can_start(self):
+        step = (ROOT / "installer/16-capacity-accept.sh").read_text(encoding="utf-8")
+        ensure = step.split("ensure_capacity_accept_data_config_dir() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('mkdir -p -- "$data_config_dir"', ensure)
+        self.assertIn('chmod 0750 -- "$data_config_dir"', ensure)
+        self.assertIn('[[ -L "$cursor" ]]', ensure)
+        self.assertIn('if [[ $EUID -ne 0 ]]', (ROOT / "installer/01-preflight.sh").read_text(encoding="utf-8"))
+        self.assertIn('ensure_capacity_accept_data_config_dir || return 1', step)
+        self.assertLess(step.index('ensure_capacity_accept_data_config_dir || return 1'),
+                        step.index('install_capacity_accept "$AGENT_PAYLOAD_DIR/system"'))
+        self.assertIn('ReadWritePaths=/etc/anyaicam-update /var/lib/anyaicam/vms/data-config',
+                      (ROOT / "appliance-agent/system/anyaicam-capacity-accept.service").read_text(encoding="utf-8"))
+
+    def test_capacity_helper_permission_modes_are_function_scoped(self):
+        library = (ROOT / "appliance-agent/scripts/lib-capacity-accept.sh").read_text(encoding="utf-8")
+        install_function = library.split("install_capacity_accept() {", 1)[1].split("\n}\n", 1)[0]
+        assignments = [line for line in install_function.splitlines()
+                       if line.lstrip().startswith("mode=")]
+        self.assertEqual(assignments, [], "permission checks must not write the caller's dynamic mode variable")
+        self.assertIn("local source owner directory_mode file_mode", install_function)
+
+    @unittest.skipUnless(BASH and os.name != "nt", "Linux bash is required for capacity helper scope regression")
+    def test_capacity_helper_does_not_clobber_callers_install_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            opt = root / "opt"
+            etc = root / "etc"
+            (opt / "anyaicam-agent" / "privileged").mkdir(parents=True)
+            (etc / "systemd" / "system").mkdir(parents=True)
+            openssl = root / "openssl"
+            openssl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            openssl.chmod(0o755)
+
+            # Redirect every fixed installation path into this temporary
+            # fixture; the real host /opt, /etc, and systemd are untouched.
+            library = (ROOT / "appliance-agent/scripts/lib-capacity-accept.sh").read_text(encoding="utf-8")
+            library = library.replace("/opt/anyaicam-agent/privileged", bash_path(opt / "anyaicam-agent/privileged"))
+            library = library.replace("/opt/anyaicam-agent", bash_path(opt / "anyaicam-agent"))
+            library = library.replace("/opt", bash_path(opt))
+            library = library.replace("/etc/systemd/system", bash_path(etc / "systemd/system"))
+            library = library.replace("/etc/systemd", bash_path(etc / "systemd"))
+            library = library.replace("/etc", bash_path(etc))
+            library = library.replace("/usr/bin/openssl", bash_path(openssl))
+            library_path = root / "lib-capacity-accept.sh"
+            library_path.write_text(library, encoding="utf-8")
+
+            script = f'''\
+set -euo pipefail
+source {shlex.quote(bash_path(library_path))}
+stat() {{
+  case "$2" in
+    %u) printf '0\\n' ;;
+    %a) printf '755\\n' ;;
+    %u:%h) printf '0:1\\n' ;;
+    *) return 2 ;;
+  esac
+}}
+install() {{
+  if [[ "$1" == "-d" ]]; then mkdir -p -- "${{@: -1}}"; fi
+}}
+systemctl() {{ :; }}
+caller() {{
+  local mode=install
+  install_capacity_accept {shlex.quote(bash_path(ROOT / "appliance-agent/system"))}
+  printf 'mode=%s\\n' "$mode"
+}}
+caller
+'''
+            result = subprocess.run([BASH, "-c", script], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("mode=install", result.stdout)
+            self.assertNotIn("mode=755", result.stdout)
+
+    @unittest.skipUnless(BASH and os.name != "nt", "Linux bash is required for capacity directory ordering regression")
+    def test_clean_capacity_step_prepares_secure_directory_before_service_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "var/lib/anyaicam/vms/data-config"
+            agent_scripts = root / "agent/scripts"
+            agent_scripts.mkdir(parents=True)
+            (agent_scripts / "lib-capacity-accept.sh").write_text("""\
+install_capacity_accept() { [[ -d "$VMS_DATA_CONFIG_DIR" ]] && [[ ! -L "$VMS_DATA_CONFIG_DIR" ]]; }
+""", encoding="utf-8")
+            step = ROOT / "installer/16-capacity-accept.sh"
+            script = f'''\
+set -euo pipefail
+VMS_DATA_CONFIG_DIR={shlex.quote(bash_path(data_dir))}
+AGENT_PAYLOAD_DIR={shlex.quote(bash_path(root / "agent"))}
+INSTALL_STATE=clean
+systemctl() {{
+  if [[ "$*" == "start anyaicam-capacity-accept.service" ]]; then
+    [[ -d "$VMS_DATA_CONFIG_DIR" && ! -L "$VMS_DATA_CONFIG_DIR" ]]
+    mode="$(stat -c '%a' "$VMS_DATA_CONFIG_DIR")"
+    (( (8#$mode & 8#022) == 0 ))
+    printf 'service-saw-dir:%s\\n' "$mode"
+  fi
+}}
+source {shlex.quote(bash_path(step))}
+install_capacity_accept_step
+'''
+            result = subprocess.run([BASH, "-c", script], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(data_dir.is_dir())
+            self.assertEqual(os.stat(data_dir).st_mode & 0o777, 0o750)
+            self.assertIn("service-saw-dir:750", result.stdout)
+
     def test_helper_unit_is_fixed_root_isolated_and_rate_limited(self):
         unit = (ROOT / "appliance-agent/system/anyaicam-capacity-accept.service").read_text(encoding="utf-8")
         path_unit = (ROOT / "appliance-agent/system/anyaicam-capacity-accept.path").read_text(encoding="utf-8")
@@ -93,6 +202,7 @@ class CapacityAcceptanceReleaseWiringTests(unittest.TestCase):
         library = (ROOT / "appliance-agent/scripts/lib-capacity-accept.sh").read_text(encoding="utf-8")
         self.assertIn("Pending signed camera-capacity snapshot was not accepted", library)
 
+    @unittest.skipUnless(BASH, "bash is required for installer sub-installer integration")
     def test_full_installer_passes_deferral_to_agent_subinstaller(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "agent-argv"
