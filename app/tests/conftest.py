@@ -6,7 +6,15 @@ memory for the whole process (see its module docstring). Every test here
 runs in one pytest process, so without a reset a configuration published
 by one test's edge sync would be served to an unrelated later test.
 """
+import os
+
 import pytest
+
+# product_mode ends the VMS process when a persisted mode change makes a
+# running flag stale, and it detects the appliance container by /.dockerenv
+# -- which a containerized test run also has. Never let a test end pytest:
+# self-restart is off unless a test turns it on (with an injected terminate).
+os.environ.setdefault("ANYAICAM_PRODUCT_MODE_SELF_RESTART", "false")
 
 
 @pytest.fixture(autouse=True)

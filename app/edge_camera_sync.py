@@ -603,4 +603,11 @@ async def camera_configuration_sync_worker() -> None:
         except Exception as error:
             sync_state["last_error"] = str(error)
             logger.warning("edge_camera_sync.worker_iteration_failed error=%s", error)
+        # Every cycle, not only when this one persisted the mode: a cycle
+        # that persisted it and then failed later must still apply it. After
+        # the cycle, so its camera rows and capacity are written first.
+        try:
+            product_mode.restart_if_running_flags_stale()
+        except Exception as error:
+            logger.warning("edge_camera_sync.product_mode_restart_failed error=%s", error)
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)

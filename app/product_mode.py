@@ -60,6 +60,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
+import threading
 from pathlib import Path
 
 logger = logging.getLogger("anyaicam.product_mode")
@@ -153,6 +155,15 @@ def resolve_cloud_flag(env_var: str, *, legacy_default: bool = False) -> bool:
     governed flag ON. No mode configured falls back to legacy_default,
     this flag's own original hardcoded literal (every one of them was
     "false" before this module existed)."""
+    value = _resolve(env_var, legacy_default)
+    # The first resolution is the one the calling module froze into its
+    # constant at import (see FLAG_REGISTRY's hot_reloadable note), so it is
+    # what this process is actually running with.
+    _RESOLVED_AT_START.setdefault(env_var, (legacy_default, value))
+    return value
+
+
+def _resolve(env_var: str, legacy_default: bool) -> bool:
     raw = os.environ.get(env_var)
     if raw is not None and raw.strip() != "":
         return raw.strip().lower() == "true"
@@ -162,6 +173,82 @@ def resolve_cloud_flag(env_var: str, *, legacy_default: bool = False) -> bool:
     if mode == "hybrid":
         return True
     return legacy_default
+
+
+# env_var -> (legacy_default, value this process started with).
+_RESOLVED_AT_START: dict[str, tuple[bool, bool]] = {}
+
+# Applying a mode change (2026-10-14). The governed flags are frozen at
+# import, and the cloud-queued restart_vms runs `docker compose up -d`,
+# which leaves the container running when only product_mode.json (a bind
+# mount) changed -- so a Local->Hybrid upgrade never took effect. Instead
+# the VMS ends its own process once the mode it just persisted changes a
+# flag it is running with; the compose service's `restart: unless-stopped`
+# starts it again and the flags are re-read. Only done where that
+# supervisor exists: inside the appliance's Docker container, or when this
+# variable says so explicitly ("false" turns it off).
+SELF_RESTART_ENV = "ANYAICAM_PRODUCT_MODE_SELF_RESTART"
+# A graceful shutdown that is stuck (e.g. on a worker thread) must not leave
+# the appliance half-stopped forever: exit hard after this many seconds.
+SELF_RESTART_GRACE_SECONDS = 30.0
+_DOCKER_MARKER = Path("/.dockerenv")
+_UNSUPPORTED_LOGGED: list[str] | None = None
+
+
+def stale_running_flags() -> list[str]:
+    """Governed flags whose value would differ from the one this process
+    started with, if it were restarted now. An explicit env var override
+    never changes with the mode, so it never appears here."""
+    return sorted(
+        env_var for env_var, (legacy_default, started) in _RESOLVED_AT_START.items()
+        if _resolve(env_var, legacy_default) != started
+    )
+
+
+def _self_restart_supported() -> bool:
+    setting = os.environ.get(SELF_RESTART_ENV, "").strip().lower()
+    if setting in ("false", "0", "no", "off"):
+        return False
+    if setting in ("true", "1", "yes", "on"):
+        return True
+    return _DOCKER_MARKER.exists()
+
+
+def _terminate_process() -> None:
+    # Hard fallback first, as a daemon timer, so it cannot itself keep the
+    # interpreter alive; then the same SIGTERM `docker stop` would send,
+    # which uvicorn handles as a graceful shutdown.
+    timer = threading.Timer(SELF_RESTART_GRACE_SECONDS, os._exit, args=(75,))
+    timer.daemon = True
+    timer.start()
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def restart_if_running_flags_stale(*, terminate=None) -> list[str]:
+    """Called after a sync persisted a new mode. Returns the stale flags;
+    when there are any and a supervisor will start the VMS again, ends this
+    process so the new mode applies. Without a supervisor it only logs:
+    the cloud's restart_vms command (or an operator) has to restart it."""
+    global _UNSUPPORTED_LOGGED
+    stale = stale_running_flags()
+    if not stale:
+        return []
+    if not _self_restart_supported():
+        if _UNSUPPORTED_LOGGED != stale:
+            logger.warning(
+                "product_mode.restart_required stale_flags=%s self_restart=unavailable "
+                "(not in the appliance container; restart the VMS to apply the new mode)",
+                ",".join(stale),
+            )
+            _UNSUPPORTED_LOGGED = stale
+        return stale
+    logger.warning(
+        "product_mode.self_restart mode=%s stale_flags=%s "
+        "(ending the VMS process; Docker restarts it with the new mode)",
+        current_mode() or "unset", ",".join(stale),
+    )
+    (terminate or _terminate_process)()
+    return stale
 
 
 # Documents every flag resolve_cloud_flag() governs -- for introspection
