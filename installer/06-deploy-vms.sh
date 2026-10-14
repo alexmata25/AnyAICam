@@ -105,19 +105,28 @@ ensure_vms_env() {
     # "local" default forever, regardless of this line ever running.
     env_request+=("default ANYAICAM_ENV=production")
 
-    # Live View staging transport (2026-09-13): the existing S3/CloudFront
-    # live-relay worker (app/live_relay_uploader.py) already self-gates on
-    # this flag and defaults OFF in the app if the key is absent entirely
-    # -- this line only makes that default explicit and present in every
-    # installed appliance's own env file, the same way ANYAICAM_RUNTIME_
-    # ROLE/ANYAICAM_ENV above do, so a future repair-install never has to
-    # guess whether an existing appliance already has an opinion here.
-    # Never overwrites an existing value -- flipping this to true for a
-    # specific pilot appliance (alongside setting AWS_REGION and the
-    # cloud-side live_relay_pilot DB flag) is a separate, explicit,
-    # per-appliance decision, not something this installer makes for
-    # every appliance by default.
-    env_request+=("default ANYAICAM_LIVE_RELAY_ENABLED=false")
+    # Live relay (2026-10-14): ANYAICAM_LIVE_RELAY_ENABLED is a product-mode
+    # flag (app/product_mode.py): Local and unset modes resolve it off,
+    # Hybrid on. The installer used to write an explicit `false` here, and an
+    # explicit value always beats the mode, so Hybrid could never turn live
+    # relay on. It is no longer written. Even when on, the worker uploads
+    # only for cameras the cloud activates (start_live_relay, pilot-gated in
+    # the cloud). Existing appliances lose that installer-written `false`
+    # once, on their next install/repair; an operator's `true` is kept, and
+    # a `false` set again after the migration marker exists is kept too.
+    # Read through the same safe helper; 3 = no file yet (fresh install).
+    # Any other failure skips the migration this time rather than marking
+    # it done; the update below then reports the unsafe file as before.
+    local current_env="" read_status=0
+    current_env="$(printf 'op read\npath %s\n' "$VMS_ENV_FILE" | agent_file 2>/dev/null)" || read_status=$?
+    if [[ "$read_status" -eq 0 || "$read_status" -eq 3 ]] \
+        && ! grep -qx 'ANYAICAM_LIVE_RELAY_DEFAULT_MIGRATED=1' <<<"$current_env"; then
+        if grep -qx 'ANYAICAM_LIVE_RELAY_ENABLED=false' <<<"$current_env"; then
+            env_request+=("remove ANYAICAM_LIVE_RELAY_ENABLED")
+        fi
+        env_request+=("default ANYAICAM_LIVE_RELAY_DEFAULT_MIGRATED=1")
+    fi
+    current_env=""
 
     # On-device analytics workers whose code default is off (2026-09-25).
     # Advanced Analytics grants People Counting and LPR per camera from the

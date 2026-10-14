@@ -635,15 +635,23 @@ printf 'ANYAICAM_ENV=staging\n' > "$VMS_ENV_FILE"
 ensure_vms_env >/dev/null 2>&1
 assert_eq "an existing, customized ANYAICAM_ENV value is preserved across reinstall" "ANYAICAM_ENV=staging" "$(grep '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null)"
 
-# 14d2. Live View staging transport (2026-09-13): ANYAICAM_LIVE_RELAY_ENABLED
-#      defaults to false on a fresh env file -- the S3/CloudFront relay
-#      worker must never attempt to run on a brand-new appliance that has
-#      no AWS configuration and is not part of the pilot -- and, like
-#      ANYAICAM_ENV/RUNTIME_ROLE above, an operator-flipped true is never
-#      clobbered back to false by a later reinstall/repair.
+# 14d2. Live relay (2026-10-14): ANYAICAM_LIVE_RELAY_ENABLED is decided by
+#      product mode (Local/unset off, Hybrid on), so the installer no longer
+#      writes it -- an explicit value would beat Hybrid. The `false` older
+#      installers wrote is removed once (marker), an operator's `true` is
+#      kept, and a `false` set again after the migration is kept.
 reset_fixture
 ensure_vms_env >/dev/null 2>&1
-assert_eq "ANYAICAM_LIVE_RELAY_ENABLED=false is written to a fresh env file" "1" "$(grep -c '^ANYAICAM_LIVE_RELAY_ENABLED=false$' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "a fresh env file has no ANYAICAM_LIVE_RELAY_ENABLED line (the mode decides)" "0" "$(grep -c '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "a fresh env file records the live-relay migration as done" "1" "$(grep -c '^ANYAICAM_LIVE_RELAY_DEFAULT_MIGRATED=1$' "$VMS_ENV_FILE" 2>/dev/null)"
+
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_ENV=production\nANYAICAM_LIVE_RELAY_ENABLED=false\n' > "$VMS_ENV_FILE"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "the installer-written ANYAICAM_LIVE_RELAY_ENABLED=false is removed on repair" "0" "$(grep -c '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "other keys survive the live-relay migration" "ANYAICAM_ENV=production" "$(grep '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "the live-relay migration is marked done" "1" "$(grep -c '^ANYAICAM_LIVE_RELAY_DEFAULT_MIGRATED=1$' "$VMS_ENV_FILE" 2>/dev/null)"
 
 reset_fixture
 mkdir -p "$CONFIG_DIR"
@@ -651,6 +659,12 @@ printf 'ANYAICAM_LIVE_RELAY_ENABLED=true\n' > "$VMS_ENV_FILE"
 ensure_vms_env >/dev/null 2>&1
 assert_eq "an operator-enabled ANYAICAM_LIVE_RELAY_ENABLED=true is preserved across reinstall" "ANYAICAM_LIVE_RELAY_ENABLED=true" "$(grep '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
 assert_eq "exactly one ANYAICAM_LIVE_RELAY_ENABLED line exists (never duplicated)" "1" "$(grep -c '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
+
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_LIVE_RELAY_DEFAULT_MIGRATED=1\nANYAICAM_LIVE_RELAY_ENABLED=false\n' > "$VMS_ENV_FILE"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "a false set by an operator after the migration is kept" "ANYAICAM_LIVE_RELAY_ENABLED=false" "$(grep '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
 
 # 14e/14f. ANYAICAM_BUILD_ID and ANYAICAM_VMS_COMMIT are installer-owned
 #      build identity -- unlike ANYAICAM_ENV/RUNTIME_ROLE, these two ARE

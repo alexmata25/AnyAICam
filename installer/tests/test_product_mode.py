@@ -70,7 +70,7 @@ diff <(sort "$tmp/before") <(sort "$VMS_ENV_FILE")
         implies for a given flag. Any _ENABLED line present in the file
         after ensure_vms_env() runs must be identical regardless of
         mode, proving it came from ensure_vms_env()'s own unrelated,
-        mode-independent defaults (e.g. ANYAICAM_LIVE_RELAY_ENABLED),
+        mode-independent defaults (e.g. ANYAICAM_LPR_ENABLED),
         never from this mode selection."""
         enabled_lines_by_mode = {}
         for mode in ("local", "hybrid"):
