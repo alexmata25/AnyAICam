@@ -257,12 +257,12 @@ def test_reconcile_revokes_password_and_sessions_when_access_changes(env):
                    "VALUES('s1','u-owner',?,'customer_owner','cookie','now','now','2999-01-01')", (OWNER_EMAIL,))
     cloud.sql("UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id='u-owner'")  # e.g. a password reset
     assert lca.reconcile(lca.fetch_verified_manifest(identity), identity)["revoked"] == 1
-    assert _edge_rows("SELECT revoked_reason FROM local_customer_credentials")[0]["revoked_reason"] == "no_longer_authorized"
+    assert _edge_rows("SELECT revoked_reason FROM local_customer_credentials")[0]["revoked_reason"] == "authorization_changed"
     assert _edge_rows("SELECT revoked_at FROM user_sessions WHERE id='s1'")[0]["revoked_at"]
     cloud.online = False
     with pytest.raises(lca.AccessDenied):
         lca.sign_in(OWNER_EMAIL, APPLIANCE_PW)
-    assert lca.status("u-owner")["revoked_reason"] == "no_longer_authorized"
+    assert lca.status("u-owner")["revoked_reason"] == "authorization_changed"
 
 
 def test_online_sign_in_after_an_authorization_change_turns_the_old_appliance_password_off(env):
@@ -362,3 +362,11 @@ def test_an_operator_account_with_the_same_email_is_never_converted(env):
         lca.sign_in(OWNER_EMAIL, OWNER_PW)
     assert denied.value.reason == "operator_email_conflict"
     assert _edge_rows("SELECT role FROM partner_users WHERE id='local-admin'")[0]["role"] == "administrator"
+
+
+def test_a_revoked_grant_is_reported_as_no_longer_authorized(env):
+    cloud, identity = env
+    lca.enroll(OWNER_SESSION, OWNER_PW, APPLIANCE_PW, user_id="u-owner")
+    cloud.sql("UPDATE identity_grants SET revoked_at='2026-10-14' WHERE user_id='u-owner'")
+    lca.reconcile(lca.fetch_verified_manifest(identity), identity)
+    assert lca.status("u-owner")["revoked_reason"] == "no_longer_authorized"
