@@ -1,5 +1,6 @@
 from cloud_config import settings as cloud_settings
 import json
+from urllib.parse import quote as _url_quote
 import logging
 import secrets
 from datetime import datetime, timedelta
@@ -600,6 +601,18 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             for n in range(configured_count+1,max(licensed_slots,configured_count)+1)
         )
         camera_cards=(real_camera_cards+placeholder_slot_cards) or '<div class="empty">No camera slots are available on this account yet.</div>'
+        # Add camera (1.2.6 acceptance): with every camera removed, /customer-live
+        # redirects here, and the free slots offered no way forward. Owners with an
+        # activated appliance and a free licensed slot get the same discovery step
+        # the Live tab's Add camera uses.
+        add_camera=''
+        if identity['role']=='customer_owner' and activated and licensed_slots>configured_count:
+            add_appliance=appliance_id
+            if not add_appliance:
+                owned=rows('SELECT id FROM appliances WHERE customer_id=?',(customer['id'],))
+                add_appliance=owned[0]['id'] if len(owned)==1 else ''
+            add_href='/customer/setup?step=4'+(f'&appliance={_url_quote(add_appliance,safe="")}' if add_appliance else '')
+            add_camera=f'<a class="action-button" id="customer-account-add-camera" href="{escape(add_href,quote=True)}">Add camera</a>'
 
         content=f'''<header class="topbar">
             <div>
@@ -616,6 +629,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                     <h2>Your cameras</h2>
                     <div class="health-detail">{configured_count} of {licensed_slots} camera{'s' if licensed_slots!=1 else ''} configured &middot; Live video streams securely from your AnyAiCam appliance.</div>
                 </div>
+                {add_camera}
             </div>
             <div class="feature-grid">{camera_cards}</div>
         </section>'''
