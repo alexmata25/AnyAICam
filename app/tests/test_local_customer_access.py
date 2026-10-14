@@ -205,13 +205,13 @@ def test_offline_sign_in_with_the_appliance_password(env):
     lca.enroll(OWNER_SESSION, OWNER_PW, APPLIANCE_PW, user_id="u-owner")
     cloud.online = False
     assert lca.sign_in(OWNER_EMAIL, APPLIANCE_PW)["mode"] == "offline"
-    for password, reason in ((OWNER_PW, "invalid_offline"), ("guess-guess-guess", "invalid_offline")):
+    answers = set()
+    for email, password in ((OWNER_EMAIL, OWNER_PW), (OWNER_EMAIL, "guess-guess-guess"), ("viewer@example.test", "Viewer-Pass-123"),
+                            ("nobody@example.test", "Whatever-123")):
         with pytest.raises(lca.AccessDenied) as denied:
-            lca.sign_in(OWNER_EMAIL, password)  # the cloud password never works offline: it is not stored
-        assert denied.value.reason == reason
-    with pytest.raises(lca.AccessDenied) as unknown:
-        lca.sign_in("viewer@example.test", "Viewer-Pass-123")
-    assert unknown.value.reason == "cloud_unavailable"
+            lca.sign_in(email, password)  # the cloud password never works offline: it is not stored
+        answers.add((denied.value.status, denied.value.detail, denied.value.reason))
+    assert answers == {(503, lca.OFFLINE_REFUSED, "invalid_offline")}  # no account enumeration offline
 
 
 def test_offline_sign_in_without_enrollment_is_refused(env):
@@ -219,7 +219,7 @@ def test_offline_sign_in_without_enrollment_is_refused(env):
     cloud.online = False
     with pytest.raises(lca.AccessDenied) as denied:
         lca.sign_in(OWNER_EMAIL, OWNER_PW)
-    assert denied.value.status == 503 and denied.value.reason == "cloud_unavailable"
+    assert denied.value.status == 503 and denied.value.reason == "invalid_offline"
 
 
 def test_offline_sign_in_stops_after_the_offline_grace_window(env, monkeypatch):
@@ -284,7 +284,7 @@ def test_reclaim_to_another_customer_invalidates_the_appliance_password(env, mon
     cloud.online = False
     with pytest.raises(lca.AccessDenied) as denied:
         lca.sign_in(OWNER_EMAIL, APPLIANCE_PW)
-    assert denied.value.reason == "cloud_unavailable"  # not usable: bound to the previous customer
+    assert denied.value.reason == "invalid_offline"  # not usable: bound to the previous customer
 
 
 def test_owner_can_turn_appliance_sign_in_off(env):
@@ -352,3 +352,13 @@ def test_revocation_disables_the_cached_local_account(env):
     lca.reconcile(lca.fetch_verified_manifest(identity), identity)
     row = _edge_rows("SELECT approved,account_status FROM partner_users WHERE id='u-owner'")[0]
     assert (row["approved"], row["account_status"]) == (0, "revoked")
+
+
+def test_an_operator_account_with_the_same_email_is_never_converted(env):
+    with connection() as db:
+        db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) "
+                   "VALUES('local-admin',NULL,?,'Admin','administrator',?,1,'now')", (OWNER_EMAIL, password_hash("Local-Admin-Pass-1")))
+    with pytest.raises(lca.AccessDenied) as denied:
+        lca.sign_in(OWNER_EMAIL, OWNER_PW)
+    assert denied.value.reason == "operator_email_conflict"
+    assert _edge_rows("SELECT role FROM partner_users WHERE id='local-admin'")[0]["role"] == "administrator"
