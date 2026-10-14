@@ -16,7 +16,8 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(ignore_cleanup_errors=True); root=Path(self.temp.name)
         self.db_path=root/"partner.db"; self.users_file=root/"must-not-exist.json"
-        os.environ["ANYAICAM_PARTNER_DB"]=str(self.db_path)
+        # Restored in tearDown: a leaked path broke later suites that read it with setdefault (1.2.6 acceptance).
+        self.env_patch=patch.dict(os.environ,{"ANYAICAM_PARTNER_DB":str(self.db_path)}); self.env_patch.start()
         self.db_override=override_target(sqlite_path=self.db_path); self.db_override.__enter__(); initialize_database()
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES('partner-a','Partner A','approved','real','now')")
@@ -29,7 +30,7 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
         self.client=TestClient(main.app,base_url="http://testserver",follow_redirects=False)
         self.master={"master":True,"email":"master@example.test","partner_id":None}
     def tearDown(self):
-        self.client.close(); self.users_patch.stop(); self.settings_patch.stop(); self.db_override.__exit__(None,None,None); self.temp.cleanup()
+        self.client.close(); self.users_patch.stop(); self.settings_patch.stop(); self.db_override.__exit__(None,None,None); self.env_patch.stop(); self.temp.cleanup()
     def rows(self,sql,args=()):
         db=sqlite3.connect(self.db_path); db.row_factory=sqlite3.Row
         try:return [dict(x) for x in db.execute(sql,args).fetchall()]
