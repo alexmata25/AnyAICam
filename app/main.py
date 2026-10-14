@@ -144099,6 +144099,60 @@ def _fix_cloud_recording_audio_for_playback(recording_id: str, s3_key: str) -> P
                     pass
 
 
+LOCAL_RECORDING_SETTLED_SECONDS = 20  # a segment still being written is never cached
+
+
+def _customer_local_recording_path(s3_key: str, camera_number) -> Path | None:
+    """The same checks as /local: a bare camera{n}_*.mkv file in that camera's folder."""
+    filename = Path(str(s3_key)).name
+    if filename != Path(filename).name or not filename.endswith(".mkv") or not filename.startswith(f"camera{camera_number}_"):
+        return None
+    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    return local_path if local_path.is_file() else None
+
+
+def _local_recording_mp4_for_playback(recording_id: str, local_path: Path) -> Path | None:
+    """Browser-playable MP4 of a finished local MKV segment: video stream
+    copy, audio (if any) to 48 kHz AAC aligned to t=0 (the same audio fix as
+    _fix_cloud_recording_audio_for_playback), cached by recording_id."""
+    try:
+        if time.time() - local_path.stat().st_mtime < LOCAL_RECORDING_SETTLED_SECONDS:
+            return None  # still recording: /local serves it as is
+    except OSError:
+        return None
+    RECORDING_MEDIA_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+    cache_path = RECORDING_MEDIA_CACHE_FOLDER / f"{recording_id}.mp4"
+    if cache_path.is_file() and cache_path.stat().st_size > 0:
+        return cache_path
+    with _recording_media_cache_lock(recording_id):
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path
+        tmp_out = cache_path.with_name(cache_path.name + ".tmp")
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(local_path), "-map", "0:v:0", "-map", "0:a:0?",
+                 "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-af", "aresample=async=1:first_pts=0",
+                 "-movflags", "+faststart", "-f", "mp4", str(tmp_out)],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                logging.getLogger("anyaicam.recording_media").error(
+                    "recording_media.local_remux_failed recording_id=%s stderr=%s",
+                    recording_id, result.stderr.decode("utf-8", "replace")[-2000:])
+                return None
+            os.replace(tmp_out, cache_path)
+            _evict_recording_media_cache_if_full()
+            return cache_path
+        except Exception:
+            logging.getLogger("anyaicam.recording_media").exception("recording_media.local_remux_error recording_id=%s", recording_id)
+            return None
+        finally:
+            try:
+                tmp_out.unlink()
+            except FileNotFoundError:
+                pass
+
+
 @app.get("/api/customer/recordings/{camera_id}/{recording_id}/media")
 def customer_recording_media(camera_id: str, recording_id: str, request: Request):
     """Serves a browser-safe copy of a customer recording for the
@@ -144142,6 +144196,18 @@ def customer_recording_media(camera_id: str, recording_id: str, request: Request
             )
         # Remux failed -- fail open to the original passthrough
         # redirect rather than a dead player.
+
+    # Local-appliance (.mkv) recordings (2026-10-14, local customer access):
+    # browsers do not play Matroska (Chromium refuses it with
+    # MEDIA_ERR_SRC_NOT_SUPPORTED, Safari/iOS never did), so the customer's
+    # Playback on the appliance got a dead player. Remux a finished segment
+    # to MP4 (video stream copy) through the same cache; fail open to /local.
+    if row and row["s3_key"] and str(row["s3_key"]).lower().endswith(".mkv") and row["camera_number"] is not None:
+        local_path = _customer_local_recording_path(row["s3_key"], row["camera_number"])
+        mp4_path = _local_recording_mp4_for_playback(recording_id, local_path) if local_path else None
+        if mp4_path is not None:
+            return FileResponse(mp4_path, media_type="video/mp4", filename=f"{recording_id}.mp4",
+                                content_disposition_type="inline")
 
     url = _customer_recording_url(camera_id, recording_id)
     if not url:

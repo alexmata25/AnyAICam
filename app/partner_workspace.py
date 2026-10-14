@@ -1,5 +1,6 @@
 from cloud_config import settings as cloud_settings
 import json
+import os
 from urllib.parse import quote as _url_quote
 import logging
 import secrets
@@ -1509,6 +1510,10 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.delete('/api/customer/cameras/{camera_id}')
     def remove_customer_camera(request: Request,camera_id: str) -> dict:
+        # Cameras belong to the cloud account: removing one on the appliance would
+        # only touch its local copy (2026-10-14, local customer access).
+        if os.environ.get('ANYAICAM_RUNTIME_ROLE','').strip().lower()=='edge':
+            raise HTTPException(status_code=409,detail='Remove cameras in the AnyAiCam portal (app.anyaicam.com); this appliance follows it.')
         # RDM camera-quota requirement: removing an active camera must
         # free its licensed slot (device_key IS NOT NULL is exactly what
         # both provisioning-enforcement gates and list_customer_cameras()'s
