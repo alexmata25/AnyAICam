@@ -1330,6 +1330,19 @@ CREATE TABLE IF NOT EXISTS hardware_checkouts(
 CREATE UNIQUE INDEX IF NOT EXISTS idx_hardware_checkouts_session ON hardware_checkouts(stripe_checkout_session_id);
 CREATE INDEX IF NOT EXISTS idx_hardware_checkouts_email ON hardware_checkouts(email);
 '''),
+    # Stripe test/live separation (stripe_customer_mode.py, 2026-10-15): the
+    # mode each stored Stripe customer belongs to (learned once from Stripe's
+    # own livemode field) and one canonical customer per account AND mode.
+    # stripe_customer_bindings and every entitlement row stay untouched. Additive.
+    ('20261015_stripe_customer_modes','''
+CREATE TABLE IF NOT EXISTS stripe_customer_modes(
+ stripe_customer_id TEXT PRIMARY KEY, livemode INTEGER NOT NULL, source TEXT NOT NULL, verified_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stripe_customer_mode_bindings(
+ customer_id TEXT NOT NULL, livemode INTEGER NOT NULL, stripe_customer_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+ PRIMARY KEY(customer_id, livemode)
+);
+'''),
 ]
 
 

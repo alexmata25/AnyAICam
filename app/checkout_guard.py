@@ -88,13 +88,32 @@ def bind_stripe_customer(customer_id: str, stripe_customer_id: str) -> bool:
     return bound_stripe_customer(customer_id) == stripe_customer_id
 
 
+BILLING_UNVERIFIED = "Billing is temporarily unavailable. Please try again in a few minutes."
+
+
 def canonical_stripe_customer(customer_id: str, *, email: str | None) -> str:
+    """The account's one Stripe customer FOR THE CURRENT STRIPE MODE (2026-10-15,
+    stripe_customer_mode): a customer of the other mode is never reused, and no
+    new customer is created while a stored one's mode is unknown (fail closed:
+    a transient Stripe error never produces a duplicate customer)."""
     import stripe_state
+    import stripe_customer_mode as modes
     from customer_billing import stripe_customer_ids_for_customer
-    bound = bound_stripe_customer(customer_id)
+    mode_known = modes.current_livemode() is not None
+    bound = modes.mode_binding(customer_id)
     if bound:
         return bound
-    known = stripe_customer_ids_for_customer(customer_id)
+    legacy_bound = bound_stripe_customer(customer_id)
+    if legacy_bound:
+        same = modes.in_current_mode(legacy_bound, lookup=True)
+        if same is None and mode_known:
+            raise HTTPException(status_code=503, detail=BILLING_UNVERIFIED)
+        if same is not False:
+            modes.bind_for_current_mode(customer_id, legacy_bound)
+            return legacy_bound
+    known = stripe_customer_ids_for_customer(customer_id, lookup=True)
+    if mode_known and any(modes.in_current_mode(cid, lookup=False) is None for cid in known):
+        raise HTTPException(status_code=503, detail=BILLING_UNVERIFIED)
     if len(known) > 1:
         raise HTTPException(status_code=409, detail=NEEDS_ATTENTION)
     if known:
@@ -105,12 +124,19 @@ def canonical_stripe_customer(customer_id: str, *, email: str | None) -> str:
         fields = [("metadata[anyaicam_customer_id]", customer_id)]
         if email:
             fields.insert(0, ("email", email))
-        created = _main().stripe_api_post("/v1/customers", fields, idempotency_key=f"anyaicam-customer-{customer_id}")
+        # The live-mode customer gets its own key: a test-mode customer was made with the original one.
+        suffix = "-live" if modes.current_livemode() else ""
+        created = _main().stripe_api_post("/v1/customers", fields, idempotency_key=f"anyaicam-customer-{customer_id}{suffix}")
         candidate = str((created or {}).get("id") or "")
         if not candidate.startswith("cus_"):
             raise HTTPException(status_code=502, detail="Stripe did not return a customer. Please try again.")
+    if legacy_bound:  # the original binding is the other mode's customer: never rewritten
+        if not modes.bind_for_current_mode(customer_id, candidate):
+            raise HTTPException(status_code=409, detail=NEEDS_ATTENTION)
+        return candidate
     if not bind_stripe_customer(customer_id, candidate):
         raise HTTPException(status_code=409, detail=NEEDS_ATTENTION)
+    modes.bind_for_current_mode(customer_id, candidate)
     return candidate
 
 
