@@ -156,6 +156,8 @@ def test_owner_case_contract_shape_appliance_included_never_stand_alone(license_
     assert body["license"]["kind"] == "appliance_included" and body["license"]["cameras"] == 8
     assert body["license"]["status"] == "active"
     assert "stand-alone" not in body["license"]["label"].lower() and "appliance" in body["license"]["label"]
+    # The count is its own field (the panel shows it on its own row); the label never repeats it.
+    assert body["license"]["label"] == "VMS software license included with your AnyAiCam appliance"
     assert [set(item) for item in body["appliances"]] == [APPLIANCE_KEYS]
     assert body["appliances"][0]["cloud_id"] == "AIC-C814766E" and body["appliances"][0]["connection"] == "never"
     assert body["appliances"][0]["installed_version"] is None

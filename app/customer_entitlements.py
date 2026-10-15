@@ -417,10 +417,12 @@ def vms_license_summary(customer_id: str) -> dict:
         kind, status = "appliance_included", "suspended"
     elif plan and plan["kind"] == "legacy":
         kind = "legacy_slots"
+    # The licensed camera count is returned separately ("cameras") and shown on its
+    # own row by the Software License panel, so active labels don't repeat it.
     labels = {
-        ("per_camera_plan", "active"): f"VMS software license included with your per-camera plan · {_count(cameras)}",
-        ("one_time_vms_license", "active"): f"One-time stand-alone VMS software license (yours to keep) · up to {_count(cameras)}",
-        ("appliance_included", "active"): f"VMS software license included with your AnyAiCam appliance · {_count(cameras)}",
+        ("per_camera_plan", "active"): "VMS software license included with your per-camera plan",
+        ("one_time_vms_license", "active"): "One-time stand-alone VMS software license (yours to keep)",
+        ("appliance_included", "active"): "VMS software license included with your AnyAiCam appliance",
         ("per_camera_plan", "suspended"): "VMS software license for your per-camera plan · suspended until billing is resolved",
         ("one_time_vms_license", "suspended"): "One-time stand-alone VMS software license · suspended (payment refunded or disputed)",
         ("appliance_included", "suspended"): "VMS software license included with your AnyAiCam appliance · suspended until billing is resolved",
