@@ -1172,7 +1172,7 @@ def register_routes(app: FastAPI) -> None:
         # 30-day free storage trial (storage_trial.py): only an administrator-
         # granted, active trial and a cloud-storage plan add anything here.
         import storage_trial
-        fields += storage_trial.checkout_fields(customer_id, plan_key)
+        fields += storage_trial.subscription_trial_fields(customer_id, checkout=True, plan_key=plan_key)
         fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
         session = checkout_guard.create_session(customer_id, "base", price_id=price_id,
                                                 quantity=int(payload.camera_quantity), fields=fields)

@@ -306,7 +306,7 @@ def test_the_trial_expires_on_its_own_after_30_days(shop, db_path, monkeypatch):
     with override_target(sqlite_path=str(db_path)):
         assert storage_trial.active_trial(CUSTOMER) is None
         assert storage_trial.customer_view(CUSTOMER)["status"] == "expired"
-        assert storage_trial.checkout_fields(CUSTOMER, "hybrid") == []
+        assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="hybrid") == []
     assert client.get("/api/v2/customer/storage-trial", cookies=_cookie(*OWNER)).json()["storage_trial"]["status"] == "expired"
     # Stripe ends the subscription at the trial end (cancel_at_period_end): recorded as expired.
     monkeypatch.setattr(storage_trial, "_now", real_now)
@@ -325,8 +325,8 @@ def test_a_short_remaining_window_never_sends_stripe_an_invalid_checkout_trial(s
     soon = (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat(timespec="seconds")
     _exec(db_path, "UPDATE storage_trials SET expires_at=?", (soon,))
     with override_target(sqlite_path=str(db_path)):
-        assert storage_trial.checkout_fields(CUSTOMER, "hybrid") == []  # Stripe Checkout needs >= 48 hours
-        assert dict(storage_trial.subscription_fields(CUSTOMER, "hybrid"))["trial_end"]
+        assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="hybrid") == []  # Stripe Checkout needs >= 48 hours
+        assert dict(storage_trial.subscription_trial_fields(CUSTOMER, checkout=False, plan_key="hybrid"))["trial_end"]
 
 
 # ------------------------------------------------------------------ cancellation
@@ -512,3 +512,24 @@ def test_friends_family_is_unchanged_and_applies_after_the_trial(shop, db_path):
     assert with_trial["discounts[0][coupon]"] == "coupon_ff_base"  # the same 50% F&F coupon, for after the trial
     assert with_trial["subscription_data[trial_settings][end_behavior][missing_payment_method]"] == "cancel"
     assert "allow_promotion_codes" not in with_trial
+
+
+def test_the_single_hook_contract(shop, db_path):
+    """subscription_trial_fields is the one hook every storage start uses."""
+    client, _, _ = shop
+    import storage_trial
+    with override_target(sqlite_path=str(db_path)):
+        for checkout in (True, False):  # no trial: nothing at all
+            assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=checkout, plan_key="hybrid") == []
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        session = dict(storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="hybrid"))
+        direct = dict(storage_trial.subscription_trial_fields(CUSTOMER, checkout=False, plan_key="hybrid"))
+        assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="basic_local") == []
+        assert storage_trial.subscription_trial_fields("cust-2", checkout=True, plan_key="hybrid") == []
+    assert set(session) == {"subscription_data[trial_end]", "subscription_data[trial_settings][end_behavior][missing_payment_method]",
+                            "payment_method_collection", "metadata[anyaicam_storage_trial]",
+                            "subscription_data[metadata][anyaicam_storage_trial]"}
+    assert set(direct) == {"trial_end", "trial_settings[end_behavior][missing_payment_method]", "cancel_at_period_end",
+                           "metadata[anyaicam_storage_trial]"}
+    assert session["subscription_data[trial_end]"] == direct["trial_end"]
