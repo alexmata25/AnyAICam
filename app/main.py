@@ -104534,35 +104534,6 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-def _vms_installer_download_html(customer_id: str, mode: str | None, is_owner: bool) -> str:
-    """Installer download (2026-10-01; moved 2026-10-08 from the removed fixed-
-    tier subscription page to the per-camera page's license card): the account
-    owner of a licensed account gets the exact published installer, with what
-    they need to verify it. Same eligibility as the download route
-    (customer_downloads.download_eligibility)."""
-    from customer_entitlements import vms_license_capacity
-    if not is_owner or vms_license_capacity(customer_id) <= 0:
-        return ""
-    import customer_downloads
-    _installer = customer_downloads.latest_vms_installer()
-    if not _installer:
-        return '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
-    # Customer-facing summary first; the build id, checksum and terminal
-    # commands stay available, tucked into a collapsed details section.
-    return (
-        f'<div class="health-row" id="vms-installer-download"><span>AnyAiCam VMS installer {escape(str(_installer["version"]))}'
-        f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk) &middot; '
-        f'{customer_downloads.human_size(int(_installer["size_bytes"]))}</span></span>'
-        f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
-        '<p class="health-detail" style="margin:8px 0 0">Install it on your PC, then link the PC to this account on '
-        '<a href="/customer/claim-appliance">Claim an appliance</a>. The step-by-step commands are in the technical details below.</p>'
-        '<details id="vms-installer-technical" style="margin-top:10px"><summary>Technical details and install commands</summary>'
-        f'<p class="health-detail" style="margin:8px 0 0">Build {escape(_installer["commit"][:7])}'
-        f'<br>SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></p>'
-        + _installer_steps_html(mode, str(_installer["filename"]), str(_installer["sha256"]))
-        + '</details>')
-
-
 def _installer_steps_html(mode: str | None, filename: str = "", sha256: str = "") -> str:
     """Install-and-activate steps under the installer download (2026-10-01).
 

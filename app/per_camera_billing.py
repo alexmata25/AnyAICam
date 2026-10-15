@@ -897,23 +897,10 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                   '<p class="health-detail">Increases and upgrades take effect after payment succeeds. Decreases and downgrades take effect at the next renewal.</p></section>')
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
     addons = _addon_portal_rows(customer_id, plan_key, is_owner)
-    vms_capacity = customer_entitlements.vms_license_capacity(customer_id)
-    owned_license = max((int(e["camera_slot_quantity"] or 0) for e in customer_entitlements.get_entitlements_for_customer(customer_id)
-                         if e["product"] == "vms_license" and e["status"] == "active"), default=0)
-    license_card = ""
-    if owned_license:  # the one-time license an own-PC customer bought: theirs to keep
-        license_card += (f'<div class="health-row"><span>One-time VMS software license (yours to keep)</span>'
-                         f'<span class="pill">Up to {_camera_count(owned_license)}</span></div>')
-    if payload:
-        license_card += (f'<div class="health-row"><span>VMS software license for your plan</span>'
-                         f'<span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>')
-    elif vms_capacity and not owned_license:
-        license_card += f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>'
-    # The installer download (owner of a licensed account), formerly only on
-    # the removed fixed-tier subscription page (2026-10-08).
-    _main = sys.modules.get("main")
-    if _main is not None and hasattr(_main, "_vms_installer_download_html"):
-        license_card += _main._vms_installer_download_html(customer_id, customer_entitlements.product_mode_for_customer(customer_id), is_owner)
+    # Software License, as three panels (VMS 1.2.7, 2026-10-15): license, registered appliances, downloads.
+    import software_license_panels
+    license_panels = software_license_panels.panels_html(customer_id, is_owner=is_owner, payload=payload,
+                                                         mode=customer_entitlements.product_mode_for_customer(customer_id))
     setup_next = ""
     if is_owner and is_active and _setup_needed(customer_id):
         # Purchase comes first, then setup (2026-10-05): once the plan is
@@ -937,7 +924,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
     <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
-    <section class="panel" style="margin-top:14px"><h2>Software license</h2>{license_card or '<p class="health-detail">The stand-alone software license remains a separate one-time purchase for local ownership.</p>'}</section>
+    {license_panels}
     {picker}{change}'''
     scripts = f'''<script>
     const v2Plans={json.dumps(plan_menu)};
