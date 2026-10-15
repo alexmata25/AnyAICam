@@ -45,7 +45,11 @@ It only affects that user's **appliance** sessions and offline appliance passwor
   - viewer, technician on the customer portal, wrong password: all refused;
   - manifest verified and reconciled.
   - The same harness against 92b0e32 reproduces the live refusal.
-- **Full app suite, base vs candidate:** see the branch report.
+- **Full app suite, base vs candidate** (one process, offline, pytest-timeout 300 s, the two known whole-suite hangs deselected):
+  - base 92b0e32: 34 failed / 6623 passed;
+  - b55fc49: 35 failed / 6636 passed (+13 = the new tests).
+  - All 34 base failures are shared. The one extra, `test_talk_audio_relay::test_no_appliance_channel_uses_local_isapi_fallback`, is pre-existing and flaky: in isolation it fails 5/5 on 92b0e32 and 4/5 on b55fc49. It passed by chance in the base full run.
+  - No new failure is attributable to the patch.
 
 ## Preconditions (stop if any fails)
 
