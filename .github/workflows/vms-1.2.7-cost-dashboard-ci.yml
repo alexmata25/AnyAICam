@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-test.txt
 
-      - name: Run dashboard, build-context, neighboring, and owner/grant authorization suites
+      - name: Run dashboard, storage-trial, hardware-checkout, build-context, neighboring, and owner/grant authorization suites
         shell: bash
         env:
           ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-1.2.7-cost-dashboard-tests.db
@@ -51,6 +51,8 @@ jobs:
           set -o pipefail
           pytest -ra --junitxml=linux-auth-and-regression.xml \
             app/tests/test_aws_cost_dashboard.py \
+            app/tests/test_storage_trial_30day.py \
+            app/tests/test_hardware_first_checkout.py \
             app/tests/test_docker_build_context_security.py \
             app/tests/test_camera_discovery_migration_restore.py \
             app/tests/test_analytics_control_center.py \
