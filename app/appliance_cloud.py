@@ -621,6 +621,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             wireguard_last_handshake_at=safe.get('wireguard_last_handshake_at')
             wireguard_last_handshake_at=str(wireguard_last_handshake_at)[:40] if isinstance(wireguard_last_handshake_at,str) else None
             db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at),wireguard_status=COALESCE(?,wireguard_status),wireguard_last_handshake_at=COALESCE(?,wireguard_last_handshake_at) WHERE id=?',(state,state,now,sanitize_software_version(safe.get('software_version')),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,wireguard_status,wireguard_last_handshake_at,appliance['id']))
+            # Installed release (Software License, 2026-10-15): parsed from
+            # this authenticated report only (software_license); the legacy
+            # software_version column above is still written for older pages.
+            from software_license import record_reported_version
+            record_reported_version(db,appliance['id'],safe,now)
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
         return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}
 
@@ -644,8 +649,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.post('/api/appliance/version')
     def version(request: Request,payload: dict) -> dict:
-        appliance=authenticate_appliance(request); version_value=sanitize_software_version(payload.get('software_version'))
-        with connection() as db: db.execute('UPDATE appliances SET software_version=?,last_check_in=? WHERE id=?',(version_value,datetime.now().isoformat(),appliance['id']))
+        appliance=authenticate_appliance(request); version_value=sanitize_software_version(payload.get('software_version')); now=datetime.now().isoformat()
+        from software_license import record_reported_version
+        with connection() as db:
+            db.execute('UPDATE appliances SET software_version=?,last_check_in=? WHERE id=?',(version_value,now,appliance['id']))
+            record_reported_version(db,appliance['id'],sanitize_appliance_payload(payload) if isinstance(payload,dict) else {},now)
         return {'status':'accepted'}
 
     @app.post('/api/appliance/cameras')
@@ -2140,7 +2148,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # are re-validated independently of whatever the client already
         # checked -- there is no shared import path between this package
         # and the agent's, so nothing from the request is trusted as-is.
-        authenticate_appliance(request)
+        appliance=authenticate_appliance(request)
         from updates_storage import get_latest_release,validate_path_segment
         try:
             target=validate_path_segment(target,'target'); channel=validate_path_segment(channel,'channel')
@@ -2152,6 +2160,17 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # published for this target/channel. Never a 404 -- s3_source.
             # py's ManifestSource treats exactly this shape as "no update
             # right now," not an error.
+            return {'status':'no_update_available'}
+        # Safe update checks (Software License backend, 2026-10-15): offer a
+        # release only when it is strictly newer than the version THIS
+        # appliance reported (software_license.installed_version_of). An
+        # appliance with no usable reported version (e.g. the agent's 0.1.0
+        # fallback) is offered nothing: Software Update already refuses to
+        # queue an install for it (software_update.is_newer), and the agent's
+        # periodic check only logs. Same answer as "nothing published".
+        from software_license import installed_version_of
+        from software_update import is_newer
+        if not is_newer(str(release['manifest'].get('version') or ''),installed_version_of(appliance) or ''):
             return {'status':'no_update_available'}
         # Software Update (2026-10-03): releases are signed offline; this
         # server holds no private key and only serves the stored signature.

@@ -50,7 +50,10 @@ def _seed_appliance(db, appliance_id: str, cloud_id: str, credential: str):
     db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-1", "Test Partner", "approved", "real", now))
     db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)", ("cust-1", "partner-1", "Test Customer", "test@example.test", "active", "real", now))
     db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", ("site-1", "cust-1", "Test Site", now))
-    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", (appliance_id, "cust-1", "site-1", cloud_id, now))
+    # The appliance reports an installed release older than the 1.2.3 these
+    # tests publish: since 2026-10-15 only a strictly newer release is offered
+    # (test_software_license_backend.py covers not-newer and unknown versions).
+    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,software_version,created_at) VALUES(?,?,?,?,?,?)", (appliance_id, "cust-1", "site-1", cloud_id, "1.2.0+aaaaaaaaaaaa", now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", ("cred-1", appliance_id, password_hash(credential), now))
 
 

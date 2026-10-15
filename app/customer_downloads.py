@@ -13,6 +13,13 @@ that license downloads the exact, verified installer from My subscription.
 - Publishing is a deliberate operator step (python -m customer_downloads
   publish ...), run with the package built and verified by
   installer/build_release_installer.py.
+- Release catalog (2026-10-15, software_releases.py): the newest APPROVED
+  catalog row per platform is what is served. While no Linux row is
+  approved, the Linux download keeps using the latest.json record below
+  unchanged (compatibility fallback), so nothing changes in production
+  until an administrator approves a catalog row. GET
+  /api/customer/downloads/{linux|windows} serves a platform;
+  /api/customer/downloads/vms-installer stays as the Linux alias.
 """
 from __future__ import annotations
 
@@ -84,6 +91,40 @@ def human_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
+def current_installer(platform: str = "linux") -> dict | None:
+    """The record a licensed owner downloads for a platform: the newest
+    approved catalog row, or -- Linux only, and only while the catalog has
+    no approved Linux row -- the latest.json record (unchanged behaviour)."""
+    from software_releases import latest_approved
+    release = latest_approved(platform)
+    if release:
+        return {"version": release["version"], "commit": release["build_commit"], "filename": release["filename"],
+                "size_bytes": int(release["size_bytes"]), "sha256": release["sha256"], "key": release["storage_key"],
+                "released_at": release.get("approved_at"), "platform": platform}
+    return latest_vms_installer() if platform == "linux" else None
+
+
+_MEDIA_TYPES = {"linux": "application/gzip", "windows": "application/vnd.microsoft.portable-executable"}
+
+
+def _serve_installer(identity: dict | None, platform: str):
+    eligible, reason = download_eligibility(identity)
+    if not eligible:
+        raise HTTPException(status_code=403, detail=reason)
+    release = current_installer(platform)
+    if not release:
+        raise HTTPException(status_code=404, detail="The installer is not available yet.")
+    logger.info("customer_download.vms_installer customer_id=%s platform=%s commit=%s", identity.get("customer_id"), platform, release["commit"][:12])
+    storage = get_storage()
+    if type(storage).__name__ == "S3Storage":
+        return RedirectResponse(storage.url(CATEGORY, release["key"], expires_seconds=300), status_code=302)
+    return Response(
+        storage.get(CATEGORY, release["key"]), media_type=_MEDIA_TYPES[platform],
+        headers={"Content-Disposition": f'attachment; filename="{release["filename"]}"',
+                 "X-Content-SHA256": release["sha256"], "Cache-Control": "no-store"},
+    )
+
+
 def register_customer_download_routes(app: FastAPI) -> None:
     from partner_portal import partner_identity
 
@@ -93,7 +134,7 @@ def register_customer_download_routes(app: FastAPI) -> None:
         if not identity or identity.get("role") not in {"customer_owner", "customer_viewer"}:
             raise HTTPException(status_code=403, detail="Customer Portal sign-in required.")
         eligible, reason = download_eligibility(identity)
-        release = latest_vms_installer()
+        release = current_installer("linux")
         body = {"eligible": eligible, "reason": reason, "available": bool(release)}
         if eligible and release:
             body["vms_installer"] = {key: release[key] for key in ("version", "commit", "filename", "size_bytes", "sha256", "released_at") if key in release}
@@ -101,22 +142,13 @@ def register_customer_download_routes(app: FastAPI) -> None:
 
     @app.get("/api/customer/downloads/vms-installer")
     def download_vms_installer(request: Request):
-        identity = partner_identity(request)
-        eligible, reason = download_eligibility(identity)
-        if not eligible:
-            raise HTTPException(status_code=403, detail=reason)
-        release = latest_vms_installer()
-        if not release:
-            raise HTTPException(status_code=404, detail="The installer is not available yet.")
-        logger.info("customer_download.vms_installer customer_id=%s commit=%s", identity.get("customer_id"), release["commit"][:12])
-        storage = get_storage()
-        if type(storage).__name__ == "S3Storage":
-            return RedirectResponse(storage.url(CATEGORY, release["key"], expires_seconds=300), status_code=302)
-        return Response(
-            storage.get(CATEGORY, release["key"]), media_type="application/gzip",
-            headers={"Content-Disposition": f'attachment; filename="{release["filename"]}"',
-                     "X-Content-SHA256": release["sha256"], "Cache-Control": "no-store"},
-        )
+        return _serve_installer(partner_identity(request), "linux")
+
+    @app.get("/api/customer/downloads/{platform}")
+    def download_platform_installer(request: Request, platform: str):
+        if platform not in _MEDIA_TYPES:
+            raise HTTPException(status_code=404, detail="Unknown platform.")
+        return _serve_installer(partner_identity(request), platform)
 
 
 def _main(argv: list[str]) -> int:

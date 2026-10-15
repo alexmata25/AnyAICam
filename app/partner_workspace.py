@@ -917,7 +917,8 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             except ProvisioningBackendUnavailable: continue
             if not status: continue
             appliance['online_status']=status['online_status']; appliance['software_version']=status['software_version']; appliance['last_check_in']=status['last_check_in']; appliance['entitlement']=status['entitlement']
-            with connection() as db: db.execute('UPDATE appliances SET online_status=?,software_version=?,last_check_in=? WHERE id=?',(status['online_status'],status['software_version'],status['last_check_in'],appliance['id']))
+            # The installed version is written only by the appliance's own authenticated reports (software_license, 2026-10-15).
+            with connection() as db: db.execute('UPDATE appliances SET online_status=?,last_check_in=? WHERE id=?',(status['online_status'],status['last_check_in'],appliance['id']))
         draft=row('SELECT * FROM customer_setup_drafts WHERE customer_id=?',(customer_id,)); return {'customer_id':customer_id,'appliances':appliances,'draft':draft}
 
     @app.post('/api/customer/setup/progress')

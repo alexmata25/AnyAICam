@@ -1343,6 +1343,26 @@ CREATE TABLE IF NOT EXISTS stripe_customer_mode_bindings(
  PRIMARY KEY(customer_id, livemode)
 );
 '''),
+    # Software License backend (software_releases.py / software_license.py,
+    # owner-approved 2026-10-15): the release catalog customers download from
+    # (draft -> approved -> withdrawn; only approved rows are served) and the
+    # installed release each appliance reports over its authenticated
+    # heartbeat. New table and new nullable columns only. Additive.
+    ('20261015_software_releases_and_versions','''
+CREATE TABLE IF NOT EXISTS software_releases(
+ id TEXT PRIMARY KEY, product TEXT NOT NULL DEFAULT 'vms', platform TEXT NOT NULL, arch TEXT NOT NULL DEFAULT 'x86_64',
+ version TEXT NOT NULL, build_commit TEXT NOT NULL, filename TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
+ storage_key TEXT NOT NULL, signed INTEGER NOT NULL DEFAULT 0, signer_subject TEXT, min_requirements TEXT NOT NULL,
+ install_flow TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+ approved_by TEXT, approved_at TEXT, withdrawn_by TEXT, withdrawn_at TEXT, withdraw_reason TEXT, notes TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_software_releases_build ON software_releases(platform, version, build_commit);
+CREATE INDEX IF NOT EXISTS idx_software_releases_status ON software_releases(platform, status);
+ALTER TABLE appliances ADD COLUMN reported_version TEXT;
+ALTER TABLE appliances ADD COLUMN reported_commit TEXT;
+ALTER TABLE appliances ADD COLUMN reported_platform TEXT;
+ALTER TABLE appliances ADD COLUMN version_reported_at TEXT;
+'''),
 ]
 
 
