@@ -773,6 +773,8 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         billing_note += (f'<p class="health-detail" id="v2-scheduled-change">Scheduled change: '
                          f'{escape(PLANS[scheduled["plan_key"]]["display_name"])} · '
                          f'{_camera_count(scheduled["camera_quantity"], "licensed camera")}{effective}.</p>')
+    import storage_trial
+    trial_note = storage_trial.customer_note_html(customer_id, is_owner)
     features = payload["included_features"] if payload else []
     plan_summary = "No per-camera plan selected yet. Choose a plan and licensed camera count to continue."
     current_html = ""
@@ -878,7 +880,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         scripts_focus += "try{sessionStorage.removeItem('v2ActivationTries')}catch(e){}"
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     {activating}{setup_next}
-    <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{billing_note}{action_html}</section>
+    <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{trial_note}{billing_note}{action_html}</section>
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
     <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
@@ -934,6 +936,10 @@ def _change_subscription(identity: dict, request: ChangeRequest) -> dict:
     import main
     import stripe_state
     entitlement, current = _owner_subscription(identity)
+    if current.get("status") == "trialing":
+        # A free storage trial covers the plan it was started with only.
+        raise HTTPException(status_code=409, detail="Plan and camera-count changes are available once your free storage "
+                                                    "trial has ended or continued as a paid plan.")
     item = _stripe_item(current)
     if not item:
         raise HTTPException(status_code=409, detail="This subscription's current per-camera Price could not be verified.")
@@ -1084,6 +1090,10 @@ def register_routes(app: FastAPI) -> None:
             ("subscription_data[metadata][anyaicam_camera_quantity]", str(int(payload.camera_quantity))),
         ]
         friends_family.apply_to_checkout_fields(fields, customer_id, "base")
+        # 30-day free storage trial (storage_trial.py): only an administrator-
+        # granted, active trial and a cloud-storage plan add anything here.
+        import storage_trial
+        fields += storage_trial.checkout_fields(customer_id, plan_key)
         fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=identity.get("email"))))
         session = checkout_guard.create_session(customer_id, "base", price_id=price_id,
                                                 quantity=int(payload.camera_quantity), fields=fields)

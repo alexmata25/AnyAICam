@@ -19657,6 +19657,22 @@ def stripe_api_get(path: str) -> dict:
         raise HTTPException(status_code=502, detail="Could not verify the price with Stripe. Try again shortly.") from exc
 
 
+def stripe_api_delete(path: str) -> dict:
+    """Stripe DELETE (storage_trial.py: cancel a free-trial subscription now,
+    which never charges); same auth and error handling as stripe_api_get()."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe is not configured. Add ANYAICAM_STRIPE_SECRET_KEY.")
+    request = UrlRequest(
+        f"{STRIPE_API_BASE}{path}", method="DELETE",
+        headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}", "User-Agent": f"AnyAiCam-VMS/{APP_VERSION}"},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Stripe did not confirm the cancellation. Try again shortly.") from exc
+
+
 _VERIFIED_STRIPE_PRICES: dict = {}
 
 
@@ -114854,6 +114870,11 @@ def _stripe_webhook_steps() -> list:
         # Grace after failed payments, refunds and disputes (2026-10-02).
         from billing_status import sync_from_stripe_event
         sync_from_stripe_event(event)
+    def storage_trials(event):
+        # 30-day free storage trial (2026-10-15): trial records follow Stripe,
+        # and a new trial subscription is set to end at the trial end.
+        from storage_trial import sync_from_stripe_event
+        sync_from_stripe_event(event)
     def checkout_sessions(event):
         # A finished Checkout Session frees its purchase claim (checkout_guard.py).
         from checkout_guard import sync_from_stripe_event
@@ -114868,6 +114889,7 @@ def _stripe_webhook_steps() -> list:
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),
         ("billing_status", billing),
+        ("storage_trials", storage_trials),
         ("checkout_sessions", checkout_sessions),
     ]
 
@@ -156034,6 +156056,11 @@ _aaco_settings.register_routes(app, page_shell, _aaco_identity_provider)
 # server-side commission ledger.
 import friends_family as _friends_family
 _friends_family.register_routes(app, page_shell)
+
+# 30-day free cloud-storage trial (owner request 2026-10-15): administrator
+# grants, Stripe-native trial on the storage plan only (storage_trial.py).
+import storage_trial as _storage_trial
+_storage_trial.register_routes(app, page_shell)
 
 
 @app.get("/api/pricing/catalog")
