@@ -1356,6 +1356,7 @@ CREATE TABLE IF NOT EXISTS aws_lifecycle_rule_snapshots(
  PRIMARY KEY(snapshot_at,bucket_name,rule_id,source)
 );
 CREATE INDEX IF NOT EXISTS idx_aws_lifecycle_bucket_snapshot ON aws_lifecycle_rule_snapshots(bucket_name,snapshot_at);
+'''),
     # 30-day free cloud-storage trial (storage_trial.py, owner request
     # 2026-10-15): one row per administrator grant -- customer, start,
     # expiry, status, who granted it and why, re-grant approval, the trial
