@@ -1313,6 +1313,23 @@ CREATE TABLE IF NOT EXISTS storage_trials(
 CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_trials_one_active ON storage_trials(customer_id) WHERE status='active';
 CREATE INDEX IF NOT EXISTS idx_storage_trials_subscription ON storage_trials(stripe_subscription_id);
 '''),
+    # Hardware-first checkout (hardware_checkout.py, owner decision
+    # 2026-10-15): one row per hardware-only Checkout attempt, guest or
+    # signed in. The paid orders themselves stay in hardware_orders (one per
+    # session and SKU); this row keeps the order email (to link a guest's
+    # order to the account created afterwards) and the shipping details
+    # Stripe collected. Stripe ids only, no card data. Additive.
+    ('20261015_hardware_checkouts','''
+CREATE TABLE IF NOT EXISTS hardware_checkouts(
+ id TEXT PRIMARY KEY, customer_id TEXT, email TEXT NOT NULL, items TEXT NOT NULL,
+ intended_plan TEXT, intended_cameras INTEGER, status TEXT NOT NULL,
+ stripe_checkout_session_id TEXT, stripe_payment_intent_id TEXT, stripe_customer_id TEXT,
+ amount_total_cents INTEGER, shipping_json TEXT, order_ids TEXT,
+ paid_at TEXT, linked_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hardware_checkouts_session ON hardware_checkouts(stripe_checkout_session_id);
+CREATE INDEX IF NOT EXISTS idx_hardware_checkouts_email ON hardware_checkouts(email);
+'''),
 ]
 
 
