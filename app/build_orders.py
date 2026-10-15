@@ -195,7 +195,7 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
             # 30-day free storage trial (storage_trial.py): storage-only
             # subscription Checkout; nothing is added without an active trial.
             import storage_trial
-            fields += storage_trial.checkout_fields(customer_id, plan_key)
+            fields += storage_trial.subscription_trial_fields(customer_id, checkout=True, plan_key=plan_key)
         primary_price, primary_quantity = plan_price, cameras
     fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=email)))
     return fields, primary_price, primary_quantity
@@ -448,7 +448,7 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
                       ("metadata[anyaicam_plan_key]", plan["plan_key"]), ("metadata[anyaicam_camera_quantity]", quantity),
                       ("metadata[anyaicam_stripe_price_id]", price_id), ("metadata[anyaicam_storage_start]", key)]
             import storage_trial
-            trial = storage_trial.subscription_fields(customer_id, plan["plan_key"])
+            trial = storage_trial.subscription_trial_fields(customer_id, checkout=False, plan_key=plan["plan_key"])
             # A free-trial subscription gets no card attached: it ends at the
             # trial end unless the customer explicitly chooses paid storage.
             method = None if trial else _default_payment_method(plan)

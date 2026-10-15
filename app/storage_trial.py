@@ -238,25 +238,41 @@ def _trial_end(trial: dict) -> str:
     return str(int(_parse(trial["expires_at"]).timestamp()))
 
 
-def checkout_fields(customer_id: str, plan_key: str) -> list[tuple[str, str]]:
-    """Extra fields for a storage-only subscription Checkout Session; []
-    when no trial applies (the session is then exactly as before)."""
-    trial = _usable(customer_id, plan_key, CHECKOUT_MIN_REMAINING)
+def subscription_trial_fields(customer_id: str, *, checkout: bool, plan_key: str) -> list[tuple[str, str]]:
+    """THE hook every storage-subscription start calls (plan Checkout,
+    Build Your System plan order, appliance activation, and any later
+    storage start such as a hardware-first per-camera Checkout).
+
+    Returns the Stripe fields to append to the request, or [] when nothing
+    applies -- no active administrator-granted trial, a plan without cloud
+    storage, a trial already used by a subscription, or too little of the
+    window left for Stripe to accept it. [] means the request is exactly as
+    it would be without this feature.
+
+    checkout=True (POST /v1/checkout/sessions, mode=subscription, storage
+    plan line only -- never a session with one-time hardware/license lines):
+      subscription_data[trial_end]=<expires_at epoch>,
+      subscription_data[trial_settings][end_behavior][missing_payment_method]=cancel,
+      payment_method_collection=if_required,
+      metadata[anyaicam_storage_trial] and subscription_data[metadata][anyaicam_storage_trial]=<trial id>.
+      The verified webhook (storage_trials step) then sets the new trial
+      subscription to cancel_at_period_end=true.
+    checkout=False (POST /v1/subscriptions, server-created):
+      trial_end, trial_settings[end_behavior][missing_payment_method]=cancel,
+      cancel_at_period_end=true, metadata[anyaicam_storage_trial]=<trial id>.
+      The caller must not attach default_payment_method when this is non-empty,
+      and should call link_subscription() with the created subscription id
+      (the webhook links it too).
+    """
+    trial = _usable(customer_id, plan_key, CHECKOUT_MIN_REMAINING if checkout else SUBSCRIPTION_MIN_REMAINING)
     if not trial:
         return []
-    return [("subscription_data[trial_end]", _trial_end(trial)),
-            ("subscription_data[trial_settings][end_behavior][missing_payment_method]", "cancel"),
-            ("payment_method_collection", "if_required"),
-            (f"metadata[{METADATA_KEY}]", trial["id"]),
-            (f"subscription_data[metadata][{METADATA_KEY}]", trial["id"])]
-
-
-def subscription_fields(customer_id: str, plan_key: str) -> list[tuple[str, str]]:
-    """Extra fields for a server-created storage subscription (appliance
-    activation); [] when no trial applies."""
-    trial = _usable(customer_id, plan_key, SUBSCRIPTION_MIN_REMAINING)
-    if not trial:
-        return []
+    if checkout:
+        return [("subscription_data[trial_end]", _trial_end(trial)),
+                ("subscription_data[trial_settings][end_behavior][missing_payment_method]", "cancel"),
+                ("payment_method_collection", "if_required"),
+                (f"metadata[{METADATA_KEY}]", trial["id"]),
+                (f"subscription_data[metadata][{METADATA_KEY}]", trial["id"])]
     return [("trial_end", _trial_end(trial)),
             ("trial_settings[end_behavior][missing_payment_method]", "cancel"),
             ("cancel_at_period_end", "true"),
