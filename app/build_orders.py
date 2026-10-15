@@ -202,6 +202,10 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
             fields.append(("metadata[anyaicam_friends_family]", "approved" if discount["friends_family"] else "none"))
         else:
             friends_family.apply_to_checkout_fields(fields, customer_id, "base")
+            # 30-day free storage trial (storage_trial.py): storage-only
+            # subscription Checkout; nothing is added without an active trial.
+            import storage_trial
+            fields += storage_trial.checkout_fields(customer_id, plan_key)
         primary_price, primary_quantity = plan_price, cameras
     fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=email)))
     return fields, primary_price, primary_quantity
@@ -498,9 +502,14 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
                       ("metadata[anyaicam_billing_version]", "2"), ("metadata[anyaicam_customer_id]", customer_id),
                       ("metadata[anyaicam_plan_key]", plan["plan_key"]), ("metadata[anyaicam_camera_quantity]", quantity),
                       ("metadata[anyaicam_stripe_price_id]", price_id), ("metadata[anyaicam_storage_start]", key)]
-            method = _default_payment_method(plan)
+            import storage_trial
+            trial = storage_trial.subscription_fields(customer_id, plan["plan_key"])
+            # A free-trial subscription gets no card attached: it ends at the
+            # trial end unless the customer explicitly chooses paid storage.
+            method = None if trial else _default_payment_method(plan)
             if method:
                 fields.append(("default_payment_method", method))
+            fields += trial
             coupon = friends_family.checkout_discount(customer_id, "base").get("coupon")
             if coupon:
                 fields.append(("discounts[0][coupon]", coupon))
@@ -514,6 +523,10 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
         return {"status": STORAGE_PAYMENT_FAILED if refused else STORAGE_FAILED}
     subscription_id = str(subscription.get("id") or "")
     _finish(customer_id, STORAGE_STARTED, subscription_id=subscription_id)
+    trial_id = str((subscription.get("metadata") or {}).get("anyaicam_storage_trial") or "")
+    if trial_id:
+        import storage_trial
+        storage_trial.link_subscription(trial_id, customer_id, subscription_id)
     try:  # the webhook applies it too; this only makes capacity appear at once
         current = stripe_state.current_subscription(subscription_id)
         if current:

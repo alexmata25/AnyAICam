@@ -1356,6 +1356,20 @@ CREATE TABLE IF NOT EXISTS aws_lifecycle_rule_snapshots(
  PRIMARY KEY(snapshot_at,bucket_name,rule_id,source)
 );
 CREATE INDEX IF NOT EXISTS idx_aws_lifecycle_bucket_snapshot ON aws_lifecycle_rule_snapshots(bucket_name,snapshot_at);
+    # 30-day free cloud-storage trial (storage_trial.py, owner request
+    # 2026-10-15): one row per administrator grant -- customer, start,
+    # expiry, status, who granted it and why, re-grant approval, the trial
+    # subscription and the customer's explicit paid authorization. At most
+    # one active trial per customer. Additive only.
+    ('20261015_storage_trials','''
+CREATE TABLE IF NOT EXISTS storage_trials(
+ id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, status TEXT NOT NULL, starts_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+ granted_by TEXT NOT NULL, granted_at TEXT NOT NULL, reason TEXT NOT NULL, repeat_of TEXT, repeat_approved_by TEXT, repeat_reason TEXT,
+ stripe_subscription_id TEXT, paid_authorized_at TEXT, paid_authorized_by TEXT, converted_at TEXT, ended_at TEXT,
+ cancelled_by TEXT, cancel_reason TEXT, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_trials_one_active ON storage_trials(customer_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_storage_trials_subscription ON storage_trials(stripe_subscription_id);
 '''),
 ]
 
