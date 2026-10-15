@@ -19,7 +19,6 @@ jobs:
     env:
       PYTHONPATH: app
       ANYAICAM_DATABASE_BACKEND: sqlite
-      ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-1.2.7-cost-dashboard-tests.db
       ANYAICAM_TEST_LAB_ENABLED: "false"
     steps:
       - name: Check out isolated 1.2.7 branch
@@ -43,6 +42,8 @@ jobs:
 
       - name: Run 52 dashboard and neighboring regressions plus owner/grant authorization suites
         shell: bash
+        env:
+          ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-1.2.7-cost-dashboard-tests.db
         run: |
           set -o pipefail
           pytest -ra --junitxml=linux-auth-and-regression.xml \
