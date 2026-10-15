@@ -113,6 +113,42 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
     return response
 
 
+def _safe_next_path(next_path):
+    """Same-origin relative path (not //, no backslash, whitespace or control
+    characters, not an auth-flow page) or None."""
+    if (isinstance(next_path,str) and next_path.startswith('/') and not next_path.startswith('//')
+            and '\\' not in next_path and not any(ch.isspace() or ord(ch)<32 for ch in next_path)
+            and not is_auth_flow_path(next_path)):
+        return next_path
+    return None
+
+
+def _claimed_appliance() -> bool:
+    """A claimed edge (persisted activation identity): customers sign in through
+    the cloud or their appliance password. An unclaimed edge keeps local sign-in."""
+    from appliance_activation import load_persisted_identity
+    return load_persisted_identity() is not None
+
+
+def _edge_customer_login(payload: dict, request: Request, email: str, password: str):
+    """Customer sign-in on a claimed appliance (local_customer_access.py):
+    cloud-delegated when online, the owner's appliance password when offline.
+    Uses the same lockout counters and session as every other sign-in."""
+    import local_customer_access
+    try:
+        result=local_customer_access.sign_in(email,password)
+    except local_customer_access.AccessDenied as denied:
+        if denied.reason in ('invalid','invalid_offline'):
+            record_login_failure(email)
+        audit({'email':email,'role':'anonymous'},'login.failed','local_customer','',{'reason':denied.reason})
+        raise HTTPException(status_code=denied.status,detail=denied.detail)
+    clear_login_failures(email)
+    audit({'email':email,'role':result['role']},'login.succeeded','local_customer',result['user']['id'],{'mode':result['mode']})
+    destination=_safe_next_path(payload.get('next')) or '/customer-live'  # the cloud setup flow is not on the appliance
+    return establish_partner_session(destination,request=request,email=email,role=result['role'],user=result['user'],
+                                     authorization_version_at_login=result['authorization_version'])
+
+
 def _require(request: Request, roles=PARTNER_ROLES) -> dict:
     identity = _identity(request)
     if not identity or identity['role'] not in roles:
@@ -246,6 +282,8 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         if login_blocked(email):
             audit({'email':email,'role':'anonymous'},'login.blocked','partner_user','',{'reason':'rate_limit'})
             raise HTTPException(status_code=429,detail='Account is temporarily locked after repeated sign-in failures. Try again later or reset your password.')
+        if settings.runtime_role=='edge' and payload.get('customer_only') and _claimed_appliance():
+            return _edge_customer_login(payload,request,email,password)
         user,reason=authenticate_detailed(email,password); role=user['role'] if user else None
         account = PORTAL_ACCOUNTS.get(email, {})
         if not role and account.get('approved') is True and account.get('role') in AUTH_ROLES and hmac.compare_digest(password, str(account.get('password',''))):
@@ -350,6 +388,9 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
                 audit(identity,'password.change_denied','partner_user',user['id'],{'reason':'current_password_mismatch'})
                 raise HTTPException(status_code=403,detail='Your current password is incorrect.')
             user_id=user['id']; db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0,terms_accepted_at=? WHERE id=?',(password_hash(password),now,user_id))
+            # A changed password also bumps the authorization version, so appliance
+            # sessions and offline appliance passwords follow it (local_customer_access.py).
+            db.execute('UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id=?',(user_id,))
             # A new password signs out every OTHER session of this user, as a
             # reset already does (cloud_security.consume_password_reset):
             # a session stolen with the old password must not outlive it.

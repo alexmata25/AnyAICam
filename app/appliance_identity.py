@@ -70,6 +70,9 @@ PORTAL_BUCKETS = {
     "administrator": {"administrator"},
     "partner": {"partner_owner", "salesperson"},
     "technician": {"technician"},
+    # Customer sign-in on the customer's own appliance (local_customer_access.py).
+    # Owner only: household viewers' per-camera permissions are not on the appliance.
+    "customer": {"customer_owner"},
 }
 
 # The authorization matrix from the reviewed design doc, enforced at

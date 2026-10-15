@@ -1300,6 +1300,16 @@ CREATE TABLE IF NOT EXISTS deferred_storage_plans(
  stripe_subscription_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT
 );
 '''),
+    # Local customer access (2026-10-14, local_customer_access.py): the owner's
+    # appliance password for offline sign-in. Only a salted hash; bound to the
+    # cloud user, the appliance's customer and the user's authorization version.
+    ('20261014_local_customer_credentials','''
+CREATE TABLE IF NOT EXISTS local_customer_credentials(
+ user_id TEXT PRIMARY KEY, email TEXT NOT NULL, customer_id TEXT NOT NULL, role TEXT NOT NULL,
+ password_hash TEXT NOT NULL, authorization_version INTEGER NOT NULL, enrolled_at TEXT NOT NULL,
+ last_verified_at TEXT, revoked_at TEXT, revoked_reason TEXT
+);
+'''),
 ]
 
 

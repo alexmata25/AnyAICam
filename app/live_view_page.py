@@ -1655,7 +1655,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
         columns = 1 if len(cameras) == 1 else 2 if len(cameras) <= 4 else 3 if len(cameras) <= 9 else 4
         camera_ids = [camera['id'] for camera in cameras]
-        is_owner = identity.get('role') == 'customer_owner'
+        # Add/Remove camera and the capacity bar manage the cloud account (billing,
+        # provisioning); on the appliance itself they would act on its local copy
+        # only, so they are cloud-only (2026-10-14, local customer access).
+        import os as _os
+        is_owner = (identity.get('role') == 'customer_owner'
+                    and _os.environ.get('ANYAICAM_RUNTIME_ROLE', '').strip().lower() != 'edge')
         # Add camera: the existing discovery step of setup, for this
         # appliance when the page shows one (or the account has only one).
         shown_appliances = list(dict.fromkeys(c['appliance_id'] for c in cameras if c.get('appliance_id')))

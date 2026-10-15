@@ -1,5 +1,7 @@
 from cloud_config import settings as cloud_settings
 import json
+import os
+from urllib.parse import quote as _url_quote
 import logging
 import secrets
 from datetime import datetime, timedelta
@@ -23,6 +25,14 @@ import video_profile
 CUSTOMERS_FILE = runtime_paths.recordings_path('partner_customers.json')
 ACCOUNT_FILE = runtime_paths.recordings_path('account_management.json')
 STATUSES = {'active', 'pending_installation', 'trial', 'suspended', 'cancelled'}
+
+
+def cloud_account_only() -> None:
+    """Cameras and appliances belong to the cloud account: on the appliance
+    itself, adding, removing, renaming or linking would only change its local
+    copy (2026-10-14, local customer access). Refuse with a pointer to the portal."""
+    if os.environ.get('ANYAICAM_RUNTIME_ROLE','').strip().lower()=='edge':
+        raise HTTPException(status_code=409,detail='Manage cameras and appliances in the AnyAiCam portal (app.anyaicam.com); this appliance follows it.')
 
 
 def _read(path: Path, fallback):
@@ -600,6 +610,19 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             for n in range(configured_count+1,max(licensed_slots,configured_count)+1)
         )
         camera_cards=(real_camera_cards+placeholder_slot_cards) or '<div class="empty">No camera slots are available on this account yet.</div>'
+        # Add camera (1.2.6 acceptance): with every camera removed, /customer-live
+        # redirects here, and the free slots offered no way forward. Owners with an
+        # activated appliance and a free licensed slot get the same discovery step
+        # the Live tab's Add camera uses.
+        add_camera=''
+        if (identity['role']=='customer_owner' and activated and licensed_slots>configured_count
+                and os.environ.get('ANYAICAM_RUNTIME_ROLE','').strip().lower()!='edge'):  # cloud-only, see cloud_account_only()
+            add_appliance=appliance_id
+            if not add_appliance:
+                owned=rows('SELECT id FROM appliances WHERE customer_id=?',(customer['id'],))
+                add_appliance=owned[0]['id'] if len(owned)==1 else ''
+            add_href='/customer/setup?step=4'+(f'&appliance={_url_quote(add_appliance,safe="")}' if add_appliance else '')
+            add_camera=f'<a class="action-button" id="customer-account-add-camera" href="{escape(add_href,quote=True)}">Add camera</a>'
 
         content=f'''<header class="topbar">
             <div>
@@ -616,6 +639,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                     <h2>Your cameras</h2>
                     <div class="health-detail">{configured_count} of {licensed_slots} camera{'s' if licensed_slots!=1 else ''} configured &middot; Live video streams securely from your AnyAiCam appliance.</div>
                 </div>
+                {add_camera}
             </div>
             <div class="feature-grid">{camera_cards}</div>
         </section>'''
@@ -968,6 +992,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.post('/api/customer/appliances/link')
     def link_customer_appliance(request: Request,payload: dict) -> dict:
+        cloud_account_only()
         identity=customer_owner(request)
         try: require_permission(identity,'appliance.self.link')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
@@ -1040,6 +1065,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.post('/api/customer/appliances/{appliance_id}/activation-token/recover')
     def recover_customer_activation_token(request: Request,appliance_id: str) -> dict:
+        cloud_account_only()
         """The account owner lost the one-time activation token (closed tab,
         lost response) before the appliance activated: issue a new one and
         revoke the old. Owner-only, this customer's own appliance only, and
@@ -1062,6 +1088,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.post('/api/customer/appliances/provision')
     def provision_customer_appliance(request: Request,payload: dict) -> dict:
+        cloud_account_only()
         """Self-service bridge for the gap this session's real customer-
         journey audit found: a customer who purchased hardware + a
         camera-slot plan through the storefront and was approved via
@@ -1213,6 +1240,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.post('/api/customer/appliances/{appliance_id}/scan')
     def request_camera_scan(request: Request,appliance_id: str) -> dict:
+        cloud_account_only()
         identity=customer_owner(request); appliance=row('SELECT * FROM appliances WHERE id=? AND customer_id=?',(appliance_id,identity['customer_id']))
         if not appliance: raise HTTPException(status_code=404,detail='Appliance not found.')
         # Readiness (2026-10-08, Codex review of 6c23573): only an appliance
@@ -1334,6 +1362,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.post('/api/customer/cameras/provision')
     def request_camera_provisioning(request: Request,payload: dict) -> dict:
+        cloud_account_only()
         identity=customer_owner(request)
         try: require_permission(identity,'camera.self.configure')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
@@ -1495,6 +1524,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.delete('/api/customer/cameras/{camera_id}')
     def remove_customer_camera(request: Request,camera_id: str) -> dict:
+        cloud_account_only()
         # RDM camera-quota requirement: removing an active camera must
         # free its licensed slot (device_key IS NOT NULL is exactly what
         # both provisioning-enforcement gates and list_customer_cameras()'s
@@ -1552,6 +1582,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.put('/api/customer/cameras')
     def configure_customer_cameras(request: Request,payload: dict) -> dict:
+        cloud_account_only()
         identity=customer_owner(request)
         try: require_permission(identity,'camera.self.configure')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error

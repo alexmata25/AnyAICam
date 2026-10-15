@@ -324,6 +324,10 @@ def consume_password_reset(raw: str,new_password: str):
         if not claimed.rowcount:
             return None
         db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0 WHERE id=?',(password_hash(new_password),match['user_id']))
+        # A reset is the account-recovery path: bumping the authorization version
+        # also revokes this user's appliance sessions and offline appliance
+        # password through the next signed identity manifest (local_customer_access.py).
+        db.execute('UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id=?',(match['user_id'],))
         db.execute('UPDATE password_reset_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL',(now,match['user_id']))
         db.execute('DELETE FROM account_lockouts WHERE email=?',(match['email'].lower(),))
         db.execute('UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',(now,match['user_id']))

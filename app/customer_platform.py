@@ -178,6 +178,11 @@ def register_customer_platform_routes(
         household_link = ('<a class="setting-link" href="/customer/household"><div><strong>Users &amp; household</strong>'
                           '<div class="health-detail">Give the people you live or work with their own sign-in and choose what each can do.</div></div><span>Open →</span></a>'
                           if (user or {}).get("role") == "customer_owner" else "")
+        # Appliance sign-in (2026-10-14, local_customer_access.py): only on the appliance itself.
+        import os as _os
+        appliance_sign_in_link = ('<a class="setting-link" id="appliance-sign-in-link" href="/customer/appliance-sign-in"><div><strong>Appliance sign-in</strong>'
+                                  '<div class="health-detail">Sign in on this appliance without internet with an appliance password.</div></div><span>Open →</span></a>'
+                                  if (user or {}).get("role") == "customer_owner" and _os.environ.get("ANYAICAM_RUNTIME_ROLE", "").strip().lower() == "edge" else "")
         content = f'''
         <header class="topbar">
           <div><p class="eyebrow">Customer VMS</p><h1>Welcome, {user.get("display_name","Customer")}</h1></div>
@@ -197,6 +202,7 @@ def register_customer_platform_routes(
           <div class="panel-head"><div><h2>Customer controls</h2><div class="health-detail">Manage paid camera analytics and notification preferences separately for each camera.</div></div></div>
           <div class="settings-list">
             {household_link}
+            {appliance_sign_in_link}
             <a class="setting-link" id="change-password-link" href="/change-password"><div><strong>Change password</strong><div class="health-detail">Choose a new password. Your other signed-in devices are signed out.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/customer-app-settings"><div><strong>Camera analytics and alerts</strong><div class="health-detail">Enable paid analytics, email alerts, push alerts, schedules, and quiet hours.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/analytics-control-center"><div><strong>Analytics Control Center</strong><div class="health-detail">Choose which analytics run on each camera. Purchased entitlements are managed separately.</div></div><span>Open →</span></a>
@@ -355,6 +361,7 @@ def register_customer_platform_routes(
 
     @app.put("/api/customer/cameras/{camera_id}/name")
     def update_customer_camera_name(camera_id: int, payload: CameraNameUpdate, request: Request):
+        from partner_workspace import cloud_account_only; cloud_account_only()
         """Renames one of this customer's own cameras. Reuses the same
         cameras.name column every other customer-facing page already
         reads (_portal_customer_camera_names(), live_view_page.py's
