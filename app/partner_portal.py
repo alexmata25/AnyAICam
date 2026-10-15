@@ -345,6 +345,9 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
                 audit(identity,'password.change_denied','partner_user',user['id'],{'reason':'current_password_mismatch'})
                 raise HTTPException(status_code=403,detail='Your current password is incorrect.')
             user_id=user['id']; db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0,terms_accepted_at=? WHERE id=?',(password_hash(password),now,user_id))
+            # A changed password also bumps the authorization version, so appliance
+            # sessions and offline appliance passwords follow it (local_customer_access.py).
+            db.execute('UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id=?',(user_id,))
             db.execute("UPDATE invitations SET status='accepted' WHERE lower(email)=? AND status='pending'",(identity['email'].lower(),))
             if identity['role'] in PARTNER_ROLES: db.execute('INSERT INTO partner_terms_acceptances(id,user_id,terms_version,accepted_at,ip_address) VALUES(?,?,?,?,?)',(secrets.token_hex(8),user_id,'2026-08-01',now,request.client.host if request.client else None))
         if identity['role'] in PARTNER_ROLES: audit(identity,'partner_terms.accepted','partner_user',user_id,{'version':'2026-08-01'})
