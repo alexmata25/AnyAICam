@@ -35,6 +35,13 @@ jobs:
             requirements.txt
             requirements-test.txt
 
+      - name: Install FFmpeg for video regressions
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
+
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -55,6 +62,9 @@ jobs:
             app/tests/test_hardware_first_checkout.py \
             app/tests/test_docker_build_context_security.py \
             app/tests/test_camera_discovery_migration_restore.py \
+            app/tests/test_ryzen_126_acceptance_fixes.py \
+            app/tests/test_cloud_customer_portal_compat.py \
+            app/tests/test_password_change_bumps_authorization_version.py \
             app/tests/test_analytics_control_center.py \
             app/tests/test_platform_owner_rbac.py \
             app/tests/test_identity_grant_privilege.py \
@@ -99,8 +109,9 @@ jobs:
               f"- Failures: **{counts['failures']}**\n"
               f"- Errors: **{counts['errors']}**\n"
               f"- Skips: **{counts['skipped']}**\n\n"
-              "The suite includes the 52 previously passing dashboard/neighbor tests, "
-              "platform-owner RBAC, and identity-grant privilege/management tests. "
+              "The suite includes the dashboard/storage-trial/hardware-checkout tests, "
+              "RC2/RC3 acceptance regressions, platform-owner RBAC, and identity-grant "
+              "privilege/management tests. FFmpeg and ffprobe are installed and checked. "
               "No AWS, Stripe, production, or deployment credentials are configured.\n"
           )
           summary.write_text(body, encoding="utf-8")
