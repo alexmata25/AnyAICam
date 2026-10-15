@@ -1363,6 +1363,17 @@ ALTER TABLE appliances ADD COLUMN reported_commit TEXT;
 ALTER TABLE appliances ADD COLUMN reported_platform TEXT;
 ALTER TABLE appliances ADD COLUMN version_reported_at TEXT;
 '''),
+    # Free storage trial countdown (storage_trial.py, owner requirement
+    # change 2026-10-15): a grant is reserved ("granted") and its 30 days
+    # start only when the storage subscription is created, never while
+    # hardware is awaiting delivery. Rows written by the first version
+    # (status active from the grant, no subscription yet) become granted;
+    # the feature was never deployed. One open (granted or active) trial per
+    # customer. starts_at/expires_at stay '' until the countdown starts.
+    ('20261015_storage_trials_pending_start','''
+UPDATE storage_trials SET status='granted',starts_at='',expires_at='' WHERE status='active' AND stripe_subscription_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_trials_one_open ON storage_trials(customer_id) WHERE status IN ('granted','active');
+'''),
 ]
 
 
