@@ -1,6 +1,78 @@
+# Keep VCS metadata, local environment/credential files, and private-key
+# material out of the Docker build context. Docker sends the context to its
+# builder even when a Dockerfile never COPYs a particular file; excluding
+# these paths here prevents accidental transmission of tracked or untracked
+# secrets such as the repository's aws.env.
 .git
+**/.git
+**/.git/**
+
 .env
 .env.*
+**/.env
+**/.env.*
+*.env
+**/*.env
+*.env.*
+**/*.env.*
+aws.env
+**/aws.env
+
+# Common local credential stores and standalone credential files.
+.aws
+**/.aws
+.ssh
+**/.ssh
+credentials
+**/credentials
+credentials.*
+**/credentials.*
+credential
+**/credential
+credential.*
+**/credential.*
+credentials*
+**/credentials*
+.netrc
+**/.netrc
+.git-credentials
+**/.git-credentials
+.npmrc
+**/.npmrc
+.pypirc
+**/.pypirc
+secrets
+**/secrets
+
+# Private key and certificate bundle formats; application source files such
+# as app/recording_credentials.py remain included.
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.token
+**/*.token
+*.secret
+**/*.secret
+token
+**/token
+token.*
+**/token.*
+secret
+**/secret
+secret.*
+**/secret.*
+client_secret*.json
+**/client_secret*.json
+id_rsa*
+**/id_rsa*
+id_ed25519*
+**/id_ed25519*
+
 __pycache__/
 *.py[cod]
 .pytest_cache/
