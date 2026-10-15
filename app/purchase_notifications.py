@@ -853,6 +853,21 @@ def retry_payment_failed_notifications(limit: int = 50) -> int:
 # generate one email, called twice or not, exactly like the webhook path.
 
 
+def _guest_order_email(order: dict, db=None) -> str:
+    """The order email of a hardware-first guest order not linked to an
+    account yet (hardware_checkout.py, 2026-10-15), so shipping and
+    cancellation notices still reach the buyer."""
+    session_id = order.get("stripe_checkout_session_id")
+    if not session_id:
+        return ""
+    query = "SELECT email FROM hardware_checkouts WHERE stripe_checkout_session_id=? AND status='paid'"
+    try:
+        found = db.execute(query, (session_id,)).fetchone() if db is not None else row(query, (session_id,))
+    except Exception:
+        return ""
+    return str((dict(found) if found else {}).get("email") or "")
+
+
 def notify_hardware_shipped(order_id: str) -> dict:
     """Only from the authoritative state (2026-10-05): a refunded, disputed
     or cancelled order, or one not recorded as shipped, is never emailed.
@@ -880,7 +895,7 @@ def notify_hardware_shipped(order_id: str) -> dict:
         customer = db.execute("SELECT * FROM customers WHERE id=?", (order["customer_id"],)).fetchone() if order.get("customer_id") else None
         customer = dict(customer) if customer else None
         first_name = _first_name(customer.get("name")) if customer else "there"
-        recipient = (customer.get("email") if customer else None) or ""
+        recipient = (customer.get("email") if customer else None) or _guest_order_email(order, db)
         subject, text, html = _hardware_shipped_email(first_name, order)
         return _send_once(
             test_mode=stripe_mode.is_test_mode(order=order),
@@ -896,7 +911,7 @@ def notify_hardware_cancellation(order_id: str) -> dict:
         return {"status": "ignored", "reason": "unknown order"}
     customer = _customer_row(order["customer_id"]) if order.get("customer_id") else None
     first_name = _first_name(customer.get("name")) if customer else "there"
-    recipient = (customer.get("email") if customer else None) or ""
+    recipient = (customer.get("email") if customer else None) or _guest_order_email(order)
     subject, text, html = _hardware_cancellation_email(first_name, order)
     return _send_once(
         test_mode=stripe_mode.is_test_mode(order=order),

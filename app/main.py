@@ -42442,6 +42442,13 @@ PUBLIC_PATH_PREFIXES = (
     "/customer-signup",
     "/customer/verify-email",
     "/api/customer/direct-signup",
+    # Hardware-first checkout (hardware_checkout.py, 2026-10-15): a visitor
+    # pays for the hardware before creating an account. The checkout page,
+    # its API and the confirmation page grant nothing; only the verified
+    # Stripe webhook records a paid order.
+    "/hardware-checkout",
+    "/api/hardware-checkout",
+    "/hardware-order/complete",
 
     "/forgot-password",
 
@@ -49245,6 +49252,8 @@ from order_funnel import register_order_funnel_routes
 register_order_funnel_routes(app)
 from build_orders import register_build_order_routes
 register_build_order_routes(app)
+from hardware_checkout import register_hardware_checkout_routes
+register_hardware_checkout_routes(app)
 from fulfillment_admin import register_fulfillment_admin_routes
 register_fulfillment_admin_routes(app, page_shell)
 from account_invitations import register_account_invitation_routes
@@ -115087,6 +115096,8 @@ async def _billing_grace_worker() -> None:
             # Build Your System order confirmations not delivered yet (same outbox).
             from order_funnel import retry_order_confirmation_notifications
             await asyncio.to_thread(retry_order_confirmation_notifications)
+            from hardware_checkout import retry_confirmations as retry_hardware_confirmations
+            await asyncio.to_thread(retry_hardware_confirmations)
             # Appliance storage plans whose start at activation has not
             # happened yet or failed transiently (build_orders.py).
             from build_orders import retry_storage_starts
@@ -115116,6 +115127,12 @@ def _stripe_webhook_steps() -> list:
     def hardware(event):
         from hardware_orders import sync_hardware_order_from_stripe_event
         sync_hardware_order_from_stripe_event(event)
+
+    def hardware_checkout(event):
+        # Hardware-only orders (2026-10-15): paid appliance/relay orders, a
+        # guest's linked later by email. Before sales_commissions.
+        from hardware_checkout import sync_from_stripe_event
+        sync_from_stripe_event(event)
 
     def build_orders(event):
         # Build Your System orders paid online (2026-10-05): appliance and
@@ -115152,6 +115169,7 @@ def _stripe_webhook_steps() -> list:
         ("camera_plan_v2_entitlements", camera_plan_v2),
         ("hardware_orders", hardware),
         ("build_orders", build_orders),
+        ("hardware_checkout", hardware_checkout),
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),
         ("billing_status", billing),

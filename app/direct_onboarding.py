@@ -188,6 +188,11 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         audit({"email": created["email"], "role": "customer_owner"}, "direct_signup.verified", "customer", created["customer_id"],
               {"channel": DIRECT_CHANNEL})
+        try:  # a hardware order paid before the account existed (hardware_checkout.py)
+            from hardware_checkout import link_paid_orders
+            link_paid_orders(created["customer_id"], created["email"])
+        except Exception:
+            logger.exception("direct_signup.hardware_orders_not_linked")
         next_path = purchase_intent_next(next)
         if next_path and "?" in next_path:
             # Kept on the new account, so the selection survives even if the
@@ -198,7 +203,10 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                 save_build_selection(created["customer_id"], selection_from_query(parse_qs(urlsplit(next_path).query)))
             except Exception:
                 logger.exception("direct_signup.selection_not_saved")
-        if next_path:
+        if next_path == "/customer/orders":
+            ready = _page("Your account is ready", "Sign in to see your hardware order and its status.",
+                          link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and view my order"))
+        elif next_path:
             ready = _page("Your account is ready", "Sign in to review your order and continue to secure checkout.",
                           link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and continue"))
         else:

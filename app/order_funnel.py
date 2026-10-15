@@ -417,6 +417,13 @@ def register_order_funnel_routes(app: FastAPI) -> None:
     @app.get(billing.ORDER_SUMMARY_PATH, response_class=HTMLResponse)
     def order_summary(request: Request):
         query_selection = billing.selection_from_query(request.query_params)
+        if query_selection.get("appliance"):
+            # Hardware-first (owner decision 2026-10-15): an appliance is paid
+            # for on its own (hardware_checkout.py); the camera subscription is
+            # bought separately after delivery, never set up with the hardware.
+            import hardware_checkout
+            return RedirectResponse(f"{hardware_checkout.CHECKOUT_PATH}?{hardware_checkout.selection_query(query_selection)}",
+                                    status_code=303)
         next_path = billing.purchase_intent_next(f"{billing.ORDER_SUMMARY_PATH}?{billing.selection_query(query_selection)}") \
             or billing.ORDER_SUMMARY_PATH
         identity, refusal = _identity(request, next_path)
@@ -437,6 +444,9 @@ def register_order_funnel_routes(app: FastAPI) -> None:
         if query_selection.get("plan"):
             billing.save_build_selection(customer_id, query_selection)
         progress = billing.build_progress(customer_id) or {}
+        if progress.get("appliance") and progress.get("state") == billing.BUILD_PENDING:
+            import hardware_checkout  # a selection saved before 2026-10-15 (see above)
+            return RedirectResponse(f"{hardware_checkout.CHECKOUT_PATH}?{hardware_checkout.selection_query(progress)}", status_code=303)
         selection = progress if progress.get("plan") else {}
         cancelled = request.query_params.get("checkout") == "cancelled"
         notice = ('<p class="notice" id="order-cancelled" role="status">Checkout was cancelled. No payment was taken and nothing was activated.</p>'

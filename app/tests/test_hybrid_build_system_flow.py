@@ -176,15 +176,13 @@ def test_new_customer_build_system_to_setup_end_to_end(shop, db_path):
     # First sign-in returns to the order summary -- not the VMS.
     assert destination == canonical
     order = _order(client, destination.split("?", 1)[1])
-    assert order.status_code == 200
-    assert _summary(order.text) == ("Hybrid", 8, "$199.92")
-    assert '<nav class="nav"' not in order.text and "mobile-nav" not in order.text  # outside the VMS shell
-    # Hardware is bought online, priced from the server catalog; the plan starts at activation.
-    assert 'id="order-appliance"><span>AnyAiCam Starter appliance</span><span>$1,249.99 one-time</span>' in order.text
-    assert 'id="order-relays"><span>Numato 3-Channel Relay Module × 2</span><span>$299.98 one-time</span>' in order.text
-    assert 'id="order-today"><span>Due today</span><span>$1,549.97</span>' in order.text
-    assert "starts when you activate your appliance" in order.text
-    assert "by phone" not in order.text and "(346)" not in order.text
+    # Hardware-first (owner decision 2026-10-15): an appliance order goes to the
+    # hardware-only checkout (test_hardware_first_checkout.py); the order summary
+    # no longer sells an appliance together with a plan.
+    assert order.status_code == 303
+    assert order.headers["location"] == "/hardware-checkout?appliance=AIC-APPLIANCE-RYZEN-STARTER&relays=2&cameras=8&plan=hybrid"
+    # Below: the older appliance + deferred-plan API path, still served for
+    # orders saved before 2026-10-15.
     customer_id = _customer_id(db_path, "new@example.test")
     assert _checkouts(captured) == [] and _capacity(db_path, customer_id) == 0  # nothing bought yet
     # Proceed to Secure Checkout: the backend builds the session from the saved order and server prices.
@@ -447,8 +445,9 @@ def test_returning_later_from_another_browser_resumes_the_purchase(shop, db_path
     _new_customer(client, mail, "later@example.test", WEBSITE_QUERY)
     client.cookies.clear()  # browser closed; nothing kept client-side
     assert _signed_in(_login(client, "later@example.test", customer_only=True))
-    html = _order(client).text
-    assert _summary(html) == ("Hybrid", 8, "$199.92") and 'id="order-appliance"' in html
+    resumed = _order(client)  # the saved appliance order resumes at the hardware checkout (2026-10-15)
+    assert resumed.status_code == 303
+    assert resumed.headers["location"] == "/hardware-checkout?appliance=AIC-APPLIANCE-RYZEN-STARTER&relays=2&cameras=8&plan=hybrid"
 
 
 def test_the_order_is_saved_at_verification_before_the_first_sign_in(shop, db_path):
@@ -476,9 +475,8 @@ def test_a_cancelled_checkout_returns_to_the_same_order_and_grants_nothing(shop,
     client, _, mail, _, _ = shop
     _new_customer(client, mail, "cancel@example.test")
     assert _checkout(client).status_code == 200
-    html = _order(client, "checkout=cancelled").text
-    assert "Checkout was cancelled. No payment was taken and nothing was activated." in html
-    assert _summary(html) == ("Hybrid", 8, "$199.92")
+    back = _order(client, "checkout=cancelled")  # an appliance order returns to the hardware checkout (2026-10-15)
+    assert back.status_code == 303 and back.headers["location"].startswith("/hardware-checkout?appliance=AIC-APPLIANCE-RYZEN-STARTER")
     assert _capacity(db_path, _customer_id(db_path, "cancel@example.test")) == 0
 
 
