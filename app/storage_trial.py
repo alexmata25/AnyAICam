@@ -11,15 +11,36 @@ A customer evaluation feature, not a discount system:
   one needs an explicit administrator re-grant approval with its own reason.
   Every grant, re-grant, cancellation and paid authorization is audited
   (audit_logs).
-* The trial is 30 days from the moment the administrator activates it
-  (starts_at .. expires_at). Expiry is derived from expires_at when read --
-  no cron is needed -- and Stripe ends the subscription itself.
-* Mechanism: Stripe's native subscription trial, never a 100% coupon. A
-  storage subscription created while the trial is active carries
-  trial_end = expires_at (so the free period can never exceed the granted
-  30 days) and trial_settings[end_behavior][missing_payment_method]=cancel.
-  Checkout uses payment_method_collection=if_required, so no card is asked
-  for during the trial.
+* Countdown (owner requirement change, 2026-10-15): the 30 days must not run
+  while hardware is still on its way. An administrator grant only reserves
+  the trial (status "granted": no starts_at, no expires_at). The 30 days
+  start when the cloud-storage subscription itself is created:
+    - subscription_trial_fields() (the one hook every storage start calls)
+      computes trial_end = now + 30 days, sends it to Stripe and keeps it on
+      the record as the provisional expires_at; the record stays "granted"
+      (an abandoned Checkout costs the customer nothing);
+    - the trial becomes "active" when the trial subscription exists: at once
+      for a server-created subscription (link_subscription(), called by
+      build_orders), and on the verified customer.subscription.created /
+      checkout.session.completed webhook for Checkout -- starts_at and
+      expires_at are then Stripe's own trial_start / trial_end.
+  A repeated Checkout request within OFFER_REUSE re-sends the same
+  trial_end, so checkout_guard can reuse the open session.
+  Statuses: granted -> active -> expired | cancelled | converted;
+  granted -> cancelled (administrator, no Stripe call) | lapsed (unused for
+  GRANT_LAPSE_DAYS after the grant; derived when read, like expiry).
+  Stripe's 48-hour minimum for a Checkout trial_end no longer matters: a
+  storage start always gets a fresh 30 days.
+  Rows written before this change (status active, no subscription yet) are
+  moved back to "granted" by migration 20261015_storage_trials_pending_start
+  (the feature was never deployed).
+* Expiry is derived from expires_at when read -- no cron is needed -- and
+  Stripe ends the subscription itself.
+* Mechanism: Stripe's native subscription trial, never a 100% coupon. The
+  storage subscription carries trial_end = start + 30 days and
+  trial_settings[end_behavior][missing_payment_method]=cancel. Checkout uses
+  payment_method_collection=if_required, so no card is asked for during the
+  trial.
 * Customer protection: nobody is charged when the trial ends unless they
   explicitly chose paid storage. Every trial subscription is set to
   cancel_at_period_end=true (directly when the server creates it; by the
@@ -51,11 +72,15 @@ from partner_db import audit, connection, row, rows
 logger = logging.getLogger("anyaicam.storage_trial")
 
 TRIAL_DAYS = 30
-ACTIVE, EXPIRED, CANCELLED, CONVERTED = "active", "expired", "cancelled", "converted"
-# Stripe Checkout requires subscription_data[trial_end] at least 48 hours
-# ahead; the server-created (appliance) subscription only needs it ahead.
-CHECKOUT_MIN_REMAINING = timedelta(hours=49)
-SUBSCRIPTION_MIN_REMAINING = timedelta(hours=1)
+GRANT_LAPSE_DAYS = 180  # an unused grant lapses; a re-grant needs the repeat approval
+GRANTED, ACTIVE, EXPIRED, CANCELLED, CONVERTED, LAPSED = "granted", "active", "expired", "cancelled", "converted", "lapsed"
+OPEN = (GRANTED, ACTIVE)
+FINAL = (CANCELLED, CONVERTED, LAPSED)
+# A repeated storage-start request this soon after the last one re-sends the
+# same trial_end (identical Checkout fields: checkout_guard reuses the open
+# session instead of refusing a second one). Longer than a Checkout Session
+# lives (checkout_guard.CHECKOUT_SESSION_SECONDS, 31 minutes).
+OFFER_REUSE = timedelta(hours=1)
 METADATA_KEY = "anyaicam_storage_trial"
 _GUARD_EVENTS = {"checkout.session.completed", "checkout.session.async_payment_succeeded",
                  "customer.subscription.created", "customer.subscription.updated"}
@@ -91,15 +116,29 @@ def _parse(value: str | None) -> datetime | None:
 
 # ------------------------------------------------------------------ records
 
+def _epoch_iso(epoch) -> str:
+    return _iso(datetime.fromtimestamp(int(epoch), tz=timezone.utc))
+
+
+def lapses_at(trial: dict) -> datetime | None:
+    granted = _parse(trial.get("granted_at"))
+    return granted + timedelta(days=GRANT_LAPSE_DAYS) if granted else None
+
+
 def effective_status(trial: dict | None) -> str | None:
     """The stored status, except that an active trial past expires_at is
-    expired -- whether or not anything has written that down yet."""
+    expired and a grant unused for GRANT_LAPSE_DAYS is lapsed -- whether or
+    not anything has written that down yet."""
     if not trial:
         return None
     if trial["status"] == ACTIVE:
         expires = _parse(trial.get("expires_at"))
         if not expires or _now() >= expires:
             return EXPIRED
+    if trial["status"] == GRANTED:
+        lapse = lapses_at(trial)
+        if not lapse or _now() >= lapse:
+            return LAPSED
     return trial["status"]
 
 
@@ -120,8 +159,15 @@ def latest(customer_id: str) -> dict | None:
 
 
 def active_trial(customer_id: str) -> dict | None:
+    """A trial whose 30 days are running."""
     trial = latest(customer_id)
     return trial if trial and trial["effective_status"] == ACTIVE else None
+
+
+def open_trial(customer_id: str) -> dict | None:
+    """A trial granted and not yet started, or running."""
+    trial = latest(customer_id)
+    return trial if trial and trial["effective_status"] in OPEN else None
 
 
 def by_subscription(subscription_id: str) -> dict | None:
@@ -132,9 +178,13 @@ def by_subscription(subscription_id: str) -> dict | None:
 
 
 def _expire_lapsed(db, customer_id: str) -> None:
-    now = _iso(_now())
+    now = _now()
     db.execute("UPDATE storage_trials SET status=?,ended_at=COALESCE(ended_at,expires_at),updated_at=? "
-               "WHERE customer_id=? AND status=? AND expires_at<=?", (EXPIRED, now, customer_id, ACTIVE, now))
+               "WHERE customer_id=? AND status=? AND expires_at<>'' AND expires_at<=?",
+               (EXPIRED, _iso(now), customer_id, ACTIVE, _iso(now)))
+    db.execute("UPDATE storage_trials SET status=?,ended_at=COALESCE(ended_at,?),updated_at=? "
+               "WHERE customer_id=? AND status=? AND granted_at<=?",
+               (LAPSED, _iso(now), _iso(now), customer_id, GRANTED, _iso(now - timedelta(days=GRANT_LAPSE_DAYS))))
 
 
 def is_storage_plan(plan_key: str) -> bool:
@@ -154,7 +204,10 @@ def _text(value, label: str, *, required: bool) -> str:
 
 
 def grant(customer_id: str, *, admin: dict, reason: str, allow_repeat: bool = False, repeat_reason: str = "") -> dict:
-    """Activate the 30-day trial for an eligible customer (administrator)."""
+    """Grant the 30-day trial to an eligible customer (administrator). It is
+    reserved, not started: the 30 days begin when the customer's cloud-storage
+    subscription is created (subscription_trial_fields / link_subscription),
+    so time spent waiting for hardware delivery never uses it up."""
     import per_camera_billing as billing
     customer_id = str(customer_id or "").strip()
     reason = _text(reason, "A reason", required=True)
@@ -164,15 +217,17 @@ def grant(customer_id: str, *, admin: dict, reason: str, allow_repeat: bool = Fa
         raise TrialError(409, "This customer already has a camera plan. The free storage trial is for customers evaluating "
                               "cloud storage before buying.")
     previous = latest(customer_id)
-    if previous and previous["effective_status"] == ACTIVE:
-        raise TrialError(409, "This customer already has an active free storage trial.")
+    if previous and previous["effective_status"] in OPEN:
+        raise TrialError(409, f"This customer already has a free storage trial ({previous['effective_status']}).")
     if previous and not allow_repeat:
         raise TrialError(409, "This customer already had a free storage trial. A second trial needs an explicit "
                               "administrator re-grant approval (allow_repeat) with its own reason.")
     repeat_reason = _text(repeat_reason, "The re-grant approval reason", required=bool(previous)) if previous else ""
     now = _now()
-    trial = {"id": uuid.uuid4().hex, "customer_id": customer_id, "status": ACTIVE, "starts_at": _iso(now),
-             "expires_at": _iso(now + timedelta(days=TRIAL_DAYS)), "granted_by": admin.get("email") or "",
+    # starts_at / expires_at stay empty until the storage subscription starts
+    # the countdown (the columns are NOT NULL in the 20261015 schema).
+    trial = {"id": uuid.uuid4().hex, "customer_id": customer_id, "status": GRANTED, "starts_at": "",
+             "expires_at": "", "granted_by": admin.get("email") or "",
              "granted_at": _iso(now), "reason": reason, "repeat_of": previous["id"] if previous else None,
              "repeat_approved_by": (admin.get("email") or "") if previous else None,
              "repeat_reason": repeat_reason or None, "updated_at": _iso(now)}
@@ -183,26 +238,31 @@ def grant(customer_id: str, *, admin: dict, reason: str, allow_repeat: bool = Fa
                        tuple(trial.values()))
     except Exception as error:  # the one-active-trial unique index: a concurrent grant won
         if "unique" in str(error).lower():
-            raise TrialError(409, "This customer already has an active free storage trial.")
+            raise TrialError(409, "This customer already has a free storage trial.")
         raise
     audit(admin, "storage_trial.regrant" if previous else "storage_trial.grant", "customer", customer_id,
-          {"trial_id": trial["id"], "starts_at": trial["starts_at"], "expires_at": trial["expires_at"], "reason": reason,
+          {"trial_id": trial["id"], "status": GRANTED, "trial_days": TRIAL_DAYS,
+           "countdown": "starts when the cloud storage subscription is created",
+           "lapses_at": _iso(lapses_at(trial)), "reason": reason,
            "repeat_of": trial["repeat_of"], "repeat_reason": trial["repeat_reason"]})
     return _with_effective(trial)
 
 
 def cancel(trial_id: str, *, admin: dict, reason: str) -> dict:
-    """Revoke a trial (administrator). Its free storage ends now: a trial
-    subscription still in its trial is cancelled on Stripe immediately, which
-    never charges the customer."""
+    """Revoke a trial (administrator). A granted trial that has not started
+    has no subscription, so this is a record change only (a Checkout still
+    open with it is caught by the webhook: its subscription is cancelled at
+    once). A running trial's free storage ends now: a subscription still in
+    its trial is cancelled on Stripe immediately, which never charges the
+    customer."""
     reason = _text(reason, "A reason", required=True)
     trial = _with_effective(row("SELECT * FROM storage_trials WHERE id=?", (trial_id,)))
     if not trial:
         raise TrialError(404, "Trial not found.")
-    if trial["status"] in (CANCELLED, CONVERTED):
+    if trial["status"] in FINAL:
         raise TrialError(409, f"This trial is already {trial['status']}.")
     subscription_status = None
-    if trial.get("stripe_subscription_id"):
+    if trial["status"] != GRANTED and trial.get("stripe_subscription_id"):
         import main
         import stripe_state
         current = stripe_state.current_subscription(trial["stripe_subscription_id"])
@@ -223,19 +283,30 @@ def cancel(trial_id: str, *, admin: dict, reason: str) -> dict:
 
 # ------------------------------------------------------------------ Stripe request fields
 
-def _usable(customer_id: str, plan_key: str, minimum: timedelta) -> dict | None:
+def _usable(customer_id: str, plan_key: str) -> dict | None:
     if not is_storage_plan(plan_key):
         return None
-    trial = active_trial(customer_id)
-    if not trial or trial.get("stripe_subscription_id"):
-        return None  # one trial subscription per trial
-    if _parse(trial["expires_at"]) - _now() < minimum:
-        return None  # too little of the window left for Stripe to accept a trial
+    trial = latest(customer_id)
+    if not trial or trial["effective_status"] != GRANTED or trial.get("stripe_subscription_id"):
+        return None  # started, ended, lapsed, cancelled -- or never granted
     return trial
 
 
-def _trial_end(trial: dict) -> str:
-    return str(int(_parse(trial["expires_at"]).timestamp()))
+def _offer_trial_end(trial: dict) -> int:
+    """trial_end (epoch seconds) for a storage start now: now + 30 days,
+    kept on the record as the provisional expires_at. A repeat within
+    OFFER_REUSE re-sends the same value."""
+    now = _now()
+    provisional = _parse(trial.get("expires_at"))
+    if provisional and now <= provisional - timedelta(days=TRIAL_DAYS) + OFFER_REUSE:
+        return int(provisional.timestamp())
+    trial_end = int((now + timedelta(days=TRIAL_DAYS)).timestamp())
+    with connection() as db:
+        db.execute("UPDATE storage_trials SET expires_at=?,updated_at=? WHERE id=? AND status=?",
+                   (_epoch_iso(trial_end), _iso(now), trial["id"], GRANTED))
+    logger.info("storage_trial.start_offered trial_id=%s customer_id=%s trial_end=%s",
+                trial["id"], trial["customer_id"], trial_end)
+    return trial_end
 
 
 def subscription_trial_fields(customer_id: str, *, checkout: bool, plan_key: str) -> list[tuple[str, str]]:
@@ -244,14 +315,18 @@ def subscription_trial_fields(customer_id: str, *, checkout: bool, plan_key: str
     storage start such as a hardware-first per-camera Checkout).
 
     Returns the Stripe fields to append to the request, or [] when nothing
-    applies -- no active administrator-granted trial, a plan without cloud
-    storage, a trial already used by a subscription, or too little of the
-    window left for Stripe to accept it. [] means the request is exactly as
-    it would be without this feature.
+    applies -- no granted, not-yet-started administrator trial, a plan
+    without cloud storage, or a trial already started (or ended) by a
+    subscription. [] means the request is exactly as it would be without
+    this feature.
+
+    This is where the 30-day countdown is set: trial_end = now + 30 days
+    (the provisional expires_at; the trial turns "active" once the
+    subscription exists -- link_subscription / the verified webhook).
 
     checkout=True (POST /v1/checkout/sessions, mode=subscription, storage
     plan line only -- never a session with one-time hardware/license lines):
-      subscription_data[trial_end]=<expires_at epoch>,
+      subscription_data[trial_end]=<now + 30 days, epoch>,
       subscription_data[trial_settings][end_behavior][missing_payment_method]=cancel,
       payment_method_collection=if_required,
       metadata[anyaicam_storage_trial] and subscription_data[metadata][anyaicam_storage_trial]=<trial id>.
@@ -264,28 +339,48 @@ def subscription_trial_fields(customer_id: str, *, checkout: bool, plan_key: str
       and should call link_subscription() with the created subscription id
       (the webhook links it too).
     """
-    trial = _usable(customer_id, plan_key, CHECKOUT_MIN_REMAINING if checkout else SUBSCRIPTION_MIN_REMAINING)
+    trial = _usable(customer_id, plan_key)
     if not trial:
         return []
+    trial_end = str(_offer_trial_end(trial))
     if checkout:
-        return [("subscription_data[trial_end]", _trial_end(trial)),
+        return [("subscription_data[trial_end]", trial_end),
                 ("subscription_data[trial_settings][end_behavior][missing_payment_method]", "cancel"),
                 ("payment_method_collection", "if_required"),
                 (f"metadata[{METADATA_KEY}]", trial["id"]),
                 (f"subscription_data[metadata][{METADATA_KEY}]", trial["id"])]
-    return [("trial_end", _trial_end(trial)),
+    return [("trial_end", trial_end),
             ("trial_settings[end_behavior][missing_payment_method]", "cancel"),
             ("cancel_at_period_end", "true"),
             (f"metadata[{METADATA_KEY}]", trial["id"])]
 
 
-def link_subscription(trial_id: str, customer_id: str, subscription_id: str) -> None:
+def link_subscription(trial_id: str, customer_id: str, subscription_id: str, *,
+                      trial_start=None, trial_end=None, source: str = "server") -> None:
+    """Binds the trial subscription to its trial and starts the 30-day
+    countdown of a granted trial: starts_at = Stripe's trial_start (or now),
+    expires_at = Stripe's trial_end (or the provisional value this module
+    sent). Called for a server-created subscription (build_orders) and by
+    the verified webhook for a trialing trial subscription."""
     if not trial_id or not subscription_id:
         return
+    now = _now()
     with connection() as db:
         db.execute("UPDATE storage_trials SET stripe_subscription_id=?,updated_at=? "
                    "WHERE id=? AND customer_id=? AND stripe_subscription_id IS NULL",
-                   (subscription_id, _iso(_now()), trial_id, customer_id))
+                   (subscription_id, _iso(now), trial_id, customer_id))
+    trial = row("SELECT * FROM storage_trials WHERE id=? AND customer_id=?", (trial_id, customer_id))
+    if not trial or trial["status"] != GRANTED or trial.get("stripe_subscription_id") != subscription_id:
+        return
+    starts = _epoch_iso(trial_start) if trial_start else _iso(now)
+    expires = (_epoch_iso(trial_end) if trial_end else trial.get("expires_at")) or _iso(now + timedelta(days=TRIAL_DAYS))
+    with connection() as db:
+        started = db.execute("UPDATE storage_trials SET status=?,starts_at=?,expires_at=?,updated_at=? WHERE id=? AND status=?",
+                             (ACTIVE, starts, expires, _iso(now), trial_id, GRANTED)).rowcount
+    if started:
+        audit(_SYSTEM if source == "webhook" else {"email": "storage-start", "role": "system"}, "storage_trial.start",
+              "customer", customer_id, {"trial_id": trial_id, "stripe_subscription_id": subscription_id,
+                                        "starts_at": starts, "expires_at": expires, "source": source})
 
 
 # ------------------------------------------------------------------ explicit paid authorization
@@ -383,14 +478,25 @@ def sync_from_stripe_event(event: dict) -> dict:
     trial = _with_effective(row("SELECT * FROM storage_trials WHERE id=?", (trial_id,))) if trial_id else by_subscription(subscription_id)
     if not trial or str(metadata.get("anyaicam_customer_id") or trial["customer_id"]) != trial["customer_id"]:
         return {"status": "ignored", "reason": "not a trial subscription of this account"}
-    link_subscription(trial["id"], trial["customer_id"], subscription_id)
-    trial = _with_effective(row("SELECT * FROM storage_trials WHERE id=?", (trial["id"],)))
     status = str(current.get("status") or "")
-    bound = trial.get("stripe_subscription_id") == subscription_id
     if status == "trialing":
-        if trial["status"] == CANCELLED:
+        if trial["status"] in (CANCELLED, LAPSED):
+            # Revoked (or lapsed and re-granted) while a Checkout was open:
+            # the free subscription ends now, which never charges anyone.
             main.stripe_api_delete(f"/v1/subscriptions/{subscription_id}")
-            return {"status": "cancelled_on_stripe", "reason": "the trial was revoked by an administrator"}
+            return {"status": "cancelled_on_stripe", "reason": f"the trial is {trial['status']}"}
+        # The trial subscription exists: the 30-day countdown starts here
+        # (a granted trial), at Stripe's own trial_start / trial_end.
+        link_subscription(trial["id"], trial["customer_id"], subscription_id, trial_start=current.get("trial_start"),
+                          trial_end=current.get("trial_end"), source="webhook")
+        trial = _with_effective(row("SELECT * FROM storage_trials WHERE id=?", (trial["id"],)))
+        bound = trial.get("stripe_subscription_id") == subscription_id
+        if bound and trial["status"] == ACTIVE and current.get("trial_end") and _epoch_iso(current["trial_end"]) != trial["expires_at"]:
+            # Stripe is the record of when the free period ends (e.g. the
+            # trial was ended early in Stripe by a person).
+            with connection() as db:
+                db.execute("UPDATE storage_trials SET expires_at=?,updated_at=? WHERE id=?",
+                           (_epoch_iso(current["trial_end"]), _iso(_now()), trial["id"]))
         authorized = bound and trial.get("paid_authorized_at")
         if event_type in _GUARD_EVENTS and not authorized and not current.get("cancel_at_period_end"):
             if event_type == "customer.subscription.updated" and (
@@ -409,7 +515,8 @@ def sync_from_stripe_event(event: dict) -> dict:
                                  idempotency_key=f"anyaicam-storage-trial-guard-{subscription_id}")
             return {"status": "guarded", "subscription_id": subscription_id}
         return {"status": "trialing"}
-    if not bound:
+    if trial.get("stripe_subscription_id") != subscription_id:
+        # Includes a granted trial: only a trialing subscription starts it.
         return {"status": "ignored", "reason": "another subscription holds this trial"}
     now = _iso(_now())
     if status == "active" and trial["status"] in (ACTIVE, EXPIRED) and _invoice_paid(current):
@@ -440,26 +547,32 @@ def customer_view(customer_id: str) -> dict | None:
     trial = latest(customer_id)
     if not trial:
         return None
-    return {"status": trial["effective_status"], "starts_at": trial["starts_at"], "expires_at": trial["expires_at"],
+    started = trial["status"] not in (GRANTED, LAPSED) and bool(trial.get("starts_at"))
+    return {"status": trial["effective_status"], "trial_days": TRIAL_DAYS, "countdown_started": started,
+            "starts_at": trial["starts_at"] if started else None, "expires_at": trial["expires_at"] if started else None,
+            "unused_grant_lapses_at": _iso(lapses_at(trial)) if trial["effective_status"] == GRANTED else None,
             "applies_to": "Cloud storage plan (Hybrid) only", "subscription_started": bool(trial.get("stripe_subscription_id")),
             "paid_after_trial": bool(trial.get("paid_authorized_at"))}
 
 
 def customer_note_html(customer_id: str, is_owner: bool) -> str:
     try:
-        trial = active_trial(customer_id)
+        trial = open_trial(customer_id)
     except Exception:
         return ""  # a database before the storage_trials migration
     if not trial:
         return ""
+    if trial["effective_status"] == GRANTED:
+        return ('<p class="health-detail" id="storage-trial-note"><strong>A 30-day free cloud storage trial is reserved for '
+                'your account.</strong> The 30 days start only when you start the Hybrid cloud storage plan (for example after '
+                'your equipment is delivered), not before. Hardware, software licenses and add-ons are charged at their normal '
+                'prices. You will not be charged for storage after the trial unless you choose to continue.</p>')
     until = escape(_parse(trial["expires_at"]).strftime("%b %d, %Y"))
     note = (f'<p class="health-detail" id="storage-trial-note"><strong>Free cloud storage trial until '
             f'<time datetime="{escape(trial["expires_at"], quote=True)}" data-local-date>{until}</time>.</strong> '
             'Hardware, software licenses and add-ons are charged at their normal prices. ')
     if trial.get("paid_authorized_at"):
         return note + 'You chose to continue cloud storage as a paid plan after the trial.</p>'
-    if not trial.get("stripe_subscription_id"):
-        return note + 'It applies when you start the Hybrid cloud storage plan before it ends.</p>'
     note += 'Your storage plan ends with the trial and you will not be charged unless you choose to continue.</p>'
     if is_owner:
         note += ('<button class="ghost-button" id="storage-trial-continue" type="button">Continue cloud storage after my trial</button>'
@@ -478,23 +591,27 @@ def customer_note_html(customer_id: str, is_owner: bool) -> str:
 def _admin_page(items: list[dict]) -> str:
     body = "".join(
         f'<tr><td>{escape(t.get("customer_name") or t["customer_id"])}<br><small>{escape(t["customer_id"])}</small></td>'
-        f'<td>{escape(t["effective_status"])}</td><td>{escape(t["starts_at"][:10])}</td><td>{escape(t["expires_at"][:10])}</td>'
+        f'<td>{escape(t["effective_status"])}</td>'
+        f'<td>{escape((t["starts_at"] or "")[:10] if t["status"] not in (GRANTED, LAPSED) else "When storage starts")}</td>'
+        f'<td>{escape((t["expires_at"] or "")[:10] if t["status"] not in (GRANTED, LAPSED) else "Start +" + str(TRIAL_DAYS) + " days")}</td>'
         f'<td>{escape(t["granted_by"])}</td><td>{escape(t["reason"])}{"<br><small>Re-grant: " + escape(t.get("repeat_reason") or "") + "</small>" if t.get("repeat_of") else ""}</td>'
         f'<td>{escape(t.get("stripe_subscription_id") or "")}</td>'
         f'<td>{"" if t["status"] in (CANCELLED, CONVERTED) else "<button class=ghost-button data-cancel=" + escape(t["id"], quote=True) + ">Cancel</button>"}</td></tr>'
         for t in items) or '<tr><td colspan="8">No storage trials yet.</td></tr>'
     return f'''<header class="topbar"><div><p class="eyebrow">Administrator</p><h1>Free storage trials</h1></div></header>
-<section class="panel"><h2>Activate a 30-day free storage trial</h2>
+<section class="panel"><h2>Grant a 30-day free storage trial</h2>
 <p class="health-detail">Cloud storage plan only (Hybrid). Hardware, licenses and add-ons stay at normal prices. The customer is never
-charged after the trial unless they choose to continue. One trial per customer; a second needs a re-grant approval reason.</p>
+charged after the trial unless they choose to continue. One trial per customer; a second needs a re-grant approval reason.
+The 30 days start when the customer starts the cloud storage plan (never while hardware is awaiting delivery); a grant unused
+for {GRANT_LAPSE_DAYS} days lapses.</p>
 <label>Customer ID <input id="st-customer" maxlength="80"></label> <label>Reason <input id="st-reason" maxlength="500"></label>
 <label><input type="checkbox" id="st-repeat"> Approve a repeat trial</label> <label>Re-grant reason <input id="st-repeat-reason" maxlength="500"></label>
-<button class="action-button" id="st-grant" type="button">Activate trial</button><p class="health-detail" id="st-result" role="status"></p></section>
+<button class="action-button" id="st-grant" type="button">Grant trial</button><p class="health-detail" id="st-result" role="status"></p></section>
 <section class="panel" style="margin-top:14px"><table><tr><th>Customer</th><th>Status</th><th>Starts</th><th>Expires</th><th>Granted by</th>
 <th>Reason</th><th>Subscription</th><th></th></tr>{body}</table></section>
 <script>
 const out=document.getElementById('st-result');
-document.getElementById('st-grant').onclick=async()=>{{const r=await fetch('/api/admin/storage-trials',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{customer_id:document.getElementById('st-customer').value,reason:document.getElementById('st-reason').value,allow_repeat:document.getElementById('st-repeat').checked,repeat_reason:document.getElementById('st-repeat-reason').value}})}});const d=await r.json().catch(()=>({{}}));out.textContent=r.ok?'Trial active until '+d.expires_at:(d.detail||'Could not activate the trial.');if(r.ok)setTimeout(()=>location.reload(),900);}};
+document.getElementById('st-grant').onclick=async()=>{{const r=await fetch('/api/admin/storage-trials',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{customer_id:document.getElementById('st-customer').value,reason:document.getElementById('st-reason').value,allow_repeat:document.getElementById('st-repeat').checked,repeat_reason:document.getElementById('st-repeat-reason').value}})}});const d=await r.json().catch(()=>({{}}));out.textContent=r.ok?'Trial granted. The 30 days start when the customer starts cloud storage.':(d.detail||'Could not grant the trial.');if(r.ok)setTimeout(()=>location.reload(),900);}};
 document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=async()=>{{const reason=prompt('Reason for cancelling this trial?');if(!reason)return;const r=await fetch('/api/admin/storage-trials/'+b.dataset.cancel+'/cancel',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{reason}})}});const d=await r.json().catch(()=>({{}}));out.textContent=r.ok?'Trial cancelled.':(d.detail||'Could not cancel the trial.');if(r.ok)setTimeout(()=>location.reload(),900);}});
 </script>'''
 
