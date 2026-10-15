@@ -47,12 +47,12 @@ def reported_version(value) -> str | None:
 
 # ------------------------------------------------------------------ the contract
 
-def contract_for(customer_id: str, *, payload: dict | None = None) -> dict:
+def contract_for(customer_id: str, *, payload: dict | None = None, role: str = "customer_owner") -> dict:
     try:
-        import software_license  # Red's backend (LICENSE_REVIEW.md), when it lands
-        return software_license.customer_contract(customer_id)
+        import software_license  # Red's backend (e2eec24): downloads come back [] for a viewer
     except ImportError:
         return _local_contract(customer_id, payload)
+    return software_license.customer_contract(customer_id, role=role)
 
 
 def _local_contract(customer_id: str, payload: dict | None) -> dict:
@@ -212,7 +212,7 @@ def downloads_panel(contract: dict, *, steps_html=None) -> str:
 
 
 def panels_html(customer_id: str, *, is_owner: bool, payload: dict | None, mode: str | None) -> str:
-    contract = contract_for(customer_id, payload=payload)
+    contract = contract_for(customer_id, payload=payload, role="customer_owner" if is_owner else "customer_viewer")
     html = license_panel(contract) + appliances_panel(contract)
     import customer_entitlements
     if is_owner and customer_entitlements.vms_license_capacity(customer_id) > 0:  # the download route's own eligibility
