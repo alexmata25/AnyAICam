@@ -83,10 +83,12 @@ jobs:
           suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
           counts = {key: sum(int(suite.attrib.get(key, 0)) for suite in suites)
                     for key in ("tests", "failures", "errors", "skipped")}
+          counts["passed"] = counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
           body = (
               "## Linux authorization/regression tests\n\n"
               f"- Job status: **{os.environ.get('JOB_STATUS', 'unknown')}**\n"
               f"- Tests: **{counts['tests']}**\n"
+              f"- Passed: **{counts['passed']}**\n"
               f"- Failures: **{counts['failures']}**\n"
               f"- Errors: **{counts['errors']}**\n"
               f"- Skips: **{counts['skipped']}**\n\n"
@@ -193,10 +195,12 @@ jobs:
           suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
           counts = {key: sum(int(suite.attrib.get(key, 0)) for suite in suites)
                     for key in ("tests", "failures", "errors", "skipped")}
+          counts["passed"] = counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
           summary.write_text(
               "## Disposable PostgreSQL migration/rollback\n\n"
               f"- Job status: **{os.environ.get('JOB_STATUS', 'unknown')}**\n"
               f"- Tests: **{counts['tests']}**\n"
+              f"- Passed: **{counts['passed']}**\n"
               f"- Failures: **{counts['failures']}**\n"
               f"- Errors: **{counts['errors']}**\n"
               f"- Skips: **{counts['skipped']}**\n\n"
