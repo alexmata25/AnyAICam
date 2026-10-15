@@ -361,6 +361,86 @@ def capacity_breakdown(customer_id: str) -> dict:
             "vms_license_capacity": license_capacity, "vms_license_required": license_capacity <= 0}
 
 
+def _count(quantity: int) -> str:
+    return f"{quantity} camera" + ("" if quantity == 1 else "s")
+
+
+def vms_license_summary(customer_id: str) -> dict:
+    """The account's VMS software license for My subscription (2026-10-15).
+
+    cameras is capacity_breakdown()["vms_license_capacity"] -- the very value
+    feature_entitlements.appliance_snapshot() signs for the account's
+    appliances -- so the page and the appliance cannot disagree. kind names
+    the source vms_license_capacity() took it from:
+
+    * per_camera_plan      -- an active billing-v2 per-camera plan;
+    * one_time_vms_license -- a purchased (DIY) one-time license row;
+    * appliance_included   -- a paid AnyAiCam appliance order: the license
+                              follows the Local/Hybrid plan quantity;
+    * legacy_slots         -- an earlier Local/Hybrid plan with no license
+                              on record (cameras 0);
+    * none                 -- nothing.
+
+    The plan view (mode separation, per_camera_billing.existing_plan /
+    has_camera_plan, cached Stripe modes only -- never a Stripe call) decides
+    suspended states and the legacy plan name. "stand-alone" appears in a
+    label only when a one-time vms_license row exists. Read-only."""
+    breakdown = capacity_breakdown(customer_id)
+    cameras = int(breakdown["vms_license_capacity"])
+    try:
+        import per_camera_billing
+        v2_capacity = min(MAX_CAMERA_SLOTS, max(0, int(per_camera_billing.vms_license_capacity(customer_id) or 0)))
+        plan = per_camera_billing.existing_plan(customer_id, lookup=False)
+        has_plan = per_camera_billing.has_camera_plan(customer_id, lookup=False)
+    except Exception:  # pre-v2 database
+        v2_capacity, plan, has_plan = 0, None, False
+    entitlements = _entitlement_rows(customer_id)
+    licenses = [e for e in entitlements if e["product"] == VMS_LICENSE_PRODUCT]
+    purchased = max((int(e["camera_slot_quantity"] or 0) for e in licenses if e["status"] == "active"), default=0)
+    purchased = min(MAX_CAMERA_SLOTS, purchased)
+    appliance_order = appliance_includes_vms_license(customer_id)
+    base_rows = [e for e in entitlements if e["product"] in BASE_PLAN_PRODUCTS]
+    kind, status = "none", "none"
+    if cameras > 0:
+        status = "active"
+        if v2_capacity and v2_capacity == cameras:
+            kind = "per_camera_plan"
+        elif purchased and purchased == cameras:
+            kind = "one_time_vms_license"
+        else:
+            kind = "appliance_included"
+    elif plan and plan["kind"] == "per_camera" and plan["entitlement"].get("status") == "suspended":
+        kind, status = "per_camera_plan", "suspended"
+    elif any(e["status"] == "suspended" for e in licenses):
+        kind, status = "one_time_vms_license", "suspended"
+    elif appliance_order and any(e["status"] == "suspended" for e in base_rows):
+        kind, status = "appliance_included", "suspended"
+    elif plan and plan["kind"] == "legacy":
+        kind = "legacy_slots"
+    labels = {
+        ("per_camera_plan", "active"): f"VMS software license included with your per-camera plan · {_count(cameras)}",
+        ("one_time_vms_license", "active"): f"One-time stand-alone VMS software license (yours to keep) · up to {_count(cameras)}",
+        ("appliance_included", "active"): f"VMS software license included with your AnyAiCam appliance · {_count(cameras)}",
+        ("per_camera_plan", "suspended"): "VMS software license for your per-camera plan · suspended until billing is resolved",
+        ("one_time_vms_license", "suspended"): "One-time stand-alone VMS software license · suspended (payment refunded or disputed)",
+        ("appliance_included", "suspended"): "VMS software license included with your AnyAiCam appliance · suspended until billing is resolved",
+    }
+    label = labels.get((kind, status))
+    if kind == "legacy_slots":
+        label = f"Earlier {plan.get('name') or 'camera'} plan ({_count(int(plan.get('quantity') or 0))}) · no VMS software license on record"
+    elif label is None:
+        label = "No VMS software license on record. It is included with every AnyAiCam appliance, or can be purchased for your own PC."
+    if kind == "per_camera_plan" and status == "active" and purchased:
+        label += f" · one-time stand-alone license for up to {_count(purchased)} also on record"
+    return {
+        "kind": kind, "cameras": cameras, "status": status, "label": label,
+        "plan_cameras": int(breakdown["plan_camera_slots"]), "usable_cameras": int(breakdown["camera_slot_quantity"]),
+        "has_camera_plan": bool(has_plan), "appliance_order": bool(appliance_order),
+        "sources": [{"product": e["product"], "qty": int(e["camera_slot_quantity"] or 0), "status": e["status"], "row_id": e["id"]}
+                    for e in entitlements if e["product"] in BASE_PLAN_PRODUCTS + (VMS_LICENSE_PRODUCT,)],
+    }
+
+
 def capacity_refusal(customer_id: str) -> str:
     """The customer-facing reason a new camera cannot be added.
 
