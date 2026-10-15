@@ -1,0 +1,216 @@
+name: VMS 1.2.7 Cost Dashboard verification
+
+on:
+  push:
+    branches:
+      - codex/vms-1.2.7-cost-dashboard-20261015
+  pull_request:
+    branches:
+      - codex/vms-1.2.7-cost-dashboard-20261015
+
+permissions:
+  contents: read
+
+jobs:
+  linux-auth-and-regression:
+    name: Linux auth and dashboard regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: app
+      ANYAICAM_DATABASE_BACKEND: sqlite
+      ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-1.2.7-cost-dashboard-tests.db
+      ANYAICAM_TEST_LAB_ENABLED: "false"
+    steps:
+      - name: Check out isolated 1.2.7 branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Run 52 dashboard and neighboring regressions plus owner/grant authorization suites
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -ra --junitxml=linux-auth-and-regression.xml \
+            app/tests/test_aws_cost_dashboard.py \
+            app/tests/test_camera_discovery_migration_restore.py \
+            app/tests/test_analytics_control_center.py \
+            app/tests/test_platform_owner_rbac.py \
+            app/tests/test_identity_grant_privilege.py \
+            app/tests/test_identity_grant_management.py \
+            app/tests/test_bootstrap_admin_identity_grant.py \
+            app/tests/test_cloud_administrator_bridge.py \
+            app/tests/test_admin_access_lockout.py \
+            app/tests/test_admin_portal_signin_pass.py \
+            2>&1 | tee linux-auth-and-regression.log
+
+      - name: Summarize test outcomes
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          report = Path("linux-auth-and-regression.xml")
+          if not report.exists():
+              summary.write_text(
+                  f"## Linux authorization/regression tests\n\n"
+                  f"Job status: **{os.environ.get('JOB_STATUS', 'unknown')}**. "
+                  "No JUnit report was produced; inspect the workflow logs for setup or collection errors.\n",
+                  encoding="utf-8",
+              )
+              raise SystemExit(0)
+
+          root = ET.parse(report).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          counts = {key: sum(int(suite.attrib.get(key, 0)) for suite in suites)
+                    for key in ("tests", "failures", "errors", "skipped")}
+          body = (
+              "## Linux authorization/regression tests\n\n"
+              f"- Job status: **{os.environ.get('JOB_STATUS', 'unknown')}**\n"
+              f"- Tests: **{counts['tests']}**\n"
+              f"- Failures: **{counts['failures']}**\n"
+              f"- Errors: **{counts['errors']}**\n"
+              f"- Skips: **{counts['skipped']}**\n\n"
+              "The suite includes the 52 previously passing dashboard/neighbor tests, "
+              "platform-owner RBAC, and identity-grant privilege/management tests. "
+              "No AWS, Stripe, production, or deployment credentials are configured.\n"
+          )
+          summary.write_text(body, encoding="utf-8")
+          PY
+
+      - name: Upload Linux test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vms-1.2.7-linux-auth-regression-report
+          path: |
+            linux-auth-and-regression.xml
+            linux-auth-and-regression.log
+          if-no-files-found: warn
+
+  postgres-migration-rollback:
+    name: Disposable PostgreSQL migration and restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vms_test
+          POSTGRES_PASSWORD: vms_test_only
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vms_test -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PYTHONPATH: app
+      ANYAICAM_DATABASE_BACKEND: postgresql
+      PGPASSWORD: vms_test_only
+      ANYAICAM_TEST_POSTGRES_URL: postgresql://vms_test:vms_test_only@localhost:5432/vms_cost_upgrade
+      ANYAICAM_TEST_POSTGRES_RESTORE_URL: postgresql://vms_test:vms_test_only@localhost:5432/vms_cost_restore
+    steps:
+      - name: Check out isolated 1.2.7 branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+
+      - name: Install PostgreSQL client and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Create isolated disposable databases
+        env:
+          PGPASSWORD: vms_test_only
+        run: |
+          createdb --host localhost --username vms_test vms_cost_upgrade
+          createdb --host localhost --username vms_test vms_cost_restore
+
+      - name: Test additive migration, idempotence, record preservation, and backup restore
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -ra --junitxml=postgres-migration-rollback.xml \
+            app/tests/test_aws_cost_dashboard_postgresql.py \
+            2>&1 | tee postgres-migration-rollback.log
+
+      - name: Summarize PostgreSQL test outcomes
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          report = Path("postgres-migration-rollback.xml")
+          if not report.exists():
+              summary.write_text(
+                  f"## Disposable PostgreSQL migration/rollback\n\n"
+                  f"Job status: **{os.environ.get('JOB_STATUS', 'unknown')}**. "
+                  "No JUnit report was produced; inspect the workflow logs for setup or collection errors.\n",
+                  encoding="utf-8",
+              )
+              raise SystemExit(0)
+
+          root = ET.parse(report).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          counts = {key: sum(int(suite.attrib.get(key, 0)) for suite in suites)
+                    for key in ("tests", "failures", "errors", "skipped")}
+          summary.write_text(
+              "## Disposable PostgreSQL migration/rollback\n\n"
+              f"- Job status: **{os.environ.get('JOB_STATUS', 'unknown')}**\n"
+              f"- Tests: **{counts['tests']}**\n"
+              f"- Failures: **{counts['failures']}**\n"
+              f"- Errors: **{counts['errors']}**\n"
+              f"- Skips: **{counts['skipped']}**\n\n"
+              "All databases and records are synthetic and exist only in this GitHub Actions service container.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload PostgreSQL test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vms-1.2.7-postgres-migration-rollback-report
+          path: |
+            postgres-migration-rollback.xml
+            postgres-migration-rollback.log
+          if-no-files-found: warn
