@@ -1310,6 +1310,53 @@ CREATE TABLE IF NOT EXISTS local_customer_credentials(
  last_verified_at TEXT, revoked_at TEXT, revoked_reason TEXT
 );
 '''),
+    # Owner-only AWS cost dashboard snapshots. This migration is additive and
+    # stores metering aggregates, never object keys, credentials, or media.
+    ('20261015_aws_cost_dashboard_snapshots','''
+CREATE TABLE IF NOT EXISTS aws_cost_monthly_snapshots(
+ month TEXT NOT NULL,
+ service TEXT NOT NULL,
+ dimension_name TEXT NOT NULL DEFAULT 'RECORD_TYPE',
+ dimension_value TEXT NOT NULL DEFAULT '',
+ amount_usd REAL NOT NULL,
+ estimated INTEGER NOT NULL DEFAULT 1,
+ source TEXT NOT NULL,
+ captured_at TEXT NOT NULL,
+ PRIMARY KEY(month,service,dimension_name,dimension_value,source)
+);
+CREATE INDEX IF NOT EXISTS idx_aws_cost_monthly_snapshots_month ON aws_cost_monthly_snapshots(month);
+CREATE TABLE IF NOT EXISTS aws_camera_usage_snapshots(
+ snapshot_date TEXT NOT NULL,
+ customer_id TEXT NOT NULL,
+ site_id TEXT NOT NULL,
+ appliance_id TEXT NOT NULL,
+ camera_id TEXT NOT NULL,
+ storage_class TEXT NOT NULL,
+ bytes INTEGER NOT NULL,
+ object_count INTEGER NOT NULL,
+ oldest_upload_at TEXT,
+ newest_upload_at TEXT,
+ recording_mode TEXT,
+ retention_days INTEGER,
+ source TEXT NOT NULL,
+ captured_at TEXT NOT NULL,
+ PRIMARY KEY(snapshot_date,camera_id,storage_class,source)
+);
+CREATE INDEX IF NOT EXISTS idx_aws_camera_usage_customer_date ON aws_camera_usage_snapshots(customer_id,snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_aws_camera_usage_camera_snapshot ON aws_camera_usage_snapshots(camera_id,snapshot_date,storage_class,source);
+CREATE TABLE IF NOT EXISTS aws_lifecycle_rule_snapshots(
+ snapshot_at TEXT NOT NULL,
+ bucket_name TEXT NOT NULL,
+ rule_id TEXT NOT NULL,
+ status TEXT NOT NULL,
+ prefix TEXT,
+ expiration_days INTEGER,
+ filter_json TEXT NOT NULL DEFAULT '{}',
+ source TEXT NOT NULL,
+ PRIMARY KEY(snapshot_at,bucket_name,rule_id,source)
+);
+CREATE INDEX IF NOT EXISTS idx_aws_lifecycle_bucket_snapshot ON aws_lifecycle_rule_snapshots(bucket_name,snapshot_at);
+'''),
 ]
 
 

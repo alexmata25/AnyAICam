@@ -49343,6 +49343,8 @@ register_talk_audio_relay_routes(app)
 register_facial_recognition_routes(app, page_shell)
 register_aac_voice_call_routes(app, page_shell)
 register_platform_owner_routes(app, page_shell)
+from aws_cost_dashboard import register_aws_cost_dashboard_routes
+register_aws_cost_dashboard_routes(app, page_shell)
 register_door_access_routes(app)
 register_security_routes(app, page_shell)
 from access_control_api import register_access_control_routes
@@ -107919,6 +107921,8 @@ def administrator_portal_page(request: Request) -> str:
 
 
 
+    from aws_cost_dashboard import owner_dashboard_entry
+    owner_cost_dashboard_entry = owner_dashboard_entry(request)
     return page_shell(
 
 
@@ -107946,7 +107950,7 @@ def administrator_portal_page(request: Request) -> str:
 
 
 
-        content.replace('<article class="admin-command-card"><h2>Administrator tools</h2>', ADMIN_SIGNIN_SECURITY_CARD + '<article class="admin-command-card"><h2>Administrator tools</h2>', 1),
+        content.replace('<article class="admin-command-card"><h2>Administrator tools</h2>', owner_cost_dashboard_entry + ADMIN_SIGNIN_SECURITY_CARD + '<article class="admin-command-card"><h2>Administrator tools</h2>', 1),
         ADMIN_SIGNIN_SECURITY_SCRIPT,
 
 
