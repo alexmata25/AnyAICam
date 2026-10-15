@@ -44,6 +44,8 @@ jobs:
         shell: bash
         env:
           ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-1.2.7-cost-dashboard-tests.db
+          ANYAICAM_HLS_FOLDER: ${{ runner.temp }}/vms-1.2.7-cost-dashboard/hls
+          ANYAICAM_RECORDINGS_FOLDER: ${{ runner.temp }}/vms-1.2.7-cost-dashboard/recordings
         run: |
           set -o pipefail
           pytest -ra --junitxml=linux-auth-and-regression.xml \
