@@ -46,6 +46,7 @@ jobs:
           ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-1.2.7-cost-dashboard-tests.db
           ANYAICAM_HLS_FOLDER: ${{ runner.temp }}/vms-1.2.7-cost-dashboard/hls
           ANYAICAM_RECORDINGS_FOLDER: ${{ runner.temp }}/vms-1.2.7-cost-dashboard/recordings
+          ANYAICAM_STATIC_FOLDER: ${{ github.workspace }}/app/static
         run: |
           set -o pipefail
           pytest -ra --junitxml=linux-auth-and-regression.xml \
