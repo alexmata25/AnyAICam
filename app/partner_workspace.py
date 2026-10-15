@@ -461,7 +461,18 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # Token-activated, or claimed and really enrolled (a claim leaves
         # activation_status 'pending' -- see appliance_readiness.py).
         from appliance_readiness import customer_has_activated_appliance
-        activated=customer_has_activated_appliance(customer['id'])
+        # On the appliance itself (1.2.6 acceptance, 2026-10-15) the local
+        # database has no appliance_credentials rows, so the check above was
+        # always False and every owner was sent to /customer/setup. Here the
+        # appliance is activated for this customer exactly when its own
+        # persisted activation identity says so.
+        on_edge=os.environ.get('ANYAICAM_RUNTIME_ROLE','').strip().lower()=='edge'
+        if on_edge:
+            from appliance_activation import load_persisted_identity
+            own=load_persisted_identity()
+            activated=bool(own and own.get('customer_id')==customer['id'])
+        else:
+            activated=customer_has_activated_appliance(customer['id'])
 
         # Multi-appliance isolation fix (2026-09-12): this page used to query
         # cameras `WHERE customer_id=?` alone, exactly the same defect class
@@ -544,21 +555,23 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # them or redirecting away.
         # An unpaid Build Your System purchase resumes on its order summary
         # (website-first purchase, then setup), with the saved selection.
-        if identity['role']=='customer_owner' and not licensed_slots:
+        # Purchase, delivery and setup all happen in the cloud portal; on the
+        # appliance this page always renders.
+        if identity['role']=='customer_owner' and not licensed_slots and not on_edge:
             import per_camera_billing
             progress=per_camera_billing.build_progress(customer['id'])
             if progress and progress['state']==per_camera_billing.BUILD_PENDING:
                 return RedirectResponse(per_camera_billing.ORDER_SUMMARY_PATH,status_code=303)
         # A paid Build Your System order whose appliance has not been
         # delivered yet returns to its order status, not to setup.
-        if identity['role']=='customer_owner' and not activated:
+        if identity['role']=='customer_owner' and not activated and not on_edge:
             import per_camera_billing, order_funnel
             progress=per_camera_billing.build_progress(customer['id'])
             if progress and progress['state']==per_camera_billing.BUILD_PAID:
                 delivery=order_funnel.hardware_delivery(customer['id'],progress)
                 if delivery and delivery['state']!=order_funnel.HARDWARE_READY:
                     return RedirectResponse(per_camera_billing.ORDER_COMPLETE_PATH,status_code=303)
-        if identity['role']=='customer_owner' and not (activated and (cameras or licensed_slots>0)):
+        if identity['role']=='customer_owner' and not on_edge and not (activated and (cameras or licensed_slots>0)):
             return RedirectResponse('/customer/setup',status_code=303)
 
         def _camera_card(camera: dict) -> str:
@@ -616,7 +629,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # the Live tab's Add camera uses.
         add_camera=''
         if (identity['role']=='customer_owner' and activated and licensed_slots>configured_count
-                and os.environ.get('ANYAICAM_RUNTIME_ROLE','').strip().lower()!='edge'):  # cloud-only, see cloud_account_only()
+                and not on_edge):  # cloud-only, see cloud_account_only()
             add_appliance=appliance_id
             if not add_appliance:
                 owned=rows('SELECT id FROM appliances WHERE customer_id=?',(customer['id'],))

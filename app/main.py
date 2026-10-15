@@ -1312,6 +1312,11 @@ CLOUD_UPLOAD_SCAN_SECONDS = max(10, int(os.environ.get("ANYAICAM_CLOUD_UPLOAD_SC
 
 
 CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS = max(30, int(os.environ.get("ANYAICAM_CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS", "90")))
+# Customer requests catalog new local recordings for at most this long
+# (see _catalog_local_recordings_for_camera()); the background worker
+# catalogs the rest every PLAYBACK_CATALOG_WORKER_INTERVAL_SECONDS.
+PLAYBACK_CATALOG_BUDGET_SECONDS = max(0.5, float(os.environ.get("ANYAICAM_PLAYBACK_CATALOG_BUDGET_SECONDS", "3")))
+PLAYBACK_CATALOG_WORKER_INTERVAL_SECONDS = max(30, int(os.environ.get("ANYAICAM_PLAYBACK_CATALOG_WORKER_INTERVAL_SECONDS", "120")))
 
 
 
@@ -40934,6 +40939,13 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
+    # Recording catalog (2026-10-15): catalogs new local recordings in the
+    # background so Playback requests stay within their time budget.
+    local_recording_catalog_task = (
+        asyncio.create_task(local_recording_catalog_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # Local customer access (2026-10-14): re-confirms offline appliance passwords
     # against the cloud's signed identity manifest (local_customer_access.py).
     local_customer_access_task = (
@@ -41136,6 +41148,8 @@ async def lifespan(app: FastAPI):
             notification_retry_task.cancel()
         if camera_config_sync_task:
             camera_config_sync_task.cancel()
+        if local_recording_catalog_task:
+            local_recording_catalog_task.cancel()
         if local_customer_access_task:
             local_customer_access_task.cancel()
         if talk_down_discovery_task:
@@ -41261,6 +41275,8 @@ async def lifespan(app: FastAPI):
             pending.append(notification_retry_task)
         if camera_config_sync_task:
             pending.append(camera_config_sync_task)
+        if local_recording_catalog_task:
+            pending.append(local_recording_catalog_task)
         if local_customer_access_task:
             pending.append(local_customer_access_task)
         if talk_down_discovery_task:
@@ -142792,7 +142808,7 @@ def _probe_recording_duration_seconds(path: Path) -> float | None:
         return None
 
 
-def _catalog_local_recordings_for_camera(camera_id: str) -> int:
+def _catalog_local_recordings_for_camera(camera_id: str, *, budget_seconds: float | None = PLAYBACK_CATALOG_BUDGET_SECONDS) -> int:
     """Backfills the recordings table from local .mkv files still on
     disk for this camera -- reconciled verbatim from the accepted,
     live production implementation (EC2/Samsung), not invented.
@@ -142856,8 +142872,16 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
 
         cutoff = time.time() - CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS
         added = 0
-
-        for path in sorted(camera_folder.glob("*.mkv")):
+        # Request-path budget (2026-10-15, Ryzen 1.2.6 acceptance): every
+        # caller is a customer request, and a backlog of uncatalogued files
+        # (thousands after an upgrade or a long gap) cost one ffprobe each,
+        # so the first Playback load took ~4 minutes. Newest first, and once
+        # the budget is spent the rest is left to
+        # local_recording_catalog_worker(); a later request picks up where
+        # this one stopped. budget_seconds=None (the worker) has no limit.
+        started_at_monotonic = time.monotonic()
+        deferred = 0
+        for path in sorted(camera_folder.glob("*.mkv"), reverse=True):
             try:
                 stat = path.stat()
             except OSError:
@@ -142895,6 +142919,9 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
             # 18s, 23s, etc., never a fixed length). Falls back to the
             # historical 300s assumption only if ffprobe genuinely can't
             # determine a real duration (never raises).
+            if budget_seconds is not None and time.monotonic() - started_at_monotonic >= budget_seconds:
+                deferred += 1
+                continue
             duration_seconds = _probe_recording_duration_seconds(path)
             if duration_seconds is None:
                 duration_seconds = 300.0
@@ -142954,7 +142981,47 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
                 else:
                     break
 
+    if deferred:
+        logging.getLogger("anyaicam.recordings_catalog").info(
+            "recordings_catalog.deferred_to_worker camera_id=%s added=%s deferred=%s",
+            camera_id, added, deferred,
+        )
     return added
+
+
+def local_recording_catalog_pass() -> int:
+    """Catalogs every camera's local recordings with no time budget.
+    Runs in local_recording_catalog_worker(), off the request path."""
+    import logging
+    from partner_db import connection
+
+    with connection() as db:
+        camera_ids = [row["id"] for row in db.execute(
+            "SELECT id FROM cameras WHERE camera_number IS NOT NULL"
+        ).fetchall()]
+    added = 0
+    for camera_id in camera_ids:
+        try:
+            added += _catalog_local_recordings_for_camera(camera_id, budget_seconds=None)
+        except Exception as error:
+            logging.getLogger("anyaicam.recordings_catalog").warning(
+                "recordings_catalog.worker_camera_failed camera_id=%s error=%s",
+                camera_id, type(error).__name__,
+            )
+    return added
+
+
+async def local_recording_catalog_worker() -> None:
+    """Keeps the recordings catalog current on the appliance, so a
+    customer's Playback request only has the last few minutes' files left
+    to catalog (see PLAYBACK_CATALOG_BUDGET_SECONDS)."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await asyncio.to_thread(local_recording_catalog_pass)
+        except Exception as error:
+            print(f"Recording catalog pass skipped: {type(error).__name__}")
+        await asyncio.sleep(PLAYBACK_CATALOG_WORKER_INTERVAL_SECONDS)
 
 
 def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, before_id: str | None = None, near: str | None = None) -> list[dict]:
@@ -143090,7 +143157,8 @@ def _recordings_overlapping_utc_range(camera_id: str, query_start: str, query_en
     Catalogs local .mkv files for this camera before querying (see
     _catalog_local_recordings_for_camera()) so a day whose Playback page
     has never been opened before -- an old retained day -- is still
-    discoverable, without any new always-running background service.
+    discoverable. The request path is time-budgeted (newest files first);
+    local_recording_catalog_worker() catalogs whatever it leaves behind.
 
     Uses an interval-overlap test (started_at < query_end AND ended_at >
     query_start), not a started_at-only bound -- a recording that starts
@@ -144354,25 +144422,32 @@ def customer_recording_thumbnail(camera_id: str, recording_id: str, request: Req
 
         temporary_path = thumbnail_path.with_suffix(".tmp.jpg")
 
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-ss", "3",
-                "-i", str(recording_path),
-                "-frames:v", "1",
-                "-vf", "scale=320:-2",
-                "-q:v", "4",
-                "-y",
-                str(temporary_path),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=15,
-        )
+        # A clip shorter than 3 s (a segment cut short by a restart; seen on
+        # the Ryzen 2026-10-15, 1.65 s) has no frame at 3 s: ffmpeg exits 0
+        # and writes nothing. Fall back to the first frame.
+        for seek_seconds in ("3", "0"):
+            temporary_path.unlink(missing_ok=True)
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-ss", seek_seconds,
+                    "-i", str(recording_path),
+                    "-frames:v", "1",
+                    "-vf", "scale=320:-2",
+                    "-q:v", "4",
+                    "-y",
+                    str(temporary_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+            if result.returncode == 0 and temporary_path.is_file() and temporary_path.stat().st_size > 0:
+                break
 
-        if result.returncode != 0 or not temporary_path.is_file():
+        if result.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
             temporary_path.unlink(missing_ok=True)
             raise HTTPException(
                 status_code=404,
