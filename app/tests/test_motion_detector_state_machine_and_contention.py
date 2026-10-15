@@ -31,6 +31,10 @@ import pytest
 
 import main
 
+# The detector's camera_in_service() gate must not see an earlier test's
+# camera rows (conftest.isolated_camera_map).
+pytestmark = pytest.mark.usefixtures("isolated_camera_map")
+
 
 def _random_frame(seed: int) -> bytes:
     rng = random.Random(seed)

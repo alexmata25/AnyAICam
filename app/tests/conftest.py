@@ -17,6 +17,24 @@ import pytest
 os.environ.setdefault("ANYAICAM_PRODUCT_MODE_SELF_RESTART", "false")
 
 
+@pytest.fixture
+def isolated_camera_map(tmp_path):
+    """motion_detector() checks main.camera_in_service() on every frame, which
+    reads the cameras table through current_camera_numbers() and caches the
+    answer process-wide for a few seconds. In one pytest process that table is
+    whatever an earlier test left behind -- often camera rows without this
+    test's camera number, which ends the detector early. Opt in (pytestmark)
+    to run against an empty database of its own (no camera rows: every camera
+    counts as in service, the real gate still runs) with a fresh cache."""
+    import main
+    from database_backend import override_target
+
+    main._camera_in_service_cache[:] = [-1e18, None]
+    with override_target(sqlite_path=str(tmp_path / "no-cameras.db")):
+        yield
+    main._camera_in_service_cache[:] = [-1e18, None]
+
+
 @pytest.fixture(autouse=True)
 def _reset_appliance_config_cache():
     try:

@@ -21,6 +21,10 @@ from pathlib import Path
 
 import pytest
 
+# The detector's camera_in_service() gate must not see an earlier test's
+# camera rows (conftest.isolated_camera_map).
+pytestmark = pytest.mark.usefixtures("isolated_camera_map")
+
 import camera_capabilities
 import live_hls_demand
 import motion_source
