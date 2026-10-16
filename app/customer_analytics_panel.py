@@ -351,6 +351,33 @@ UPGRADE_CARD_CONTENT: dict[str, dict] = {
             "Full facial-event history with confidence and thumbnails",
         ],
     },
+    # The rule analytics (ae06971) run on Smart Motion's person/vehicle
+    # detections; every camera lists every ANALYTIC_KEYS entry, so each one
+    # needs a card here (a missing one made the Live View row return 500).
+    "line_crossing": {
+        "description": "Get an alert when a person or vehicle crosses a line you draw on "
+                        "this camera. Uses Smart Motion's detections.",
+        "benefits": [
+            "Alerts when someone crosses a line you choose",
+            "Works with Smart Motion on this camera",
+        ],
+    },
+    "intrusion": {
+        "description": "Get an alert when a person or vehicle enters an area you mark on "
+                        "this camera. Uses Smart Motion's detections.",
+        "benefits": [
+            "Alerts when someone enters an area you choose",
+            "Works with Smart Motion on this camera",
+        ],
+    },
+    "loitering": {
+        "description": "Get an alert when a person stays in an area you mark on this "
+                        "camera for longer than you allow. Uses Smart Motion's detections.",
+        "benefits": [
+            "Alerts when someone lingers in an area you choose",
+            "Works with Smart Motion on this camera",
+        ],
+    },
 }
 
 

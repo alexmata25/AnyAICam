@@ -2297,7 +2297,9 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             entitlements = camera_entitlement_rows(db, camera_id)
         analytics = analytics_row_state(entitlements)
         for item in analytics:
-            item['upgrade'] = UPGRADE_CARD_CONTENT[item['key']]
+            # .get(): one analytic without card copy must not take the whole
+            # row down (a missing key returned 500 for every camera).
+            item['upgrade'] = UPGRADE_CARD_CONTENT.get(item['key']) or {'description': '', 'benefits': []}
         return {'analytics': analytics}
 
     @app.get('/api/customer/cameras/{camera_id}/analytics/{analytic_key}/summary')
