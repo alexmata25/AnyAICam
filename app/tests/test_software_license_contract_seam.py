@@ -33,3 +33,14 @@ def test_a_backend_error_is_not_masked_by_the_local_fallback(monkeypatch):
     _fake_backend(monkeypatch, broken)
     with pytest.raises(ImportError):
         panels.contract_for("cust-1")
+
+
+def test_a_pending_appliance_license_reads_as_starting_at_setup():
+    contract = {"account": {"customer_id": "c1", "name": "Bea"}, "appliances": [], "downloads": [], "notes": {},
+                "license": {"kind": "appliance_included", "cameras": 0, "status": "pending",
+                            "label": "VMS software license included with your AnyAiCam appliance (activates when you set up your appliance)"}}
+    html = panels.license_panel(contract)
+    assert "Starts when your appliance is set up" in html and "Set when your appliance is set up" in html
+    assert ">pending<" not in html and "No VMS software license" not in html
+    contract["license"]["cameras"] = 8
+    assert "Up to 8 cameras" in panels.license_panel(contract)

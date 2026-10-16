@@ -139,8 +139,13 @@ def _row(label: str, value: str, row_id: str = "") -> str:
 
 def license_panel(contract: dict) -> str:
     license_ = contract["license"]
-    status = {"active": "Active", "suspended": "Paused (billing problem)", "none": "—"}.get(license_["status"], escape(str(license_["status"])))
-    cameras = f'Up to {int(license_["cameras"])} camera{"" if int(license_["cameras"]) == 1 else "s"}' if license_["cameras"] else "—"
+    # "pending" (Red, 2026-10-15): a paid appliance order whose license activates when the appliance is set up.
+    status = {"active": "Active", "suspended": "Paused (billing problem)", "pending": "Starts when your appliance is set up",
+              "none": "—"}.get(license_["status"], escape(str(license_["status"])))
+    if license_["cameras"]:
+        cameras = f'Up to {int(license_["cameras"])} camera{"" if int(license_["cameras"]) == 1 else "s"}'
+    else:
+        cameras = "Set when your appliance is set up" if license_["status"] == "pending" else "—"
     body = (_row("License type", escape(license_["label"]), "sl-type") + _row("Licensed cameras", cameras, "sl-cameras")
             + _row("Status", status, "sl-status") + _row("Account", escape(contract["account"].get("name") or "Your AnyAiCam account"), "sl-account"))
     note = ('<p class="health-detail">Your license belongs to your AnyAiCam account. It stays the same when you reinstall '
