@@ -19924,10 +19924,21 @@ def require_stripe_price_matches_catalog(price_id: str, expected_cents: int, int
         return
     price = stripe_api_get(f"/v1/prices/{quote(price_id, safe='')}")
     actual_interval = ((price.get("recurring") or {}).get("interval")) if price.get("recurring") else None
-    if (int(price.get("unit_amount") or -1) != int(expected_cents) or actual_interval != interval
-            or str(price.get("currency") or "").lower() != "usd" or price.get("active") is False):
+    recurring = price.get("recurring") or {}
+    try:
+        interval_count = int(recurring.get("interval_count", 1)) if recurring else None
+    except (TypeError, ValueError):
+        interval_count = None
+    try:
+        actual_cents = int(price.get("unit_amount"))
+    except (TypeError, ValueError):
+        actual_cents = None
+    if (str(price.get("id") or "") != str(price_id)
+            or actual_cents != int(expected_cents) or actual_interval != interval
+            or (interval is not None and interval_count != 1)
+            or str(price.get("currency") or "").lower() != "usd" or price.get("active") is not True):
         structured_log("stripe.price_catalog_mismatch", level="error", price_id=price_id,
-                       expected_cents=int(expected_cents), actual_cents=price.get("unit_amount"),
+                       expected_cents=int(expected_cents), actual_cents=actual_cents,
                        expected_interval=interval, actual_interval=actual_interval)
         raise HTTPException(status_code=503, detail="PRICE_MISMATCH: this item's Stripe price does not match the published price, so checkout is paused. Please contact AnyAiCam support.")
     _VERIFIED_STRIPE_PRICES[key] = True

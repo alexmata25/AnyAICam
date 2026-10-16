@@ -137,6 +137,9 @@ def test_v2_checkout_uses_approved_monthly_unit_price_and_camera_quantity(
     {"unit_amount": 1499, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
     {"unit_amount": 999, "currency": "eur", "active": True, "recurring": {"interval": "month"}},
     {"unit_amount": 999, "currency": "usd", "active": True, "recurring": {"interval": "year"}},
+    {"unit_amount": 999, "currency": "usd", "active": True, "recurring": {"interval": "month", "interval_count": 12}},
+    {"unit_amount": 999, "currency": "usd", "active": True, "recurring": {"interval": "month", "interval_count": 0}},
+    {"unit_amount": "not-an-integer", "currency": "usd", "active": True, "recurring": {"interval": "month"}},
     {"unit_amount": 999, "currency": "usd", "active": False, "recurring": {"interval": "month"}},
 ])
 def test_v2_checkout_refuses_a_mismatched_or_inactive_stripe_price(
