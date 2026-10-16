@@ -347,3 +347,43 @@ def test_the_local_network_allowlist_is_explicit():
     from pathlib import Path
     source = Path(__file__).resolve().parents[1].joinpath("appliance_cloud.py").read_text(encoding="utf-8")
     assert "RECONNECT_LOCAL_NETWORKS=" + repr(networks).replace(" ", "") in source.replace(" ", "")
+
+
+# ------------------------------------------------ the driveway scenario
+
+LEFT = "urn:uuid:d45ec000-f254-11b4-839a-142ffd606e23"
+
+
+def test_both_driveway_cameras_reconnect_after_the_oct_12_dhcp_change(client, db_path, monkeypatch):
+    """Driveway Right .44 -> .43 and Driveway Left .70 -> .69, each reconnected
+    as itself: identities, numbers and names kept, no plan place used, and a
+    reconnect of one never moves the other."""
+    monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", KEY)
+    monkeypatch.delenv("ANYAICAM_RUNTIME_ROLE", raising=False)
+    monkeypatch.setattr("appliance_readiness.enrollment_ready", lambda appliance_id: True)
+    _seed_tenant(db_path)
+    _per_camera_plan(db_path, 2)
+    credential = _activated(client, db_path)
+    cams = {}
+    for key, name, old in ((RIGHT, "Driveway Right", "192.168.0.44"), (LEFT, "Driveway Left", "192.168.0.70")):
+        assert _add(client, credential, key).status_code == 200
+        cid = _camera_id(db_path, key)
+        assert client.post(f"/api/appliance/AIC-SLOT1/cameras/{cid}/media-uri", json={"device_key": key, "rtsp_uri": f"rtsp://{old}:554{PATH}"},
+                           headers=_appliance_headers("appl-1", credential)).json()["updated"]
+        _sql(db_path, "UPDATE cameras SET name=? WHERE id=?", (name, cid))
+        cams[key] = cid
+    before = {k: _sql(db_path, "SELECT * FROM cameras WHERE id=?", (cid,))[0] for k, cid in cams.items()}
+    for key, new in ((RIGHT, "192.168.0.43"), (LEFT, "192.168.0.69")):
+        world = {"client": client, "db": db_path, "credential": credential, "camera_id": cams[key]}
+        assert _rediscover(world, [RIGHT, LEFT])["found"] is True
+        job_id = _reconnect(world, username="admin", password="pw").json()["job_id"]
+        _appliance_confirms(world, job_id)
+        moved = _appliance(world, "post", f"/api/appliance/AIC-SLOT1/cameras/{cams[key]}/media-uri",
+                           json={"device_key": key, "rtsp_uri": f"rtsp://{new}:554{PATH}", "provisioning_job_id": job_id})
+        assert moved.json()["updated"] is True, moved.text
+    after = {k: _sql(db_path, "SELECT * FROM cameras WHERE id=?", (cid,))[0] for k, cid in cams.items()}
+    assert after[RIGHT]["onvif_endpoint"] == f"rtsp://192.168.0.43:554{PATH}"
+    assert after[LEFT]["onvif_endpoint"] == f"rtsp://192.168.0.69:554{PATH}"
+    for key in cams:
+        assert {k: v for k, v in after[key].items() if k != "onvif_endpoint"} == {k: v for k, v in before[key].items() if k != "onvif_endpoint"}
+    assert _sql(db_path, "SELECT COUNT(*) AS n FROM cameras WHERE device_key IS NOT NULL")[0]["n"] == 2

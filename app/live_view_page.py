@@ -638,6 +638,14 @@ _CAMERA_MANAGE_JS = """
     if(target)link.setAttribute('href',target);
     document.querySelectorAll('.remove-camera').forEach(button=>{button.hidden=!manage;});
     document.querySelectorAll('.reconnect-camera').forEach(button=>{button.hidden=!manage;});
+    // Dashboard "Reconnect camera" (/customer-live?reconnect=<id>): open the
+    // dialog for that camera once, when the cloud confirms the owner may manage.
+    const wanted=new URLSearchParams(window.location.search).get('reconnect');
+    if(manage&&wanted&&!bar.dataset.reconnectOpened){
+      bar.dataset.reconnectOpened='1';
+      const target=[...document.querySelectorAll('.reconnect-camera')].find(button=>button.dataset.cameraId===wanted);
+      if(target)target.click();
+    }
     bar.hidden=false;
   }
   fetch('/api/customer/cameras',{headers:{'Accept':'application/json'}})
