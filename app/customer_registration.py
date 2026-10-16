@@ -19,8 +19,33 @@ def create_pending_registration(display_name: str, email: str, password: str) ->
     normalized = email.strip().lower()
     with connection() as db:
         existing = db.execute(
-            "SELECT id,status FROM customer_registration_requests WHERE email=?", (normalized,)
+            "SELECT id,status,customer_id,user_id,decided_at,decided_by,rejection_reason FROM customer_registration_requests WHERE email=?",
+            (normalized,),
         ).fetchone()
+        if existing and existing["status"] == "rejected" and not existing["customer_id"] and not existing["user_id"]:
+            # Codex review 2026-10-16: a rejected request used to block that email forever. A rejection that never
+            # created an account is reopened as a new pending request (same row: email is UNIQUE); the earlier
+            # decision stays in the audit log. A rejection of an approved account (customer/user rows exist,
+            # suspended/revoked) is not reopened here: those rows still hold the email (see below).
+            import json as _json
+            if db.execute("SELECT 1 FROM partner_users WHERE lower(email)=?", (normalized,)).fetchone() or                     db.execute("SELECT 1 FROM customers WHERE lower(email)=?", (normalized,)).fetchone():
+                raise HTTPException(status_code=409, detail="That email belongs to an existing account. Please contact AnyAiCam support.")
+            now = _now()
+            db.execute(
+                "UPDATE customer_registration_requests SET display_name=?,password_hash=?,status='pending',partner_id=NULL,"
+                "requested_at=?,decided_at=NULL,decided_by=NULL,rejection_reason=NULL WHERE id=? AND status='rejected'",
+                (display_name.strip(), password_hash(password), now, existing["id"]),
+            )
+            db.execute(
+                "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (normalized, "anonymous", "customer_registration.reopened", "customer_registration", existing["id"],
+                 _json.dumps({"previous_status": "rejected", "previous_decided_at": existing["decided_at"],
+                              "previous_decided_by": existing["decided_by"],
+                              "previous_reason": (existing["rejection_reason"] or "")[:200]}), now),
+            )
+            return "pending", True
+        if existing and existing["status"] == "rejected":
+            raise HTTPException(status_code=409, detail="That email belongs to an existing account. Please contact AnyAiCam support.")
         if existing:
             return existing["status"], False
         if db.execute("SELECT 1 FROM partner_users WHERE lower(email)=?", (normalized,)).fetchone():

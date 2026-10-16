@@ -142,11 +142,21 @@ def _now() -> str:
     return datetime.now().isoformat()
 
 
+# Accounts that must never receive a purchase by email matching (Codex review 2026-10-16): a rejected
+# registration's account is 'suspended' (customer_registration.reject_registration), and the test-account cleanup
+# (Requirement #11) tombstones accounts as 'closed_test'. A Stripe event with no authoritative customer id for such an
+# email becomes a pending link instead, resolved only when a verified account for that email exists.
+INACTIVE_CUSTOMER_STATUSES = ("suspended", "closed", "closed_test", "rejected", "deleted")
+
+
 def find_customer_by_email(email: str) -> Optional[dict]:
+    """The usable customer account for an email, for webhook reconciliation only. Inactive accounts never match."""
     normalized = normalize_email(email)
     if not normalized:
         return None
-    return row("SELECT * FROM customers WHERE lower(email)=?", (normalized,))
+    placeholders = ",".join("?" * len(INACTIVE_CUSTOMER_STATUSES))
+    return row(f"SELECT * FROM customers WHERE lower(email)=? AND COALESCE(lower(status),'active') NOT IN ({placeholders})",
+               (normalized, *INACTIVE_CUSTOMER_STATUSES))
 
 
 # --------------------------------------------------------------- entitlements
@@ -442,7 +452,10 @@ def vms_license_summary(customer_id: str) -> dict:
     elif label is None:
         label = "No VMS software license on record. It is included with every AnyAiCam appliance, or can be purchased for your own PC."
     if kind == "per_camera_plan" and status == "active" and purchased:
-        label += f" · one-time stand-alone license for up to {_count(purchased)} also on record"
+        # An own-PC buyer holds both (activation-first flow): name the license they paid for first, then what the
+        # plan covers today, e.g. "One-time AnyAiCam VMS software license (up to 8 cameras) · your plan covers 1 camera".
+        label = (f"One-time AnyAiCam VMS software license (up to {_count(purchased)}) · your plan covers "
+                 f"{_count(int(breakdown['plan_camera_slots']))}")
     return {
         "kind": kind, "cameras": cameras, "status": status, "label": label,
         "plan_cameras": int(breakdown["plan_camera_slots"]), "usable_cameras": int(breakdown["camera_slot_quantity"]),

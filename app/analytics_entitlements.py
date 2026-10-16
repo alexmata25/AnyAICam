@@ -173,10 +173,9 @@ def resolve_addon(price_id: str) -> Optional[dict]:
 
 
 def _find_customer_by_email(email: str) -> Optional[dict]:
-    normalized = (email or "").strip().lower()
-    if not normalized:
-        return None
-    return row("SELECT * FROM customers WHERE lower(email)=?", (normalized,))
+    # Same rule as the camera-plan webhook: a suspended or closed account never receives a purchase by email.
+    import customer_entitlements
+    return customer_entitlements.find_customer_by_email(email)
 
 
 def upsert_analytics_subscription(
