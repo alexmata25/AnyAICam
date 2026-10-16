@@ -23,7 +23,7 @@ from .metrics import collect
 from .lan_addresses import publish as publish_lan_addresses
 from .onvif_media import resolve_media_uri
 from .portal import PortalClient,PortalError,sanitize
-from .provisioning import locate_device,verify_device
+from .provisioning import locate_device,verify_device,verify_rtsp_credentials
 from .queue import OfflineQueue
 from .updater.factory import build_update_state_machine
 from .updater.health import make_health_check
@@ -339,7 +339,7 @@ class ApplianceAgent:
                 # docstring for why this, not a second fetch/store, is
                 # the only place ONVIF resolution is ever attempted
                 # with a credential.
-                self._resolve_media_uri_after_provisioning(job.get('device_key',''),job.get('credentials'))
+                self._resolve_media_uri_after_provisioning(job.get('device_key',''),job.get('credentials'),job_id=job_id)
                 # Cloud->edge camera-configuration sync (2026-09-12):
                 # same reuse principle as the ONVIF resolution call just
                 # above -- the ONE plaintext credential this job payload
@@ -392,7 +392,7 @@ class ApplianceAgent:
             # and never logs the credential itself under any
             # circumstance, matching this file's existing discipline.
             self.log.warning('Local VMS credential handoff failed device_key=%s error=%s',device_key,error)
-    def _resolve_media_uri_after_provisioning(self,device_key,credentials):
+    def _resolve_media_uri_after_provisioning(self,device_key,credentials,job_id=None):
         # Deliberately the ONLY caller of resolve_media_uri() that ever
         # passes a username/password -- and only the exact plaintext
         # values this same job's own verify_device() call already used,
@@ -416,7 +416,12 @@ class ApplianceAgent:
         for camera in configuration.get('cameras',[]):
             if camera.get('device_key')==device_key:
                 if camera.get('onvif_endpoint'):
-                    return  # already resolved (e.g. an earlier attempt for this same camera) -- nothing to do
+                    # Already resolved. A successful job for an existing
+                    # camera is a reconnect: if the device now answers at a
+                    # different address, move only the host (2026-10-15).
+                    if job_id:
+                        self._reconnect_existing_camera_address(camera,device,credentials,job_id)
+                    return
                 camera_id=camera.get('id'); break
         if not camera_id:
             return
@@ -430,6 +435,33 @@ class ApplianceAgent:
             self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':result['rtsp_uri']})
         except PortalError as error:
             self.log.debug('onvif_media.submit_failed_during_provisioning device_key=%s error=%s',device_key,error)
+    def _reconnect_existing_camera_address(self,camera,device,credentials,job_id):
+        """Reconnect an existing camera whose DHCP address changed. The
+        device was located by its ONVIF identity (locate_device) for this
+        job; before the cloud may change the stored address, the camera's
+        own stream URL -- same scheme, port, path and query, only the host
+        replaced -- must accept this job's credentials (RTSP DESCRIBE).
+        Never logs or submits a credential, and never logs an address."""
+        from urllib.parse import urlsplit,urlunsplit
+        current=urlsplit(str(camera.get('onvif_endpoint') or ''))
+        new_host=str(device.get('ip') or '')
+        if current.scheme!='rtsp' or not current.hostname or not new_host or current.hostname==new_host:
+            return
+        netloc=new_host if not current.port else f'{new_host}:{current.port}'
+        new_uri=urlunsplit((current.scheme,netloc,current.path,current.query,''))
+        path=(current.path or '/')+(f'?{current.query}' if current.query else '')
+        username=str((credentials or {}).get('username',''))
+        password=str((credentials or {}).get('password',''))
+        ok,_detail=verify_rtsp_credentials(new_host,current.port or 554,username,password,path=path)
+        if not ok:
+            self.log.info('camera.reconnect_not_verified camera_id=%s',camera.get('id'))
+            return
+        try:
+            self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera.get("id")}/media-uri',
+                                {'device_key':camera.get('device_key'),'rtsp_uri':new_uri,'provisioning_job_id':job_id})
+            self.log.info('camera.reconnected_at_new_address camera_id=%s',camera.get('id'))
+        except PortalError as error:
+            self.log.debug('camera.reconnect_submit_failed camera_id=%s error=%s',camera.get('id'),error)
     def poll_commands(self):
         try:
             for item in self.client.request('GET','/api/appliance/commands').get('commands',[]):
