@@ -1451,6 +1451,99 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         if not job: raise HTTPException(status_code=404,detail='Provisioning job not found.')
         return _maybe_time_out_provisioning_job(job)
 
+    # ---- Reconnect an existing camera (2026-10-15, VMS 1.2.7). A camera
+    # whose DHCP address changed is found again and reconnected AS THE SAME
+    # CAMERA: same camera id and number, analytics rules, recordings and
+    # settings. Unlike Remove + Add (which makes a new camera), nothing is
+    # created and no plan slot is used. The identity always comes from the
+    # camera's own row (its ONVIF device_key), never from the browser, so a
+    # different physical device can never be attached in its place: the
+    # appliance agent locates the device by that identity, checks its
+    # credentials with an RTSP DESCRIBE at its current address, and only
+    # then may the stored address change (appliance_submit_media_uri).
+    def _reconnectable_camera(identity: dict, camera_id: str) -> dict:
+        camera=row("SELECT id,name,device_key,appliance_id,site_id,status,camera_number FROM cameras WHERE id=? AND customer_id=?",
+                   (camera_id,identity['customer_id']))
+        if not camera or camera.get('status')=='removed':
+            raise HTTPException(status_code=404,detail='Camera not found.')
+        if not camera.get('device_key') or not camera.get('appliance_id'):
+            raise HTTPException(status_code=409,detail='This camera has not been set up on an appliance yet; use Add camera instead.')
+        return camera
+
+    @app.post('/api/customer/cameras/{camera_id}/rediscover')
+    def rediscover_camera(request: Request,camera_id: str) -> dict:
+        cloud_account_only()
+        identity=customer_owner(request)
+        camera=_reconnectable_camera(identity,camera_id)
+        scan=request_camera_scan(request,camera['appliance_id'])
+        return {'scan_job_id':scan['job_id'],'status':scan['status'],'message':scan.get('message','')}
+
+    @app.get('/api/customer/cameras/{camera_id}/rediscover/{scan_job_id}')
+    def rediscover_camera_status(request: Request,camera_id: str,scan_job_id: str) -> dict:
+        identity=customer_owner(request)
+        camera=_reconnectable_camera(identity,camera_id)
+        job=row('SELECT * FROM camera_scan_jobs WHERE id=? AND customer_id=? AND appliance_id=?',
+                (scan_job_id,identity['customer_id'],camera['appliance_id']))
+        if not job: raise HTTPException(status_code=404,detail='Camera discovery job not found.')
+        job=_maybe_time_out_scan_job(job)
+        result={'status':job['status'],'progress':job.get('progress'),'message':job.get('message') or ''}
+        if job['status']=='complete':
+            found=json.loads(job.get('results_json') or '[]')
+            result['found']=any(str(item.get('device_key') or '')==camera['device_key'] for item in found if isinstance(item,dict))
+            result['other_devices']=sum(1 for item in found if isinstance(item,dict) and str(item.get('device_key') or '')!=camera['device_key'])
+            result['has_saved_credentials']=bool(row('SELECT 1 AS present FROM camera_credentials WHERE camera_id=?',(camera_id,)))
+        return result
+
+    @app.post('/api/customer/cameras/{camera_id}/reconnect')
+    def reconnect_camera(request: Request,camera_id: str,payload: dict) -> dict:
+        cloud_account_only()
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        camera=_reconnectable_camera(identity,camera_id)
+        username=str(payload.get('username') or ''); password=str(payload.get('password') or '')
+        if payload.get('use_saved_credentials') and not (username or password):
+            saved=row('SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?',(camera_id,))
+            if not saved: raise HTTPException(status_code=400,detail='No saved username and password for this camera. Enter them to reconnect it.')
+            encrypted=saved['encrypted_blob']
+        elif username or password:
+            encrypted=encrypt_camera_credentials(username,password)
+            if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured on this deployment yet. Contact support.')
+        else:
+            encrypted=None  # a camera that serves video without a login
+        now=datetime.now().isoformat()
+        with connection() as db:
+            pending=db.execute("SELECT id,status,message FROM camera_provisioning_requests WHERE customer_id=? AND device_key=? AND status IN ('queued','verifying') ORDER BY created_at DESC LIMIT 1",
+                               (identity['customer_id'],camera['device_key'])).fetchone()
+            if pending:
+                return {'job_id':pending['id'],'status':pending['status'],'message':pending['message']}
+            job_id=secrets.token_hex(6)
+            db.execute(
+                'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (job_id,identity['customer_id'],camera['appliance_id'],camera['site_id'],camera['device_key'],camera.get('name') or 'Camera',
+                 'motion','[]',encrypted,'queued','Reconnect request queued for the appliance.',now,now),
+            )
+        audit(identity,'camera.reconnect_requested','camera',camera_id,{'job_id':job_id,'saved_credentials':bool(payload.get('use_saved_credentials') and not (username or password))})
+        return {'job_id':job_id,'status':'queued','message':'Reconnect request queued for the appliance.'}
+
+    @app.get('/api/customer/cameras/{camera_id}/reconnect/{job_id}')
+    def reconnect_camera_status(request: Request,camera_id: str,job_id: str) -> dict:
+        identity=customer_owner(request)
+        camera=_reconnectable_camera(identity,camera_id)
+        job=row('SELECT id,status,camera_id,device_key,message,failure_code,created_at,updated_at FROM camera_provisioning_requests WHERE id=? AND customer_id=? AND device_key=?',
+                (job_id,identity['customer_id'],camera['device_key']))
+        if not job: raise HTTPException(status_code=404,detail='Reconnect request not found.')
+        job=_maybe_time_out_provisioning_job(job)
+        result={'status':job['status'],'message':job.get('message') or '','failure_code':job.get('failure_code')}
+        if job['status']=='provisioned':
+            # Video confirmed: the appliance's own heartbeat reports this
+            # camera online and recording again after the reconnect.
+            seen=row('SELECT online,recording,updated_at FROM appliance_camera_status WHERE appliance_id=? AND camera_id=?',
+                     (camera['appliance_id'],camera_id))
+            result['video_confirmed']=bool(seen and seen.get('online') and str(seen.get('updated_at') or '')>=str(job.get('updated_at') or ''))
+        return result
+
     # Appliance-facing provisioning-jobs routes (GET/POST) now live in
     # appliance_cloud.py, authenticated via authenticate_appliance()
     # instead of the removed appliance_agent() bearer-vs-activation-token
