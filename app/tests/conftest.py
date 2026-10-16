@@ -35,6 +35,30 @@ def isolated_camera_map(tmp_path):
     main._camera_in_service_cache[:] = [-1e18, None]
 
 
+_DATABASE_ENV = ("ANYAICAM_PARTNER_DB", "ANYAICAM_DATABASE_BACKEND", "ANYAICAM_DATABASE_URL")
+
+
+@pytest.fixture(autouse=True)
+def _restore_database_environment():
+    """partner_db.connection() follows ANYAICAM_PARTNER_DB at call time, so
+    a test that points it at its own temporary file and never puts it back
+    leaves every later test on a deleted (then empty, schema-less) database:
+    "no such table" in whichever unrelated tests come next in the whole-suite
+    order (Red triage 2026-10-15: 26 such failures after
+    test_customer_registration_csrf.py). Whatever a test does to these
+    variables is undone when it ends; module-level setup done at collection
+    time is untouched."""
+    import os
+
+    saved = {name: os.environ.get(name) for name in _DATABASE_ENV}
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 @pytest.fixture(autouse=True)
 def _reset_appliance_config_cache():
     try:
