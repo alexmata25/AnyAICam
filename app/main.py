@@ -40968,18 +40968,21 @@ async def lifespan(app: FastAPI):
     )
     # Camera address recovery (1.2.7): finds a camera again by its ONVIF
     # identity after DHCP gives it a new address (camera_address_recovery.py).
-    import camera_address_recovery
-    camera_address_recovery_task = (
-        asyncio.create_task(camera_address_recovery.camera_address_recovery_worker(
-            lambda: camera_address_recovery.Dependencies(
-                is_streaming=camera_receiving_video,
-                processes=lambda: list(ffmpeg_processes),
-                alert=append_in_app_alert,
-            )
-        ))
-        if RUNTIME_ROLE in {"edge", "combined"}
-        else None
-    )
+    # Appliance roles only, and never allowed to stop start-up: if the module
+    # cannot load, the VMS runs as before without the worker.
+    camera_address_recovery_task = None
+    if RUNTIME_ROLE in {"edge", "combined"}:
+        try:
+            import camera_address_recovery
+            camera_address_recovery_task = asyncio.create_task(camera_address_recovery.camera_address_recovery_worker(
+                lambda: camera_address_recovery.Dependencies(
+                    is_streaming=camera_receiving_video,
+                    processes=lambda: list(ffmpeg_processes),
+                    alert=append_in_app_alert,
+                )
+            ))
+        except Exception as error:
+            print(f"camera_address_recovery unavailable; continuing without it ({type(error).__name__})")
     talk_down_discovery_task = (
         asyncio.create_task(talk_down_discovery.talk_down_discovery_worker())
         if RUNTIME_ROLE in {"edge", "combined"}

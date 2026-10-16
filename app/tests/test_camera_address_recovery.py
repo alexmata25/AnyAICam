@@ -837,3 +837,64 @@ def test_recording_and_talk_use_the_configured_address_untouched_when_nothing_mo
     assert stream == {"rtsp_url": f"rtsp://192.168.0.70:554{PATH}", "username": "admin", "password": "pw-left"}
     assert talk_down_discovery._provisioned_camera_credentials(3) == ("192.168.0.70", "admin", "pw-left")
     assert rows(s["db_path"], "SELECT * FROM camera_address_overrides") == []
+
+
+# ------------------------------------------------ Red final review fixes
+
+def test_the_stream_gate_never_opens_a_socket_on_the_event_loop_thread(driveway, monkeypatch):
+    """Async callers (refresh_live_copy_probe -> camera_url) must not block the
+    loop: with a stale or missing check, the gate uses the worker's last
+    result instead of probing."""
+    import asyncio
+    monkeypatch.setattr(car, "udp_probe_many", lambda *a, **k: pytest.fail("socket opened on the event loop thread"))
+    url = f"rtsp://192.168.0.44:554{PATH}"
+
+    async def on_loop():
+        return car.stream_endpoint("dc7a226120", RIGHT, url, 2)
+    assert asyncio.run(on_loop()) == url
+
+
+def test_on_the_loop_a_hold_found_by_the_worker_still_applies(driveway):
+    import asyncio
+    s = driveway
+    passes(s, 1)
+    s["lan"].hosts["192.168.0.44"] = Device(OTHER, None, hardware="X")
+    passes(s, 1)  # the worker (a thread) records the mismatch
+
+    async def on_loop():
+        return car.stream_endpoint("dc7a226120", RIGHT, f"rtsp://192.168.0.44:554{PATH}", 2,
+                                   probe=lambda *a: pytest.fail("probe on loop"), clock=s["clock"])
+    with pytest.raises(car.CameraIdentityHoldError):
+        asyncio.run(on_loop())
+
+
+def test_off_the_loop_the_gate_still_probes_a_stale_check(driveway):
+    calls = []
+    def probe(ip, timeout):
+        calls.append((ip, timeout))
+        return None
+    car.stream_endpoint("dc7a226120", RIGHT, f"rtsp://192.168.0.44:554{PATH}", 2, probe=probe)
+    assert calls == [("192.168.0.44", car.GATE_PROBE_TIMEOUT_SECONDS)]
+
+
+def test_lifespan_loads_recovery_only_on_appliances_and_cannot_stop_startup():
+    """The import sits inside the edge/combined branch and inside a try that
+    logs and continues, so a cloud start-up never imports it and an import
+    failure never stops an appliance start-up."""
+    import ast
+    from pathlib import Path
+    tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8"))
+    lifespan = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "lifespan")
+    found = []
+
+    def visit(node, ancestors):
+        if isinstance(node, ast.Import) and any(a.name == "camera_address_recovery" for a in node.names):
+            found.append(ancestors)
+        for child in ast.iter_child_nodes(node):
+            visit(child, ancestors + [node])
+    visit(lifespan, [])
+    assert found, "lifespan no longer starts the recovery worker"
+    for ancestors in found:
+        assert any(isinstance(a, ast.Try) and any(isinstance(h.type, ast.Name) and h.type.id == "Exception" for h in a.handlers)
+                   for a in ancestors), "import not guarded"
+        assert any(isinstance(a, ast.If) and "RUNTIME_ROLE" in ast.unparse(a.test) for a in ancestors), "import not appliance-only"
