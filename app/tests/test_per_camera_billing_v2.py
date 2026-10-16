@@ -69,6 +69,114 @@ def test_v2_catalog_is_customer_safe_and_keeps_premium_analytics_separate():
     assert "stripe_price_id" not in serialized and "commission" not in serialized
 
 
+@pytest.mark.parametrize(("plan_key", "unit_cents"), [
+    ("basic_local", 999), ("ai_local", 1499), ("hybrid", 2499),
+])
+@pytest.mark.parametrize("quantity", [1, 5])
+def test_v2_checkout_uses_approved_monthly_unit_price_and_camera_quantity(
+        plan_key, unit_cents, quantity, db_path, monkeypatch):
+    """The Checkout Price remains a per-camera monthly unit; Stripe quantity
+    is the camera count. Never send a multiplied unit amount or quantity 1
+    for a multi-camera order."""
+    from fastapi import FastAPI, Request
+    import checkout_guard
+    import main
+    import partner_portal
+    import per_camera_billing as billing
+
+    price_id = f"price_test_{plan_key}"
+    monkeypatch.setenv(billing.PRICE_ENV[plan_key], price_id)
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://app.example.test")
+    monkeypatch.setattr(main, "_VERIFIED_STRIPE_PRICES", {})
+    monkeypatch.setattr(main, "stripe_api_get", lambda path: {
+        "id": price_id, "unit_amount": unit_cents, "currency": "usd", "active": True,
+        "recurring": {"interval": "month"},
+    } if path == f"/v1/prices/{price_id}" else (_ for _ in ()).throw(AssertionError(path)))
+    monkeypatch.setattr(partner_portal, "partner_identity", lambda _request: {
+        "customer_id": "cust-v2", "email": "v2@example.test", "role": "customer_owner",
+    })
+    captured = []
+
+    def capture_session(customer_id, purchase, *, price_id, quantity, fields):
+        captured.append({"customer_id": customer_id, "purchase": purchase, "price_id": price_id,
+                         "quantity": quantity, "fields": dict(fields)})
+        return {"id": "cs_test_pricing", "url": "https://checkout.stripe.test/session"}
+
+    monkeypatch.setattr(checkout_guard, "canonical_stripe_customer", lambda *_args, **_kwargs: "cus_test")
+    monkeypatch.setattr(checkout_guard, "create_session", capture_session)
+    app = FastAPI()
+    billing.register_routes(app)
+    endpoint = next(route.endpoint for route in app.routes
+                    if getattr(route, "path", None) == "/api/v2/customer/subscription/checkout")
+    request = Request({"type": "http", "method": "POST", "path": "/api/v2/customer/subscription/checkout",
+                       "headers": [], "query_string": b"", "server": ("testserver", 80),
+                       "client": ("testclient", 12345), "scheme": "http"})
+
+    with override_target(sqlite_path=str(db_path)):
+        result = endpoint(billing.CheckoutRequest(plan_key=plan_key, camera_quantity=quantity), request)
+
+    assert result["status"] == "complete"
+    assert len(captured) == 1
+    session = captured[0]
+    fields = session["fields"]
+    assert session["price_id"] == price_id
+    assert session["quantity"] == quantity
+    assert fields["mode"] == "subscription"
+    assert fields["line_items[0][price]"] == price_id
+    assert fields["line_items[0][quantity]"] == str(quantity)
+    assert fields["metadata[anyaicam_plan_key]"] == plan_key
+    assert fields["metadata[anyaicam_camera_quantity]"] == str(quantity)
+    assert fields["subscription_data[metadata][anyaicam_plan_key]"] == plan_key
+    assert fields["subscription_data[metadata][anyaicam_camera_quantity]"] == str(quantity)
+    assert "line_items[0][price_data][unit_amount]" not in fields
+
+
+@pytest.mark.parametrize("bad_price", [
+    {"unit_amount": 50, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
+    {"unit_amount": 60, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
+    {"unit_amount": 1499, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
+    {"unit_amount": 999, "currency": "eur", "active": True, "recurring": {"interval": "month"}},
+    {"unit_amount": 999, "currency": "usd", "active": True, "recurring": {"interval": "year"}},
+    {"unit_amount": 999, "currency": "usd", "active": False, "recurring": {"interval": "month"}},
+])
+def test_v2_checkout_refuses_a_mismatched_or_inactive_stripe_price(
+        bad_price, db_path, monkeypatch):
+    """A stale 50/60-cent test Price or any wrong currency/interval/status
+    must fail closed before a Checkout Session is requested."""
+    from fastapi import FastAPI, HTTPException, Request
+    import checkout_guard
+    import main
+    import partner_portal
+    import per_camera_billing as billing
+
+    price_id = "price_test_basic_local_wrong"
+    monkeypatch.setenv(billing.PRICE_ENV["basic_local"], price_id)
+    monkeypatch.setattr(main, "PUBLIC_BASE_URL", "https://app.example.test")
+    monkeypatch.setattr(main, "_VERIFIED_STRIPE_PRICES", {})
+    monkeypatch.setattr(main, "stripe_api_get", lambda path: {"id": price_id, **bad_price})
+    monkeypatch.setattr(partner_portal, "partner_identity", lambda _request: {
+        "customer_id": "cust-v2", "email": "v2@example.test", "role": "customer_owner",
+    })
+    calls = []
+    monkeypatch.setattr(checkout_guard, "canonical_stripe_customer", lambda *_args, **_kwargs: "cus_test")
+    monkeypatch.setattr(checkout_guard, "create_session", lambda *args, **kwargs: calls.append((args, kwargs)))
+    app = FastAPI()
+    billing.register_routes(app)
+    endpoint = next(route.endpoint for route in app.routes
+                    if getattr(route, "path", None) == "/api/v2/customer/subscription/checkout")
+    request = Request({"type": "http", "method": "POST", "path": "/api/v2/customer/subscription/checkout",
+                       "headers": [], "query_string": b"", "server": ("testserver", 80),
+                       "client": ("testclient", 12345), "scheme": "http"})
+
+    with override_target(sqlite_path=str(db_path)):
+        with pytest.raises(HTTPException) as raised:
+            endpoint(billing.CheckoutRequest(plan_key="basic_local", camera_quantity=1), request)
+
+    assert raised.value.status_code == 503
+    assert "PRICE_MISMATCH" in raised.value.detail
+    assert calls == []
+
+
 @pytest.mark.parametrize("quantity", [0, 65, True])
 def test_v2_checkout_request_rejects_invalid_camera_quantity(quantity):
     from per_camera_billing import CheckoutRequest
