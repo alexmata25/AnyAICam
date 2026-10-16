@@ -144,7 +144,7 @@ def test_ai_local_and_hybrid_never_show_talk_down_as_an_add(db_path, monkeypatch
 def test_basic_local_can_still_add_talk_down(db_path, monkeypatch, prices):
     _plan(db_path, monkeypatch, "basic_local")
     rows = _addon_rows(_page(db_path))
-    assert 'data-addon-key="talk_down"' in rows["talk_down"] and "$4.99/mo per site" in rows["talk_down"]
+    assert 'data-addon-key="talk_down"' in rows["talk_down"] and "$4.99 per site/month" in rows["talk_down"]
 
 
 def test_optional_analytics_are_one_section_with_what_each_package_adds(db_path, monkeypatch, prices):
@@ -152,10 +152,10 @@ def test_optional_analytics_are_one_section_with_what_each_package_adds(db_path,
     html = _page(db_path)
     rows = _addon_rows(html)
     assert set(rows) == {"ai_essentials", "ai_professional", "vehicle_intelligence", "advanced_analytics"}
-    assert "People Counting<br>" in rows["ai_essentials"] and "$7.99/mo" in rows["ai_essentials"]
-    assert "Adds: License Plate Recognition (LPR)" in rows["vehicle_intelligence"] and "$14.99/mo" in rows["vehicle_intelligence"]
+    assert "People Counting<br>" in rows["ai_essentials"] and "$7.99 per camera/month" in rows["ai_essentials"]
+    assert "Adds: License Plate Recognition (LPR)" in rows["vehicle_intelligence"] and "$14.99 per camera/month" in rows["vehicle_intelligence"]
     assert "Adds: People Counting (advanced rules and reports), PPE detection" in rows["ai_professional"]
-    assert "$24.99/mo" in rows["advanced_analytics"]
+    assert "$24.99 per camera/month" in rows["advanced_analytics"]
     for old in ("AI Essentials", "AI Professional", "Vehicle Intelligence", "Premium Add-ons", "Cloud Overflow"):
         assert old not in html
     assert 'id="optional-analytics-note"' in html
@@ -234,7 +234,7 @@ def test_without_a_plan_the_three_plans_are_compared_from_the_catalog(db_path, m
     seed_customer(db_path)
     html = _page(db_path)
     table = re.search(r'id="v2-plan-compare".*?</table>', html, re.S).group(0)
-    assert "$9.99/camera/mo" in table and "$14.99/camera/mo" in table and "$24.99/camera/mo" in table
+    assert "$9.99 per camera/month" in table and "$14.99 per camera/month" in table and "$24.99 per camera/month" in table
     assert "Cloud EVENT retention" in table and "14 days" in table
     assert 'id="v2-checkout-button"' in html
 

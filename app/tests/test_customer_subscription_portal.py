@@ -121,7 +121,7 @@ def test_an_active_addon_shows_an_active_pill_not_a_buy_button(http_client, db_p
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Complete analytics: People Counting + LPR + PPE" in html
-    assert re.search(r'<span>Complete analytics: People Counting \+ LPR \+ PPE<br><span class="health-detail">\$24\.99/mo · [^<]+</span></span><span class="pill">Active</span>', html)
+    assert re.search(r'<span>Complete analytics: People Counting \+ LPR \+ PPE<br><span class="health-detail">\$24\.99 per camera/month · [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, monkeypatch):
@@ -133,7 +133,7 @@ def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, m
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert 'data-addon-key="ai_essentials"' in html
-    assert "$7.99/mo · Adds: People Counting (advanced rules and reports)" in html
+    assert "$7.99 per camera/month · Adds: People Counting (advanced rules and reports)" in html
 
 
 def test_face_access_offers_one_size_per_door_and_never_the_old_sku(http_client, db_path, monkeypatch):
@@ -148,7 +148,7 @@ def test_face_access_offers_one_size_per_door_and_never_the_old_sku(http_client,
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert html.count("<span>Face Access / Facial Recognition — Small<br>") == 1
-    assert "$39.99/mo per door" in html
+    assert "$39.99 per door/month" in html
     assert "Facial Recognition — Medium" not in html and "Facial Recognition — Large" not in html
     assert 'data-addon-key="facial_recognition"' not in html
     assert 'data-addon-key="face_access_' not in html  # no Face Access Price ID configured here
@@ -171,7 +171,7 @@ def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(ht
     assert "Complete analytics: People Counting + LPR + PPE" in html
     # 2026-09-25: shown as clearly unavailable (not an active-looking
     # "Coming soon"), with what it includes from the catalog mapping.
-    assert re.search(r'<span>Complete analytics: People Counting \+ LPR \+ PPE<br><span class="health-detail">\$24\.99/mo · Adds: People Counting \(advanced rules and reports\), License Plate Recognition \(LPR\), PPE detection</span></span>'
+    assert re.search(r'<span>Complete analytics: People Counting \+ LPR \+ PPE<br><span class="health-detail">\$24\.99 per camera/month · Adds: People Counting \(advanced rules and reports\), License Plate Recognition \(LPR\), PPE detection</span></span>'
                      r'<span class="pending-badge" aria-disabled="true"[^>]*>Not available yet</span>', html)
     assert 'data-addon-key="advanced_analytics"' not in html
 
@@ -193,7 +193,7 @@ def test_an_addon_already_active_without_its_price_id_configured_still_shows_act
             upsert_analytics_subscription(customer_id="cust-1", analytic_key=key, status="active")
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert re.search(r'<span>Complete analytics: People Counting \+ LPR \+ PPE<br><span class="health-detail">\$24\.99/mo · [^<]+</span></span><span class="pill">Active</span>', html)
+    assert re.search(r'<span>Complete analytics: People Counting \+ LPR \+ PPE<br><span class="health-detail">\$24\.99 per camera/month · [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 # ------------------------------------------------------- customer_viewer role

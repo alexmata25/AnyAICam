@@ -125,7 +125,7 @@ def plan_comparison_html() -> str:
             if feature not in features:
                 features.append(feature)
     head = "".join(f'<th scope="col">{escape(per_camera_billing.PLANS[k]["display_name"])}<br>'
-                   f'<span class="health-detail">${per_camera_billing.PLANS[k]["monthly_cents_per_camera"] / 100:.2f}/camera/mo</span></th>'
+                   f'<span class="health-detail">${per_camera_billing.PLANS[k]["monthly_cents_per_camera"] / 100:.2f} per camera/month</span></th>'
                    for k in keys)
     body = ""
     for feature in features:
@@ -145,8 +145,8 @@ def plan_comparison_html() -> str:
 def _price_text(addon: dict | None) -> str:
     if not addon or addon["monthly_cents"] is None:
         return ""
-    per = " per site" if addon["unit"] == "per_site" else ""
-    return f"${addon['monthly_cents'] / 100:.2f}/mo{per}"
+    per = {"per_site": "site", "per_door": "door"}.get(addon["unit"], "camera")
+    return f"${addon['monthly_cents'] / 100:.2f} per {per}/month"
 
 
 def analytics_rows_html(customer_id: str, plan_key: str | None, is_owner: bool, site_count: int) -> str:
