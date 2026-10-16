@@ -106,12 +106,14 @@ def load_rules_for_camera(camera_id: str) -> list[dict]:
         # stale/missed cloud configuration poll must not leave rule inference
         # running after OFF, and an edge-local OFF remains effective offline.
         from analytics_control_center import operational_enabled
-        operational = {"line_crossing": "line_crossing", "intrusion": "intrusion",
-                       "loitering": "loitering", "security_line": "smart_motion"}
+        # Fix 7 (owner, 2026-10-16): a security line needs BOTH the Line
+        # Crossing switch and Smart Motion; Line Crossing OFF stops it.
+        operational = {"line_crossing": ("line_crossing",), "intrusion": ("intrusion",),
+                       "loitering": ("loitering",), "security_line": ("line_crossing", "smart_motion")}
         enabled_rules = []
         for row in raw_rules:
-            control_key = operational.get(row["rule_type"])
-            if control_key and operational_enabled(db, camera_id, control_key):
+            control_keys = operational.get(row["rule_type"])
+            if control_keys and all(operational_enabled(db, camera_id, key) for key in control_keys):
                 enabled_rules.append(row)
         raw_rules = enabled_rules
     rules = []

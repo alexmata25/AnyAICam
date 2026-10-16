@@ -227,3 +227,25 @@ def test_a_declined_upgrade_payment_keeps_the_paid_plan(v2):
     response = env["client"].post("/api/v2/customer/subscription/change", json={"plan_key": "hybrid", "camera_quantity": 4})
     assert response.status_code == 402, response.text
     assert _state(env) == {"plan": "ai_local", "status": "active", "quantity": 2, "capacity": 2, "mode": "local"}
+
+
+def test_e1_plan_changes_never_charge_the_one_time_license_again(v2):
+    """Owner decision E1 (2026-10-16): an own-PC customer pays the one-time VMS license once, in the first checkout;
+    later plan and camera-count changes only modify the recurring plan item."""
+    import customer_entitlements as ce
+    env = v2
+    _checkout_to_active(env, "basic_local", 1)
+    ce.upsert_entitlement(customer_id="cust-A", product="vms_license", camera_slot_quantity=8, status="active",
+                          stripe_customer_id="cus_A", stripe_subscription_id=None, stripe_checkout_session_id="cs_own_pc")
+    before = len(env["posts"])
+    for plan_key, cameras in (("basic_local", 4), ("ai_local", 4), ("hybrid", 6), ("hybrid", 2)):
+        _ok(env["client"].post("/api/v2/customer/subscription/change", json={"plan_key": plan_key, "camera_quantity": cameras}))
+    writes = [dict(fields) for _, fields in env["posts"][before:]]
+    assert writes, "the changes reached Stripe"
+    for write in writes:
+        assert not any(key.startswith("line_items") for key in write), write
+        assert not any("vms" in str(value).lower() or "license" in str(value).lower() for value in write.values()), write
+        assert set(k for k in write if k.startswith("items[")) <= {"items[0][id]", "items[0][price]", "items[0][quantity]"}
+    with sqlite3.connect(env["path"]) as db:  # still the one license row, untouched
+        assert db.execute("SELECT camera_slot_quantity,status FROM customer_entitlements WHERE customer_id='cust-A' "
+                          "AND product='vms_license'").fetchall() == [(8, "active")]

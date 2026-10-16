@@ -420,9 +420,9 @@ def test_rule_delivery_honors_individual_switches_preserves_exclusion_and_fails_
             camera = [{"id": "cam-1", "smart_motion_enabled": True, "people_counting_enabled": False}]
             assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r", "r-sec", "r-ex"]
             db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-1','line_crossing',0,'x')")
-            # The armed Secure Edge alarm is independent of informational
-            # Line Crossing, while Smart Motion still gates both.
-            assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r-sec", "r-ex"]
+            # Owner decision 2026-10-16 (Fix 7): Line Crossing OFF also stops the
+            # armed security lines; Smart Motion still gates both.
+            assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r-ex"]
             assert acc.filter_rule_items(db, rules, [{**camera[0], "smart_motion_enabled": False}]) == []
 
 

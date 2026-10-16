@@ -123,7 +123,7 @@ def test_cloud_toggle_off_reaches_edge_flag_only_for_that_analytic_and_camera(cl
     assert cams["cam-1"][FLAG[key]] is True
 
 
-@pytest.mark.parametrize("key,rtypes", [("line_crossing", {"line_crossing"}),
+@pytest.mark.parametrize("key,rtypes", [("line_crossing", {"line_crossing", "security_line"}),  # Fix 7 (owner 2026-10-16)
                                         ("intrusion", {"intrusion"}), ("loitering", {"loitering"})])
 def test_cloud_rule_toggle_off_removes_only_that_rule_type(cloud, key, rtypes):
     db_path, conn = cloud

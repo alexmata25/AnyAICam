@@ -28,11 +28,13 @@ ANALYTICS: dict[str, dict[str, str]] = {
     "lpr": {"label": "License Plates", "dependency": "Vehicle detection and the LPR engine"},
     "ppe": {"label": "PPE", "dependency": "Person detection and the PPE model"},
     "facial_recognition": {"label": "Facial Recognition", "dependency": "Person detection and Face Access assignment"},
-    "line_crossing": {"label": "Line Crossing", "dependency": "Smart Motion and a configured line rule"},
+    "line_crossing": {"label": "Line Crossing", "dependency": "Smart Motion and a configured line rule. Also turns security-line alarms on or off"},
     "intrusion": {"label": "Intrusion", "dependency": "Smart Motion and a configured zone rule"},
     "loitering": {"label": "Loitering", "dependency": "Smart Motion and a configured loitering zone"},
 }
-RULE_TYPES = {"line_crossing": ("line_crossing",),
+# Owner decision 2026-10-16 (Fix 7): the Line Crossing switch governs security lines too. Turning it off stops them
+# (rules and history are kept); turning it back on restores them, each subject to its own enabled setting.
+RULE_TYPES = {"line_crossing": ("line_crossing", "security_line"),
               "intrusion": ("intrusion",), "loitering": ("loitering",)}
 RULE_ANALYTICS = {"line_crossing": "line_crossing",
                   "intrusion": "intrusion", "loitering": "loitering",
@@ -268,12 +270,13 @@ def filter_rule_items(db, rules: list[dict], cameras: list[dict]) -> list[dict]:
         if not camera:
             continue
         rule_type = rule.get("rule_type")
-        # Secure Edge security lines are armed intrusion alarms, with a
-        # separate evaluator and lifecycle from informational Line Crossing.
-        # They still require the Smart Motion detection entitlement, but an
-        # informational Line Crossing OFF preference must never disable them.
+        # Secure Edge security lines are armed intrusion alarms with their own
+        # evaluator, but (owner decision 2026-10-16, Fix 7) the customer's Line
+        # Crossing switch also governs them: OFF stops them processing and
+        # alerting, ON restores them. Smart Motion still gates them too.
         if rule_type == "security_line":
-            if camera.get("smart_motion_enabled"):
+            if (camera.get("smart_motion_enabled") and operational_enabled(db, rule["camera_id"], "line_crossing")
+                    and operational_enabled(db, rule["camera_id"], "smart_motion")):
                 filtered.append(rule)
             continue
         if rule_type == "exclusion":
