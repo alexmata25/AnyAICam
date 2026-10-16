@@ -125,6 +125,12 @@ def _standard_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
     monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
     monkeypatch.setattr(main, "append_analytics_event", lambda event: None)
+    # These tests exercise an entitled/operational camera. Since the Control
+    # Center (bf05889), save_yolo_events() creates person/vehicle events only
+    # when Smart Motion is on for the camera, and ai_person_detector() pauses
+    # for all-OFF cameras (same pattern as test_ai_safety_concurrency.py).
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity",
+                        lambda _camera: {"smart_motion_enabled": True})
 
 
 def _run_save_yolo_events_on_a_real_loop(camera_number: int, result: dict) -> list[dict]:

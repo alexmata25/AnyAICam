@@ -193,6 +193,12 @@ def _run_loop(monkeypatch, camera, frames, saved):
     monkeypatch.setattr(main, "AI_DETECTOR_STARTUP_STAGGER_SECONDS", 0)
     monkeypatch.setattr(main.lpr, "LPR_ENABLED", False)
     monkeypatch.setattr(main, "detect_objects_frame", lambda camera_number: queue.pop(0))
+    # Detector-loop tests exercise an entitled/operational camera. The
+    # Control Center now intentionally pauses inference for all-OFF cameras
+    # (bf05889); without this the paused detector never consumes the queue
+    # and the sleep patch below never ends the loop (whole-suite hang).
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity",
+                        lambda _camera: {"smart_motion_enabled": True})
     monkeypatch.setattr(main, "_ai_activity_limits", lambda c: (10.0, 300.0))
     main.ai_detection_state.setdefault(camera, {"status": "starting", "last_checked": None, "last_detection": None, "detections": 0, "error": None})
     main.ai_person_last_event[camera] = 0.0
