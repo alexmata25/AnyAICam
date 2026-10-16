@@ -35947,10 +35947,13 @@ def reconcile_camera_workers(numbers) -> dict:
         registry = _camera_worker_tasks[kind]
         retiring = _camera_worker_retiring[kind]
         for number, task in list(retiring.items()):
-            if task.done():
+            if task.done() or not _on_running_loop(task):
                 retiring.pop(number)
         for number, task in list(registry.items()):
-            if task.done():
+            if task.done() or not _on_running_loop(task):
+                # A task of an earlier event loop (the application started
+                # again in this process) can never run or be awaited here:
+                # forget it so the camera gets a fresh worker on this loop.
                 registry.pop(number)
             elif want is not None and number not in want:
                 task.cancel()
@@ -35971,9 +35974,20 @@ def reconcile_camera_workers(numbers) -> dict:
     return {"started": started, "retired": sorted(retired)}
 
 
+def _on_running_loop(task) -> bool:
+    """True when task belongs to the running event loop (or none is running).
+    The worker registries are module-level, so they outlive one application
+    lifespan; a task from an earlier loop must never be gathered or kept."""
+    try:
+        return task.get_loop() is asyncio.get_running_loop()
+    except RuntimeError:  # no running loop: nothing to compare against
+        return True
+
+
 def camera_worker_tasks() -> list:
     return [task for registries in (_camera_worker_tasks, _camera_worker_retiring)
-            for registry in registries.values() for task in registry.values()]
+            for registry in registries.values() for task in registry.values()
+            if _on_running_loop(task)]
 
 
 async def motion_detector(camera_number: int) -> None:
