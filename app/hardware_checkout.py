@@ -57,6 +57,11 @@ COMPLETE_PATH = "/hardware-order/complete"
 ORDERS_PATH = "/customer/orders"
 API_PATH = "/api/hardware-checkout"
 HARDWARE_ONLY = "hardware_only"
+# Accessory order (VMS 1.2.7, owner decision 2026-10-16): door-control relays bought from My subscription after
+# activation, by the signed-in account owner only. Same Stripe flow, shipping, records and fulfilment as a hardware
+# order; never an appliance, never a guest.
+ACCESSORY_ONLY = "accessory_only"
+RELAY_API_PATH = "/api/customer/relay-checkout"
 APPLIANCE_PREFIX = "AIC-APPLIANCE-"
 RELAY_SKU = "AIC-RELAY-NUMATO-3CH"
 MAX_RELAY_MODULES = 16
@@ -128,8 +133,8 @@ def selection_query(selection: dict) -> str:
 
 def quote_for(selection: dict) -> dict:
     catalog = _catalog()
-    lines = [{"sku": selection["appliance"], "name": catalog[selection["appliance"]]["name"], "quantity": 1,
-              "cents": catalog[selection["appliance"]]["cents"]}]
+    lines = ([{"sku": selection["appliance"], "name": catalog[selection["appliance"]]["name"], "quantity": 1,
+               "cents": catalog[selection["appliance"]]["cents"]}] if selection.get("appliance") else [])
     if selection.get("relays"):
         lines.append({"sku": RELAY_SKU, "name": catalog[RELAY_SKU]["name"], "quantity": int(selection["relays"]),
                       "cents": catalog[RELAY_SKU]["cents"]})
@@ -233,7 +238,10 @@ def create_checkout(selection: dict, *, email: str, identity: dict | None) -> di
         items.append(f"{line['sku']}:{line['quantity']}")
     checkout_id = secrets.token_hex(16)
     customer_id = identity["customer_id"] if identity else None
-    metadata = {"anyaicam_build_order": HARDWARE_ONLY, "anyaicam_hardware_checkout_id": checkout_id,
+    accessory = not selection.get("appliance")
+    if accessory and not customer_id:
+        raise HTTPException(status_code=403, detail="Sign in to your AnyAiCam account to order relays.")
+    metadata = {"anyaicam_build_order": ACCESSORY_ONLY if accessory else HARDWARE_ONLY, "anyaicam_hardware_checkout_id": checkout_id,
                 "anyaicam_hardware_items": ",".join(items)}
     if customer_id:
         metadata["anyaicam_customer_id"] = customer_id
@@ -244,13 +252,15 @@ def create_checkout(selection: dict, *, email: str, identity: dict | None) -> di
     for key, value in metadata.items():
         fields += [(f"metadata[{key}]", value), (f"payment_intent_data[metadata][{key}]", value)]
     fields += [
-        ("success_url", f"{base}{COMPLETE_PATH}?session_id={{CHECKOUT_SESSION_ID}}"),
-        ("cancel_url", f"{base}{CHECKOUT_PATH}?{selection_query(selection)}&checkout=cancelled"),
+        ("success_url", f"{base}{ORDERS_PATH}?relay_payment=success" if accessory
+         else f"{base}{COMPLETE_PATH}?session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", "{0}/subscription-portal?relay_payment=cancelled#v2-relays".format(base) if accessory
+         else f"{base}{CHECKOUT_PATH}?{selection_query(selection)}&checkout=cancelled"),
         ("client_reference_id", customer_id or checkout_id),
         ("shipping_address_collection[allowed_countries][0]", "US"),
         ("phone_number_collection[enabled]", "true"),
         ("allow_promotion_codes", "false"),
-        ("payment_intent_data[description]", "AnyAiCam hardware order"),
+        ("payment_intent_data[description]", "AnyAiCam relay order" if accessory else "AnyAiCam hardware order"),
     ]
     if customer_id:
         fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=email)))
@@ -295,7 +305,8 @@ def sync_from_stripe_event(event: dict) -> dict:
     event_type = str(event.get("type") or "")
     session = (event.get("data") or {}).get("object") or {}
     metadata = session.get("metadata") or {}
-    if str(metadata.get("anyaicam_build_order") or "") != HARDWARE_ONLY:
+    kind = str(metadata.get("anyaicam_build_order") or "")
+    if kind not in (HARDWARE_ONLY, ACCESSORY_ONLY):
         return {"status": "ignored"}
     checkout_id = str(metadata.get("anyaicam_hardware_checkout_id") or "")
     record = checkout_row(checkout_id=checkout_id) if checkout_id else None
@@ -324,7 +335,13 @@ def sync_from_stripe_event(event: dict) -> dict:
         sku, _, quantity = part.partition(":")
         if sku in catalog and quantity.isdigit() and int(quantity) >= 1:
             items.append((sku, int(quantity)))
-    if not items or not items[0][0].startswith(APPLIANCE_PREFIX):
+    if kind == ACCESSORY_ONLY:
+        # Relays only, for a signed-in account that still exists; never an appliance through this path.
+        if not items or any(sku != RELAY_SKU for sku, _ in items):
+            return {"status": "rejected", "reason": "an accessory order holds relays only"}
+        if not row("SELECT id FROM customers WHERE id=?", (str(metadata.get("anyaicam_customer_id") or ""),)):
+            return {"status": "rejected", "reason": "an accessory order needs its account"}
+    elif not items or not items[0][0].startswith(APPLIANCE_PREFIX):
         return {"status": "rejected", "reason": "no appliance in this order"}
     try:
         amounts = build_orders._line_amounts(session)
@@ -613,6 +630,29 @@ def register_hardware_checkout_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=422, detail="Enter a valid email address for your order confirmation.")
         return create_checkout(selection, email=email, identity=identity)
 
+    @app.post(RELAY_API_PATH)
+    async def relay_checkout_api(request: Request) -> dict:
+        """Door-control relays from My subscription: account owner only, after activation, quantity 1-16, priced from
+        the server catalog; one open checkout per account email (_expire_previous) and one paid order per session."""
+        client_ip = request.client.host if request.client else "unknown"
+        if not _create_limiter.allow(client_ip):
+            raise HTTPException(status_code=429, detail="Too many checkout attempts. Please wait a few minutes and try again.")
+        identity = _identity(request)
+        if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
+            raise HTTPException(status_code=403, detail="Only the account owner can order relays.")
+        import per_camera_billing
+        per_camera_billing.require_activated(identity["customer_id"])
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid request.")
+        if not isinstance(payload, dict) or set(payload) - {"quantity"}:
+            raise HTTPException(status_code=422, detail="Invalid request.")
+        quantity = payload.get("quantity")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= MAX_RELAY_MODULES:
+            raise HTTPException(status_code=422, detail=f"Choose from 1 to {MAX_RELAY_MODULES} relays.")
+        return create_checkout({"relays": quantity}, email=_account_email(identity["customer_id"]), identity=identity)
+
     @app.get(COMPLETE_PATH, response_class=HTMLResponse)
     def hardware_order_complete(request: Request, session_id: str = ""):
         identity = _identity(request)
@@ -639,4 +679,7 @@ def register_hardware_checkout_routes(app: FastAPI) -> None:
         identity = _identity(request)
         if not identity:
             return RedirectResponse(f"/customer-login.html?next={quote(ORDERS_PATH, safe='')}", status_code=303)
-        return HTMLResponse(_page("My orders", _orders_page(identity["customer_id"]), signed_in=True), headers=NO_STORE)
+        notice = ('<p class="notice ok" id="orders-relay-paid" role="status">Payment received. Your relay order appears below as soon '
+                  'as Stripe confirms it; refresh in a moment if it is not there yet.</p>'
+                  if request.query_params.get("relay_payment") == "success" else "")
+        return HTMLResponse(_page("My orders", notice + _orders_page(identity["customer_id"]), signed_in=True), headers=NO_STORE)
