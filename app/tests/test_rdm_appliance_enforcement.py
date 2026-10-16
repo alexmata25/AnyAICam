@@ -228,7 +228,23 @@ def test_edge_camera_sync_upserts_all_four_columns_locally(db_path, monkeypatch)
 # --------------------------------------------------- link 4: recording_uploader._refresh_camera_map() populates all four
 
 
-def test_refresh_camera_map_includes_all_four_entitlement_keys(monkeypatch):
+@pytest.fixture()
+def isolated_refresh(monkeypatch, tmp_path):
+    """_refresh_camera_map() reads the persisted product mode (Local ->
+    local database instead of the control plane) and overlays
+    camera_analytics_operations from the current database, failing closed
+    (everything OFF) when it cannot be read. Both are process-wide, so in the
+    whole suite an earlier test's leftovers changed these results. Pin Hybrid
+    and give the overlay its own empty, initialized database."""
+    import product_mode
+    from partner_db import initialize_database
+    monkeypatch.setenv(product_mode.PRODUCT_MODE_ENV, "hybrid")
+    with override_target(sqlite_path=tmp_path / "refresh.db"):
+        initialize_database()
+        yield
+
+
+def test_refresh_camera_map_includes_all_four_entitlement_keys(monkeypatch, isolated_refresh):
     import recording_uploader
 
     fake_response = {
@@ -255,7 +271,7 @@ def test_refresh_camera_map_includes_all_four_entitlement_keys(monkeypatch):
     }
 
 
-def test_refresh_camera_map_treats_a_missing_key_as_false_not_a_crash(monkeypatch):
+def test_refresh_camera_map_treats_a_missing_key_as_false_not_a_crash(monkeypatch, isolated_refresh):
     """Backward compatibility: an older/mocked control-plane response
     that omits the new keys entirely must not raise, and must be
     treated as not-entitled (fail closed), never as entitled."""
