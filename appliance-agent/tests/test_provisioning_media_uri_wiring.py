@@ -77,7 +77,7 @@ class PollProvisioningWiringTests(unittest.TestCase):
         with patch('anyaicam_agent.service.verify_device', return_value=(True, 'ok')), \
              patch.object(self.agent, '_resolve_media_uri_after_provisioning') as resolve_after:
             self.agent.poll_provisioning()
-        resolve_after.assert_called_once_with('urn:uuid:aaaa', {'username': 'admin', 'password': 'hunter2'})
+        resolve_after.assert_called_once_with('urn:uuid:aaaa', {'username': 'admin', 'password': 'hunter2'}, job_id='job-1')
 
     def test_failed_job_never_triggers_resolution(self):
         job = {'id': 'job-1', 'device_key': 'urn:uuid:aaaa', 'credentials': {'username': 'admin', 'password': 'hunter2'}}

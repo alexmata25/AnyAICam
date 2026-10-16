@@ -307,6 +307,20 @@ def _forget_removed_camera(db, camera_id: str, former_device_key) -> None:
     logger.info("edge_camera_sync.camera_removed camera_id=%s credentials_deleted=1", camera_id)
 
 
+PENDING_CREDENTIAL_REPLACE_SECONDS = 900
+
+
+def _fresh_pending_credential(created_at) -> bool:
+    """True only for a pending credential written within the last
+    PENDING_CREDENTIAL_REPLACE_SECONDS (the agent's local handoff right after
+    a verified provisioning or reconnect). Unparseable or old rows are stale."""
+    try:
+        age = (datetime.now() - datetime.fromisoformat(str(created_at))).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= PENDING_CREDENTIAL_REPLACE_SECONDS
+
+
 def sync_provisioned_cameras() -> dict:
     """One reconciliation pass. Safe to call repeatedly (idempotent) and
     safe to call after any restart (reads only durable local/cloud
@@ -540,16 +554,21 @@ def sync_provisioned_cameras() -> dict:
             if not device_key:
                 continue
             pending = db.execute(
-                "SELECT encrypted_blob FROM pending_camera_credentials WHERE device_key=?", (device_key,)
+                "SELECT encrypted_blob,created_at FROM pending_camera_credentials WHERE device_key=?", (device_key,)
             ).fetchone()
             if not pending:
                 continue
+            already_has_credential = db.execute(
+                "SELECT 1 FROM camera_credentials WHERE camera_id=?", (camera_id,)
+            ).fetchone()
+            # An existing credential is never overwritten by a stale or
+            # replayed pending row. Only one the agent handed over moments ago
+            # -- after verifying it against this device, as a reconnect does
+            # (2026-10-15) -- replaces it, so a changed password takes effect.
+            if already_has_credential and not _fresh_pending_credential(pending["created_at"]):
+                continue
             # Ciphertext relocation only -- this process never decrypts,
-            # inspects, or logs the value it is moving. A pending credential
-            # only exists after the agent verified it against this device
-            # (poll_provisioning: success), so it also REPLACES an older one:
-            # reconnecting an existing camera with a changed password
-            # (2026-10-15) must not leave the appliance on the old password.
+            # inspects, or logs the value it is moving.
             db.execute(
                 "INSERT INTO camera_credentials(camera_id,encrypted_blob,created_at,updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(camera_id) DO UPDATE SET encrypted_blob=excluded.encrypted_blob,updated_at=excluded.updated_at",

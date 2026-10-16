@@ -1467,7 +1467,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         if not camera or camera.get('status')=='removed':
             raise HTTPException(status_code=404,detail='Camera not found.')
         if not camera.get('device_key') or not camera.get('appliance_id'):
-            raise HTTPException(status_code=409,detail='This camera has not been set up on an appliance yet; use Add camera instead.')
+            raise HTTPException(status_code=409,detail='This camera has not been set up on an appliance yet. Use Add camera instead.')
         return camera
 
     @app.post('/api/customer/cameras/{camera_id}/rediscover')
@@ -1484,7 +1484,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         camera=_reconnectable_camera(identity,camera_id)
         job=row('SELECT * FROM camera_scan_jobs WHERE id=? AND customer_id=? AND appliance_id=?',
                 (scan_job_id,identity['customer_id'],camera['appliance_id']))
-        if not job: raise HTTPException(status_code=404,detail='Camera discovery job not found.')
+        if not job: raise HTTPException(status_code=404,detail='This network search has ended. Start Reconnect again.')
         job=_maybe_time_out_scan_job(job)
         result={'status':job['status'],'progress':job.get('progress'),'message':job.get('message') or ''}
         if job['status']=='complete':
@@ -1508,7 +1508,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             encrypted=saved['encrypted_blob']
         elif username or password:
             encrypted=encrypt_camera_credentials(username,password)
-            if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured on this deployment yet. Contact support.')
+            if encrypted is None: raise HTTPException(status_code=503,detail='Camera logins cannot be saved right now. Please try again later or contact AnyAiCam support.')
         else:
             encrypted=None  # a camera that serves video without a login
         now=datetime.now().isoformat()
@@ -1516,7 +1516,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             pending=db.execute("SELECT id,status,message FROM camera_provisioning_requests WHERE customer_id=? AND device_key=? AND status IN ('queued','verifying') ORDER BY created_at DESC LIMIT 1",
                                (identity['customer_id'],camera['device_key'])).fetchone()
             if pending:
-                return {'job_id':pending['id'],'status':pending['status'],'message':pending['message']}
+                return {'job_id':pending['id'],'status':pending['status'],'message':'Your appliance is already checking this camera.'}
             job_id=secrets.token_hex(6)
             db.execute(
                 'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) '
@@ -1525,7 +1525,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                  'motion','[]',encrypted,'queued','Reconnect request queued for the appliance.',now,now),
             )
         audit(identity,'camera.reconnect_requested','camera',camera_id,{'job_id':job_id,'saved_credentials':bool(payload.get('use_saved_credentials') and not (username or password))})
-        return {'job_id':job_id,'status':'queued','message':'Reconnect request queued for the appliance.'}
+        return {'job_id':job_id,'status':'queued','message':'Your appliance is checking the camera and its login.'}
 
     @app.get('/api/customer/cameras/{camera_id}/reconnect/{job_id}')
     def reconnect_camera_status(request: Request,camera_id: str,job_id: str) -> dict:
@@ -1533,7 +1533,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         camera=_reconnectable_camera(identity,camera_id)
         job=row('SELECT id,status,camera_id,device_key,message,failure_code,created_at,updated_at FROM camera_provisioning_requests WHERE id=? AND customer_id=? AND device_key=?',
                 (job_id,identity['customer_id'],camera['device_key']))
-        if not job: raise HTTPException(status_code=404,detail='Reconnect request not found.')
+        if not job: raise HTTPException(status_code=404,detail='This reconnect has ended. Start Reconnect again.')
         job=_maybe_time_out_provisioning_job(job)
         result={'status':job['status'],'message':job.get('message') or '','failure_code':job.get('failure_code')}
         if job['status']=='provisioned':
