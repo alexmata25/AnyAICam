@@ -204,14 +204,19 @@ def test_an_open_talk_session_ends_when_the_entitlement_ends(customer_client, cl
             assert message["type"] == "error" and message["reason"] == "not_entitled"
             with pytest.raises(WebSocketDisconnect) as closed:
                 socket.receive_json()
+            # The server ends the session row just after closing the socket.
+            # Wait for it while still inside the context: Starlette's
+            # TestClient cancels the server task when the context exits, which
+            # could cut that cleanup short (intermittent "the session was never
+            # ended" in a full-suite run, Red triage 2026-10-15). Under a real
+            # server nothing cancels it (talk_real_server_check.py).
+            import time
+            deadline = time.monotonic() + 10
+            while _cloud_rows(cloud_db, "SELECT state FROM customer_talk_sessions WHERE id='talk-2'")[0]["state"] == "requested":
+                assert time.monotonic() < deadline, "the session was never ended"
+                time.sleep(0.05)
     assert closed.value.code == 4403
     assert len(frames) == 1  # only audio sent while entitled reached the camera
-    # The server ends the session row just after closing the socket.
-    import time
-    deadline = time.monotonic() + 10
-    while _cloud_rows(cloud_db, "SELECT state FROM customer_talk_sessions WHERE id='talk-2'")[0]["state"] == "requested":
-        assert time.monotonic() < deadline, "the session was never ended"
-        time.sleep(0.05)
 
 
 def test_alarm_talk_down_cannot_be_switched_on_without_talk_down(customer_client, cloud_db):
