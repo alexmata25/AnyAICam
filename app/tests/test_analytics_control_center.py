@@ -17,11 +17,26 @@ from database_backend import override_target
 from partner_db import connection, initialize_database
 
 
+@pytest.fixture(scope="module")
+def _module_db_path(tmp_path_factory):
+    # Without the CI runner's process-wide ANYAICAM_PARTNER_DB (the plain
+    # Docker/pytest recipe, or tests/conftest.py restoring the variable after
+    # each test), use one isolated file for this module -- the same sharing
+    # the CI path gives -- instead of failing every test with KeyError.
+    return str(tmp_path_factory.mktemp("analytics_control_center") / "partner.db")
+
+
 @pytest.fixture()
-def db_path():
+def db_path(_module_db_path, monkeypatch):
     # This process-wide path is explicitly redirected to the worktree's
-    # isolated SQLite test database.
-    return os.environ["ANYAICAM_PARTNER_DB"]
+    # isolated SQLite test database. The concurrency tests start their own
+    # threads, which do not inherit override_target's context variable and
+    # read the process-wide path, so the fallback sets it for this test too.
+    configured = os.environ.get("ANYAICAM_PARTNER_DB")
+    if configured:
+        return configured
+    monkeypatch.setenv("ANYAICAM_PARTNER_DB", _module_db_path)
+    return _module_db_path
 
 
 @pytest.fixture()
