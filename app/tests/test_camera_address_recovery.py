@@ -716,3 +716,124 @@ def test_a_failing_recovery_never_disables_talk(driveway, monkeypatch):
     monkeypatch.setattr(car, "stream_endpoint", broken)
     assert talk_down_discovery._provisioned_camera_credentials(2) == ("192.168.0.44", "admin", "pw-right")
     assert talk_audio_relay_client._provisioned_camera_transport_credentials(2)[0] == "192.168.0.44"
+
+
+# ---------------------------------------- the hold needs POSITIVE evidence
+# (Red review 2026-10-15: a hold stops recording, so only a successful reply
+# carrying a different stable identifier may trigger it.)
+
+def _reply(address_xml="", hardware="CMIP1042W-28MA"):
+    return (
+        '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+        'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"><e:Header>'
+        '<w:MessageID>uuid:11111111-1111-1111-1111-111111111111</w:MessageID>'
+        '<w:RelatesTo>uuid:22222222-2222-2222-2222-222222222222</w:RelatesTo></e:Header>'
+        f'<e:Body><d:ProbeMatches><d:ProbeMatch>{address_xml}'
+        f'<d:Scopes>onvif://www.onvif.org/hardware/{hardware}</d:Scopes>'
+        '<d:XAddrs>http://192.168.0.44/onvif/device_service</d:XAddrs></d:ProbeMatch></d:ProbeMatches></e:Body></e:Envelope>'
+    )
+
+
+@pytest.mark.parametrize("payload", [
+    _reply(""),  # firmware omits the EndpointReference entirely
+    _reply("<w:EndpointReference><w:Address></w:Address></w:EndpointReference>"),  # empty identifier
+    _reply("<w:EndpointReference><w:Address>urn:uuid:00000000-0000-0000-0000-000000000000</w:Address></w:EndpointReference>"),  # nil UUID
+    _reply("<w:EndpointReference><w:Address>http://192.168.0.44/</w:Address></w:EndpointReference>"),  # not a UUID
+    _reply("<w:EndpointReference><w:Address>urn:uuid:fd430000-f7d4</w:Address></w:EndpointReference>"),  # truncated
+    "<e:Envelope><e:Body><d:ProbeMatches>",  # partial / malformed XML
+    "",
+], ids=["no-endpoint-reference", "empty-address", "nil-uuid", "not-a-uuid", "truncated-uuid", "malformed", "empty"])
+def test_a_reply_without_a_usable_identifier_never_holds(driveway, payload):
+    s = driveway
+
+    def probe(ip, timeout):
+        return car.parse_probe_match(ip, payload)
+    url = f"rtsp://192.168.0.44:554{PATH}"
+    assert car.stream_endpoint("dc7a226120", RIGHT, url, 2, probe=probe, clock=s["clock"]) == url
+    assert car.held("dc7a226120", "192.168.0.44") is None
+    assert car.identity_check("dc7a226120", RIGHT, "192.168.0.44", probe=probe).outcome == "no_reply"
+
+
+def test_a_changed_model_string_with_the_same_identity_never_holds(driveway):
+    s = driveway
+    passes(s, 1)  # learns hardware CMIP1042W-28MA
+    s["lan"].hosts["192.168.0.44"].hardware = "CMIP1042W-28MA-V2 (firmware update)"
+    assert passes(s, 1)[0]["dc7a226120"] == "healthy"
+    assert endpoint("dc7a226120", s, s["lan"], s["clock"]) == f"rtsp://192.168.0.44:554{PATH}"
+
+
+def test_a_reply_from_another_address_is_ignored(monkeypatch):
+    other = _reply(f"<w:EndpointReference><w:Address>{OTHER}</w:Address></w:EndpointReference>").encode()
+    monkeypatch.setattr(car, "udp_probe_many", lambda ips, timeout: [("192.168.0.99", other)])
+    assert car.default_probe("192.168.0.44", 0.1) is None
+
+
+def test_a_hold_is_visible_in_the_event_log_the_process_log_and_the_stream_error(driveway, capsys):
+    s = driveway
+    lan = s["lan"]
+    passes(s, 1)
+    lan.hosts["192.168.0.44"] = Device(OTHER, None, hardware="CMIP3382WI-28SDL")
+    passes(s, 1)
+    assert ("identity_mismatch", {"host": "192.168.0.44"}) in events(s["db_path"], "dc7a226120")
+    assert "camera_address_recovery event=identity_mismatch camera=2" in capsys.readouterr().out
+    with pytest.raises(car.CameraIdentityHoldError) as held_error:
+        endpoint("dc7a226120", s, lan, s["clock"])
+    # the supervisor shows this message as the camera's last error (OSError path)
+    assert "different device now answers" in str(held_error.value) and "192.168.0.44" in str(held_error.value)
+
+
+# ------------------------------- real timeout, cache window, no sweep in path
+
+def test_the_stream_gate_probe_is_capped_at_half_a_second_and_cached_for_a_minute(driveway):
+    """A real silent device: a UDP socket bound on 3702 that never answers.
+    The gate's real probe must give up after GATE_PROBE_TIMEOUT_SECONDS, the
+    result must be reused inside CHECK_FRESH_SECONDS, and the address must be
+    probed again (once) after the window."""
+    import time as _time
+    silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        silent.bind(("127.0.0.1", car.WS_DISCOVERY_PORT))
+    except OSError:
+        silent.close()
+        pytest.skip("UDP 3702 not bindable here")
+    clock = Clock()
+    url = f"rtsp://127.0.0.1:554{PATH}"
+    try:
+        timings = []
+        for advance in (0, 30, 31):  # t=0 probe, t=30 cached, t=61 probe again
+            clock.advance(advance)
+            started = _time.monotonic()
+            assert car.stream_endpoint("dc7a226120", RIGHT, url, 2, clock=clock) == url
+            timings.append(_time.monotonic() - started)
+    finally:
+        silent.close()
+    assert car.GATE_PROBE_TIMEOUT_SECONDS == 0.5
+    assert 0.4 <= timings[0] <= 0.8, timings
+    assert timings[1] < 0.15, timings
+    assert 0.4 <= timings[2] <= 0.8, timings
+    assert car.held("dc7a226120", "127.0.0.1") is None  # silence never holds
+
+
+def test_the_stream_call_only_ever_probes_the_one_configured_address(driveway, monkeypatch):
+    calls = []
+    monkeypatch.setattr(car, "udp_probe_many", lambda ips, timeout: calls.append((list(ips), timeout)) or [])
+    monkeypatch.setattr(car, "default_sweep", lambda *a, **k: pytest.fail("sweep inside the stream call"))
+    clock = Clock()
+    for _ in range(5):
+        car.stream_endpoint("dc7a226120", RIGHT, f"rtsp://192.168.0.44:554{PATH}", 2, clock=clock)
+        clock.advance(61)
+    assert calls and all(ips == ["192.168.0.44"] and timeout <= 0.5 for ips, timeout in calls)
+
+
+def test_recording_and_talk_use_the_configured_address_untouched_when_nothing_moved(driveway, monkeypatch):
+    """Preservation: with healthy cameras the recording stream URL, its
+    credentials and the talk-down host are exactly what they were before."""
+    import main
+    import talk_down_discovery
+    s = driveway
+    monkeypatch.setattr(car, "default_probe", s["lan"].probe)
+    passes(s, 3)
+    stream = main._provisioned_camera_stream(3)
+    assert stream == {"rtsp_url": f"rtsp://192.168.0.70:554{PATH}", "username": "admin", "password": "pw-left"}
+    assert talk_down_discovery._provisioned_camera_credentials(3) == ("192.168.0.70", "admin", "pw-left")
+    assert rows(s["db_path"], "SELECT * FROM camera_address_overrides") == []
