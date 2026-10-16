@@ -308,7 +308,7 @@ def test_reader_not_ready_is_an_error_not_an_hls_read(monkeypatch):
     assert result["ok"] is False and "starting" in result["error"]
 
 
-def test_hls_mode_is_the_previous_path_and_keeps_the_encoder(monkeypatch, tmp_path):
+def test_hls_mode_is_the_previous_path_and_keeps_the_encoder(monkeypatch, tmp_path, isolated_camera_map):
     live_hls_demand.configure(mode="on_demand", idle_seconds=60, clock=Clock())
     monkeypatch.setattr(main, "HLS_FOLDER", tmp_path)
     (tmp_path / "camera6.m3u8").write_text("#EXTM3U\n")
