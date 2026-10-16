@@ -103,8 +103,9 @@ def test_incomplete_or_reversed_purchases_do_not_activate(env, setup):
 def test_every_my_subscription_purchase_is_refused_before_activation(env, plan_prices, path, body):
     import per_camera_billing as billing
     response = env["client"].post(path, json=body, cookies=_cookie(*OWNER_A))
-    assert response.status_code == 409 and response.json()["detail"] == billing.ACTIVATE_FIRST
-    assert "https://anyaicam.com/build-your-system.html?source=installed" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert response.status_code == 409 and detail["code"] == "activate_first" and detail["message"] == billing.ACTIVATE_FIRST
+    assert detail["activate_url"] == "https://anyaicam.com/build-your-system.html?source=installed" == billing.ACTIVATE_URL
     assert "/v1/checkout/sessions" not in _stripe_posts(env)
 
 
@@ -128,8 +129,10 @@ def test_portal_before_activation_shows_disabled_controls_and_the_activate_link(
     import per_camera_billing as billing
     page = _portal(env)
     assert 'id="v2-activate-first"' in page and billing.ACTIVATE_URL in page and "Activate Your System" in page
-    assert 'id="v2-checkout-button"' not in page and 'id="v2-checkout-disabled" disabled' in page
+    assert 'id="v2-checkout-button" data-locked="1" disabled' in page  # the real control, disabled
     assert 'id="addons-after-activation"' in page
+    assert page.index('id="v2-activate-first"') < page.index('id="v2-plan-summary"')  # the way forward comes first
+    assert "Not activated yet. Choose Activate Your System" in page
     assert 'addon-buy-button" data-addon-key' not in page  # every Add button carries disabled
 
 

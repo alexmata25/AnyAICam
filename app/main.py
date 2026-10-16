@@ -106026,7 +106026,7 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
-      if(!response.ok)return showToast(data.detail||'Could not start checkout.');
+      if(!response.ok)return showToast((data.detail&&data.detail.message)||data.detail||'Could not start checkout.');
 
 
 
