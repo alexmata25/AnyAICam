@@ -239,7 +239,7 @@ class LinkServerTests(LinkServerBase):
 
     def test_status_endpoint_for_the_desktop_launcher(self):
         _, body = self.request('GET', '/status')
-        self.assertEqual(json.loads(body), {'linked': False, 'can_link': True, 'portal': PORTAL})
+        self.assertEqual(json.loads(body), {'linked': False, 'can_link': True, 'portal': PORTAL, 'needs_activation': False})
         self.is_linked = True
         self.assertTrue(json.loads(self.request('GET', '/status')[1])['linked'])
 
@@ -397,3 +397,46 @@ class ClaimExpiryWordingTests(unittest.TestCase):
             self.assertNotIn('within an hour', text, name)
             for stated in re.findall(r'(\d+) minutes', text):
                 self.assertEqual(int(stated), minutes, name)
+
+
+class ActivationStepTests(LinkServerBase):
+    """VMS 1.2.7: once linked, an account the cloud says has no camera plan is sent to Activate Your System."""
+
+    ACTIVATE = 'https://anyaicam.com/build-your-system.html?source=installed'
+
+    def setUp(self):
+        super().setUp()
+        self.plan = None
+        self.server.plan_active = lambda: self.plan
+
+    def test_linked_without_a_plan_shows_the_activation_step(self):
+        self.is_linked, self.plan = True, False
+        _, page = self.request('GET', '/')
+        self.assertIn('Activate Your System', page)
+        self.assertIn(f'href="{self.ACTIVATE}"', page)
+        self.assertIn(f'{PORTAL}/customer/setup', page)
+        self.assertTrue(json.loads(self.request('GET', '/status')[1])['needs_activation'])
+
+    def test_unknown_or_active_plan_never_shows_it(self):
+        self.is_linked = True
+        for plan in (None, True):
+            self.plan = plan
+            _, page = self.request('GET', '/')
+            self.assertNotIn('Activate Your System', page)
+            self.assertIn('linked to your AnyAiCam account', page)
+            self.assertFalse(json.loads(self.request('GET', '/status')[1])['needs_activation'])
+
+    def test_not_linked_never_shows_it(self):
+        self.plan = False
+        _, page = self.request('GET', '/')
+        self.assertNotIn('Activate Your System', page)
+
+    def test_a_failing_plan_reader_never_breaks_the_page(self):
+        self.is_linked = True
+
+        def boom():
+            raise RuntimeError('disk')
+        self.server.plan_active = boom
+        response, page = self.request('GET', '/')
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('Activate Your System', page)

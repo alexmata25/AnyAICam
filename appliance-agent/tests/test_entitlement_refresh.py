@@ -96,3 +96,29 @@ class EntitlementRefreshTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PlanActiveForTheSetupPageTests(unittest.TestCase):
+    """VMS 1.2.7: the Setup page's Activate Your System step reads this. Unknown is None, never False."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.agent = _agent(self._tmpdir.name)
+        self.agent.client.request = MagicMock()
+
+    def test_never_refreshed_is_unknown(self):
+        self.assertIsNone(self.agent.plan_active())
+
+    def test_a_refresh_with_no_cameras_is_no_plan_and_with_cameras_is_a_plan(self):
+        self.agent.client.request.return_value = {'camera_slot_quantity': 0, 'entitlements': []}
+        self.agent.poll_entitlement()
+        self.assertIs(self.agent.plan_active(), False)
+        self.agent._next_entitlement_check_at = 0
+        self.agent.client.request.return_value = {'camera_slot_quantity': 4, 'entitlements': []}
+        self.agent.poll_entitlement()
+        self.assertIs(self.agent.plan_active(), True)
+
+    def test_a_corrupt_state_file_is_unknown(self):
+        Path(self.agent.config.entitlement_state_file).write_text('{not json', encoding='utf-8')
+        self.assertIsNone(self.agent.plan_active())

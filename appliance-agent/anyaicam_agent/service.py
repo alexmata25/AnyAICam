@@ -236,6 +236,14 @@ class ApplianceAgent:
             return max(0,int(data.get('camera_slot_quantity',0)))
         except (OSError,json.JSONDecodeError,ValueError,TypeError):
             return 0
+    def plan_active(self):
+        # The Setup page's activation step (VMS 1.2.7): True/False from the last successful entitlement refresh,
+        # None when there has never been one (never prompt a paying customer to buy just because it is unknown).
+        try:
+            data=json.loads(self.config.entitlement_state_file.read_text(encoding='utf-8'))
+            return max(0,int(data.get('camera_slot_quantity',0)))>0
+        except (OSError,json.JSONDecodeError,ValueError,TypeError,AttributeError):
+            return None
     def poll_entitlement(self):
         # Provisioning Phase 7: the device-side caller for the cloud's
         # already-existing, already-tested POST /api/provisioning/refresh
@@ -619,7 +627,7 @@ class ApplianceAgent:
         if raw=='0': return None
         try:
             port=int(raw)
-            self.link_server=LinkServer(self.config,self.log,headless=lambda:self.headless if self.headless is not None and not self.headless.done else None,linked=self.linked,port=port).start()
+            self.link_server=LinkServer(self.config,self.log,headless=lambda:self.headless if self.headless is not None and not self.headless.done else None,linked=self.linked,port=port,plan_active=self.plan_active).start()
         except (OSError,ValueError) as error:
             self.log.warning('AnyAiCam Setup page not started (%s)',error)
             self.link_server=None

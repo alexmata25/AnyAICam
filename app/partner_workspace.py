@@ -622,7 +622,21 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             </article>'''
             for n in range(configured_count+1,max(licensed_slots,configured_count)+1)
         )
-        camera_cards=(real_camera_cards+placeholder_slot_cards) or '<div class="empty">No camera slots are available on this account yet.</div>'
+        empty_cameras='<div class="empty">No camera slots are available on this account yet.</div>'
+        if on_edge and not (real_camera_cards+placeholder_slot_cards):
+            # VMS 1.2.7: the installed VMS of an account with no plan yet points to the one approved first purchase
+            # (the shell banner says the same; this replaces the dead-end empty state).
+            try:
+                import activation_prompt
+                if activation_prompt.needs_activation():
+                    if identity['role']=='customer_owner':
+                        empty_cameras=('<div class="empty" id="customer-account-activate">No cameras yet: this account has no camera plan. '
+                                       f'<a class="action-button" href="{escape(activation_prompt.ACTIVATE_URL,quote=True)}" target="_blank" rel="noopener">Activate Your System</a></div>')
+                    else:
+                        empty_cameras='<div class="empty" id="customer-account-activate">No cameras yet: the account owner has not activated this system.</div>'
+            except Exception:
+                logging.getLogger('anyaicam.partner_workspace').exception('activation prompt on customer account failed')
+        camera_cards=(real_camera_cards+placeholder_slot_cards) or empty_cameras
         # Add camera (1.2.6 acceptance): with every camera removed, /customer-live
         # redirects here, and the free slots offered no way forward. Owners with an
         # activated appliance and a free licensed slot get the same discovery step

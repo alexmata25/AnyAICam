@@ -49117,6 +49117,14 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         RUNTIME_ROLE == "cloud" and shell_role in {"customer_owner", "customer_viewer"}
     ):
         content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
+    # VMS 1.2.7: a linked edge appliance whose account has no camera plan or licence yet offers the one approved
+    # first purchase, Activate Your System -> Build Your System (activation_prompt.py). Signed-in users only.
+    if RUNTIME_ROLE in {"edge", "combined"} and shell_user:
+        try:
+            import activation_prompt
+            content = activation_prompt.banner_html(shell_role) + content
+        except Exception:
+            application_logger.exception("activation prompt banner failed")
     # An unfinished Build Your System purchase follows the owner across the
     # VMS (2026-10-05): Continue checkout until paid, then Continue to setup.
     if shell_has_partner_identity and shell_role == "customer_owner":

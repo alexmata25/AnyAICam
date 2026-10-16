@@ -76,13 +76,19 @@ def _origin(url: str) -> str:
 class LinkServer:
     """Serves the local setup page. `headless` returns the agent's current
     HeadlessClaim (or None when the appliance cannot claim itself);
-    `linked` says whether the appliance already has its credential."""
+    `linked` says whether the appliance already has its credential. `plan_active` (optional) returns True when the
+    linked account has a camera plan, False when the cloud said it has none, and None when unknown; only False shows
+    the "Activate Your System" step (VMS 1.2.7 activation-first purchase)."""
+
+    ACTIVATE_URL = 'https://anyaicam.com/build-your-system.html?source=installed'
 
     def __init__(self, config, log, headless: Callable[[], object], linked: Callable[[], bool],
-                 port: int = DEFAULT_PORT, host: str = '127.0.0.1', clock: Callable[[], float] = time.monotonic):
+                 port: int = DEFAULT_PORT, host: str = '127.0.0.1', clock: Callable[[], float] = time.monotonic,
+                 plan_active: Callable[[], object] | None = None):
         if host not in ('127.0.0.1', '::1'):
             raise ValueError('the setup page is served on the loopback interface only')
         self.config, self.log, self.headless, self.linked, self.clock = config, log, headless, linked, clock
+        self.plan_active = plan_active
         self.token = secrets.token_urlsafe(32)
         self._links = deque()
         self._lock = threading.Lock()
@@ -120,13 +126,29 @@ class LinkServer:
 
     def status(self) -> dict:
         linked = bool(self.linked())
-        return {'linked': linked, 'can_link': (not linked) and self.headless() is not None, 'portal': self.portal}
+        needs_activation = False
+        if linked and self.plan_active is not None:
+            try:
+                needs_activation = self.plan_active() is False
+            except Exception:
+                needs_activation = False
+        return {'linked': linked, 'can_link': (not linked) and self.headless() is not None, 'portal': self.portal,
+                'needs_activation': needs_activation}
 
     # ---------------------------------------------------------------- pages
     def page(self) -> str:
         state = self.status()
         portal = html.escape(self.portal, quote=True)
-        if state['linked']:
+        if state['linked'] and state.get('needs_activation'):
+            activate = html.escape(self.ACTIVATE_URL, quote=True)
+            body = ('<h1>This appliance is linked. Next: activate your system</h1>'
+                    '<p>Your account has no camera plan yet. Choose your plan and the number of cameras in Build Your '
+                    'System; one checkout activates this installed VMS. There is nothing more to download.</p>'
+                    f'<p><a class="button" href="{activate}" target="_blank" rel="noopener">Activate Your System</a></p>'
+                    '<p class="note">After checkout your cameras start automatically within a few minutes. '
+                    f'You can also <a href="{portal}/customer/setup">continue in AnyAiCam</a> or open the local VMS: '
+                    '<a href="http://127.0.0.1:8000/">http://127.0.0.1:8000</a></p>')
+        elif state['linked']:
             body = ('<h1>This appliance is linked to your AnyAiCam account</h1>'
                     f'<p><a class="button" href="{portal}/customer/setup">Continue in AnyAiCam</a></p>'
                     '<p class="note">Discover and add your cameras in AnyAiCam. The local VMS on this computer: '
