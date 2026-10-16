@@ -19,8 +19,6 @@ jobs:
       ANYAICAM_DATABASE_BACKEND: sqlite
       ANYAICAM_TEST_LAB_ENABLED: "false"
       ANYAICAM_STATIC_FOLDER: ${{ github.workspace }}/app/static
-      ANYAICAM_RECORDINGS_FOLDER: ${{ runner.temp }}/vms-127-analytics/recordings
-      ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-127-analytics/partner.db
     steps:
       - name: Check out isolated verification branch
         uses: actions/checkout@v4
@@ -52,6 +50,9 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-test.txt
 
       - name: Run analytics and neighboring regressions
+        env:
+          ANYAICAM_RECORDINGS_FOLDER: ${{ runner.temp }}/vms-127-analytics/recordings
+          ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-127-analytics/partner.db
         shell: bash
         run: |
           set -o pipefail
