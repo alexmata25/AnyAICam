@@ -173,7 +173,7 @@ def _provisioned_camera_transport_credentials(camera_number: int) -> tuple[str, 
     try:
         with connection() as db:
             camera = db.execute(
-                "SELECT id, onvif_endpoint FROM cameras WHERE camera_number=?",
+                "SELECT id, onvif_endpoint, device_key FROM cameras WHERE camera_number=?",
                 (camera_number,),
             ).fetchone()
             if not camera:
@@ -189,7 +189,19 @@ def _provisioned_camera_transport_credentials(camera_number: int) -> tuple[str, 
     credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
     if not credentials:
         return None
-    parsed = urlsplit(camera["onvif_endpoint"] or "")
+    # Camera address recovery (1.2.7): the same recovered address and identity
+    # hold as the video stream (camera_address_recovery.stream_endpoint), so a
+    # credential is never sent to a different device at the old address.
+    endpoint = camera["onvif_endpoint"] or ""
+    try:
+        import camera_address_recovery
+        endpoint = camera_address_recovery.stream_endpoint(camera["id"], camera["device_key"], endpoint, camera_number)
+    except OSError as error:
+        if type(error).__name__ == "CameraIdentityHoldError":
+            return None
+    except Exception:
+        pass
+    parsed = urlsplit(endpoint)
     if parsed.scheme != "rtsp" or not parsed.hostname:
         return None
     return (
