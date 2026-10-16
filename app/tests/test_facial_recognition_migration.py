@@ -42,7 +42,12 @@ def _facial_migration_sql() -> str:
 
 
 @pytest.fixture()
-def db_path(tmp_path):
+def db_path(tmp_path, monkeypatch):
+    # The PostgreSQL section below switches this process to the postgresql
+    # backend at import whenever ANYAICAM_TEST_POSTGRES_URL is set; the
+    # SQLite tests must stay on SQLite either way.
+    monkeypatch.setenv("ANYAICAM_DATABASE_BACKEND", "sqlite")
+    monkeypatch.delenv("ANYAICAM_DATABASE_URL", raising=False)
     return tmp_path / "test_facial_migration.db"
 
 
