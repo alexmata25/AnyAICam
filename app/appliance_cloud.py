@@ -1040,6 +1040,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         return {'message':'Media URI recorded.' if updated else 'Camera already has a media URI; not replaced.','updated':updated}
 
     RECONNECT_JOB_WINDOW_SECONDS=1800
+    RECONNECT_LOCAL_NETWORKS=('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16','100.64.0.0/10','fc00::/7','fe80::/10')
 
     def _reconnect_existing_address(appliance: dict,camera: dict,device_key: str,rtsp_uri: str,job_id: str) -> bool:
         from urllib.parse import urlsplit
@@ -1062,8 +1063,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         import ipaddress
         try: address=ipaddress.ip_address(new.hostname or '')
         except ValueError: raise HTTPException(status_code=409,detail='A reconnected camera must be on the local network (an IP address).')
-        local=(address.is_private or address.is_link_local
-               or (address.version==4 and address in ipaddress.ip_network('100.64.0.0/10')))
+        # An explicit allowlist, not is_private (which also covers documentation
+        # and reserved ranges, differently across Python versions).
+        local=any(address in ipaddress.ip_network(network) for network in RECONNECT_LOCAL_NETWORKS
+                  if ipaddress.ip_network(network).version==address.version)
         if not local or address.is_loopback or address.is_unspecified or address.is_multicast:
             raise HTTPException(status_code=409,detail='A reconnected camera must be on the local network.')
         with connection() as db:
