@@ -16,6 +16,19 @@ os.environ["ANYAICAM_PARTNER_DB"] = db
 os.environ["ANYAICAM_DATABASE_BACKEND"] = "sqlite"
 import appliance_cloud, talk_sessions, talk_audio_relay, partner_portal
 from partner_db import connection, initialize_database
+# Entitlements (e188810 / ad3b65a): Talk Down on an appliance (the default
+# edge role) needs a valid signed entitlement snapshot, else 403. This
+# subprocess does not get tests/conftest.py's autouse _appliance_entitlements
+# fixture, so apply the same stand-in here: entitlement files in a temp dir
+# (never the machine's /etc) and an entitled appliance. This check is about
+# the relay lifecycle; the entitlement gate has its own suites
+# (test_appliance_feature_entitlements.py, test_runtime_feature_enforcement.py).
+import appliance_entitlements
+from pathlib import Path
+_ent_dir = Path(tempfile.mkdtemp(prefix="talk-real-server-ent-"))
+appliance_entitlements.STATE_FILE = _ent_dir / "feature_entitlements.json"
+appliance_entitlements.TRUST_ANCHOR_FILE = _ent_dir / "trust-anchor" / "entitlement_signing_keys.json"
+appliance_entitlements.feature_allowed = lambda feature, customer_id=None: True
 from test_talk_audio_relay import _seed_tenant, _seed_camera, _owner_cookie
 initialize_database()
 with connection() as c:
