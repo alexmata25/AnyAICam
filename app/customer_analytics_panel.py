@@ -53,7 +53,7 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     "smart_motion": ("Smart Motion", ("motion", "smart_motion", "person", "vehicle", "car", "truck", "bus", "motorcycle", "bicycle",
                                       "intrusion", "line_crossing", "loitering")),
     "people_counting": ("People Counting", ("people_counting", "people_counting_in", "people_counting_out")),
-    "lpr": ("LPR", ("lpr", "plate")),
+    "lpr": ("License Plates", ("lpr", "plate")),
     "ppe": ("PPE", ("ppe",)),
     "line_crossing": ("Line Crossing", ("line_crossing", "people_counting_in", "people_counting_out")),
     "intrusion": ("Intrusion", ("intrusion",)),

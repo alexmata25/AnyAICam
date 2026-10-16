@@ -37,7 +37,7 @@ def _download(version="1.2.6", platform="linux"):
 
 def test_license_panel_shows_type_cameras_status_and_account():
     html = panels.license_panel(_contract())
-    assert "My Software License" in html and "included with your AnyAiCam appliance" in html
+    assert "My software license" in html and "included with your AnyAiCam appliance" in html
     assert "Up to 8 cameras" in html and ">Active<" in html and "Bea&#x27;s Bakery" in html
     assert "stays the same when you reinstall or update" in html
 
@@ -127,3 +127,20 @@ def test_installer_older_than_installed_only_uses_fully_reported_versions():
     assert older(["1.2"]) is False           # not a full major.minor.patch
     assert older(["1.2.4"]) is False and older(["1.2.6"], served="1.2.6") is False
     assert panels.strict_version("1.2.6-rc3") == (1, 2, 6) and panels.strict_version("1.2") is None
+
+
+def test_an_own_pc_buyer_sees_the_license_size_and_what_the_plan_covers_now():
+    """Activation-first (2026-10-16, Green's review): Basic Local x 1 bought with the 8-camera one-time license must not
+    read 'Licensed cameras: Up to 1 camera' next to an 8-camera license."""
+    label = "One-time AnyAiCam VMS software license (up to 8 cameras) · your plan covers 1 camera"
+    html = panels.license_panel(_contract(license={"kind": "per_camera_plan", "cameras": 1, "usable_cameras": 1,
+                                                   "status": "active", "label": label}))
+    assert "up to 8 cameras" in html and "your plan covers 1 camera" in html
+    assert "Cameras you can run now" in html and "Up to 1 camera<" in html
+    assert "Licensed cameras" not in html
+
+
+def test_a_license_without_a_plan_never_claims_runnable_cameras():
+    html = panels.license_panel(_contract(license={"kind": "one_time_vms_license", "cameras": 8, "usable_cameras": 0,
+                                                   "status": "active", "label": panels.LICENSE_LABELS["one_time_vms_license"]}))
+    assert "None yet: choose a camera plan in My subscription" in html and "Up to 8 cameras" not in html

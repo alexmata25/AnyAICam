@@ -48115,7 +48115,7 @@ NAV_ITEMS = [
     # viewer's own facial.view permission, not by role membership in
     # this list -- being in NAV_ITEMS at all only makes "aac" eligible
     # to appear, the same as every other entry here.
-    ("aac", "/aac/people", "◎", "Facial Recognition"),
+    ("aac", "/aac/people", "◎", "Facial recognition"),
 
 
 
@@ -48914,13 +48914,17 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
             mobile_items.append(("partner-quotes", "/partner-quotes", "Quotes"))
         mobile_items.append(("help", "/help", "Help"))
     elif shell_role in CUSTOMER_PORTAL_ROLES:
+        # Phone bar (2026-10-16): Dashboard and Account are separate tabs, Events
+        # is on the phone, and labels match the sidebar. Playback stays one tap
+        # away on Account and from every event's "Review footage".
         mobile_items = [
-            ("live", "/customer-live", "Cameras"),
+            ("dashboard", "/dashboard", "Dashboard"),
+            ("live", "/customer-live", "Live"),
+            ("events", "/events", "Events"),
+            ("alerts", "/alerts", "Smart alerts"),
             ("security", "/customer-security", "Security"),
-            ("alerts", "/alerts", "Alerts"),
-            ("playback", "/playback", "Playback"),
             ("investigate", "/investigate", "Investigate"),
-            ("dashboard", "/customer-portal", "Account"),
+            ("account", "/customer-portal", "Account"),
         ]
         # People on the phone (2026-10-01): Facial Recognition was reachable
         # only from the desktop sidebar. Shown to an account with the Face
@@ -48928,11 +48932,11 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         # the add-on), and only to identities granted facial.view.
         if (shell_has_partner_identity and _facial_view_permitted(shell_user, shell_role)
                 and _face_access_active((shell_user or {}).get("customer_id"))):
-            mobile_items.insert(5, ("aac", "/aac/people", "People"))
+            mobile_items.insert(6, ("aac", "/aac/people", "People"))
         # AACO on the phone (2026-10-05): right after Investigate, same
         # visibility rule as the sidebar entry.
         if _aaco_enabled_for(shell_user):
-            mobile_items.insert(5, ("aaco", "/aaco", "AACO"))
+            mobile_items.insert(6, ("aaco", "/aaco", "AACO"))
 
 
 
@@ -49031,6 +49035,12 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
+    # The Account hub (/customer-portal) renders with active="dashboard"; on the
+    # phone it highlights its own Account tab, not Dashboard.
+    mobile_active = active
+    if (shell_role in CUSTOMER_PORTAL_ROLES and active == "dashboard" and request is not None
+            and request.url.path.rstrip("/") == "/customer-portal"):
+        mobile_active = "account"
     mobile = "".join(
 
 
@@ -49040,7 +49050,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-        f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
+        f'<a class="{"active" if key == mobile_active else ""}" href="{url}">{label}</a>'
 
 
 
@@ -49060,8 +49070,8 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
     )
     if analytics_menu:
-        mobile_links = [f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>' for key, url, label in mobile_items]
-        mobile_links.insert(3, analytics_menu[1])  # Cameras, Security, Alerts, Analytics, Playback, Investigate, Account
+        mobile_links = [f'<a class="{"active" if key == mobile_active else ""}" href="{url}">{label}</a>' for key, url, label in mobile_items]
+        mobile_links.insert(4, analytics_menu[1])  # Dashboard, Live, Events, Smart alerts, Analytics, Security, Investigate, Account
         mobile = "".join(mobile_links)
         import customer_analytics_workspace
         scripts = analytics_menu[2] + customer_analytics_workspace.NAV_ASSETS + scripts
@@ -49160,6 +49170,12 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         if _show_aaco:
             from aaco_web import render_aaco_floating_widget
             aaco_widget_html = render_aaco_floating_widget()
+    # Customers see only the version; build, host and Cloud ID are for staff (2026-10-16).
+    if shell_role in CUSTOMER_PORTAL_ROLES:
+        build_badge = f'<div class="sidebar-build-badge">v{escape(APP_VERSION)}</div>'
+    else:
+        build_badge = (f'<div class="sidebar-build-badge" title="Cloud ID: {escape(build_identifier()["cloud_id"] or "not activated")}">'
+                       f'v{escape(APP_VERSION)} · {escape(BUILD_ID)} · {escape(appliance_hostname())}</div>')
 
 
 
@@ -49168,7 +49184,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071032"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="ANY AI CAM"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png"><link rel="icon" type="image/png" href="/static/brand-icon.png"><title>{escape(title)} · AnyAiCam</title><style>{STYLES}</style></head><body><div class="shell"><aside class="sidebar"><div class="brand"><img class="brand-logo" src="/static/brand-icon.png" alt="AnyAiCam"></div><nav class="nav" aria-label="Primary">{navigation}</nav>{identity_html}<form class="sidebar-auth logout-form" method="post" action="/logout" id="logout-form"><input type="hidden" name="csrf_token" value=""><button class="sidebar-logout" type="submit" aria-label="Log out of AnyAiCam"><span class="sidebar-logout-icon" aria-hidden="true">↪</span><span>Log out</span></button></form><script>document.addEventListener('submit',function(e){{var f=e.target;if(!f||!f.classList||!f.classList.contains('logout-form')||!f.csrf_token)return;var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(!match)return;var v=decodeURIComponent(match[1]);if(v.length>=2&&v[0]==='"'&&v[v.length-1]==='"')v=v.slice(1,-1);f.csrf_token.value=v;}},true);</script><div class="sidebar-build-badge" title="Cloud ID: {escape(build_identifier()['cloud_id'] or 'not activated')}">v{escape(APP_VERSION)} · {escape(BUILD_ID)} · {escape(appliance_hostname())}</div></aside><main class="content">{content}</main></div><nav class="mobile-nav" aria-label="Mobile">{mobile}</nav><div class="toast" id="toast" role="status"></div><script>const nativeFetch=window.fetch.bind(window);window.fetch=(input,options={{}})=>{{const method=(options.method||'GET').toUpperCase(),sameOrigin=typeof input==='string'?(!input.startsWith('http://')&&!input.startsWith('https://')):input.url.startsWith(location.origin);if(sameOrigin&&['POST','PUT','PATCH','DELETE'].includes(method)){{const csrf=document.cookie.split('; ').find(item=>item.startsWith('anyaicam_csrf='));if(csrf)options.headers={{...(options.headers||{{}}),'X-CSRF-Token':decodeURIComponent(csrf.split('=').slice(1).join('='))}}}}return nativeFetch(input,options)}};function showToast(message){{const toast=document.getElementById('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>toast.classList.remove('show'),3200)}}function comingSoon(label){{showToast(/saved|error|failed|no live/i.test(label)?label:label+' is ready for a future update.')}}if('serviceWorker' in navigator){{window.addEventListener('load',()=>navigator.serviceWorker.register('/service-worker.js').catch(()=>{{}}));}}document.addEventListener('DOMContentLoaded',()=>{{const activeTab=document.querySelector('.sidebar .nav a.active');if(activeTab){{requestAnimationFrame(()=>activeTab.scrollIntoView({{block:'center',inline:'nearest',behavior:'auto'}}));}}const mobileActive=document.querySelector('.mobile-nav a.active');if(mobileActive){{requestAnimationFrame(()=>mobileActive.scrollIntoView({{block:'nearest',inline:'center',behavior:'auto'}}));}}}});</script>{scripts}{aaco_widget_html}</body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071032"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="AnyAiCam"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png"><link rel="icon" type="image/png" href="/static/brand-icon.png"><title>{escape(title)} · AnyAiCam</title><style>{STYLES}</style></head><body><div class="shell"><aside class="sidebar"><div class="brand"><img class="brand-logo" src="/static/brand-icon.png" alt="AnyAiCam"></div><nav class="nav" aria-label="Primary">{navigation}</nav>{identity_html}<form class="sidebar-auth logout-form" method="post" action="/logout" id="logout-form"><input type="hidden" name="csrf_token" value=""><button class="sidebar-logout" type="submit" aria-label="Log out of AnyAiCam"><span class="sidebar-logout-icon" aria-hidden="true">↪</span><span>Log out</span></button></form><script>document.addEventListener('submit',function(e){{var f=e.target;if(!f||!f.classList||!f.classList.contains('logout-form')||!f.csrf_token)return;var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(!match)return;var v=decodeURIComponent(match[1]);if(v.length>=2&&v[0]==='"'&&v[v.length-1]==='"')v=v.slice(1,-1);f.csrf_token.value=v;}},true);</script>{build_badge}</aside><main class="content">{content}</main></div><nav class="mobile-nav" aria-label="Mobile">{mobile}</nav><div class="toast" id="toast" role="status"></div><script>const nativeFetch=window.fetch.bind(window);window.fetch=(input,options={{}})=>{{const method=(options.method||'GET').toUpperCase(),sameOrigin=typeof input==='string'?(!input.startsWith('http://')&&!input.startsWith('https://')):input.url.startsWith(location.origin);if(sameOrigin&&['POST','PUT','PATCH','DELETE'].includes(method)){{const csrf=document.cookie.split('; ').find(item=>item.startsWith('anyaicam_csrf='));if(csrf)options.headers={{...(options.headers||{{}}),'X-CSRF-Token':decodeURIComponent(csrf.split('=').slice(1).join('='))}}}}return nativeFetch(input,options)}};function showToast(message){{const toast=document.getElementById('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>toast.classList.remove('show'),3200)}}function comingSoon(label){{showToast(label)}}if('serviceWorker' in navigator){{window.addEventListener('load',()=>navigator.serviceWorker.register('/service-worker.js').catch(()=>{{}}));}}document.addEventListener('DOMContentLoaded',()=>{{const activeTab=document.querySelector('.sidebar .nav a.active');if(activeTab){{requestAnimationFrame(()=>activeTab.scrollIntoView({{block:'center',inline:'nearest',behavior:'auto'}}));}}const mobileActive=document.querySelector('.mobile-nav a.active');if(mobileActive){{requestAnimationFrame(()=>mobileActive.scrollIntoView({{block:'nearest',inline:'center',behavior:'auto'}}));}}}});</script>{scripts}{aaco_widget_html}</body></html>"""
 
 
 
@@ -49720,7 +49736,7 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';function loadDetailHls(attempt){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});hls.on(Hls.Events.ERROR,(_,data)=>{{if(!data.fatal)return;hls.destroy();if(attempt<20)setTimeout(()=>loadDetailHls(attempt+1),3000)}})}}if(Hls.isSupported()){{loadDetailHls(0)}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';function loadDetailHls(attempt){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});hls.on(Hls.Events.ERROR,(_,data)=>{{if(!data.fatal)return;hls.destroy();if(attempt<20)setTimeout(()=>loadDetailHls(attempt+1),3000)}})}}if(Hls.isSupported()){{loadDetailHls(0)}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
 
 
 
@@ -72963,7 +72979,7 @@ def home(request: Request):
 
 
 
-    scripts = """<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+    scripts = """<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>
 
 
 
@@ -75668,7 +75684,7 @@ def camera_health_page(request: Request) -> str:
 _DASHBOARD_ANALYTICS_LABELS = (
     ("smart_motion_enabled", "Smart Motion"),
     ("people_counting_enabled", "People Counting"),
-    ("lpr_enabled", "LPR"),
+    ("lpr_enabled", "License Plates"),
     ("ppe_enabled", "PPE"),
 )
 
@@ -76139,7 +76155,28 @@ def dashboard(request: Request) -> str:
 
 
 
-        confidence_text = f"{confidence}% confidence" if confidence is not None else "Event detected"
+        # Same whole-number percent and camera name the JS repaint shows (2026-10-16).
+        confidence = event.get("display_confidence") if "display_confidence" in event else _customer_real_confidence(event.get("event_type"), confidence)
+        try:
+            confidence_value = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence_value = None
+        confidence_text = (f"{int((confidence_value * 100 if confidence_value <= 1 else confidence_value) + 0.5)}% confidence"
+                           if confidence_value is not None else "Event detected")
+        camera_label = escape(str(event.get("camera_name") or f"Camera {event.get('camera', '?')}"))
+        event_epoch_ms = _naive_utc_timestamp_to_epoch_ms(event.get("start_time", event.get("timestamp", "")))
+        if event_epoch_ms is None:
+            time_text = "Time unavailable"
+        else:
+            seconds = max(0, int(datetime.now(timezone.utc).timestamp() - event_epoch_ms / 1000))
+            if seconds < 60:
+                time_text = f"{seconds}s ago"
+            elif seconds < 3600:
+                time_text = f"{seconds // 60}m ago"
+            elif seconds < 86400:
+                time_text = f"{seconds // 3600}h ago"
+            else:
+                time_text = f"{seconds // 86400}d ago"
 
 
 
@@ -76175,7 +76212,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            f'<img src="{escape(str(thumbnail))}" alt="{event_type} on Camera {camera_number}" loading="lazy">'
+            f'<img src="{escape(str(thumbnail))}" alt="{event_type} on {camera_label}" loading="lazy">'
 
 
 
@@ -76292,7 +76329,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            f'<span class="dashboard-event-camera">Camera {camera_number}</span></div>'
+            f'<span class="dashboard-event-camera">{camera_label}</span></div>'
 
 
 
@@ -76319,7 +76356,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            f'<div class="dashboard-event-meta"><span>{escape(confidence_text)}</span><time datetime="{timestamp}">{timestamp[:19].replace("T", " ")}</time></div>'
+            f'<div class="dashboard-event-meta"><span>{escape(confidence_text)}</span><time datetime="{timestamp}">{escape(time_text)}</time></div>'
 
 
 
@@ -76931,7 +76968,7 @@ def dashboard(request: Request) -> str:
 
 
 
-    scripts = """<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+    scripts = """<script>
 
 
 
@@ -76983,7 +77020,6 @@ function attachDashboardSnapshot(cameraNumber){
     setInterval(refresh,DASHBOARD_SNAPSHOT_REFRESH_MS);
 }
 document.querySelectorAll('[data-dashboard-camera]').forEach(card=>attachDashboardSnapshot(card.dataset.dashboardCamera));
-function relativeTime(value){const d=new Date(/Z$|[+-]\d\d:?\d\d$/.test(value)?value:value+'Z');if(Number.isNaN(d.getTime()))return '';const s=Math.round((Date.now()-d.getTime())/1000);if(s<60)return 'just now';if(s<3600)return `${Math.round(s/60)} min ago`;if(s<86400)return `${Math.round(s/3600)} h ago`;return d.toLocaleDateString();}
 function paintLastEvents(){document.querySelectorAll('[id^="dashboard-last-event-"]').forEach(cell=>{const t=cell.querySelector('time');if(t&&cell.dataset.at)t.textContent=' · '+relativeTime(cell.dataset.at);});}
 paintLastEvents();
 
@@ -77096,9 +77132,9 @@ async function updateDashboard(){
             state.textContent=camera.online?'Online':'Offline';
             state.classList.remove('checking');state.classList.toggle('offline',!camera.online);
             rec.dataset.mode=rec.dataset.mode||rec.textContent;
-            rec.textContent=`${rec.dataset.mode} · ${camera.recording==='armed'?'waiting for activity':(recordingOk?'recording':'recording '+camera.recording)}`;
+            rec.textContent=`${rec.dataset.mode} · ${camera.recording==='armed'?'waiting for activity':(recordingOk?'recording':'not recording')}`;
             rec.classList.toggle('problem',!recordingOk);
-            const problem=!camera.online?`Camera offline (stream ${camera.stream}).`:(!recordingOk?`Recording problem: ${camera.recording}.`:'');
+            const problem=!camera.online?'Camera offline. Check its power and network.':(!recordingOk?'Recording problem. Check the camera and its storage.':'');
             warning.textContent=problem;warning.hidden=!problem;
             if(problem)attention++;
             card.classList.toggle('offline',!camera.online);card.classList.toggle('attention',!!problem);
@@ -77366,7 +77402,7 @@ function renderIntelligence(data){
 
 
 
-    document.getElementById('ai-data-note').textContent=data.analytics_mock?'Analytics counters currently use demo data':'Live analytics and motion activity';
+    document.getElementById('ai-data-note').textContent=(data.analytics_mock&&!window.__anyaicamCustomerDashboard)?'Analytics counters currently use demo data':'Live analytics and motion activity';
 
 
 
@@ -79944,7 +79980,7 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 
 
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const type='{analytic_type}',canvas=document.getElementById('rule-canvas'),context=canvas.getContext('2d'),points=[];function draw(){{context.clearRect(0,0,canvas.width,canvas.height);if(!points.length)return;context.strokeStyle='#42e4dc';context.fillStyle='rgba(66,228,220,.16)';context.lineWidth=5;context.beginPath();points.forEach((point,index)=>index?context.lineTo(point.x*canvas.width,point.y*canvas.height):context.moveTo(point.x*canvas.width,point.y*canvas.height));if(type==='intrusion'&&points.length>2){{context.closePath();context.fill()}}context.stroke();points.forEach(point=>{{context.beginPath();context.arc(point.x*canvas.width,point.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}canvas.addEventListener('click',event=>{{const rect=canvas.getBoundingClientRect();if(type==='line_crossing'&&points.length>=2)points.length=0;points.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});draw()}});document.getElementById('clear-rule').addEventListener('click',()=>{{points.length=0;draw()}});const camera=document.getElementById('rule-camera'),video=document.getElementById('rule-preview');function connectPreview(attempt){{attempt=typeof attempt==='number'?attempt:0;const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.ruleHls)window.ruleHls.destroy();window.ruleHls=null;if(Hls.isSupported()){{const hls=new Hls();window.ruleHls=hls;hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal&&window.ruleHls===hls&&attempt<20)setTimeout(()=>{{if(window.ruleHls===hls)connectPreview(attempt+1)}},3000)}})}}else video.src=source}}camera.addEventListener('change',()=>connectPreview(0));connectPreview(0);document.getElementById('analytic-rule-form').addEventListener('submit',async event=>{{event.preventDefault();if(points.length<(type==='line_crossing'?2:3)){{showToast('Draw the required line or zone first.');return}}const payload={{camera:Number(camera.value),name:document.getElementById('rule-name').value,analytic_type:type,enabled:document.getElementById('rule-enabled').checked,direction:document.getElementById('rule-direction').value,sensitivity:Number(document.getElementById('rule-sensitivity').value),confidence_threshold:Number(document.getElementById('rule-confidence').value),schedule_start:document.getElementById('rule-start').value,schedule_end:document.getElementById('rule-end').value,retention_days:Number(document.getElementById('rule-retention').value),alerts_enabled:document.getElementById('rule-alerts').checked,geometry:points}},response=await fetch('/api/analytics/rules',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();showToast(result.message)}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>const type='{analytic_type}',canvas=document.getElementById('rule-canvas'),context=canvas.getContext('2d'),points=[];function draw(){{context.clearRect(0,0,canvas.width,canvas.height);if(!points.length)return;context.strokeStyle='#42e4dc';context.fillStyle='rgba(66,228,220,.16)';context.lineWidth=5;context.beginPath();points.forEach((point,index)=>index?context.lineTo(point.x*canvas.width,point.y*canvas.height):context.moveTo(point.x*canvas.width,point.y*canvas.height));if(type==='intrusion'&&points.length>2){{context.closePath();context.fill()}}context.stroke();points.forEach(point=>{{context.beginPath();context.arc(point.x*canvas.width,point.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}canvas.addEventListener('click',event=>{{const rect=canvas.getBoundingClientRect();if(type==='line_crossing'&&points.length>=2)points.length=0;points.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});draw()}});document.getElementById('clear-rule').addEventListener('click',()=>{{points.length=0;draw()}});const camera=document.getElementById('rule-camera'),video=document.getElementById('rule-preview');function connectPreview(attempt){{attempt=typeof attempt==='number'?attempt:0;const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.ruleHls)window.ruleHls.destroy();window.ruleHls=null;if(Hls.isSupported()){{const hls=new Hls();window.ruleHls=hls;hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal&&window.ruleHls===hls&&attempt<20)setTimeout(()=>{{if(window.ruleHls===hls)connectPreview(attempt+1)}},3000)}})}}else video.src=source}}camera.addEventListener('change',()=>connectPreview(0));connectPreview(0);document.getElementById('analytic-rule-form').addEventListener('submit',async event=>{{event.preventDefault();if(points.length<(type==='line_crossing'?2:3)){{showToast('Draw the required line or zone first.');return}}const payload={{camera:Number(camera.value),name:document.getElementById('rule-name').value,analytic_type:type,enabled:document.getElementById('rule-enabled').checked,direction:document.getElementById('rule-direction').value,sensitivity:Number(document.getElementById('rule-sensitivity').value),confidence_threshold:Number(document.getElementById('rule-confidence').value),schedule_start:document.getElementById('rule-start').value,schedule_end:document.getElementById('rule-end').value,retention_days:Number(document.getElementById('rule-retention').value),alerts_enabled:document.getElementById('rule-alerts').checked,geometry:points}},response=await fetch('/api/analytics/rules',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();showToast(result.message)}});</script>"""
 
 
 
@@ -82480,7 +82516,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     <section class="investigation-shell">
       <aside class="investigation-filters">
         <h2>Search evidence</h2>
-        <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
+        <label>Search<input id="investigation-query" placeholder="Search by type, camera or plate…"></label>
         <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option><option value="loitering">Loitering</option></select></label>
         <label>Camera<select id="investigation-camera"><option value="">All cameras</option>{camera_options}</select></label>
         <label>From<input id="investigation-from" type="datetime-local"></label>
@@ -82490,16 +82526,16 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
       <div>
         <section class="investigation-summary">
           <div class="stat"><span class="stat-label">Results</span><span class="stat-value" id="investigation-result-count">0</span></div>
-          <div class="stat"><span class="stat-label">People</span><span class="stat-value" id="investigation-people-count">0</span></div>
-          <div class="stat"><span class="stat-label">Vehicles</span><span class="stat-value" id="investigation-vehicle-count">0</span></div>
-          <div class="stat"><span class="stat-label">Bookmarked</span><span class="stat-value" id="investigation-bookmark-count">0</span></div>
+          <div class="stat"><span class="stat-label">People (shown)</span><span class="stat-value" id="investigation-people-count">0</span></div>
+          <div class="stat"><span class="stat-label">Vehicles (shown)</span><span class="stat-value" id="investigation-vehicle-count">0</span></div>
+          <div class="stat"><span class="stat-label">Bookmarked (shown)</span><span class="stat-value" id="investigation-bookmark-count">0</span></div>
         </section>
         <p class="health-detail" id="investigation-shown-note"></p>
         <div class="investigation-grid" id="investigation-grid"></div>
         <div class="investigation-actions"><button class="ghost-button" id="load-more-investigation" type="button" hidden>Load more</button></div>
         <section class="evidence-panel">
           <div class="panel-head"><div><h2>Evidence export</h2><div class="health-detail">Select results and export a JSON evidence manifest. Video export continues to use existing playback tools.</div></div></div>
-          <div class="investigation-actions"><button id="select-visible-evidence" type="button">Select visible results</button><button id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Export manifest</button></div>
+          <div class="investigation-actions"><button class="ghost-button" id="select-visible-evidence" type="button">Select visible results</button><button class="ghost-button" id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Download evidence list</button></div>
         </section>
       </div>
     </section>"""
@@ -83111,7 +83147,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-        <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
+        <label>Search<input id="investigation-query" placeholder="Search by type, camera or plate…"></label>
 
 
 
@@ -83282,7 +83318,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-          <div class="investigation-actions"><button id="select-visible-evidence" type="button">Select visible results</button><button id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Export manifest</button><button class="ghost-button" id="create-case-from-evidence" type="button">Create case</button></div>
+          <div class="investigation-actions"><button class="ghost-button" id="select-visible-evidence" type="button">Select visible results</button><button class="ghost-button" id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Download evidence list</button><button class="ghost-button" id="create-case-from-evidence" type="button">Create case</button></div>
 
 
 
@@ -83634,6 +83670,8 @@ def investigation_page(request: Request) -> str:
 
 
       const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
+      const typeLabel=String(event.event_type||'event').replaceAll('_',' ').replace(/^./,ch=>ch.toUpperCase());
+      const when=(()=>{{const parsed=new Date(event.timestamp||'');return isNaN(parsed.getTime())?'Unknown time':parsed.toLocaleString([],{{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}})}})();
 
 
 
@@ -83660,7 +83698,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{event.event_type.replaceAll('_',' ')}}</span></div>
+        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{typeLabel}}</span></div>
 
 
 
@@ -83678,7 +83716,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-          <div class="investigation-title"><h3>${{event.event_type.replaceAll('_',' ')}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
+          <div class="investigation-title"><h3>${{typeLabel}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
 
 
 
@@ -83687,7 +83725,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-          <div class="investigation-meta">Camera ${{event.camera}} · ${{String(event.timestamp||'').replace('T',' ').slice(0,19)}}<br>Confidence ${{confidence}}${{event.color?` · ${{event.color}}`:''}}${{event.plate?` · ${{event.plate}}`:''}}</div>
+          <div class="investigation-meta">Camera ${{event.camera}} · ${{when}}<br>Confidence ${{confidence}}${{event.color?` · ${{event.color}}`:''}}${{event.plate?` · ${{event.plate}}`:''}}</div>
 
 
 
@@ -83696,7 +83734,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button><a href="/customer-live">Live camera</a></div>
+          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.camera?`<a href="/camera/${{encodeURIComponent(event.camera)}}">Live camera</a>`:''}}</div>
 
 
 
@@ -105017,7 +105055,7 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
-    content = """<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>Subscription portal</h1></div></header>
+    content = """<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
 
 
 
@@ -105134,7 +105172,7 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
-          <h2>Cloud and edge usage</h2>
+          <h2>Usage</h2>
 
 
 
@@ -106394,7 +106432,7 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
-        "Subscription portal",
+        "My subscription",
 
 
 
@@ -121987,7 +122025,7 @@ def _event_confidence_percent(confidence) -> str:
         return "—"
     value = float(confidence)
     percent = value * 100 if value <= 1 else value
-    return f"{percent:.1f}%"
+    return f"{int(percent + 0.5)}%"  # whole numbers, like the JS Math.round()
 
 
 def _naive_utc_timestamp_to_epoch_ms(raw_timestamp) -> int | None:
@@ -122163,7 +122201,7 @@ def _render_customer_events(request: Request) -> str:
             datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
             timestamp_html = smart_alerts.local_time_html(raw_timestamp, "datetime")
         except ValueError:
-            timestamp_html = escape(raw_timestamp or "Unknown time")
+            timestamp_html = "Unknown time"
         thumb_img = (
             # 2026-09-16: loading="lazy" -- found live, real production
             # data now has enough accumulated events (multi-thousand
@@ -122235,7 +122273,7 @@ def _render_customer_events(request: Request) -> str:
             )
             action_html = (
                 f'{live_link}<span class="download event-action-pending" aria-disabled="true" '
-                f'title="Playback will be available once processing completes">Playback</span>'
+                f'title="Playback will be available once processing completes">Processing…</span>'
             )
         else:
             action_html = _customer_event_actions(camera_id_val, raw_timestamp, event_id_val, event.get("has_event_clip"))
@@ -122255,7 +122293,7 @@ def _render_customer_events(request: Request) -> str:
         # whether a real response was ever received.
         media_state = "ready" if event.get("has_event_clip") else ("processing" if is_pending else "unavailable")
         rows.append(
-            f'<tr data-event-camera="{escape(str(camera_number or ""), quote=True)}" '
+            f'<tr data-event-camera="{escape(str(camera_id_val or ""), quote=True)}" '
             f'data-event-type="{escape(str(event.get("event_type") or ""), quote=True)}" '
             f'data-event-id="{event_id_attr}" '
             f'data-event-timestamp="{escape(raw_timestamp, quote=True)}" '
@@ -122284,12 +122322,11 @@ def _render_customer_events(request: Request) -> str:
 .event-action-pending{{opacity:.55;cursor:default;pointer-events:none}}
 .event-thumb-none{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
 </style>
-<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
-<div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
+<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
-<input class="picker-search" id="events-search" type="search" placeholder="Search" aria-label="Search cameras"><div id="events-camera-filters"{' data-initial-filter="1"' if requested_camera_id else ""}>{camera_options}</div></aside>
-<section class="work-area" style="min-width:0"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
+<input class="picker-search" id="events-search" type="search" placeholder="Search events" aria-label="Search events"><div id="events-camera-filters"{' data-initial-filter="1"' if requested_camera_id else ""}>{camera_options}</div></aside>
+<section class="work-area" style="min-width:0"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event{'' if len(events_list) == 1 else 's'}</span></div>
 <div style="overflow-x:auto;max-width:100%"><table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
 <tbody>{event_body}</tbody></table></div></section></div>"""
 
@@ -122351,7 +122388,7 @@ def _render_customer_events(request: Request) -> str:
   }
   async function apply(){
     const checkedBoxes=[...filters.querySelectorAll('input:checked')];
-    const checked=new Set(checkedBoxes.map(box=>box.dataset.camera));
+    const checked=new Set(checkedBoxes.map(box=>box.dataset.cameraId));
     if(checkedBoxes.length===1&&filters.querySelectorAll('input').length>1){
       await ensureCameraScopedEvents(checkedBoxes[0].dataset.cameraId);
     }
@@ -122494,7 +122531,7 @@ def _render_customer_events(request: Request) -> str:
   function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,mediaState){
     const liveLink=cameraId?`<a class="download" href="/customer/cameras/${encodeURIComponent(cameraId)}/live">Live view</a> `:'';
     if(mediaState==='processing'){
-      return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Playback</span>`;
+      return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Processing…</span>`;
     }
     if(mediaState!=='ready'){
       return `${liveLink}<span class="event-action-pending" aria-disabled="true" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>`;
@@ -122523,7 +122560,7 @@ def _render_customer_events(request: Request) -> str:
     document.querySelectorAll('.event-count-pill').forEach(pill=>{
       const next=Math.max(0,parseInt(pill.dataset.count||'0',10)+delta);
       pill.dataset.count=String(next);
-      pill.textContent=`${next} event(s)`;
+      pill.textContent=`${next} event${next===1?'':'s'}`;
     });
   }
 
@@ -122559,15 +122596,15 @@ def _render_customer_events(request: Request) -> str:
     const placeholder=tbody.querySelector('tr td.empty-stage')?.closest('tr');
     if(placeholder)placeholder.remove();
     const row=document.createElement('tr');
-    row.dataset.eventCamera=String(event.camera||'');
+    row.dataset.eventCamera=String(event.camera_id||'');
     row.dataset.eventType=String(event.event_type||'');
     row.dataset.eventId=String(event.id);
     row.dataset.eventTimestamp=String(event.timestamp||'');
     row.dataset.eventHasClip=event.has_event_clip?'1':'0';
     row.dataset.mediaState=mediaState;
     const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
-    const confidence=event.confidence;
-    const confidencePercent=(confidence===null||confidence===undefined)?'—':`${(confidence<=1?confidence*100:confidence).toFixed(1)}%`;
+    const confidence=event.display_confidence!==undefined?event.display_confidence:event.confidence;
+    const confidencePercent=(confidence===null||confidence===undefined)?'—':`${Math.round(confidence<=1?confidence*100:confidence)}%`;
     row.innerHTML=`<td>${desktopEventDate(event.timestamp).toLocaleString([],{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit'})}</td>`+
       `<td>${AnyAiCamEventMedia.escape(event.camera_name||(event.camera?`Camera ${event.camera}`:'—'))}</td>`+
       `<td class="event-thumbnail-cell">${thumbHtml}</td>`+
@@ -122682,7 +122719,7 @@ def _render_customer_events(request: Request) -> str:
           if(active)keep.add(active);
           ordered.forEach(row=>{if(!keep.has(row))row.remove();});
           rows.splice(0,rows.length,...ordered.filter(row=>keep.has(row)));
-          document.querySelectorAll('.event-count-pill').forEach(pill=>{pill.dataset.count=String(rows.length);pill.textContent=`${rows.length} event(s)`;});
+          document.querySelectorAll('.event-count-pill').forEach(pill=>{pill.dataset.count=String(rows.length);pill.textContent=`${rows.length} event${rows.length===1?'':'s'}`;});
           apply();
         }
         // non-2xx: transient, retried below via finally -- never a
@@ -122932,7 +122969,7 @@ def alerts(request: Request) -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div><div><button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion alerts</h2><span class="pill">{len(events)} event(s)</span></div><div class="feature-grid">{alert_body}</div></section></div>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div><div><a class="action-button" href="/settings/notifications">Alert settings</a></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion alerts</h2><span class="pill">{len(events)} event(s)</span></div><div class="feature-grid">{alert_body}</div></section></div>"""
 
 
 
@@ -122991,7 +123028,7 @@ def events(request: Request) -> str:
 
 
 
-    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in get_camera_numbers())
+    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked data-camera="{n}"> Camera {n}</label>' for n in get_camera_numbers())
 
 
 
@@ -123108,7 +123145,7 @@ def events(request: Request) -> str:
 
 
 
-        event_rows.append(f'<tr data-event-camera="{event.get("camera", "")}"><td>{escape(timestamp_label)}</td><td>Camera {event.get("camera", "—")}</td><td>{thumbnail}</td><td><span class="pill">Motion</span></td><td>{confidence:.1f}%</td><td><a class="download" href="/playback">Review footage</a></td></tr>')
+        event_rows.append(f'<tr data-event-camera="{event.get("camera", "")}"><td>{escape(timestamp_label)}</td><td>Camera {event.get("camera", "—")}</td><td>{thumbnail}</td><td><span class="pill">Motion</span></td><td>{int((confidence * 100 if confidence <= 1 else confidence) + 0.5)}%</td><td><a class="download" href="/playback">Review footage</a></td></tr>')
 
 
 
@@ -123135,7 +123172,7 @@ def events(request: Request) -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div><div><span class="pill">Motion detection: {detector_status}</span></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion</h2><span class="health-detail">{len(recent_events)} event(s)</span></div><table class="data-table"><thead><tr><th>Start time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead><tbody>{event_body}</tbody></table></section></div>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div><div><span class="pill">Motion detection: {detector_status}</span></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" id="events-search" type="search" placeholder="Search events" aria-label="Search events"><div id="events-camera-filters">{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion</h2><span class="health-detail">{len(recent_events)} event{'' if len(recent_events) == 1 else 's'}</span></div><table class="data-table" id="events-table"><thead><tr><th>Start time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead><tbody>{event_body}</tbody></table></section></div>"""
 
 
 
@@ -123144,7 +123181,13 @@ def events(request: Request) -> str:
 
 
 
-    return page_shell("Events", "events", content)
+    # Camera picker and search filter the rows on this appliance too (2026-10-16).
+    scripts = """<script>(function(){const search=document.getElementById('events-search'),filters=document.getElementById('events-camera-filters');
+if(!search||!filters)return;const rows=[...document.querySelectorAll('#events-table tbody tr[data-event-camera]')];
+function apply(){const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));const query=(search.value||'').toLowerCase();
+rows.forEach(row=>{row.hidden=!(checked.has(row.dataset.eventCamera)&&(!query||row.textContent.toLowerCase().includes(query)))})}
+filters.addEventListener('change',apply);search.addEventListener('input',apply);})();</script>"""
+    return page_shell("Events", "events", content, scripts)
 
 
 
@@ -148080,7 +148123,7 @@ def playback(request: Request, response: Response) -> str:
 
 
 
-    scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+    scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>
 
 
 

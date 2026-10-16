@@ -61,6 +61,25 @@ LINK_FAILURE_PAGES = {
 }
 
 
+# Shown, with the HTTP status unchanged, when "Link this appliance" is refused by
+# the token / same-origin checks (most often a tab opened before the agent
+# restarted: the page token is new on every start) or the form is malformed.
+# Static text only: it never says which check failed.
+EXPIRED_PAGE = ('<h1>This page expired</h1>'
+                '<p>Reload this page and try again.</p>'
+                '<p><a class="button" href="/">Reload this page</a></p>')
+
+
+def render_page(body: str) -> str:
+    """The HTML shell shared by every AnyAiCam Setup page (`body` is trusted, already-escaped HTML)."""
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1"><title>AnyAiCam Setup</title>'
+            '<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#0b1530}'
+            '.button{display:inline-block;background:#16778b;color:#fff;border:0;border-radius:10px;padding:.8rem 1.3rem;'
+            'font-size:1rem;text-decoration:none;cursor:pointer}.note{color:#64748b;font-size:.9rem}</style>'
+            f'</head><body><p class="note">AnyAiCam Setup</p>{body}</body></html>')
+
+
 class _LoopbackServer(ThreadingHTTPServer):
     # Linux refuses a second listener on the port even with SO_REUSEADDR (which
     # only lets a restarted agent rebind past TIME_WAIT); Windows would let
@@ -146,12 +165,12 @@ class LinkServer:
                     'System; one checkout activates this installed VMS. There is nothing more to download.</p>'
                     f'<p><a class="button" href="{activate}" target="_blank" rel="noopener">Activate Your System</a></p>'
                     '<p class="note">After checkout your cameras start automatically within a few minutes. '
-                    f'You can also <a href="{portal}/customer/setup">continue in AnyAiCam</a> or open the local VMS: '
+                    f'You can also <a href="{portal}/customer/setup">continue in AnyAiCam</a> or open AnyAiCam on this computer: '
                     '<a href="http://127.0.0.1:8000/">http://127.0.0.1:8000</a></p>')
         elif state['linked']:
             body = ('<h1>This appliance is linked to your AnyAiCam account</h1>'
                     f'<p><a class="button" href="{portal}/customer/setup">Continue in AnyAiCam</a></p>'
-                    '<p class="note">Discover and add your cameras in AnyAiCam. The local VMS on this computer: '
+                    '<p class="note">Discover and add your cameras in AnyAiCam. Open AnyAiCam on this computer: '
                     '<a href="http://127.0.0.1:8000/">http://127.0.0.1:8000</a></p>')
         elif state['can_link']:
             body = ('<h1>Link this appliance to your AnyAiCam account</h1>'
@@ -165,12 +184,7 @@ class LinkServer:
             body = ('<h1>AnyAiCam Setup is not available yet</h1>'
                     '<p>This appliance is not set up to link itself to an AnyAiCam account (no AnyAiCam cloud address is '
                     'configured, or it is still starting). Please contact AnyAiCam support.</p>')
-        return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
-                '<meta name="viewport" content="width=device-width,initial-scale=1"><title>AnyAiCam Setup</title>'
-                '<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#0b1530}'
-                '.button{display:inline-block;background:#16778b;color:#fff;border:0;border-radius:10px;padding:.8rem 1.3rem;'
-                'font-size:1rem;text-decoration:none;cursor:pointer}.note{color:#64748b;font-size:.9rem}</style>'
-                f'</head><body><p class="note">AnyAiCam Setup</p>{body}</body></html>')
+        return render_page(body)
 
     # ---------------------------------------------------------------- HTTP
     def _handler(self):
@@ -207,7 +221,8 @@ class LinkServer:
             def _host_ok(self) -> bool:
                 if self.headers.get('Host', '') in server.allowed_hosts:
                     return True
-                self._send(421, b'Misdirected request')
+                self._send(421, render_page('<h1>Open AnyAiCam Setup on this appliance</h1>'
+                                            '<p>Use the AnyAiCam Setup shortcut on this appliance\'s desktop.</p>').encode())
                 return False
 
             def do_GET(self):
@@ -218,7 +233,8 @@ class LinkServer:
                     return self._send(200, server.page().encode())
                 if path == '/status':
                     return self._send(200, json.dumps(server.status()).encode(), 'application/json')
-                return self._send(404, b'Not found')
+                return self._send(404, render_page('<h1>Page not found</h1>'
+                                                   '<p><a href="/">Go to AnyAiCam Setup</a></p>').encode())
 
             do_HEAD = do_GET
 
@@ -226,35 +242,37 @@ class LinkServer:
                 if not self._host_ok():
                     return
                 if urlsplit(self.path).path != '/link':
-                    return self._send(404, b'Not found')
+                    return self._send(404, render_page('<h1>Page not found</h1>'
+                                                   '<p><a href="/">Go to AnyAiCam Setup</a></p>').encode())
                 origin = self.headers.get('Origin')
                 if origin is not None and origin.lower() not in {f'http://{h}' for h in server.allowed_hosts}:
-                    return self._send(403, b'Forbidden')
+                    return self._send(403, render_page(EXPIRED_PAGE).encode())
                 if self.headers.get('Sec-Fetch-Site', 'same-origin') not in ('same-origin', 'none'):
-                    return self._send(403, b'Forbidden')
+                    return self._send(403, render_page(EXPIRED_PAGE).encode())
                 try:
                     length = int(self.headers.get('Content-Length') or 0)
                 except ValueError:
                     length = -1
                 if length < 0:
-                    return self._send(400, b'Bad request')
+                    return self._send(400, render_page(EXPIRED_PAGE).encode())
                 if length > 4096:
-                    return self._send(413, b'Too large')
+                    return self._send(413, render_page(EXPIRED_PAGE).encode())
                 form = parse_qs(self.rfile.read(length).decode('utf-8', 'replace'))
                 token = (form.get('token') or [''])[0]
                 if not hmac.compare_digest(token.encode(), server.token.encode()):
-                    return self._send(403, b'Forbidden')
+                    return self._send(403, render_page(EXPIRED_PAGE).encode())
                 if server.linked():
                     return self._send(303, location=f'{server.portal}/customer/setup')
                 if not server._allow_link():
-                    return self._send(429, b'Too many attempts; wait a minute and try again.')
+                    return self._send(429, render_page('<h1>Too many attempts</h1>'
+                                                       '<p>Wait a minute, then <a href="/">try again</a>.</p>').encode())
                 claim = server.headless()
                 code = claim.link_code() if claim is not None else None
                 if not code:
                     status, message = LINK_FAILURE_PAGES.get(getattr(claim, 'link_failure', None),
                                                              LINK_FAILURE_PAGES['unreachable'])
-                    page = ('<!doctype html><meta charset="utf-8"><title>AnyAiCam Setup</title>'
-                            f'<p>{message}</p>').encode()
+                    page = render_page('<h1>This appliance was not linked</h1>'
+                                       f'<p>{message}</p><p><a class="button" href="/">Try again</a></p>').encode()
                     return self._send(status, page)
                 server.log.info('Setup page: sent the owner to AnyAiCam to link this appliance.')
                 return self._send(303, location=f'{server.portal}/claim#code={code}')

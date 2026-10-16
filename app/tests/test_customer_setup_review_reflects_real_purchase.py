@@ -144,7 +144,7 @@ def test_review_shows_the_purchased_local_tier_and_licensed_slot_count(http_clie
     _seed_legacy_plan(conn, camera_quantity=1)  # deliberately mismatched from the real entitlement
     _seed_camera_slot_entitlement(conn, product="camera_slots_local", camera_slot_quantity=8)
     response = _setup_page(http_client)
-    assert "8 licensed camera slots" in response.text
+    assert "8 licensed cameras" in response.text
     assert "Local" in response.text
 
 
@@ -154,7 +154,7 @@ def test_review_shows_the_purchased_hybrid_tier_when_thats_what_was_bought(http_
     _seed_camera_slot_entitlement(conn, product="camera_slots_hybrid", camera_slot_quantity=16)
     response = _setup_page(http_client)
     assert "Hybrid" in response.text
-    assert "16 licensed camera slots" in response.text
+    assert "16 licensed cameras" in response.text
 
 
 def test_review_shows_every_purchased_analytic_and_no_others(http_client, db_path):
@@ -172,15 +172,15 @@ def test_review_shows_every_purchased_analytic_and_no_others(http_client, db_pat
     # whole-body substring check coincidentally collided with it purely
     # because its label text matches the analytic's own display name.
     body = response.text.split("</nav>", 1)[-1]
-    # 2026-09-30: scoped to the Licensing & billing panel itself -- the
+    # 2026-09-30: scoped to the Plan & billing panel itself -- the
     # Friends & Family panel that follows it describes the discount on
     # "analytics and Talk Down" in general, not a purchase.
     body = body.split('id="customer-subscription-review"', 1)[-1].split('id="friends-family-panel"', 1)[0]
     # Labels come from customer_analytics_panel.ANALYTIC_LABELS, in key order.
-    assert "Analytics: LPR, People Counting, Smart Motion</p>" in body
+    assert "Analytics: License Plates, People Counting, Smart Motion</p>" in body
     # Unpurchased analytics must not appear as if they were enabled.
     assert "Talk Down" not in body
-    assert "PPE Detection" not in body
+    assert "PPE" not in body
     assert "Facial Recognition" not in body
 
 
@@ -214,7 +214,7 @@ def test_review_reports_no_purchases_yet_without_manufacturing_defaults(http_cli
     response = _setup_page(http_client)
     body = response.text
     assert "No hardware purchased yet" in body
-    assert "No camera-slot plan purchased yet" in body
+    assert "No camera plan purchased yet" in body
     assert "None purchased" in body
 
 
@@ -243,7 +243,7 @@ def test_a_billing_v2_customer_sees_the_per_camera_plan_and_no_purchase_prompt(h
     body = _setup_page(http_client).text
     assert "Camera plan: AI Local &middot; 6 licensed cameras" in body
     assert '<div id="camera-plan-purchase" hidden>' in body
-    assert "No camera-slot plan purchased yet" not in body
+    assert "No camera plan purchased yet" not in body
 
 
 # ------------------------------------------------ Step 5: placeholder camera
@@ -256,7 +256,7 @@ def test_placeholder_camera_is_labeled_not_a_discovered_device(http_client, db_p
     _seed_placeholder_camera(conn, "ph-1", name="Camera 1")
     response = _setup_page(http_client)
     body = response.text
-    assert "Licensed slot" in body
+    assert "Camera not yet discovered" in body
     assert "not yet discovered" in body
 
 
@@ -272,7 +272,7 @@ def test_offline_uninstalled_appliance_with_only_placeholders_does_not_look_disc
     response = _setup_page(http_client)
     body = response.text
     assert "pending_installation" not in body  # the raw status string is no longer shown for a placeholder
-    assert "Licensed slot" in body
+    assert "Camera not yet discovered" in body
 
 
 # ------------------------------------ retention configuration never touches billing

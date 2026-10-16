@@ -42,4 +42,4 @@ def test_without_face_access_the_phone_bar_stays_as_it_was(http_client, db_path)
 def test_the_account_hub_links_facial_recognition(http_client, db_path):
     _seed(db_path, face_access=False)
     html = http_client.get("/customer-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
-    assert 'href="/aac/people"><div><strong>Facial Recognition</strong>' in html
+    assert 'href="/aac/people"><div><strong>Facial recognition</strong>' in html

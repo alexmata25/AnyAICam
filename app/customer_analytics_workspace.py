@@ -478,7 +478,8 @@ def render_landing(request: Request, cameras: list[dict], page_shell: Callable) 
                   f'<span class="aw-meta">{escape(SMART_RULES_DESCRIPTION)}</span><span class="aw-rules-action">Choose a camera &rsaquo;</span></a>')
     content = (PAGE_CSS + '<header class="topbar"><div><p class="eyebrow">Reports</p><h1>Analytics</h1></div>'
                '<a class="ghost-button" href="/investigate">Search evidence</a></header>' + body
-               + f'<h2 class="aw-section">Set up</h2><div class="aw-landing">{rules_tile}</div>')
+               + f'<h2 class="aw-section">Set up</h2><div class="aw-landing">{rules_tile}</div>'
+               + '<p class="health-detail"><a href="/analytics-control-center">Turn analytics on or off for each camera</a></p>')
     return page_shell("Analytics", "analytics", versioned(content))
 
 

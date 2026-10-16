@@ -86,7 +86,7 @@ def test_setup_page_renders_device_key_for_every_candidate(http_client, db_path)
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     body = response.text
-    assert "'Device key: '" in body
+    assert "'Camera ID: '" in body
     assert "el('code',{textContent:String(x.device_key||'none')})" in body
 
 

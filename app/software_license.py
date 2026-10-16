@@ -203,7 +203,7 @@ def customer_contract(customer_id: str, *, role: str = "customer_owner") -> dict
     downloads = software_releases.offered_downloads() if role == "customer_owner" and summary["cameras"] > 0 else []
     return {
         "account": {"customer_id": customer_id, "name": customer.get("name") or ""},
-        "license": {key: summary[key] for key in ("kind", "cameras", "status", "label")},
+        "license": {key: summary[key] for key in ("kind", "cameras", "status", "label", "usable_cameras")},
         "appliances": [{key: value for key, value in item.items() if key != "platform"} for item in appliances],
         "downloads": downloads,
         "notes": {"installer_older_than_installed": installer_older_than_installed(downloads, appliances)},

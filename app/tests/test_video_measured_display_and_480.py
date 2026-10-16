@@ -162,11 +162,11 @@ def test_customer_live_tiles_and_camera_page_show_measured_video(client, db_path
     _activate(db_path, "appl-ryzen")
     cookie = {"anyaicam_partner_session": _owner_cookie()}
     page = client.get("/customer-live", params={"appliance_id": "appl-ryzen"}, cookies=cookie).text
-    assert '<small class="tile-video">Not yet measured</small>' in page            # never the '4mp' label
+    assert 'title="Video: Not yet measured"' in page            # never the '4mp' label (tooltip only, 2026-10-16)
     _measure(db_path, "cam-ryzen-1", measured_width=3840, measured_height=2160, measured_codec="H265", measured_fps=20.0,
              measured_resolution_class="8mp", measured_source="measured")
     page = client.get("/customer-live", params={"appliance_id": "appl-ryzen"}, cookies=cookie).text
-    assert '<small class="tile-video">3840x2160 H265 20 fps (8MP)</small>' in page
+    assert 'title="Video: 3840x2160 H265 20 fps (8MP)"' in page
     single = client.get("/customer/cameras/cam-ryzen-1/live", cookies=cookie)
     assert single.status_code == 200
     assert "Video: 3840x2160 H265 20 fps (8MP)" in single.text

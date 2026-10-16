@@ -1201,7 +1201,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
         f'<div id="live-analytics-panel" class="health-list"></div>'
         f'</section>'
     )
-    scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
+    scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraId={json.dumps(camera_id)};
   const isOwner={json.dumps(identity.get('role') == 'customer_owner')};
@@ -1416,7 +1416,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
       link.download=`snapshot-${{Date.now()}}.png`;
       document.body.appendChild(link);link.click();link.remove();
     }}catch(e){{
-      comingSoon('Snapshot is not available for this stream right now');
+      showToast('Snapshot is not available for this stream right now.');
     }}
   }});
   // Frame fullscreen where the browser supports it; iPhone Safari only
@@ -1698,13 +1698,13 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
       const response=await fetch(`/api/customer/cameras/${{cameraId}}/status`);
       if(response.ok){{
         const {{state,message}}=await response.json();
-        if(state==='not_configured'){{setStatus(message||'Not configured');placeholder.hidden=false;return}}
-        if(state==='appliance_offline'){{setStatus(message||'Appliance offline');placeholder.hidden=false;return}}
+        if(state==='not_configured'){{setStatus(message||'Camera not set up yet');placeholder.hidden=false;return}}
+        if(state==='appliance_offline'){{setStatus(message||'Your AnyAiCam appliance is offline');placeholder.hidden=false;return}}
         // 'degraded' is a health warning (e.g. low disk), not an outage --
         // the appliance is still heartbeating and relaying, so live view
         // proceeds normally; the warning is only surfaced as a transient
         // status line, never blocking startSession() below.
-        if(state==='degraded'){{setStatus(message||'Appliance health warning -- starting live view…')}}
+        if(state==='degraded'){{setStatus(message||'Connecting… your system reported a warning')}}
       }}
     }}catch(e){{}}
     startSession();
@@ -1826,7 +1826,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                   <span class="signal">◉</span>
                   <strong id="live-grid-status-{escape(camera['id'], quote=True)}">{'Camera offline' if offline else 'Starting live view…'}</strong>
                 </div>
-                <div class="tile-name-overlay" title="Video: {escape(video_profile.display_video(camera), quote=True)}">{escape(_camera_display_label(camera))}<small class="tile-video">{escape(video_profile.display_video(camera))}</small></div>
+                <div class="tile-name-overlay" title="Video: {escape(video_profile.display_video(camera), quote=True)}">{escape(_camera_display_label(camera))}</div>
                 <div class="tile-controls-overlay">
                   {f'''<button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
                     data-camera-id="{escape(camera['id'], quote=True)}"
@@ -1854,11 +1854,15 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         # exactly as before (no heading, no visual change).
         distinct_appliance_ids = list(dict.fromkeys(c['appliance_id'] for c in cameras)) if not appliance_id else []
         if len(distinct_appliance_ids) > 1:
+            # Customer-facing heading is a friendly "AnyAiCam appliance N";
+            # the cloud_id stays visible as secondary text so support can
+            # still tell the groups apart.
             tiles = ''.join(
                 f'<div class="live-grid-appliance-heading" style="grid-column:1/-1;font-weight:600;margin-top:14px">'
-                f'{escape(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid) or "Appliance")}</div>'
+                f'AnyAiCam appliance {index}'
+                f' <small style="font-weight:400;opacity:.7">{escape(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid) or "")}</small></div>'
                 + ''.join(_tile(c) for c in cameras if c['appliance_id'] == aid)
-                for aid in distinct_appliance_ids
+                for index, aid in enumerate(distinct_appliance_ids, start=1)
             )
         else:
             tiles = ''.join(_tile(camera) for camera in cameras)
@@ -1919,7 +1923,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<section class="live-grid">{tiles}</section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
 

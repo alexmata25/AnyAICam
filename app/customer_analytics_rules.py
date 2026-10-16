@@ -431,7 +431,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         </section>
         '''
 
-        scripts = ('<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>(function(){'
+        scripts = ('<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3"></script><script>(function(){'
                    'const cameraId=' + json.dumps(camera_id) + ';'
                    'const canEdit=' + json.dumps(can_edit) + ';'
                    'const startUrl=' + json.dumps(start_url) + ';'

@@ -163,9 +163,11 @@ def _finish_enrollment(config:AgentConfig,activated:dict,ask_discovery:bool=True
         answer='n'
         print('\nSkipping camera discovery here; cameras can be added from the AnyAiCam portal.')
     if answer.strip().lower()!='n':
-        cameras=scan(config.discovery_networks); config.cameras_file.parent.mkdir(parents=True,exist_ok=True); config.cameras_file.write_text(json.dumps(cameras,indent=2),encoding='utf-8'); print(f'Discovered {len(cameras)} compatible endpoints.')
+        cameras=scan(config.discovery_networks); config.cameras_file.parent.mkdir(parents=True,exist_ok=True); config.cameras_file.write_text(json.dumps(cameras,indent=2),encoding='utf-8'); print(f"Found {len(cameras)} camera{'s' if len(cameras)!=1 else ''}.")
     print('Configuration saved securely.')
-    print('AnyAiCam service restarted and authenticated during identity commit.')
+    # Accurate whether the agent restart was queued, skipped (Windows) or could
+    # not be queued: the running service picks up the new credential on its own.
+    print('AnyAiCam is linked. The service will reconnect within a minute.')
 
 
 def interactive_main():
@@ -173,7 +175,7 @@ def interactive_main():
     config=AgentConfig.load(); config.portal_url=input(f'Portal URL [{config.portal_url}]: ').strip() or config.portal_url; config.mode=input(f'Mode (development/production) [{config.mode}]: ').strip() or config.mode
     cloud_id,token=qr_payload(); config.cloud_id=cloud_id.upper()
     client=PortalClient(config.portal_url)
-    try: info=client.test(); print('Portal connectivity: OK',info.get('mode'))
+    try: client.test(); print('Connected to AnyAiCam.')
     except PortalError as error: raise SystemExit(f'Portal connectivity failed: {error}')
     try:
         provisional_identity={}
@@ -184,7 +186,7 @@ def interactive_main():
         activated=client.activate(config.cloud_id,token,
                                   provisional_appliance_id=provisional_identity.get('appliance_id'))
     except PortalError as error: raise SystemExit(f'Activation failed: {error}')
-    print('Assigned customer:',activated.get('customer_id')); print('Assigned site:',activated.get('site_id'))
+    print('Linked to your AnyAiCam account.')
     _finish_enrollment(config,activated)
 
 
@@ -403,12 +405,12 @@ def claim_main(args=()):
     config=AgentConfig.load(); _apply_portal_options(config,list(args))
     device_id=_installer_device_id(config)
     client=PortalClient(config.portal_url)
-    try: info=client.test(); print('Portal connectivity: OK',info.get('mode'))
+    try: client.test(); print('Connected to AnyAiCam.')
     except PortalError as error: raise SystemExit(f'Portal connectivity failed: {error}')
     state=_open_or_resume_claim(client,config,device_id)
     _wait_for_claim_proof(client,config,state)
     activated=_complete_claim_with_retry(client,config,state)
-    print('Assigned customer:',activated.get('customer_id')); print('Assigned site:',activated.get('site_id'))
+    print('Linked to your AnyAiCam account.')
     _finish_enrollment(config,activated)
     # Only cleared here, after local enrollment has actually succeeded --
     # never right after claim_complete() returns. claim_state.json is the

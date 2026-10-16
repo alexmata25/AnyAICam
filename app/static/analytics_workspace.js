@@ -53,7 +53,7 @@
     if(key==='people_counting'){
       return [d.direction==='in'?'Entry':d.direction==='out'?'Exit':'Count',d.direction==='in'?'good':'',d.direction==='in'?'Person entered':d.direction==='out'?'Person left':'People count',[]];
     }
-    if(key==='lpr')return ['LPR','',d.plate?`Plate ${d.plate}`:'License plate read',[d.plate?null:'Plate not recorded',e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
+    if(key==='lpr')return ['Plate','',d.plate?`Plate ${d.plate}`:'License plate read',[d.plate?null:'Plate not recorded',e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
     if(key==='ppe'){
       const part=(n,v)=>v==null?null:`${n} ${v?'✓':'✗ missing'}`;
       return [d.status==='violation'?'Violation':d.status==='compliant'?'Compliant':'PPE',d.status==='violation'?'bad':d.status==='compliant'?'good':'',
@@ -191,7 +191,7 @@
       if(append){results.insertAdjacentHTML('beforeend',html);inline.reattach(results)}
       else results.innerHTML=(LPR?LPR_HEAD:'')+(html||`<div class="aw-empty">${esc(emptyText())}</div>`);
       state.before=body.next_before;more.hidden=!body.next_before;
-    }catch(error){if(!append)results.innerHTML=(LPR?LPR_HEAD:'')+`<div class="aw-empty">${esc(error.message)}</div>`}
+    }catch(error){if(!append)results.innerHTML=(LPR?LPR_HEAD:'')+`<div class="aw-empty">${esc(error instanceof TypeError?'Analytics could not be loaded. Check your connection and try again.':error.message)}</div>`}
     finally{state.loading=false}
   }
   // License Plates keep themselves current (2026-10-06): while the page is

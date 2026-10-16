@@ -152,7 +152,7 @@ def test_owner_case_contract_shape_appliance_included_never_stand_alone(license_
     body = response.json()
     assert set(body) == CONTRACT_KEYS
     assert body["account"] == {"customer_id": "cust-1", "name": "Real Customer"}
-    assert set(body["license"]) == {"kind", "cameras", "status", "label"}
+    assert set(body["license"]) == {"kind", "cameras", "status", "label", "usable_cameras"}  # usable_cameras: 2026-10-16, compatible addition
     assert body["license"]["kind"] == "appliance_included" and body["license"]["cameras"] == 8
     assert body["license"]["status"] == "active"
     assert "stand-alone" not in body["license"]["label"].lower() and "appliance" in body["license"]["label"]
@@ -220,7 +220,8 @@ def test_per_camera_plan_also_mentions_an_owned_one_time_license(license_portal,
     import customer_entitlements as ce
     summary = ce.vms_license_summary("cust-1")
     assert summary["kind"] == "per_camera_plan" and summary["cameras"] == 6 == ce.capacity_breakdown("cust-1")["vms_license_capacity"]
-    assert "stand-alone" in summary["label"]  # a vms_license row exists
+    # a vms_license row exists: the label names the license size and what the plan covers (2026-10-16 wording)
+    assert summary["label"] == "One-time AnyAiCam VMS software license (up to 8 cameras) · your plan covers 6 cameras"
 
 
 def test_appliance_snapshot_signs_the_same_number(license_portal, db_path):

@@ -16,7 +16,7 @@ def test_customer_mobile_bar_has_investigate(client):
     labels = re.findall(r'href="([^"]+)">([^<]+)</a>', bar)
     assert ("/investigate", "Investigate") in labels
     order = [label for _, label in labels]
-    assert order.index("Playback") < order.index("Investigate") < order.index("Account")
+    assert order.index("Events") < order.index("Investigate") < order.index("Account")
 
 
 def test_investigate_page_marks_its_tab_active(client):
@@ -30,7 +30,7 @@ def test_investigate_page_marks_its_tab_active(client):
 def test_customer_mobile_bar_and_sidebar_have_security(client):
     html = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
     labels = [label for _, label in re.findall(r'href="([^"]+)">([^<]+)</a>', _mobile_bar(html))]
-    assert labels[:3] == ["Cameras", "Security", "Alerts"]
+    assert labels[:4] == ["Dashboard", "Live", "Events", "Smart alerts"] and "Security" in labels
     assert re.search(r'href="/customer-security"><span class="nav-icon">[^<]*</span><span>Security</span>', html)
 
 

@@ -240,5 +240,6 @@ def test_both_event_count_pills_carry_the_class_and_data_count_client_side_recon
     conn.close()
 
     response = http_client.get("/events", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
-    assert response.text.count('class="pill event-count-pill" data-count="2"') == 1
-    assert response.text.count('class="health-detail event-count-pill" data-count="2"') == 1
+    # 2026-10-16: the count is shown once (panel head), correctly pluralised.
+    assert 'class="pill event-count-pill"' not in response.text
+    assert response.text.count('class="health-detail event-count-pill" data-count="2">2 events<') == 1

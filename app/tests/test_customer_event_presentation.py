@@ -28,7 +28,7 @@ def test_events_table_uses_labels_and_real_confidence():
     assert "_event_confidence_percent(_customer_real_confidence(" in source
     assert main._event_confidence_percent(main._customer_real_confidence("motion", 17.1)) == "—"
     assert main._event_confidence_percent(main._customer_real_confidence("ppe", 0.0)) == "—"
-    assert main._event_confidence_percent(main._customer_real_confidence("person", 0.539)) == "53.9%"
+    assert main._event_confidence_percent(main._customer_real_confidence("person", 0.539)) == "54%"
 
 
 def test_investigate_client_shape_is_customer_ready(monkeypatch):

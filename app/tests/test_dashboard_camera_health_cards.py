@@ -38,7 +38,7 @@ def test_card_shows_health_and_activity_not_a_live_tile(http_client, db_path):
     card = _card(html, 1)
     assert "Front Door" in card
     assert "Recording</dt>" in card and ">Event<" in card
-    assert "Smart Motion, LPR" in card
+    assert "Smart Motion, License Plates" in card
     assert "Last event</dt>" in card and "Person" in card and 'data-at="2026-09-28T11:30:00"' in card  # the newest event
     assert ">Snapshot<" in card  # the image is labelled as a snapshot
     for live_tile_text in ("Live preview will appear", "dashboard-live-badge", ">LIVE<", "Connecting to"):
@@ -80,7 +80,7 @@ def test_status_poll_drives_online_recording_and_attention_without_new_polling()
     text = open(page, encoding="utf-8").read()
     assert "DASHBOARD_SNAPSHOT_REFRESH_MS=60000" in text  # was 20 s per camera
     assert "state.textContent=camera.online?'Online':'Offline'" in text
-    assert "Recording problem: ${camera.recording}" in text
+    assert "Recording problem. Check the camera and its storage." in text
     assert 'id="dashboard-attention"' in text and "All cameras healthy" in text
     assert "document.querySelectorAll('[data-dashboard-camera]')" in text
 

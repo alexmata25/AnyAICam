@@ -142,27 +142,40 @@ def license_panel(contract: dict) -> str:
     # "pending" (Red, 2026-10-15): a paid appliance order whose license activates when the appliance is set up.
     status = {"active": "Active", "suspended": "Paused (billing problem)", "pending": "Starts when your appliance is set up",
               "none": "—"}.get(license_["status"], escape(str(license_["status"])))
-    if license_["cameras"]:
-        cameras = f'Up to {int(license_["cameras"])} camera{"" if int(license_["cameras"]) == 1 else "s"}'
+    runnable = int(license_["usable_cameras"]) if "usable_cameras" in license_ else int(license_["cameras"] or 0)
+    if runnable:
+        cameras = f'Up to {runnable} camera{"" if runnable == 1 else "s"}'
+    elif license_["cameras"] and license_["status"] == "active":
+        cameras = "None yet: choose a camera plan in My subscription"
     else:
         cameras = "Set when your appliance is set up" if license_["status"] == "pending" else "—"
-    body = (_row("License type", escape(license_["label"]), "sl-type") + _row("Licensed cameras", cameras, "sl-cameras")
+    # The row counts the cameras the account can run now (the plan), which is not the size of a one-time license an
+    # own-PC buyer also holds; the License type line names both (2026-10-16, Green's activation review).
+    body = (_row("License type", escape(license_["label"]), "sl-type") + _row("Cameras you can run now", cameras, "sl-cameras")
             + _row("Status", status, "sl-status") + _row("Account", escape(contract["account"].get("name") or "Your AnyAiCam account"), "sl-account"))
     note = ('<p class="health-detail">Your license belongs to your AnyAiCam account. It stays the same when you reinstall '
             'or update the software.</p>' if license_["kind"] != "none" else
             '<p class="health-detail">A VMS software license is included with every AnyAiCam appliance and per-camera plan.</p>')
-    return f'<section class="panel" style="margin-top:14px" id="sl-license"><h2>My Software License</h2>{body}{note}</section>'
+    return f'<section class="panel" style="margin-top:14px" id="sl-license"><h2>My software license</h2>{body}{note}</section>'
+
+
+def _appliance_title(item: dict, index: int, total: int) -> str:
+    """Friendly appliance name; the raw Cloud ID is shown only as secondary text."""
+    name = str(item.get("name") or "").strip()
+    if name and name != item.get("cloud_id"):
+        return name
+    return f"AnyAiCam appliance {index}" if total > 1 else "AnyAiCam appliance"
 
 
 def appliances_panel(contract: dict) -> str:
     items = contract.get("appliances") or []
     if not items:
-        return ('<section class="panel" style="margin-top:14px" id="sl-appliances"><h2>My Registered Appliances</h2>'
+        return ('<section class="panel" style="margin-top:14px" id="sl-appliances"><h2>My registered appliances</h2>'
                 '<p class="health-detail" id="sl-no-appliances">No appliances are registered to this account yet. When your AnyAiCam '
                 'appliance arrives, or after you install AnyAiCam on your own PC, link it on <a href="/customer/claim-appliance">'
                 'Claim an appliance</a>.</p></section>')
     rows_html = ""
-    for item in items:
+    for index, item in enumerate(items, start=1):
         connection = {"online": "Online", "offline": f"Offline · last seen {_ago(item.get('last_check_in'))}".rstrip(" ·"),
                       "never": "Not connected yet"}[item["connection"]]
         version = item.get("installed_version")
@@ -177,9 +190,10 @@ def appliances_panel(contract: dict) -> str:
             version_text = (f"Last reported VMS {escape(version)} ({age})" if stale else f"VMS {escape(version)} · reported {age}")
         registration = {"activated": "Activated", "claimed_pending": "Waiting to finish activation", "deactivated": "Deactivated"}[item["registration"]]
         rows_html += (f'<div class="sl-appliance" data-cloud-id="{escape(item["cloud_id"], quote=True)}">'
-                      f'<h3 style="margin:10px 0 4px">{escape(item["name"])} <span class="health-detail">({escape(item["cloud_id"])})</span></h3>'
+                      f'<h3 style="margin:10px 0 4px">{escape(_appliance_title(item, index, len(items)))}'
+                      f'<br><small class="health-detail" style="font-weight:400">Cloud ID {escape(item["cloud_id"])}</small></h3>'
                       + _row("Connection", connection) + _row("Installed version", version_text) + _row("Registration", registration) + "</div>")
-    return f'<section class="panel" style="margin-top:14px" id="sl-appliances"><h2>My Registered Appliances</h2>{rows_html}</section>'
+    return f'<section class="panel" style="margin-top:14px" id="sl-appliances"><h2>My registered appliances</h2>{rows_html}</section>'
 
 
 def downloads_panel(contract: dict, *, steps_html=None) -> str:
@@ -189,7 +203,7 @@ def downloads_panel(contract: dict, *, steps_html=None) -> str:
                 'already installed and running.</strong> Software updates are installed only when you choose to install them. '
                 'Download the installer only to set up a new PC, or if AnyAiCam support asks you to reinstall.</p>')
     if not downloads:
-        return (f'<section class="panel" style="margin-top:14px" id="sl-downloads"><h2>Software Downloads</h2>{reminder}'
+        return (f'<section class="panel" style="margin-top:14px" id="sl-downloads"><h2>Software downloads</h2>{reminder}'
                 '<p class="health-detail" id="sl-no-installer">The installer download will appear here when an approved release is available.</p></section>')
     cards = ""
     for item in downloads:
@@ -213,7 +227,7 @@ def downloads_panel(contract: dict, *, steps_html=None) -> str:
                   f'<code style="word-break:break-all">{escape(item["sha256"])}</code></p>{steps}</details></div>')
     lead = reminder if running else ('<p class="health-detail">Install AnyAiCam on your PC, then link it to this account on '
                                      '<a href="/customer/claim-appliance">Claim an appliance</a>.</p>' + reminder)
-    return f'<section class="panel" style="margin-top:14px" id="sl-downloads"><h2>Software Downloads</h2>{lead}{cards}</section>'
+    return f'<section class="panel" style="margin-top:14px" id="sl-downloads"><h2>Software downloads</h2>{lead}{cards}</section>'
 
 
 def panels_html(customer_id: str, *, is_owner: bool, payload: dict | None, mode: str | None) -> str:

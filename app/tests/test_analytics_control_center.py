@@ -139,14 +139,14 @@ def test_control_center_page_exposes_eight_controls_and_guardian_is_hard_off(cli
     response = _call(client, "GET", "/analytics-control-center", cookies=_cookie())
     assert response.status_code == 200
     assert "Analytics Control Center" in response.text
-    assert "Turn All OFF" in response.text
-    assert "Turn OFF all eight analytics for this camera?" in response.text
+    assert "Turn all off" in response.text
+    assert "Turn off all your analytics for this camera?" in response.text
     assert "playback continue" in response.text.lower()
-    assert "Master state: OFF" in response.text
-    assert "No Guardian workers are contacted" in response.text
+    # Guardian: customer wording (2026-10-16), still hard-off with no enable path.
+    assert "Not available yet. AAC Guardian is a separate product in development and is not part of this system." in response.text
     assert 'id="guardian-master"' not in response.text
-    assert 'disabled aria-disabled="true"' in response.text
-    assert "Capabilities available from an approved runtime manifest: 0" in response.text
+    assert 'disabled aria-disabled="true">Not available</button>' in response.text
+    assert "Enable Guardian" not in response.text
     body = _call(client, "GET", "/api/customer/analytics-control/cameras/cam-1", cookies=_cookie()).json()
     assert [item["key"] for item in body["analytics"]] == list(acc.ANALYTICS)
 

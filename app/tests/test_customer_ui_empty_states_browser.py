@@ -60,7 +60,7 @@ def _signed_in_page(browser, origin, viewport):
     page.fill("#password", PASSWORD)
     page.press("#password", "Enter")
     page.wait_for_url(lambda url: "customer-login" not in url, timeout=15000)
-    page.route("https://cdn.jsdelivr.net/npm/hls.js@latest", lambda route: route.fulfill(body=HLS_STUB, content_type="application/javascript"))
+    page.route("https://cdn.jsdelivr.net/npm/hls.js@*", lambda route: route.fulfill(body=HLS_STUB, content_type="application/javascript"))
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     return page, errors
