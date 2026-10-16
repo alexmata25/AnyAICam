@@ -419,3 +419,65 @@ def test_a_guest_without_an_account_still_gets_the_shipping_email(hw, db_path):
         assert purchase_notifications.notify_hardware_shipped(order_id)["status"] == "sent"
     shipped = [m for m in hw["sent"] if m["type"] == "hardware_shipped"]
     assert len(shipped) == 1 and shipped[0]["to"] == "buyer@example.test"
+
+
+# ------------------------------------------------------------ 1.2.7 journey review (2026-10-15): My subscription while hardware is pending
+
+def _hardware_owner_with_paid_order(hw, db_path, email="pending@example.test"):
+    _buy(hw, email=email)
+    _record(db_path, _paid_event(hw, "cs_test_hw000001", email=email))
+    _signup_and_verify(hw, email, next_path="/customer/orders")
+    assert _signed_in(_login(hw["client"], email, customer_only=True))
+    return _one(db_path, "SELECT id FROM customers WHERE email=?", (email,))["id"]
+
+
+def test_my_subscription_says_no_plan_is_needed_while_the_hardware_is_on_its_way(hw, db_path):
+    _hardware_owner_with_paid_order(hw, db_path)
+    html = hw["client"].get("/subscription-portal").text
+    assert "You don&#x27;t need to choose or pay for a camera plan until your equipment arrives" in html \
+        or "You don't need to choose or pay for a camera plan until your equipment arrives" in html
+    assert 'href="/customer/orders"' in html
+    # Starting early stays possible but is folded away and says when billing starts.
+    assert '<details id="v2-checkout-early"><summary>Start my camera plan now' in html and "billing starts when you complete checkout" in html
+    assert "<h2>Choose a per-camera plan</h2>" not in html
+    assert "scrollIntoView({block:'start'})" not in html  # no jump to the picker
+
+
+def test_the_plan_picker_is_prefilled_from_the_hardware_order(hw, db_path):
+    _hardware_owner_with_paid_order(hw, db_path, "prefill@example.test")
+    html = hw["client"].get("/subscription-portal").text
+    assert '<option value="hybrid" selected>' in html and 'id="v2-quantity" type="number" min="1" max="64" value="8"' in html
+    assert "Selected in Build Your System: Hybrid · 8 cameras" in html
+
+
+def test_after_delivery_the_normal_plan_picker_returns(hw, db_path):
+    _hardware_owner_with_paid_order(hw, db_path, "arrived@example.test")
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE hardware_orders SET fulfillment_status='delivered' WHERE sku LIKE 'AIC-APPLIANCE-%'")
+    conn.commit()
+    conn.close()
+    html = hw["client"].get("/subscription-portal").text
+    assert "<h2>Choose a per-camera plan</h2>" in html and 'id="v2-checkout-early"' not in html
+    assert "until your equipment arrives" not in html
+    assert '<option value="hybrid" selected>' in html
+
+
+def test_the_prefill_never_overrides_the_customers_own_choice(hw, db_path):
+    _hardware_owner_with_paid_order(hw, db_path, "ownchoice@example.test")
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE hardware_orders SET fulfillment_status='delivered' WHERE sku LIKE 'AIC-APPLIANCE-%'")
+    conn.commit()
+    conn.close()
+    assert '<option value="hybrid" selected>' in hw["client"].get("/subscription-portal").text  # pre-filled from the order
+    response = hw["client"].post("/api/v2/customer/subscription/checkout", json={"plan_key": "ai_local", "camera_quantity": 2})
+    assert response.status_code == 200, response.text
+    fields = [f for f in hw["captured"] if f.get("mode") == "subscription"][-1]
+    assert (fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == ("price_srv_ai", "2")  # what the customer chose
+
+
+def test_own_pc_customers_are_told_appliance_or_pc(db_path, monkeypatch):
+    from test_per_camera_billing_v2 import _v2_page
+    billing = _v2_page(db_path, monkeypatch, quantity=6)
+    html = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
+    assert 'id="v2-setup-next"' in html  # active plan, nothing set up yet
+    assert "Connect your AnyAiCam appliance or PC and add your cameras" in html

@@ -291,6 +291,30 @@ def existing_plan(customer_id: str, *, lookup: bool = False) -> dict | None:
     return None
 
 
+def hardware_awaiting_delivery(customer_id: str) -> bool:
+    """A paid AnyAiCam appliance order that has not been delivered yet (hardware-first, 2026-10-15)."""
+    return bool(row("SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' AND status='paid' "
+                    "AND COALESCE(fulfillment_status,'paid') NOT IN ('delivered','cancelled') LIMIT 1", (customer_id,)))
+
+
+def hardware_plan_intent(customer_id: str) -> dict:
+    """The plan and camera count chosen in Build Your System with the latest paid hardware order
+    (kept on hardware_checkouts as intent only; never charged with the hardware)."""
+    try:
+        found = row("SELECT intended_plan,intended_cameras FROM hardware_checkouts WHERE customer_id=? AND status='paid' "
+                    "ORDER BY paid_at DESC LIMIT 1", (customer_id,))
+    except Exception:  # database before the hardware_checkouts migration
+        return {}
+    if not found:
+        return {}
+    intent = {}
+    if found.get("intended_plan") in PLANS:
+        intent["plan"] = found["intended_plan"]
+    if found.get("intended_cameras") and MIN_CAMERA_QUANTITY <= int(found["intended_cameras"]) <= MAX_CAMERA_QUANTITY:
+        intent["cameras"] = int(found["intended_cameras"])
+    return intent
+
+
 def has_camera_plan(customer_id: str, *, lookup: bool = False) -> bool:
     """An active (or suspended) camera plan, per-camera or legacy (existing_plan)."""
     plan = existing_plan(customer_id, lookup=lookup)
@@ -933,7 +957,13 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         actions.append('<button class="ghost-button" id="manage-billing-button">Manage billing</button>')
     action_html = f'<div class="plan-actions">{"".join(actions)}</div><p id="v2-message" class="health-detail" role="status"></p>' if actions else '<p id="v2-message" class="health-detail" role="status"></p>'
     picker = ""
-    selection = selection or {}
+    selection_requested = bool(selection)
+    selection = selection or ({} if payload else hardware_plan_intent(customer_id))
+    # Hardware-first (2026-10-15): while the appliance is on its way, a camera plan is not needed yet.
+    awaiting = bool(not payload and not legacy and not deferred and hardware_awaiting_delivery(customer_id))
+    if awaiting:
+        plan_summary = ("Your AnyAiCam system has been ordered. You don't need to choose or pay for a camera plan until your "
+                        'equipment arrives. Follow your order on <a href="/customer/orders">My orders</a>.')
     selected_plan = selection.get("plan")
     selected_quantity = selection.get("cameras")
     selection_note = ""
@@ -957,11 +987,16 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         if payment_outcome == "cancelled":
             selection_note += '<p class="health-detail" id="v2-checkout-cancelled">Checkout was cancelled. No payment was taken.</p>'
         options = "".join(f'<option value="{key}"{" selected" if key == selected_plan else ""}>{escape(plan["display_name"])} · ${plan["monthly_cents_per_camera"] / 100:.2f} per camera/month</option>' for key, plan in PLANS.items())
-        picker = ('<section class="panel" id="v2-checkout"><h2>Choose a per-camera plan</h2>' + selection_note +
-                  '<label>Plan <select id="v2-plan-key">' + options + '</select></label> '
-                  f'<label>Cameras <input id="v2-quantity" type="number" min="1" max="64" value="{selected_quantity or 1}"></label> '
-                  '<p id="v2-total" class="health-detail"></p><button class="action-button" id="v2-checkout-button">Continue to secure checkout</button>'
-                  '<p id="v2-checkout-message" class="health-detail" role="alert" aria-live="assertive"></p></section>')
+        form = (selection_note +
+                '<label>Plan <select id="v2-plan-key">' + options + '</select></label> '
+                f'<label>Cameras <input id="v2-quantity" type="number" min="1" max="64" value="{selected_quantity or 1}"></label> '
+                '<p id="v2-total" class="health-detail"></p><button class="action-button" id="v2-checkout-button">Continue to secure checkout</button>'
+                '<p id="v2-checkout-message" class="health-detail" role="alert" aria-live="assertive"></p>')
+        if awaiting:  # still possible, but clearly optional and folded away until the equipment arrives
+            picker = ('<section class="panel" id="v2-checkout"><details id="v2-checkout-early"><summary>Start my camera plan now '
+                      '(optional &mdash; billing starts when you complete checkout)</summary>' + form + '</details></section>')
+        else:
+            picker = '<section class="panel" id="v2-checkout"><h2>Choose a per-camera plan</h2>' + form + '</section>'
     change = ""
     if is_owner and payload and is_active:
         change_plan = selected_plan or plan_key
@@ -982,9 +1017,9 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         # Purchase comes first, then setup (2026-10-05): once the plan is
         # active and no appliance is activated yet, setup is the next step.
         setup_next = ('<section class="panel" id="v2-setup-next"><h2>Payment complete — Set up your AnyAiCam system</h2>'
-                      '<p class="health-detail">Your plan is active. Connect your AnyAiCam appliance and add your cameras to start recording.</p>'
+                      '<p class="health-detail">Your plan is active. Connect your AnyAiCam appliance or PC and add your cameras to start recording.</p>'
                       '<a class="action-button" href="/customer/setup">Continue to setup</a></section>')
-    if selection and (picker or change):
+    if selection_requested and (picker or change) and not awaiting:
         scripts_focus = "const v2Focus=document.getElementById('v2-checkout')||document.getElementById('v2-change');if(v2Focus)v2Focus.scrollIntoView({block:'start'});"
     else:
         scripts_focus = ""
