@@ -420,7 +420,7 @@ def vms_license_summary(customer_id: str) -> dict:
     # The licensed camera count is returned separately ("cameras") and shown on its
     # own row by the Software License panel, so active labels don't repeat it.
     labels = {
-        ("per_camera_plan", "active"): "VMS software license included with your per-camera plan",
+        ("per_camera_plan", "active"): "VMS software license included with your plan",
         ("one_time_vms_license", "active"): "One-time stand-alone VMS software license (yours to keep)",
         ("appliance_included", "active"): "VMS software license included with your AnyAiCam appliance",
         ("per_camera_plan", "suspended"): "VMS software license for your per-camera plan · suspended until billing is resolved",

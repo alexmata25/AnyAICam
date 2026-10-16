@@ -330,7 +330,13 @@ def download_entry(release: dict) -> dict:
     return {"platform": release["platform"], "version": release["version"], "commit": release["build_commit"],
             "filename": release["filename"], "size_bytes": int(release["size_bytes"]), "sha256": release["sha256"],
             "signed": bool(release.get("signed")), "min_requirements": release.get("min_requirements") or "",
-            "install_flow": release.get("install_flow") or "", "url": f"/api/customer/downloads/{release['platform']}"}
+            "install_flow": release.get("install_flow") or "", "url": download_url(release["platform"])}
+
+
+def download_url(platform: str) -> str:
+    """Linux keeps the long-standing /vms-installer route (the same file as
+    /linux), so existing links and the portal panels stay unchanged."""
+    return "/api/customer/downloads/vms-installer" if platform == "linux" else f"/api/customer/downloads/{platform}"
 
 
 def offered_downloads() -> list[dict]:
