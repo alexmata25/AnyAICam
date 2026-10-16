@@ -54,10 +54,11 @@ jobs:
         env:
           ANYAICAM_RECORDINGS_FOLDER: ${{ runner.temp }}/vms-127-analytics/recordings
           ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-127-analytics/partner.db
+          ANYAICAM_HLS_FOLDER: ${{ runner.temp }}/vms-127-analytics/hls
         shell: bash
         run: |
           set -o pipefail
-          mkdir -p "$ANYAICAM_RECORDINGS_FOLDER" "$(dirname "$ANYAICAM_PARTNER_DB")"
+          mkdir -p "$ANYAICAM_RECORDINGS_FOLDER" "$ANYAICAM_HLS_FOLDER" "$(dirname "$ANYAICAM_PARTNER_DB")"
           pytest -ra --junitxml=analytics-linux.xml \
             app/tests/test_analytics_toggle_revision_probes.py \
             app/tests/test_analytics_control_center.py \
