@@ -179,6 +179,7 @@ def test_owner_case_contract_shape_appliance_included_never_stand_alone(license_
     ("per_camera_suspended", "per_camera_plan", 0, "suspended", False),
     ("legacy_no_order", "legacy_slots", 0, "none", False),
     ("appliance_included", "appliance_included", 8, "active", False),
+    ("appliance_paid_awaiting_delivery", "appliance_included", 0, "pending", False),
     ("one_time_suspended", "one_time_vms_license", 0, "suspended", True),
 ])
 def test_every_license_kind_matches_the_signed_capacity(license_portal, db_path, setup, kind, cameras, status, stand_alone):
@@ -196,6 +197,8 @@ def test_every_license_kind_matches_the_signed_capacity(license_portal, db_path,
         _entitle("cust-1", "camera_slots_hybrid", 8)
     elif setup == "one_time_suspended":
         _entitle("cust-1", "vms_license", 16, status="suspended")
+    elif setup == "appliance_paid_awaiting_delivery":
+        _paid_appliance_order(db_path)  # hardware-first: paid, no camera plan yet
     import customer_entitlements as ce
     summary = ce.vms_license_summary("cust-1")
     assert (summary["kind"], summary["cameras"], summary["status"]) == (kind, cameras, status)
@@ -204,6 +207,10 @@ def test_every_license_kind_matches_the_signed_capacity(license_portal, db_path,
     assert ("stand-alone" in summary["label"].lower()) is stand_alone
     if setup == "legacy_no_order":
         assert "Local" in summary["label"] and "no VMS software license" in summary["label"]
+    if setup == "appliance_paid_awaiting_delivery":
+        # Green's 1.2.7 journey review: a buyer awaiting delivery must not read "no license on record".
+        assert summary["label"] == "VMS software license included with your AnyAiCam appliance (activates when you set up your appliance)"
+        assert "no VMS software license" not in summary["label"]
 
 
 def test_per_camera_plan_also_mentions_an_owned_one_time_license(license_portal, db_path):
