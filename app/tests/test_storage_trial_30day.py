@@ -1,7 +1,8 @@
 """30-day free cloud-storage trial (owner request 2026-10-15).
 
 Administrator-granted, storage plan only, Stripe-native trial (never a 100%
-coupon), expires on its own after 30 days, never charges the customer after
+coupon), 30 days counted from the start of the storage subscription (not
+from the grant), expires on its own after those 30 days, never charges the customer after
 the trial without an explicit paid authorization, one trial per customer
 unless an administrator approves a re-grant. Stripe is a test double here:
 no Stripe API is ever called.
@@ -124,6 +125,20 @@ def _trial_subscription(stripe, trial_id, sub_id="sub_trial", customer_id=CUSTOM
     return sub
 
 
+START = int(datetime(2026, 10, 20, tzinfo=timezone.utc).timestamp())
+
+
+def _start(stripe, db_path, trial_id, sub_id="sub_trial", **extra):
+    """The trial subscription is created: the verified webhook starts the countdown."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    extra.setdefault("cancel_at_period_end", True)
+    sub = _trial_subscription(stripe, trial_id, sub_id=sub_id, trial_start=now, trial_end=now + 30 * 86400, **extra)
+    with override_target(sqlite_path=str(db_path)):
+        _sync(_event("customer.subscription.created", sub))
+    assert _trial(db_path)["status"] == "active"
+    return sub
+
+
 def _event(event_type, obj, **data):
     return {"id": f"evt_{event_type}_{obj.get('id')}", "type": event_type, "data": {"object": obj, **data}}
 
@@ -143,8 +158,9 @@ def _audit(db_path, action):
 
 # ------------------------------------------------------------------ admin control + tracking
 
-def test_only_a_platform_administrator_can_activate_a_trial_and_it_is_recorded(shop, db_path):
+def test_only_a_platform_administrator_can_grant_a_trial_and_it_is_recorded(shop, db_path):
     client, _, _ = shop
+    assert _grant(client, {}).status_code in (401, 303)  # not signed in
     assert _grant(client, _cookie(*OWNER)).status_code == 403
     assert _grant(client, _cookie("company-admin@example.test", "administrator")).status_code == 403  # no global grant
     assert _q(db_path, "SELECT * FROM storage_trials") == []
@@ -152,19 +168,22 @@ def test_only_a_platform_administrator_can_activate_a_trial_and_it_is_recorded(s
     response = _grant(client, admin)
     assert response.status_code == 200, response.text
     trial = _trial(db_path)
-    starts = datetime.fromisoformat(trial["starts_at"])
-    expires = datetime.fromisoformat(trial["expires_at"])
-    assert trial["customer_id"] == CUSTOMER and trial["status"] == "active"
-    assert expires - starts == timedelta(days=30)
-    assert abs((starts - datetime.now(timezone.utc)).total_seconds()) < 60
+    # Reserved, not started: no countdown until the storage subscription exists.
+    assert trial["customer_id"] == CUSTOMER and trial["status"] == "granted"
+    assert trial["starts_at"] == "" and trial["expires_at"] == ""
+    assert response.json()["effective_status"] == "granted"
     assert trial["granted_by"] == "admin@example.test" and trial["reason"] == "Evaluating cloud storage"
     logged = _audit(db_path, "storage_trial.grant")
     assert len(logged) == 1 and logged[0]["actor_email"] == "admin@example.test" and logged[0]["entity_id"] == CUSTOMER
-    assert json.loads(logged[0]["details_json"])["expires_at"] == trial["expires_at"]
+    details = json.loads(logged[0]["details_json"])
+    assert details["status"] == "granted" and details["reason"] == "Evaluating cloud storage" and details["lapses_at"]
     # The admin list and page are administrator-only too.
     assert client.get("/api/admin/storage-trials", cookies=_cookie(*OWNER)).status_code == 403
-    assert client.get("/api/admin/storage-trials", cookies=admin).json()["trials"][0]["effective_status"] == "active"
-    assert client.get("/admin/storage-trials", cookies=admin).status_code == 200
+    assert client.get("/api/admin/storage-trials", cookies={}).status_code in (401, 303)
+    assert client.get("/api/admin/storage-trials", cookies=admin).json()["trials"][0]["effective_status"] == "granted"
+    assert client.get("/admin/storage-trials", cookies=_cookie(*OWNER)).status_code in (403, 303)
+    page = client.get("/admin/storage-trials", cookies=admin)
+    assert page.status_code == 200 and "When storage starts" in page.text
 
 
 def test_a_reason_is_required_and_only_eligible_customers_get_a_trial(shop, db_path):
@@ -183,16 +202,18 @@ def test_a_reason_is_required_and_only_eligible_customers_get_a_trial(shop, db_p
 
 # ------------------------------------------------------------------ Stripe fields, storage only
 
-def test_storage_checkout_carries_a_stripe_trial_capped_at_the_granted_30_days(shop, db_path):
+def test_storage_checkout_carries_a_stripe_trial_of_30_days_from_the_storage_start(shop, db_path):
     client, captured, _ = shop
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
     trial = _trial(db_path)
     response = _checkout(client)
     assert response.status_code == 200, response.text
     fields = captured[-1]
-    expires = int(datetime.fromisoformat(trial["expires_at"]).timestamp())
-    assert fields["subscription_data[trial_end]"] == str(expires)
-    assert expires <= (datetime.now(timezone.utc) + timedelta(days=30, minutes=1)).timestamp()
+    trial_end = int(fields["subscription_data[trial_end]"])
+    assert abs(trial_end - (datetime.now(timezone.utc) + timedelta(days=30)).timestamp()) < 60
+    stored = _trial(db_path)  # provisional end kept; still granted until the subscription exists
+    assert stored["status"] == "granted" and int(datetime.fromisoformat(stored["expires_at"]).timestamp()) == trial_end
+    assert "line_items[0][price_data][unit_amount]" not in fields  # the plan's own price: $0 comes from the trial, not a price
     assert fields["subscription_data[trial_settings][end_behavior][missing_payment_method]"] == "cancel"
     assert fields["payment_method_collection"] == "if_required"
     assert fields["subscription_data[metadata][anyaicam_storage_trial]"] == trial["id"]
@@ -253,8 +274,12 @@ def test_appliance_storage_start_uses_the_trial_with_no_card_attached(shop, db_p
     assert trial_fields["trial_settings[end_behavior][missing_payment_method]"] == "cancel"
     assert trial_fields["cancel_at_period_end"] == "true"  # ends at the trial end unless the customer chooses paid
     assert int(trial_fields["trial_end"]) == int(datetime.fromisoformat(_trial(db_path)["expires_at"]).timestamp())
+    assert abs(int(trial_fields["trial_end"]) - (datetime.now(timezone.utc) + timedelta(days=30)).timestamp()) < 60
     assert "default_payment_method" not in trial_fields
-    assert _trial(db_path)["stripe_subscription_id"] == "sub_new_1"
+    started = _trial(db_path)
+    assert started["stripe_subscription_id"] == "sub_new_1" and started["status"] == "active"  # countdown started now
+    assert abs((datetime.fromisoformat(started["starts_at"]) - datetime.now(timezone.utc)).total_seconds()) < 60
+    assert json.loads(_audit(db_path, "storage_trial.start")[0]["details_json"])["source"] == "server"
     # Without a trial the start is exactly as before: the saved card, no trial.
     assert build_orders.start_storage_plan("cust-2")["status"] == "started"
     normal = dict(stripe["created"][-1])
@@ -270,7 +295,7 @@ def test_a_checkout_trial_subscription_is_set_to_end_at_the_trial_end(shop, db_p
     assert "storage_trials" in [name for name, _ in main._stripe_webhook_steps()]
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
     trial = _trial(db_path)
-    _trial_subscription(stripe, trial["id"])
+    _trial_subscription(stripe, trial["id"], trial_start=START, trial_end=START + 30 * 86400)
     session = {"id": "cs_trial", "subscription": "sub_trial", "metadata": {"anyaicam_storage_trial": trial["id"]}}
     with override_target(sqlite_path=str(db_path)):
         assert _sync(_event("checkout.session.completed", session))["status"] == "guarded"
@@ -279,7 +304,10 @@ def test_a_checkout_trial_subscription_is_set_to_end_at_the_trial_end(shop, db_p
         assert key == "anyaicam-storage-trial-guard-sub_trial"
         assert _sync(_event("customer.subscription.created", stripe["subscriptions"]["sub_trial"]))["status"] == "trialing"
     assert len(stripe["updates"]) == 1  # already guarded: nothing more
-    assert _trial(db_path)["stripe_subscription_id"] == "sub_trial"
+    stored = _trial(db_path)
+    assert stored["stripe_subscription_id"] == "sub_trial" and stored["status"] == "active"
+    assert stored["starts_at"] == "2026-10-20T00:00:00+00:00" and stored["expires_at"] == "2026-11-19T00:00:00+00:00"
+    assert len(_audit(db_path, "storage_trial.start")) == 1
 
 
 def test_unrelated_stripe_events_are_ignored_without_a_stripe_call(shop, db_path):
@@ -296,6 +324,7 @@ def test_the_trial_expires_on_its_own_after_30_days(shop, db_path, monkeypatch):
     client, _, stripe = shop
     import storage_trial
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    _start(stripe, db_path, _trial(db_path)["id"])
     trial = _trial(db_path)
     expires = datetime.fromisoformat(trial["expires_at"])
     real_now = storage_trial._now
@@ -310,23 +339,31 @@ def test_the_trial_expires_on_its_own_after_30_days(shop, db_path, monkeypatch):
     assert client.get("/api/v2/customer/storage-trial", cookies=_cookie(*OWNER)).json()["storage_trial"]["status"] == "expired"
     # Stripe ends the subscription at the trial end (cancel_at_period_end): recorded as expired.
     monkeypatch.setattr(storage_trial, "_now", real_now)
-    _trial_subscription(stripe, trial["id"], status="canceled", ended_at=int(expires.timestamp()))
-    _exec(db_path, "UPDATE storage_trials SET stripe_subscription_id='sub_trial'")
+    stripe["subscriptions"]["sub_trial"].update(status="canceled", ended_at=int(expires.timestamp()))
     with override_target(sqlite_path=str(db_path)):
         assert _sync(_event("customer.subscription.deleted", stripe["subscriptions"]["sub_trial"]))["status"] == "expired"
     assert _trial(db_path)["status"] == "expired" and _audit(db_path, "storage_trial.expired")
     assert stripe["updates"] == []  # nothing charged, nothing changed on Stripe
 
 
-def test_a_short_remaining_window_never_sends_stripe_an_invalid_checkout_trial(shop, db_path):
+def test_a_storage_start_always_gets_a_fresh_30_days_and_an_unused_grant_lapses(shop, db_path, monkeypatch):
+    """Stripe Checkout needs trial_end >= 48 hours ahead: always true now,
+    since every storage start gets now + 30 days. A grant unused for 180
+    days lapses (derived when read) and then offers nothing."""
     client, _, _ = shop
     import storage_trial
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
-    soon = (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat(timespec="seconds")
-    _exec(db_path, "UPDATE storage_trials SET expires_at=?", (soon,))
+    granted = datetime.fromisoformat(_trial(db_path)["granted_at"])
+    late = granted + timedelta(days=179)
+    monkeypatch.setattr(storage_trial, "_now", lambda: late)
     with override_target(sqlite_path=str(db_path)):
-        assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="hybrid") == []  # Stripe Checkout needs >= 48 hours
-        assert dict(storage_trial.subscription_trial_fields(CUSTOMER, checkout=False, plan_key="hybrid"))["trial_end"]
+        fields = dict(storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="hybrid"))
+    assert int(fields["subscription_data[trial_end]"]) == int((late + timedelta(days=30)).timestamp())
+    monkeypatch.setattr(storage_trial, "_now", lambda: granted + timedelta(days=180, seconds=1))
+    with override_target(sqlite_path=str(db_path)):
+        assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=True, plan_key="hybrid") == []
+        assert storage_trial.subscription_trial_fields(CUSTOMER, checkout=False, plan_key="hybrid") == []
+        assert storage_trial.customer_view(CUSTOMER)["status"] == "lapsed"
 
 
 # ------------------------------------------------------------------ cancellation
@@ -336,8 +373,7 @@ def test_an_administrator_cancels_a_trial_and_its_free_subscription_ends_without
     admin = _make_global_admin(db_path)
     assert _grant(client, admin).status_code == 200
     trial = _trial(db_path)
-    _trial_subscription(stripe, trial["id"])
-    _exec(db_path, "UPDATE storage_trials SET stripe_subscription_id='sub_trial'")
+    _start(stripe, db_path, trial["id"])
     url = f"/api/admin/storage-trials/{trial['id']}/cancel"
     assert client.post(url, json={"reason": "x"}, cookies=_cookie(*OWNER)).status_code == 403
     assert client.post(url, json={}, cookies=admin).status_code == 400
@@ -346,31 +382,44 @@ def test_an_administrator_cancels_a_trial_and_its_free_subscription_ends_without
     assert stripe["deletes"] == ["/v1/subscriptions/sub_trial"] and stripe["updates"] == []
     stored = _trial(db_path)
     assert stored["cancelled_by"] == "admin@example.test" and stored["cancel_reason"] == "Customer asked to stop"
-    assert _audit(db_path, "storage_trial.cancel")
+    assert json.loads(_audit(db_path, "storage_trial.cancel")[0]["details_json"])["previous_status"] == "active"
     assert client.post(url, json={"reason": "again"}, cookies=admin).status_code == 409
     with override_target(sqlite_path=str(db_path)):  # Stripe's deletion event leaves the record cancelled
         _sync(_event("customer.subscription.deleted", stripe["subscriptions"]["sub_trial"]))
     assert _trial(db_path)["status"] == "cancelled"
 
 
-def test_cancelling_an_unused_trial_needs_no_stripe_call(shop, db_path):
+def test_cancelling_a_granted_trial_needs_no_stripe_call(shop, db_path):
     client, captured, stripe = shop
     admin = _make_global_admin(db_path)
     assert _grant(client, admin).status_code == 200
     trial = _trial(db_path)
-    assert client.post(f"/api/admin/storage-trials/{trial['id']}/cancel", json={"reason": "Granted by mistake"},
-                       cookies=admin).status_code == 200
-    assert stripe["deletes"] == []
+    response = client.post(f"/api/admin/storage-trials/{trial['id']}/cancel", json={"reason": "Granted by mistake"}, cookies=admin)
+    assert response.status_code == 200 and response.json()["status"] == "cancelled"
+    assert stripe["deletes"] == [] and stripe["updates"] == []
+    assert json.loads(_audit(db_path, "storage_trial.cancel")[0]["details_json"])["previous_status"] == "granted"
     assert _checkout(client).status_code == 200
     assert not any(key in captured[-1] for key in TRIAL_KEYS)  # a cancelled trial applies to nothing
+
+
+def test_a_checkout_left_open_when_a_granted_trial_is_cancelled_ends_its_free_subscription(shop, db_path):
+    client, captured, stripe = shop
+    admin = _make_global_admin(db_path)
+    assert _grant(client, admin).status_code == 200
+    trial = _trial(db_path)
+    assert _checkout(client).status_code == 200 and captured[-1]["subscription_data[trial_end]"]
+    assert client.post(f"/api/admin/storage-trials/{trial['id']}/cancel", json={"reason": "Revoked"}, cookies=admin).status_code == 200
+    sub = _trial_subscription(stripe, trial["id"])  # the customer completes the open Checkout afterwards
+    with override_target(sqlite_path=str(db_path)):
+        assert _sync(_event("customer.subscription.created", sub))["status"] == "cancelled_on_stripe"
+    assert stripe["deletes"] == ["/v1/subscriptions/sub_trial"] and _trial(db_path)["status"] == "cancelled"
 
 
 # ------------------------------------------------------------------ conversion to paid storage
 
 def _trialing_plan(stripe, db_path, trial_id):
     import per_camera_billing as billing
-    _exec(db_path, "UPDATE storage_trials SET stripe_subscription_id='sub_trial'")
-    sub = _trial_subscription(stripe, trial_id, cancel_at_period_end=True)
+    sub = _start(stripe, db_path, trial_id)
     with override_target(sqlite_path=str(db_path)):
         assert billing._upsert_current(sub)["status"] == "entitlement_updated"
     return sub
@@ -465,8 +514,10 @@ def test_a_second_trial_needs_an_administrator_approved_re_grant(shop, db_path):
     client, _, _ = shop
     admin = _make_global_admin(db_path)
     assert _grant(client, admin).status_code == 200
-    assert _grant(client, admin).status_code == 409  # already active
+    assert _grant(client, admin).status_code == 409  # already granted
     assert _grant(client, admin, allow_repeat=True, repeat_reason="x").status_code == 409  # never two at once
+    _start(shop[2], db_path, _trial(db_path)["id"])
+    assert _grant(client, admin, allow_repeat=True, repeat_reason="x").status_code == 409  # running
     past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
     _exec(db_path, "UPDATE storage_trials SET expires_at=?", (past,))
     refused = _grant(client, admin)
@@ -475,18 +526,23 @@ def test_a_second_trial_needs_an_administrator_approved_re_grant(shop, db_path):
     regrant = _grant(client, admin, allow_repeat=True, repeat_reason="Owner approved a second evaluation")
     assert regrant.status_code == 200, regrant.text
     trials = _q(db_path, "SELECT * FROM storage_trials WHERE customer_id=? ORDER BY granted_at", (CUSTOMER,))
-    assert [t["status"] for t in trials] == ["expired", "active"]
+    assert [t["status"] for t in trials] == ["expired", "granted"]
     assert trials[1]["repeat_of"] == trials[0]["id"] and trials[1]["repeat_approved_by"] == "admin@example.test"
     assert trials[1]["repeat_reason"] == "Owner approved a second evaluation"
     assert _audit(db_path, "storage_trial.regrant")
 
 
-def test_the_database_allows_only_one_active_trial_per_customer(shop, db_path):
+def test_the_database_allows_only_one_open_trial_per_customer(shop, db_path):
     client, _, _ = shop
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
-    with pytest.raises(sqlite3.IntegrityError):
-        _exec(db_path, "INSERT INTO storage_trials(id,customer_id,status,starts_at,expires_at,granted_by,granted_at,reason,updated_at) "
-                       "VALUES('dup','cust-1','active','a','b','c','d','e','f')")
+    conn = sqlite3.connect(db_path)
+    try:
+        for status in ("granted", "active"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO storage_trials(id,customer_id,status,starts_at,expires_at,granted_by,granted_at,reason,updated_at) "
+                             "VALUES('dup','cust-1',?,'a','b','c','d','e','f')", (status,))
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ existing billing unchanged

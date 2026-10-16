@@ -207,13 +207,14 @@ def test_my_subscription_says_1_camera_and_6_cameras(db_path, monkeypatch):
     billing = _v2_page(db_path, monkeypatch, quantity=1)
     one = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
     assert "Basic Local · 1 licensed camera · $9.99 per camera/month" in one
-    assert "Included with the subscription · 1 camera<" in one
+    # My Software License panel (VMS 1.2.7 layout, 2026-10-15): license included with the plan, singular count.
+    assert "VMS software license included with your plan" in one and "Up to 1 camera<" in one
     assert "1 licensed cameras" not in one and "· 1 cameras" not in one
     billing._upsert_current({"id": "sub_page", "customer": "cus_v2", "status": "active", "metadata": {"anyaicam_customer_id": "cust-v2"},
                              "current_period_end": 1800000000,
                              "items": {"data": [{"id": "si", "quantity": 6, "price": {"id": "price_basic"}}]}})
     six = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
-    assert "Basic Local · 6 licensed cameras · " in six and "Included with the subscription · 6 cameras<" in six
+    assert "Basic Local · 6 licensed cameras · " in six and "Up to 6 cameras<" in six
 
 
 def test_my_subscription_cancellation_and_scheduled_change_show_their_dates(db_path, monkeypatch):

@@ -167,7 +167,8 @@ def test_my_subscription_shows_the_download_to_a_licensed_owner(license_portal, 
     _license(db_path)
     record = _publish(package)
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert 'id="vms-installer-download"' in html and 'href="/api/customer/downloads/vms-installer"' in html
+    # Software Downloads panel (VMS 1.2.7 three-panel layout, 2026-10-15).
+    assert 'id="sl-downloads"' in html and 'data-platform="linux"' in html and 'href="/api/customer/downloads/vms-installer"' in html
     assert record["sha256"] in html and "Ubuntu 24.04" in html and "sudo ./install.sh" in html
 
 
@@ -180,15 +181,15 @@ def test_the_license_card_tucks_build_checksum_and_commands_into_technical_detai
     _license(db_path)
     record = _publish(package)
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    start = html.index('id="vms-installer-download"')
-    details = html.index('<details id="vms-installer-technical"', start)
+    start = html.index('id="sl-downloads"')
+    details = html.index("<details", start)
     end = html.index("</details>", details)
     visible, technical = html[start:details], html[details:end]
     assert "Download installer" in visible and "Ubuntu 24.04" in visible and 'href="/customer/claim-appliance"' in visible
     for hidden in (record["sha256"], f"Build {COMMIT[:7]}", "sudo ./install.sh", "sha256sum -c", "anyaicam-setup --claim"):
         assert hidden not in visible and hidden in technical
-    assert "<details id=\"vms-installer-technical\" open" not in html  # collapsed by default
-    assert technical.index("<summary>Technical details and install commands</summary>") < technical.index("vms-installer-steps")
+    assert "<details open" not in html[start:]  # collapsed by default
+    assert technical.index("<summary>Installation and setup instructions</summary>") < technical.index("vms-installer-steps")
 
 
 def test_my_subscription_hides_the_download_without_a_license(license_portal, db_path, storage, package):
@@ -197,7 +198,7 @@ def test_my_subscription_hides_the_download_without_a_license(license_portal, db
     _license(db_path, product="camera_slots_local", quantity=8)
     _publish(package)
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert 'id="vms-installer-download"' not in html and "/api/customer/downloads/vms-installer" not in html
+    assert 'id="sl-downloads"' not in html and "/api/customer/downloads/vms-installer" not in html
 
 
 def test_my_subscription_says_when_the_installer_is_not_released_yet(license_portal, db_path, storage):
@@ -206,7 +207,7 @@ def test_my_subscription_says_when_the_installer_is_not_released_yet(license_por
     _license(db_path, product="camera_slots_local", quantity=8)
     _license(db_path)
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert "will appear here when it is released" in html
+    assert "will appear here when an approved release is available" in html
 
 
 # ------------------------------------------------------------------ install + activate steps

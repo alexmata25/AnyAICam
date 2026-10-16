@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, conint
 
-from partner_db import connection, row
+from partner_db import connection, row, rows
 
 MAX_CAMERA_QUANTITY = 64
 MIN_CAMERA_QUANTITY = 1
@@ -249,12 +249,52 @@ BUILD_PAID = "paid_setup_pending"
 BUILD_DONE = "setup_complete"
 
 
-def has_camera_plan(customer_id: str) -> bool:
+LEGACY_PLAN_NAMES = {"camera_slots_local": "Local", "camera_slots_hybrid": "Hybrid"}
+LEGACY_PLAN_REFUSAL = ("This account has an earlier AnyAiCam camera plan. To move to a per-camera plan, cancel the earlier "
+                       "plan in Manage billing; when it has ended, choose your per-camera plan here.")
+LEGACY_PLAN_UNVERIFIED = ("This account has an earlier AnyAiCam camera plan whose billing details we couldn't confirm. "
+                          "Please contact AnyAiCam support before choosing a new plan, so you are never billed twice.")
+
+
+def existing_plan(customer_id: str, *, lookup: bool = False) -> dict | None:
+    """The one definition (2026-10-15) of the camera plan an account already
+    has, shared by My subscription, the subscription checkout, the Build Your
+    System order and the storage-trial grant, so they always agree:
+
+    * {"kind": "per_camera", "active": ...} -- the billing-v2 account row;
+      only active/suspended rows block another checkout. Cancelled rows are
+      retained for history and may be rebound by the verified new-subscription
+      webhook, matching the established resubscription flow;
+    * {"kind": "legacy", "product", "quantity", "verified"} -- an active or
+      suspended Local/Hybrid camera-slot plan from before per-camera pricing;
+    * None -- no plan: the per-camera plan can be bought.
+
+    A plan whose Stripe customer is KNOWN to belong to the other Stripe mode
+    (e.g. a test-mode plan once the cloud runs a live key) does not count: it
+    can neither be billed nor managed with this key. A plan whose mode cannot
+    be determined (no Stripe customer recorded, or Stripe not reachable) still
+    counts -- fail closed against double billing -- with verified=False.
+    Nothing here changes, cancels or migrates any record. Page views pass
+    lookup=False (cached modes only); checkout passes lookup=True."""
+    import stripe_customer_mode
     entitlement = entitlement_for_customer(customer_id)
-    if entitlement and entitlement.get("status") in ("active", "suspended"):
-        return True
-    return bool(row("SELECT id FROM customer_entitlements WHERE customer_id=? AND product IN ('camera_slots_local','camera_slots_hybrid') "
-                    "AND status IN ('active','suspended') LIMIT 1", (customer_id,)))
+    if entitlement and stripe_customer_mode.in_current_mode(entitlement.get("stripe_customer_id"), lookup=lookup) is not False:
+        return {"kind": "per_camera", "active": entitlement.get("status") in ("active", "suspended"), "entitlement": entitlement}
+    for legacy in rows("SELECT product,status,camera_slot_quantity,stripe_customer_id FROM customer_entitlements WHERE customer_id=? "
+                       "AND product IN ('camera_slots_local','camera_slots_hybrid') AND status IN ('active','suspended') "
+                       "ORDER BY created_at", (customer_id,)):
+        mode = stripe_customer_mode.in_current_mode(legacy.get("stripe_customer_id"), lookup=lookup)
+        if mode is False:
+            continue
+        return {"kind": "legacy", "product": legacy["product"], "name": LEGACY_PLAN_NAMES[legacy["product"]],
+                "quantity": int(legacy.get("camera_slot_quantity") or 0), "status": legacy["status"], "verified": mode is True}
+    return None
+
+
+def has_camera_plan(customer_id: str, *, lookup: bool = False) -> bool:
+    """An active (or suspended) camera plan, per-camera or legacy (existing_plan)."""
+    plan = existing_plan(customer_id, lookup=lookup)
+    return bool(plan and (plan["kind"] == "legacy" or plan["active"]))
 
 
 GRACE_STRIPE_STATUSES = ("past_due", "unpaid")
@@ -809,7 +849,11 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     import customer_billing
     import friends_family
     customer_id = identity["customer_id"]
+    existing = existing_plan(customer_id)
+    if entitlement and not (existing and existing["kind"] == "per_camera" and existing["active"]):
+        entitlement = None  # a plan of the other Stripe mode: not this key's plan (existing_plan)
     payload = entitlement_payload(entitlement)
+    legacy = existing if existing and existing["kind"] == "legacy" else None
     is_owner = identity.get("role") == "customer_owner"
     is_active = bool(payload and payload.get("status") == "active")
     plan_key = payload.get("plan_key") if payload else ""
@@ -860,6 +904,9 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         plan_summary = (f"{escape(PLANS[deferred['plan_key']]['display_name'])} · "
                         f"{_camera_count(deferred['camera_quantity'], 'licensed camera')} · ordered with your appliance. "
                         "Your storage plan starts when you activate the appliance.")
+    if legacy:
+        plan_summary = (f"AnyAiCam {legacy['name']} (earlier plan) · {_camera_count(legacy['quantity'], 'camera')}"
+                        + (" · paused because of a billing problem" if legacy["status"] == "suspended" else ""))
     if payload:
         plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
                         f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
@@ -901,6 +948,11 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         # refuse a second one anyway).
         activating = ('<section class="panel" id="v2-activating"><h2>Payment received</h2>'
                       '<p class="health-detail" role="status">Your plan is being activated. This page refreshes automatically.</p></section>')
+    elif is_owner and legacy:
+        # The checkout backend refuses a second plan for the same account
+        # (existing_plan): say so here instead of offering a picker that fails.
+        activating = ('<section class="panel" id="v2-legacy-plan"><h2>Your earlier camera plan</h2>'
+                      f'<p class="health-detail" role="status">{escape(LEGACY_PLAN_REFUSAL if legacy["verified"] else LEGACY_PLAN_UNVERIFIED)}</p></section>')
     elif is_owner and not payload and not deferred:
         if payment_outcome == "cancelled":
             selection_note += '<p class="health-detail" id="v2-checkout-cancelled">Checkout was cancelled. No payment was taken.</p>'
@@ -921,23 +973,10 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                   '<p class="health-detail">Increases and upgrades take effect after payment succeeds. Decreases and downgrades take effect at the next renewal.</p></section>')
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
     addons = _addon_portal_rows(customer_id, plan_key, is_owner)
-    vms_capacity = customer_entitlements.vms_license_capacity(customer_id)
-    owned_license = max((int(e["camera_slot_quantity"] or 0) for e in customer_entitlements.get_entitlements_for_customer(customer_id)
-                         if e["product"] == "vms_license" and e["status"] == "active"), default=0)
-    license_card = ""
-    if owned_license:  # the one-time license an own-PC customer bought: theirs to keep
-        license_card += (f'<div class="health-row"><span>One-time VMS software license (yours to keep)</span>'
-                         f'<span class="pill">Up to {_camera_count(owned_license)}</span></div>')
-    if payload:
-        license_card += (f'<div class="health-row"><span>VMS software license for your plan</span>'
-                         f'<span class="pill">Included with the subscription · {_camera_count(payload["camera_quantity"])}</span></div>')
-    elif vms_capacity and not owned_license:
-        license_card += f'<div class="health-row"><span>Existing stand-alone VMS license</span><span class="pill">{_camera_count(vms_capacity)}</span></div>'
-    # The installer download (owner of a licensed account), formerly only on
-    # the removed fixed-tier subscription page (2026-10-08).
-    _main = sys.modules.get("main")
-    if _main is not None and hasattr(_main, "_vms_installer_download_html"):
-        license_card += _main._vms_installer_download_html(customer_id, customer_entitlements.product_mode_for_customer(customer_id), is_owner)
+    # Software License, as three panels (VMS 1.2.7, 2026-10-15): license, registered appliances, downloads.
+    import software_license_panels
+    license_panels = software_license_panels.panels_html(customer_id, is_owner=is_owner, payload=payload,
+                                                         mode=customer_entitlements.product_mode_for_customer(customer_id))
     setup_next = ""
     if is_owner and is_active and not problem and _setup_needed(customer_id):
         # Purchase comes first, then setup (2026-10-05): once the plan is
@@ -961,7 +1000,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
     <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
-    <section class="panel" style="margin-top:14px"><h2>Software license</h2>{license_card or '<p class="health-detail">The stand-alone software license remains a separate one-time purchase for local ownership.</p>'}</section>
+    {license_panels}
     {picker}{change}'''
     scripts = f'''<script>
     const v2Plans={json.dumps(plan_menu)};
@@ -1135,13 +1174,11 @@ def register_routes(app: FastAPI) -> None:
         if not price_id:
             raise HTTPException(status_code=503, detail=f"No Stripe Price is configured for {plan_key}.")
         customer_id = identity["customer_id"]
-        # Only a CURRENT plan (active, or suspended for billing; v2 or legacy
-        # camera slots) routes the owner to plan change. A plan Stripe has
-        # ended (status 'cancelled', kept for history) does not: the customer
-        # may buy again, and the verified webhook rebinds the account's row to
-        # the new subscription (_upsert_current, stripe_state.conflicting_subscription).
-        if has_camera_plan(customer_id):
+        existing = existing_plan(customer_id, lookup=True)
+        if existing and existing["kind"] == "per_camera" and existing["active"]:
             raise HTTPException(status_code=409, detail="This account already has a camera plan. Use its plan-change action instead.")
+        if existing and existing["kind"] == "legacy":
+            raise HTTPException(status_code=409, detail=LEGACY_PLAN_REFUSAL if existing["verified"] else LEGACY_PLAN_UNVERIFIED)
         if deferred_storage_plan(customer_id):
             # Paid with the appliance order; it starts at activation (build_orders.py).
             raise HTTPException(status_code=409, detail="Your storage plan was ordered with your appliance and starts when you activate it.")

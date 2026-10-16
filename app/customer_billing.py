@@ -73,7 +73,14 @@ def _portal_configuration(main) -> dict:
     return data[0] if data else {}
 
 
-def stripe_customer_ids_for_customer(customer_id: str) -> set[str]:
+def stripe_customer_ids_for_customer(customer_id: str, *, lookup: bool = False) -> set[str]:
+    """The account's Stripe customers of the current Stripe mode (stripe_customer_mode):
+    ids known to belong to the other mode are left out; unknown ones stay."""
+    import stripe_customer_mode
+    return stripe_customer_mode.keep_for_current_mode(_stored_stripe_customer_ids(customer_id), lookup=lookup)
+
+
+def _stored_stripe_customer_ids(customer_id: str) -> set[str]:
     from partner_db import rows
     try:  # the canonical Stripe customer (checkout_guard.py)
         ids = {r["stripe_customer_id"] for r in rows(
@@ -110,7 +117,10 @@ def register_customer_billing_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=403, detail="Only the account owner can manage billing.")
         if not portal_enabled():
             raise HTTPException(status_code=404, detail="Online billing management is not available yet.")
-        ids = stripe_customer_ids_for_customer(identity["customer_id"])
+        ids = stripe_customer_ids_for_customer(identity["customer_id"], lookup=True)
+        import stripe_customer_mode
+        if any(stripe_customer_mode.in_current_mode(cid, lookup=False) is None for cid in ids) and stripe_customer_mode.current_livemode() is not None:
+            raise HTTPException(status_code=503, detail="Billing management is not available right now. Please try again shortly.")
         if not ids:
             raise HTTPException(status_code=404, detail="There is no billing account for this AnyAiCam account yet.")
         if len(ids) > 1:

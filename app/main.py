@@ -49244,6 +49244,10 @@ from mobile_push_routes import register_routes as register_mobile_push_routes
 register_mobile_push_routes(app)
 from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
+from software_license import register_software_license_routes
+register_software_license_routes(app)
+from software_releases import register_software_release_routes
+register_software_release_routes(app)
 from customer_billing import register_customer_billing_routes
 register_customer_billing_routes(app)
 from per_camera_billing import register_routes as register_per_camera_billing_routes
