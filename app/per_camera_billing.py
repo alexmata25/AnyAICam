@@ -6,6 +6,8 @@ every entitlement write is based on Stripe's current subscription state.
 """
 from __future__ import annotations
 
+import logging
+
 import json
 import os
 import secrets
@@ -24,6 +26,8 @@ from partner_db import connection, row, rows
 
 MAX_CAMERA_QUANTITY = 64
 MIN_CAMERA_QUANTITY = 1
+logger = logging.getLogger("anyaicam.per_camera_billing")
+
 PRICE_ENV = {
     "basic_local": "ANYAICAM_STRIPE_PRICE_BASIC_LOCAL",
     "ai_local": "ANYAICAM_STRIPE_PRICE_AI_LOCAL",
@@ -508,7 +512,7 @@ def purchase_progress_banner(customer_id: str, path: str = "") -> str:
                 f'<strong>Order confirmed</strong> — Your AnyAiCam system {status}. '
                 f'<a href="{ORDER_COMPLETE_PATH}">View order status</a></div>')
     return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
-            '<strong>Payment complete</strong> — Set up your AnyAiCam system. '
+            '<strong>Payment complete</strong> — set up your AnyAiCam system. '
             '<a href="/customer/setup">Continue to setup</a></div>')
 
 
@@ -870,7 +874,7 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
         if not is_active and (face_held or key != f"face_access_{face_size}"):
             continue
         item = analytics.checkout_item(key, customer_id)
-        price = f"${tier['monthly_cents_per_door'] / 100:.2f}/mo per door"
+        price = f"${tier['monthly_cents_per_door'] / 100:.2f} per door/month"
         detail = f"{door_count} door{'s' if door_count != 1 else ''}" if door_count else "No door cameras set up yet"
         if is_active:
             action = '<span class="pill">Active</span>'
@@ -983,7 +987,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                         f"${payload['monthly_base_total']:.2f} monthly base total")
         retention = f"{payload['local_retention_days']}-day local retention"
         if payload["cloud_event_storage"]:
-            retention += f" · {payload['cloud_event_retention_days']}-day cloud EVENT retention"
+            retention += f" · {payload['cloud_event_retention_days']}-day cloud event storage"
         current_html = f'<div class="health-row"><span>Licensed cameras</span><span>{payload["camera_quantity"]}</span></div><div class="health-row"><span>Retention</span><span>{retention}</span></div>'
     # What the plan includes, from PLANS (subscription_offers, 2026-10-05):
     # features, retention, cloud EVENT retention, the VMS license. Without a
@@ -1080,7 +1084,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     if is_owner and is_active and not problem and _setup_needed(customer_id):
         # Purchase comes first, then setup (2026-10-05): once the plan is
         # active and no appliance is activated yet, setup is the next step.
-        setup_next = ('<section class="panel" id="v2-setup-next"><h2>Payment complete — Set up your AnyAiCam system</h2>'
+        setup_next = ('<section class="panel" id="v2-setup-next"><h2>Payment complete — set up your AnyAiCam system</h2>'
                       '<p class="health-detail">Your plan is active. Connect your AnyAiCam appliance or PC and add your cameras to start recording.</p>'
                       '<a class="action-button" href="/customer/setup">Continue to setup</a></section>')
     if selection_requested and (picker or change) and not awaiting:
@@ -1103,15 +1107,15 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     {picker}{change}'''
     scripts = f'''<script>
     const v2Plans={json.dumps(plan_menu)};
-    function v2Total(planEl,quantityEl,targetEl){{if(!planEl||!quantityEl||!targetEl)return;const p=v2Plans[planEl.value],q=Math.max(0,Number(quantityEl.value)||0);targetEl.textContent=p?'Monthly base total: $'+(p.cents*q/100).toFixed(2):'';}}
+    function v2Total(planEl,quantityEl,targetEl){{if(!planEl||!quantityEl||!targetEl)return;const p=v2Plans[planEl.value],q=Math.max(0,Number(quantityEl.value)||0);targetEl.textContent=p?'$'+(p.cents*q/100).toFixed(2)+' per month':'';}}
     const v2Plan=document.getElementById('v2-plan-key'),v2Qty=document.getElementById('v2-quantity');
     const v2Target=document.getElementById('v2-total');if(v2Plan&&v2Qty){{v2Plan.onchange=()=>v2Total(v2Plan,v2Qty,v2Target);v2Qty.oninput=()=>v2Total(v2Plan,v2Qty,v2Target);v2Total(v2Plan,v2Qty,v2Target);}}
     const v2ChangePlan=document.getElementById('v2-change-plan'),v2ChangeQty=document.getElementById('v2-change-quantity'),v2ChangeTarget=document.getElementById('v2-change-total');if(v2ChangePlan&&v2ChangeQty){{v2ChangePlan.onchange=()=>v2Total(v2ChangePlan,v2ChangeQty,v2ChangeTarget);v2ChangeQty.oninput=()=>v2Total(v2ChangePlan,v2ChangeQty,v2ChangeTarget);v2Total(v2ChangePlan,v2ChangeQty,v2ChangeTarget);}}
     const checkoutButton=document.getElementById('v2-checkout-button');if(checkoutButton){{window.addEventListener('pageshow',()=>{{checkoutButton.disabled=false;}});checkoutButton.onclick=async()=>{{const message=document.getElementById('v2-checkout-message')||document.getElementById('v2-message');const show=text=>{{message.textContent=text;message.scrollIntoView({{block:'center'}});}};const qty=Number(v2Qty.value);if(!Number.isInteger(qty)||qty<1||qty>64){{show('Choose from 1 to 64 cameras.');return;}}checkoutButton.disabled=true;message.textContent='';let response=null,data={{}};try{{response=await fetch('/api/v2/customer/subscription/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2Plan.value,camera_quantity:qty}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{checkoutButton.disabled=false;show('Could not reach AnyAiCam. Check your connection and try again.');return;}}if(!response.ok||!data.checkout_url){{checkoutButton.disabled=false;const d=data&&data.detail;show(typeof d==='string'&&d?d:Array.isArray(d)?'Please check the plan and camera count and try again.':'Checkout could not be started (error '+response.status+'). Please try again or contact AnyAiCam support.');return;}}location.href=data.checkout_url;}};}}
-    const changeButton=document.getElementById('v2-change-button');if(changeButton)changeButton.onclick=async()=>{{const message=document.getElementById('v2-message');if(!confirm('Apply this plan or camera-count change?'))return;changeButton.disabled=true;const response=await fetch('/api/v2/customer/subscription/change',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2ChangePlan.value,camera_quantity:Number(v2ChangeQty.value)}})}});const data=await response.json();if(!response.ok){{changeButton.disabled=false;message.textContent=data.detail||'The change could not be completed.';return;}}message.textContent=data.message||'The subscription was updated.';setTimeout(()=>location.reload(),1000);}};
-    const cancelButton=document.getElementById('v2-cancel-plan');if(cancelButton)cancelButton.onclick=async()=>{{if(!confirm('Cancel at the end of the paid period?'))return;const response=await fetch('/api/v2/customer/subscription/cancel',{{method:'POST'}}),data=await response.json();document.getElementById('v2-message').textContent=data.detail||'Your plan will stay active through the paid period.';if(response.ok)setTimeout(()=>location.reload(),1000);}};
-    document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;const response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}}),data=await response.json();if(!response.ok){{button.disabled=false;message.textContent=data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
-    async function v2OpenBillingPortal(){{const response=await fetch('/api/customer/billing-portal',{{method:'POST'}}),data=await response.json();if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}}
+    const changeButton=document.getElementById('v2-change-button');if(changeButton)changeButton.onclick=async()=>{{const message=document.getElementById('v2-message');if(!confirm('Apply this plan or camera-count change?'))return;changeButton.disabled=true;let response,data={{}};try{{response=await fetch('/api/v2/customer/subscription/change',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2ChangePlan.value,camera_quantity:Number(v2ChangeQty.value)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{changeButton.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{changeButton.disabled=false;message.textContent=data.detail||'The change could not be completed.';return;}}message.textContent=data.message||'The subscription was updated.';setTimeout(()=>location.reload(),1000);}};
+    const cancelButton=document.getElementById('v2-cancel-plan');if(cancelButton)cancelButton.onclick=async()=>{{if(!confirm('Cancel at the end of the paid period?'))return;let response,data={{}};try{{response=await fetch('/api/v2/customer/subscription/cancel',{{method:'POST'}});data=await response.json().catch(()=>({{}}));}}catch(e){{document.getElementById('v2-message').textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok&&!data.detail)data.detail='Your plan could not be cancelled right now. Please try again.';document.getElementById('v2-message').textContent=data.detail||'Your plan will stay active through the paid period.';if(response.ok)setTimeout(()=>location.reload(),1000);}};
+    document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;let response,data={{}};try{{response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{button.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{button.disabled=false;message.textContent=data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
+    async function v2OpenBillingPortal(){{let response,data={{}};try{{response=await fetch('/api/customer/billing-portal',{{method:'POST'}});data=await response.json().catch(()=>({{}}));}}catch(e){{document.getElementById('v2-message').textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}}
     const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=v2OpenBillingPortal;
     const updatePayment=document.getElementById('v2-update-payment');if(updatePayment)updatePayment.onclick=v2OpenBillingPortal;
     document.querySelectorAll('time[data-local-date]').forEach(t=>{{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {{dateStyle:'medium'}})}});
@@ -1143,13 +1147,24 @@ def _owner_subscription(identity: dict) -> tuple[dict, dict]:
     return entitlement, current
 
 
+PLAN_CHANGE_UNAVAILABLE = "This plan can't be changed right now. Please contact AnyAiCam support."
+PLAN_START_UNAVAILABLE = "This plan can't be started right now. Please contact AnyAiCam support."
+
+
+def _unavailable(status: int, customer_message: str, reason: str, **context) -> HTTPException:
+    """A configuration or verification problem: the customer sees a plain message; the detail is logged."""
+    logger.warning("per_camera_billing.unavailable reason=%s %s", reason,
+                   " ".join(f"{key}={value}" for key, value in context.items()))
+    return HTTPException(status_code=status, detail=customer_message)
+
+
 def _change_subscription(identity: dict, request: ChangeRequest) -> dict:
     plan_key = request.plan_key.strip().lower()
     if plan_key not in PLANS:
-        raise HTTPException(status_code=400, detail="Unknown plan key.")
+        raise _unavailable(400, PLAN_CHANGE_UNAVAILABLE, "unknown plan key", plan_key=plan_key[:40])
     price_id = price_id_for(plan_key)
     if not price_id:
-        raise HTTPException(status_code=503, detail=f"No Stripe Price is configured for {plan_key}.")
+        raise _unavailable(503, PLAN_CHANGE_UNAVAILABLE, "no Stripe Price configured", plan_key=plan_key)
     import main
     import stripe_state
     entitlement, current = _owner_subscription(identity)
@@ -1159,7 +1174,8 @@ def _change_subscription(identity: dict, request: ChangeRequest) -> dict:
                                                     "trial has ended or continued as a paid plan.")
     item = _stripe_item(current)
     if not item:
-        raise HTTPException(status_code=409, detail="This subscription's current per-camera Price could not be verified.")
+        raise _unavailable(409, PLAN_CHANGE_UNAVAILABLE, "current per-camera Price could not be verified",
+                           customer_id=identity.get("customer_id"))
     current_plan = item["plan"]
     current_quantity = int(item["item"].get("quantity") or 0)
     target_quantity = int(request.camera_quantity)
@@ -1182,7 +1198,8 @@ def _change_subscription(identity: dict, request: ChangeRequest) -> dict:
     attempt = _change_attempt(identity["customer_id"], str(current["id"]), plan_key, price_id, target_quantity, action)
     item_id = str(item["item"].get("id") or "")
     if not item_id:
-        raise HTTPException(status_code=409, detail="This subscription item could not be verified.")
+        raise _unavailable(409, PLAN_CHANGE_UNAVAILABLE, "subscription item could not be verified",
+                           customer_id=identity.get("customer_id"))
     if immediate:
         fields = [
             ("items[0][id]", item_id), ("items[0][price]", price_id), ("items[0][quantity]", str(target_quantity)),
@@ -1269,9 +1286,9 @@ def register_routes(app: FastAPI) -> None:
         plan = PLANS.get(plan_key)
         price_id = price_id_for(plan_key)
         if not plan:
-            raise HTTPException(status_code=400, detail="Unknown plan key.")
+            raise _unavailable(400, PLAN_START_UNAVAILABLE, "unknown plan key", plan_key=plan_key[:40])
         if not price_id:
-            raise HTTPException(status_code=503, detail=f"No Stripe Price is configured for {plan_key}.")
+            raise _unavailable(503, PLAN_START_UNAVAILABLE, "no Stripe Price configured", plan_key=plan_key)
         customer_id = identity["customer_id"]
         existing = existing_plan(customer_id, lookup=True)
         if existing and existing["kind"] == "per_camera" and existing["active"]:

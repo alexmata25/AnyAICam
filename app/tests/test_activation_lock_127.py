@@ -215,3 +215,61 @@ def test_appliance_licence_line_uses_the_owner_wording():
 def test_add_camera_refusal_before_activation_points_to_activation(env):
     import customer_entitlements
     assert customer_entitlements.capacity_refusal(CID).startswith("Activate your system to add cameras")
+
+
+# ------------------------------------------------------------------ failed, cancelled, expired payments never activate
+
+def _own_pc_session(status, payment_status="unpaid"):
+    from test_stripe_billing_launch import _checkout  # noqa: F401 -- same event shape as the launch suite
+    return {"id": f"evt_{status}_{payment_status}", "type": status, "created": 2_000, "data": {"object": {
+        "id": f"cs_{status}", "object": "checkout.session", "mode": "subscription", "payment_status": payment_status,
+        "status": "expired" if status.endswith("expired") else "complete", "customer": "cus_A", "subscription": None,
+        "customer_details": {"email": "a@example.test"},
+        "metadata": {"anyaicam_customer_id": CID, "anyaicam_build_order": "own_pc", "anyaicam_plan_key": "basic_local",
+                     "anyaicam_camera_quantity": "1", "anyaicam_billing_version": "2", "anyaicam_stripe_price_id": "price_basic_local",
+                     "anyaicam_vms_license_price_id": "price_lic_8", "anyaicam_vms_license_capacity": "8"}}}}
+
+
+def _nothing_granted(env):
+    import per_camera_billing as billing
+    conn = sqlite3.connect(env["path"])
+    licences = conn.execute("SELECT COUNT(*) FROM customer_entitlements WHERE customer_id=?", (CID,)).fetchone()[0]
+    plans = conn.execute("SELECT COUNT(*) FROM camera_plan_entitlements_v2 WHERE customer_id=?", (CID,)).fetchone()[0]
+    paid = conn.execute("SELECT COUNT(*) FROM hardware_orders WHERE customer_id=? AND status='paid'", (CID,)).fetchone()[0]
+    conn.close()
+    return licences == 0 and plans == 0 and paid == 0 and billing.account_activated(CID) is False
+
+
+@pytest.mark.parametrize("event_type,payment_status", [
+    ("checkout.session.completed", "unpaid"),            # card declined / bank debit not settled
+    ("checkout.session.async_payment_failed", "unpaid"),  # delayed payment failed
+    ("checkout.session.expired", "unpaid"),               # abandoned or cancelled checkout
+])
+def test_an_unpaid_failed_or_expired_own_pc_checkout_never_activates(env, plan_prices, monkeypatch, event_type, payment_status):
+    from test_stripe_billing_launch import _deliver
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8", "price_lic_8")
+    response = _deliver(env, _own_pc_session(event_type, payment_status))
+    assert response.status_code == 200, response.text
+    assert _nothing_granted(env)
+
+
+def test_an_incomplete_first_subscription_payment_never_activates(env, plan_prices):
+    from test_stripe_billing_launch import _deliver, _sub_event
+    subscription = {"id": "sub_inc", "object": "subscription", "customer": "cus_A", "status": "incomplete",
+                    "current_period_end": 1_893_456_000, "cancel_at_period_end": False, "latest_invoice": "in_inc",
+                    "items": {"data": [{"id": "si_inc", "price": {"id": "price_basic_local"}, "quantity": 1}]},
+                    "metadata": {"anyaicam_customer_id": CID, "anyaicam_billing_version": "2", "anyaicam_plan_key": "basic_local"}}
+    env["stripe"]["sub_inc"] = subscription
+    assert _deliver(env, _sub_event("evt_inc", "created", subscription, 2_100)).status_code == 200
+    assert _nothing_granted(env)
+
+
+def test_an_unpaid_appliance_checkout_never_activates(env):
+    from test_stripe_billing_launch import _deliver
+    event = {"id": "evt_hw_unpaid", "type": "checkout.session.completed", "created": 2_200, "data": {"object": {
+        "id": "cs_hw_unpaid", "object": "checkout.session", "mode": "payment", "payment_status": "unpaid",
+        "customer": "cus_A", "payment_intent": "pi_hw_unpaid",
+        "metadata": {"anyaicam_customer_id": CID, "anyaicam_build_order": "appliance", "anyaicam_plan_key": "hybrid",
+                     "anyaicam_camera_quantity": "4", "anyaicam_hardware_items": "AIC-APPLIANCE-RYZEN-STARTER:1"}}}}
+    assert _deliver(env, event).status_code == 200
+    assert _nothing_granted(env)
