@@ -23,18 +23,19 @@ jobs:
       - name: Check out isolated verification branch
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact analytics source and workflow-only delta
+      - name: Verify analytics source ancestry and workflow-only delta
         env:
           EXPECTED_SOURCE_COMMIT: bf05889185a2fba6ab2f3df0751e234841525786
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$EXPECTED_SOURCE_COMMIT"
-          git diff --exit-code "$EXPECTED_SOURCE_COMMIT" HEAD -- . \
-            ':(exclude).github/workflows/vms-1.2.7-analytics-verification.yml'
-          echo "Verified source parent: $EXPECTED_SOURCE_COMMIT"
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_COMMIT" HEAD
+          changed_paths="$(git diff --name-only "$EXPECTED_SOURCE_COMMIT" HEAD)"
+          test "$changed_paths" = ".github/workflows/vms-1.2.7-analytics-verification.yml"
+          echo "Verified source ancestor: $EXPECTED_SOURCE_COMMIT"
           echo "Workflow commit: $(git rev-parse HEAD)"
 
       - name: Install FFmpeg and ffprobe
@@ -155,18 +156,19 @@ jobs:
       - name: Check out isolated verification branch
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact analytics source and workflow-only delta
+      - name: Verify analytics source ancestry and workflow-only delta
         env:
           EXPECTED_SOURCE_COMMIT: bf05889185a2fba6ab2f3df0751e234841525786
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$EXPECTED_SOURCE_COMMIT"
-          git diff --exit-code "$EXPECTED_SOURCE_COMMIT" HEAD -- . \
-            ':(exclude).github/workflows/vms-1.2.7-analytics-verification.yml'
-          echo "Verified source parent: $EXPECTED_SOURCE_COMMIT"
+          git merge-base --is-ancestor "$EXPECTED_SOURCE_COMMIT" HEAD
+          changed_paths="$(git diff --name-only "$EXPECTED_SOURCE_COMMIT" HEAD)"
+          test "$changed_paths" = ".github/workflows/vms-1.2.7-analytics-verification.yml"
+          echo "Verified source ancestor: $EXPECTED_SOURCE_COMMIT"
           echo "Workflow commit: $(git rev-parse HEAD)"
 
       - name: Install PostgreSQL client tools and Python test dependencies
@@ -253,7 +255,7 @@ jobs:
           {
             echo "## VMS 1.2.7 analytics verification gate"
             echo
-            echo "- Source commit: `bf05889185a2fba6ab2f3df0751e234841525786`"
+            echo '- Source commit: `bf05889185a2fba6ab2f3df0751e234841525786`'
             echo "- Linux regressions / real FFmpeg: **${LINUX_RESULT}**"
             echo "- PostgreSQL 16 migration and restore: **${POSTGRES_RESULT}**"
             if [ "$LINUX_RESULT" = success ] && [ "$POSTGRES_RESULT" = success ]; then
