@@ -291,7 +291,7 @@ def test_the_appliance_picks_up_the_new_address_and_the_new_password(world, tmp_
             if pending_password:
                 con = sqlite3.connect(edge_db)
                 con.execute("INSERT INTO pending_camera_credentials(device_key,encrypted_blob,created_at) VALUES(?,?,?)",
-                            (RIGHT, encrypt_camera_credentials("admin", pending_password), "2026-10-15"))
+                            (RIGHT, encrypt_camera_credentials("admin", pending_password), datetime.now().isoformat()))
                 con.commit(); con.close()
             assert edge_camera_sync.sync_provisioned_cameras()["status"] == "ok"
             con = sqlite3.connect(edge_db); con.row_factory = sqlite3.Row
@@ -387,3 +387,15 @@ def test_both_driveway_cameras_reconnect_after_the_oct_12_dhcp_change(client, db
     for key in cams:
         assert {k: v for k, v in after[key].items() if k != "onvif_endpoint"} == {k: v for k, v in before[key].items() if k != "onvif_endpoint"}
     assert _sql(db_path, "SELECT COUNT(*) AS n FROM cameras WHERE device_key IS NOT NULL")[0]["n"] == 2
+
+
+def test_only_a_fresh_verified_credential_replaces_a_saved_one():
+    """A reconnect's handoff (written moments ago) replaces the saved login;
+    a stale or unparseable pending row never does (see test_edge_camera_sync:
+    test_existing_local_credential_is_never_overwritten_by_a_stale_pending_row)."""
+    fresh = edge_camera_sync._fresh_pending_credential
+    assert fresh(datetime.now().isoformat()) is True
+    assert fresh((datetime.now() - timedelta(seconds=edge_camera_sync.PENDING_CREDENTIAL_REPLACE_SECONDS + 5)).isoformat()) is False
+    assert fresh("2026-09-12T05:50:00") is False
+    assert fresh((datetime.now() + timedelta(hours=1)).isoformat()) is False  # clock nonsense is not "fresh"
+    assert fresh(None) is False and fresh("not a time") is False

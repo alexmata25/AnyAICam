@@ -1044,8 +1044,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         except (TypeError,ValueError): age=RECONNECT_JOB_WINDOW_SECONDS+1
         if age>RECONNECT_JOB_WINDOW_SECONDS:
             raise HTTPException(status_code=409,detail='This reconnect has expired; reconnect the camera again.')
-        old=urlsplit(camera['onvif_endpoint']); new=urlsplit(rtsp_uri)
-        if (old.scheme,old.port,old.path,old.query)!=(new.scheme,new.port,new.path,new.query):
+        try:
+            old=urlsplit(camera['onvif_endpoint']); new=urlsplit(rtsp_uri)
+            old_parts=(old.scheme,old.port,old.path,old.query); new_parts=(new.scheme,new.port,new.path,new.query)
+        except ValueError:
+            raise HTTPException(status_code=409,detail='The new camera address could not be read.')
+        if old_parts!=new_parts:
             raise HTTPException(status_code=409,detail='Only the camera network address may change on reconnect.')
         if (old.hostname or '')==(new.hostname or ''):
             return False
