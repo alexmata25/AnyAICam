@@ -80,13 +80,14 @@ def _hardware_checkout_event(event_id, price_id, *, email="real-customer@example
 
 def test_catalog_has_exactly_the_four_expected_skus_at_the_verified_prices():
     rows = ho._catalog_rows()
-    assert len(rows) == 4
+    assert len(rows) == 5
     by_product = {r["product"]: (r["sku"], r["amount_cents"]) for r in rows}
     assert by_product == {
         "ryzen_starter": ("AIC-APPLIANCE-RYZEN-STARTER", 124999),
         "ryzen_enterprise": ("AIC-APPLIANCE-RYZEN-ENTERPRISE", 174999),
         "ryzen_aac_facial_recognition": ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", 224999),
         "numato_3_channel_relay": ("AIC-RELAY-NUMATO-3CH", 14999),
+        "ryzen_residential": ("AIC-APPLIANCE-RYZEN-RESIDENTIAL", 94999),
     }
 
 
@@ -111,7 +112,8 @@ def test_the_display_name_rename_only_touched_the_name_field(monkeypatch):
     # prices above, restated here so this test alone documents "the
     # rename changed display text only" without depending on that other
     # test having run).
-    assert {product: (sku, amount) for sku, product, _, amount, _ in ho.HARDWARE_CATALOG} == {
+    # (The Residential appliance added 2026-10-16 is not part of this rename.)
+    assert {product: (sku, amount) for sku, product, _, amount, _ in ho.HARDWARE_CATALOG if product != "ryzen_residential"} == {
         "ryzen_starter": ("AIC-APPLIANCE-RYZEN-STARTER", 124999),
         "ryzen_enterprise": ("AIC-APPLIANCE-RYZEN-ENTERPRISE", 174999),
         "ryzen_aac_facial_recognition": ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", 224999),

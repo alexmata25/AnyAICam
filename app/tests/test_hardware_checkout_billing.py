@@ -120,6 +120,9 @@ def test_client_supplied_prices_and_amounts_are_ignored(hw):
 def test_every_catalog_sku_charges_its_own_published_price(hw):
     import hardware_orders
     for sku, _product, _name, cents, var in hardware_orders.HARDWARE_CATALOG:
+        if sku in hardware_orders.HARDWARE_NOT_YET_SELLABLE:
+            assert _buy(hw, sku=sku).status_code == 409, sku  # planned product: never charged yet
+            continue
         assert _buy(hw, sku=sku).status_code == 200, sku
     sent = {fields["metadata[anyaicam_hardware_sku]"]: fields["line_items[0][price]"] for fields, _ in _session_posts(hw)}
     assert sent == {STARTER_SKU: STARTER, "AIC-APPLIANCE-RYZEN-ENTERPRISE": PRO,

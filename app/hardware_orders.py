@@ -150,7 +150,28 @@ HARDWARE_CATALOG = [
     ("AIC-APPLIANCE-RYZEN-ENTERPRISE", "ryzen_enterprise", "AnyAiCam Professional", 174999, "ANYAICAM_STRIPE_PRICE_RYZEN_ENTERPRISE"),
     ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", "ryzen_aac_facial_recognition", "AnyAiCam Enterprise", 224999, "ANYAICAM_STRIPE_PRICE_RYZEN_AAC_FACIAL"),
     ("AIC-RELAY-NUMATO-3CH", "numato_3_channel_relay", "Numato 3-Channel Relay Module", 14999, "ANYAICAM_STRIPE_PRICE_RELAY_NUMATO_3CH"),
+    # Residential VMS -- Ryzen 5 (owner-approved planned product, 2026-10-16,
+    # at the website's existing $949.99). The AIC-APPLIANCE- prefix makes a
+    # paid order include the VMS software license like every other appliance
+    # (customer_entitlements.appliance_includes_vms_license). Not orderable
+    # yet: see HARDWARE_NOT_YET_SELLABLE.
+    ("AIC-APPLIANCE-RYZEN-RESIDENTIAL", "ryzen_residential", "AnyAiCam Residential VMS — Ryzen 5", 94999,
+     "ANYAICAM_STRIPE_PRICE_RYZEN_RESIDENTIAL"),
 ]
+
+# Catalog items that exist (price, SKU, included license) but may not be
+# ordered online yet, with the reason. Every ordering path (Build Your
+# System, the hardware-first checkout, the older hardware checkout) and the
+# website catalog skip them until the owner approves selling the product and
+# its Stripe Price is configured -- removing the entry here is that switch.
+HARDWARE_NOT_YET_SELLABLE = {
+    "AIC-APPLIANCE-RYZEN-RESIDENTIAL": "The AnyAiCam Residential VMS — Ryzen 5 is not available to order online yet.",
+}
+
+
+def orderable(sku: str) -> bool:
+    """Whether this catalog SKU may be ordered online now."""
+    return any(item[0] == sku for item in HARDWARE_CATALOG) and sku not in HARDWARE_NOT_YET_SELLABLE
 
 
 def _catalog_rows() -> list[dict]:
@@ -174,7 +195,7 @@ def hardware_catalog_for_website() -> list[dict]:
     for_website()'s same omission for the same reason."""
     return [
         {"sku": r["sku"], "product": r["product"], "name": r["name"], "amount_cents": r["amount_cents"]}
-        for r in _catalog_rows()
+        for r in _catalog_rows() if r["sku"] not in HARDWARE_NOT_YET_SELLABLE
     ]
 
 

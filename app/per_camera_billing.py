@@ -177,7 +177,8 @@ def _whole_number(value, low: int, high: int) -> int | None:
 def _appliance_skus() -> dict:
     try:
         import hardware_orders
-        return {sku: name for sku, product, name, _cents, _env in hardware_orders.HARDWARE_CATALOG if sku.startswith("AIC-APPLIANCE-")}
+        return {sku: name for sku, product, name, _cents, _env in hardware_orders.HARDWARE_CATALOG
+                if sku.startswith("AIC-APPLIANCE-") and hardware_orders.orderable(sku)}
     except Exception:
         return {}
 

@@ -114401,6 +114401,9 @@ def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Requ
     catalog_entry = next((item for item in HARDWARE_CATALOG if item[0] == sku), None)
     if not catalog_entry:
         raise HTTPException(status_code=400, detail="Unknown hardware SKU.")
+    from hardware_orders import HARDWARE_NOT_YET_SELLABLE
+    if sku in HARDWARE_NOT_YET_SELLABLE:
+        raise HTTPException(status_code=409, detail=HARDWARE_NOT_YET_SELLABLE[sku])
     _, product, name, amount_cents, env_var = catalog_entry
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:

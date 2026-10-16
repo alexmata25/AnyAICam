@@ -110,7 +110,8 @@ def selection_from(values) -> dict | None:
     import per_camera_billing as billing
     get = values.get
     appliance = str(get("appliance") or "").strip()
-    if not appliance.startswith(APPLIANCE_PREFIX) or appliance not in _catalog():
+    import hardware_orders
+    if not appliance.startswith(APPLIANCE_PREFIX) or appliance not in _catalog() or not hardware_orders.orderable(appliance):
         return None
     relays = _int(get("relays"))
     if not 0 <= relays <= MAX_RELAY_MODULES:
