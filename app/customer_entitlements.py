@@ -461,6 +461,14 @@ def capacity_refusal(customer_id: str) -> str:
     page shows those."""
     breakdown = capacity_breakdown(customer_id)
     if breakdown["plan_camera_slots"] <= 0:
+        try:
+            import per_camera_billing
+            activated = per_camera_billing.account_activated(customer_id)
+        except Exception:
+            activated = True
+        if not activated:  # VMS 1.2.7: the first purchase is made through Activate Your System (Build Your System)
+            return ("Activate your system to add cameras: choose Activate Your System to pick your cameras and monthly plan in "
+                    "Build Your System. Your installed AnyAiCam picks up the purchase automatically.")
         return ("A camera plan is required to add cameras. Choose Basic Local, AI Local or Hybrid and how many "
                 "cameras on My subscription.")
     if breakdown["vms_license_required"]:

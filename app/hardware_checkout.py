@@ -461,7 +461,7 @@ def _checkout_page(selection: dict, identity: dict | None, *, cancelled: bool) -
                f'<p class="note">Already have an AnyAiCam account? <a href="{escape(sign_in, quote=True)}">Sign in first</a>. '
                'Otherwise you create your account after paying, with this email address.</p>')
     body = ('<h2>Your AnyAiCam hardware</h2>' + notice + _lines_html(quote_["lines"]) +
-            '<div class="order-line"><span>AnyAiCam VMS software license</span><span>Included with your appliance</span></div>'
+            '<div class="order-line" id="order-license-included"><span>AnyAiCam VMS Software License</span><span>FREE, included with your PC ($0.00)</span></div>'
             f'<div class="order-line order-total" id="hw-total"><span>Due today</span><span>{_money(quote_["total_cents"])}</span></div>'
             f'<p class="notice ok" id="hw-purchased-today">{escape(PURCHASED_TODAY)}</p>' + intent + who +
             '<p class="note">Stripe collects your shipping address and shows the final amount, including any tax, before you pay.</p>'

@@ -107,10 +107,11 @@ def _order_lines(selection: dict) -> tuple[str, str]:
         lines += (f'<div class="order-line" id="{line_id}"><span>{escape(line["name"])}{count}</span>'
                   f'<span>{_money(line["cents"] * line["quantity"])} one-time</span></div>')
     if quote["kind"] == build_orders.APPLIANCE_ORDER:
-        lines += ('<div class="order-line"><span>AnyAiCam VMS software license</span><span>Included with your appliance</span></div>')
+        lines += ('<div class="order-line" id="order-license-included"><span>AnyAiCam VMS Software License</span><span>FREE, included with your PC ($0.00)</span></div>')
     elif quote["kind"] == build_orders.PLAN_ORDER:
-        lines += (f'<div class="order-line"><span>AnyAiCam VMS software license</span>'
-                  f'<span>Included · {quantity} camera{"" if quantity == 1 else "s"}</span></div>')
+        # No hardware and no license line: the account already holds its one-time license (never sold twice).
+        lines += ('<div class="order-line" id="order-license-owned"><span>AnyAiCam VMS software license</span>'
+                  '<span>Already on your account ($0.00)</span></div>')
     lines += (f'<div class="order-line" id="order-monthly"><span>Monthly subscription</span><span>{_money(unit * quantity)}/month</span></div>'
               f'<div class="order-line order-total" id="order-today"><span>Due today</span><span>{_money(quote["due_today_cents"])}</span></div>')
     if quote["kind"] == build_orders.APPLIANCE_ORDER:
@@ -120,7 +121,9 @@ def _order_lines(selection: dict) -> tuple[str, str]:
                  'start then without asking for it again.</p>'
                  f'<p class="note" id="order-shipping">{escape(PREPARATION_TIMEFRAME_TEXT)} We prepare and test your appliance before it ships.</p>')
     elif quote["kind"] == build_orders.OWN_PC_ORDER:
-        notes = ('<p class="note" id="order-plan-start">Your one-time VMS software license and your first month are charged today; '
+        notes = ('<p class="note" id="order-license-required">A one-time AnyAiCam VMS software license is required when using '
+                 'your own computer.</p>'
+                 '<p class="note" id="order-plan-start">Your one-time VMS software license and your first month are charged today; '
                  'your monthly subscription starts today.</p>'
                  '<p class="note" id="order-own-pc">Runs on your own Ubuntu 24.04 PC. The license is yours to keep; the '
                  'monthly subscription is separate.</p>')
@@ -260,7 +263,22 @@ def _hardware_status_body(progress: dict, delivery: dict, summary: str) -> str:
             "<p class=\"note\">You don't need to set up any cameras yet. You can close this page; your order is saved to your account.</p>")
 
 
-def _software_body(progress: dict, summary: str) -> str:
+def linked_pc(customer_id: str) -> bool:
+    """The account already has AnyAiCam installed and linked (the secure appliance claim made on that PC)."""
+    from partner_db import row
+    return bool(customer_id) and row("SELECT id FROM appliances WHERE customer_id=? LIMIT 1", (customer_id,)) is not None
+
+
+RETURN_TO_VMS = ('<p class="notice ok" role="status">Payment complete</p><h2 id="order-return-to-vms">Return to your AnyAiCam VMS</h2>'
+                 '{summary}<p id="order-installed">AnyAiCam is already installed on your computer, so there is nothing to download '
+                 'or reinstall. Go back to AnyAiCam on that computer: your plan reaches it within a minute or two, then add your '
+                 'cameras (scan, enter each camera&rsquo;s username and password, and finish setup).</p>'
+                 '<a class="ghost" id="order-account" href="/customer-account" style="margin-top:10px">Open my AnyAiCam account</a>')
+
+
+def _software_body(progress: dict, summary: str, customer_id: str = "") -> str:
+    if customer_id and progress.get("own_pc") and linked_pc(customer_id):
+        return RETURN_TO_VMS.format(summary=summary)
     try:
         import customer_downloads
         installer = customer_downloads.latest_vms_installer()
@@ -282,7 +300,8 @@ def _software_body(progress: dict, summary: str) -> str:
             '<a class="submit" id="order-setup" href="/customer/setup" style="margin-top:10px">Set Up My System</a>')
 
 
-def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_line: str) -> tuple[str, str, str, str]:
+def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_line: str,
+                 installed: bool = False) -> tuple[str, str, str, str]:
     """(notification type, subject, text, html) for the Build Your System
     order confirmation."""
     import purchase_notifications as pn
@@ -306,6 +325,9 @@ def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_li
         ]
         if progress.get("own_pc"):
             paragraphs.insert(1, "Your one-time AnyAiCam VMS software license is on your account.")
+        if installed:  # already installed and linked on the customer's own PC: never sent to a download
+            paragraphs[-1] = ("AnyAiCam is already installed on your computer, so there is nothing to download or reinstall. "
+                              "Go back to AnyAiCam on that computer: your plan reaches it within a minute or two, then add your cameras.")
         kind, subject = "account_ready", "Your AnyAiCam subscription is active"
     text = f"Hi {first_name},\n\n" + "\n\n".join(paragraphs) + f"\n\nSign in: {sign_in}\n\n{pn._SUPPORT_FOOTER_TEXT}"
     html = (f"<p>Hi {escape(first_name)},</p>" + "".join(f"<p>{escape(p)}</p>" for p in paragraphs)
@@ -366,7 +388,8 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
     plan_name, plan_cameras = _ordered_plan(customer_id)
     plan_line = (f"AnyAiCam {plan_name} subscription for {_cameras(plan_cameras)}" if plan_name else "AnyAiCam subscription")
     kind, subject, text, html = _order_email(pn._first_name(customer.get("name")), progress,
-                                             hardware_delivery(customer_id, progress), plan_line)
+                                             hardware_delivery(customer_id, progress), plan_line,
+                                             installed=bool(progress.get("own_pc")) and linked_pc(customer_id))
     if attempts:
         # Retry the same outbox row, never a second one under another type.
         kind = attempts[0]["notification_type"]
@@ -485,7 +508,8 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             script = ""
             if billing._setup_needed(customer_id):
                 delivery = hardware_delivery(customer_id, progress)
-                body = _hardware_status_body(progress, delivery, summary) if delivery else _software_body(progress, summary)
+                body = (_hardware_status_body(progress, delivery, summary) if delivery
+                        else _software_body(progress, summary, customer_id))
             elif deferred and deferred["state"] == "payment_failed":
                 # Activated, but the storage plan's first payment was refused.
                 body = ('<p class="notice warn" role="status">Storage plan not started</p>'

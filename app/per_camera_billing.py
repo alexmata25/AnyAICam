@@ -368,6 +368,48 @@ def order_paid(customer_id: str) -> bool:
     return has_camera_plan(customer_id) or deferred_storage_plan(customer_id) is not None
 
 
+ACTIVATE_URL = "https://anyaicam.com/build-your-system.html?source=installed"
+ACTIVATE_FIRST = ("Activate your system first: choose your cameras and plan in Build Your System (" + ACTIVATE_URL + "). "
+                  "Purchases in My subscription open after your first order is confirmed.")
+
+
+def vms_license_owned(customer_id: str) -> bool:
+    """An active one-time VMS software license row (granted only by the verified webhook)."""
+    return row("SELECT id FROM customer_entitlements WHERE customer_id=? AND product='vms_license' AND status='active' LIMIT 1",
+               (customer_id,)) is not None
+
+
+def account_activated(customer_id: str) -> bool:
+    """VMS 1.2.7 activation (owner decision 2026-10-16): the account's initial purchase is verified, so My subscription
+    may sell plans and add-ons. Only records the verified Stripe webhook writes count:
+    * a camera plan that was paid for: active, past-due/suspended for a failed renewal, or since cancelled (an account
+      that once had one resubscribes here and is never sent back through Build Your System), or an earlier plan;
+    * an active one-time VMS software license;
+    * a paid AnyAiCam appliance order, or the storage plan ordered with it (hardware-first: the plan follows delivery).
+    A saved Build Your System selection, an open or unpaid checkout, or a refunded/disputed order is not activation."""
+    if not customer_id:
+        return False
+    legacy = existing_plan(customer_id)
+    if (legacy and legacy["kind"] == "legacy") or deferred_storage_plan(customer_id) is not None or vms_license_owned(customer_id):
+        return True
+    try:
+        # Rows exist only once Stripe confirmed a payment (an unpaid or incomplete checkout never writes one, see
+        # _upsert_current); a plan whose payment was refunded or disputed does not count.
+        if row("SELECT id FROM camera_plan_entitlements_v2 WHERE customer_id=? AND (status IN ('active','cancelled') OR "
+               "(status='suspended' AND COALESCE(suspended_reason,'') NOT IN ('refunded','disputed'))) LIMIT 1", (customer_id,)):
+            return True
+    except Exception:  # pre-v2 database
+        pass
+    import customer_entitlements
+    return customer_entitlements.appliance_includes_vms_license(customer_id)
+
+
+def require_activated(customer_id: str) -> None:
+    """Server-side lock for every My subscription purchase before activation (409, never a Stripe call)."""
+    if not account_activated(customer_id):
+        raise HTTPException(status_code=409, detail=ACTIVATE_FIRST)
+
+
 def save_build_selection(customer_id: str, selection: dict) -> None:
     """Keep a validated Build Your System selection on the account until it
     is paid for. A selection with a plan replaces the saved one (a fresh
@@ -380,8 +422,11 @@ def save_build_selection(customer_id: str, selection: dict) -> None:
     if existing and existing["state"] != BUILD_PENDING:
         return
     now = _now()
+    # No AnyAiCam hardware means the customer's own PC, which needs the one-time license -- unless the account
+    # already holds it (never charged twice; the order then shows it as already on the account).
+    own_pc = not selection.get("appliance") and not vms_license_owned(customer_id)
     values = (selection["plan"], selection.get("cameras") or MIN_CAMERA_QUANTITY, selection.get("appliance"),
-              selection.get("relays"), 1 if selection.get("own_pc") else 0)
+              selection.get("relays"), 1 if own_pc else 0)
     with connection() as db:
         db.execute("INSERT INTO build_system_intents(customer_id,plan_key,camera_quantity,appliance_sku,relay_modules,own_pc,state,"
                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(customer_id) DO UPDATE SET plan_key=excluded.plan_key,"
@@ -873,6 +918,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     import customer_billing
     import friends_family
     customer_id = identity["customer_id"]
+    activated = account_activated(customer_id)
     existing = existing_plan(customer_id)
     if entitlement and not (existing and existing["kind"] == "per_camera" and existing["active"]):
         entitlement = None  # a plan of the other Stripe mode: not this key's plan (existing_plan)
@@ -983,6 +1029,20 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         # (existing_plan): say so here instead of offering a picker that fails.
         activating = ('<section class="panel" id="v2-legacy-plan"><h2>Your earlier camera plan</h2>'
                       f'<p class="health-detail" role="status">{escape(LEGACY_PLAN_REFUSAL if legacy["verified"] else LEGACY_PLAN_UNVERIFIED)}</p></section>')
+    elif is_owner and not payload and not deferred and not activated:
+        # Before activation (owner decision 2026-10-16): the first purchase goes through Build Your System, so the plan
+        # picker is shown but disabled, with the way forward. require_activated() refuses the checkout server-side too.
+        options = "".join(f'<option>{escape(plan["display_name"])} · ${plan["monthly_cents_per_camera"] / 100:.2f} per camera/month</option>'
+                          for plan in PLANS.values())
+        picker = ('<section class="panel" id="v2-activate-first"><h2>Activate your system</h2>'
+                  '<p class="health-detail">Your first order is made in Build Your System: choose your cameras and monthly plan '
+                  '(and, on your own computer, the one-time AnyAiCam VMS software license). Plans and add-ons can be bought '
+                  'here once your system is activated.</p>'
+                  f'<a class="action-button" id="v2-activate-link" href="{escape(ACTIVATE_URL, quote=True)}">Activate Your System</a>'
+                  '<fieldset disabled aria-disabled="true" style="border:0;padding:0;margin:12px 0 0;opacity:.6">'
+                  f'<label>Plan <select>{options}</select></label> <label>Cameras <input type="number" value="1"></label> '
+                  '<button class="action-button" type="button" id="v2-checkout-disabled" disabled>Continue to secure checkout</button>'
+                  '</fieldset></section>')
     elif is_owner and not payload and not deferred:
         if payment_outcome == "cancelled":
             selection_note += '<p class="health-detail" id="v2-checkout-cancelled">Checkout was cancelled. No payment was taken.</p>'
@@ -1008,6 +1068,10 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                   '<p class="health-detail">Increases and upgrades take effect after payment succeeds. Decreases and downgrades take effect at the next renewal.</p></section>')
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
     addons = _addon_portal_rows(customer_id, plan_key, is_owner)
+    if not activated:  # visible, but bought only after activation (require_activated() on the server)
+        addons = ('<p class="health-detail" id="addons-after-activation">Add-ons can be added after you activate your system.</p>'
+                  + addons.replace('<button class="ghost-button addon-buy-button"',
+                                   '<button class="ghost-button addon-buy-button" disabled aria-disabled="true" title="Available after activation"'))
     # Software License, as three panels (VMS 1.2.7, 2026-10-15): license, registered appliances, downloads.
     import software_license_panels
     license_panels = software_license_panels.panels_html(customer_id, is_owner=is_owner, payload=payload,
@@ -1212,6 +1276,7 @@ def register_routes(app: FastAPI) -> None:
         existing = existing_plan(customer_id, lookup=True)
         if existing and existing["kind"] == "per_camera" and existing["active"]:
             raise HTTPException(status_code=409, detail="This account already has a camera plan. Use its plan-change action instead.")
+        require_activated(customer_id)
         if existing and existing["kind"] == "legacy":
             raise HTTPException(status_code=409, detail=LEGACY_PLAN_REFUSAL if existing["verified"] else LEGACY_PLAN_UNVERIFIED)
         if deferred_storage_plan(customer_id):

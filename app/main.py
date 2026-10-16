@@ -113349,6 +113349,8 @@ def create_stripe_checkout(
     if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
         authoritative_customer_id = str(_identity["customer_id"])
         authoritative_email = str(_identity.get("email") or "")
+        import per_camera_billing
+        per_camera_billing.require_activated(authoritative_customer_id)  # VMS 1.2.7: no My subscription purchase before activation
 
 
 
@@ -114134,6 +114136,8 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     identity = _authoritative_identity(request)
     if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
         raise HTTPException(status_code=403, detail="Customer owner permission required.")
+    import per_camera_billing
+    per_camera_billing.require_activated(identity["customer_id"])  # VMS 1.2.7: no My subscription purchase before activation
     from analytics_entitlements import ANALYTICS_CATALOG, checkout_item
     addon_key = payload.addon_key.strip().lower()
     # In billing v2, supported Talk Down is already part of AI Local and
@@ -114324,6 +114328,8 @@ def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Reque
     customer_id = identity["customer_id"]
     if appliance_includes_vms_license(customer_id):
         raise HTTPException(status_code=409, detail="Your AnyAiCam appliance already includes the VMS software license. There is nothing to pay.")
+    import per_camera_billing
+    per_camera_billing.require_activated(customer_id)  # VMS 1.2.7: no My subscription purchase before activation
     owned = max((int(e["camera_slot_quantity"] or 0) for e in get_entitlements_for_customer(customer_id)
                  if e["product"] == pricing_catalog.VMS_LICENSE_PRODUCT and e["status"] == "active"), default=0)
     if owned >= license_["capacity"]:
@@ -114395,6 +114401,8 @@ def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Requ
     if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
         authoritative_customer_id = str(_identity["customer_id"])
         authoritative_email = str(_identity.get("email") or "")
+        import per_camera_billing
+        per_camera_billing.require_activated(authoritative_customer_id)  # VMS 1.2.7: no My subscription purchase before activation
 
     from hardware_orders import HARDWARE_CATALOG
     sku = payload.sku.strip()
