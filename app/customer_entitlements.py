@@ -376,7 +376,10 @@ def vms_license_summary(customer_id: str) -> dict:
     * per_camera_plan      -- an active billing-v2 per-camera plan;
     * one_time_vms_license -- a purchased (DIY) one-time license row;
     * appliance_included   -- a paid AnyAiCam appliance order: the license
-                              follows the Local/Hybrid plan quantity;
+                              follows the Local/Hybrid plan quantity. Status
+                              "pending" (cameras 0) while the appliance is
+                              paid but no camera plan exists yet -- the
+                              hardware-first order is awaiting delivery/setup;
     * legacy_slots         -- an earlier Local/Hybrid plan with no license
                               on record (cameras 0);
     * none                 -- nothing.
@@ -415,6 +418,11 @@ def vms_license_summary(customer_id: str) -> dict:
         kind, status = "one_time_vms_license", "suspended"
     elif appliance_order and any(e["status"] == "suspended" for e in base_rows):
         kind, status = "appliance_included", "suspended"
+    elif appliance_order and not (plan and plan["kind"] == "legacy"):
+        # Hardware-first (2026-10-15): the appliance is paid for but no camera
+        # plan has started yet (awaiting delivery or setup). The license comes
+        # with the appliance; it is pending, not missing.
+        kind, status = "appliance_included", "pending"
     elif plan and plan["kind"] == "legacy":
         kind = "legacy_slots"
     # The licensed camera count is returned separately ("cameras") and shown on its
@@ -426,6 +434,7 @@ def vms_license_summary(customer_id: str) -> dict:
         ("per_camera_plan", "suspended"): "VMS software license for your per-camera plan · suspended until billing is resolved",
         ("one_time_vms_license", "suspended"): "One-time stand-alone VMS software license · suspended (payment refunded or disputed)",
         ("appliance_included", "suspended"): "VMS software license included with your AnyAiCam appliance · suspended until billing is resolved",
+        ("appliance_included", "pending"): "VMS software license included with your AnyAiCam appliance (activates when you set up your appliance)",
     }
     label = labels.get((kind, status))
     if kind == "legacy_slots":
