@@ -896,7 +896,7 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
                         '<p class="health-detail">Door access by face, a separate product billed per door; not part of any plan.</p>')
         rendered += face_rows
     rendered.append('<p class="health-detail">Advanced Line Crossing is not sold separately today; existing Smart Motion and line-crossing '
-                    'behavior are unchanged.</p>')
+                    'behavior are unchanged. Turning Line Crossing off also stops security-line alarms.</p>')
     return "".join(rendered)
 
 
@@ -911,6 +911,34 @@ def _local_date_html(epoch) -> str:
 
 def _camera_count(quantity, noun: str = "camera") -> str:
     return f"{int(quantity)} {noun}{'' if int(quantity) == 1 else 's'}"
+
+
+def _relay_panel(is_owner: bool, activated: bool) -> str:
+    """Door-control relays (Numato 3-channel) from My subscription (owner decision 2026-10-16): ordered by the account
+    owner only after activation, through the hardware checkout (hardware_checkout.RELAY_API_PATH). Before activation
+    the option is described with no purchase control."""
+    import hardware_checkout
+    import hardware_orders
+    entry = next((item for item in hardware_orders.HARDWARE_CATALOG if item[0] == hardware_checkout.RELAY_SKU), None)
+    if not entry:
+        return ""
+    cents, env = entry[3], entry[4]
+    price = f"${cents / 100:.2f}"
+    intro = (f'<p class="health-detail">Numato 3-channel relay for AAC Face Access door control or local door and gate '
+             f'triggering · {price} each, one-time · ships to a US address (Stripe collects it at checkout).</p>')
+    if not activated:
+        body = intro + '<p class="health-detail" id="v2-relays-after-activation">Relays can be ordered here after you activate your system.</p>'
+    elif not is_owner:
+        body = intro + '<p class="health-detail">The account owner can order relays.</p>'
+    elif not os.environ.get(env, "").strip():
+        body = intro + '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
+    else:
+        body = (intro + f'<label>Relays <input id="v2-relay-qty" type="number" min="1" max="{hardware_checkout.MAX_RELAY_MODULES}" '
+                f'value="1" data-cents="{cents}"></label> <span id="v2-relay-total" class="health-detail">{price} total, one-time</span> '
+                '<button class="action-button" id="v2-relay-buy" type="button">Order relays</button>'
+                '<p id="v2-relay-message" class="health-detail" role="status" aria-live="polite"></p>'
+                '<p class="health-detail"><a href="/customer/orders">My orders</a> shows each order from Paid to Delivered.</p>')
+    return f'<section class="panel" style="margin-top:14px" id="v2-relays"><h2>Door control</h2>{body}</section>'
 
 
 def customer_portal_page(identity: dict, entitlement: dict | None, selection: dict | None = None,
@@ -1105,6 +1133,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
     <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
+    {_relay_panel(is_owner, activated)}
     {license_panels}
     {picker if activated else ""}{change}'''
     scripts = f'''<script>
@@ -1117,6 +1146,10 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     const changeButton=document.getElementById('v2-change-button');if(changeButton)changeButton.onclick=async()=>{{const message=document.getElementById('v2-message');if(!confirm('Apply this plan or camera-count change?'))return;changeButton.disabled=true;let response,data={{}};try{{response=await fetch('/api/v2/customer/subscription/change',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2ChangePlan.value,camera_quantity:Number(v2ChangeQty.value)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{changeButton.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{changeButton.disabled=false;message.textContent=data.detail||'The change could not be completed.';return;}}message.textContent=data.message||'The subscription was updated.';setTimeout(()=>location.reload(),1000);}};
     const cancelButton=document.getElementById('v2-cancel-plan');if(cancelButton)cancelButton.onclick=async()=>{{if(!confirm('Cancel at the end of the paid period?'))return;let response,data={{}};try{{response=await fetch('/api/v2/customer/subscription/cancel',{{method:'POST'}});data=await response.json().catch(()=>({{}}));}}catch(e){{document.getElementById('v2-message').textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok&&!data.detail)data.detail='Your plan could not be cancelled right now. Please try again.';document.getElementById('v2-message').textContent=data.detail||'Your plan will stay active through the paid period.';if(response.ok)setTimeout(()=>location.reload(),1000);}};
     document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;let response,data={{}};try{{response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{button.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{button.disabled=false;message.textContent=(data.detail&&data.detail.message)||data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
+    const relayQty=document.getElementById('v2-relay-qty'),relayBuy=document.getElementById('v2-relay-buy'),relayMsg=document.getElementById('v2-relay-message');
+    function relayTotal(){{if(!relayQty)return;const q=Number(relayQty.value),c=Number(relayQty.dataset.cents);document.getElementById('v2-relay-total').textContent=Number.isInteger(q)&&q>=1&&q<=Number(relayQty.max)?'$'+(q*c/100).toFixed(2)+' total, one-time':'Choose from 1 to '+relayQty.max+' relays.';}}
+    if(relayQty){{relayQty.oninput=relayTotal;relayTotal();if(new URLSearchParams(location.search).get('relay_payment')==='cancelled')relayMsg.textContent='Checkout was cancelled. No payment was taken.';}}
+    if(relayBuy){{window.addEventListener('pageshow',()=>{{relayBuy.disabled=false;}});relayBuy.onclick=async()=>{{const q=Number(relayQty.value);if(!Number.isInteger(q)||q<1||q>Number(relayQty.max)){{relayMsg.textContent='Choose from 1 to '+relayQty.max+' relays.';return;}}relayBuy.disabled=true;relayMsg.textContent='';let response,data={{}};try{{response=await fetch('/api/customer/relay-checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{quantity:q}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{relayBuy.disabled=false;relayMsg.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok||!data.checkout_url){{relayBuy.disabled=false;const d=data.detail;relayMsg.textContent=(d&&d.message)||(typeof d==='string'?d:'')||'Checkout could not be started. Please try again.';return;}}location.href=data.checkout_url;}};}}
     async function v2OpenBillingPortal(){{let response,data={{}};try{{response=await fetch('/api/customer/billing-portal',{{method:'POST'}});data=await response.json().catch(()=>({{}}));}}catch(e){{document.getElementById('v2-message').textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}}
     const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=v2OpenBillingPortal;
     const updatePayment=document.getElementById('v2-update-payment');if(updatePayment)updatePayment.onclick=v2OpenBillingPortal;
