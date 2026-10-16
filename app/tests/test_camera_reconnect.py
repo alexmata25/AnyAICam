@@ -327,8 +327,23 @@ def test_a_camera_can_only_be_moved_to_a_local_network_address(world):
     and so its stored credentials, at a public host, a name or loopback."""
     job_id = _reconnect(world, username="admin", password="p").json()["job_id"]
     _appliance_confirms(world, job_id)
-    for host in ("8.8.8.8", "203.0.113.7", "camera.example.com", "127.0.0.1", "0.0.0.0", "224.0.0.1"):
+    for host in ("8.8.8.8", "203.0.113.7", "198.51.100.7", "192.0.2.5", "240.0.0.1", "198.18.0.1",
+                 "camera.example.com", "127.0.0.1", "0.0.0.0", "224.0.0.1", "[2001:db8::1]", "[::1]"):
         response = _appliance_moves_address(world, job_id, rtsp_uri=f"rtsp://{host}:554{PATH}")
         assert response.status_code in {400, 409}, host
     assert _camera(world)["onvif_endpoint"] == OLD
     assert _appliance_moves_address(world, job_id, rtsp_uri=f"rtsp://100.64.10.20:554{PATH}").json()["updated"] is True
+
+
+def test_the_local_network_allowlist_is_explicit():
+    import ipaddress
+    import appliance_cloud  # noqa: F401  (the constant lives in its route registration)
+    allowed = ("10.1.2.3", "172.16.0.9", "172.31.255.1", "192.168.0.43", "169.254.1.1", "100.64.10.20", "fd00::5", "fe80::1")
+    refused = ("172.32.0.1", "100.128.0.1", "203.0.113.7", "198.51.100.7", "192.0.2.5", "240.0.0.1", "198.18.0.1", "2001:db8::1")
+    networks = ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', 'fc00::/7', 'fe80::/10')
+    inside = lambda ip: any(ipaddress.ip_address(ip) in ipaddress.ip_network(n) for n in networks
+                            if ipaddress.ip_network(n).version == ipaddress.ip_address(ip).version)
+    assert all(inside(ip) for ip in allowed) and not any(inside(ip) for ip in refused)
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[1].joinpath("appliance_cloud.py").read_text(encoding="utf-8")
+    assert "RECONNECT_LOCAL_NETWORKS=" + repr(networks).replace(" ", "") in source.replace(" ", "")
