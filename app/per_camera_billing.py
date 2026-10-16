@@ -411,7 +411,8 @@ def account_activated(customer_id: str) -> bool:
 def require_activated(customer_id: str) -> None:
     """Server-side lock for every My subscription purchase before activation (409, never a Stripe call)."""
     if not account_activated(customer_id):
-        raise HTTPException(status_code=409, detail=ACTIVATE_FIRST)
+        raise HTTPException(status_code=409, detail={"code": "activate_first", "message": ACTIVATE_FIRST,
+                                                     "activate_url": ACTIVATE_URL})
 
 
 def save_build_selection(customer_id: str, selection: dict) -> None:
@@ -970,7 +971,8 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     import storage_trial
     trial_note = storage_trial.customer_note_html(customer_id, is_owner)
     features = payload["included_features"] if payload else []
-    plan_summary = "No per-camera plan selected yet. Choose a plan and licensed camera count to continue."
+    plan_summary = ("No per-camera plan selected yet. Choose a plan and licensed camera count to continue." if activated else
+                    "Not activated yet. Choose Activate Your System to make your first order in Build Your System.")
     current_html = ""
     # Ordered with an appliance: paid at activation, never offered again here.
     deferred = None if payload else deferred_storage_plan(customer_id)
@@ -984,7 +986,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     if payload:
         plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
                         f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
-                        f"${payload['monthly_base_total']:.2f} monthly base total")
+                        f"${payload['monthly_base_total']:.2f} per month in total")
         retention = f"{payload['local_retention_days']}-day local retention"
         if payload["cloud_event_storage"]:
             retention += f" · {payload['cloud_event_retention_days']}-day cloud event storage"
@@ -1045,7 +1047,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                   f'<a class="action-button" id="v2-activate-link" href="{escape(ACTIVATE_URL, quote=True)}">Activate Your System</a>'
                   '<fieldset disabled aria-disabled="true" style="border:0;padding:0;margin:12px 0 0;opacity:.6">'
                   f'<label>Plan <select>{options}</select></label> <label>Cameras <input type="number" value="1"></label> '
-                  '<button class="action-button" type="button" id="v2-checkout-disabled" disabled>Continue to secure checkout</button>'
+                  '<button class="action-button" type="button" id="v2-checkout-button" data-locked="1" disabled aria-disabled="true">Continue to secure checkout</button>'
                   '</fieldset></section>')
     elif is_owner and not payload and not deferred:
         if payment_outcome == "cancelled":
@@ -1098,23 +1100,23 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     else:
         scripts_focus += "try{sessionStorage.removeItem('v2ActivationTries')}catch(e){}"
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
-    {payment_alert}{activating}{setup_next}
+    {payment_alert}{activating}{setup_next}{picker if not activated else ""}
     <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{trial_note}{billing_note}{action_html}</section>
     {friends_family.customer_panel_html()}
     <section class="panel" style="margin-top:14px" id="v2-included"><h2>{included_title}</h2>{feature_html}</section>
     <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
     {license_panels}
-    {picker}{change}'''
+    {picker if activated else ""}{change}'''
     scripts = f'''<script>
     const v2Plans={json.dumps(plan_menu)};
     function v2Total(planEl,quantityEl,targetEl){{if(!planEl||!quantityEl||!targetEl)return;const p=v2Plans[planEl.value],q=Math.max(0,Number(quantityEl.value)||0);targetEl.textContent=p?'$'+(p.cents*q/100).toFixed(2)+' per month':'';}}
     const v2Plan=document.getElementById('v2-plan-key'),v2Qty=document.getElementById('v2-quantity');
     const v2Target=document.getElementById('v2-total');if(v2Plan&&v2Qty){{v2Plan.onchange=()=>v2Total(v2Plan,v2Qty,v2Target);v2Qty.oninput=()=>v2Total(v2Plan,v2Qty,v2Target);v2Total(v2Plan,v2Qty,v2Target);}}
     const v2ChangePlan=document.getElementById('v2-change-plan'),v2ChangeQty=document.getElementById('v2-change-quantity'),v2ChangeTarget=document.getElementById('v2-change-total');if(v2ChangePlan&&v2ChangeQty){{v2ChangePlan.onchange=()=>v2Total(v2ChangePlan,v2ChangeQty,v2ChangeTarget);v2ChangeQty.oninput=()=>v2Total(v2ChangePlan,v2ChangeQty,v2ChangeTarget);v2Total(v2ChangePlan,v2ChangeQty,v2ChangeTarget);}}
-    const checkoutButton=document.getElementById('v2-checkout-button');if(checkoutButton){{window.addEventListener('pageshow',()=>{{checkoutButton.disabled=false;}});checkoutButton.onclick=async()=>{{const message=document.getElementById('v2-checkout-message')||document.getElementById('v2-message');const show=text=>{{message.textContent=text;message.scrollIntoView({{block:'center'}});}};const qty=Number(v2Qty.value);if(!Number.isInteger(qty)||qty<1||qty>64){{show('Choose from 1 to 64 cameras.');return;}}checkoutButton.disabled=true;message.textContent='';let response=null,data={{}};try{{response=await fetch('/api/v2/customer/subscription/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2Plan.value,camera_quantity:qty}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{checkoutButton.disabled=false;show('Could not reach AnyAiCam. Check your connection and try again.');return;}}if(!response.ok||!data.checkout_url){{checkoutButton.disabled=false;const d=data&&data.detail;show(typeof d==='string'&&d?d:Array.isArray(d)?'Please check the plan and camera count and try again.':'Checkout could not be started (error '+response.status+'). Please try again or contact AnyAiCam support.');return;}}location.href=data.checkout_url;}};}}
+    const checkoutButton=document.getElementById('v2-checkout-button');if(checkoutButton&&!checkoutButton.dataset.locked){{window.addEventListener('pageshow',()=>{{checkoutButton.disabled=false;}});checkoutButton.onclick=async()=>{{const message=document.getElementById('v2-checkout-message')||document.getElementById('v2-message');const show=text=>{{message.textContent=text;message.scrollIntoView({{block:'center'}});}};const qty=Number(v2Qty.value);if(!Number.isInteger(qty)||qty<1||qty>64){{show('Choose from 1 to 64 cameras.');return;}}checkoutButton.disabled=true;message.textContent='';let response=null,data={{}};try{{response=await fetch('/api/v2/customer/subscription/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2Plan.value,camera_quantity:qty}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{checkoutButton.disabled=false;show('Could not reach AnyAiCam. Check your connection and try again.');return;}}if(!response.ok||!data.checkout_url){{checkoutButton.disabled=false;const d=data&&data.detail;show(d&&typeof d==='object'&&d.message?d.message:typeof d==='string'&&d?d:Array.isArray(d)?'Please check the plan and camera count and try again.':'Checkout could not be started (error '+response.status+'). Please try again or contact AnyAiCam support.');return;}}location.href=data.checkout_url;}};}}
     const changeButton=document.getElementById('v2-change-button');if(changeButton)changeButton.onclick=async()=>{{const message=document.getElementById('v2-message');if(!confirm('Apply this plan or camera-count change?'))return;changeButton.disabled=true;let response,data={{}};try{{response=await fetch('/api/v2/customer/subscription/change',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{plan_key:v2ChangePlan.value,camera_quantity:Number(v2ChangeQty.value)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{changeButton.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{changeButton.disabled=false;message.textContent=data.detail||'The change could not be completed.';return;}}message.textContent=data.message||'The subscription was updated.';setTimeout(()=>location.reload(),1000);}};
     const cancelButton=document.getElementById('v2-cancel-plan');if(cancelButton)cancelButton.onclick=async()=>{{if(!confirm('Cancel at the end of the paid period?'))return;let response,data={{}};try{{response=await fetch('/api/v2/customer/subscription/cancel',{{method:'POST'}});data=await response.json().catch(()=>({{}}));}}catch(e){{document.getElementById('v2-message').textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok&&!data.detail)data.detail='Your plan could not be cancelled right now. Please try again.';document.getElementById('v2-message').textContent=data.detail||'Your plan will stay active through the paid period.';if(response.ok)setTimeout(()=>location.reload(),1000);}};
-    document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;let response,data={{}};try{{response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{button.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{button.disabled=false;message.textContent=data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
+    document.querySelectorAll('.addon-buy-button').forEach(button=>button.onclick=async()=>{{const message=document.getElementById('subscription-addon-message');button.disabled=true;let response,data={{}};try{{response=await fetch('/api/customer/analytics/checkout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{addon_key:button.dataset.addonKey,quantity:Number(button.dataset.quantity||1)}})}});data=await response.json().catch(()=>({{}}));}}catch(e){{button.disabled=false;message.textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(!response.ok){{button.disabled=false;message.textContent=(data.detail&&data.detail.message)||data.detail||'Add-on checkout could not be started.';return;}}location.href=data.checkout_url;}});
     async function v2OpenBillingPortal(){{let response,data={{}};try{{response=await fetch('/api/customer/billing-portal',{{method:'POST'}});data=await response.json().catch(()=>({{}}));}}catch(e){{document.getElementById('v2-message').textContent='Could not reach AnyAiCam. Check your connection and try again.';return;}}if(response.ok)location.href=data.url;else document.getElementById('v2-message').textContent=data.detail||'Billing management could not be opened.';}}
     const manage=document.getElementById('manage-billing-button');if(manage)manage.onclick=v2OpenBillingPortal;
     const updatePayment=document.getElementById('v2-update-payment');if(updatePayment)updatePayment.onclick=v2OpenBillingPortal;
@@ -1282,6 +1284,8 @@ def register_routes(app: FastAPI) -> None:
         identity = partner_identity(request)
         if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
             raise HTTPException(status_code=403, detail="Customer owner permission required.")
+        # Before activation the answer is always "activate first", whatever the plan or its configuration.
+        require_activated(identity["customer_id"])
         plan_key = payload.plan_key.strip().lower()
         plan = PLANS.get(plan_key)
         price_id = price_id_for(plan_key)
@@ -1293,7 +1297,6 @@ def register_routes(app: FastAPI) -> None:
         existing = existing_plan(customer_id, lookup=True)
         if existing and existing["kind"] == "per_camera" and existing["active"]:
             raise HTTPException(status_code=409, detail="This account already has a camera plan. Use its plan-change action instead.")
-        require_activated(customer_id)
         if existing and existing["kind"] == "legacy":
             raise HTTPException(status_code=409, detail=LEGACY_PLAN_REFUSAL if existing["verified"] else LEGACY_PLAN_UNVERIFIED)
         if deferred_storage_plan(customer_id):

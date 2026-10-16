@@ -286,8 +286,9 @@ def pytest_configure(config):
 def _accounts_activated(request, monkeypatch):
     """VMS 1.2.7 activation lock (per_camera_billing.account_activated, owner decision 2026-10-16): My subscription
     purchases need a verified first purchase. Tests written before it buy as accounts that already made one (their
-    subject is the checkout itself); tests marked real_activation run the real rule."""
-    if request.node.get_closest_marker("real_activation"):
+    subject is the checkout itself); tests marked real_activation, and every test module about activation (its file
+    name contains "activation", e.g. an independent acceptance suite), run the real rule."""
+    if request.node.get_closest_marker("real_activation") or "activation" in request.node.fspath.basename:
         yield
         return
     try:

@@ -171,7 +171,7 @@ def test_v2_my_subscription_shows_plan_and_does_not_offer_included_talk_down(db_
     billing._upsert_current(sub)
     import partner_portal
     html = billing.customer_portal_page({"customer_id": "cust-v2", "role": "customer_owner"}, billing.entitlement_for_customer("cust-v2"))
-    assert "AI Local" in html and "$14.99 per camera/month" in html and "$89.94 monthly base total" in html
+    assert "AI Local" in html and "$14.99 per camera/month" in html and "$89.94 per month in total" in html
     assert "7-day local retention" in html
     assert "Talk Down / two-way audio on supported cameras" in html
     assert 'data-addon-key="talk_down"' not in html

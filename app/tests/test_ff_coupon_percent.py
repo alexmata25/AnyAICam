@@ -9,20 +9,23 @@ anything else pauses checkout (503) rather than giving the wrong discount.
 import pytest
 
 from database_backend import override_target
-from test_hybrid_build_system_flow import (_checkout, _checkouts, _customer_id, _new_customer,  # noqa: F401
+from test_hybrid_build_system_flow import (PRICES, _checkout, _checkouts, _customer_id, _new_customer,  # noqa: F401
                                            db_path, license_portal, package, portal, shop, site, storage)
 
 pytestmark = pytest.mark.usefixtures("stripe_follows_events")
 
+# A first order without hardware is the own-PC order (VMS 1.2.7 activation-first): the AI Local plan plus the one-time
+# licence line, so the base coupon must be scoped on Stripe to the plan's Product (friends_family.verify_coupon_scope).
 PLAN_ONLY = "plan=ai_local&cameras=3"
+PLAN_PRODUCT = "prod_plan_ai_local"
 
 
 @pytest.fixture()
 def coupons(monkeypatch):
     """Stripe's coupons as a test sets them; reads are counted."""
     import main
-    state = {"coupon_ff_base": {"percent_off": 50, "valid": True}, "coupon_ff_analytics": {"percent_off": 25, "valid": True},
-             "reads": 0, "fail": False}
+    state = {"coupon_ff_base": {"percent_off": 50, "valid": True, "applies_to": {"products": [PLAN_PRODUCT]}},
+             "coupon_ff_analytics": {"percent_off": 25, "valid": True}, "reads": 0, "fail": False}
     previous = main.stripe_api_get
 
     def get(path):
@@ -32,6 +35,11 @@ def coupons(monkeypatch):
                 raise OSError("Stripe unreachable")
             coupon_id = path.split("/")[3].split("?")[0]
             return {"id": coupon_id, **state.get(coupon_id, {})}
+        if path.startswith("/v1/prices/"):  # each Price's Product, for the coupon scope check
+            price_id = path.rsplit("/", 1)[-1].split("?")[0]
+            found = dict(previous(path) or {})
+            found["product"] = PLAN_PRODUCT if price_id == PRICES["ai_local"] else f"prod_for_{price_id}"
+            return found
         return previous(path)
     monkeypatch.setattr(main, "stripe_api_get", get)
     return state
@@ -60,6 +68,16 @@ def test_a_correctly_configured_coupon_is_used(shop, db_path, coupons):
     import friends_family
     with override_target(sqlite_path=str(db_path)):
         assert friends_family.checkout_discount(customer_id, "analytics")["coupon"] == "coupon_ff_analytics"
+
+
+def test_an_unscoped_base_coupon_pauses_the_own_pc_first_order(shop, db_path, coupons):
+    """A coupon that applies to every product would also discount the one-time licence: fail closed."""
+    client, captured, mail, _, _ = shop
+    coupons["coupon_ff_base"] = {"percent_off": 50, "valid": True}
+    _approved(client, mail, db_path, "unscoped@example.test")
+    before = len(_checkouts(captured))
+    assert _checkout(client).status_code == 503
+    assert len(_checkouts(captured)) == before
 
 
 @pytest.mark.parametrize("configured", [{"percent_off": 25, "valid": True}, {"percent_off": 100, "valid": True},
