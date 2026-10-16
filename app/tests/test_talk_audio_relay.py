@@ -109,6 +109,12 @@ def _start_session(client, camera_id, cookie):
     return response.json()["session_id"]
 
 
+def _wait_until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
 def _session_state(db_path, session_id):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -229,7 +235,19 @@ def test_no_appliance_channel_uses_local_isapi_fallback(client, db_path, monkeyp
     monkeypatch.setattr(talk_audio_relay, "_LocalIsapiTalkRelay", FakeLocalRelay)
     session_id = _start_session(client, "cam-1", {partner_portal.SESSION_COOKIE: _owner_cookie()})
     with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio?sample_rate=44100", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}) as websocket:
+        # Flake fix (Red triage 2026-10-15; failed intermittently on 9bf3c20
+        # and 4dc7ad1 with the frame or the stop missing): the server opens
+        # the local relay in a worker thread and only then reads audio, and
+        # Starlette's TestClient cancels the server task when this context
+        # exits (see talk_real_server_check.py). Sending and leaving at once
+        # raced both. Wait for "ready", for the frame to reach the relay, and
+        # for the relay to be stopped after a normal close -- all while the
+        # server task is still alive.
+        assert websocket.receive_json() == {"type": "ready"}
         websocket.send_bytes(b"\x00\x00")
+        _wait_until(lambda: b"\x00\x00" in calls)
+        websocket.close()
+        _wait_until(lambda: calls[-1] == "stopped")
     assert calls[0] == ("cam-1", 44100, session_id)
     assert b"\x00\x00" in calls
     assert calls[-1] == "stopped"
