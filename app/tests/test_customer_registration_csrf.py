@@ -16,6 +16,11 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(ignore_cleanup_errors=True); root=Path(self.temp.name)
         self.db_path=root/"partner.db"; self.users_file=root/"must-not-exist.json"
+        # Restored in tearDown: this file is deleted with the temp dir, and a
+        # leaked ANYAICAM_PARTNER_DB sent every later test that uses the
+        # ambient database (no override_target) to an empty file ("no such
+        # table") -- 26 order-dependent full-suite failures (Red triage 2026-10-15).
+        self._saved_partner_db=os.environ.get("ANYAICAM_PARTNER_DB")
         os.environ["ANYAICAM_PARTNER_DB"]=str(self.db_path)
         self.db_override=override_target(sqlite_path=self.db_path); self.db_override.__enter__(); initialize_database()
         with sqlite3.connect(self.db_path) as db:
@@ -30,6 +35,8 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
         self.master={"master":True,"email":"master@example.test","partner_id":None}
     def tearDown(self):
         self.client.close(); self.users_patch.stop(); self.settings_patch.stop(); self.db_override.__exit__(None,None,None); self.temp.cleanup()
+        if self._saved_partner_db is None: os.environ.pop("ANYAICAM_PARTNER_DB",None)
+        else: os.environ["ANYAICAM_PARTNER_DB"]=self._saved_partner_db
     def rows(self,sql,args=()):
         db=sqlite3.connect(self.db_path); db.row_factory=sqlite3.Row
         try:return [dict(x) for x in db.execute(sql,args).fetchall()]
