@@ -211,7 +211,9 @@ def scan(monkeypatch, tmp_path, pipeline, background_loop):
         return f"/recordings/clips/motion/motion_{event_id}.mp4"
 
     monkeypatch.setattr(main, "build_motion_event_clip", build)
-    identity = {"ppe_enabled": False, "smart_motion_enabled": False, "cloud_recording_mode": "motion"}
+    # Person/vehicle events exist only while Smart Motion is on (Control Center,
+    # bf05889); this scenario needs the person event, so the camera has it on.
+    identity = {"ppe_enabled": False, "smart_motion_enabled": True, "cloud_recording_mode": "motion"}
     monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda camera: identity)
     monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera: identity["ppe_enabled"])
     monkeypatch.setattr(main.ppe, "detect_ppe", lambda crop, camera_number=None: {"hard_hat_present": False, "safety_vest_present": True, "confidence": 0.8})
@@ -362,3 +364,14 @@ def test_people_counting_owned_clip_is_built_uploaded_and_shared(pipeline, monke
 def test_people_counting_without_media_capture_builds_nothing(pipeline, monkeypatch):
     sys.modules["event_media_uploader"].EVENT_MEDIA_UPLOAD_ENABLED = False
     assert main._analytics_media_owner(3, "count-1", T0) is None
+
+
+def test_ppe_only_camera_builds_its_own_clip_for_the_ppe_event(scan):
+    """Smart Motion off (Control Center, bf05889): no person event is created,
+    so the PPE event itself owns the scan's clip -- PPE alerts still get video."""
+    scan.identity["smart_motion_enabled"] = False
+    scan.identity["ppe_enabled"] = True
+    events = scan.run()
+    assert _of(events, "person") == []
+    ppe_event = _of(events, "ppe")[0]
+    assert _wait_until(lambda: [u["event_id"] for u in scan.calls.uploads] == [ppe_event["id"]])

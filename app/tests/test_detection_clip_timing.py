@@ -134,6 +134,9 @@ def wired(monkeypatch, tmp_path):
     main.ai_activities.reset()
     # One scan: its activity ends at once (continuous activity: test_continuous_activity.py).
     monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    # Person/vehicle events exist only while Smart Motion is on (Control Center,
+    # bf05889); this scenario needs the person event, so the camera has it on.
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda camera: {"smart_motion_enabled": True})
     builds, uploads = [], []
 
     async def fake_build(event_id, camera_number, start, end):

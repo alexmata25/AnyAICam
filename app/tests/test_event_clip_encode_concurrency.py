@@ -363,6 +363,9 @@ def test_ai_event_and_thumbnail_are_immediate_even_when_encode_queue_is_saturate
 
     monkeypatch.setattr(main, "event_clip_encode_semaphore", asyncio.Semaphore(1))
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
+    # Person/vehicle events exist only while Smart Motion is on (Control Center,
+    # bf05889); this scenario needs the person event, so the camera has it on.
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda camera: {"smart_motion_enabled": True})
 
     camera_number = 4
     monkeypatch.delitem(main.ai_event_clip_windows, camera_number, raising=False)

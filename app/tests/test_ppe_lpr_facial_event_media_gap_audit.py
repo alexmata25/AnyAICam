@@ -148,7 +148,8 @@ def test_ppe_event_in_same_scan_shares_that_scans_clip(
     monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera_number: True)
     monkeypatch.setattr(
         main.recording_uploader, "_camera_identity",
-        lambda camera_number: {"ppe_enabled": True, "smart_motion_enabled": False},
+        # Person + PPE in one scan: the person event needs Smart Motion on (bf05889).
+        lambda camera_number: {"ppe_enabled": True, "smart_motion_enabled": True},
     )
     monkeypatch.setattr(
         main.ppe, "detect_ppe",

@@ -39,6 +39,9 @@ def save_env(monkeypatch, tmp_path):
     main.ai_event_clip_windows.clear()
     main.ai_activities.reset()
     monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    # Person/vehicle events exist only while Smart Motion is on (Control Center,
+    # bf05889); this scenario needs the person event, so the camera has it on.
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda n: {"smart_motion_enabled": True})
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
     monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
     events = []
