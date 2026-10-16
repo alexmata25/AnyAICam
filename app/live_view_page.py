@@ -637,6 +637,7 @@ _CAMERA_MANAGE_JS = """
     link.hidden=!(refusal&&target);
     if(target)link.setAttribute('href',target);
     document.querySelectorAll('.remove-camera').forEach(button=>{button.hidden=!manage;});
+    document.querySelectorAll('.reconnect-camera').forEach(button=>{button.hidden=!manage;});
     bar.hidden=false;
   }
   fetch('/api/customer/cameras',{headers:{'Accept':'application/json'}})
@@ -649,7 +650,8 @@ _CAMERA_MANAGE_JS = """
       const name=button.dataset.cameraName||'this camera';
       const ok=window.confirm(`Remove ${name} from your cameras?\\n\\n`+
         'AnyAiCam stops recording it within about a minute, its place on your plan becomes free, and the appliance forgets the camera and its saved password. '+
-        'Its recordings, events and clips are kept. If you add this camera again later, it starts as a new camera.');
+        'Its recordings, events and clips are kept. If you add this camera again later, it starts as a new camera.\\n\\n'+
+        'If the camera only went offline (for example after a power cut), use Reconnect instead: it keeps the camera, its rules and recordings.');
       if(!ok)return;
       button.disabled=true;
       try{
@@ -659,6 +661,92 @@ _CAMERA_MANAGE_JS = """
         showToast(String(body.message||'Camera removed.'));
         setTimeout(()=>window.location.reload(),900);
       }catch(e){button.disabled=false;showToast('The camera could not be removed. Check your connection and try again.');}
+    });
+  });
+  // Reconnect an existing camera (2026-10-15): search the network for THIS
+  // camera (matched by its own identity on the server), confirm or enter its
+  // login, let the appliance verify it, then wait for its video.
+  const dialog=document.getElementById('reconnect-dialog');
+  if(!dialog)return;
+  const statusEl=document.getElementById('reconnect-status'),form=document.getElementById('reconnect-form'),
+        userEl=document.getElementById('reconnect-username'),passEl=document.getElementById('reconnect-password'),
+        savedRow=document.getElementById('reconnect-saved-row'),useSaved=document.getElementById('reconnect-use-saved'),
+        submitEl=document.getElementById('reconnect-submit'),help=document.getElementById('reconnect-help'),
+        closeEl=document.getElementById('reconnect-close'),title=document.getElementById('reconnect-title');
+  let active=null,reconnected=false;
+  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  const say=text=>{statusEl.textContent=text;};
+  const showHelp=text=>{help.textContent=text;help.hidden=!text;};
+  async function api(method,url,body){
+    const response=await fetch(url,{method,headers:{'Accept':'application/json','Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+    let data={};try{data=await response.json();}catch(e){}
+    if(!response.ok)throw new Error(String(data.detail||'The request did not succeed. Try again.'));
+    return data;
+  }
+  async function rediscover(id,name){
+    active={id,name,cancelled:false};reconnected=false;form.hidden=true;showHelp('');
+    title.textContent=`Reconnect ${name}`;
+    say(`Searching your network for ${name}…`);
+    try{
+      const started=await api('POST',`/api/customer/cameras/${encodeURIComponent(id)}/rediscover`);
+      const deadline=Date.now()+120000;
+      while(Date.now()<deadline){
+        if(active.cancelled)return;
+        const scan=await api('GET',`/api/customer/cameras/${encodeURIComponent(id)}/rediscover/${encodeURIComponent(started.scan_job_id)}`);
+        if(scan.status==='complete'){
+          if(scan.found){
+            say(`Found ${name} on your network at a new address. It is the same camera, recognized by its own identity.`);
+            savedRow.hidden=!scan.has_saved_credentials;useSaved.checked=!!scan.has_saved_credentials;
+            userEl.value='';passEl.value='';form.hidden=false;
+            (scan.has_saved_credentials?submitEl:userEl).focus();
+          }else{
+            say(`${name} was not found on your network.`);
+            showHelp((scan.other_devices?`${scan.other_devices} other device${scan.other_devices===1?' was':'s were'} found, but AnyAiCam never connects a different device in place of this camera. `:'')+
+              'Check that the camera has power and its network cable is connected, then try again. If you replaced the camera with a new one, remove it and use Add camera.');
+          }
+          return;
+        }
+        if(['error','timed_out','cancelled'].includes(scan.status)){say(scan.message||'The network search did not finish. Try again.');return;}
+        await sleep(2000);
+      }
+      say('The network search is taking longer than expected. Try again in a minute.');
+    }catch(error){say(error.message);}
+  }
+  form.addEventListener('submit',async event=>{
+    event.preventDefault();
+    if(!active)return;
+    const {id,name}=active;
+    const saved=useSaved.checked&&!savedRow.hidden&&!userEl.value&&!passEl.value;
+    const body={username:userEl.value,password:passEl.value,use_saved_credentials:saved};
+    submitEl.disabled=true;form.hidden=true;showHelp('');
+    say('Checking the username and password with the camera…');
+    try{
+      const job=await api('POST',`/api/customer/cameras/${encodeURIComponent(id)}/reconnect`,body);
+      passEl.value='';
+      const deadline=Date.now()+180000;
+      while(Date.now()<deadline){
+        if(active.cancelled)return;
+        const state=await api('GET',`/api/customer/cameras/${encodeURIComponent(id)}/reconnect/${encodeURIComponent(job.job_id)}`);
+        if(state.status==='failed'){say(state.message||'The camera could not be reconnected.');form.hidden=false;return;}
+        if(state.status==='provisioned'){
+          reconnected=true;
+          if(state.video_confirmed){say(`${name} is reconnected and its video is back.`);return;}
+          say(`${name} is reconnected. Waiting for its video…`);
+        }
+        await sleep(3000);
+      }
+      say(reconnected?`${name} is reconnected. Its video should appear within a minute.`:'The appliance has not answered yet. Check that it is online, then try again.');
+    }catch(error){say(error.message);form.hidden=false;}
+    finally{submitEl.disabled=false;}
+  });
+  useSaved.addEventListener('change',()=>{if(useSaved.checked){userEl.value='';passEl.value='';}});
+  closeEl.addEventListener('click',()=>{if(active)active.cancelled=true;dialog.close();if(reconnected)window.location.reload();});
+  dialog.addEventListener('cancel',()=>{if(active)active.cancelled=true;});
+  document.querySelectorAll('.reconnect-camera').forEach(button=>{
+    button.addEventListener('click',event=>{
+      event.preventDefault();event.stopPropagation();
+      try{dialog.showModal();}catch(e){dialog.setAttribute('open','');}
+      rediscover(button.dataset.cameraId,button.dataset.cameraName||'this camera');
     });
   });
 })();
@@ -1674,6 +1762,18 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             '<a class="ghost-button" id="camera-capacity-link" href="/subscription-portal" hidden>My subscription</a>'
             f'<a class="action-button" id="add-camera-button" href="{escape(add_href, quote=True)}" hidden>Add camera</a>'
             '</div></section>'
+            '<dialog class="reconnect-dialog panel" id="reconnect-dialog" aria-labelledby="reconnect-title">'
+            '<h2 id="reconnect-title">Reconnect camera</h2>'
+            '<p id="reconnect-status" role="status" aria-live="polite"></p>'
+            '<form id="reconnect-form" hidden>'
+            '<label id="reconnect-saved-row" hidden><input type="checkbox" id="reconnect-use-saved"> Use the saved username and password</label>'
+            '<label>Camera username <input id="reconnect-username" name="username" autocomplete="off"></label>'
+            '<label>Camera password <input id="reconnect-password" name="password" type="password" autocomplete="new-password"></label>'
+            '<button class="action-button" type="submit" id="reconnect-submit">Verify and reconnect</button>'
+            '</form>'
+            '<p class="reconnect-help" id="reconnect-help" hidden></p>'
+            '<div class="camera-manage-actions"><button class="ghost-button" type="button" id="reconnect-close">Close</button></div>'
+            '</dialog>'
         ) if is_owner else ''
 
         def _tile(camera: dict) -> str:
@@ -1699,6 +1799,17 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 f' title="Remove camera" aria-label="Remove {escape(_camera_display_label(camera), quote=True)}">🗑</button>'
                 if is_owner else ''
             )
+            # Reconnect (owners only, 2026-10-15): bring back THIS camera after
+            # its network address changed, keeping its identity, rules and
+            # recordings -- see _CAMERA_MANAGE_JS and /api/customer/cameras/
+            # {id}/rediscover and /reconnect (partner_workspace.py).
+            reconnect_button = (
+                f'<button class="camera-tool reconnect-camera" hidden'
+                f' data-camera-id="{escape(camera["id"], quote=True)}"'
+                f' data-camera-name="{escape(_camera_display_label(camera), quote=True)}"'
+                f' title="Reconnect camera" aria-label="Reconnect {escape(_camera_display_label(camera), quote=True)}">🔄</button>'
+                if is_owner else ''
+            )
             offline = bool(camera.get('known_offline'))
             return f'''<article class="live-grid-tile{' tile-offline' if offline else ''}" data-camera-id="{escape(camera['id'], quote=True)}"{' data-offline="1"' if offline else ''}>
               <div class="camera-view" style="border-radius:10px">
@@ -1717,6 +1828,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                     title="Camera tools (mute, snapshot, fullscreen, playback, analytics, stop)"
                     aria-label="Open camera tools">⚙</a>
                   {unlock_button}
+                  {reconnect_button}
                   {remove_button}
                 </div>
               </div>
@@ -1789,6 +1901,10 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.camera-manage-actions{{display:flex;flex-wrap:wrap;gap:8px}}'
             f'.camera-capacity-message{{margin:4px 0 0;max-width:62ch}}'
             f'.remove-camera:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'.reconnect-dialog{{max-width:min(460px,calc(100vw - 32px));padding:18px 20px}}'
+            f'.reconnect-dialog label{{display:block;margin:10px 0}}'
+            f'.reconnect-dialog input:not([type=checkbox]){{display:block;width:100%;margin-top:4px}}'
+            f'.reconnect-help{{max-width:62ch}}'
             f'.tile-video{{display:block;font-size:11px;font-weight:400;opacity:.8}}'
             f'</style>'
             f'{manage_bar}'

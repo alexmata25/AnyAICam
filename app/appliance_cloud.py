@@ -1019,7 +1019,42 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 updated=bool(changed)
             if updated:
                 audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.media_uri_resolved','camera',camera_id,{'device_key':device_key})
+        elif str(payload.get('provisioning_job_id') or '').strip():
+            # Reconnect (2026-10-15, VMS 1.2.7): the camera's DHCP address
+            # changed. Only the HOST may change, and only on the strength of
+            # a recent, successful provisioning job for this same camera,
+            # identity and appliance -- the agent located the device by its
+            # ONVIF identity and verified the credentials at the new address
+            # (appliance-agent service.py, _reconnect_existing_camera_address).
+            if _reconnect_existing_address(appliance,camera,device_key,rtsp_uri,str(payload.get('provisioning_job_id')).strip()):
+                return {'message':'Camera reconnected at its new network address.','updated':True}
+            return {'message':'Camera address unchanged.','updated':False}
         return {'message':'Media URI recorded.' if updated else 'Camera already has a media URI; not replaced.','updated':updated}
+
+    RECONNECT_JOB_WINDOW_SECONDS=1800
+
+    def _reconnect_existing_address(appliance: dict,camera: dict,device_key: str,rtsp_uri: str,job_id: str) -> bool:
+        from urllib.parse import urlsplit
+        job=row('SELECT id,status,camera_id,device_key,updated_at FROM camera_provisioning_requests WHERE id=? AND appliance_id=? AND customer_id=?',
+                (job_id,appliance['id'],appliance['customer_id']))
+        if not job or job['status']!='provisioned' or job['camera_id']!=camera['id'] or job['device_key']!=device_key:
+            raise HTTPException(status_code=409,detail='No successful reconnect of this camera authorizes an address change.')
+        try: age=(datetime.now()-datetime.fromisoformat(job['updated_at'])).total_seconds()
+        except (TypeError,ValueError): age=RECONNECT_JOB_WINDOW_SECONDS+1
+        if age>RECONNECT_JOB_WINDOW_SECONDS:
+            raise HTTPException(status_code=409,detail='This reconnect has expired; reconnect the camera again.')
+        old=urlsplit(camera['onvif_endpoint']); new=urlsplit(rtsp_uri)
+        if (old.scheme,old.port,old.path,old.query)!=(new.scheme,new.port,new.path,new.query):
+            raise HTTPException(status_code=409,detail='Only the camera network address may change on reconnect.')
+        if (old.hostname or '')==(new.hostname or ''):
+            return False
+        with connection() as db:
+            changed=db.execute('UPDATE cameras SET onvif_endpoint=? WHERE id=? AND appliance_id=? AND device_key=? AND onvif_endpoint=?',
+                               (rtsp_uri,camera['id'],appliance['id'],device_key,camera['onvif_endpoint'])).rowcount
+        if changed:
+            audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.address_reconnected','camera',camera['id'],
+                  {'device_key':device_key,'provisioning_job_id':job_id})
+        return bool(changed)
 
     @app.get('/api/appliance/signing-keys')
     def identity_signing_keys() -> dict:

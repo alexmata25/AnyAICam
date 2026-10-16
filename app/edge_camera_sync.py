@@ -539,21 +539,20 @@ def sync_provisioned_cameras() -> dict:
 
             if not device_key:
                 continue
-            already_has_credential = db.execute(
-                "SELECT 1 FROM camera_credentials WHERE camera_id=?", (camera_id,)
-            ).fetchone()
-            if already_has_credential:
-                continue
             pending = db.execute(
                 "SELECT encrypted_blob FROM pending_camera_credentials WHERE device_key=?", (device_key,)
             ).fetchone()
             if not pending:
                 continue
             # Ciphertext relocation only -- this process never decrypts,
-            # inspects, or logs the value it is moving.
+            # inspects, or logs the value it is moving. A pending credential
+            # only exists after the agent verified it against this device
+            # (poll_provisioning: success), so it also REPLACES an older one:
+            # reconnecting an existing camera with a changed password
+            # (2026-10-15) must not leave the appliance on the old password.
             db.execute(
                 "INSERT INTO camera_credentials(camera_id,encrypted_blob,created_at,updated_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(camera_id) DO NOTHING",
+                "ON CONFLICT(camera_id) DO UPDATE SET encrypted_blob=excluded.encrypted_blob,updated_at=excluded.updated_at",
                 (camera_id, pending["encrypted_blob"], now, now),
             )
             db.execute("DELETE FROM pending_camera_credentials WHERE device_key=?", (device_key,))
