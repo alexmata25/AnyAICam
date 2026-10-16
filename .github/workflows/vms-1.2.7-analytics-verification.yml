@@ -1,0 +1,265 @@
+name: VMS 1.2.7 analytics verification (bf058891)
+
+on:
+  push:
+    branches:
+      - codex/vms-1.2.7-analytics-ci-bf058891
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-regressions:
+    name: Ubuntu 24.04 analytics, billing, media, and FFmpeg regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONPATH: app
+      ANYAICAM_DATABASE_BACKEND: sqlite
+      ANYAICAM_TEST_LAB_ENABLED: "false"
+      ANYAICAM_STATIC_FOLDER: ${{ github.workspace }}/app/static
+      ANYAICAM_RECORDINGS_FOLDER: ${{ runner.temp }}/vms-127-analytics/recordings
+      ANYAICAM_PARTNER_DB: ${{ runner.temp }}/vms-127-analytics/partner.db
+    steps:
+      - name: Check out isolated verification branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify exact analytics source and workflow-only delta
+        env:
+          EXPECTED_SOURCE_COMMIT: bf05889185a2fba6ab2f3df0751e234841525786
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_SOURCE_COMMIT"
+          git diff --exit-code "$EXPECTED_SOURCE_COMMIT" HEAD -- . \
+            ':(exclude).github/workflows/vms-1.2.7-analytics-verification.yml'
+          echo "Verified source parent: $EXPECTED_SOURCE_COMMIT"
+          echo "Workflow commit: $(git rev-parse HEAD)"
+
+      - name: Install FFmpeg and ffprobe
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
+
+      - name: Install pinned project test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Run analytics and neighboring regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$ANYAICAM_RECORDINGS_FOLDER" "$(dirname "$ANYAICAM_PARTNER_DB")"
+          pytest -ra --junitxml=analytics-linux.xml \
+            app/tests/test_analytics_toggle_revision_probes.py \
+            app/tests/test_analytics_control_center.py \
+            app/tests/test_loitering_rules.py \
+            app/tests/test_customer_analytics_rule_worker.py \
+            app/tests/test_edge_camera_sync_analytics_rules.py \
+            app/tests/test_appliance_analytics_rules_delivery.py \
+            app/tests/test_analytics_entitlements.py \
+            app/tests/test_facial_events.py \
+            app/tests/test_ai_substream_frames.py \
+            app/tests/test_software_license_backend.py \
+            app/tests/test_customer_downloads.py \
+            app/tests/test_per_camera_billing_v2.py \
+            app/tests/test_aws_cost_dashboard.py \
+            app/tests/test_live_stream_copy_safety.py \
+            app/tests/test_recording_codec_aware.py \
+            app/tests/test_recording_uploader_motion_gate.py \
+            app/tests/test_process_supervisor_recording_nonblocking.py \
+            app/tests/test_customer_playback_date_api.py \
+            app/tests/test_local_customer_playback.py \
+            2>&1 | tee analytics-linux.log
+
+      - name: Summarize regression result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("analytics-linux.xml")
+          counts = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
+          if report.exists():
+              root = ET.parse(report).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              counts = {key: sum(int(s.attrib.get(key, 0)) for s in suites) for key in counts}
+          counts["passed"] = counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
+          status = os.environ.get("JOB_STATUS", "unknown")
+          body = (
+              "## Linux regression report\n\n"
+              f"- Job: **{status}**\n"
+              f"- Tests: **{counts['tests']}**; passed **{counts['passed']}**; "
+              f"failed **{counts['failures']}**; errors **{counts['errors']}**; "
+              f"skipped **{counts['skipped']}**\n"
+              "- Source: `bf05889185a2fba6ab2f3df0751e234841525786`\n"
+              "- FFmpeg and ffprobe are installed and version-checked by this job.\n"
+              "- No AWS, Stripe, production, or appliance credentials are configured.\n"
+          )
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              Path(summary).write_text(body, encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in counts.items():
+                  print(f"{key}={value}", file=output)
+          print(body)
+          PY
+
+      - name: Upload regression logs and counts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vms-127-analytics-linux-report
+          path: |
+            analytics-linux.xml
+            analytics-linux.log
+          if-no-files-found: warn
+
+  postgres-migration-restore:
+    name: PostgreSQL 16 disposable migration and backup/restore
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vms_test
+          POSTGRES_PASSWORD: vms_test_only
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vms_test -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PYTHONPATH: app
+      ANYAICAM_DATABASE_BACKEND: postgresql
+      PGPASSWORD: vms_test_only
+      ANYAICAM_TEST_POSTGRES_URL: postgresql://vms_test:vms_test_only@localhost:5432/vms_cost_upgrade
+      ANYAICAM_TEST_POSTGRES_RESTORE_URL: postgresql://vms_test:vms_test_only@localhost:5432/vms_cost_restore
+    steps:
+      - name: Check out isolated verification branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify exact analytics source and workflow-only delta
+        env:
+          EXPECTED_SOURCE_COMMIT: bf05889185a2fba6ab2f3df0751e234841525786
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_SOURCE_COMMIT"
+          git diff --exit-code "$EXPECTED_SOURCE_COMMIT" HEAD -- . \
+            ':(exclude).github/workflows/vms-1.2.7-analytics-verification.yml'
+          echo "Verified source parent: $EXPECTED_SOURCE_COMMIT"
+          echo "Workflow commit: $(git rev-parse HEAD)"
+
+      - name: Install PostgreSQL client tools and Python test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Create two isolated disposable databases
+        run: |
+          createdb --host localhost --username vms_test vms_cost_upgrade
+          createdb --host localhost --username vms_test vms_cost_restore
+          pg_isready --host localhost --username vms_test --dbname vms_cost_upgrade
+          pg_isready --host localhost --username vms_test --dbname vms_cost_restore
+
+      - name: Run additive migration, repeatability, data preservation, and restore test
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -ra --junitxml=postgres-restore.xml \
+            app/tests/test_aws_cost_dashboard_postgresql.py \
+            2>&1 | tee postgres-restore.log
+
+      - name: Summarize PostgreSQL result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("postgres-restore.xml")
+          counts = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
+          if report.exists():
+              root = ET.parse(report).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+              counts = {key: sum(int(s.attrib.get(key, 0)) for s in suites) for key in counts}
+          counts["passed"] = counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"]
+          status = os.environ.get("JOB_STATUS", "unknown")
+          body = (
+              "## PostgreSQL 16 migration/restore report\n\n"
+              f"- Job: **{status}**\n"
+              f"- Tests: **{counts['tests']}**; passed **{counts['passed']}**; "
+              f"failed **{counts['failures']}**; errors **{counts['errors']}**; "
+              f"skipped **{counts['skipped']}**\n"
+              "- Both databases are synthetic, separate, and local to the disposable PostgreSQL service.\n"
+          )
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              Path(summary).write_text(body, encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in counts.items():
+                  print(f"{key}={value}", file=output)
+          print(body)
+          PY
+
+      - name: Upload PostgreSQL logs and counts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vms-127-postgres-migration-restore-report
+          path: |
+            postgres-restore.xml
+            postgres-restore.log
+          if-no-files-found: warn
+
+  final-report:
+    name: Verification gate summary
+    if: always()
+    needs:
+      - linux-regressions
+      - postgres-migration-restore
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report gate results
+        env:
+          LINUX_RESULT: ${{ needs.linux-regressions.result }}
+          POSTGRES_RESULT: ${{ needs.postgres-migration-restore.result }}
+        run: |
+          {
+            echo "## VMS 1.2.7 analytics verification gate"
+            echo
+            echo "- Source commit: `bf05889185a2fba6ab2f3df0751e234841525786`"
+            echo "- Linux regressions / real FFmpeg: **${LINUX_RESULT}**"
+            echo "- PostgreSQL 16 migration and restore: **${POSTGRES_RESULT}**"
+            if [ "$LINUX_RESULT" = success ] && [ "$POSTGRES_RESULT" = success ]; then
+              echo "- Overall: **PASS**"
+            else
+              echo "- Overall: **FAIL** (one or more required jobs did not pass)"
+            fi
+            echo "- No production credentials or external service endpoints are used."
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$LINUX_RESULT" = success && test "$POSTGRES_RESULT" = success
