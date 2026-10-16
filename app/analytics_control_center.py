@@ -32,14 +32,42 @@ ANALYTICS: dict[str, dict[str, str]] = {
     "intrusion": {"label": "Intrusion", "dependency": "Smart Motion and a configured zone rule"},
     "loitering": {"label": "Loitering", "dependency": "Smart Motion and a configured loitering zone"},
 }
-RULE_TYPES = {"line_crossing": ("line_crossing", "security_line"),
+RULE_TYPES = {"line_crossing": ("line_crossing",),
               "intrusion": ("intrusion",), "loitering": ("loitering",)}
-RULE_ANALYTICS = {"line_crossing": "line_crossing", "security_line": "line_crossing",
+RULE_ANALYTICS = {"line_crossing": "line_crossing",
                   "intrusion": "intrusion", "loitering": "loitering",
                   "people_counting": "people_counting"}
 _GRANT_FIELDS = {"schema_version", "grant_id", "key_id", "environment_id", "appliance_id",
                  "customer_id", "site_id", "camera_ids", "analytics", "issued_at", "not_before", "expires_at"}
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _people_counting_line_ready(db, camera_id: str) -> bool:
+    """Return true only for an enabled, usable customer counting line.
+
+    A placeholder rule row (the old UI sometimes created one with empty
+    geometry) must not make People Counting appear activatable.
+    """
+    rows = db.execute(
+        "SELECT geometry_json FROM customer_analytics_rules "
+        "WHERE camera_id=? AND rule_type='people_counting' AND enabled=1",
+        (camera_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            geometry = json.loads(row["geometry_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(geometry, list) or len(geometry) < 2:
+            continue
+        points = geometry[:2]
+        try:
+            coordinates = [(float(point["x"]), float(point["y"])) for point in points]
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        if all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for x, y in coordinates) and coordinates[0] != coordinates[1]:
+            return True
+    return False
 
 
 def _canonical(value: dict) -> bytes:
@@ -240,6 +268,14 @@ def filter_rule_items(db, rules: list[dict], cameras: list[dict]) -> list[dict]:
         if not camera:
             continue
         rule_type = rule.get("rule_type")
+        # Secure Edge security lines are armed intrusion alarms, with a
+        # separate evaluator and lifecycle from informational Line Crossing.
+        # They still require the Smart Motion detection entitlement, but an
+        # informational Line Crossing OFF preference must never disable them.
+        if rule_type == "security_line":
+            if camera.get("smart_motion_enabled"):
+                filtered.append(rule)
+            continue
         if rule_type == "exclusion":
             if camera.get("smart_motion_enabled"):
                 filtered.append(rule)
@@ -247,9 +283,9 @@ def filter_rule_items(db, rules: list[dict], cameras: list[dict]) -> list[dict]:
         analytic_key = RULE_ANALYTICS.get(rule_type)
         if not analytic_key:
             continue
-        state = db.execute("SELECT enabled FROM camera_analytics_operations WHERE camera_id=? AND analytic_key=?",
-                           (rule["camera_id"], analytic_key)).fetchone()
-        if state is not None and not bool(state["enabled"]):
+        if not operational_enabled(db, rule["camera_id"], analytic_key):
+            continue
+        if rule_type in RULE_TYPES and not operational_enabled(db, rule["camera_id"], "smart_motion"):
             continue
         camera_flag = "people_counting_enabled" if rule_type == "people_counting" else "smart_motion_enabled"
         if camera.get(camera_flag):
@@ -258,6 +294,26 @@ def filter_rule_items(db, rules: list[dict], cameras: list[dict]) -> list[dict]:
 
 
 def register_routes(app: FastAPI, page_shell: Callable) -> None:
+    def refresh_appliance_runtime(camera_id: str) -> None:
+        """Apply local operational changes to the edge's cached worker map.
+
+        Cloud routes are authoritative for Hybrid customers and their next
+        authenticated configuration poll updates the edge. On an appliance,
+        the locally persisted switch must take effect immediately, including
+        while offline; it cannot grant entitlement because the refresh only
+        overlays OFF/pause on the last locally stored authorization snapshot.
+        """
+        try:
+            import recording_uploader
+            if recording_uploader.RUNTIME_ROLE in {"edge", "combined"}:
+                recording_uploader._refresh_camera_map(prefer_local=True)
+        except Exception as error:
+            # A refresh failure must not roll back a durable customer choice;
+            # the periodic map worker retries and emits its own diagnostic.
+            import logging
+            logging.getLogger("anyaicam.analytics_control_center").warning(
+                "local_runtime_refresh_failed camera_id=%s error_type=%s", camera_id, type(error).__name__)
+
     def identity(request: Request) -> dict:
         who = partner_identity(request)
         if not who or who.get("role") not in {"customer_owner", "customer_viewer"} or not who.get("customer_id"):
@@ -305,7 +361,7 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
         <section class="panel" style="margin-top:16px"><h2>AAC Guardian</h2><p>Guardian integration is unavailable until its authenticated runtime API contract and safety approval are supplied. Master state: OFF. No Guardian workers are contacted.</p><button type="button" disabled aria-disabled="true" title="Unavailable until the Guardian API contract and safety approval are available">Enable Guardian</button><div>Capabilities available from an approved runtime manifest: 0</div></section>
         <script>const sel=document.getElementById('acc-camera'),list=document.getElementById('acc-list');
         function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-        async function load(){if(!sel.value){list.textContent='No cameras are assigned to this account.';return}const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value));const d=await r.json();if(!r.ok){list.textContent=d.detail||'Could not load controls.';return}list.innerHTML=d.analytics.map(a=>{const q=a.license;const qty=q.purchase_kind==='included'?'Included for eligible cameras':`Purchased ${q.purchased_quantity} / assigned ${q.assigned_quantity} / available ${q.available_quantity}`;const state=a.system_paused?'Temporarily paused by system'+(a.system_pause_reason?': '+esc(a.system_pause_reason):''):a.assigned?(a.customer_enabled?'Customer ON':'Customer OFF'):'Unassigned';return `<div class="health-row"><span><b>${esc(a.label)}</b><br><span class="health-detail">${qty} · ${state}${a.dependency_ready?'':' · Configure prerequisites'}</span></span><span><button type="button" data-assign="${esc(a.key)}" ${a.can_assign?'':'disabled'}>${a.assigned?'Unassign':'Assign'}</button> <button type="button" data-key="${esc(a.key)}" ${a.assigned&&a.can_enable?'':'disabled'}>${a.customer_enabled?'Turn OFF':'Turn ON'}</button></span></div>`}).join('');list.querySelectorAll('button[data-key]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.key);const next=!a.customer_enabled;if(!next&&!confirm('Turn off '+a.label+' on this camera? Its license assignment stays in place. Recording, live view, and playback continue.'))return;set(a.key,next)});list.querySelectorAll('button[data-assign]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.assign);const next=!a.assigned;if(!next&&!confirm('Release this camera\'s '+a.label+' license assignment? Its purchased subscription remains active.'))return;assign(a.key,next)})}
+        async function load(){if(!sel.value){list.textContent='No cameras are assigned to this account.';return}const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value));const d=await r.json();if(!r.ok){list.textContent=d.detail||'Could not load controls.';return}list.innerHTML=d.analytics.map(a=>{const q=a.license;const qty=a.assignment_required===false?'Included with Smart Motion':q.purchase_kind==='included'?'Included for eligible cameras':`Purchased ${q.purchased_quantity} / assigned ${q.assigned_quantity} / available ${q.available_quantity}`;const state=a.system_paused?'Temporarily paused by system'+(a.system_pause_reason?': '+esc(a.system_pause_reason):''):a.assigned?(a.customer_enabled?'Customer ON':'Customer OFF'):'Unassigned';return `<div class="health-row"><span><b>${esc(a.label)}</b><br><span class="health-detail">${qty} · ${state}${a.dependency_ready?'':' · Configure prerequisites'}</span></span><span><button type="button" data-assign="${esc(a.key)}" ${a.assignment_required&&a.can_assign?'':'disabled'} ${a.assignment_required?'':'hidden'}>${a.assigned?'Unassign':'Assign'}</button> <button type="button" data-key="${esc(a.key)}" ${a.assigned&&(a.customer_enabled||a.can_enable)?'':'disabled'}>${a.customer_enabled?'Turn OFF':'Turn ON'}</button></span></div>`}).join('');list.querySelectorAll('button[data-key]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.key);const next=!a.customer_enabled;if(!next&&!confirm('Turn off '+a.label+' on this camera? Its license assignment stays in place. Recording, live view, and playback continue.'))return;set(a.key,next)});list.querySelectorAll('button[data-assign]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.assign);const next=!a.assigned;if(!next&&!confirm('Release this camera\'s '+a.label+' license assignment? Its purchased subscription remains active.'))return;assign(a.key,next)})}
         async function set(key,enabled){const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value)+'/'+encodeURIComponent(key),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});const d=await r.json();if(!r.ok)alert(d.detail||'Could not update analytics.');await load()}
         async function assign(key,assigned){const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value)+'/'+encodeURIComponent(key)+'/assignment',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned})});const d=await r.json();if(!r.ok)alert(d.detail||'Could not update assignment.');await load()}
         document.getElementById('acc-off').onclick=async()=>{if(!confirm('Turn OFF all eight analytics for this camera? Assignments and subscriptions remain. Recording, live view, and playback continue.'))return;const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value)+'/turn-all-off',{method:'POST'});if(!r.ok){const d=await r.json();alert(d.detail||'Could not turn analytics off.')}await load()};sel.onchange=load;load();</script>'''.replace('__CAMERA_OPTIONS__', options)
@@ -319,25 +375,36 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
             camera = camera_access(db, camera_id, who, edit=False)
             from analytics_entitlements import commercial_camera_analytic_authorized
             for key, spec in ANALYTICS.items():
-                license_counts = analytics_license_summary(db, camera["customer_id"], camera["site_id"], key)
+                rule_analytic = key in RULE_TYPES
+                license_key = "smart_motion" if rule_analytic else key
+                license_counts = analytics_license_summary(db, camera["customer_id"], camera["site_id"], license_key)
                 row = db.execute("SELECT status FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=?",
                                  (camera_id, key)).fetchone()
                 commercial_assigned = bool(row and row["status"] == "active")
+                if rule_analytic:
+                    parent_row = db.execute("SELECT status FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key='smart_motion'",
+                                            (camera_id,)).fetchone()
+                    commercial_assigned = bool(parent_row and parent_row["status"] == "active")
                 paid = commercial_camera_analytic_authorized(
                     db, customer_id=camera["customer_id"], site_id=camera["site_id"],
                     camera_id=camera_id, analytic_key=key)
                 lab = active_lab_grant(db, camera, key)
-                if key in RULE_TYPES:
+                if rule_analytic:
+                    lab = active_lab_grant(db, camera, "smart_motion")
                     paid = paid or commercial_camera_analytic_authorized(
                         db, customer_id=camera["customer_id"], site_id=camera["site_id"],
                         camera_id=camera_id, analytic_key="smart_motion")
                 rule_ready = True
-                if key in RULE_TYPES:
+                if key == "people_counting":
+                    rule_ready = _people_counting_line_ready(db, camera_id)
+                elif rule_analytic:
                     rule_ready = bool(db.execute("SELECT 1 FROM customer_analytics_rules WHERE camera_id=? AND rule_type IN (" + ",".join("?" for _ in RULE_TYPES[key]) + ") LIMIT 1",
                                                   (camera_id, *RULE_TYPES[key])).fetchone())
-                parent_ready = key not in RULE_TYPES or commercial_camera_analytic_authorized(
+                parent_ready = not rule_analytic or commercial_camera_analytic_authorized(
                     db, customer_id=camera["customer_id"], site_id=camera["site_id"],
                     camera_id=camera_id, analytic_key="smart_motion") or lab_assignment_enabled(db, camera_id, "smart_motion")
+                if rule_analytic:
+                    parent_ready = bool(parent_ready and operational_enabled(db, camera_id, "smart_motion"))
                 lab_assignment = db.execute(
                     "SELECT a.grant_id FROM test_lab_analytics_assignments a "
                     "JOIN test_lab_grants g ON g.grant_id=a.grant_id "
@@ -359,6 +426,10 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                                       "assigned_quantity": int(lab_used),
                                       "available_quantity": max(0, lab_quantity - int(lab_used))}
                 assigned = commercial_assigned or lab_assigned
+                if rule_analytic:
+                    # Rule analytics are capabilities of an assigned Smart
+                    # Motion seat, not separately purchasable/assignable seats.
+                    assigned = commercial_assigned or lab_assignment_enabled(db, camera_id, "smart_motion")
                 state = operational_status(db, camera_id, key)
                 license_paused = commercial_assigned and not paid
                 system_paused = state["system_paused"] or license_paused
@@ -367,13 +438,16 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                     if license_paused else None)
                 enabled = state["effective_enabled"] and assigned and bool(paid or lab) and rule_ready and parent_ready
                 can_enable = assigned and bool(paid or lab) and rule_ready and parent_ready
-                can_assign = (assigned or license_counts["purchase_kind"] == "included"
+                can_assign = (False if rule_analytic else assigned or license_counts["purchase_kind"] == "included"
                               or bool(license_counts["available_quantity"]) or bool(lab))
                 data.append({"key": key, "label": spec["label"], "dependency": spec["dependency"], "enabled": enabled,
                              "assigned": assigned, "customer_enabled": state["customer_enabled"],
                              "system_paused": system_paused, "system_pause_reason": system_pause_reason,
                              "operational_status": "system_paused" if system_paused else "customer_off" if not state["customer_enabled"] else "on" if enabled else "off",
-                             "license": license_counts, "can_assign": can_assign, "dependency_ready": rule_ready and parent_ready,
+                             "license": license_counts, "can_assign": can_assign,
+                             "assignment_required": not rule_analytic,
+                             "license_basis": "smart_motion" if rule_analytic else key,
+                             "dependency_ready": rule_ready and parent_ready,
                              "entitled": bool(paid or lab), "authorization": "test_lab" if lab and not paid else "commercial" if paid else "none",
                              "can_enable": can_enable or enabled})
         return {"camera_id": camera_id, "analytics": data}
@@ -391,31 +465,41 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                 raise HTTPException(status_code=404, detail="Customer account not found.")
             camera = camera_access(db, camera_id, who, edit=True)
             if enabled:
+                rule_analytic = analytic_key in RULE_TYPES
+                license_key = "smart_motion" if rule_analytic else analytic_key
                 row = db.execute("SELECT status FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=?",
                                  (camera_id, analytic_key)).fetchone()
                 commercial_assigned = bool(row and row["status"] == "active")
+                if rule_analytic:
+                    row = db.execute("SELECT status FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key='smart_motion'",
+                                     (camera_id,)).fetchone()
+                    commercial_assigned = bool(row and row["status"] == "active")
                 from analytics_entitlements import commercial_camera_analytic_authorized
                 paid = commercial_camera_analytic_authorized(
                     db, customer_id=camera["customer_id"], site_id=camera["site_id"],
-                    camera_id=camera_id, analytic_key=analytic_key)
+                    camera_id=camera_id, analytic_key=license_key)
                 assigned = commercial_assigned or lab_assignment_enabled(db, camera_id, analytic_key)
                 lab = active_lab_grant(db, camera, analytic_key)
                 parent_paid = False
                 parent_lab = None
-                if analytic_key in RULE_TYPES:
+                if rule_analytic:
                     parent_paid = commercial_camera_analytic_authorized(
                         db, customer_id=camera["customer_id"], site_id=camera["site_id"],
                         camera_id=camera_id, analytic_key="smart_motion")
                     parent_lab = active_lab_grant(db, camera, "smart_motion")
-                if commercial_assigned and not paid:
+                    assigned = commercial_assigned or lab_assignment_enabled(db, camera_id, "smart_motion")
+                    lab = parent_lab
+                if commercial_assigned and not (paid or (rule_analytic and parent_paid)):
                     raise HTTPException(status_code=409, detail="Assigned cameras exceed the current purchased quantity or the subscription is inactive. Release an assignment or restore licenses before enabling processing.")
                 if not (paid or lab or parent_paid or parent_lab):
                     raise HTTPException(status_code=403, detail="A purchased entitlement or valid scoped Test Lab grant is required.")
-                if analytic_key not in RULE_TYPES and not (paid or lab):
+                if not rule_analytic and not (paid or lab):
                     raise HTTPException(status_code=403, detail="A purchased entitlement or valid scoped Test Lab grant is required.")
                 if not assigned:
-                    raise HTTPException(status_code=409, detail="Assign a purchased analytic license to this camera before turning it on.")
-                if analytic_key in RULE_TYPES:
+                    message = ("Assign Smart Motion to this camera before enabling this rule." if rule_analytic
+                               else "Assign a purchased analytic license to this camera before turning it on.")
+                    raise HTTPException(status_code=409, detail=message)
+                if rule_analytic:
                     args = (camera_id, *RULE_TYPES[analytic_key])
                     marks = ",".join("?" for _ in RULE_TYPES[analytic_key])
                     if not db.execute(f"SELECT 1 FROM customer_analytics_rules WHERE camera_id=? AND rule_type IN ({marks}) LIMIT 1", args).fetchone():
@@ -423,7 +507,9 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                     parent_lab_assigned = bool(parent_lab and lab_assignment_enabled(db, camera_id, "smart_motion"))
                     if (not parent_paid and not parent_lab_assigned) or not operational_enabled(db, camera_id, "smart_motion"):
                         raise HTTPException(status_code=409, detail="Smart Motion must be enabled for rule analytics.")
-                if lab and not paid:
+                if analytic_key == "people_counting" and not _people_counting_line_ready(db, camera_id):
+                    raise HTTPException(status_code=409, detail="Configure a counting line on the camera before enabling People Counting.")
+                if lab and not paid and not rule_analytic:
                     grant_id = lab["grant_id"]
                     used = db.execute("SELECT COUNT(*) AS n FROM test_lab_analytics_assignments WHERE grant_id=? AND analytic_key=? AND enabled=1",
                                       (grant_id, analytic_key)).fetchone()["n"]
@@ -439,6 +525,7 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                        (camera_id, analytic_key, int(enabled), now, who.get("email")))
             _audit(db, who, "analytics.operational_toggle_changed", camera_id,
                    {"analytic_key": analytic_key, "enabled": enabled})
+        refresh_appliance_runtime(camera_id)
         return {"camera_id": camera_id, "analytic_key": analytic_key, "enabled": enabled}
 
     @app.put("/api/customer/analytics-control/cameras/{camera_id}/{analytic_key}/assignment")
@@ -488,6 +575,7 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                            (camera_id, analytic_key, now, who.get("email")))
             _audit(db, who, "analytics.assignment_changed", camera_id,
                    {"analytic_key": analytic_key, "assigned": payload["assigned"]})
+        refresh_appliance_runtime(camera_id)
         return {"camera_id": camera_id, "analytic_key": analytic_key, "assigned": payload["assigned"]}
 
     @app.post("/api/customer/analytics-control/cameras/{camera_id}/turn-all-off")
@@ -504,6 +592,7 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                            "ON CONFLICT(camera_id,analytic_key) DO UPDATE SET enabled=0,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
                            (camera_id, key, now, who.get("email")))
             _audit(db, who, "analytics.turn_all_off", camera_id, {"analytics": list(ANALYTICS)})
+        refresh_appliance_runtime(camera_id)
         return {"camera_id": camera_id, "enabled": False, "analytics": list(ANALYTICS)}
 
     @app.post("/api/admin/test-lab/grants")

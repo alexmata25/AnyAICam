@@ -188,6 +188,13 @@ def _is_entitled(db, *, camera_id: str) -> bool:
         return False
     if camera["facial_recognition_enabled"] is not None and not bool(camera["facial_recognition_enabled"]):
         return False
+    # The camera flag is the authenticated cloud-to-edge effective grant
+    # (entitlement + assignment + operational preference) mirrored by
+    # edge_camera_sync. Split-edge databases do not contain the cloud's
+    # camera_analytics_entitlements rows, so requiring that duplicate row
+    # incorrectly disabled licensed Face Access on the appliance.
+    if camera["facial_recognition_enabled"] is not None and bool(camera["facial_recognition_enabled"]):
+        return True
     row = db.execute(
         "SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=? AND status='active'",
         (camera_id, ANALYTIC_KEY),

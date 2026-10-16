@@ -37689,6 +37689,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         return []
+    runtime_identity = recording_uploader._camera_identity(camera_number)
+    smart_motion_enabled = bool(runtime_identity and runtime_identity.get("smart_motion_enabled"))
     # PPE / face crops (2026-10-11, video-pipeline P2a): on an analytics-
     # stream frame, the person is cut from ONE main-stream frame grabbed on
     # demand -- only when a PPE/face check actually crops a person. On a
@@ -38434,7 +38436,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # A kind of object already in a continuing activity gets no new card
         # (no new notification): the activity's card and clip cover it.
         event = None
-        if not (continuing and class_name in activity.classes):
+        if smart_motion_enabled and not (continuing and class_name in activity.classes):
             event = AnalyticsEventModel(
                 id=(event_group_id if class_name == primary_class_name else uuid.uuid4().hex[:12]),
                 camera=camera_number,
@@ -38460,7 +38462,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 event_media_sharing.attach_child(media_owner_id, event["id"], camera_number)
             if activity is not None and class_name in AI_ACTIVITY_CLASSES:
                 ai_activities.add(activity, classes=[class_name])
-        smart_motion.record_object_detection(camera_number, class_name)
+        if smart_motion_enabled:
+            smart_motion.record_object_detection(camera_number, class_name)
         # 2026-09-16: ppe.is_camera_enabled() is deployment-pilot scope
         # only (ANYAICAM_PPE_CAMERAS); it was never customer-entitlement-
         # aware. This second check is the real per-camera RDM entitlement
@@ -38504,7 +38507,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 if not ppe_result:
                     continue
                 ppe_event = AnalyticsEventModel(
-                    id=uuid.uuid4().hex[:12],
+                    id=(event_group_id if not smart_motion_enabled and not continuing and not saved_events
+                        else uuid.uuid4().hex[:12]),
                     camera=camera_number,
                     site="home",
                     rule_name=(
@@ -39573,6 +39577,8 @@ async def ai_person_detector(camera_number: int) -> None:
 
                 detections
                 and not stationary_repeat
+                and any(bool(runtime_identity.get(flag)) for flag in (
+                    "smart_motion_enabled", "ppe_enabled", "facial_recognition_enabled"))
 
 
 
@@ -40916,6 +40922,13 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and (recording_uploader.RECORDING_UPLOAD_ENABLED or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE)
         else None
     )
+    # Populate the shared analytics camera map independently of optional
+    # cloud recording uploads, including Local mode and offline restarts.
+    analytics_camera_map_task = (
+        asyncio.create_task(recording_uploader.analytics_camera_map_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     recording_retention_sweep_task = (
         asyncio.create_task(recording_retention_sweep.recording_retention_sweep_worker())
         if RUNTIME_ROLE in {"cloud", "combined"} and recording_retention_sweep.RETENTION_SWEEP_ENABLED
@@ -41154,6 +41167,8 @@ async def lifespan(app: FastAPI):
             local_storage_manager_task.cancel()
         if recording_upload_task:
             recording_upload_task.cancel()
+        if analytics_camera_map_task:
+            analytics_camera_map_task.cancel()
         if recording_retention_sweep_task:
             recording_retention_sweep_task.cancel()
         if event_media_retry_task:
@@ -41281,6 +41296,8 @@ async def lifespan(app: FastAPI):
             pending.append(local_storage_manager_task)
         if recording_upload_task:
             pending.append(recording_upload_task)
+        if analytics_camera_map_task:
+            pending.append(analytics_camera_map_task)
         if recording_retention_sweep_task:
             pending.append(recording_retention_sweep_task)
         if event_media_retry_task:

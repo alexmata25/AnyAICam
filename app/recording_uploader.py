@@ -332,7 +332,7 @@ def _control_plane_get(path: str) -> dict | None:
         return None
 
 
-def _refresh_camera_map() -> None:
+def _refresh_camera_map(*, prefer_local: bool = False) -> None:
     """Polls the existing, unchanged GET /api/appliance/configuration for
     this appliance's own camera_number -> camera_id/site_id/cloud_recording_
     mode mapping. Never writes anything; a failed/unreachable poll just
@@ -359,12 +359,28 @@ def _refresh_camera_map() -> None:
     no test coverage on this exact map. lpr.is_camera_enabled() and
     ppe.is_camera_enabled() now consult the same 3 new keys the same
     way."""
-    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
-    if not isinstance(response, dict):
-        return
-    cameras = response.get("cameras")
+    response = None
+    if not prefer_local and product_mode.current_mode() != "local":
+        response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
+    cameras = response.get("cameras") if isinstance(response, dict) else None
     if not isinstance(cameras, list):
-        return
+        # The DB is the durable source for Local appliances and the last
+        # authenticated configuration snapshot for an offline Hybrid reboot.
+        # This restores the runtime map after process restart without needing
+        # recording uploads or a live cloud connection.
+        try:
+            from partner_db import connection
+            with connection() as db:
+                cameras = [dict(row) for row in db.execute(
+                    "SELECT id,site_id,camera_number,cloud_recording_mode AS recording_mode,local_recording_mode,"
+                    "people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,facial_recognition_enabled,"
+                    "analytics_lab_leases_json FROM cameras WHERE COALESCE(status,'')!='removed'"
+                ).fetchall()]
+            if product_mode.current_mode() != "local":
+                logger.info("recording_upload.camera_map_seeded_from_local_database cameras=%s", len(cameras))
+        except Exception as error:
+            logger.warning("recording_upload.local_camera_map_unavailable error_type=%s", type(error).__name__)
+            return
     mapping: dict[int, dict] = {}
     for item in cameras:
         if not isinstance(item, dict):
@@ -379,6 +395,12 @@ def _refresh_camera_map() -> None:
         if not isinstance(site_id, str) or not site_id.strip():
             continue
         cloud_recording_mode = item.get("recording_mode")
+        leases = item.get("analytics_lab_leases")
+        if not isinstance(leases, dict):
+            try:
+                leases = json.loads(item.get("analytics_lab_leases_json") or "{}")
+            except (TypeError, ValueError):
+                leases = {}
         mapping[camera_number] = {
             "camera_id": camera_id,
             "site_id": site_id,
@@ -388,9 +410,31 @@ def _refresh_camera_map() -> None:
             "lpr_enabled": bool(item.get("lpr_enabled")),
             "ppe_enabled": bool(item.get("ppe_enabled")),
             "facial_recognition_enabled": bool(item.get("facial_recognition_enabled")),
-            "analytics_lab_leases": item.get("analytics_lab_leases") if isinstance(item.get("analytics_lab_leases"), dict) else {},
+            "analytics_lab_leases": leases if isinstance(leases, dict) else {},
         }
-    cloud_policy = response.get("cloud_policy")
+    # Persisted customer/system operational state is a local fail-safe overlay:
+    # OFF or paused always suppresses processing, while ON never grants access
+    # beyond the cloud/local licensing flag in the source camera row.
+    operation_flags = {"smart_motion": "smart_motion_enabled", "people_counting": "people_counting_enabled",
+                       "lpr": "lpr_enabled", "ppe": "ppe_enabled",
+                       "facial_recognition": "facial_recognition_enabled"}
+    try:
+        from partner_db import connection
+        with connection() as db:
+            states = db.execute("SELECT camera_id,analytic_key,enabled,system_paused FROM camera_analytics_operations").fetchall()
+        camera_numbers = {value["camera_id"]: number for number, value in mapping.items()}
+        for state in states:
+            field = operation_flags.get(state["analytic_key"])
+            number = camera_numbers.get(state["camera_id"])
+            if field and number is not None and (not bool(state["enabled"]) or bool(state["system_paused"])):
+                mapping[number][field] = False
+    except Exception as error:
+        logger.warning("recording_upload.analytics_operations_unavailable error_type=%s", type(error).__name__)
+        # Fail closed when operational state cannot be read.
+        for item in mapping.values():
+            for field in operation_flags.values():
+                item[field] = False
+    cloud_policy = response.get("cloud_policy") if isinstance(response, dict) else None
     daily_cloud_seconds = (
         cloud_policy.get("daily_cloud_seconds")
         if isinstance(cloud_policy, dict) and isinstance(cloud_policy.get("daily_cloud_seconds"), int)
@@ -402,6 +446,26 @@ def _refresh_camera_map() -> None:
         global _daily_cloud_seconds
         _daily_cloud_seconds = daily_cloud_seconds
     recording_upload_state["last_config_refresh_at"] = datetime.now().isoformat()
+
+
+async def analytics_camera_map_worker() -> None:
+    """Refresh the analytics runtime map independently of cloud uploads.
+
+    Local mode intentionally has no recording-upload worker; without this
+    separate task a fresh Local install (and an offline Hybrid reboot) would
+    never populate the shared camera map used by optional analytics.
+    """
+    if RUNTIME_ROLE not in {"edge", "combined"}:
+        return
+    logger.info("recording_upload.analytics_camera_map_worker_started")
+    while True:
+        try:
+            await asyncio.to_thread(_refresh_camera_map)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("recording_upload.analytics_camera_map_refresh_failed error_type=%s", type(error).__name__)
+        await asyncio.sleep(CONFIG_REFRESH_SECONDS)
 
 
 def _known_camera_numbers() -> list[int]:

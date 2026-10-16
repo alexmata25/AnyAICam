@@ -347,8 +347,12 @@ def _seed_cloud(db, *, customer_id="cust-1", appliance_id="appl-1", camera_id="c
                (appliance_id, customer_id, f"site-{customer_id}", f"AIC-{appliance_id}", now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)",
                (f"cred-{appliance_id}", appliance_id, password_hash(credential), now))
-    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-               (camera_id, customer_id, f"site-{customer_id}", appliance_id, "Front Door", 1, "configured", now))
+    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+               (camera_id, customer_id, f"site-{customer_id}", appliance_id, "Front Door", 1, "configured", 1, now))
+    db.execute("INSERT OR IGNORE INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,licensed_quantity,created_at) "
+               "VALUES(?,?,?,?,?,?,?)", (f"sm-sub-{camera_id}", customer_id, f"site-{customer_id}", "smart_motion", "active", 1, now))
+    db.execute("INSERT OR IGNORE INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
+               "VALUES(?,?,?,?,?)", (camera_id, "smart_motion", "active", now, now))
     db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,account_status,created_at) "
                "VALUES(?,?,?,?,?,?,?,?,?,?)", (f"owner-{customer_id}", "partner-1", f"owner-{customer_id}@example.test", "Owner",
                                                "customer_owner", password_hash("x"), 1, customer_id, "active", now))
@@ -437,8 +441,11 @@ def edge_db(tmp_path):
             db.execute("INSERT INTO customers(id,partner_id,name,email,status,created_at) VALUES('cust-1','partner-1','C','c@example.test','active',?)", (now,))
             db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-cust-1','cust-1','Home',?)", (now,))
             db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-1','cust-1','site-cust-1','AIC-1',?)", (now,))
-            db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) "
-                       "VALUES('cam-1','cust-1','site-cust-1','appl-1','Front Door',1,'configured',?)", (now,))
+            # This is the edge's authenticated cloud-synced effective
+            # Smart Motion assignment; rule fixtures need it to represent
+            # an actually authorized runtime camera.
+            db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) "
+                       "VALUES('cam-1','cust-1','site-cust-1','appl-1','Front Door',1,'configured',1,?)", (now,))
             _seed_cloud_rule(db, dwell=45, notifications=0)
         yield path
 

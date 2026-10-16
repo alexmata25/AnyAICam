@@ -185,6 +185,55 @@ def test_operational_toggle_survives_application_recreation(client, db_path):
     assert next(item for item in state["analytics"] if item["key"] == "lpr")["enabled"] is False
 
 
+def test_appliance_local_toggle_refreshes_runtime_map_immediately_and_persists(client, db_path, monkeypatch):
+    import product_mode
+    import recording_uploader
+
+    monkeypatch.setattr(recording_uploader, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(product_mode, "current_mode", lambda: "local")
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("UPDATE cameras SET lpr_enabled=1 WHERE id='cam-1'")
+    recording_uploader._camera_map.clear()
+    recording_uploader._refresh_camera_map()
+    assert recording_uploader._camera_identity(1)["lpr_enabled"] is True
+
+    off = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/lpr",
+                payload={"enabled": False}, cookies=_cookie())
+    assert off.status_code == 200
+    assert recording_uploader._camera_identity(1)["lpr_enabled"] is False
+
+    restarted = FastAPI()
+    acc.register_routes(restarted, lambda title, nav, content: HTMLResponse(content))
+    again = _call(restarted, "PUT", "/api/customer/analytics-control/cameras/cam-1/lpr",
+                  payload={"enabled": True}, cookies=_cookie())
+    assert again.status_code == 200
+    assert recording_uploader._camera_identity(1)["lpr_enabled"] is True
+
+
+def test_local_and_offline_hybrid_boot_seed_runtime_map_from_persisted_cameras(client, db_path, monkeypatch):
+    import product_mode
+    import recording_uploader
+
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("UPDATE cameras SET lpr_enabled=1 WHERE id='cam-1'")
+    monkeypatch.setattr(recording_uploader, "RUNTIME_ROLE", "edge")
+    recording_uploader._camera_map.clear()
+
+    monkeypatch.setattr(product_mode, "current_mode", lambda: "local")
+    recording_uploader._refresh_camera_map()
+    local = recording_uploader._camera_identity(1)
+    assert local and local["camera_id"] == "cam-1" and local["lpr_enabled"] is True
+
+    monkeypatch.setattr(product_mode, "current_mode", lambda: "hybrid")
+    monkeypatch.setattr(recording_uploader.appliance_config_cache, "get_or_fetch", lambda fetch: None)
+    recording_uploader._camera_map.clear()
+    recording_uploader._refresh_camera_map()
+    offline = recording_uploader._camera_identity(1)
+    assert offline and offline["camera_id"] == "cam-1" and offline["lpr_enabled"] is True
+
+
 def test_assignment_counts_reassignment_and_customer_off_preserve_paid_seat(client, db_path):
     before = _call(client, "GET", "/api/customer/analytics-control/cameras/cam-1", cookies=_cookie()).json()
     lpr = next(item for item in before["analytics"] if item["key"] == "lpr")
@@ -288,18 +337,77 @@ def test_rule_analytic_requires_smart_motion_parent_and_existing_rule(client):
     assert _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-2/line_crossing", payload={"enabled": True}, cookies=_cookie()).status_code == 403
 
 
+@pytest.mark.parametrize("key", ["line_crossing", "intrusion", "loitering"])
+def test_rule_analytic_can_be_reenabled_using_smart_motion_assignment(client, db_path, key):
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,created_at,updated_at) "
+                       "VALUES('base-plan','c','camera_slots_hybrid',1,'active','x','x') "
+                       "ON CONFLICT(customer_id,product) DO UPDATE SET status='active',camera_slot_quantity=1")
+            if not db.execute("SELECT 1 FROM customer_analytics_rules WHERE camera_id='cam-1' AND rule_type=?",
+                              (key,)).fetchone():
+                db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,geometry_json,enabled,created_at,updated_at) "
+                           "VALUES(?,?,?,?,?,?,?,?,1,'x','x')", (f'r-{key}', 'c', 's', 'a', 'cam-1', key, key, '[]'))
+    assert _call(client, "PUT", f"/api/customer/analytics-control/cameras/cam-1/{key}",
+                 payload={"enabled": False}, cookies=_cookie()).status_code == 200
+    enabled = _call(client, "PUT", f"/api/customer/analytics-control/cameras/cam-1/{key}",
+                    payload={"enabled": True}, cookies=_cookie())
+    assert enabled.status_code == 200, enabled.json()
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            assert acc.operational_enabled(db, "cam-1", key) is True
+            assert db.execute("SELECT 1 FROM camera_analytics_entitlements WHERE camera_id='cam-1' AND analytic_key=?",
+                              (key,)).fetchone() is None
+
+
+def test_people_counting_requires_a_valid_configured_line(client, db_path):
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,licensed_quantity,created_at) "
+                       "VALUES('pc-sub','c','s','people_counting','active',1,'x')")
+            db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
+                       "VALUES('cam-1','people_counting','active','x','x')")
+            db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,geometry_json,enabled,created_at,updated_at) "
+                       "VALUES('pc-line','c','s','a','cam-1','people_counting','Count','[]',1,'x','x')")
+    missing = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/people_counting",
+                    payload={"enabled": True}, cookies=_cookie())
+    assert missing.status_code == 409
+    assert "counting line" in missing.json()["detail"].lower()
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("UPDATE customer_analytics_rules SET geometry_json=? WHERE id='pc-line'",
+                       ('[{"x":0.1,"y":0.2},{"x":0.9,"y":0.8}]',))
+    ready = _call(client, "PUT", "/api/customer/analytics-control/cameras/cam-1/people_counting",
+                  payload={"enabled": True}, cookies=_cookie())
+    assert ready.status_code == 200
+
+
+def test_people_counting_line_validation_rejects_malformed_or_degenerate_geometry(client, db_path):
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            assert acc._people_counting_line_ready(db, "cam-1") is False
+            db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,geometry_json,enabled,created_at,updated_at) "
+                       "VALUES('bad-line','c','s','a','cam-1','people_counting','Bad','not-json',1,'x','x')")
+            db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,geometry_json,enabled,created_at,updated_at) "
+                       "VALUES('degenerate-line','c','s','a','cam-1','people_counting','Same points','[{\"x\":0.5,\"y\":0.5},{\"x\":0.5,\"y\":0.5}]',1,'x','x')")
+            assert acc._people_counting_line_ready(db, "cam-1") is False
+
+
 def test_rule_delivery_honors_individual_switches_preserves_exclusion_and_fails_closed_for_unknown(client, db_path):
     with override_target(sqlite_path=db_path):
         with connection() as db:
             db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,geometry_json,enabled,created_at,updated_at) "
                        "VALUES('r-ex','c','s','a','cam-1','exclusion','Ignore','[]',1,'x','x')")
             rules = [{"id": "r", "camera_id": "cam-1", "rule_type": "line_crossing"},
+                     {"id": "r-sec", "camera_id": "cam-1", "rule_type": "security_line"},
                      {"id": "r-ex", "camera_id": "cam-1", "rule_type": "exclusion"},
                      {"id": "r-unknown", "camera_id": "cam-1", "rule_type": "future_rule"}]
             camera = [{"id": "cam-1", "smart_motion_enabled": True, "people_counting_enabled": False}]
-            assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r", "r-ex"]
+            assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r", "r-sec", "r-ex"]
             db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-1','line_crossing',0,'x')")
-            assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r-ex"]
+            # The armed Secure Edge alarm is independent of informational
+            # Line Crossing, while Smart Motion still gates both.
+            assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r-sec", "r-ex"]
             assert acc.filter_rule_items(db, rules, [{**camera[0], "smart_motion_enabled": False}]) == []
 
 

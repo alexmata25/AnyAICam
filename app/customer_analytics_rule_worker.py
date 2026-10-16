@@ -102,6 +102,18 @@ def load_rules_for_camera(camera_id: str) -> list[dict]:
             "FROM customer_analytics_rules WHERE camera_id=?",
             (camera_id,),
         ).fetchall()
+        # Enforce the persisted operational switch at the edge too. A
+        # stale/missed cloud configuration poll must not leave rule inference
+        # running after OFF, and an edge-local OFF remains effective offline.
+        from analytics_control_center import operational_enabled
+        operational = {"line_crossing": "line_crossing", "intrusion": "intrusion",
+                       "loitering": "loitering", "security_line": "smart_motion"}
+        enabled_rules = []
+        for row in raw_rules:
+            control_key = operational.get(row["rule_type"])
+            if control_key and operational_enabled(db, camera_id, control_key):
+                enabled_rules.append(row)
+        raw_rules = enabled_rules
     rules = []
     for row in raw_rules:
         if not row["enabled"] or row["rule_type"] not in EVALUATED_RULE_TYPES:
