@@ -75687,7 +75687,7 @@ def _dashboard_camera_health_facts(customer_cameras, camera_ids_by_number) -> di
     return facts
 
 
-def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, facts, live_href) -> str:
+def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, facts, live_href, can_reconnect=False) -> str:
     safe_name = escape(name)
     analytics = facts.get("analytics") or []
     analytics_text = ", ".join(analytics) if analytics else "None enabled"
@@ -75702,6 +75702,12 @@ def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, f
         actions.append(f'<a class="dash-cam-action" href="/playback?camera={quoted}">Playback</a>')
         actions.append(f'<a class="dash-cam-action" href="/events?camera={quoted}">Events</a>')
         actions.append(f'<a class="dash-cam-action" href="/customer/cameras/{quoted}/analytics-rules">Rules</a>')
+        if can_reconnect:
+            # Manual recovery (2026-10-15): shown only while the camera is
+            # offline (status poll below); opens the Cameras tab's Reconnect
+            # dialog for this camera, which finds it again by its identity.
+            actions.append(f'<a class="dash-cam-action dash-cam-reconnect" id="dashboard-reconnect-{camera_number}"'
+                           f' href="/customer-live?reconnect={quoted}" hidden>Reconnect camera</a>')
     else:
         actions.append(f'<a class="dash-cam-action" href="{escape(live_href, quote=True)}">Open</a>')
     return (
@@ -76005,6 +76011,10 @@ def dashboard(request: Request) -> str:
     # events polls) plus one grouped query here for each camera's last
     # event -- no new polling.
     _dashboard_camera_facts = _dashboard_camera_health_facts(_customer_dashboard_cameras, _dashboard_camera_ids_by_number)
+    # Reconnect is an owner action on the portal (the appliance follows the
+    # cloud account; cloud_account_only() refuses it on the appliance).
+    _dashboard_can_reconnect = bool(_dashboard_identity and _dashboard_identity.get("role") == "customer_owner"
+                                    and RUNTIME_ROLE != "edge")
     camera_cards = "".join(
         _render_dashboard_camera_card(
             camera_number,
@@ -76013,6 +76023,7 @@ def dashboard(request: Request) -> str:
             can_live=camera_number not in _dashboard_camera_playback_only,
             facts=_dashboard_camera_facts.get(camera_number, {}),
             live_href=_dashboard_camera_hrefs[camera_number],
+            can_reconnect=_dashboard_can_reconnect,
         )
         for camera_number in _dashboard_camera_numbers
     )
@@ -77069,6 +77080,8 @@ async function updateDashboard(){
             warning.textContent=problem;warning.hidden=!problem;
             if(problem)attention++;
             card.classList.toggle('offline',!camera.online);card.classList.toggle('attention',!!problem);
+            const reconnect=document.getElementById(`dashboard-reconnect-${camera.camera}`);
+            if(reconnect)reconnect.hidden=!!camera.online;
         });
         const attentionEl=document.getElementById('dashboard-attention');
         if(attentionEl){attentionEl.textContent=attention?`${attention} need${attention===1?'s':''} attention`:'All cameras healthy';attentionEl.classList.toggle('problem',attention>0);}

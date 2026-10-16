@@ -40,3 +40,40 @@ def test_the_appliance_page_has_no_reconnect(client, world, monkeypatch):
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
     page = _page(client, appliance_id="appl-ryzen")
     assert "reconnect-camera" not in page and 'id="reconnect-dialog"' not in page
+
+
+# ------------------------------------------- Dashboard entry point (2026-10-15)
+
+def test_dashboard_offline_cards_offer_reconnect_to_owners():
+    import main
+    card = main._render_dashboard_camera_card(2, name="Driveway Right", camera_id="dc7a226120", can_live=True,
+                                              facts={}, live_href="/customer-live", can_reconnect=True)
+    assert ('<a class="dash-cam-action dash-cam-reconnect" id="dashboard-reconnect-2" '
+            'href="/customer-live?reconnect=dc7a226120" hidden>Reconnect camera</a>') in card
+    viewer = main._render_dashboard_camera_card(2, name="Driveway Right", camera_id="dc7a226120", can_live=True,
+                                                facts={}, live_href="/customer-live", can_reconnect=False)
+    assert "Reconnect camera" not in viewer
+    legacy = main._render_dashboard_camera_card(2, name="Camera 2", camera_id=None, can_live=True,
+                                                facts={}, live_href="/live", can_reconnect=True)
+    assert "Reconnect camera" not in legacy
+
+
+def test_dashboard_shows_reconnect_only_while_the_camera_is_offline_and_only_for_portal_owners():
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8")
+    assert "if(reconnect)reconnect.hidden=!!camera.online;" in source
+    assert '_dashboard_identity.get("role") == "customer_owner"' in source and 'RUNTIME_ROLE != "edge"' in source
+
+
+def test_the_cameras_tab_opens_the_dialog_for_the_camera_named_in_the_link():
+    import live_view_page
+    script = live_view_page._CAMERA_MANAGE_JS
+    assert "new URLSearchParams(window.location.search).get('reconnect')" in script
+    assert "button.dataset.cameraId===wanted" in script and "if(manage&&wanted" in script
+
+
+def test_settings_points_to_camera_management():
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[1].joinpath("customer_platform.py").read_text(encoding="utf-8")
+    assert '<section class="panel" id="camera-management">' in source
+    assert '<a class="action-button" href="/customer-live">Manage cameras</a>' in source

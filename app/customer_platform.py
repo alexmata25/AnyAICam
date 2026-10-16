@@ -245,7 +245,11 @@ def register_customer_platform_routes(
           <a class="ghost-button" href="/analytics-control-center">Analytics Control Center</a>
           <a class="ghost-button" href="/customer-portal">Back to customer portal</a>
         </header>
-        <section class="panel">
+        <section class="panel" id="camera-management">
+          <div class="panel-head"><div><h2>Camera management</h2><div class="health-detail">Add a camera, reconnect a camera that went offline after a network change (it keeps its recordings, rules and settings), or remove one.</div></div></div>
+          <a class="action-button" href="/customer-live">Manage cameras</a>
+        </section>
+        <section class="panel" style="margin-top:16px">
           <div class="panel-head"><div><h2>Choose a camera</h2><div class="health-detail">Paid analytics are enabled individually per camera.</div></div></div>
           <label style="display:grid;gap:7px;max-width:360px">Camera<select id="camera-select">{camera_options}</select></label>{no_cameras_notice}
         </section>
