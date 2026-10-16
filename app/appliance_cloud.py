@@ -1048,6 +1048,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=409,detail='Only the camera network address may change on reconnect.')
         if (old.hostname or '')==(new.hostname or ''):
             return False
+        # The camera, and with it its stored credentials, may only move to a
+        # local-network IP literal (Red review 2026-10-15): private, link-local
+        # or CGNAT/Tailscale. Never a public host, a name, or loopback.
+        import ipaddress
+        try: address=ipaddress.ip_address(new.hostname or '')
+        except ValueError: raise HTTPException(status_code=409,detail='A reconnected camera must be on the local network (an IP address).')
+        local=(address.is_private or address.is_link_local
+               or (address.version==4 and address in ipaddress.ip_network('100.64.0.0/10')))
+        if not local or address.is_loopback or address.is_unspecified or address.is_multicast:
+            raise HTTPException(status_code=409,detail='A reconnected camera must be on the local network.')
         with connection() as db:
             changed=db.execute('UPDATE cameras SET onvif_endpoint=? WHERE id=? AND appliance_id=? AND device_key=? AND onvif_endpoint=?',
                                (rtsp_uri,camera['id'],appliance['id'],device_key,camera['onvif_endpoint'])).rowcount

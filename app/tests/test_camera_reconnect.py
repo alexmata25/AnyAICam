@@ -320,3 +320,15 @@ def test_the_cameras_tab_offers_reconnect_to_owners_on_the_portal():
         assert needle in script, needle
     assert "document.querySelectorAll('.reconnect-camera').forEach(button=>{button.hidden=!manage;});" in script
     assert "use Reconnect instead" in script
+
+
+def test_a_camera_can_only_be_moved_to_a_local_network_address(world):
+    """Red review: a compromised or buggy appliance must not repoint a camera,
+    and so its stored credentials, at a public host, a name or loopback."""
+    job_id = _reconnect(world, username="admin", password="p").json()["job_id"]
+    _appliance_confirms(world, job_id)
+    for host in ("8.8.8.8", "203.0.113.7", "camera.example.com", "127.0.0.1", "0.0.0.0", "224.0.0.1"):
+        response = _appliance_moves_address(world, job_id, rtsp_uri=f"rtsp://{host}:554{PATH}")
+        assert response.status_code in {400, 409}, host
+    assert _camera(world)["onvif_endpoint"] == OLD
+    assert _appliance_moves_address(world, job_id, rtsp_uri=f"rtsp://100.64.10.20:554{PATH}").json()["updated"] is True
