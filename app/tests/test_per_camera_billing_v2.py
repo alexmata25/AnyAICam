@@ -132,6 +132,7 @@ def test_v2_checkout_uses_approved_monthly_unit_price_and_camera_quantity(
 
 
 @pytest.mark.parametrize("bad_price", [
+    {"id": "price_different_from_requested", "unit_amount": 999, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
     {"unit_amount": 50, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
     {"unit_amount": 60, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
     {"unit_amount": 1499, "currency": "usd", "active": True, "recurring": {"interval": "month"}},
