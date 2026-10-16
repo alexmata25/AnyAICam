@@ -15863,7 +15863,7 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
         from appliance_protocol import decrypt_camera_credentials
         with connection() as db:
             camera = db.execute(
-                "SELECT id, onvif_endpoint, ip_address FROM cameras WHERE camera_number=?",
+                "SELECT id, onvif_endpoint, ip_address, device_key FROM cameras WHERE camera_number=?",
                 (camera_number,),
             ).fetchone()
             if not camera:
@@ -15877,6 +15877,19 @@ def _provisioned_camera_stream(camera_number: int) -> dict | None:
     rtsp_url = camera["onvif_endpoint"] or ""
     if not rtsp_url.startswith("rtsp://"):
         return None
+    # Camera address recovery (1.2.7, camera_address_recovery.py): the address
+    # recovered after a DHCP change while the cloud still holds the one it
+    # replaced. Only a positive identity mismatch (a different device answers
+    # at the address) stops the stream, so its credentials are never sent
+    # there; any failure inside recovery keeps the configured address.
+    try:
+        import camera_address_recovery
+        rtsp_url = camera_address_recovery.stream_endpoint(camera["id"], camera["device_key"], rtsp_url, camera_number)
+    except OSError as error:
+        if type(error).__name__ == "CameraIdentityHoldError":
+            raise
+    except Exception:
+        pass
     if not credential_row:
         # A camera provisioned without credentials (it serves RTSP without
         # authentication) has no camera_credentials row at all: stream its
@@ -40982,6 +40995,20 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE == "edge"
         else None
     )
+    # Camera address recovery (1.2.7): finds a camera again by its ONVIF
+    # identity after DHCP gives it a new address (camera_address_recovery.py).
+    import camera_address_recovery
+    camera_address_recovery_task = (
+        asyncio.create_task(camera_address_recovery.camera_address_recovery_worker(
+            lambda: camera_address_recovery.Dependencies(
+                is_streaming=camera_receiving_video,
+                processes=lambda: list(ffmpeg_processes),
+                alert=append_in_app_alert,
+            )
+        ))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     talk_down_discovery_task = (
         asyncio.create_task(talk_down_discovery.talk_down_discovery_worker())
         if RUNTIME_ROLE in {"edge", "combined"}
@@ -41183,6 +41210,8 @@ async def lifespan(app: FastAPI):
             local_recording_catalog_task.cancel()
         if local_customer_access_task:
             local_customer_access_task.cancel()
+        if camera_address_recovery_task:
+            camera_address_recovery_task.cancel()
         if talk_down_discovery_task:
             talk_down_discovery_task.cancel()
         if talk_audio_relay_client_task:
@@ -41312,6 +41341,8 @@ async def lifespan(app: FastAPI):
             pending.append(local_recording_catalog_task)
         if local_customer_access_task:
             pending.append(local_customer_access_task)
+        if camera_address_recovery_task:
+            pending.append(camera_address_recovery_task)
         if talk_down_discovery_task:
             pending.append(talk_down_discovery_task)
         if talk_audio_relay_client_task:
