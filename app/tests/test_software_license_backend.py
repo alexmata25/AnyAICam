@@ -164,7 +164,7 @@ def test_owner_case_contract_shape_appliance_included_never_stand_alone(license_
     assert [set(item) for item in body["downloads"]] == [DOWNLOAD_KEYS]
     download = body["downloads"][0]
     assert download["platform"] == "linux" and download["version"] == "1.2.4" and download["commit"] == COMMIT_124
-    assert download["url"] == "/api/customer/downloads/linux" and download["signed"] is False
+    assert download["url"] == "/api/customer/downloads/vms-installer" and download["signed"] is False
     assert download["install_flow"] == "terminal_claim"
     assert body["notes"] == {"installer_older_than_installed": False}
 
