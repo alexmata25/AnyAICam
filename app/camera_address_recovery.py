@@ -490,6 +490,14 @@ def identity_check(camera_id: str, device_key: str, host: str, probe=None, timeo
     return check
 
 
+def _on_event_loop_thread() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def stream_endpoint(camera_id: str, device_key: str | None, cloud_endpoint: str, camera_number=None, *, db=None,
                     probe=None, clock=time.monotonic) -> str:
     """Called by the VMS wherever it is about to use a provisioned camera's
@@ -521,7 +529,13 @@ def stream_endpoint(camera_id: str, device_key: str | None, cloud_endpoint: str,
         return endpoint
     with _lock:
         check = _checks.get(camera_id)
-    if check is None or check.host != host or clock() - check.at > CHECK_FRESH_SECONDS:
+    stale = check is None or check.host != host or clock() - check.at > CHECK_FRESH_SECONDS
+    # Never block the event loop (Red review 2026-10-15): async callers such as
+    # refresh_live_copy_probe() reach this through camera_url(). On the loop
+    # thread only the worker's last result is used; the worker (which runs in
+    # a thread every CHECK_INTERVAL_SECONDS, first pass at start-up) refreshes
+    # it, and stops any stream it later finds connected to a different device.
+    if stale and not _on_event_loop_thread():
         try:
             check = identity_check(camera_id, device_key, host, probe=probe, timeout=GATE_PROBE_TIMEOUT_SECONDS, clock=clock)
         except Exception:
