@@ -480,3 +480,15 @@ def test_reset_password_without_the_csrf_header_is_the_confirmed_live_failure(db
         with sqlite3.connect(db_path) as conn:
             row = conn.execute("SELECT used_at FROM password_reset_tokens WHERE user_id='cust-user-1'").fetchone()
             assert row[0] is None
+
+
+def test_an_account_stored_with_a_mixed_case_email_can_reset_its_password(http_client, db_path, monkeypatch):
+    """Sign-in matches lower(email); the reset request used an exact match, so such an account could sign in
+    but never received a reset link (Green 2026-10-16)."""
+    _seed_customer(db_path, email="Customer.Mixed@Example.test", password="old-temp-password-123")
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    monkeypatch.setattr(cloud_features, "settings", _cloud_production())
+    token = _request_and_extract_token(http_client, capturing, "customer.mixed@example.test")
+    assert http_client.post("/api/password-reset/complete",
+                            json={"token": token, "password": "brand-new-password-456"}).status_code == 200

@@ -166,7 +166,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     def password_reset_request(payload: dict,request: Request):
         email=str(payload.get('email','')).strip().lower(); client_ip=(request.client.host if request.client else 'unknown')
         allowed=_password_reset_email_limiter.allow(email) and _password_reset_ip_limiter.allow(client_ip)
-        user=row('SELECT id,email,role FROM partner_users WHERE email=?',(email,)) if allowed else None
+        user=row('SELECT id,email,role FROM partner_users WHERE lower(email)=?',(email,)) if allowed else None  # as sign-in
         if user:
             raw=create_password_reset(user['id'],email)
             # Confirmed live on Samsung: settings.password_reset_url defaults
