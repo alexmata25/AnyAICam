@@ -301,6 +301,12 @@ def hardware_awaiting_delivery(customer_id: str) -> bool:
                     "AND COALESCE(fulfillment_status,'paid') NOT IN ('delivered','cancelled') LIMIT 1", (customer_id,)))
 
 
+def hardware_order_paid(customer_id: str) -> bool:
+    """A paid AnyAiCam appliance order (hardware-first, delivered or not; refunded/disputed orders are not 'paid')."""
+    return bool(row("SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' AND status='paid' "
+                    "AND COALESCE(fulfillment_status,'paid')!='cancelled' LIMIT 1", (customer_id,)))
+
+
 def hardware_plan_intent(customer_id: str) -> dict:
     """The plan and camera count chosen in Build Your System with the latest paid hardware order
     (kept on hardware_checkouts as intent only; never charged with the hardware)."""

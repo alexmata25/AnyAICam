@@ -560,7 +560,10 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         if identity['role']=='customer_owner' and not licensed_slots and not on_edge:
             import per_camera_billing
             progress=per_camera_billing.build_progress(customer['id'])
-            if progress and progress['state']==per_camera_billing.BUILD_PENDING:
+            # A saved selection whose appliance is already paid for (hardware-first,
+            # 2026-10-15) is not an unpaid purchase: never back to "Pay for hardware".
+            if (progress and progress['state']==per_camera_billing.BUILD_PENDING
+                    and not per_camera_billing.hardware_order_paid(customer['id'])):
                 return RedirectResponse(per_camera_billing.ORDER_SUMMARY_PATH,status_code=303)
         # A paid Build Your System order whose appliance has not been
         # delivered yet returns to its order status, not to setup.
@@ -571,6 +574,11 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 delivery=order_funnel.hardware_delivery(customer['id'],progress)
                 if delivery and delivery['state']!=order_funnel.HARDWARE_READY:
                     return RedirectResponse(per_camera_billing.ORDER_COMPLETE_PATH,status_code=303)
+        # Hardware-first (2026-10-15): paid equipment still on its way waits on My orders, not in setup.
+        if identity['role']=='customer_owner' and not activated and not on_edge:
+            import per_camera_billing, hardware_checkout
+            if per_camera_billing.hardware_awaiting_delivery(customer['id']):
+                return RedirectResponse(hardware_checkout.ORDERS_PATH,status_code=303)
         if identity['role']=='customer_owner' and not on_edge and not (activated and (cameras or licensed_slots>0)):
             return RedirectResponse('/customer/setup',status_code=303)
 
