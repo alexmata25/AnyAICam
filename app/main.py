@@ -35625,7 +35625,8 @@ async def store_motion_event(
     # detection above this point is completely unaffected either way;
     # this only gates the smart_motion-specific correlated event.
     smart_motion_identity = recording_uploader._camera_identity(camera_number)
-    classification = smart_motion.classify_motion(camera_number) if bool(smart_motion_identity and smart_motion_identity.get("smart_motion_enabled")) else None
+    classification = (smart_motion.classify_motion(camera_number)
+                      if effective_analytics(smart_motion_identity, camera_number, ("smart_motion_enabled",)) else None)
     if classification:
         smart_event = AnalyticsEventModel(
             camera=camera_number,
@@ -37733,7 +37734,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         return []
     runtime_identity = recording_uploader._camera_identity(camera_number)
-    smart_motion_enabled = bool(runtime_identity and runtime_identity.get("smart_motion_enabled"))
+    # Camera flag AND the appliance-wide Smart Motion switch (the same gate as the detector's).
+    smart_motion_enabled = bool(effective_analytics(runtime_identity, camera_number, ("smart_motion_enabled",)))
     # PPE / face crops (2026-10-11, video-pipeline P2a): on an analytics-
     # stream frame, the person is cut from ONE main-stream frame grabbed on
     # demand -- only when a PPE/face check actually crops a person. On a
@@ -39390,7 +39392,8 @@ async def people_counting_worker(camera_number: int) -> None:
 def _analytic_globally_enabled(flag: str, camera_number: int) -> bool:
     """The appliance-wide condition each analytic's own processing applies."""
     if flag == "smart_motion_enabled":
-        return True  # the detector itself (AI_PERSON_DETECTION_ENABLED gates the whole worker)
+        # Codex 2026-10-17: Smart Motion's own appliance-wide switch (smart_motion.py) is part of the gate too.
+        return bool(smart_motion.SMART_MOTION_ENABLED)
     if flag == "people_counting_enabled":
         return PEOPLE_COUNTING_ENABLED
     if flag == "lpr_enabled":

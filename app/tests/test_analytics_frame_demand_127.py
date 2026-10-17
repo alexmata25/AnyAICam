@@ -166,3 +166,24 @@ def test_independently_enabled_lpr_still_gets_its_full_resolution_frame(scan, mo
     result = {"detections": [car], "frame": np.zeros((360, 640, 3), np.uint8), "frame_source": "substream"}
     assert main.run_lpr_scan(4, result) == []
     assert scan.rtsp_grabs == [4] and used and used[0] is not None
+
+
+# ---------------------------------------------------------------- Smart Motion (Codex 2026-10-17)
+def test_smart_motion_off_appliance_wide_saves_no_person_event(scan, monkeypatch):
+    saved = []
+    monkeypatch.setattr(main, "append_analytics_event", saved.append)
+    monkeypatch.setattr(main.smart_motion, "SMART_MOTION_ENABLED", False)
+    monkeypatch.setattr(main.ppe, "PPE_ENABLED", False)
+    monkeypatch.setattr(main.facial_recognition, "FACIAL_RECOGNITION_ENABLED", False)
+    scan.identity.update(smart_motion_enabled=True)
+    scan.run()
+    assert [e for e in saved if e.get("event_type") == "person"] == [] and _nothing_acquired(scan)
+
+
+def test_smart_motion_on_still_saves_the_person_event(scan, monkeypatch):
+    saved = []
+    monkeypatch.setattr(main, "append_analytics_event", saved.append)
+    monkeypatch.setattr(main.smart_motion, "SMART_MOTION_ENABLED", True)
+    scan.identity.update(smart_motion_enabled=True)
+    scan.run()
+    assert [e for e in saved if e.get("event_type") == "person"]
