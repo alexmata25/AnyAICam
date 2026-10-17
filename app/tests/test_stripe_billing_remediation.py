@@ -392,3 +392,27 @@ def test_without_a_stripe_key_an_add_on_checkout_grants_nothing(env, monkeypatch
     assert _deliver(env, _checkout("evt_t", sub_id="sub_T", price="price_talk")).status_code == 503
     with override_target(sqlite_path=str(env["path"])):
         assert ae.get_active_analytics_for_customer("cust-A") == []
+
+
+def test_a_failure_email_still_being_sent_is_not_sent_a_second_time_by_the_worker(env, mail):
+    """A 'pending' outbox row may be a send in progress: the worker retries it only once it is stale
+    (Green 2026-10-16), as order_funnel's confirmation retry does."""
+    from datetime import datetime
+    import purchase_notifications
+    _customer(env)
+    _deliver(env, _invoice("evt_fail_pending", invoice_id="in_r9", kind="invoice.payment_failed"))
+    assert len([m for m in mail["sent"] if m["type"] == "payment_failed"]) == 1
+    conn = sqlite3.connect(env["path"])
+    # As if the webhook's send were still in flight: the row is 'pending', just updated.
+    conn.execute("UPDATE provisioning_notifications SET status='pending',sent_at=NULL,updated_at=? "
+                 "WHERE stripe_event_id='payment-failed:in_r9'", (datetime.now().isoformat(),))
+    conn.commit()
+    with override_target(sqlite_path=str(env["path"])):
+        assert purchase_notifications.retry_payment_failed_notifications() == 0
+    assert len([m for m in mail["sent"] if m["type"] == "payment_failed"]) == 1
+    stale = (datetime.now() - timedelta(seconds=purchase_notifications.PAYMENT_FAILED_STALE_SECONDS + 60)).isoformat()
+    conn.execute("UPDATE provisioning_notifications SET updated_at=? WHERE stripe_event_id='payment-failed:in_r9'", (stale,))
+    conn.commit()
+    conn.close()
+    with override_target(sqlite_path=str(env["path"])):
+        assert purchase_notifications.retry_payment_failed_notifications() == 1  # interrupted for real: sent once more

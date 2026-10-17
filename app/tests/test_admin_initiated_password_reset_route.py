@@ -198,3 +198,21 @@ def test_admin_initiated_reset_does_not_mutate_unrelated_customer_fields(monkeyp
         reset(_fake_request(), "customer-a", "user-a")
         after = row("SELECT * FROM customers WHERE id='customer-a'")
     assert before == after
+
+
+def test_admin_initiated_reset_says_so_when_the_email_could_not_be_delivered(monkeypatch, db_path):
+    """SMTPEmail.send returns {'status': 'failed'} instead of raising: the admin must not be told it was sent
+    (Green 2026-10-16)."""
+    class _FailingEmailService:
+        def send(self, message_type, to, subject, text, html=None, metadata=None):
+            return {"type": message_type, "to": to, "status": "failed", "error": "(535, b'5.7.8 Username and Password not accepted')"}
+
+    reset = _route("/api/partner/customers/{customer_id}/accounts/{user_id}/reset-password")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(cloud_features, "require_partner_access", lambda request: _technician_identity())
+        monkeypatch.setattr(cloud_features, "get_email_service", lambda: _FailingEmailService())
+        result = reset(_fake_request(), "customer-a", "user-a")
+    assert result["status"] == "failed"
+    assert "could not be delivered" in result["message"] and "535" in result["message"]
+    assert "sent to the account on file" not in result["message"]

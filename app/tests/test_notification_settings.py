@@ -356,3 +356,22 @@ def test_unauthenticated_request_is_denied(http_client):
     assert response.status_code == 401
     response = http_client.put("/api/customer/notifications/preferences", json={})
     assert response.status_code == 401
+
+
+def test_test_email_is_rate_limited_per_user(http_client, db_path, monkeypatch):
+    """Green 2026-10-16: like the test SMS, "Send test email" cannot be clicked without limit."""
+    import notification_settings_page
+    monkeypatch.setattr(notification_settings_page, "_test_email_limiter", None)  # a fresh hour for this test
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn)
+    _seed_owner(conn, "user-1", "owner@example.test", "cust-1")
+    cookie = _owner_cookie()
+    http_client.put(
+        "/api/customer/notifications/preferences", cookies={partner_portal.SESSION_COOKIE: cookie},
+        json={"email_enabled": True, "email_address": "owner@example.test", "sms_enabled": False, "phone_number": "",
+              "event_types": [], "camera_scope": "all", "camera_ids": []},
+    )
+    for _ in range(notification_settings_page.TEST_EMAIL_MAX_PER_HOUR):
+        assert http_client.post("/api/customer/notifications/test-email", cookies={partner_portal.SESSION_COOKIE: cookie}).status_code == 200
+    limited = http_client.post("/api/customer/notifications/test-email", cookies={partner_portal.SESSION_COOKIE: cookie})
+    assert limited.status_code == 429 and "limit" in limited.json()["detail"].lower()
