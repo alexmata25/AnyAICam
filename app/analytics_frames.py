@@ -526,6 +526,20 @@ class AnalyticsFrames:
             self._failures.pop(camera_number, None)
             return self._hls_until.pop(camera_number, None) is not None
 
+    def release(self, camera_number: int) -> bool:
+        """Every analytic on this camera was just switched off (Codex 2026-10-17): stop its reader's ffmpeg NOW
+        instead of after IDLE_STOP_SECONDS. Unlike forget(), the camera keeps its generation, fallback window and
+        failure count, and the reader is not retired: the next get_frame() simply starts it again. True if a
+        reader was running."""
+        with self._lock:
+            reader = self._readers.get(camera_number)
+        if reader is None:
+            return False
+        thread = getattr(reader, "_thread", None)
+        running = bool(thread is not None and thread.is_alive())
+        reader.stop()
+        return running
+
     def forget(self, camera_number: int) -> None:
         """Stop the camera's reader (its ffmpeg), drop all its state and
         start a new generation for the camera."""

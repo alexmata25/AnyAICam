@@ -39661,6 +39661,15 @@ async def ai_person_detector(camera_number: int) -> None:
             # recording and video workers are separate tasks and continue.
             runtime_identity = recording_uploader._camera_identity(camera_number)
             if not effective_analytics(runtime_identity, camera_number):
+                if state.get("pause_reason") != "analytics_disabled":
+                    # Codex 2026-10-17: on the switch-off itself, stop the analytics reader's ffmpeg at once
+                    # rather than after the reader's 120 s idle stop. Once per transition; resuming starts a
+                    # fresh reader through get_frame(). (The idle stop remains the backstop.)
+                    try:
+                        if await asyncio.to_thread(ai_frames.release, camera_number):
+                            print(f"Camera {camera_number} AI reader stopped: every analytic is off")
+                    except Exception as error:
+                        print(f"Camera {camera_number} AI reader release skipped (non-fatal): {error}")
                 state.update(status="paused", error=None, pause_reason="analytics_disabled")
                 await asyncio.sleep(AI_DETECTION_INTERVAL_SECONDS)
                 continue
