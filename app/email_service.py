@@ -37,6 +37,9 @@ EMAIL_TYPES={
     # but never registered here, so the preview backend refused them and the
     # retry worker re-queued them forever. SMTP does not check this set.
     'payment_failed','friends_family_request','friends_family_decision',
+    # Billing Consent Exception (2026-10-17, storage_trial.py): the administrator alert for a paid trial
+    # subscription without the customer's authorization. Additive only.
+    'billing_consent_exception',
 }
 
 
