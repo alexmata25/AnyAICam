@@ -42,6 +42,19 @@ from partner_portal import partner_identity
 
 CUSTOMER_ROLES = {"customer_owner", "customer_viewer"}
 
+# "Send test email" goes to an address the customer typed in: at most this many per user per hour, so the button
+# cannot be used to spend the account's SMTP sending quota (Green 2026-10-16; the test SMS has its own limit).
+TEST_EMAIL_MAX_PER_HOUR = 5
+_test_email_limiter = None
+
+
+def _test_email_allowed(user_id: str) -> bool:
+    global _test_email_limiter
+    if _test_email_limiter is None:
+        from appliance_protocol import RateLimiter
+        _test_email_limiter = RateLimiter(TEST_EMAIL_MAX_PER_HOUR, 3600)
+    return _test_email_limiter.allow(f"test-email:{user_id}")
+
 
 def _test_sms_limit_reached(db, *, user_id: str) -> bool:
     """Each "Send test SMS" click is a paid message to a typed-in number:
@@ -287,6 +300,8 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
             preferences = get_preferences(db, user_id=user_id)
             if not preferences["email_address"]:
                 raise HTTPException(status_code=400, detail="Save a notification email address first.")
+            if not _test_email_allowed(user_id):
+                raise HTTPException(status_code=429, detail="Test email limit reached. Please try again in an hour.")
             result = get_email_service().send(
                 "notification_test", preferences["email_address"], "AnyAiCam test notification",
                 "This is a test notification from your AnyAiCam account. If you received this, email notifications are working.",

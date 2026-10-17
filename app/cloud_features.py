@@ -257,7 +257,11 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         message=get_email_service().send('password_reset',user['email'],subject,text,html=html_body,metadata={'expires_minutes':60,'initiated_by':'admin'})
         with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',user['email'],message['status'],settings.email_backend,json.dumps(email_error_fields(message)|{'expires_minutes':60,'initiated_by':'admin'}),datetime.now().isoformat()))
         audit(identity,'customer_account.password_reset_initiated','partner_user',user_id,{'customer_id':customer_id,'provider':settings.email_backend})
-        return {'message':'Password-reset message sent to the account on file. The customer\'s current password remains unchanged until they complete the reset.'}
+        if message.get('status')=='failed':
+            # SMTPEmail.send returns, not raises, a delivery failure: never tell the admin it was sent (Green 2026-10-16).
+            reason=email_error_fields(message).get('error') or 'the email provider reported a failure'
+            return {'status':'failed','message':f'The password-reset email could not be delivered ({reason}). The customer\'s password is unchanged; try again or check the email settings.'}
+        return {'status':message.get('status'),'message':'Password-reset message sent to the account on file. The customer\'s current password remains unchanged until they complete the reset.'}
 
     @app.post('/api/partner/customers/{customer_id}/accounts/{user_id}/change-email')
     def change_customer_account_email(request: Request,customer_id: str,user_id: str,payload: dict):

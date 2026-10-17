@@ -833,12 +833,20 @@ def notify_payment_failed(invoice_id: str) -> dict:
     )
 
 
+# A 'pending' row may be a send still in progress (an SMTP call can take ~20 s):
+# it is retried only once it is this old, so the worker never sends a second copy.
+PAYMENT_FAILED_STALE_SECONDS = 300
+
+
 def retry_payment_failed_notifications(limit: int = 50) -> int:
     """Resend failed-renewal emails that were not delivered yet."""
+    from datetime import timedelta
     from partner_db import rows
+    stale_before = (datetime.now() - timedelta(seconds=PAYMENT_FAILED_STALE_SECONDS)).isoformat()
     sent = 0
     for pending in rows("SELECT stripe_event_id FROM provisioning_notifications WHERE notification_type=? "
-                        "AND status IN ('pending','failed') ORDER BY updated_at LIMIT ?", (PAYMENT_FAILED_TYPE, limit)):
+                        "AND (status='failed' OR (status='pending' AND updated_at<?)) ORDER BY updated_at LIMIT ?",
+                        (PAYMENT_FAILED_TYPE, stale_before, limit)):
         key = str(pending["stripe_event_id"] or "")
         if key.startswith("payment-failed:"):
             try:
