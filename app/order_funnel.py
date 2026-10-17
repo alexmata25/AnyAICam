@@ -86,12 +86,16 @@ def _identity(request: Request, next_path: str):
     return identity, None
 
 
-def _order_lines(selection: dict) -> tuple[str, str]:
+def _order_lines(selection: dict, customer_id: str | None = None) -> tuple[str, str]:
     """Summary rows and notes, all priced from the server catalog
     (build_orders.order_quote): what is charged today, the monthly plan,
-    and when the plan starts (owner decisions 2026-10-05)."""
+    and when the plan starts (owner decisions 2026-10-05). A plan-only
+    order that build_orders' Checkout starts with the granted 30-day storage
+    trial shows $0.00 due today and the trial terms (display only; Green 2026-10-16)."""
     import build_orders
+    import storage_trial
     quote = build_orders.order_quote(selection)
+    trial = quote["kind"] == build_orders.PLAN_ORDER and storage_trial.offer_available(customer_id, selection["plan"])
     plan = billing.PLANS[selection["plan"]]
     quantity = quote["cameras"]
     unit = int(plan["monthly_cents_per_camera"])
@@ -113,7 +117,8 @@ def _order_lines(selection: dict) -> tuple[str, str]:
         lines += ('<div class="order-line" id="order-license-owned"><span>AnyAiCam VMS software license</span>'
                   '<span>Already on your account ($0.00)</span></div>')
     lines += (f'<div class="order-line" id="order-monthly"><span>Monthly subscription</span><span>{_money(unit * quantity)}/month</span></div>'
-              f'<div class="order-line order-total" id="order-today"><span>Due today</span><span>{_money(quote["due_today_cents"])}</span></div>')
+              f'<div class="order-line order-total" id="order-today"><span>Due today</span>'
+              f'<span>{_money(0 if trial else quote["due_today_cents"])}</span></div>')
     if quote["kind"] == build_orders.APPLIANCE_ORDER:
         from hardware_fulfillment import PREPARATION_TIMEFRAME_TEXT
         notes = ('<p class="note" id="order-plan-start">Your hardware is charged today. Your monthly subscription starts when you '
@@ -127,6 +132,10 @@ def _order_lines(selection: dict) -> tuple[str, str]:
                  'your monthly subscription starts today.</p>'
                  '<p class="note" id="order-own-pc">Runs on your own Ubuntu 24.04 PC. The license is yours to keep; the '
                  'monthly subscription is separate.</p>')
+    elif trial:
+        notes = (f'<p class="note" id="order-plan-start">Your {storage_trial.TRIAL_DAYS}-day free cloud storage trial starts today: '
+                 f'nothing is charged now. The plan ends with the trial and you will not be charged unless you choose to '
+                 f'continue, then at {_money(unit * quantity)}/month.</p>')
     else:
         notes = '<p class="note" id="order-plan-start">Your monthly subscription starts today.</p>'
     return lines, notes
@@ -484,7 +493,7 @@ def register_order_funnel_routes(app: FastAPI) -> None:
                     '<p>Pick a plan and how many cameras to license, then review your order.</p>' + _chooser({}) +
                     f'<a class="ghost" href="{WEBSITE_BUILD_URL}">Back to Build Your System</a>')
             return HTMLResponse(_page("Your order", body), headers=NO_STORE)
-        lines, hardware = _order_lines(selection)
+        lines, hardware = _order_lines(selection, customer_id)
         quantity = int(selection.get("cameras") or billing.MIN_CAMERA_QUANTITY)
         body = ('<h2>Order summary</h2>' + notice + lines + hardware +
                 '<p class="note">Stripe shows the final amount, including any discount or tax, before you pay. '
