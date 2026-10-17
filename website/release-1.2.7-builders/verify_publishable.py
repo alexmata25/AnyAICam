@@ -52,11 +52,12 @@ for name in ("plans.html", "build-your-system.html"):
     for unqualified in ('"v2-retention">2-day', '"v2-retention">7-day', "<small>2-day local recording", "<small>7-day local recording"):
         if unqualified in _pages[name]:
             problems.append(f"{name}: retention is not advertised as 'up to' ({unqualified})")
-# The 14-day cloud event-clip claim is published only once the S3 expiration rule was verified (read-only).
-_s3 = HERE / "S3-LIFECYCLE-VERIFIED.md"
-if not _s3.exists() or "RESULT: 14-day expiration confirmed" not in _s3.read_text(encoding="utf-8"):
-    problems.append("the 14-day cloud event-clip retention is not yet verified against the S3 lifecycle rule "
-                    "(record the read-only check in S3-LIFECYCLE-VERIFIED.md)")
+# No cloud day-count promise (owner 2026-10-17): the S3 lifecycle check showed the 14-day expiry is NOT enforced (clips
+# are kept), and the owner chose to keep the claim off rather than change S3. Any cloud 14-day claim blocks publication.
+import re as _re
+for name, html in _pages.items():
+    for claim in _re.findall(r"[^<>]{0,40}(?:14[- ]day cloud|cloud for 14 days|online for 14 days|14 days online|14 days of cloud)[^<>]{0,20}", html):
+        problems.append(f"{name}: promises a cloud day count the storage does not enforce: {claim.strip()!r}")
 if pricing.KEPT not in _home:
     problems.append("index.html: the comparison table does not show how long recordings are kept")
 if 'data-plan="hybrid" data-plan-price="19.99"' not in _pages["plans.html"] or "hybrid:19.99" not in _pages["build-your-system.html"]:
