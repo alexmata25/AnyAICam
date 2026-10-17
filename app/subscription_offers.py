@@ -46,6 +46,10 @@ PACKAGE_NAMES = {
 PLAN_FEATURE_WORDING = {
     "remote_viewing_where_supported": "Remote viewing: watch your cameras from anywhere using your phone or computer",
 }
+# Shown to customers as ONE "Cloud Video Backup" line (owner decision 2026-10-17: the overlapping Hybrid cloud rows
+# are consolidated). Display only -- the feature keys stay in PLANS and nothing gates on them.
+MERGED_INTO_CLOUD_VIDEO_BACKUP = {"hybrid_cloud_services", "cloud_event_protection"}
+LOCAL_RETENTION_NOTE = "depends on the storage available on your AnyAiCam system"
 # Features a plan's gating treats as included (analytics_entitlements.account_wide_feature_active).
 # voice_call is deliberately absent: ordinary Talk Down does not include AAC Voice Call.
 V2_INCLUDED_GRANTS = {"talk_down": "supported_talk_down", "smart_motion": "smart_motion", "aaco": "core_aaco_retrieval"}
@@ -99,10 +103,12 @@ def plan_inclusions_html(plan_key: str, payload: dict | None = None) -> str:
     plan = per_camera_billing.PLANS[plan_key]
     rows = []
     for feature in plan["features"]:
+        if feature in MERGED_INTO_CLOUD_VIDEO_BACKUP:
+            continue
         label = PLAN_FEATURE_WORDING.get(feature) or per_camera_billing.FEATURE_LABELS.get(feature, feature)
         rows.append((label, "Included"))
     local_days = (payload or {}).get("local_retention_days") or plan["local_retention_days"]
-    rows.append((f"Local recording retention: {local_days} days standard", "Included"))
+    rows.append((f"Local recording: up to {local_days} days ({LOCAL_RETENTION_NOTE})", "Included"))
     if plan["cloud_event_storage"]:
         rows.append((f"Cloud event storage: {plan['cloud_event_retention_days']} days (event clips, not continuous recording)", "Included"))
     html ="".join(f'<div class="health-row" data-included="{escape(label, quote=True)}"><span>{escape(label)}</span>'
@@ -122,6 +128,8 @@ def plan_comparison_html() -> str:
     features = []
     for key in keys:
         for feature in per_camera_billing.PLANS[key]["features"]:
+            if feature in MERGED_INTO_CLOUD_VIDEO_BACKUP:
+                continue
             if feature not in features:
                 features.append(feature)
     head = "".join(f'<th scope="col">{escape(per_camera_billing.PLANS[k]["display_name"])}<br>'
@@ -133,8 +141,8 @@ def plan_comparison_html() -> str:
         cells = "".join("<td>✓</td>" if feature in per_camera_billing.PLANS[k]["features"] else '<td aria-label="Not included">—</td>'
                         for k in keys)
         body += f"<tr><th scope=\"row\">{escape(label)}</th>{cells}</tr>"
-    body += ("<tr><th scope=\"row\">Local recording retention (standard)</th>"
-             + "".join(f"<td>{per_camera_billing.PLANS[k]['local_retention_days']} days</td>" for k in keys) + "</tr>")
+    body += (f"<tr><th scope=\"row\">Local recording (up to; {LOCAL_RETENTION_NOTE})</th>"
+             + "".join(f"<td>up to {per_camera_billing.PLANS[k]['local_retention_days']} days</td>" for k in keys) + "</tr>")
     body += ("<tr><th scope=\"row\">Cloud event storage</th>"
              + "".join(f"<td>{per_camera_billing.PLANS[k]['cloud_event_retention_days']} days</td>" if per_camera_billing.PLANS[k]["cloud_event_storage"]
                        else "<td>—</td>" for k in keys) + "</tr>")

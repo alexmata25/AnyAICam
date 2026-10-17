@@ -22,7 +22,12 @@ SUPPORT = "Free remote technical support by phone, Monday through Sunday, during
 LICENSES_OLD = ("$49.99", "$79.99", "$129.99", "$199.99")
 LICENSES_NEW = ("$24.99", "$37.49", "$62.49", "$99.99")
 REMOTE = "Watch your cameras from anywhere using your phone or computer."
-BACKUP = "Keep an extra copy of your camera's event video clips safely stored online."
+REMOTE_DETAIL = REMOTE + " It works over the internet, so your AnyAiCam system needs an internet connection."
+BACKUP = "Keep an extra copy of your camera's event video clips safely stored online for 14 days."
+# Owner decisions 2026-10-17: advertise local retention as "up to", and say why.
+STORAGE_NOTE = "How long local recordings are kept depends on the storage available on your AnyAiCam system."
+RETENTION = {"basic": "Up to 2 days of local recording", "ai": "Up to 7 days of local recording",
+             "hybrid": "Up to 7 days of local recording + 14 days of cloud event-clip backup"}
 AI_LOCAL = "Smart AI camera features, local recording, and remote viewing — without paying for cloud video storage."
 KEPT = "How long recordings are kept"
 DESC_CSS = (".aic-compare-desc{display:block;font-weight:400;font-size:.86em;line-height:1.35;color:#52627a;margin-top:.15rem}"
@@ -68,9 +73,17 @@ def plans(html, page="plans.html"):
         html = replace(html, f"<tr><th>Up to {capacity} cameras</th><td>{old} one-time</td></tr>",
                        f"<tr><th>Up to {capacity} cameras</th><td>{new} one-time</td></tr>", page=page)
     html = replace(html, "<li>Remote viewing where supported</li>", f"<li>{REMOTE[:-1]}</li>", page=page)
+    # One Cloud Video Backup line replaces the two overlapping Hybrid cloud lines.
+    html = replace(html, "<li>Cloud event protection: events kept in the cloud for 14 days</li>\n", "", page=page)
     html = replace(html, "<li>Remote cloud services</li>",
-                   "<li>Cloud Video Backup: an extra copy of your event video clips, stored online</li>", page=page)
+                   "<li>Cloud Video Backup: an extra copy of your event video clips, kept online for 14 days</li>", page=page)
+    for old, key in (("2-day local recording", "basic"), ("7-day local recording", "ai"),
+                     ("7-day local recording + 14-day cloud event retention", "hybrid")):
+        html = replace(html, f'<p class="v2-retention">{old}</p>', f'<p class="v2-retention">{RETENTION[key]}</p>', page=page)
     html = insert_in_card(html, 'id="plan-ai-local"', "<ul>", f'<p class="v2-tagline">{AI_LOCAL}</p>\n', page=page)
+    if STORAGE_NOTE not in html:
+        html = replace(html, '<article class="card" id="plan-estimator"',
+                       f'<p class="v2-storage-note">{STORAGE_NOTE}</p>\n\n<article class="card" id="plan-estimator"', page=page)
     for card in ('id="plan-basic-local"', 'id="plan-ai-local"', 'id="plan-hybrid"'):
         html = insert_in_card(html, card, "</ul>", f'<li class="v2-support">{SUPPORT}</li>\n', page=page)
     return html
@@ -85,11 +98,16 @@ def build_your_system(html, page="build-your-system.html"):
     html = replace(html, "LICENCE=[[8,49.99],[16,79.99],[32,129.99],[64,199.99]]",
                    "LICENCE=[[8,24.99],[16,37.49],[32,62.49],[64,99.99]]", page=page)
     html = replace(html, "2-day local recording, basic motion and events, remote viewing where supported. No cloud event storage.",
-                   "2-day local recording, basic motion and events. Watch your cameras from anywhere. No cloud video backup.", page=page)
+                   "Up to 2 days of local recording, basic motion and events. Watch your cameras from anywhere. "
+                   "No cloud video backup.", page=page)
     html = replace(html, "7-day local recording, person and vehicle detection, Smart Motion, AI search, Talk Down on supported "
                          "cameras. No cloud event storage.",
-                   "7-day local recording, person and vehicle detection, Smart Motion, AI search, Talk Down on supported "
-                   "cameras. Watch your cameras from anywhere. No cloud video backup.", page=page)
+                   "Up to 7 days of local recording, person and vehicle detection, Smart Motion, AI search, Talk Down on "
+                   "supported cameras. Watch your cameras from anywhere. No cloud video backup.", page=page)
+    if STORAGE_NOTE not in html:
+        html = replace(html, '</label></div><div class="field-grid" style="margin-top:1rem">',
+                       f'</label></div><p class="inline-note">{STORAGE_NOTE}</p><div class="field-grid" style="margin-top:1rem">',
+                       page=page)
     html = replace(html, "Everything in AI Local, plus 14-day cloud event retention. Not continuous cloud recording.",
                    "Everything in AI Local, plus Cloud Video Backup: an extra copy of your event video clips kept online "
                    "for 14 days. Not continuous cloud recording.", page=page)
@@ -116,14 +134,23 @@ def home(html, page="index.html"):
     html = replace(html, "AnyAiCam VMS monthly plans, priced per camera. See exactly what each plan includes.",
                    "AnyAiCam VMS monthly plans, priced per camera. Every plan lets you watch your cameras from anywhere; "
                    "Hybrid also keeps a backup copy of your event video online.", page=page)
-    html = replace(html, '<th scope="row">Remote viewing where supported</th>', _desc("Remote viewing", REMOTE), page=page)
+    html = replace(html, '<th scope="row">Remote viewing where supported</th>', _desc("Remote viewing", REMOTE_DETAIL), page=page)
     html = replace(html, '<th scope="row">Remote cloud services</th>', _desc("Cloud Video Backup", BACKUP), page=page)
+    # One clear Cloud Video Backup row: the two overlapping Hybrid-only rows go (owner decision 2026-10-17).
+    for label in ("Hybrid cloud services", "Cloud event protection"):
+        marker = f'<tr><th scope="row">{label}</th>'
+        if marker in html:
+            start = html.index(marker)
+            row = html[start:html.index("</tr>", start) + len("</tr>")]
+            if row.count('class="aic-yes"') != 1:
+                raise Mismatch(f"{page}: '{label}' is not a Hybrid-only row; refusing to remove it")
+            html = html.replace(row, "", 1)
     if KEPT not in html:
         anchor = html.index('<tr><th scope="row">Local recording</th>')
         anchor_end = html.index("</tr>", anchor) + len("</tr>")
-        kept = ("<tr>" + _desc(KEPT, "On your AnyAiCam system. With Hybrid, event video clips are also kept online.")
-                + '<td class="aic-compare-kept">2 days</td><td class="aic-compare-kept">7 days</td>'
-                  '<td class="aic-col-recommended aic-compare-kept">7 days + 14 days online</td></tr>')
+        kept = ("<tr>" + _desc(KEPT, STORAGE_NOTE + " Hybrid also keeps event video clips online for 14 days.")
+                + '<td class="aic-compare-kept">Up to 2 days</td><td class="aic-compare-kept">Up to 7 days</td>'
+                  '<td class="aic-col-recommended aic-compare-kept">Up to 7 days + 14 days online</td></tr>')
         html = html[:anchor_end] + kept + html[anchor_end:]
     # Comparison table: one row, included with all three plans (a copy of the all-included "Local VMS" row).
     if 'class="aic-compare-desc">' + SUPPORT not in html:
@@ -131,7 +158,7 @@ def home(html, page="index.html"):
         row = html[start:html.index("</tr>", start) + len("</tr>")]
         if row.count('class="aic-yes"') != 3:
             raise Mismatch(f"{page}: the Local VMS comparison row is not included in all three plans")
-        anchor = html.index('<tr><th scope="row">Cloud event protection</th>')
+        anchor = html.index('<tr><th scope="row">Cloud Video Backup<span class="aic-compare-desc">')
         anchor_end = html.index("</tr>", anchor) + len("</tr>")
         html = html[:anchor_end] + row.replace('<th scope="row">Local VMS</th>', _desc("Free phone support", SUPPORT)) + html[anchor_end:]
     return html
