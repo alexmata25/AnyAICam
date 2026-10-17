@@ -167,7 +167,13 @@ def _claim_attempt(
     win); an existing row is taken only from 'failed', or from a stale
     'pending' (OUTBOX_CLAIM_STALE_SECONDS). The 'pending' row is written
     before the email backend is called, so a crash still leaves a
-    retryable row. With db, inside the caller's transaction."""
+    retryable row. With db, inside the caller's transaction.
+
+    Delivery is AT-LEAST-ONCE, by design (Codex 1.2.7 finding #4): if the provider accepted the email but the
+    process died before _mark_result, the row stays 'pending' and is retaken after OUTBOX_CLAIM_STALE_SECONDS,
+    so that customer can receive the email twice -- never more often per crash, and never while a send is in
+    progress. The alternative (at-most-once) would silently lose order confirmations. Re-sends carry the same
+    Message-ID (email_service.stable_message_id). Neither SMTP nor SES SendEmail offers an idempotency key."""
     if db is None:
         with connection() as own:
             return _claim_attempt(event_id=event_id, notification_type=notification_type, customer_id=customer_id,
@@ -248,7 +254,10 @@ def _send_once(
         reason = "already sent" if found.get("status") == "sent" else "send in progress elsewhere"
         return {"status": "skipped", "reason": reason, "notification_id": found.get("id")}
     try:
-        result = get_email_service().send(notification_type, recipient_email, subject, text, html=html, metadata=metadata or {})
+        # One Message-ID per (event, notification type): a re-send of this outbox row is the same email (Codex #4).
+        from email_service import stable_message_id
+        metadata = dict(metadata or {}, message_id=stable_message_id("outbox", event_id, notification_type))
+        result = get_email_service().send(notification_type, recipient_email, subject, text, html=html, metadata=metadata)
     except Exception as exc:
         _mark_result(tracking["id"], status="failed", error_detail=str(exc)[:500], db=db)
         return {"status": "failed", "notification_id": tracking["id"], "error": str(exc)[:500]}

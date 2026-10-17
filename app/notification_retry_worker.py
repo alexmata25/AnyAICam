@@ -19,7 +19,15 @@ Only ever retries a delivery whose genuinely LATEST attempt for that
 RETRYABLE_STATUSES) -- 'preview'/'unavailable'/'stored' are
 configuration states, not failures, and are never retried (retrying a
 Preview send forever would just write endless local preview files with
-no real customer benefit). Bounded to MAX_ATTEMPTS total attempts per
+no real customer benefit).
+
+Delivery is AT-LEAST-ONCE (Codex 1.2.7 finding #4). Each attempt is claimed first (notification_delivery_
+claims, CLAIM_STALE_SECONDS lease), so concurrent workers never send the same attempt twice. But if the
+provider accepted a message and the worker died before recording the new delivery row, the claim goes stale
+and the attempt is sent once more: one extra copy per crash, never while the first send is still in
+progress. Provider idempotency: SMTP has none (alert emails carry a stable Message-ID per notification and
+channel, email_service.stable_message_id, so de-duplicating clients/gateways can collapse the copy); Twilio's
+Messages API has no idempotency key; SES SendEmail has none either (not used today). Bounded to MAX_ATTEMPTS total attempts per
 (notification_id, channel), with escalating backoff between attempts
 -- see _due_for_retry() -- so a genuinely down provider is retried a
 few times over roughly the first two hours, then left alone rather

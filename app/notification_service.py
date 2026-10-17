@@ -19,10 +19,13 @@ class EmailChannel(NotificationChannel):
         # notification's context can be read; the original title/message
         # email otherwise -- a rendering problem must never drop an alert.
         content=_rich_alert_content(notification)
+        # One Message-ID per (notification, channel): a retry of the same alert is recognisably the same email.
+        from email_service import stable_message_id
+        metadata={'notification_id':notification['id'],'message_id':stable_message_id('notification',notification['id'],'email')}
         if content:
-            message=get_email_service().send('appliance_alert',recipient,content['subject'],content['text'],html=content['html'],metadata={'notification_id':notification['id']},images=content['images'])
+            message=get_email_service().send('appliance_alert',recipient,content['subject'],content['text'],html=content['html'],metadata=metadata,images=content['images'])
         else:
-            message=get_email_service().send('appliance_alert',recipient,notification['title'],notification.get('message') or notification['title'],metadata={'notification_id':notification['id']})
+            message=get_email_service().send('appliance_alert',recipient,notification['title'],notification.get('message') or notification['title'],metadata=metadata)
         return {'channel':'email','status':message['status'],'provider':'configured_email','error':message.get('error')}
 
 

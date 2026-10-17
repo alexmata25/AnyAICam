@@ -40,6 +40,23 @@ EMAIL_TYPES={
 }
 
 
+def stable_message_id(*parts) -> str:
+    """A deterministic RFC 5322 Message-ID for one logical email (Codex 1.2.7 finding #4). Delivery is
+    at-least-once: a worker that crashes after the provider accepted a message but before recording it sends it
+    again once its lease expires. Re-sends carry the SAME Message-ID, so mail clients and gateways that
+    de-duplicate by Message-ID (Gmail does) can collapse the copies. SMTP itself has no idempotency key."""
+    import hashlib
+    digest = hashlib.sha256("|".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:32]
+    domain = (str(settings.email_from or "").rsplit("@", 1)[-1].strip(" >") or "anyaicam.com")
+    return f"<anyaicam-{digest}@{domain}>"
+
+
+def _valid_message_id(value) -> bool:
+    text = str(value or "")
+    return (text.startswith("<") and text.endswith(">") and "@" in text and len(text) <= 250
+            and not any(ch.isspace() for ch in text))
+
+
 class EmailBackend(ABC):
     @abstractmethod
     def send(self,message_type,to,subject,text,html=None,metadata=None,images=None): ...
@@ -56,6 +73,8 @@ class SMTPEmail(EmailBackend):
     def send(self,message_type,to,subject,text,html=None,metadata=None,images=None):
         if settings.email_backend!='smtp' or not settings.smtp_host: raise RuntimeError('SMTP email is disabled or incomplete.')
         message=EmailMessage(); message['From']=settings.email_from; message['To']=to; message['Subject']=subject; message.set_content(text)
+        if _valid_message_id((metadata or {}).get('message_id')):
+            message['Message-ID']=(metadata or {})['message_id']  # stable across at-least-once re-sends (stable_message_id)
         if html:
             message.add_alternative(html,subtype='html')
             # Inline images (2026-09-27, alert thumbnails): attached to the

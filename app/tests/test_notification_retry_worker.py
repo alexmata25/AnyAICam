@@ -358,3 +358,39 @@ def test_a_claim_is_stamped_when_it_is_taken_not_when_the_pass_started():
     assert claimed_at >= before
     # Freshly taken, so a second worker cannot retake it.
     assert retry_worker._claim(candidate, channel="email", attempt=2) is False
+
+
+class _WorkerCrash(BaseException):
+    """Escapes the worker's own `except Exception` like a real process death would."""
+
+
+def test_a_crash_after_the_provider_accepted_sends_at_most_one_extra_copy(monkeypatch):
+    """Codex 1.2.7 finding #4, pinned: delivery is at-least-once. The provider accepts the retry, then the worker
+    dies before recording it. While the lease is fresh nobody sends; once stale, exactly one more send; then the
+    recorded row ends it. Exactly 2 provider sends, never 3."""
+    sends = []
+
+    class _AcceptsThenWorkerDies:
+        crash = True
+
+        def send(self, notification, recipient):
+            sends.append(recipient)  # the provider has accepted the message
+            if _AcceptsThenWorkerDies.crash:
+                raise _WorkerCrash()  # ... and the worker dies before the delivery row is written
+            return {"channel": "fake", "status": "sent", "provider": "fake", "error": None}
+
+    monkeypatch.setattr(retry_worker, "CHANNELS", {"email": _AcceptsThenWorkerDies(), "sms": _AcceptsThenWorkerDies()})
+    with connection() as db:
+        notification_id = _seed_notification(db)
+        _insert_delivery(db, notification_id=notification_id, channel="email", status="failed", attempt=1,
+                         created_at="2026-09-16T00:00:00")
+    with pytest.raises(_WorkerCrash):
+        retry_worker.retry_failed_deliveries()
+    assert len(sends) == 1
+    _AcceptsThenWorkerDies.crash = False
+    assert retry_worker.retry_failed_deliveries()["attempted"] == 0 and len(sends) == 1  # lease fresh: no duplicate
+    stale = (datetime.now() - timedelta(seconds=retry_worker.CLAIM_STALE_SECONDS + 60)).isoformat()
+    with connection() as db:
+        db.execute("UPDATE notification_delivery_claims SET claimed_at=? WHERE notification_id=?", (stale, notification_id))
+    assert retry_worker.retry_failed_deliveries()["succeeded"] == 1 and len(sends) == 2  # the one at-least-once copy
+    assert retry_worker.retry_failed_deliveries()["attempted"] == 0 and len(sends) == 2  # recorded: never a third
