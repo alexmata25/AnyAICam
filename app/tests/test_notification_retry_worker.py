@@ -340,3 +340,21 @@ def test_a_claim_left_by_a_worker_that_stopped_mid_send_is_retaken_once_stale(fa
         db.execute("UPDATE notification_delivery_claims SET claimed_at=? WHERE notification_id=?", (stale, notification_id))
     assert retry_worker.retry_failed_deliveries()["attempted"] == 1
     assert len(fake_channels["email"].calls) == 1
+
+
+def test_a_claim_is_stamped_when_it_is_taken_not_when_the_pass_started():
+    """Green 2026-10-17 self-review: a pass can run for minutes (SMTP timeouts). A claim stamped with the pass's
+    start time could look stale the moment it was written and be retaken by another worker mid-send."""
+    with connection() as db:
+        notification_id = _seed_notification(db)
+        _insert_delivery(db, notification_id=notification_id, channel="email", status="failed", attempt=1,
+                         created_at="2026-09-16T00:00:00")
+        candidate = retry_worker._latest_failed_deliveries(db)[0]
+    before = datetime.now()
+    assert retry_worker._claim(candidate, channel="email", attempt=2) is True
+    with connection() as db:
+        claimed_at = datetime.fromisoformat(db.execute(
+            "SELECT claimed_at FROM notification_delivery_claims WHERE notification_id=?", (notification_id,)).fetchone()[0])
+    assert claimed_at >= before
+    # Freshly taken, so a second worker cannot retake it.
+    assert retry_worker._claim(candidate, channel="email", attempt=2) is False
