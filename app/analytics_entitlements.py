@@ -173,9 +173,10 @@ def resolve_addon(price_id: str) -> Optional[dict]:
 
 
 def _find_customer_by_email(email: str) -> Optional[dict]:
-    # Same rule as the camera-plan webhook: a suspended or closed account never receives a purchase by email.
-    import customer_entitlements
-    return customer_entitlements.find_customer_by_email(email)
+    # Same rule as the camera-plan webhook (shared via the neutral customer_lookup module, keeping this module
+    # separate from customer_entitlements): a suspended or closed account never receives a purchase by email.
+    import customer_lookup
+    return customer_lookup.find_usable_customer_by_email(email)
 
 
 def upsert_analytics_subscription(

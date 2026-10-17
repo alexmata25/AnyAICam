@@ -142,21 +142,15 @@ def _now() -> str:
     return datetime.now().isoformat()
 
 
-# Accounts that must never receive a purchase by email matching (Codex review 2026-10-16): a rejected
-# registration's account is 'suspended' (customer_registration.reject_registration), and the test-account cleanup
-# (Requirement #11) tombstones accounts as 'closed_test'. A Stripe event with no authoritative customer id for such an
-# email becomes a pending link instead, resolved only when a verified account for that email exists.
-INACTIVE_CUSTOMER_STATUSES = ("suspended", "closed", "closed_test", "rejected", "deleted")
+# One rule shared with the hardware and analytics webhooks, in a neutral module (customer_lookup.py) so those
+# modules stay separate from this one (Codex review 2026-10-16): inactive accounts never match by email.
+from customer_lookup import INACTIVE_CUSTOMER_STATUSES  # noqa: E402  (re-exported for callers and tests)
 
 
 def find_customer_by_email(email: str) -> Optional[dict]:
     """The usable customer account for an email, for webhook reconciliation only. Inactive accounts never match."""
-    normalized = normalize_email(email)
-    if not normalized:
-        return None
-    placeholders = ",".join("?" * len(INACTIVE_CUSTOMER_STATUSES))
-    return row(f"SELECT * FROM customers WHERE lower(email)=? AND COALESCE(lower(status),'active') NOT IN ({placeholders})",
-               (normalized, *INACTIVE_CUSTOMER_STATUSES))
+    import customer_lookup
+    return customer_lookup.find_usable_customer_by_email(email)
 
 
 # --------------------------------------------------------------- entitlements
