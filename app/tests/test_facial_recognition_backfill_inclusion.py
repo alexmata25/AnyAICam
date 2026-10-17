@@ -72,6 +72,10 @@ def facial_recognition_fires_one_match(monkeypatch):
     a canned result, so the surrounding `with aac_connect() as aac_db`
     just needs a harmless no-op connection."""
     monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda camera_number: True)
+    # 2026-10-17: facial recognition runs only for an authorized camera with the appliance switch on.
+    monkeypatch.setattr(main.facial_recognition, "FACIAL_RECOGNITION_ENABLED", True)
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity",
+                        lambda camera_number: {"facial_recognition_enabled": True})
 
     @contextmanager
     def fake_connect():
