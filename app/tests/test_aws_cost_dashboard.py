@@ -444,7 +444,7 @@ def test_cost_explorer_rejects_non_usd_values():
         }]})
 
 
-def test_usage_details_without_record_type_totals_are_not_presented_as_zero():
+def test_usage_details_without_record_type_totals_are_not_presented_as_zero(client):
     _seed_customer_and_camera(camera_count=1)
     with connection() as db:
         db.execute(
@@ -456,3 +456,24 @@ def test_usage_details_without_record_type_totals_are_not_presented_as_zero():
     assert bill["total_usd"] is None
     assert bill["s3_usd"] is None
     assert bill["usage_breakdown"][0]["amount_usd"] == pytest.approx(1.25)
+
+
+def test_soft_removed_camera_is_not_counted_as_registered_but_keeps_storage_history(client):
+    _seed_customer_and_camera(camera_count=1)
+    captured = "2026-10-14T00:00:00+00:00"
+    with connection() as db:
+        db.execute("UPDATE cameras SET status='removed' WHERE id='cam-000'")
+        db.execute(
+            "INSERT INTO aws_camera_usage_snapshots(snapshot_date,customer_id,site_id,appliance_id,camera_id,storage_class,bytes,object_count,oldest_upload_at,newest_upload_at,recording_mode,retention_days,source,captured_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-10-14", "c-cost", "s-cost", "a-cost", "cam-000", "STANDARD", 2_000_000_000, 4, None, None, None, None, "s3_inventory", captured),
+        )
+    data = costs.dashboard_summary(date(2026, 10, 14))
+    camera = next(row for row in data["cameras"] if row["camera_id"] == "cam-000")
+    customer = next(row for row in data["customers"] if row["customer_id"] == "c-cost")
+    assert camera["registered"] is False
+    assert camera["camera_status"] == "removed"
+    assert camera["decimal_gb"] == pytest.approx(2)
+    assert camera["object_or_version_count"] == 4
+    assert customer["camera_count"] == 0
+    assert customer["active_camera_count"] == 0
+    assert customer["stored_camera_prefix_count"] == 1

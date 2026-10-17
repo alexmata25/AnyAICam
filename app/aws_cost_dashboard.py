@@ -451,7 +451,10 @@ def dashboard_summary(as_of: date | None = None) -> dict:
         record = customers.setdefault(customer_id, {"customer_id": customer_id, "customer_name": None, "appliance_ids": set(), "camera_count": 0, "stored_camera_prefix_count": 0, "cameras": []})
         if appliance_id:
             record["appliance_ids"].add(appliance_id)
-        record["camera_count"] += 1
+        camera_status = str(camera.get("status") or "").strip().casefold()
+        camera_is_registered = camera_status not in {"removed", "deleted"}
+        if camera_is_registered:
+            record["camera_count"] += 1
         snapshots = usage_by_camera.get(camera_id, [])
         context = resolve_recording_context(camera)
         record["stored_camera_prefix_count"] += int(bool(snapshots))
@@ -492,7 +495,7 @@ def dashboard_summary(as_of: date | None = None) -> dict:
             "camera_id": camera_id,
             "camera_name": camera.get("camera_name"),
             "camera_status": camera.get("status"),
-            "registered": True,
+            "registered": camera_is_registered,
             "cloud_recording_mode": camera.get("cloud_recording_mode"),
             "local_recording_mode": camera.get("local_recording_mode"),
             "snapshot_recording_mode": snapshot_mode,
