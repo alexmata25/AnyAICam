@@ -5,6 +5,7 @@ import pytest
 from fastapi import HTTPException
 
 import live_view_p2p
+import live_view_wireguard
 
 
 class _Result:
@@ -44,6 +45,14 @@ def test_viewer_requires_current_camera_live_grant_for_another_users_session():
 def test_customer_owner_keeps_existing_access_without_camera_grant_lookup():
     owner = {"customer_id": "cust-a", "email": "owner@example.test", "role": "customer_owner"}
     assert live_view_p2p._own_session(_Db(can_live=False), "session-a", owner)["id"] == "session-a"
+
+
+def test_wireguard_session_access_rechecks_current_camera_live_grant():
+    viewer = {"customer_id": "cust-a", "email": "viewer@example.test", "role": "customer_viewer"}
+    with pytest.raises(HTTPException) as denied:
+        live_view_wireguard._own_session(_Db(can_live=False), "session-a", viewer)
+    assert denied.value.status_code == 404
+    assert live_view_wireguard._own_session(_Db(can_live=True), "session-a", viewer)["camera_id"] == "cam-a"
 
 
 def test_signaling_storage_rejects_oversized_payload_instead_of_truncating_json():

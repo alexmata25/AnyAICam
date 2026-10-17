@@ -145,6 +145,24 @@ def _own_session(db, session_id: str, identity: dict) -> dict:
     ).fetchone()
     if not session:
         raise HTTPException(status_code=404, detail='Live view session not found.')
+    # Revalidate the viewer's camera grant on every tunnel-backed request.
+    # A same-customer session ID alone must not bypass a revoked or absent
+    # can_live grant.
+    if identity.get('role') != 'customer_owner':
+        camera = db.execute(
+            'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+            (session['camera_id'], identity['customer_id']),
+        ).fetchone()
+        user = db.execute(
+            'SELECT id FROM partner_users WHERE email=? AND customer_id=?',
+            (identity.get('email'), identity['customer_id']),
+        ).fetchone()
+        permission = (db.execute(
+            'SELECT can_live FROM customer_camera_permissions WHERE user_id=? AND camera_id=?',
+            (user['id'], session['camera_id']),
+        ).fetchone() if user else None)
+        if not camera or not permission or not permission['can_live']:
+            raise HTTPException(status_code=404, detail='Live view session not found.')
     return dict(session)
 
 
