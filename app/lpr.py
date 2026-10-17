@@ -790,7 +790,8 @@ def _scaled_region(region, analytics_frame, full_frame):
     return int(x * sx), int(y * sy), max(1, int(w * sx)), max(1, int(h * sy))
 
 
-def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: float | None = None) -> list:
+def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: float | None = None,
+               full_frame_for_fallback: bool = False) -> list:
     """One LPR pass over one analytics frame. vehicle_boxes are (x, y, w, h)
     vehicle detections on that frame. Returns the plates confirmed by this
     pass: dicts with plate_number, confidence, region (coordinates inside
@@ -800,7 +801,9 @@ def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: flo
     video-pipeline: main.py grabs one main-stream frame on demand); it is
     called at most once, and only when a vehicle box is actually read --
     never for a parked vehicle that is being skipped, and never for the
-    no-vehicle full-frame fallback."""
+    no-vehicle full-frame fallback -- unless full_frame_for_fallback is True
+    (2026-10-17: the recording-buffer source, whose eager decode used to run
+    every AI pass, is now also lazy but still feeds the fallback when due)."""
     if not LPR_ENABLED or frame is None or not is_camera_enabled(camera_number):
         return []
     provider = full_frame if callable(full_frame) else None
@@ -841,7 +844,7 @@ def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: flo
             mark_vehicle_read(camera_number, box)
             confirmed.append(dict(result, crop=crop, vehicle_box=box, source="vehicle"))
     if not vehicle_boxes and LPR_FULL_FRAME_FALLBACK and _due(_last_full_frame, camera_number, LPR_FULL_FRAME_SECONDS, now):
-        full_frame = None if provider is not None else _full()
+        full_frame = None if (provider is not None and not full_frame_for_fallback) else _full()
         use_full = full_frame is not None and full_frame.shape[1] >= frame.shape[1] * 1.3
         for plate in detect_plates_full_frame(frame):
             px, py, pw, ph = plate["region"]
