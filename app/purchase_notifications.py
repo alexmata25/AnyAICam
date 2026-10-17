@@ -148,36 +148,48 @@ def _existing_notification(event_id: str, notification_type: str, db=None) -> Op
     return row(sql, params)
 
 
-def _record_attempt(
+# A claimed send ('pending') older than this is taken to be interrupted (a crash
+# between claiming and recording the outcome) and may be claimed again. An
+# email send takes seconds (SMTP timeout ~20 s), so a live send is never retaken.
+OUTBOX_CLAIM_STALE_SECONDS = 300
+
+
+def _claim_attempt(
     *, event_id: str, notification_type: str, customer_id: Optional[str], recipient_email: str, subject: str,
     db=None,
-) -> dict:
-    """Creates (or reuses, if a prior failed attempt already exists) the
-    tracking row for this (event, type) pair, in 'pending' status, before
-    actually calling the email backend -- so a crash between "decided to
-    send" and "actually sent" still leaves a retryable 'pending'/'failed'
-    row rather than silently losing the attempt. With db, inside the
-    caller's transaction."""
+) -> Optional[dict]:
+    """Atomically takes the right to send this (event, type) email, or
+    returns None when it is already sent or another worker is sending it
+    right now (Green 2026-10-16: two retry workers -- several processes, or
+    an old and a new container during a deploy -- used to both see the
+    'failed' row and both send). A new row is created 'pending' (the unique
+    (stripe_event_id, notification_type) index lets exactly one creator
+    win); an existing row is taken only from 'failed', or from a stale
+    'pending' (OUTBOX_CLAIM_STALE_SECONDS). The 'pending' row is written
+    before the email backend is called, so a crash still leaves a
+    retryable row. With db, inside the caller's transaction."""
     if db is None:
         with connection() as own:
-            return _record_attempt(event_id=event_id, notification_type=notification_type, customer_id=customer_id,
-                                   recipient_email=recipient_email, subject=subject, db=own)
-    existing = _existing_notification(event_id, notification_type, db)
+            return _claim_attempt(event_id=event_id, notification_type=notification_type, customer_id=customer_id,
+                                  recipient_email=recipient_email, subject=subject, db=own)
+    from datetime import timedelta
     now = _now()
-    if existing:
-        notification_id = existing["id"]
-        db.execute(
-            "UPDATE provisioning_notifications SET customer_id=?,recipient_email=?,subject=?,updated_at=? WHERE id=?",
-            (customer_id, recipient_email, subject, now, notification_id),
-        )
-    else:
-        notification_id = uuid.uuid4().hex
-        db.execute(
-            "INSERT INTO provisioning_notifications(id,stripe_event_id,notification_type,customer_id,"
-            "recipient_email,subject,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (notification_id, event_id, notification_type, customer_id, recipient_email, subject, "pending", now, now),
-        )
-    return dict(db.execute("SELECT * FROM provisioning_notifications WHERE id=?", (notification_id,)).fetchone())
+    stale_before = (datetime.now() - timedelta(seconds=OUTBOX_CLAIM_STALE_SECONDS)).isoformat()
+    created = db.execute(
+        "INSERT OR IGNORE INTO provisioning_notifications(id,stripe_event_id,notification_type,customer_id,"
+        "recipient_email,subject,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (uuid.uuid4().hex, event_id, notification_type, customer_id, recipient_email, subject, "pending", now, now),
+    ).rowcount
+    if not created:
+        taken = db.execute(
+            "UPDATE provisioning_notifications SET status='pending',customer_id=?,recipient_email=?,subject=?,"
+            "error_detail=NULL,updated_at=? WHERE stripe_event_id=? AND notification_type=? "
+            "AND (status='failed' OR (status='pending' AND updated_at<?))",
+            (customer_id, recipient_email, subject, now, event_id, notification_type, stale_before),
+        ).rowcount
+        if not taken:
+            return None
+    return _existing_notification(event_id, notification_type, db)
 
 
 def _mark_result(notification_id: str, *, status: str, error_detail: Optional[str] = None, db=None) -> None:
@@ -226,10 +238,15 @@ def _send_once(
     if html:
         import email_layout
         html = email_layout.wrap(html, preheader=subject)
-    tracking = _record_attempt(
+    tracking = _claim_attempt(
         event_id=event_id, notification_type=notification_type, customer_id=customer_id,
         recipient_email=recipient_email, subject=subject, db=db,
     )
+    if tracking is None:
+        # Sent meanwhile, or another worker is sending it now: never a second copy.
+        found = _existing_notification(event_id, notification_type, db) or {}
+        reason = "already sent" if found.get("status") == "sent" else "send in progress elsewhere"
+        return {"status": "skipped", "reason": reason, "notification_id": found.get("id")}
     try:
         result = get_email_service().send(notification_type, recipient_email, subject, text, html=html, metadata=metadata or {})
     except Exception as exc:

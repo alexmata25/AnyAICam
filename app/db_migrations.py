@@ -1441,6 +1441,16 @@ ALTER TABLE customer_registration_requests ADD COLUMN verification_token_hash TE
 ALTER TABLE customer_registration_requests ADD COLUMN verification_expires_at TEXT;
 ALTER TABLE customer_registration_requests ADD COLUMN verification_sent_at TEXT
 '''),
+    # Notification retry claims (notification_retry_worker.py, Green 2026-10-16):
+    # one row per (notification, channel, attempt) a worker is about to send, so
+    # two retry workers (several processes, or an old and a new container during
+    # a deploy) never both re-send the same failed delivery. Additive.
+    ('20261016_notification_delivery_claims','''
+CREATE TABLE IF NOT EXISTS notification_delivery_claims(
+ notification_id TEXT NOT NULL, channel TEXT NOT NULL, attempt INTEGER NOT NULL, claimed_at TEXT NOT NULL,
+ PRIMARY KEY(notification_id, channel, attempt)
+);
+'''),
 ]
 
 

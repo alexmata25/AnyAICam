@@ -44,6 +44,10 @@ MAX_ATTEMPTS = max(1, int(os.environ.get("ANYAICAM_NOTIFICATION_RETRY_MAX_ATTEMP
 # repeats for any attempt count beyond the list's own length.
 _BACKOFF_MINUTES = [2, 10, 30, 60, 120]
 SCAN_SECONDS = max(30.0, float(os.environ.get("ANYAICAM_NOTIFICATION_RETRY_SCAN_SECONDS", "120.0")))
+# A claim older than this is taken to be from a worker that stopped mid-send and
+# may be taken again; a send takes seconds, so a live one is never retaken.
+CLAIM_STALE_SECONDS = 300
+PENDING_MEDIA_CLAIM_CHANNEL = "email:pending_media"
 
 retry_worker_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_error": None}
 
@@ -63,6 +67,34 @@ def _due_for_retry(delivery: dict, *, now: datetime) -> bool:
     except (TypeError, ValueError):
         return False
     return now >= last_attempt_at + timedelta(minutes=_backoff_minutes(delivery["attempt"]))
+
+
+def _claim(delivery: dict, *, channel: str, attempt: int, now: datetime) -> bool:
+    """Atomically takes the right to make this attempt (Green 2026-10-16).
+    Two workers that both read the same failed (or held) row used to both
+    send it. Only the worker whose claim row is created (or that retakes a
+    stale one) sends -- and only if no newer delivery row for the pair
+    exists by then, so a worker holding an old candidate list, or one
+    retaking a stale claim whose send did finish, never sends a second
+    copy. The claim is written (and committed) before the provider call."""
+    stale_before = (now - timedelta(seconds=CLAIM_STALE_SECONDS)).isoformat()
+    with connection() as db:
+        claimed = db.execute(
+            "INSERT INTO notification_delivery_claims(notification_id,channel,attempt,claimed_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(notification_id,channel,attempt) DO UPDATE SET claimed_at=excluded.claimed_at "
+            "WHERE notification_delivery_claims.claimed_at<?",
+            (delivery["notification_id"], channel, attempt, now.isoformat(), stale_before),
+        ).rowcount
+    if not claimed:
+        return False
+    with connection() as db:
+        newer = db.execute(
+            "SELECT 1 FROM notification_deliveries WHERE notification_id=? AND channel=? AND id!=? "
+            "AND (attempt>? OR created_at>?) LIMIT 1",
+            (delivery["notification_id"], delivery["channel"], delivery["id"], int(delivery["attempt"] or 0),
+             delivery["created_at"]),
+        ).fetchone()
+    return newer is None
 
 
 def _latest_failed_deliveries(db) -> list[dict]:
@@ -118,6 +150,8 @@ def retry_failed_deliveries() -> dict:
         if delivery["channel"] == "sms" and not sms_alert_allowed(str(notification["event_type"] or "")):
             continue
         notification = {key: notification[key] for key in ("id", "title", "message")}
+        if not _claim(delivery, channel=delivery["channel"], attempt=int(delivery["attempt"] or 0) + 1, now=now):
+            continue  # another worker is making (or already made) this attempt
         attempted += 1
         try:
             result = CHANNELS[delivery["channel"]].send(dict(notification), delivery["recipient"])
@@ -186,16 +220,22 @@ def send_pending_media_emails(*, now: datetime | None = None) -> dict:
             )
         if not email_alert_allowed(str(context.get("event_type") or "")):
             status, result = "skipped_allowlist", {"provider": "configured_email", "error": None}
-            skipped += 1
         elif superseded:
             # The same visit already produced an AAC Voice Call email.
             status, result = "skipped_voice_call", {"provider": "configured_email", "error": None}
-            skipped += 1
         elif entrance:
             # Entrance camera: give the Voice Call time to exist first.
             held += 1
             continue
         elif notification_email.media_ready(context) or age >= notification_email.MEDIA_WAIT_SECONDS:
+            status, result = None, None
+        else:
+            held += 1
+            continue
+        # Resolving a held email (sent or skipped) is claimed like a retry: one worker only.
+        if not _claim(delivery, channel=PENDING_MEDIA_CLAIM_CHANNEL, attempt=1, now=now):
+            continue
+        if status is None:
             try:
                 result = CHANNELS["email"].send({"id": context["id"], "title": context["title"], "message": context["message"]}, delivery["recipient"])
             except Exception as error:
@@ -203,8 +243,7 @@ def send_pending_media_emails(*, now: datetime | None = None) -> dict:
             status = result.get("status")
             sent += status == "sent"
         else:
-            held += 1
-            continue
+            skipped += 1
         import secrets
         with connection() as db:
             db.execute(

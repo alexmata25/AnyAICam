@@ -272,3 +272,71 @@ async def test_worker_runs_and_updates_state_on_cloud_role(monkeypatch, fake_cha
     assert retry_worker.retry_worker_state["worker_status"] == "running"
     assert retry_worker.retry_worker_state["last_scan_at"] is not None
     assert retry_worker.retry_worker_state["last_error"] is None
+
+
+# --------------------------------------------------------------- concurrent workers (Green 2026-10-16)
+
+def _claims(db, notification_id):
+    return [dict(r) for r in db.execute("SELECT channel,attempt FROM notification_delivery_claims WHERE notification_id=?",
+                                        (notification_id,)).fetchall()]
+
+
+def test_a_second_worker_running_during_a_retry_never_sends_the_same_delivery_again(monkeypatch):
+    """Two retry workers (several processes, or an old and a new container during a deploy) read the same failed
+    row. The second runs while the first is still sending: only one email goes out."""
+    sends = []
+
+    class _ReentrantChannel:
+        def send(self, notification, recipient):
+            sends.append(recipient)
+            if len(sends) == 1:
+                inner["stats"] = retry_worker.retry_failed_deliveries()  # the other worker, mid-send
+            return {"channel": "fake", "status": "sent", "provider": "fake", "error": None}
+
+    inner = {}
+    monkeypatch.setattr(retry_worker, "CHANNELS", {"email": _ReentrantChannel(), "sms": _ReentrantChannel()})
+    with connection() as db:
+        notification_id = _seed_notification(db)
+        _insert_delivery(db, notification_id=notification_id, channel="email", status="failed", attempt=1,
+                         created_at="2026-09-16T00:00:00")
+    stats = retry_worker.retry_failed_deliveries()
+    assert sends == ["user-1@example.test"]
+    assert stats["attempted"] == 1 and inner["stats"]["attempted"] == 0
+    with connection() as db:
+        attempts = [r["attempt"] for r in db.execute("SELECT attempt FROM notification_deliveries WHERE notification_id=? "
+                                                     "AND channel='email' ORDER BY attempt", (notification_id,)).fetchall()]
+        assert attempts == [1, 2] and _claims(db, notification_id) == [{"channel": "email", "attempt": 2}]
+
+
+def test_a_stale_claim_whose_send_finished_is_not_sent_again(fake_channels):
+    with connection() as db:
+        notification_id = _seed_notification(db)
+        _insert_delivery(db, notification_id=notification_id, channel="email", status="failed", attempt=1,
+                         created_at="2026-09-16T00:00:00")
+    candidate = None
+    with connection() as db:
+        candidate = retry_worker._latest_failed_deliveries(db)[0]
+        # Another worker claimed attempt 2 long ago and did record it.
+        db.execute("INSERT INTO notification_delivery_claims(notification_id,channel,attempt,claimed_at) VALUES(?,?,?,?)",
+                   (notification_id, "email", 2, "2026-09-16T00:05:00"))
+        _insert_delivery(db, notification_id=notification_id, channel="email", status="sent", attempt=2,
+                         created_at="2026-09-16T00:05:01")
+    # This worker still holds the old candidate list: its (stale-claim) retake must not send.
+    assert retry_worker._claim(candidate, channel="email", attempt=2, now=datetime.now()) is False
+    assert fake_channels["email"].calls == []
+
+
+def test_a_claim_left_by_a_worker_that_stopped_mid_send_is_retaken_once_stale(fake_channels):
+    with connection() as db:
+        notification_id = _seed_notification(db)
+        _insert_delivery(db, notification_id=notification_id, channel="email", status="failed", attempt=1,
+                         created_at="2026-09-16T00:00:00")
+        fresh = datetime.now().isoformat()
+        db.execute("INSERT INTO notification_delivery_claims(notification_id,channel,attempt,claimed_at) VALUES(?,?,?,?)",
+                   (notification_id, "email", 2, fresh))
+    assert retry_worker.retry_failed_deliveries()["attempted"] == 0  # possibly still sending right now
+    stale = (datetime.now() - timedelta(seconds=retry_worker.CLAIM_STALE_SECONDS + 60)).isoformat()
+    with connection() as db:
+        db.execute("UPDATE notification_delivery_claims SET claimed_at=? WHERE notification_id=?", (stale, notification_id))
+    assert retry_worker.retry_failed_deliveries()["attempted"] == 1
+    assert len(fake_channels["email"].calls) == 1
