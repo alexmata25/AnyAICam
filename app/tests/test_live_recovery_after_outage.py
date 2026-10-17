@@ -312,3 +312,45 @@ def test_a_motion_reader_on_the_hls_fallback_re_chooses_its_source_on_recovery(m
     asyncio.run(go())
     assert [r.kind for r in readers][:2] == ["hls", "substream"]
     assert readers[0].returncode is not None  # the HLS reader was stopped, not leaked
+
+
+# ------------------------------------------------------- AI frame reader fallback
+def test_recovery_ends_the_ai_frame_readers_hls_fallback(monkeypatch):
+    """analytics_frames falls back to the live HLS stream for 30 min after
+    repeated reader failures (a camera that was down); recovery ends that
+    window so detection reads the camera's own analytics stream again."""
+    monkeypatch.setattr(main.ai_frames, "mode", "auto")
+    monkeypatch.setattr(main.ai_frames, "_hls_until", {2: time.monotonic() + 1800, 3: time.monotonic() + 1800})
+    monkeypatch.setattr(main.ai_frames, "_failures", {2: 2})
+    assert main.ai_frames.uses_hls(2) and main.ai_frames.uses_hls(3)
+    main.note_live_stream_recovered(2)
+    assert main.ai_frames.uses_hls(2) is False
+    assert 2 not in main.ai_frames._failures
+    assert main.ai_frames.uses_hls(3) is True  # other cameras untouched
+
+
+def test_an_address_change_ends_the_ai_frame_readers_hls_fallback(monkeypatch):
+    monkeypatch.setattr(main.ai_frames, "mode", "auto")
+    monkeypatch.setattr(main.ai_frames, "_hls_until", {2: time.monotonic() + 1800})
+    url = {"v": URL_OLD}
+    monkeypatch.setattr(main, "camera_url", lambda n: url["v"])
+    monkeypatch.setattr(main, "probe_camera_video_codec", _Probe(lambda u: None))
+    asyncio.run(main.refresh_live_copy_probe(2))
+    assert main.ai_frames.uses_hls(2)
+    url["v"] = URL_NEW
+    asyncio.run(main.refresh_live_copy_probe(2))
+    assert main.ai_frames.uses_hls(2) is False
+
+
+def test_clear_fallback_leaves_the_reader_running():
+    import analytics_frames
+    frames = analytics_frames.AnalyticsFrames(lambda n: None, mode="auto", start_housekeeping=False)
+    frames._failures[4] = 1
+    frames._hls_until[4] = time.monotonic() + 100
+    reader = object()
+    frames._readers[4] = reader
+    assert frames.uses_hls(4)
+    assert frames.clear_fallback(4) is True
+    assert frames.clear_fallback(4) is False
+    assert frames.uses_hls(4) is False
+    assert frames._readers[4] is reader  # not stopped, not forgotten

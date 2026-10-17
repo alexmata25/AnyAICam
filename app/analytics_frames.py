@@ -517,6 +517,15 @@ class AnalyticsFrames:
         if reader is not None:
             reader.restart()
 
+    def clear_fallback(self, camera_number: int) -> bool:
+        """The camera recovered (or its stream address changed): end its HLS
+        fallback window and failure count so the next get_frame() uses the
+        reader again. The reader itself is left alone. True if a fallback
+        was active (recovery, 2026-10-17)."""
+        with self._lock:
+            self._failures.pop(camera_number, None)
+            return self._hls_until.pop(camera_number, None) is not None
+
     def forget(self, camera_number: int) -> None:
         """Stop the camera's reader (its ffmpeg), drop all its state and
         start a new generation for the camera."""

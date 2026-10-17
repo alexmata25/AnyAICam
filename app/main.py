@@ -16225,12 +16225,23 @@ def forget_camera_stream_state(camera_number: int, *, copy_fallback: bool = True
     """Drop what was learned about a camera while it was unreachable: the
     cached copy probe (and, by default, the copy-failure fallback) and the
     motion reader's substream-failure fallback window. The next live start
-    re-probes; a motion reader on the HLS fallback re-chooses its source."""
+    re-probes; a motion reader on the HLS fallback re-chooses its source;
+    the AI frame reader leaves its HLS fallback."""
     _live_copy_probe.pop(camera_number, None)
     if copy_fallback:
         _live_copy_quick_failures.pop(camera_number, None)
         _live_copy_disabled_until.pop(camera_number, None)
     _motion_source_selector.forget(camera_number)
+    _clear_ai_frames_fallback(camera_number)
+
+
+def _clear_ai_frames_fallback(camera_number: int) -> None:
+    """End the AI frame reader's HLS fallback window for a recovered camera
+    (analytics_frames.py: 30 min after repeated reader failures). Never raises."""
+    try:
+        ai_frames.clear_fallback(camera_number)
+    except Exception:
+        pass
 
 
 def note_live_stream_recovered(camera_number: int) -> None:
@@ -16243,6 +16254,7 @@ def note_live_stream_recovered(camera_number: int) -> None:
     if cached and not cached[1]:
         _live_copy_probe.pop(camera_number, None)
     _motion_source_selector.forget(camera_number)
+    _clear_ai_frames_fallback(camera_number)
     print(f"Camera {camera_number} is sending video again; re-checking its live video codec and motion source.")
 
 
