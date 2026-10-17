@@ -312,6 +312,20 @@ _P2P_JS = """
     video.addEventListener('resize', reveal);
   };
 
+  // 1.2.7 transport audit (defect 2): while P2P plays, keep the session leased (the relay heartbeat never runs on
+  // P2P), so a later P2P drop can still resume the relay. Stops by itself once isActive() is false or the cloud
+  // says the session is over.
+  window.keepLiveSessionLeased = function(sessionId, isActive, intervalMs){
+    if (!sessionId) return;
+    const timer = setInterval(() => {
+      if (!isActive()) { clearInterval(timer); return; }
+      fetch(`/api/customer/live/sessions/${sessionId}/keepalive`, {method: 'POST'})
+        .then(response => { if (!response.ok) clearInterval(timer); })
+        .catch(() => {});
+    }, intervalMs || 300000);
+    return timer;
+  };
+
   window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
     if (!sessionId) return;
     fetch(`/api/customer/live/sessions/${sessionId}/transport-outcome`, {
@@ -1360,6 +1374,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
       p2pConnection=result.pc;
       video.play().catch(()=>{{}});
       if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
+      keepLiveSessionLeased(sessionId,()=>!stopped&&p2pConnection===result.pc);
       window.watchLiveP2P(result.pc,()=>{{
         if(stopped||p2pConnection!==result.pc)return;
         p2pConnection=null;
@@ -2114,6 +2129,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       tile.p2pConnection=result.pc;
       tile.video.play().catch(()=>{{}});
       if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
+      keepLiveSessionLeased(tile.sessionId,()=>!tile.stopped&&tile.p2pConnection===result.pc);
       window.watchLiveP2P(result.pc,()=>{{
         // P2P dropped mid-view: fall back to the relay (the playlist fetch
         // itself asks the cloud to resume the relay if it was stopped).

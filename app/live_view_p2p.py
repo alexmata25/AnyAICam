@@ -256,6 +256,33 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
         candidates = [item['payload'] for item in signals if item['kind'] == 'ice_appliance']
         return {'answer': answer, 'candidates': candidates}
 
+    @app.post('/api/customer/live/sessions/{session_id}/keepalive')
+    def keep_session_leased(request: Request, session_id: str) -> dict:
+        """1.2.7 transport audit (defect 2): a P2P viewer never fetches the relay playlist, so nothing extended its
+        session lease and it expired at the 30-minute mark mid-view -- after which a P2P drop could no longer resume
+        the relay (record_relay_viewer_activity() needs a live 'requested' session). The browser calls this while P2P
+        is playing. It extends ONLY expires_at: last_seen_at is relay demand (live_relay_idle_sweep), so a P2P viewer
+        still releases the AWS relay upload. Re-checks the viewer's own session and its live permission each time, so
+        a revoked can_live ends the lease."""
+        from live_relay_idle_sweep import SESSION_LEASE_SECONDS
+        from live_view_sessions import _authorized_camera as _authorized_live_camera
+        identity = _customer_identity(request)
+        now = datetime.now()
+        lease_until = (now + timedelta(seconds=SESSION_LEASE_SECONDS)).isoformat()
+        with connection() as db:
+            session = _own_session(db, session_id, identity)
+            if str(session.get('requested_by') or '').lower() != str(identity.get('email') or '').lower():
+                raise HTTPException(status_code=404, detail='Live view session not found.')
+            _authorized_live_camera(db, session['camera_id'], identity)
+            cursor = db.execute(
+                "UPDATE live_view_sessions SET expires_at=CASE WHEN expires_at<? THEN ? ELSE expires_at END "
+                "WHERE id=? AND state='requested' AND expires_at>?",
+                (lease_until, lease_until, session_id, now.isoformat()),
+            )
+            if cursor.rowcount != 1:
+                raise HTTPException(status_code=409, detail='Live view session is not active.')
+        return {'status': 'leased'}
+
     @app.post('/api/customer/live/sessions/{session_id}/transport-outcome')
     def report_transport_outcome(request: Request, session_id: str, payload: dict) -> dict:
         """Client-reported: the browser is the only party that actually
