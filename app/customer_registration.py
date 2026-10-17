@@ -72,10 +72,14 @@ def send_registration_verification(email: str, base_url: str | None = None, *, f
         logging.getLogger("anyaicam.customer_registration").warning(
             "registration_verification.not_sent reason=ANYAICAM_PUBLIC_URL_missing")
         return False
+    normalized = email.strip().lower()
+    with connection() as db:  # the link in force now: put back if the new one never reaches the inbox
+        previous = db.execute("SELECT verification_token_hash,verification_expires_at,verification_sent_at "
+                              "FROM customer_registration_requests WHERE email=? AND status='pending'", (normalized,)).fetchone()
+    previous = dict(previous) if previous else None
     raw = issue_registration_verification(email, force=force)
     if not raw:
         return False
-    normalized = email.strip().lower()
     link = f"{base_url.rstrip('/')}/customer-register/verify-email?token={raw}"
     subject = "Confirm your email for your AnyAiCam account request"
     text = ("Confirm this email address and choose your password to complete your AnyAiCam account request:\n"
@@ -84,11 +88,21 @@ def send_registration_verification(email: str, base_url: str | None = None, *, f
     try:
         from email_service import get_email_service
         result = get_email_service().send("email_verification", normalized, subject, text)
+        sent = not (isinstance(result, dict) and result.get("status") in ("failed", "error"))
     except Exception as error:
         logging.getLogger("anyaicam.customer_registration").warning(
             "registration_verification.email_failed error_type=%s", type(error).__name__)
-        return False
-    return not (isinstance(result, dict) and result.get("status") in ("failed", "error"))
+        sent = False
+    if not sent and previous is not None:
+        # Green review of 80a961a: a failed send must not leave the owner with a dead earlier link AND the 1 h
+        # re-submission hold. The earlier link (or no link, so a re-submission issues one) comes back -- only if
+        # nothing replaced the link issued here in the meantime.
+        with connection() as db:
+            db.execute("UPDATE customer_registration_requests SET verification_token_hash=?,verification_expires_at=?,"
+                       "verification_sent_at=? WHERE email=? AND verification_token_hash=? AND email_verified_at IS NULL",
+                       (previous["verification_token_hash"], previous["verification_expires_at"],
+                        previous["verification_sent_at"], normalized, _token_hash(raw)))
+    return sent
 
 
 def verify_registration_email(raw: str, password: str, display_name: str, *, now: datetime | None = None) -> bool:
