@@ -1408,4 +1408,6 @@ def register_routes(app: FastAPI) -> None:
         if not current.get("cancel_at_period_end"):
             logger.warning("per_camera_billing.cancel_not_confirmed subscription=%s", current.get("id"))
             raise HTTPException(status_code=502, detail="Your cancellation could not be confirmed. Please try again in a moment.")
+        import storage_trial
+        storage_trial.withdraw_paid_authorization(str(current.get("id") or ""), by=identity)  # a trial's "continue as paid"
         return {"status": "cancellation_scheduled", "effective_at": _period_end(current)}
