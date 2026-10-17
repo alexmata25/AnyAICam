@@ -464,6 +464,11 @@ def register_order_funnel_routes(app: FastAPI) -> None:
                                       '<p>Plan changes, camera count and billing for an existing account are managed in My subscription.</p>'
                                       f'<a class="submit" id="order-manage" href="{escape(manage, quote=True)}">Open My subscription</a>'),
                                 headers=NO_STORE)
+        if billing.hardware_order_paid(customer_id):
+            # Hardware-first (2026-10-15): the appliance includes the VMS license and its camera plan is chosen from
+            # My orders after delivery; this account never gets an own-PC order (or the license) here (Green 2026-10-16).
+            import hardware_checkout
+            return RedirectResponse(hardware_checkout.ORDERS_PATH, status_code=303)
         if query_selection.get("plan"):
             billing.save_build_selection(customer_id, query_selection)
         progress = billing.build_progress(customer_id) or {}
