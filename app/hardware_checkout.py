@@ -419,10 +419,19 @@ def send_confirmation(checkout_id: str, *, test_mode: bool | None = None) -> dic
                          text=text, html=html, metadata={"hardware_checkout_id": checkout_id}, test_mode=test_mode)
 
 
+# A confirmation still undelivered this long after payment is left 'failed' in
+# the outbox (visible to support) instead of being retried every sweep forever.
+CONFIRMATION_RETRY_DAYS = 3
+
+
 def retry_confirmations(limit: int = 50) -> int:
+    from datetime import timedelta
+    oldest = (datetime.now() - timedelta(days=CONFIRMATION_RETRY_DAYS)).isoformat()
     sent = 0
-    for record in rows("SELECT h.id FROM hardware_checkouts h WHERE h.status='paid' AND NOT EXISTS (SELECT 1 FROM provisioning_notifications n "
-                       "WHERE n.stripe_event_id=('hardware-checkout-confirmed:' || h.id) AND n.status='sent') LIMIT ?", (limit,)):
+    for record in rows("SELECT h.id FROM hardware_checkouts h WHERE h.status='paid' AND COALESCE(h.paid_at,h.updated_at)>=? "
+                       "AND NOT EXISTS (SELECT 1 FROM provisioning_notifications n "
+                       "WHERE n.stripe_event_id=('hardware-checkout-confirmed:' || h.id) AND n.status='sent') "
+                       "ORDER BY COALESCE(h.paid_at,h.updated_at) DESC LIMIT ?", (oldest, limit)):
         try:
             if send_confirmation(record["id"]).get("status") == "sent":
                 sent += 1

@@ -231,10 +231,18 @@ def _send_once(
         recipient_email=recipient_email, subject=subject, db=db,
     )
     try:
-        get_email_service().send(notification_type, recipient_email, subject, text, html=html, metadata=metadata or {})
+        result = get_email_service().send(notification_type, recipient_email, subject, text, html=html, metadata=metadata or {})
     except Exception as exc:
         _mark_result(tracking["id"], status="failed", error_detail=str(exc)[:500], db=db)
         return {"status": "failed", "notification_id": tracking["id"], "error": str(exc)[:500]}
+    # SMTPEmail.send reports an SMTP/connection failure by RETURNING
+    # {'status': 'failed', 'error': ...} rather than raising (email_service.py),
+    # so the outcome is read from the result too: such a send stays 'failed'
+    # for the outbox retry instead of being recorded as delivered (Green 2026-10-16).
+    if isinstance(result, dict) and str(result.get("status") or "").lower() in ("failed", "error"):
+        reason = str(result.get("error") or "email provider reported a failed send")[:500]
+        _mark_result(tracking["id"], status="failed", error_detail=reason, db=db)
+        return {"status": "failed", "notification_id": tracking["id"], "error": reason}
     _mark_result(tracking["id"], status="sent", db=db)
     return {"status": "sent", "notification_id": tracking["id"]}
 
