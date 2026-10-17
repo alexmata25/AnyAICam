@@ -119,7 +119,19 @@ from customer_registration import issue_registration_verification
 
 confirm_token = issue_registration_verification("customer@cpu-only.test", force=True)
 assert confirm_token
-confirmed = request("/customer-register/verify-email?" + urllib.parse.urlencode({"token": confirm_token}))
+opened = request("/customer-register/verify-email?" + urllib.parse.urlencode({"token": confirm_token}))
+assert opened.status == 200  # opening the link only shows the form
+confirmed = request(
+    "/customer-register/verify-email",
+    urllib.parse.urlencode(
+        {
+            "token": confirm_token,
+            "password": "Synthetic-Password-2026",
+            "confirm_password": "Synthetic-Password-2026",
+            "csrf_token": token,
+        }
+    ).encode(),
+)
 print(f"EMAIL_CONFIRM={confirmed.status}")
 assert confirmed.status == 200
 

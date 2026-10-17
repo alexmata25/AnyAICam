@@ -2,7 +2,7 @@ import hashlib
 import logging
 import secrets
 from datetime import datetime, timedelta
-from fastapi import HTTPException, Request
+from fastapi import Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from appliance_identity import create_grant
@@ -19,8 +19,9 @@ def _now() -> str:
 # that email (resolve_pending_links_for_customer), so the requester must first prove they own the address.
 VERIFY_TTL_HOURS = 48
 VERIFY_RESEND_SECONDS = 120
-VERIFIED_MESSAGE = ("Thank you. Your email address is confirmed. An administrator will review your AnyAiCam "
-                    "account request; you'll be able to sign in once it is approved.")
+MIN_PASSWORD = 10  # the /customer-register form's rule
+VERIFIED_MESSAGE = ("Thank you. Your email address is confirmed and your password is set. An administrator will "
+                    "review your AnyAiCam account request; you'll be able to sign in once it is approved.")
 VERIFY_INVALID_MESSAGE = ("This confirmation link is invalid or has expired. Submit the registration form again "
                           "to receive a new link.")
 
@@ -55,16 +56,27 @@ def issue_registration_verification(email: str, *, now: datetime | None = None, 
     return raw
 
 
-def send_registration_verification(email: str, base_url: str, *, force: bool = False) -> bool:
+def _link_base() -> str:
+    import os
+    return os.environ.get("ANYAICAM_PUBLIC_URL", "").strip().rstrip("/")
+
+
+def send_registration_verification(email: str, base_url: str | None = None, *, force: bool = False) -> bool:
     """Issues a link (issue_registration_verification) and emails it to that same address. True when the email
-    service accepted it. The email says nothing about purchases or other accounts."""
+    service accepted it. The email says nothing about purchases or other accounts. The link base is the
+    configured ANYAICAM_PUBLIC_URL, never the request's Host (Green review F3); without it nothing is sent."""
+    base_url = base_url or _link_base()
+    if not base_url:
+        logging.getLogger("anyaicam.customer_registration").warning(
+            "registration_verification.not_sent reason=ANYAICAM_PUBLIC_URL_missing")
+        return False
     raw = issue_registration_verification(email, force=force)
     if not raw:
         return False
     normalized = email.strip().lower()
     link = f"{base_url.rstrip('/')}/customer-register/verify-email?token={raw}"
     subject = "Confirm your email for your AnyAiCam account request"
-    text = ("Confirm this email address to complete your AnyAiCam account request:\n"
+    text = ("Confirm this email address and choose your password to complete your AnyAiCam account request:\n"
             f"{link}\n\nThis link works once and expires in {VERIFY_TTL_HOURS} hours. "
             "Your request is reviewed only after the address is confirmed. If you didn't ask for this, ignore this email.")
     try:
@@ -77,10 +89,12 @@ def send_registration_verification(email: str, base_url: str, *, force: bool = F
     return not (isinstance(result, dict) and result.get("status") in ("failed", "error"))
 
 
-def verify_registration_email(raw: str, *, now: datetime | None = None) -> bool:
-    """Marks the request this link belongs to as verified FOR ITS OWN EMAIL. Single use; expired, unknown, used
-    or non-pending links all return False with no detail."""
-    if not raw or len(raw) > 200:
+def verify_registration_email(raw: str, password: str, *, now: datetime | None = None) -> bool:
+    """Marks the request this link belongs to as verified FOR ITS OWN EMAIL and sets its password to the one chosen
+    by whoever holds the link (Green review F1: the first submitter's password must never survive -- the password
+    typed on /customer-register by someone who does not own the inbox is discarded here). Single use; expired,
+    unknown, used or non-pending links and a too-short password all return False with no detail."""
+    if not raw or len(raw) > 200 or len(password or "") < MIN_PASSWORD:
         return False
     now = now or datetime.now()
     with connection() as db:
@@ -91,14 +105,41 @@ def verify_registration_email(raw: str, *, now: datetime | None = None) -> bool:
         if not item or not item["verification_expires_at"] or item["verification_expires_at"] < now.isoformat():
             return False
         db.execute(
-            "UPDATE customer_registration_requests SET email_verified_at=?,email_verified_for=?,"
+            "UPDATE customer_registration_requests SET email_verified_at=?,email_verified_for=?,password_hash=?,"
             "verification_token_hash=NULL,verification_expires_at=NULL WHERE id=? AND email_verified_at IS NULL",
-            (now.isoformat(), item["email"], item["id"]))
+            (now.isoformat(), item["email"], password_hash(password), item["id"]))
         db.execute(
             "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
-            (item["email"], "anonymous", "customer_registration.email_verified", "customer_registration", item["id"], "{}",
-             now.isoformat()))
+            (item["email"], "anonymous", "customer_registration.email_verified", "customer_registration", item["id"],
+             '{"password_set": true}', now.isoformat()))
     return True
+
+
+def _verify_form(token: str, error: str = "") -> str:
+    from html import escape
+    return ((f'<p role="alert">{escape(error)}</p>' if error else "")
+            + '<p>Choose the password for your AnyAiCam account to confirm this email address.</p>'
+            '<form method="post" action="/customer-register/verify-email" id="verify-form">'
+            f'<input type="hidden" name="token" value="{escape(token or "", quote=True)}">'
+            '<input type="hidden" name="csrf_token" value="">'
+            '<label>Password<br><input name="password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
+            '<label>Confirm password<br><input name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
+            '<button type="submit">Confirm email</button></form>'
+            "<script>document.getElementById('verify-form').addEventListener('submit',function(){"
+            "var m=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(m)this.csrf_token.value=decodeURIComponent(m[1]);});</script>")
+
+
+def _verify_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
+    response = HTMLResponse(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1"><title>AnyAiCam</title>'
+        '<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;color:#0b1530}'
+        'input{width:100%;padding:.5rem;margin:.25rem 0 .75rem;box-sizing:border-box}</style>'
+        f'</head><body><h1>{title}</h1>{body}</body></html>', status_code=status_code)
+    # Green review F5: the token is in the URL.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def create_pending_registration(display_name: str, email: str, password: str) -> tuple[str, bool]:
@@ -355,8 +396,14 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
             raise HTTPException(status_code=409, detail="Only pending registrations can be confirmed.")
         if item.get("email_verified_at"):
             return {"status": "complete", "message": "This email address is already confirmed."}
-        from direct_onboarding import _base
-        if not send_registration_verification(item["email"], _base(request), force=True):
+        sent_at = item.get("verification_sent_at")
+        try:
+            recent = bool(sent_at) and (datetime.now() - datetime.fromisoformat(sent_at)).total_seconds() < VERIFY_RESEND_SECONDS
+        except ValueError:
+            recent = False
+        if recent:  # Green review F4: no unthrottled mail to an address, even from a reviewer
+            raise HTTPException(status_code=429, detail="A confirmation link was sent recently. Try again in a few minutes.")
+        if not send_registration_verification(item["email"]):
             raise HTTPException(status_code=503, detail="The confirmation email could not be sent. Please try again.")
         with connection() as db:
             db.execute(
@@ -366,15 +413,21 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
         return {"status": "complete", "message": "A new confirmation link was emailed to the requester."}
 
     @app.get("/customer-register/verify-email", response_class=HTMLResponse)
-    def verify_registration_email_page(token: str = ""):
-        ok = verify_registration_email(token)
-        title, message = ("Email confirmed", VERIFIED_MESSAGE) if ok else ("Link not valid", VERIFY_INVALID_MESSAGE)
-        return HTMLResponse(
-            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width,initial-scale=1"><title>AnyAiCam</title>'
-            '<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;color:#0b1530}</style>'
-            f'</head><body><h1>{title}</h1><p>{message}</p><p><a href="/customer-login.html">Go to sign in</a></p></body></html>',
-            status_code=200 if ok else 400)
+    def verify_registration_email_form(token: str = ""):
+        # Green review F2: a GET never changes anything -- mail scanners prefetch links. It only shows the form;
+        # it does not say whether the token is valid.
+        return _verify_page("Confirm your email", _verify_form(token))
+
+    @app.post("/customer-register/verify-email", response_class=HTMLResponse)
+    def verify_registration_email_submit(token: str = Form(""), password: str = Form(""), confirm_password: str = Form("")):
+        if len(password) < MIN_PASSWORD or password != confirm_password:
+            error = ("Password must contain at least 10 characters." if len(password) < MIN_PASSWORD
+                     else "The two passwords do not match.")
+            return _verify_page("Confirm your email", _verify_form(token, error), status_code=422)
+        if verify_registration_email(token, password):
+            return _verify_page("Email confirmed", f"<p>{VERIFIED_MESSAGE}</p>"
+                                '<p><a href="/customer-login.html">Go to sign in</a></p>')
+        return _verify_page("Link not valid", f"<p>{VERIFY_INVALID_MESSAGE}</p>", status_code=400)
 
     @app.post("/api/customer-registration-requests/{request_id}/reject")
     def reject(request_id: str, request: Request, payload: dict):
