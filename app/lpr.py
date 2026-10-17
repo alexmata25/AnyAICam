@@ -557,15 +557,25 @@ import subprocess
 
 LPR_FULL_RES_FRAMES = os.environ.get("ANYAICAM_LPR_FULL_RES_FRAMES", "true").strip().lower() == "true"
 LPR_FULL_RES_CACHE_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_LPR_FULL_RES_CACHE_SECONDS", "2.5")))
+# A buffer segment older than this is not a "latest" frame (L-1, 2026-10-17):
+# the in-progress segment is written continuously and the previous one ended
+# at most a moment ago, so anything older means the camera stopped. Without
+# this bound a stopped camera's last segment was decoded to a full-resolution
+# PNG every cache period, forever (Ryzen: ~80-90 C after the driveway cameras
+# stopped), and LPR kept reading a frozen picture.
+LPR_FULL_RES_MAX_AGE_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_LPR_FULL_RES_MAX_AGE_SECONDS", "10")))
 _full_frame_cache: dict = {}  # camera -> (monotonic, frame)
 _full_frame_lock = threading.Lock()
 
 
-def latest_full_resolution_frame(camera_number, buffer_dir, *, now: float | None = None):
-    """Newest decoded frame of the camera's recording buffer, or None."""
+def latest_full_resolution_frame(camera_number, buffer_dir, *, now: float | None = None, wall_now: float | None = None):
+    """Newest decoded frame of the camera's recording buffer, or None -- also
+    None when the buffer holds nothing written in the last
+    LPR_FULL_RES_MAX_AGE_SECONDS (a stopped camera is never decoded)."""
     if not LPR_FULL_RES_FRAMES:
         return None
     now = time.monotonic() if now is None else now
+    wall_now = time.time() if wall_now is None else wall_now
     with _full_frame_lock:
         cached = _full_frame_cache.get(camera_number)
         if cached and now - cached[0] <= LPR_FULL_RES_CACHE_SECONDS:
@@ -576,6 +586,11 @@ def latest_full_resolution_frame(camera_number, buffer_dir, *, now: float | None
         return None
     frame = None
     for entry in reversed(segments[-2:]):  # the in-progress segment, else the previous one
+        try:
+            if wall_now - entry.stat().st_mtime > LPR_FULL_RES_MAX_AGE_SECONDS:
+                continue  # stale: the camera stopped writing it
+        except OSError:
+            continue
         try:
             raw = subprocess.run(
                 ["ffmpeg", "-v", "error", "-sseof", "-1.5", "-i", entry.path, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
