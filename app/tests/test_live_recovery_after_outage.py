@@ -217,6 +217,23 @@ def test_a_healthy_h265_camera_is_not_restarted_or_probed_again(monkeypatch):
     assert len(probe.urls) == 1
 
 
+@pytest.mark.parametrize("retry_seconds", [60, 0.2])
+def test_a_camera_whose_codec_stays_unknown_is_never_restarted(monkeypatch, capsys, retry_seconds):
+    """Red's review (a): the probe keeps failing on a healthy, encoding
+    camera -- no copy upgrade, no restart, at most one probe per retry window."""
+    monkeypatch.setattr(main, "camera_url", lambda n: URL_NEW)
+    monkeypatch.setattr(main, "LIVE_VIDEO_COPY_PROBE_RETRY_SECONDS", retry_seconds)
+    probe = _Probe(lambda u: None)
+    monkeypatch.setattr(main, "probe_camera_video_codec", probe)
+    started = time.monotonic()
+    starts = _run_supervisor(monkeypatch, lambda i: True, lambda s: False, timeout=1.0)
+    elapsed = time.monotonic() - started
+    assert starts == ["encode"]  # one worker, never restarted
+    assert len(probe.urls) <= 1 + int(elapsed / retry_seconds) + 1
+    assert main.camera_reconnect_counts[2] == 0
+    assert "restarting the live worker with stream copy" not in capsys.readouterr().out
+
+
 def test_a_genuine_copy_fallback_survives_recovery_without_a_restart_loop(monkeypatch):
     monkeypatch.setattr(main, "camera_url", lambda n: URL_NEW)
     probe = _Probe(lambda u: "h264")
