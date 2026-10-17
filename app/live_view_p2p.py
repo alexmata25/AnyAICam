@@ -76,6 +76,7 @@ _DEFAULT_STUN_SERVERS = "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3
 # immediate-return behavior exactly.
 MAX_PENDING_WAIT_SECONDS = 25.0
 PENDING_RECHECK_SECONDS = 2.0
+MAX_SIGNAL_PAYLOAD_BYTES = 20_000
 
 
 class _PendingSignalNotifier:
@@ -181,13 +182,37 @@ def _own_session(db, session_id: str, identity: dict) -> dict:
     ).fetchone()
     if not session:
         raise HTTPException(status_code=404, detail='Live view session not found.')
+    # Session ownership is not a substitute for camera authorization. A
+    # customer viewer may learn a session id from another user or a stale
+    # browser tab, so re-check the current can_live grant for every signaling
+    # read/write (also closes access immediately when a grant is revoked).
+    if identity.get('role') != 'customer_owner':
+        camera = db.execute(
+            'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+            (session['camera_id'], identity['customer_id']),
+        ).fetchone()
+        user = db.execute(
+            'SELECT id FROM partner_users WHERE email=? AND customer_id=?',
+            (identity.get('email'), identity['customer_id']),
+        ).fetchone()
+        permission = (db.execute(
+            'SELECT can_live FROM customer_camera_permissions WHERE user_id=? AND camera_id=?',
+            (user['id'], session['camera_id']),
+        ).fetchone() if user else None)
+        if not camera or not permission or not permission['can_live']:
+            # Keep inaccessible camera/session IDs indistinguishable from
+            # sessions outside this customer's scope.
+            raise HTTPException(status_code=404, detail='Live view session not found.')
     return dict(session)
 
 
 def _insert_signal(db, *, session_id: str, kind: str, payload: dict, now: datetime) -> None:
+    encoded = json.dumps(payload, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_SIGNAL_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail='The P2P signaling payload is too large.')
     db.execute(
         'INSERT INTO live_view_p2p_signaling(id,session_id,kind,payload_json,created_at,consumed_at) VALUES(?,?,?,?,?,NULL)',
-        (secrets.token_hex(12), session_id, kind, json.dumps(payload)[:20000], now.isoformat()),
+        (secrets.token_hex(12), session_id, kind, encoded, now.isoformat()),
     )
 
 

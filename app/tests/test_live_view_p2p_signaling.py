@@ -57,11 +57,20 @@ def _seed(conn):
         "INSERT OR IGNORE INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
         "VALUES('user-b','owner-b@example.test','customer_owner','cust-b','x','all',?)", (now,)
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
+        "VALUES('viewer-a','viewer-a@example.test','customer_viewer','cust-a','x','selected',?)", (now,)
+    )
+    conn.execute("INSERT OR IGNORE INTO customer_camera_permissions(user_id,camera_id,can_live) VALUES('viewer-a','cam-a',0)")
     conn.commit()
 
 
 def _owner_cookie(customer_id, email):
     return partner_portal._token(email, "customer_owner", None, customer_id, None)
+
+
+def _viewer_cookie(customer_id, email):
+    return partner_portal._token(email, "customer_viewer", None, customer_id, None)
 
 
 @pytest.fixture()
@@ -149,6 +158,29 @@ def test_offer_rejects_a_session_belonging_to_another_customer(client, db_path):
     other_cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-b", "owner-b@example.test")}
     response = client.post(f"/api/customer/live/sessions/{session_id}/p2p/offer", cookies=other_cookies, json={"sdp": "v=0\r\n..."})
     assert response.status_code == 404
+
+
+def test_same_customer_viewer_without_can_live_cannot_access_another_users_signaling(client, db_path):
+    session_id, _ = _start_session(client, db_path)
+    cookies = {partner_portal.SESSION_COOKIE: _viewer_cookie("cust-a", "viewer-a@example.test")}
+    responses = [
+        client.post(f"/api/customer/live/sessions/{session_id}/p2p/offer", cookies=cookies, json={"sdp": "offer"}),
+        client.post(f"/api/customer/live/sessions/{session_id}/p2p/ice", cookies=cookies,
+                    json={"candidate": {"candidate": "candidate:1"}}),
+        client.get(f"/api/customer/live/sessions/{session_id}/p2p/answer", cookies=cookies),
+        client.post(f"/api/customer/live/sessions/{session_id}/transport-outcome", cookies=cookies,
+                    json={"transport": "p2p"}),
+    ]
+    assert [response.status_code for response in responses] == [404, 404, 404, 404]
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import connection
+        with connection() as db:
+            assert db.execute(
+                "SELECT COUNT(*) AS count FROM live_view_p2p_signaling WHERE session_id=?", (session_id,)
+            ).fetchone()["count"] == 0
+            assert db.execute(
+                "SELECT transport FROM live_view_sessions WHERE id=?", (session_id,)
+            ).fetchone()["transport"] == "not_configured"
 
 
 def test_offer_requires_nonempty_sdp(client, db_path):
