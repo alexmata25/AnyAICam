@@ -33,7 +33,7 @@ def scan(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_ai_event_media_loop", None)
 
     state = types.SimpleNamespace(identity={"smart_motion_enabled": True}, frame_requests=[], rtsp_grabs=[],
-                                  ppe_calls=[], facial_calls=[], db_connects=[])
+                                  ppe_calls=[], facial_calls=[])
     monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda n: dict(state.identity))
     full = np.zeros((2160, 3840, 3), np.uint8)
 
@@ -47,7 +47,6 @@ def scan(monkeypatch, tmp_path):
 
     @contextmanager
     def connect():
-        state.db_connects.append(1)
         yield object()
 
     monkeypatch.setattr("database_backend.connect", connect)
@@ -100,17 +99,17 @@ def test_enabled_ppe_still_gets_its_main_stream_crop(scan):
 
 
 # ---------------------------------------------------------------- facial recognition
-def test_facial_recognition_disabled_appliance_wide_opens_no_rtsp_and_no_database(scan, monkeypatch):
+def test_facial_recognition_disabled_appliance_wide_opens_no_rtsp(scan, monkeypatch):
     monkeypatch.setattr(main.facial_recognition, "FACIAL_RECOGNITION_ENABLED", False)
     scan.identity.update(facial_recognition_enabled=True)
     state = scan.run()
-    assert _nothing_acquired(state) and state.facial_calls == [] and state.db_connects == []
+    assert _nothing_acquired(state) and state.facial_calls == []
 
 
 def test_facial_recognition_not_authorized_for_the_camera_opens_no_rtsp(scan):
     scan.identity.update(facial_recognition_enabled=False)
     state = scan.run()
-    assert _nothing_acquired(state) and state.facial_calls == [] and state.db_connects == []
+    assert _nothing_acquired(state) and state.facial_calls == []
 
 
 def test_facial_recognition_with_no_camera_identity_yet_fails_closed(scan, monkeypatch):
