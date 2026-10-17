@@ -51,7 +51,7 @@ def test_a_purchase_made_before_registration_is_granted_automatically_on_approva
         create_pending_registration("New Customer", "new-customer@example.test", "correct-horse-battery-staple")
         conn = sqlite3.connect(db_path)
         request_id = conn.execute("SELECT id FROM customer_registration_requests WHERE email=?", ("new-customer@example.test",)).fetchone()[0]
-        assert verify_registration_email(issue_registration_verification("new-customer@example.test", force=True), "correct-horse-battery-staple")  # requester confirms (2026-10-17)
+        assert verify_registration_email(issue_registration_verification("new-customer@example.test", force=True), "correct-horse-battery-staple", "Confirmed Owner")  # requester confirms (2026-10-17)
 
         result = approve_registration(request_id, "partner-a", MASTER_ACTOR)
         total_slots = ce.total_camera_slots(result["customer_id"])
@@ -68,7 +68,7 @@ def test_approval_with_no_pending_purchase_is_unaffected(db_path):
         create_pending_registration("Plain Customer", "plain@example.test", "correct-horse-battery-staple")
         conn = sqlite3.connect(db_path)
         request_id = conn.execute("SELECT id FROM customer_registration_requests WHERE email=?", ("plain@example.test",)).fetchone()[0]
-        assert verify_registration_email(issue_registration_verification("plain@example.test", force=True), "correct-horse-battery-staple")  # requester confirms (2026-10-17)
+        assert verify_registration_email(issue_registration_verification("plain@example.test", force=True), "correct-horse-battery-staple", "Confirmed Owner")  # requester confirms (2026-10-17)
 
         result = approve_registration(request_id, "partner-a", MASTER_ACTOR)
         total_slots = ce.total_camera_slots(result["customer_id"])
@@ -85,7 +85,7 @@ def test_a_pending_link_for_a_different_email_is_never_attached(db_path):
         create_pending_registration("New Customer", "new-customer@example.test", "correct-horse-battery-staple")
         conn = sqlite3.connect(db_path)
         request_id = conn.execute("SELECT id FROM customer_registration_requests WHERE email=?", ("new-customer@example.test",)).fetchone()[0]
-        assert verify_registration_email(issue_registration_verification("new-customer@example.test", force=True), "correct-horse-battery-staple")  # requester confirms (2026-10-17)
+        assert verify_registration_email(issue_registration_verification("new-customer@example.test", force=True), "correct-horse-battery-staple", "Confirmed Owner")  # requester confirms (2026-10-17)
 
         result = approve_registration(request_id, "partner-a", MASTER_ACTOR)
         total_slots = ce.total_camera_slots(result["customer_id"])

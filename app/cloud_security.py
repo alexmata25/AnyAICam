@@ -213,7 +213,7 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
         frame_ancestors=_frame_ancestors_csp(request)
-        response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY' if frame_ancestors=='none' else 'SAMEORIGIN'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
+        response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY' if frame_ancestors=='none' else 'SAMEORIGIN'; response.headers['Referrer-Policy']='no-referrer' if response.headers.get('Referrer-Policy')=='no-referrer' else 'same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
         firebase_scripts = ' https://www.gstatic.com/firebasejs/12.0.0/' if request.url.path in {'/settings/notifications', '/mobile-push-sw.js'} else ''
         response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp(request)+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"+firebase_scripts+"; worker-src 'self' blob:; frame-ancestors '"+frame_ancestors+"'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
