@@ -24,6 +24,7 @@ def globals_off(monkeypatch):
     monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera: True)
     monkeypatch.setattr(main.facial_recognition, "FACIAL_RECOGNITION_ENABLED", False)
     monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda camera: True)
+    monkeypatch.setattr(main.smart_motion, "SMART_MOTION_ENABLED", False)
     return monkeypatch
 
 
@@ -64,8 +65,12 @@ def test_lpr_camera_scope_is_respected(globals_off):
     assert main.effective_analytics({**ALL_OFF, "lpr_enabled": True}, 2) == []
 
 
-def test_smart_motion_is_active_whenever_the_camera_has_it(globals_off):
+def test_smart_motion_needs_the_camera_flag_and_the_appliance_switch(globals_off):
+    """Codex 2026-10-17: Smart Motion was the one analytic whose appliance-wide switch the gate ignored."""
+    assert main.effective_analytics({**ALL_OFF, "smart_motion_enabled": True}, 1) == []
+    globals_off.setattr(main.smart_motion, "SMART_MOTION_ENABLED", True)
     assert main.effective_analytics({**ALL_OFF, "smart_motion_enabled": True}, 1) == ["smart_motion_enabled"]
+    assert main.effective_analytics(ALL_OFF, 1) == []
 
 
 def test_people_counting_needs_the_appliance_switch(globals_off):
@@ -93,6 +98,7 @@ def test_a_failing_scope_check_fails_closed_for_that_analytic_only(globals_off):
     def boom(camera):
         raise RuntimeError("bad env")
     globals_off.setattr(main.ppe, "is_camera_enabled", boom)
+    globals_off.setattr(main.smart_motion, "SMART_MOTION_ENABLED", True)
     identity = {**ALL_OFF, "ppe_enabled": True, "smart_motion_enabled": True}
     assert main.effective_analytics(identity, 1) == ["smart_motion_enabled"]
 
@@ -150,6 +156,17 @@ def test_detector_pauses_and_requests_no_frame_when_ppe_is_off_appliance_wide(gl
     requested, state = _run_detector_once(globals_off, {**ALL_OFF, "ppe_enabled": True})
     assert requested == []
     assert state.get("status") == "paused" and state.get("pause_reason") == "analytics_disabled"
+
+
+def test_detector_pauses_when_smart_motion_is_off_appliance_wide(globals_off):
+    requested, state = _run_detector_once(globals_off, {**ALL_OFF, "smart_motion_enabled": True})
+    assert requested == [] and state.get("pause_reason") == "analytics_disabled"
+
+
+def test_detector_runs_for_smart_motion_with_its_switch_on(globals_off):
+    globals_off.setattr(main.smart_motion, "SMART_MOTION_ENABLED", True)
+    requested, state = _run_detector_once(globals_off, {**ALL_OFF, "smart_motion_enabled": True})
+    assert requested == [7] and state.get("pause_reason") is None
 
 
 def test_detector_runs_when_an_analytic_is_effectively_active(globals_off):
