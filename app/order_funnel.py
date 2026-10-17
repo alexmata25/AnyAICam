@@ -290,7 +290,7 @@ def _software_body(progress: dict, summary: str, customer_id: str = "") -> str:
         return RETURN_TO_VMS.format(summary=summary)
     try:
         import customer_downloads
-        installer = customer_downloads.latest_vms_installer()
+        installer = customer_downloads.current_installer("linux")  # what the download link below really serves
     except Exception:
         installer = None
     if installer:

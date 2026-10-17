@@ -569,6 +569,11 @@ def _session_state(session_id: str, record: dict | None) -> str:
     return "not_paid"
 
 
+def _has_camera_plan(customer_id: str) -> bool:
+    import per_camera_billing
+    return per_camera_billing.has_camera_plan(customer_id)
+
+
 def _orders_page(customer_id: str) -> str:
     orders = rows("SELECT * FROM hardware_orders WHERE customer_id=? ORDER BY created_at DESC", (customer_id,))
     if not orders:
@@ -591,6 +596,12 @@ def _orders_page(customer_id: str) -> str:
     if waiting and not delivered:
         guide = (f'<p class="notice ok" id="orders-waiting" role="status">{escape(WAITING_FOR_DELIVERY)}</p>'
                  '<p class="note">Order statuses: Paid → Preparing → Shipped → Delivered. We email you when your equipment ships.</p>')
+    elif delivered and _has_camera_plan(customer_id):
+        # The plan already exists (a second one is refused anyway): no "Choose my camera plan" (Green 2026-10-16).
+        guide = ('<p class="notice ok" id="orders-delivered" role="status">Your equipment has arrived.</p>'
+                 '<p>Your camera plan is active. Manage it on My subscription, then set up your appliance and add your cameras.</p>'
+                 '<a class="ghost" id="orders-manage-plan" href="/subscription-portal">Open My subscription</a>'
+                 '<a class="ghost" id="orders-setup" href="/customer/setup">Set up my system</a>')
     elif delivered:
         guide = ('<p class="notice ok" id="orders-delivered" role="status">Your equipment has arrived.</p>'
                  '<p>Choose your camera plan and number of cameras on My subscription. That is a separate checkout, and billing '

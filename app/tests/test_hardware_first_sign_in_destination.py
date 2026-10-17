@@ -89,3 +89,28 @@ def test_an_appliance_owner_is_never_given_an_own_pc_order_or_charged_the_licenc
         assert billing.build_progress(customer_id) is None  # nothing saved, so no license line can be built
         billing.save_build_selection(customer_id, billing.purchase_selection("basic_local", "4"))
         assert not billing.build_progress(customer_id)["own_pc"]  # the appliance includes the license
+
+
+def test_my_orders_offers_no_second_plan_once_one_is_active(hw, db_path, monkeypatch):
+    import per_camera_billing as billing
+    _paid_and_signed_in(hw, db_path)
+    _fulfillment(db_path, "delivered")
+    assert 'id="orders-choose-plan"' in hw["client"].get("/customer/orders").text
+    monkeypatch.setattr(billing, "has_camera_plan", lambda customer_id, **_: True)
+    html = hw["client"].get("/customer/orders").text
+    assert 'id="orders-choose-plan"' not in html and 'id="orders-manage-plan"' in html and 'id="orders-setup"' in html
+
+
+def test_order_complete_offers_the_download_the_catalog_serves(monkeypatch):
+    """/order-complete decides from customer_downloads.current_installer (the approved catalog row, what the
+    download route serves), not only the legacy latest.json record."""
+    import customer_downloads
+    import order_funnel
+    import software_releases
+    monkeypatch.setattr(customer_downloads, "latest_vms_installer", lambda: None)
+    monkeypatch.setattr(software_releases, "latest_approved", lambda platform: {
+        "version": "1.2.7", "build_commit": "c" * 40, "filename": "anyaicam-appliance-installer-1.2.7-vms-cccccccccccc.tar.gz",
+        "size_bytes": 1, "sha256": "d" * 64, "storage_key": "k", "approved_at": "2026-10-16"} if platform == "linux" else None)
+    assert 'id="order-download"' in order_funnel._software_body({"own_pc": 1}, "")
+    monkeypatch.setattr(software_releases, "latest_approved", lambda platform: None)
+    assert 'id="order-download-pending"' in order_funnel._software_body({"own_pc": 1}, "")
