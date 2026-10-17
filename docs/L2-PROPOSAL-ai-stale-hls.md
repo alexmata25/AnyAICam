@@ -1,6 +1,6 @@
-# L-2 proposal: stop AI analytics on a disconnected camera's stale live playlist (NOT applied)
+# L-2: stop AI analytics on a disconnected camera's stale live playlist (applied in 2eb431b)
 
-Yellow, 2026-10-17. Branch `claude/yellow-ai-stale-hls-l2-20261017` (on 7804f3d) holds **tests only**; no production code.
+Yellow, 2026-10-17. Status: **applied in 2eb431b** on branch `claude/yellow-ai-stale-hls-l2-20261017` (L-1 29b7b9b → 88a4fb3 → 2eb431b, on 7804f3d); owner decision: required for 1.2.7; reviewed and approved by Red.
 
 ## Why it happens (source, 7804f3d; identical in RC3 01d1470)
 1. AI frames come from the persistent main-stream reader (`ANYAICAM_AI_SOURCE=main`, the default). Its
@@ -17,7 +17,7 @@ Observed on the Ryzen, 2026-10-17 00:35–00:45Z:
 - after cameras 2 and 3 stopped, the Python VMS ran at 360–450 % CPU with only cameras 1 and 5 streaming;
 - before the repair attempt, the same two cameras ran at 27–50 %.
 
-## Smallest safe correction (proposed)
+## Smallest safe correction (as applied)
 In `_read_hls_analytics_frame`, after the existing "playlist exists" check, require freshness in every mode:
 ```python
 HLS_ANALYTICS_MAX_AGE_SECONDS = float(os.environ.get("ANYAICAM_HLS_ANALYTICS_MAX_AGE_SECONDS", "15"))
@@ -40,8 +40,7 @@ shows analytics waiting rather than running on stale video.
 
 ## Tests prepared (`app/tests/test_ai_stale_hls_playlist.py`, real ffmpeg HLS)
 - A live playlist still feeds detection. Must pass now and after.
-- **A stale playlist (10 min old) is not analysed.** Marked `xfail(strict=True)`: it demonstrates today's bug and flips to
-  passing with the fix.
+- **A stale playlist (10 min old) is not analysed**, in both always-on and on-demand modes (the xfail was removed when the fix landed).
 - Detection resumes when the playlist is fresh again (reconnection). Must pass now and after.
 - A missing playlist is still reported as "not ready". Must pass now and after.
 
