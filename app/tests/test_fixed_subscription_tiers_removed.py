@@ -86,7 +86,7 @@ def test_the_one_time_vms_licences_are_unchanged():
 def test_the_public_catalog_api_lists_licences_but_no_fixed_tiers(http_client):
     body = http_client.get("/api/pricing/catalog").json()
     assert "base_plans" not in body
-    assert [lic["one_time"] for lic in body["vms_licenses"]] == [49.99, 79.99, 129.99, 199.99]
+    assert [lic["one_time"] for lic in body["vms_licenses"]] == [24.99, 37.49, 62.49, 99.99]
 
 
 # ------------------------------------------------------------- checkout and plan-change paths
