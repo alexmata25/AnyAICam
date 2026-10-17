@@ -146,7 +146,7 @@ def test_a_suspended_plan_adds_no_cameras(client, db_path):
 def test_the_per_camera_prices_are_unchanged():
     import per_camera_billing
     assert {k: p["monthly_cents_per_camera"] for k, p in per_camera_billing.PLANS.items()} == {
-        "basic_local": 999, "ai_local": 1499, "hybrid": 2499}
+        "basic_local": 999, "ai_local": 1499, "hybrid": 1999}
 
 
 # ---------------------------------------------------------- pending add requests

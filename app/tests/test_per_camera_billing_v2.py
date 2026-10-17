@@ -53,7 +53,7 @@ def test_v2_catalog_is_customer_safe_and_keeps_premium_analytics_separate():
     assert catalog["quantity"] == {"minimum": 1, "maximum": 64}
     assert catalog["continuous_cloud_recording_included"] is False
     plans = {plan["plan_key"]: plan for plan in catalog["plans"]}
-    assert [plans[key]["monthly_per_camera_amount"] for key in ("basic_local", "ai_local", "hybrid")] == [9.99, 14.99, 24.99]
+    assert [plans[key]["monthly_per_camera_amount"] for key in ("basic_local", "ai_local", "hybrid")] == [9.99, 14.99, 19.99]
     assert plans["basic_local"]["local_retention_days"] == 2
     assert plans["ai_local"]["local_retention_days"] == plans["hybrid"]["local_retention_days"] == 7
     assert plans["hybrid"]["cloud_event_retention_days"] == 14
@@ -230,7 +230,7 @@ def test_my_subscription_cancellation_and_scheduled_change_show_their_dates(db_p
     assert "1800000000" not in html
 
 
-@pytest.mark.parametrize("plan_key,unit_cents", [("basic_local", 999), ("ai_local", 1499), ("hybrid", 2499)])
+@pytest.mark.parametrize("plan_key,unit_cents", [("basic_local", 999), ("ai_local", 1499), ("hybrid", 1999)])
 def test_friends_family_base_coupon_applies_to_camera_quantity(plan_key, unit_cents, db_path, monkeypatch):
     import friends_family
     import pricing_catalog

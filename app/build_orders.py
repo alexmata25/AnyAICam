@@ -335,8 +335,10 @@ def _grant_vms_license(session: dict, customer_id: str, metadata: dict) -> dict:
         capacity = int(metadata.get("anyaicam_vms_license_capacity") or 0)
     except (TypeError, ValueError):
         capacity = 0
+    from pricing_catalog import vms_license_price_ids
     tier = next((t for t in VMS_LICENSES if t[0] == capacity), None)
-    if not tier or not price_id or os.environ.get(tier[2], "").strip() != price_id:
+    # The tier's current or an earlier Price (2026-10-17 repricing: a checkout opened before the switch still grants).
+    if not tier or not price_id or price_id not in vms_license_price_ids(tier[2]):
         return {"status": "rejected", "reason": "license metadata does not match the configured license price"}
     entitlement = upsert_entitlement(customer_id=customer_id, product=VMS_LICENSE_PRODUCT, camera_slot_quantity=capacity,
                                      stripe_customer_id=str(session.get("customer") or "") or None,

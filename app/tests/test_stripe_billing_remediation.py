@@ -204,7 +204,7 @@ def test_a_partial_refund_before_the_grant_leaves_service_on(env):
 def _license_checkout(event_id, intent="pi_license"):
     return {"id": event_id, "type": "checkout.session.completed", "data": {"object": {
         "id": f"cs_{event_id}", "object": "checkout.session", "mode": "payment", "payment_status": "paid", "customer": "cus_A",
-        "payment_intent": intent, "amount_total": 4999, "customer_details": {"email": "a@example.test"},
+        "payment_intent": intent, "amount_total": 2499, "customer_details": {"email": "a@example.test"},
         "metadata": {"anyaicam_customer_id": "cust-A", "anyaicam_stripe_price_id": "price_vms_8"}}}}
 
 
@@ -213,7 +213,7 @@ def test_a_refunded_vms_license_payment_is_never_granted(env, monkeypatch):
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8", "price_vms_8")
     monkeypatch.setattr(ce, "PRICE_ID_VMS_LICENSE_MAP", ce._load_vms_license_map())
     _deliver(env, {"id": "evt_lic_refund", "type": "charge.refunded", "data": {"object": {
-        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 4999, "amount_refunded": 4999, "refunded": True}}})
+        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 2499, "amount_refunded": 2499, "refunded": True}}})
     _deliver(env, _license_checkout("evt_lic"))
     with override_target(sqlite_path=str(env["path"])):
         assert ce.vms_license_capacity("cust-A") == 0

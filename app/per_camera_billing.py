@@ -29,6 +29,14 @@ PRICE_ENV = {
     "ai_local": "ANYAICAM_STRIPE_PRICE_AI_LOCAL",
     "hybrid": "ANYAICAM_STRIPE_PRICE_HYBRID",
 }
+# Hybrid repricing (owner approval 2026-10-17: $19.99 per camera per month, was $24.99). Stripe Prices are
+# immutable, so ANYAICAM_STRIPE_PRICE_HYBRID names the new $19.99 Price and every NEW checkout uses it (the price
+# guard refuses a Price that does not charge the catalog amount). Subscriptions still on an earlier Hybrid Price
+# stay fully recognized -- same plan, features and commission -- through ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS
+# (comma-separated Price IDs), and are shown at what that Price really bills. Nothing moves them: what existing
+# subscribers pay is an open owner decision. A previous Price is never offered for a new purchase.
+PREVIOUS_PRICE_ENV = {"hybrid": "ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS"}
+PREVIOUS_MONTHLY_CENTS_PER_CAMERA = {"hybrid": 2499}
 PLANS = {
     "basic_local": {
         "display_name": "Basic Local", "monthly_cents_per_camera": 999,
@@ -36,7 +44,7 @@ PLANS = {
         "cloud_event_retention_days": None, "mode": "local", "commission_percent": 0,
         "resolution_classes": ["standard", "high_resolution"],
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
-                     "standard_camera_management", "remote_viewing_where_supported"],
+                     "standard_camera_management", "remote_viewing_where_supported", "remote_phone_support"],
     },
     "ai_local": {
         "display_name": "AI Local", "monthly_cents_per_camera": 1499,
@@ -46,10 +54,10 @@ PLANS = {
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
-                     "core_aaco_retrieval", "supported_talk_down"],
+                     "core_aaco_retrieval", "supported_talk_down", "remote_phone_support"],
     },
     "hybrid": {
-        "display_name": "Hybrid", "monthly_cents_per_camera": 2499,
+        "display_name": "Hybrid", "monthly_cents_per_camera": 1999,
         "local_retention_days": 7, "cloud_event_storage": True,
         "cloud_event_retention_days": 14, "mode": "hybrid", "commission_percent": 20,
         "resolution_classes": ["standard", "high_resolution"],
@@ -57,9 +65,10 @@ PLANS = {
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
                      "core_aaco_retrieval", "supported_talk_down", "hybrid_cloud_services",
-                     "remote_cloud_services", "cloud_event_protection"],
+                     "remote_cloud_services", "cloud_event_protection", "remote_phone_support"],
     },
 }
+REMOTE_PHONE_SUPPORT = "Free remote technical support by phone, Monday through Sunday, during business hours"
 FEATURE_LABELS = {
     "local_vms": "Local VMS", "local_recording": "Local recording", "local_playback": "Local playback",
     "basic_motion_events": "Basic motion and events", "standard_camera_management": "Camera management",
@@ -68,6 +77,8 @@ FEATURE_LABELS = {
     "intelligent_notifications": "Intelligent notifications", "core_aaco_retrieval": "Core AACO video and event retrieval",
     "supported_talk_down": "Talk Down / two-way audio on supported cameras", "hybrid_cloud_services": "Hybrid cloud services",
     "remote_cloud_services": "Remote cloud services", "cloud_event_protection": "Cloud event protection",
+    # Owner approval 2026-10-17: included with every plan (Basic Local, AI Local and Hybrid).
+    "remote_phone_support": REMOTE_PHONE_SUPPORT,
 }
 
 
@@ -108,7 +119,28 @@ def _configured_prices() -> dict[str, dict]:
             if price_id in found:
                 raise ValueError("A Stripe Price ID is configured for more than one per-camera plan.")
             found[price_id] = {**plan, "plan_key": key, "product": "camera_plan_v2", "price_id": price_id}
+    for key, env in PREVIOUS_PRICE_ENV.items():
+        for price_id in previous_price_ids(key):
+            if price_id in found:
+                raise ValueError("A previous Stripe Price ID is also configured as a current per-camera Price.")
+            found[price_id] = {**PLANS[key], "plan_key": key, "product": "camera_plan_v2", "price_id": price_id,
+                               "monthly_cents_per_camera": PREVIOUS_MONTHLY_CENTS_PER_CAMERA[key], "previous_price": True}
     return found
+
+
+def previous_price_ids(plan_key: str) -> list[str]:
+    """Earlier Stripe Price IDs of a plan that existing subscriptions may still be on (never sold again)."""
+    env = PREVIOUS_PRICE_ENV.get(plan_key)
+    return [item.strip() for item in os.environ.get(env, "").split(",") if item.strip()] if env else []
+
+
+def billed_cents_per_camera(entitlement: dict) -> int:
+    """What this subscription is really billed per camera: its earlier Hybrid Price, if it is still on one,
+    otherwise the catalog price."""
+    plan_key = str(entitlement.get("plan_key") or "")
+    if str(entitlement.get("stripe_price_id") or "") in previous_price_ids(plan_key):
+        return PREVIOUS_MONTHLY_CENTS_PER_CAMERA[plan_key]
+    return int(PLANS[plan_key]["monthly_cents_per_camera"])
 
 
 def resolve_price(price_id: str) -> Optional[dict]:
@@ -388,11 +420,13 @@ def entitlement_payload(entitlement: dict | None) -> dict | None:
     if not plan:
         return None
     quantity = int(entitlement.get("camera_quantity") or 0)
+    billed = billed_cents_per_camera(entitlement)
     return {
         "plan_key": entitlement["plan_key"], "display_name": plan["display_name"],
         "status": entitlement.get("status"), "stripe_status": entitlement.get("stripe_status"),
-        "camera_quantity": quantity, "monthly_per_camera_amount": plan["monthly_cents_per_camera"] / 100,
-        "monthly_base_total": plan["monthly_cents_per_camera"] * quantity / 100,
+        "camera_quantity": quantity, "monthly_per_camera_amount": billed / 100,
+        "monthly_base_total": billed * quantity / 100,
+        "previous_price": billed != int(plan["monthly_cents_per_camera"]),
         "local_retention_days": int(entitlement.get("local_retention_days") or plan["local_retention_days"]),
         "cloud_event_storage": bool(entitlement.get("cloud_event_storage")),
         "cloud_event_retention_days": entitlement.get("cloud_event_retention_days"),
