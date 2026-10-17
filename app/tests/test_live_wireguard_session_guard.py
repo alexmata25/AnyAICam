@@ -107,3 +107,13 @@ def test_the_newest_rotated_peer_is_used(client, db_path, wireguard_on):
     session_id, cookies = _start_session(client, "cust-a", "owner-a@example.test", "cam-a")
     assert _playlist(client, session_id, cookies).status_code == 200
     assert wireguard_on == [newer["tunnel_address"]]
+
+
+def test_a_same_customer_viewer_with_can_live_cannot_fetch_from_another_users_session(client, db_path, wireguard_on):
+    session_id, _ = _start_session(client, "cust-a", "owner-a@example.test", "cam-a")
+    _db(db_path, "INSERT INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
+                 "VALUES('user-g','viewer-g@example.test','customer_viewer','cust-a','x','selected','2026-10-17')")
+    _db(db_path, "INSERT INTO customer_camera_permissions(user_id,camera_id,can_live) VALUES('user-g','cam-a',1)")
+    viewer = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer-g@example.test", "customer_viewer", None, "cust-a", None)}
+    assert _playlist(client, session_id, viewer).status_code == 404
+    assert wireguard_on == []

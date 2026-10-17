@@ -111,3 +111,29 @@ def test_both_pages_lease_the_session_only_while_their_own_p2p_connection_plays(
     assert "keepLiveSessionLeased(sessionId,()=>!stopped&&p2pConnection===result.pc);" in source
     assert "keepLiveSessionLeased(tile.sessionId,()=>!tile.stopped&&tile.p2pConnection===result.pc);" in source
     assert "if (!isActive()) { clearInterval(timer); return; }" in source
+
+
+def test_a_same_customer_viewer_with_can_live_still_cannot_use_another_users_session(client, db_path):
+    """Codex's grant check stops viewers WITHOUT can_live; a viewer who CAN view the camera still may not signal into,
+    lease, or report on the owner's session (it would hijack the owner's P2P answer)."""
+    session_id, _ = _start_session(client, db_path)
+    _db_rows = [
+        "INSERT INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
+        "VALUES('user-g','viewer-g@example.test','customer_viewer','cust-a','x','selected','2026-10-17')",
+        "INSERT INTO customer_camera_permissions(user_id,camera_id,can_live) VALUES('user-g','cam-a',1)",
+    ]
+    for sql in _db_rows:
+        _set(db_path, sql, ())
+    viewer = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer-g@example.test", "customer_viewer", None, "cust-a", None)}
+    responses = [
+        client.post(f"/api/customer/live/sessions/{session_id}/p2p/offer", cookies=viewer, json={"sdp": "offer"}),
+        client.post(f"/api/customer/live/sessions/{session_id}/p2p/ice", cookies=viewer,
+                    json={"candidate": {"candidate": "candidate:1"}}),
+        client.get(f"/api/customer/live/sessions/{session_id}/p2p/answer", cookies=viewer),
+        client.post(f"/api/customer/live/sessions/{session_id}/transport-outcome", cookies=viewer, json={"transport": "p2p"}),
+        _keepalive(client, session_id, viewer),
+    ]
+    assert [r.status_code for r in responses] == [404] * 5
+    own = client.post("/api/customer/cameras/cam-a/live/start", cookies=viewer)
+    assert own.status_code == 200, own.text
+    assert _keepalive(client, own.json()["session_id"], viewer).status_code == 200  # their own session works

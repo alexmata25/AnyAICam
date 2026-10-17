@@ -188,6 +188,11 @@ def _own_session(db, session_id: str, identity: dict) -> dict:
     ).fetchone()
     if not session:
         raise HTTPException(status_code=404, detail='Live view session not found.')
+    # 1.2.7 transport audit: a session belongs to the user who started it. A same-customer user -- even one with
+    # can_live on the camera -- must not signal into, fetch from or lease someone else's session.
+    requested_by = dict(session).get('requested_by')
+    if requested_by and str(requested_by).lower() != str(identity.get('email') or '').lower():
+        raise HTTPException(status_code=404, detail='Live view session not found.')
     # Session ownership is not a substitute for camera authorization. A
     # customer viewer may learn a session id from another user or a stale
     # browser tab, so re-check the current can_live grant for every signaling
