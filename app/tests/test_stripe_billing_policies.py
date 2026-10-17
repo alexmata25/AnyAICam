@@ -245,7 +245,7 @@ def test_a_refunded_vms_license_stops_the_installer_download(env, monkeypatch):
     with override_target(sqlite_path=str(env["path"])):
         assert ce.vms_license_capacity("cust-A") == 8
     _deliver(env, {"id": "evt_lr", "type": "charge.refunded", "data": {"object": {
-        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 4999, "amount_refunded": 4999, "refunded": True}}})
+        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 2499, "amount_refunded": 2499, "refunded": True}}})
     with override_target(sqlite_path=str(env["path"])):
         assert ce.vms_license_capacity("cust-A") == 0
     assert env["client"].get("/api/customer/downloads/vms-installer", cookies=_cookie(*OWNER_A)).status_code == 403
@@ -328,7 +328,7 @@ def test_partial_refunds_leave_add_ons_and_licenses_unchanged(env, monkeypatch):
         "payment_intent": "pi_license", "customer_details": {"email": "a@example.test"},
         "metadata": {"anyaicam_customer_id": "cust-A", "anyaicam_stripe_price_id": "price_vms_8"}}}})
     _deliver(env, {"id": "evt_lpr", "type": "charge.refunded", "data": {"object": {
-        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 4999, "amount_refunded": 1000, "refunded": False}}})
+        "id": "ch_license", "object": "charge", "payment_intent": "pi_license", "amount": 2499, "amount_refunded": 1000, "refunded": False}}})
     with override_target(sqlite_path=str(env["path"])):
         assert ce.vms_license_capacity("cust-A") == 8
 

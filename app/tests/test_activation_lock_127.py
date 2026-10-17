@@ -151,7 +151,7 @@ def test_a_selection_without_hardware_is_the_own_pc_order_with_its_licence(env):
     progress = billing.build_progress(CID)
     assert progress.get("own_pc") and build_orders.order_kind(progress) == build_orders.OWN_PC_ORDER
     quote = build_orders.order_quote(progress)
-    assert [line["cents"] for line in quote["one_time"]] == [4999] and quote["due_today_cents"] == 999 + 4999
+    assert [line["cents"] for line in quote["one_time"]] == [2499] and quote["due_today_cents"] == 999 + 2499
 
 
 def test_an_account_that_owns_the_licence_is_not_charged_it_again(env):

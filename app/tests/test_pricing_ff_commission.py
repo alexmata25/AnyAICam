@@ -527,7 +527,7 @@ def test_friends_family_panel_is_offered_where_customers_buy(portal, db_path):
 
 # ================================================================ one-time VMS software license
 
-@pytest.mark.parametrize("capacity,cents", [(8, 4999), (16, 7999), (32, 12999), (64, 19999)])
+@pytest.mark.parametrize("capacity,cents", [(8, 2499), (16, 3749), (32, 6249), (64, 9999)])
 def test_vms_license_prices_are_one_time(capacity, cents):
     lic = pc.find_vms_license(capacity)
     assert lic["one_time_cents"] == cents and lic["billing_type"] == "one_time"
@@ -647,7 +647,7 @@ def test_price_script_refuses_live_keys(monkeypatch, capsys):
 def test_checkout_refuses_a_one_time_price_for_a_monthly_item(license_portal, db_path, fake_stripe_prices):
     client, captured, sent = license_portal
     _seed(db_path)
-    fake_stripe_prices["price_vms_8"] = {"id": "price_vms_8", "unit_amount": 4999, "currency": "usd", "active": True,
+    fake_stripe_prices["price_vms_8"] = {"id": "price_vms_8", "unit_amount": 2499, "currency": "usd", "active": True,
                                          "recurring": {"interval": "month"}}  # wrong: the license is one-time
     response = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
     assert response.status_code == 503 and "PRICE_MISMATCH" in response.json()["detail"]
