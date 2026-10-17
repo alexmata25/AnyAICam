@@ -23,7 +23,7 @@ def test_a_plan_only_storage_order_with_a_granted_trial_shows_nothing_due_today(
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
     html = _summary({"plan": "hybrid", "cameras": 4})
     assert '<span>Due today</span><span>$0.00</span>' in html
-    assert "30-day free cloud storage trial starts today" in html and "unless you choose to continue, then at $99.96/month" in html
+    assert "30-day free cloud storage trial starts today" in html and "unless you choose to continue, then at $79.96/month" in html
     assert "Your monthly subscription starts today." not in html
     # The Checkout that page leads to really carries the trial (the claim above is not a promise of its own).
     fields, _, _ = build_orders._checkout_fields(CUSTOMER, "owner@example.test", {"plan": "hybrid", "cameras": 4})
@@ -32,7 +32,7 @@ def test_a_plan_only_storage_order_with_a_granted_trial_shows_nothing_due_today(
 
 def test_without_a_trial_or_for_orders_that_never_carry_one_the_full_amount_is_shown(shop, db_path):
     html = _summary({"plan": "hybrid", "cameras": 4})  # no grant
-    assert '<span>Due today</span><span>$99.96</span>' in html and "Your monthly subscription starts today." in html
+    assert '<span>Due today</span><span>$79.96</span>' in html and "Your monthly subscription starts today." in html
     client, _, _ = shop
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
     local = _summary({"plan": "ai_local", "cameras": 4})  # a local-only plan has no storage trial

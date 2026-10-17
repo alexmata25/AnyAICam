@@ -127,7 +127,7 @@ def test_no_plan_still_offers_the_picker_at_the_verified_prices(hw, db_path, str
     _owner(hw, db_path, "fresh@example.test")
     page = hw["client"].get("/subscription-portal").text
     assert 'id="v2-checkout-button"' in page and 'id="v2-legacy-plan"' not in page
-    assert {k: p["monthly_cents_per_camera"] for k, p in billing.PLANS.items()} == {"basic_local": 999, "ai_local": 1499, "hybrid": 2499}
+    assert {k: p["monthly_cents_per_camera"] for k, p in billing.PLANS.items()} == {"basic_local": 999, "ai_local": 1499, "hybrid": 1999}
     assert _plan_checkout(hw).status_code == 200
     fields = _subscription_sessions(hw)[-1]
     assert fields["line_items[0][price]"] == "price_srv_hybrid" and fields["line_items[0][quantity]"] == "4"

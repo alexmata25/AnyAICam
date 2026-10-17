@@ -146,7 +146,7 @@ def test_the_hardware_page_prices_from_the_server_and_says_the_subscription_come
     assert 'id="hw-total"><span>Due today</span><span>$1,549.97</span>' in html
     assert ("Your AnyAiCam hardware is purchased today. Your camera subscription will be activated separately after your "
             "equipment arrives and you complete setup.") in html
-    assert "not charged today" in html and "$199.92" not in html  # the plan is not part of this order
+    assert "not charged today" in html and "$159.92" not in html  # the plan is not part of this order
     assert 'id="hw-email"' in html and "Pay for hardware" in html
 
 

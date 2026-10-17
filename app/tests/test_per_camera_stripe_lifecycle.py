@@ -8,7 +8,7 @@ routes and every Stripe event through the real signed webhook route
 (test_stripe_billing_launch's fake Stripe; no live Stripe). After each step
 the entitlement, the usable camera capacity and the product mode must be
 exactly what was paid for, at the universal per-camera prices
-(Basic Local $9.99, AI Local $14.99, Hybrid $24.99 per camera per month).
+(Basic Local $9.99, AI Local $14.99, Hybrid $19.99 per camera per month).
 """
 from datetime import datetime, timedelta
 import sqlite3
@@ -18,7 +18,7 @@ import pytest
 
 from test_stripe_billing_launch import OWNER_A, _cookie, _deliver, env  # noqa: F401  (env is a fixture)
 
-PRICES = {"basic_local": ("price_v2_basic", 999), "ai_local": ("price_v2_ai", 1499), "hybrid": ("price_v2_hybrid", 2499)}
+PRICES = {"basic_local": ("price_v2_basic", 999), "ai_local": ("price_v2_ai", 1499), "hybrid": ("price_v2_hybrid", 1999)}
 SUB = "sub_v2_life"
 PERIOD_END = 1_893_456_000
 
@@ -110,7 +110,7 @@ def _checkout_to_active(env, plan_key="ai_local", quantity=4):
 def test_the_catalog_is_the_universal_per_camera_prices_and_no_fixed_tiers(v2):
     catalog = _ok(v2["client"].get("/api/v2/pricing/catalog"))
     plans = {p["plan_key"]: p for p in catalog["plans"]}
-    assert {key: plans[key]["monthly_per_camera_amount"] for key in plans} == {"basic_local": 9.99, "ai_local": 14.99, "hybrid": 24.99}
+    assert {key: plans[key]["monthly_per_camera_amount"] for key in plans} == {"basic_local": 9.99, "ai_local": 14.99, "hybrid": 19.99}
     assert "base_plans" not in catalog
     text = str(catalog)
     for retired in ("1_8", "9_16", "17_32", "33_64"):
@@ -175,7 +175,7 @@ def test_a_per_camera_plan_through_its_whole_stripe_lifecycle(v2):
     assert _state(env) == {"plan": "hybrid", "status": "active", "quantity": 2, "capacity": 2, "mode": "hybrid"}
 
     # 6. A full refund of the current period suspends service; a replayed paid invoice never restores it.
-    refund = {"id": "ch_in_renew_1", "object": "charge", "amount": 4998, "amount_refunded": 4998, "refunded": True,
+    refund = {"id": "ch_in_renew_1", "object": "charge", "amount": 3998, "amount_refunded": 3998, "refunded": True,
               "payment_intent": "pi_in_renew_1", "invoice": "in_renew_1"}
     _deliver(env, _event("evt_refund", "charge.refunded", refund))
     assert _state(env)["status"] == "suspended" and _state(env)["capacity"] == 0

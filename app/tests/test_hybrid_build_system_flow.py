@@ -244,7 +244,7 @@ def test_new_customer_build_system_to_setup_end_to_end(shop, db_path):
     assert "Your AnyAiCam plan is active" in client.get("/order-complete").text
 
 
-@pytest.mark.parametrize("plan_key,label,unit", [("basic_local", "Basic Local", 999), ("ai_local", "AI Local", 1499), ("hybrid", "Hybrid", 2499)])
+@pytest.mark.parametrize("plan_key,label,unit", [("basic_local", "Basic Local", 999), ("ai_local", "AI Local", 1499), ("hybrid", "Hybrid", 1999)])
 def test_each_plan_and_quantity_is_summarised_from_server_prices(shop, db_path, plan_key, label, unit):
     client, _, mail, _, _ = shop
     _direct_owner(client, mail, f"{plan_key}@example.test")
@@ -410,7 +410,7 @@ def test_the_browser_cannot_choose_a_price_or_a_price_id(shop, db_path):
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, "price@example.test")
     html = _order(client, "plan=hybrid&cameras=8&price_id=price_evil&unit_amount=1&monthly=1").text
-    assert _summary(html) == ("Hybrid", 8, "$199.92")
+    assert _summary(html) == ("Hybrid", 8, "$159.92")
     assert "price_srv_" not in html and "price_evil" not in html
     for extra in ({"price_id": "price_evil"}, {"unit_amount": 1}, {"success_url": "https://evil.example"}, {"flow": "https://evil.example"}):
         refused = client.post("/api/v2/customer/subscription/checkout", json={"plan_key": "hybrid", "camera_quantity": 8, **extra})
