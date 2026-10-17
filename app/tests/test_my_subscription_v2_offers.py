@@ -82,7 +82,7 @@ def test_basic_local_shows_its_own_inclusions_and_no_ai(db_path, monkeypatch, pr
     _plan(db_path, monkeypatch, "basic_local")
     included = _included(_page(db_path))
     for label in ("Local VMS", "Local recording", "Local playback", "Basic motion and events", "Camera management",
-                  "Local recording retention: 2 days standard"):
+                  "Local recording: up to 2 days (depends on the storage available on your AnyAiCam system)"):
         assert label in included
     for absent in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio on supported cameras"):
         assert absent not in included
@@ -96,7 +96,7 @@ def test_ai_local_shows_its_core_ai_features_as_included(db_path, monkeypatch, p
     included = _included(_page(db_path))
     for label in ("Person and vehicle detection", "Smart Motion", "AI event search and filters", "Intelligent notifications",
                   "Core AACO video and event retrieval", "Talk Down / two-way audio on supported cameras",
-                  "Local recording retention: 7 days standard"):
+                  "Local recording: up to 7 days (depends on the storage available on your AnyAiCam system)"):
         assert label in included
     assert not any(label.startswith("Cloud EVENT") for label in included)
 
@@ -105,9 +105,12 @@ def test_hybrid_shows_ai_features_plus_cloud_event_retention(db_path, monkeypatc
     _plan(db_path, monkeypatch, "hybrid")
     included = _included(_page(db_path))
     for label in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio on supported cameras",
-                  "Hybrid cloud services", "Cloud Video Backup: an extra copy of your event video clips, stored online",
-                  "Cloud event storage: 14 days (event clips, not continuous recording)", "Local recording retention: 7 days standard"):
+                  "Cloud Video Backup: an extra copy of your event video clips, kept online for 14 days",
+                  "Cloud event storage: 14 days (event clips, not continuous recording)",
+                  "Local recording: up to 7 days (depends on the storage available on your AnyAiCam system)"):
         assert label in included
+    for merged in ("Hybrid cloud services", "Cloud event protection"):  # one Cloud Video Backup line (2026-10-17)
+        assert merged not in included
 
 
 @pytest.mark.parametrize("plan_key,expected", [("basic_local", "$9.99 per camera/month · $39.96"), ("ai_local", "$14.99 per camera/month · $59.96"),

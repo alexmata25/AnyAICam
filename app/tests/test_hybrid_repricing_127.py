@@ -116,6 +116,6 @@ def test_the_plan_comparison_says_every_plan_watches_remotely_and_only_hybrid_ha
     def row(label):
         return table.split(label, 1)[1].split("</tr>", 1)[0]
     assert row("Remote viewing: watch your cameras from anywhere using your phone or computer").count("<td>✓</td>") == 3
-    backup = row("Cloud Video Backup: an extra copy of your event video clips, stored online")
+    backup = row("Cloud Video Backup: an extra copy of your event video clips, kept online for 14 days")
     assert backup.count("<td>✓</td>") == 1 and backup.count("Not included") == 2
     assert "Remote cloud services" not in table and "Remote viewing where supported" not in table
