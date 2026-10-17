@@ -39,6 +39,7 @@ import os
 from datetime import datetime, timedelta
 
 from notification_service import CHANNELS
+from database_backend import backend
 from partner_db import connection, row, rows
 
 logger = logging.getLogger("anyaicam.notification_retry")
@@ -208,11 +209,17 @@ def send_pending_media_emails(*, now: datetime | None = None) -> dict:
                                      email_alert_allowed, voice_call_supersedes_email)
     now = now or datetime.now()
     sent = held = skipped = 0
+    # Insertion order: SQLite's rowid; PostgreSQL has no rowid (the query failed on every pass there), so
+    # created_at with the row id as the tie-break.
+    if backend() == "postgresql":
+        newer, order = "(later.created_at>nd.created_at OR (later.created_at=nd.created_at AND later.id>nd.id))", "nd.created_at, nd.id"
+    else:
+        newer, order = "later.rowid>nd.rowid", "nd.rowid"
     with connection() as db:
         pending = [dict(r) for r in db.execute(
             "SELECT nd.* FROM notification_deliveries nd WHERE nd.channel='email' AND nd.status='pending_media' "
             "AND NOT EXISTS (SELECT 1 FROM notification_deliveries later WHERE later.notification_id=nd.notification_id "
-            "AND later.channel='email' AND later.rowid>nd.rowid) ORDER BY nd.rowid LIMIT 200").fetchall()]
+            f"AND later.channel='email' AND {newer}) ORDER BY {order} LIMIT 200").fetchall()]
     for delivery in pending:
         with connection() as db:
             context = notification_email.alert_context(db, delivery["notification_id"])

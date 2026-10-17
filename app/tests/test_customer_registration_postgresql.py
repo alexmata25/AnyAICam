@@ -16,7 +16,7 @@ import psycopg
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 from customer_registration import approve_registration, assign_registration, create_pending_registration, reject_registration
-from db_migrations import apply_migrations
+from db_migrations import MIGRATIONS, apply_migrations
 from partner_db import authenticate_detailed, initialize_database, password_hash
 
 
@@ -57,7 +57,10 @@ class PostgreSQLCustomerRegistrationTests(unittest.TestCase):
         with self.db() as db:
             db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('preserved','partner-a','Preserved','preserved@example.test','active','real','now')")
             db.execute("DROP TABLE customer_registration_requests")
-            db.execute("DELETE FROM schema_migrations WHERE version='20260907_customer_registration_requests'")
+            # Every migration that builds this table (the 2026-09-07 base and the later additive columns), so the
+            # re-created table is complete and the tests after this one see the real schema.
+            for version in [v for v,script in MIGRATIONS if "customer_registration_requests" in script]:
+                db.execute("DELETE FROM schema_migrations WHERE version=%s",(version,))
         # This now represents an already-populated Partner VMS database
         # immediately before this migration is applied.
         apply_migrations(); apply_migrations()

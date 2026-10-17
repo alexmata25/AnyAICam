@@ -1682,12 +1682,15 @@ def _last_email_delivery() -> dict | None:
     reported password_reset_email_ready=True for a week while every send
     was rejected with SMTP 535, because readiness only looked at config.
     Newest row by rowid (insertion order), so this stays cheap as the
-    delivery tables grow. None when nothing was ever sent or on error."""
+    delivery tables grow. None when nothing was ever sent or on error.
+    PostgreSQL has no rowid (this returned None there): created_at, id."""
     try:
+        from database_backend import backend as _email_backend
         from partner_db import connection as _email_connection
+        newest = "created_at DESC, id DESC" if _email_backend() == "postgresql" else "rowid DESC"
         with _email_connection() as db:
-            account = db.execute("SELECT status, created_at, metadata_json FROM email_messages ORDER BY rowid DESC LIMIT 1").fetchone()
-            alert = db.execute("SELECT status, created_at, error FROM notification_deliveries WHERE channel='email' ORDER BY rowid DESC LIMIT 1").fetchone()
+            account = db.execute(f"SELECT status, created_at, metadata_json FROM email_messages ORDER BY {newest} LIMIT 1").fetchone()
+            alert = db.execute(f"SELECT status, created_at, error FROM notification_deliveries WHERE channel='email' ORDER BY {newest} LIMIT 1").fetchone()
     except Exception:
         return None
     candidates = []
