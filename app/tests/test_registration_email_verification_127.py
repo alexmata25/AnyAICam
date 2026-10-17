@@ -379,3 +379,29 @@ def test_no_referrer_survives_the_security_middleware(db):
         other = http.get("/plain")
     assert token_page.headers["referrer-policy"] == "no-referrer" and token_page.headers["cache-control"] == "no-store"
     assert other.headers["referrer-policy"] == "same-origin"  # everything else unchanged
+
+
+def test_a_failed_confirmation_email_keeps_the_earlier_link_working(db, monkeypatch):
+    """Green review of 80a961a: an SMTP outage must not kill the owner's earlier link and then block re-sending."""
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    earlier = cr.issue_registration_verification(EMAIL, now=datetime.now() - timedelta(hours=2))
+    import email_service
+
+    class Down:
+        def send(self, *a, **k):
+            return {"status": "failed"}
+    monkeypatch.setattr(email_service, "get_email_service", lambda: Down())
+    monkeypatch.setenv("ANYAICAM_PUBLIC_URL", "https://app.example.test")
+    assert cr.send_registration_verification(EMAIL) is False
+    assert cr.verify_registration_email(earlier, PASSWORD, "Owner") is True
+
+
+def test_a_failed_first_confirmation_email_leaves_no_hold(db, monkeypatch):
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    import email_service
+    monkeypatch.setattr(email_service, "get_email_service", lambda: type("M", (), {"send": lambda *a, **k: 1 / 0})())
+    monkeypatch.setenv("ANYAICAM_PUBLIC_URL", "https://app.example.test")
+    assert cr.send_registration_verification(EMAIL) is False
+    item = _request(db)
+    assert item["verification_token_hash"] is None and item["verification_sent_at"] is None
+    assert cr.issue_registration_verification(EMAIL)  # a re-submission can issue a link at once
