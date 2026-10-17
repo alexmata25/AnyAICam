@@ -156,6 +156,7 @@ class MotionSourceSelector:
         self._failures: dict[int, int] = {}
         self._hls_until: dict[int, float] = {}
         self._last_kind: dict[int, str] = {}
+        self._generation: dict[int, int] = {}
 
     def choose(self, camera_number: int, resolve_substream: Callable[[int], Optional[str]]) -> tuple[str, Optional[str]]:
         """("substream", credentialed URL) or ("hls", None)."""
@@ -196,10 +197,16 @@ class MotionSourceSelector:
         return f"Camera {camera_number} motion detector source: {'camera substream' if kind == 'substream' else 'live HLS stream'}."
 
     def forget(self, camera_number: int) -> None:
-        """Drop the camera's failure count, HLS fallback window and last kind."""
+        """Drop the camera's failure count, HLS fallback window and last kind.
+        Bumps its generation, so a reader running on the HLS fallback knows
+        to re-choose its source (recovery, 2026-10-17)."""
         self._failures.pop(camera_number, None)
         self._hls_until.pop(camera_number, None)
         self._last_kind.pop(camera_number, None)
+        self._generation[camera_number] = self._generation.get(camera_number, 0) + 1
+
+    def generation(self, camera_number: int) -> int:
+        return self._generation.get(camera_number, 0)
 
     def failures(self, camera_number: int) -> int:
         return self._failures.get(camera_number, 0)

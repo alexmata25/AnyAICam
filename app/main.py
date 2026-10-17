@@ -16153,6 +16153,12 @@ LIVE_VIDEO_COPY_FALLBACK_SECONDS = 3600
 _live_copy_probe: dict[int, tuple[float, str | None]] = {}   # camera -> (checked at, codec or None)
 _live_copy_quick_failures: dict[int, int] = {}
 _live_copy_disabled_until: dict[int, float] = {}
+# Recovery (2026-10-17): the credential-free stream address each probe answer
+# belongs to. A camera that was unreachable caches "unknown codec"; when its
+# address is corrected (or 1.2.7 IP recovery re-addresses it) that answer and
+# its fallbacks belonged to the old address, so they are dropped.
+_live_copy_probe_url: dict[int, str] = {}
+LIVE_RECOVERY_UNHEALTHY_RUNS = 2  # live runs in a row that never wrote video = the camera was down
 _VIDEO_CODEC_NAME = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
@@ -16206,21 +16212,62 @@ async def probe_camera_video_codec(url: str, timeout: float = LIVE_VIDEO_COPY_PR
     return codec if _VIDEO_CODEC_NAME.match(codec) else None
 
 
+def _stream_address(url: str) -> str:
+    """The camera stream URL without credentials (safe to keep and compare)."""
+    import camera_capabilities
+    try:
+        return camera_capabilities.split_credentials(url)[0]
+    except Exception:
+        return ""
+
+
+def forget_camera_stream_state(camera_number: int, *, copy_fallback: bool = True) -> None:
+    """Drop what was learned about a camera while it was unreachable: the
+    cached copy probe (and, by default, the copy-failure fallback) and the
+    motion reader's substream-failure fallback window. The next live start
+    re-probes; a motion reader on the HLS fallback re-chooses its source."""
+    _live_copy_probe.pop(camera_number, None)
+    if copy_fallback:
+        _live_copy_quick_failures.pop(camera_number, None)
+        _live_copy_disabled_until.pop(camera_number, None)
+    _motion_source_selector.forget(camera_number)
+
+
+def note_live_stream_recovered(camera_number: int) -> None:
+    """The live worker writes video again after LIVE_RECOVERY_UNHEALTHY_RUNS
+    runs that never did (camera back from an outage, same address). An
+    "unknown codec" answer cached while it was down is dropped, and motion
+    gets the substream back; a verified codec and a genuine copy-failure
+    fallback are kept."""
+    cached = _live_copy_probe.get(camera_number)
+    if cached and not cached[1]:
+        _live_copy_probe.pop(camera_number, None)
+    _motion_source_selector.forget(camera_number)
+    print(f"Camera {camera_number} is sending video again; re-checking its live video codec and motion source.")
+
+
 async def refresh_live_copy_probe(camera_number: int) -> None:
     """Probes the camera's codec before its live worker starts, when copy is
-    on and the last answer is old enough. Never raises."""
+    on and the last answer is old enough -- or belongs to a different stream
+    address. Never raises."""
     if not LIVE_VIDEO_COPY:
         return
+    try:
+        url = camera_url(camera_number)
+    except Exception:
+        return
+    address = _stream_address(url)
+    previous = _live_copy_probe_url.get(camera_number)
+    if previous is not None and address != previous:
+        forget_camera_stream_state(camera_number)
+        print(f"Camera {camera_number} stream address changed; re-checking its live video codec and motion source.")
+    _live_copy_probe_url[camera_number] = address
     now = time.monotonic()
     cached = _live_copy_probe.get(camera_number)
     if cached:
         age_limit = LIVE_VIDEO_COPY_PROBE_TTL_SECONDS if cached[1] else LIVE_VIDEO_COPY_PROBE_RETRY_SECONDS
         if now - cached[0] < age_limit:
             return
-    try:
-        url = camera_url(camera_number)
-    except Exception:
-        return
     try:
         codec = await probe_camera_video_codec(url)
     except Exception:
@@ -17271,6 +17318,7 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
 
 
+    unhealthy_runs = 0  # live: runs in a row that never wrote video (recovery detection)
     while True:
         if mode == "live" and live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
             await _wait_for_live_hls_demand(camera_number)
@@ -17328,6 +17376,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                 f"Camera {camera_number} {mode} process could not start: "
                 f"{error_text}; retrying in 10 seconds."
             )
+            if mode == "live":
+                unhealthy_runs += 1
             await asyncio.sleep(10)
             continue
 
@@ -17366,6 +17416,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
         completed = False
         watchdog_restart = False
         idle_stop = False
+        run_healthy = False  # this worker has written its own playlist
+        copy_upgrade = False
         try:
             if mode == "live":
                 playlist_path = HLS_FOLDER / f"camera{camera_number}.m3u8"
@@ -17373,6 +17425,31 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                 watchdog_started_wall = time.time()
                 while process.poll() is None:
                     await asyncio.sleep(5)
+                    # Recovery (2026-10-17): the first playlist this worker
+                    # writes after an outage clears what was cached while the
+                    # camera was down; an encode chosen only because the codec
+                    # was unknown then switches to stream copy once verified.
+                    if not run_healthy:
+                        try:
+                            run_healthy = playlist_path.stat().st_mtime >= watchdog_started_wall
+                        except OSError:
+                            pass
+                        if run_healthy and unhealthy_runs >= LIVE_RECOVERY_UNHEALTHY_RUNS:
+                            note_live_stream_recovered(camera_number)
+                    cached_probe = _live_copy_probe.get(camera_number)
+                    if (run_healthy and LIVE_VIDEO_COPY and not live_copy_used
+                            and (cached_probe is None or not cached_probe[1])):
+                        await refresh_live_copy_probe(camera_number)
+                        if live_copy_allowed(camera_number):
+                            copy_upgrade = True
+                            print(f"Camera {camera_number} live video codec verified; "
+                                  f"restarting the live worker with stream copy.")
+                            process.terminate()
+                            try:
+                                await asyncio.to_thread(process.wait, timeout=5)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                            break
                     # On-demand live HLS only: keep camera{N}.alive fresh
                     # (status) while this encoder starts up; and once nothing
                     # has needed this camera's live video for IDLE_SECONDS,
@@ -17469,7 +17546,7 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
             if idle_stop:
                 live_hls_demand.mark_playlist_stale(playlist_path)
                 camera_process_state[camera_number][mode] = "idle"
-            elif mode == "live":
+            elif mode == "live" and not copy_upgrade:
                 camera_process_state[camera_number]["last_exit_code"] = return_code
                 camera_process_state[camera_number]["last_error"] = (
                     "HLS playlist stopped advancing; worker restarted automatically."
@@ -17480,7 +17557,9 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                     datetime.now().isoformat()
                 )
 
-            if not idle_stop:
+            if copy_upgrade:
+                camera_process_state[camera_number][mode] = "connecting"
+            elif not idle_stop:
                 camera_reconnect_counts[camera_number] += 1
                 camera_process_state[camera_number][mode] = "retrying"
                 print(
@@ -17499,8 +17578,10 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         ffmpeg_processes.remove(process)
                     except ValueError:
                         pass
-        if idle_stop:
-            continue  # straight back to waiting for demand
+        if mode == "live" and not idle_stop and not copy_upgrade:
+            unhealthy_runs = 0 if run_healthy else unhealthy_runs + 1
+        if idle_stop or copy_upgrade:
+            continue  # straight back to waiting for demand / into stream copy
         await asyncio.sleep(10)
 
 
@@ -36145,6 +36226,7 @@ async def _motion_detector_loop(camera_number: int, hold_owner: str = "motion") 
         process = None
         frames_read = 0
         stalled = False
+        source_generation = _motion_source_selector.generation(camera_number)
         try:
             if source_kind == "substream":
                 # The URL carries the camera's credentials: stderr is
@@ -36180,6 +36262,12 @@ async def _motion_detector_loop(camera_number: int, hold_owner: str = "motion") 
                         # The finally below terminates this ffmpeg.
                         print(f"Camera {camera_number} is no longer configured; motion detector stopped.")
                         return
+                    # Recovery (2026-10-17): the camera came back or its address
+                    # changed -- leave the HLS fallback and re-choose the source.
+                    if (source_kind == "hls" and _motion_source_selector.mode == "auto"
+                            and _motion_source_selector.generation(camera_number) != source_generation):
+                        previous_frame = None
+                        raise RuntimeError("re-checking the motion source after the camera recovered")
 
 
 
