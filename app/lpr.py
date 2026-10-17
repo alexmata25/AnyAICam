@@ -580,17 +580,24 @@ def latest_full_resolution_frame(camera_number, buffer_dir, *, now: float | None
         cached = _full_frame_cache.get(camera_number)
         if cached and now - cached[0] <= LPR_FULL_RES_CACHE_SECONDS:
             return cached[1]
+    # Fresh = written within the bound on either side of now: a future mtime
+    # (clock stepped back after it was written) is as stale as an old one,
+    # so after a clock step the camera's newly written segment is chosen.
+    segments = []
     try:
-        segments = sorted((p for p in os.scandir(buffer_dir) if p.name.endswith(".mkv")), key=lambda p: p.stat().st_mtime)
+        for entry in os.scandir(buffer_dir):
+            if entry.name.endswith(".mkv"):
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if abs(wall_now - mtime) <= LPR_FULL_RES_MAX_AGE_SECONDS:
+                    segments.append((mtime, entry))
     except OSError:
         return None
+    segments.sort(key=lambda item: item[0])
     frame = None
-    for entry in reversed(segments[-2:]):  # the in-progress segment, else the previous one
-        try:
-            if wall_now - entry.stat().st_mtime > LPR_FULL_RES_MAX_AGE_SECONDS:
-                continue  # stale: the camera stopped writing it
-        except OSError:
-            continue
+    for _, entry in reversed(segments[-2:]):  # the in-progress segment, else the previous one
         try:
             raw = subprocess.run(
                 ["ffmpeg", "-v", "error", "-sseof", "-1.5", "-i", entry.path, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],

@@ -316,8 +316,14 @@ def file_age(path: Path, now: Optional[float] = None) -> Optional[float]:
 
 
 def playlist_fresh(manifest: Path, max_age: float = FRESH_SECONDS) -> bool:
-    age = file_age(manifest)
-    return age is not None and age <= max_age
+    """Written within max_age on either side of now: a future mtime (the
+    clock was stepped back after a now-disconnected camera last wrote it)
+    is stale, not fresh. file_age() itself is unchanged for its callers."""
+    try:
+        age = time.time() - Path(manifest).stat().st_mtime
+    except OSError:
+        return False
+    return abs(age) <= max_age
 
 
 def mark_playlist_stale(manifest: Path) -> None:
