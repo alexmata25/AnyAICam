@@ -126,6 +126,7 @@ confirmed = request(
     urllib.parse.urlencode(
         {
             "token": confirm_token,
+            "display_name": "CPU Image Validation",
             "password": "Synthetic-Password-2026",
             "confirm_password": "Synthetic-Password-2026",
             "csrf_token": token,

@@ -18,7 +18,8 @@ def _now() -> str:
 # Email ownership (owner decision 2026-10-17): approving a request attaches any purchase made earlier under
 # that email (resolve_pending_links_for_customer), so the requester must first prove they own the address.
 VERIFY_TTL_HOURS = 48
-VERIFY_RESEND_SECONDS = 120
+VERIFY_RESEND_SECONDS = 120  # reviewer resend throttle
+VERIFY_REISSUE_HOLD_SECONDS = 3600  # a public re-submission keeps a link this young valid instead of replacing it
 MIN_PASSWORD = 10  # the /customer-register form's rule
 VERIFIED_MESSAGE = ("Thank you. Your email address is confirmed and your password is set. An administrator will "
                     "review your AnyAiCam account request; you'll be able to sign in once it is approved.")
@@ -32,8 +33,9 @@ def _token_hash(raw: str) -> str:
 
 def issue_registration_verification(email: str, *, now: datetime | None = None, force: bool = False) -> str | None:
     """A new single-use link token for the PENDING, UNVERIFIED request of this email, or None (no such request,
-    already verified, or a link was sent less than VERIFY_RESEND_SECONDS ago and not forced). The previous link
-    stops working."""
+    already verified, or -- unless forced by a reviewer's resend -- a link was issued less than
+    VERIFY_REISSUE_HOLD_SECONDS ago: anyone can re-submit the public form, and that must not keep invalidating the
+    owner's link). The previous link stops working."""
     normalized = (email or "").strip().lower()
     now = now or datetime.now()
     with connection() as db:
@@ -44,7 +46,7 @@ def issue_registration_verification(email: str, *, now: datetime | None = None, 
             return None
         if not force and item["verification_sent_at"]:
             try:
-                if (now - datetime.fromisoformat(item["verification_sent_at"])).total_seconds() < VERIFY_RESEND_SECONDS:
+                if (now - datetime.fromisoformat(item["verification_sent_at"])).total_seconds() < VERIFY_REISSUE_HOLD_SECONDS:
                     return None
             except ValueError:
                 pass
@@ -89,12 +91,16 @@ def send_registration_verification(email: str, base_url: str | None = None, *, f
     return not (isinstance(result, dict) and result.get("status") in ("failed", "error"))
 
 
-def verify_registration_email(raw: str, password: str, *, now: datetime | None = None) -> bool:
+def verify_registration_email(raw: str, password: str, display_name: str, *, now: datetime | None = None) -> bool:
     """Marks the request this link belongs to as verified FOR ITS OWN EMAIL and sets its password to the one chosen
     by whoever holds the link (Green review F1: the first submitter's password must never survive -- the password
     typed on /customer-register by someone who does not own the inbox is discarded here). Single use; expired,
-    unknown, used or non-pending links and a too-short password all return False with no detail."""
-    if not raw or len(raw) > 200 or len(password or "") < MIN_PASSWORD:
+    unknown, used or non-pending links and a too-short password all return False with no detail.
+    The name is set here too (owner follow-up 2026-10-17): approval creates the account with the name the inbox
+    owner gave, never one an unverified applicant typed. Exactly one of two simultaneous submissions of a link
+    succeeds (the UPDATE re-checks the token; only rowcount 1 is a success)."""
+    name = (display_name or "").strip()
+    if not raw or len(raw) > 200 or len(password or "") < MIN_PASSWORD or not 2 <= len(name) <= 120:
         return False
     now = now or datetime.now()
     with connection() as db:
@@ -104,10 +110,13 @@ def verify_registration_email(raw: str, password: str, *, now: datetime | None =
             (_token_hash(raw),)).fetchone()
         if not item or not item["verification_expires_at"] or item["verification_expires_at"] < now.isoformat():
             return False
-        db.execute(
+        updated = db.execute(
             "UPDATE customer_registration_requests SET email_verified_at=?,email_verified_for=?,password_hash=?,"
-            "verification_token_hash=NULL,verification_expires_at=NULL WHERE id=? AND email_verified_at IS NULL",
-            (now.isoformat(), item["email"], password_hash(password), item["id"]))
+            "display_name=?,verification_token_hash=NULL,verification_expires_at=NULL "
+            "WHERE id=? AND verification_token_hash=? AND status='pending' AND email_verified_at IS NULL",
+            (now.isoformat(), item["email"], password_hash(password), name, item["id"], _token_hash(raw))).rowcount
+        if updated != 1:
+            return False  # another submission of this link (or a reissue) won the race
         db.execute(
             "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
             (item["email"], "anonymous", "customer_registration.email_verified", "customer_registration", item["id"],
@@ -118,10 +127,11 @@ def verify_registration_email(raw: str, password: str, *, now: datetime | None =
 def _verify_form(token: str, error: str = "") -> str:
     from html import escape
     return ((f'<p role="alert">{escape(error)}</p>' if error else "")
-            + '<p>Choose the password for your AnyAiCam account to confirm this email address.</p>'
+            + '<p>Enter your name and choose the password for your AnyAiCam account to confirm this email address.</p>'
             '<form method="post" action="/customer-register/verify-email" id="verify-form">'
             f'<input type="hidden" name="token" value="{escape(token or "", quote=True)}">'
             '<input type="hidden" name="csrf_token" value="">'
+            '<label>Full name<br><input name="display_name" minlength="2" maxlength="120" autocomplete="name" required></label><br>'
             '<label>Password<br><input name="password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
             '<label>Confirm password<br><input name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
             '<button type="submit">Confirm email</button></form>'
@@ -403,7 +413,7 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
             recent = False
         if recent:  # Green review F4: no unthrottled mail to an address, even from a reviewer
             raise HTTPException(status_code=429, detail="A confirmation link was sent recently. Try again in a few minutes.")
-        if not send_registration_verification(item["email"]):
+        if not send_registration_verification(item["email"], force=True):
             raise HTTPException(status_code=503, detail="The confirmation email could not be sent. Please try again.")
         with connection() as db:
             db.execute(
@@ -419,12 +429,15 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
         return _verify_page("Confirm your email", _verify_form(token))
 
     @app.post("/customer-register/verify-email", response_class=HTMLResponse)
-    def verify_registration_email_submit(token: str = Form(""), password: str = Form(""), confirm_password: str = Form("")):
+    def verify_registration_email_submit(token: str = Form(""), password: str = Form(""), confirm_password: str = Form(""),
+                                         display_name: str = Form("")):
+        if not 2 <= len(display_name.strip()) <= 120:
+            return _verify_page("Confirm your email", _verify_form(token, "Enter your full name."), status_code=422)
         if len(password) < MIN_PASSWORD or password != confirm_password:
             error = ("Password must contain at least 10 characters." if len(password) < MIN_PASSWORD
                      else "The two passwords do not match.")
             return _verify_page("Confirm your email", _verify_form(token, error), status_code=422)
-        if verify_registration_email(token, password):
+        if verify_registration_email(token, password, display_name):
             return _verify_page("Email confirmed", f"<p>{VERIFIED_MESSAGE}</p>"
                                 '<p><a href="/customer-login.html">Go to sign in</a></p>')
         return _verify_page("Link not valid", f"<p>{VERIFY_INVALID_MESSAGE}</p>", status_code=400)
@@ -437,5 +450,5 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
     def requests_page(request: Request):
         actor(request)
         content = '''<header class="topbar"><div><p class="eyebrow">Customer access</p><h1>Registration requests</h1></div></header><section class="panel"><p class="health-detail">Unassigned public requests require a master administrator to select an existing partner. Partner administrators see only requests assigned to their tenant.</p><div id="registration-requests">Loading…</div></section>'''
-        scripts = '''<script>const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));async function loadRegistrations(){const r=await fetch('/api/customer-registration-requests'),p=await r.json(),box=document.getElementById('registration-requests');box.innerHTML=(p.requests||[]).map(x=>`<article class="feature-card"><strong>${esc(x.display_name)}</strong><p>${esc(x.email)} · ${esc(x.status)} · ${x.email_verified_at?'email confirmed':'email NOT confirmed'}</p><label>Existing partner ID<input id="partner-${x.id}" value="${esc(x.partner_id)}"></label><button onclick="decide('${x.id}','assign')">Assign</button> <button onclick="decide('${x.id}','approve')">Approve</button> <button onclick="decide('${x.id}','resend-verification')">Resend confirmation</button> <button onclick="decide('${x.id}','reject')">Reject</button></article>`).join('')||'<div class="empty">No registration requests.</div>'}async function decide(id,action){const partner=document.getElementById('partner-'+id)?.value||'',reason=action==='reject'?prompt('Rejection reason')||'Rejected':'';const r=await fetch(`/api/customer-registration-requests/${id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({partner_id:partner,reason})}),p=await r.json();showToast(p.message||p.detail);if(r.ok)loadRegistrations()}loadRegistrations();</script>'''
+        scripts = '''<script>const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));async function loadRegistrations(){const r=await fetch('/api/customer-registration-requests'),p=await r.json(),box=document.getElementById('registration-requests');box.innerHTML=(p.requests||[]).map(x=>`<article class="feature-card"><strong>${esc(x.display_name)}</strong> <small>${x.email_verified_at?'(name set by the confirmed email owner)':'(name NOT verified -- typed by the applicant)'}</small><p>${esc(x.email)} · ${esc(x.status)} · ${x.email_verified_at?'email confirmed':'email NOT confirmed'}</p><label>Existing partner ID<input id="partner-${x.id}" value="${esc(x.partner_id)}"></label><button onclick="decide('${x.id}','assign')">Assign</button> <button onclick="decide('${x.id}','approve')">Approve</button> <button onclick="decide('${x.id}','resend-verification')">Resend confirmation</button> <button onclick="decide('${x.id}','reject')">Reject</button></article>`).join('')||'<div class="empty">No registration requests.</div>'}async function decide(id,action){const partner=document.getElementById('partner-'+id)?.value||'',reason=action==='reject'?prompt('Rejection reason')||'Rejected':'';const r=await fetch(`/api/customer-registration-requests/${id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({partner_id:partner,reason})}),p=await r.json();showToast(p.message||p.detail);if(r.ok)loadRegistrations()}loadRegistrations();</script>'''
         return page_shell("Customer registrations", "business-users", content, scripts=scripts)

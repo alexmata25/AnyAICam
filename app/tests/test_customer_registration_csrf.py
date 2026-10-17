@@ -42,7 +42,7 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
         create_pending_registration("New Customer",email,"correct-horse-battery-staple")
         if confirm:  # 2026-10-17: approval requires a confirmed email; the requester clicks the link
             import customer_registration as cr
-            assert cr.verify_registration_email(cr.issue_registration_verification(email,force=True),"correct-horse-battery-staple")
+            assert cr.verify_registration_email(cr.issue_registration_verification(email,force=True),"correct-horse-battery-staple", "Confirmed Owner")
         return self.rows("SELECT * FROM customer_registration_requests WHERE email=?",(email,))[0]
     def test_get_sets_csrf_and_form_submits_token(self):
         r=self.client.get("/customer-register"); self.assertEqual(r.status_code,200); self.assertIn("anyaicam_csrf=",r.headers.get("set-cookie","")); self.assertIn('name="csrf_token"',r.text)
