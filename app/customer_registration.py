@@ -154,7 +154,10 @@ def _verify_form(token: str, error: str = "") -> str:
             '<label>Password<br><input name="password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
             '<label>Confirm password<br><input name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
             '<button type="submit">Confirm email</button></form>'
-            "<script>document.getElementById('verify-form').addEventListener('submit',function(){"
+            # Drop the token from the address bar at once (history and any later Referer); the hidden field above
+            # still carries it for the POST (Green journey REG6, 2026-10-17).
+            "<script>if(location.search){history.replaceState(null,'',location.pathname);}"
+            "document.getElementById('verify-form').addEventListener('submit',function(){"
             "var m=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(m)this.csrf_token.value=decodeURIComponent(m[1]);});</script>")
 
 
@@ -165,8 +168,11 @@ def _verify_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
         '<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;color:#0b1530}'
         'input{width:100%;padding:.5rem;margin:.25rem 0 .75rem;box-sizing:border-box}</style>'
         f'</head><body><h1>{title}</h1>{body}</body></html>', status_code=status_code)
-    # Green review F5: the token is in the URL.
-    response.headers["Referrer-Policy"] = "no-referrer"
+    # same-origin, NOT no-referrer (Green journey REG6, 2026-10-17): under no-referrer a browser sends the form POST
+    # with "Origin: null", which ProductionSecurityMiddleware rejects (403 "Origin is not allowed.") -- no customer
+    # could confirm. same-origin still sends nothing to other sites, and the page removes the token from the URL
+    # on load (history.replaceState), so same-origin navigations carry no token either.
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Cache-Control"] = "no-store"
     return response
 

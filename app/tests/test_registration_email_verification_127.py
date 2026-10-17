@@ -184,7 +184,8 @@ def test_opening_the_link_never_confirms_and_reveals_nothing(db, client):
     assert valid.text.replace(raw, "") == invalid.text.replace("not-a-real-token", "")  # no validity oracle
     assert _request(db)["email_verified_at"] is None  # a mail scanner's prefetch changes nothing
     for response in (valid, invalid):
-        assert response.headers["referrer-policy"] == "no-referrer" and response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "same-origin" and response.headers["cache-control"] == "no-store"
+        assert "history.replaceState(null,'',location.pathname)" in response.text
         assert 'method="post"' in response.text and EMAIL not in response.text
 
 
@@ -197,7 +198,7 @@ def test_posting_the_form_confirms_and_sets_the_password(db, client):
     done = client.post("/customer-register/verify-email",
                        data={"display_name": "Confirmed Owner", "token": raw, "password": "chosen-password-22", "confirm_password": "chosen-password-22"})
     assert done.status_code == 200 and "Email confirmed" in done.text
-    assert done.headers["referrer-policy"] == "no-referrer"
+    assert done.headers["referrer-policy"] == "same-origin"
     assert _request(db)["email_verified_for"] == EMAIL
     cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
     assert authenticate_detailed(EMAIL, "submitted-password-1")[0] is None
@@ -377,7 +378,7 @@ def test_no_referrer_survives_the_security_middleware(db):
     with TestClient(app) as http:
         token_page = http.get("/customer-register/verify-email", params={"token": "abc"})
         other = http.get("/plain")
-    assert token_page.headers["referrer-policy"] == "no-referrer" and token_page.headers["cache-control"] == "no-store"
+    assert token_page.headers["referrer-policy"] == "same-origin" and token_page.headers["cache-control"] == "no-store"
     assert other.headers["referrer-policy"] == "same-origin"  # everything else unchanged
 
 
@@ -460,3 +461,21 @@ def test_a_first_link_is_also_compare_and_set(db, monkeypatch):
     assert _request(db)["verification_token_hash"] is None
     first = cr.issue_registration_verification(EMAIL)
     assert first and _request(db)["verification_token_hash"]
+
+
+def test_the_confirmation_post_is_not_an_origin_null_request(db):
+    """Green journey REG6 (2026-10-17): with Referrer-Policy no-referrer a real browser POSTs the form with
+    Origin: null, and the security middleware refuses it -- nobody could confirm. The token pages must use a policy
+    that lets the browser send the real Origin, and the middleware must keep rejecting Origin: null."""
+    import cloud_security
+    from fastapi.responses import PlainTextResponse
+    app = FastAPI()
+    cr.register_customer_registration_routes(app, lambda *a, **k: "", lambda request: {"email": "m@example.test"},
+                                             lambda user: True)
+    app.post("/echo")(lambda: PlainTextResponse("ok"))
+    app.add_middleware(cloud_security.ProductionSecurityMiddleware)
+    with TestClient(app) as http:
+        page = http.get("/customer-register/verify-email", params={"token": "abc"})
+        null_origin = http.post("/echo", headers={"Origin": "null"})
+    assert page.headers["referrer-policy"] not in ("no-referrer", "")      # a browser would send Origin: null
+    assert null_origin.status_code == 403 and "Origin is not allowed" in null_origin.text
