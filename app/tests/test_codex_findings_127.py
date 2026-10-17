@@ -13,7 +13,7 @@ from fastapi import HTTPException
 import analytics_entitlements
 import customer_entitlements
 import hardware_orders
-from customer_registration import create_pending_registration
+from customer_registration import create_pending_registration, issue_registration_verification, verify_registration_email
 from database_backend import override_target
 from partner_db import initialize_database
 
@@ -81,6 +81,7 @@ def _reject(conn, email, *, customer_id=None, user_id=None):
 
 def test_a_rejected_request_can_apply_again_and_the_old_decision_stays_audited(db):
     assert create_pending_registration("First Try", "again@example.test", "correct-horse-battery-staple") == ("pending", True)
+    assert verify_registration_email(issue_registration_verification("again@example.test"))
     first = _request(db, "again@example.test")
     _reject(db, "again@example.test")
 
@@ -90,6 +91,10 @@ def test_a_rejected_request_can_apply_again_and_the_old_decision_stays_audited(d
     assert reopened["status"] == "pending" and reopened["display_name"] == "Second Try"
     assert reopened["decided_at"] is None and reopened["decided_by"] is None and reopened["rejection_reason"] is None
     assert reopened["password_hash"] != first["password_hash"]
+    # 2026-10-17: the earlier confirmation is void; the reopened request must confirm its email again.
+    assert first["email_verified_at"] is not None
+    assert reopened["email_verified_at"] is None and reopened["email_verified_for"] is None
+    assert reopened["verification_token_hash"] is None and reopened["verification_sent_at"] is None
     audit = db.execute("SELECT details_json FROM audit_logs WHERE action='customer_registration.reopened' AND entity_id=?",
                        (first["id"],)).fetchone()
     details = json.loads(audit["details_json"])

@@ -44628,14 +44628,24 @@ def customer_register_submit(
 
 
 
-    from customer_registration import create_pending_registration
+    from customer_registration import create_pending_registration, send_registration_verification
     try:
         status, created = create_pending_registration(normalized_name, normalized_email, password)
     except HTTPException as error:
         return HTMLResponse(customer_register_page_html(str(error.detail)), status_code=error.status_code)
+    # Owner decision 2026-10-17: a request is only reviewed after its email is confirmed. A new or reopened
+    # request gets a link; a still-unconfirmed pending one gets a fresh link (rate-limited). Best effort: the
+    # page text below is the same whether or not an email went out.
+    if status == "pending":
+        try:
+            from direct_onboarding import _base
+            send_registration_verification(normalized_email, _base(request))
+        except Exception:
+            application_logger.exception("registration confirmation email failed")
     if not created:
         message = (
-            "Your customer account request is already pending approval."
+            "Your customer account request is pending. Confirm your email address with the link we sent; "
+            "it is reviewed only after that."
             if status == "pending"
             else "That email is already registered. Use the sign-in page."
         )
@@ -44648,8 +44658,9 @@ def customer_register_submit(
     return HTMLResponse(
         customer_register_page_html(
             message=(
-                "Your customer account request was submitted. "
-                "After the master administrator approves it, sign in to open your VMS portal."
+                "Your customer account request was submitted. Check your email and confirm your address with "
+                "the link we sent; after that, an administrator reviews the request and you can sign in once "
+                "it is approved."
             )
         ),
         status_code=200,
