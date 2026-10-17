@@ -238,7 +238,8 @@ def test_without_a_plan_the_three_plans_are_compared_from_the_catalog(db_path, m
     html = _page(db_path)
     table = re.search(r'id="v2-plan-compare".*?</table>', html, re.S).group(0)
     assert "$9.99 per camera/month" in table and "$14.99 per camera/month" in table and "$19.99 per camera/month" in table
-    assert "Cloud event storage" in table and "14 days" in table
+    # No day count is promised for cloud clips (owner 2026-10-17: the 14-day expiry is not enforced yet).
+    assert "Cloud event storage" in table and "14 days" not in table
     assert 'id="v2-checkout-button"' in html
 
 
