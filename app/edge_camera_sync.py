@@ -606,6 +606,19 @@ def sync_provisioned_cameras() -> dict:
     return result
 
 
+def refresh_analytics_camera_map() -> None:
+    """After a successful sync, refresh the in-memory camera map the analytics gates read
+    (recording_uploader._camera_identity) right away (2026-10-17, Yellow on the Ryzen: an analytic switched
+    off or on in the UI otherwise took up to CONFIG_REFRESH_SECONDS=300 s, plus the 120 s AI-reader idle stop,
+    to take effect). Cheap: the sync just published the fresh configuration to appliance_config_cache, which
+    _refresh_camera_map reads (no extra request); Local mode reads the local database. Never raises."""
+    try:
+        import recording_uploader
+        recording_uploader._refresh_camera_map()
+    except Exception as error:
+        logger.warning("edge_camera_sync.analytics_map_refresh_failed error_type=%s", type(error).__name__)
+
+
 async def camera_configuration_sync_worker() -> None:
     if RUNTIME_ROLE not in ("edge", "combined"):
         while True:
@@ -616,6 +629,8 @@ async def camera_configuration_sync_worker() -> None:
             result = await asyncio.to_thread(sync_provisioned_cameras)
             if result.get("status") not in ("ok", "not_activated"):
                 logger.debug("edge_camera_sync.cycle_result result=%s", result)
+            if result.get("status") == "ok":
+                await asyncio.to_thread(refresh_analytics_camera_map)
         except asyncio.CancelledError:
             raise
         except Exception as error:

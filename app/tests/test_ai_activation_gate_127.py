@@ -157,3 +157,56 @@ def test_detector_runs_when_an_analytic_is_effectively_active(globals_off):
     requested, state = _run_detector_once(globals_off, {**ALL_OFF, "lpr_enabled": True, "ppe_enabled": True})
     assert requested == [7]
     assert state.get("pause_reason") is None
+
+
+# ------------------------------------------------------------------ latency: map refreshed right after each edge sync
+def _run_sync_worker_once(monkeypatch, status):
+    import asyncio
+    import edge_camera_sync
+    import recording_uploader
+
+    class Stop(BaseException):
+        pass
+
+    refreshed = []
+
+    async def no_sleep(_seconds):
+        raise Stop()
+
+    async def direct(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(edge_camera_sync, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(edge_camera_sync, "sync_provisioned_cameras", lambda: {"status": status})
+    monkeypatch.setattr(edge_camera_sync.product_mode, "restart_if_running_flags_stale", lambda: None)
+    monkeypatch.setattr(recording_uploader, "_refresh_camera_map", lambda **kw: refreshed.append(kw))
+    monkeypatch.setattr(edge_camera_sync.asyncio, "to_thread", direct)
+    monkeypatch.setattr(edge_camera_sync.asyncio, "sleep", no_sleep)
+    worker = edge_camera_sync.camera_configuration_sync_worker()
+    try:
+        worker.send(None)
+    except Stop:
+        pass
+    finally:
+        worker.close()
+    return refreshed
+
+
+def test_a_successful_edge_sync_refreshes_the_analytics_map_immediately(monkeypatch):
+    """Yellow, Ryzen 2026-10-17: a UI analytics change took up to ~7 min (300 s map refresh + 120 s reader idle)."""
+    assert _run_sync_worker_once(monkeypatch, "ok") == [{}]
+
+
+@pytest.mark.parametrize("status", ["not_activated", "error", "cloud_unavailable"])
+def test_no_refresh_when_the_sync_did_not_succeed(monkeypatch, status):
+    assert _run_sync_worker_once(monkeypatch, status) == []
+
+
+def test_a_failing_refresh_never_breaks_the_sync_worker(monkeypatch):
+    import edge_camera_sync
+    import recording_uploader
+
+    def boom(**_kw):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(recording_uploader, "_refresh_camera_map", boom)
+    edge_camera_sync.refresh_analytics_camera_map()  # logs, never raises
