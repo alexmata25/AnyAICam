@@ -92,3 +92,30 @@ def test_run_lpr_scan_main_stream_path_is_unchanged(env):
     car = {"class_name": "car", "x": 1, "y": 1, "width": 50, "height": 50, "confidence": 0.9}
     main.run_lpr_scan(2, {"frame": SMALL, "frame_source": "substream", "detections": [car]})
     assert "full_frame_for_fallback" not in seen and callable(seen["full_frame"])
+
+
+def test_buffer_frame_is_piped_as_uncompressed_bmp_and_decodes_pixel_identical(monkeypatch, tmp_path):
+    """No PNG compress/decompress round trip for a frame that is decoded straight back (2026-10-17)."""
+    import os
+    import subprocess
+    import time
+    import cv2
+
+    segment = tmp_path / "buf2_2026-10-17_00-00-00.mkv"
+    segment.write_bytes(b"x")
+    now = time.time()
+    os.utime(segment, (now, now))
+    original = (np.arange(48 * 64 * 3, dtype=np.uint8) % 251).reshape(48, 64, 3)
+    ok, encoded = cv2.imencode(".bmp", original)
+    assert ok
+    commands = []
+
+    class Done:
+        stdout = encoded.tobytes()
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: commands.append(cmd) or Done())
+    monkeypatch.setattr(lpr, "LPR_FULL_RES_FRAMES", True)
+    monkeypatch.setattr(lpr, "_full_frame_cache", {})
+    frame = lpr.latest_full_resolution_frame(2, str(tmp_path), now=1.0, wall_now=now)
+    assert commands and commands[0][commands[0].index("-vcodec") + 1] == "bmp"
+    assert frame is not None and np.array_equal(frame, original)

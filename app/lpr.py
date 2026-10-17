@@ -600,7 +600,10 @@ def latest_full_resolution_frame(camera_number, buffer_dir, *, now: float | None
     for _, entry in reversed(segments[-2:]):  # the in-progress segment, else the previous one
         try:
             raw = subprocess.run(
-                ["ffmpeg", "-v", "error", "-sseof", "-1.5", "-i", entry.path, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+                # BMP, not PNG (2026-10-17): the frame is decoded straight back by
+                # cv2.imdecode, so PNG's zlib compression of a 1080p-1440p frame was
+                # pure CPU cost; BMP is uncompressed and pixel-identical.
+                ["ffmpeg", "-v", "error", "-sseof", "-1.5", "-i", entry.path, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "bmp", "pipe:1"],
                 capture_output=True, timeout=8,
             ).stdout
             if raw:
