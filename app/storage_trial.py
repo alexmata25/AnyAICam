@@ -486,6 +486,39 @@ def _invoice_paid(subscription: dict) -> bool:
     return str(invoice.get("status") or "") == "paid"
 
 
+def _un_cancelled_in_stripe(event: dict, current: dict) -> bool:
+    """A person un-cancelled the subscription in Stripe (customer portal or dashboard): an explicit choice of paid
+    storage. Only a customer.subscription.updated whose previous cancel_at_period_end was true, and which no longer
+    ends, says so."""
+    return (str(event.get("type") or "") == "customer.subscription.updated" and not current.get("cancel_at_period_end")
+            and ((event.get("data") or {}).get("previous_attributes") or {}).get("cancel_at_period_end") is True)
+
+
+def _record_stripe_authorization(trial: dict, subscription_id: str) -> None:
+    now = _iso(_now())
+    with connection() as db:
+        db.execute("UPDATE storage_trials SET paid_authorized_at=COALESCE(paid_authorized_at,?),"
+                   "paid_authorized_by=COALESCE(paid_authorized_by,'stripe'),updated_at=? WHERE id=?",
+                   (now, now, trial["id"]))
+    audit(_SYSTEM, "storage_trial.paid_authorized", "customer", trial["customer_id"],
+          {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "via": "stripe"})
+
+
+def _flag_unauthorized_charge(trial: dict, subscription_id: str, invoice_id: str) -> None:
+    """Stripe billed a trial subscription nobody authorized (Codex 2026-10-17). Never recorded as a conversion; an
+    administrator reviews it. Audited once per trial and invoice so Stripe's repeated events add nothing."""
+    logger.error("storage_trial.charged_without_authorization trial_id=%s customer_id=%s subscription_id=%s invoice_id=%s",
+                 trial["id"], trial["customer_id"], subscription_id, invoice_id)
+    marker = f'%"invoice_id": "{invoice_id}"%'
+    seen = rows("SELECT id FROM audit_logs WHERE action='storage_trial.charged_without_authorization' AND entity_id=? "
+                "AND details_json LIKE ? AND details_json LIKE ?",
+                (trial["customer_id"], f'%"trial_id": "{trial["id"]}"%', marker))
+    if not seen:
+        audit(_SYSTEM, "storage_trial.charged_without_authorization", "customer", trial["customer_id"],
+              {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "invoice_id": invoice_id,
+               "action_required": "review the charge and refund or confirm it with the customer"})
+
+
 def sync_from_stripe_event(event: dict) -> dict:
     """Keeps trial records in step with Stripe and enforces the no-charge
     guard. Acts only on trial subscriptions; everything else is ignored
@@ -531,17 +564,10 @@ def sync_from_stripe_event(event: dict) -> dict:
             withdraw_paid_authorization(subscription_id, by=_SYSTEM)
             return {"status": "paid_authorization_withdrawn"}
         if event_type in _GUARD_EVENTS and not authorized and not current.get("cancel_at_period_end"):
-            if event_type == "customer.subscription.updated" and (
-                    ((event.get("data") or {}).get("previous_attributes") or {}).get("cancel_at_period_end") is True):
+            if _un_cancelled_in_stripe(event, current):
                 # A person un-cancelled it in Stripe (customer portal or
                 # dashboard): an explicit choice of paid storage.
-                now = _iso(_now())
-                with connection() as db:
-                    db.execute("UPDATE storage_trials SET paid_authorized_at=COALESCE(paid_authorized_at,?),"
-                               "paid_authorized_by=COALESCE(paid_authorized_by,'stripe'),updated_at=? WHERE id=?",
-                               (now, now, trial["id"]))
-                audit(_SYSTEM, "storage_trial.paid_authorized", "customer", trial["customer_id"],
-                      {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "via": "stripe"})
+                _record_stripe_authorization(trial, subscription_id)
                 return {"status": "paid_authorized_in_stripe"}
             main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [("cancel_at_period_end", "true")],
                                  idempotency_key=f"anyaicam-storage-trial-guard-{subscription_id}")
@@ -552,6 +578,14 @@ def sync_from_stripe_event(event: dict) -> dict:
         return {"status": "ignored", "reason": "another subscription holds this trial"}
     now = _iso(_now())
     if status == "active" and trial["status"] in (ACTIVE, EXPIRED) and _invoice_paid(current):
+        # Paid storage after the trial needs the owner's explicit choice (authorize_paid, or an un-cancel in Stripe).
+        # An active, paid subscription is not that choice: the guard may have failed or been undone, or a person
+        # changed it in Stripe. Only an un-cancel arriving late (after the trial ended) still counts.
+        if not trial.get("paid_authorized_at"):
+            if not _un_cancelled_in_stripe(event, current):
+                _flag_unauthorized_charge(trial, subscription_id, _id(current.get("latest_invoice")))
+                return {"status": "charged_without_authorization"}
+            _record_stripe_authorization(trial, subscription_id)
         with connection() as db:
             db.execute("UPDATE storage_trials SET status=?,converted_at=?,ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?",
                        (CONVERTED, now, trial["expires_at"], now, trial["id"]))
