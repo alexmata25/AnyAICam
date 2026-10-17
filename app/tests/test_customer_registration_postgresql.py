@@ -39,8 +39,11 @@ class PostgreSQLCustomerRegistrationTests(unittest.TestCase):
         self.master={"master":True,"email":"master@example.test","partner_id":None}
     def rows(self,sql,args=()):
         with self.db() as db:return list(db.execute(sql,args).fetchall())
-    def pending(self,email="new@example.test"):
+    def pending(self,email="new@example.test",confirm=True):
         create_pending_registration("New Customer",email,"correct-horse-battery-staple")
+        if confirm:  # 2026-10-17: approval requires a confirmed email; the requester clicks the link
+            import customer_registration as cr
+            assert cr.verify_registration_email(cr.issue_registration_verification(email,force=True))
         return self.rows("SELECT * FROM customer_registration_requests WHERE email=%s",(email,))[0]
     def test_schema_columns_index_and_unique_constraint(self):
         columns={x["column_name"] for x in self.rows("SELECT column_name FROM information_schema.columns WHERE table_name='customer_registration_requests'")}

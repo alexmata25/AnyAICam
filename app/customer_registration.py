@@ -1,6 +1,7 @@
+import hashlib
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
 
@@ -12,6 +13,92 @@ from partner_portal import partner_identity
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+
+# Email ownership (owner decision 2026-10-17): approving a request attaches any purchase made earlier under
+# that email (resolve_pending_links_for_customer), so the requester must first prove they own the address.
+VERIFY_TTL_HOURS = 48
+VERIFY_RESEND_SECONDS = 120
+VERIFIED_MESSAGE = ("Thank you. Your email address is confirmed. An administrator will review your AnyAiCam "
+                    "account request; you'll be able to sign in once it is approved.")
+VERIFY_INVALID_MESSAGE = ("This confirmation link is invalid or has expired. Submit the registration form again "
+                          "to receive a new link.")
+
+
+def _token_hash(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def issue_registration_verification(email: str, *, now: datetime | None = None, force: bool = False) -> str | None:
+    """A new single-use link token for the PENDING, UNVERIFIED request of this email, or None (no such request,
+    already verified, or a link was sent less than VERIFY_RESEND_SECONDS ago and not forced). The previous link
+    stops working."""
+    normalized = (email or "").strip().lower()
+    now = now or datetime.now()
+    with connection() as db:
+        item = db.execute(
+            "SELECT id,email_verified_at,verification_sent_at FROM customer_registration_requests "
+            "WHERE email=? AND status='pending'", (normalized,)).fetchone()
+        if not item or item["email_verified_at"]:
+            return None
+        if not force and item["verification_sent_at"]:
+            try:
+                if (now - datetime.fromisoformat(item["verification_sent_at"])).total_seconds() < VERIFY_RESEND_SECONDS:
+                    return None
+            except ValueError:
+                pass
+        raw = secrets.token_urlsafe(32)
+        db.execute(
+            "UPDATE customer_registration_requests SET verification_token_hash=?,verification_expires_at=?,"
+            "verification_sent_at=? WHERE id=? AND status='pending' AND email_verified_at IS NULL",
+            (_token_hash(raw), (now + timedelta(hours=VERIFY_TTL_HOURS)).isoformat(), now.isoformat(), item["id"]))
+    return raw
+
+
+def send_registration_verification(email: str, base_url: str, *, force: bool = False) -> bool:
+    """Issues a link (issue_registration_verification) and emails it to that same address. True when the email
+    service accepted it. The email says nothing about purchases or other accounts."""
+    raw = issue_registration_verification(email, force=force)
+    if not raw:
+        return False
+    normalized = email.strip().lower()
+    link = f"{base_url.rstrip('/')}/customer-register/verify-email?token={raw}"
+    subject = "Confirm your email for your AnyAiCam account request"
+    text = ("Confirm this email address to complete your AnyAiCam account request:\n"
+            f"{link}\n\nThis link works once and expires in {VERIFY_TTL_HOURS} hours. "
+            "Your request is reviewed only after the address is confirmed. If you didn't ask for this, ignore this email.")
+    try:
+        from email_service import get_email_service
+        result = get_email_service().send("email_verification", normalized, subject, text)
+    except Exception as error:
+        logging.getLogger("anyaicam.customer_registration").warning(
+            "registration_verification.email_failed error_type=%s", type(error).__name__)
+        return False
+    return not (isinstance(result, dict) and result.get("status") in ("failed", "error"))
+
+
+def verify_registration_email(raw: str, *, now: datetime | None = None) -> bool:
+    """Marks the request this link belongs to as verified FOR ITS OWN EMAIL. Single use; expired, unknown, used
+    or non-pending links all return False with no detail."""
+    if not raw or len(raw) > 200:
+        return False
+    now = now or datetime.now()
+    with connection() as db:
+        item = db.execute(
+            "SELECT id,email,verification_expires_at FROM customer_registration_requests "
+            "WHERE verification_token_hash=? AND status='pending' AND email_verified_at IS NULL",
+            (_token_hash(raw),)).fetchone()
+        if not item or not item["verification_expires_at"] or item["verification_expires_at"] < now.isoformat():
+            return False
+        db.execute(
+            "UPDATE customer_registration_requests SET email_verified_at=?,email_verified_for=?,"
+            "verification_token_hash=NULL,verification_expires_at=NULL WHERE id=? AND email_verified_at IS NULL",
+            (now.isoformat(), item["email"], item["id"]))
+        db.execute(
+            "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            (item["email"], "anonymous", "customer_registration.email_verified", "customer_registration", item["id"], "{}",
+             now.isoformat()))
+    return True
 
 
 def create_pending_registration(display_name: str, email: str, password: str) -> tuple[str, bool]:
@@ -33,7 +120,9 @@ def create_pending_registration(display_name: str, email: str, password: str) ->
             now = _now()
             db.execute(
                 "UPDATE customer_registration_requests SET display_name=?,password_hash=?,status='pending',partner_id=NULL,"
-                "requested_at=?,decided_at=NULL,decided_by=NULL,rejection_reason=NULL WHERE id=? AND status='rejected'",
+                "requested_at=?,decided_at=NULL,decided_by=NULL,rejection_reason=NULL,email_verified_at=NULL,"
+                "email_verified_for=NULL,verification_token_hash=NULL,verification_expires_at=NULL,verification_sent_at=NULL "
+                "WHERE id=? AND status='rejected'",
                 (display_name.strip(), password_hash(password), now, existing["id"]),
             )
             db.execute(
@@ -111,6 +200,13 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
             return {"status": "complete", "message": "Account was already approved.", "customer_id": item["customer_id"], "user_id": item["user_id"]}
         if item["status"] == "rejected":
             raise HTTPException(status_code=409, detail="A rejected registration cannot be approved.")
+        # Owner decision 2026-10-17: never approve (and so never attach pending purchases to) an address nobody
+        # has proven they own. The proof must be for THIS request's email.
+        if (not item.get("email_verified_at")
+                or (item.get("email_verified_for") or "").lower() != (item.get("email") or "").lower()):
+            raise HTTPException(status_code=409, detail=(
+                "This request's email address has not been confirmed yet. Ask the requester to use the "
+                "confirmation link we emailed, or resend it from this page."))
         selected_partner = (partner_id or item.get("partner_id") or "").strip()
         if not selected_partner:
             raise HTTPException(status_code=422, detail="Select an existing partner before approval.")
@@ -239,7 +335,8 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
                 items = db.execute("SELECT * FROM customer_registration_requests ORDER BY requested_at DESC").fetchall()
             else:
                 items = db.execute("SELECT * FROM customer_registration_requests WHERE partner_id=? ORDER BY requested_at DESC", (who["partner_id"],)).fetchall()
-        return {"requests": [{k: v for k, v in dict(row).items() if k != "password_hash"} for row in items]}
+        hidden = {"password_hash", "verification_token_hash"}
+        return {"requests": [{k: v for k, v in dict(row).items() if k not in hidden} for row in items]}
 
     @app.post("/api/customer-registration-requests/{request_id}/approve")
     def approve(request_id: str, request: Request, payload: dict):
@@ -249,6 +346,36 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
     def assign(request_id: str, request: Request, payload: dict):
         return assign_registration(request_id, str(payload.get("partner_id") or ""), actor(request))
 
+    @app.post("/api/customer-registration-requests/{request_id}/resend-verification")
+    def resend_verification(request_id: str, request: Request):
+        who = actor(request)
+        with connection() as db:
+            item = _request_for_actor(db, request_id, who)
+        if item["status"] != "pending":
+            raise HTTPException(status_code=409, detail="Only pending registrations can be confirmed.")
+        if item.get("email_verified_at"):
+            return {"status": "complete", "message": "This email address is already confirmed."}
+        from direct_onboarding import _base
+        if not send_registration_verification(item["email"], _base(request), force=True):
+            raise HTTPException(status_code=503, detail="The confirmation email could not be sent. Please try again.")
+        with connection() as db:
+            db.execute(
+                "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (who["email"], "administrator" if who["master"] else "partner_owner", "customer_registration.verification_resent",
+                 "customer_registration", request_id, "{}", _now()))
+        return {"status": "complete", "message": "A new confirmation link was emailed to the requester."}
+
+    @app.get("/customer-register/verify-email", response_class=HTMLResponse)
+    def verify_registration_email_page(token: str = ""):
+        ok = verify_registration_email(token)
+        title, message = ("Email confirmed", VERIFIED_MESSAGE) if ok else ("Link not valid", VERIFY_INVALID_MESSAGE)
+        return HTMLResponse(
+            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1"><title>AnyAiCam</title>'
+            '<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;color:#0b1530}</style>'
+            f'</head><body><h1>{title}</h1><p>{message}</p><p><a href="/customer-login.html">Go to sign in</a></p></body></html>',
+            status_code=200 if ok else 400)
+
     @app.post("/api/customer-registration-requests/{request_id}/reject")
     def reject(request_id: str, request: Request, payload: dict):
         return reject_registration(request_id, str(payload.get("reason") or ""), actor(request))
@@ -257,5 +384,5 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
     def requests_page(request: Request):
         actor(request)
         content = '''<header class="topbar"><div><p class="eyebrow">Customer access</p><h1>Registration requests</h1></div></header><section class="panel"><p class="health-detail">Unassigned public requests require a master administrator to select an existing partner. Partner administrators see only requests assigned to their tenant.</p><div id="registration-requests">Loading…</div></section>'''
-        scripts = '''<script>const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));async function loadRegistrations(){const r=await fetch('/api/customer-registration-requests'),p=await r.json(),box=document.getElementById('registration-requests');box.innerHTML=(p.requests||[]).map(x=>`<article class="feature-card"><strong>${esc(x.display_name)}</strong><p>${esc(x.email)} · ${esc(x.status)}</p><label>Existing partner ID<input id="partner-${x.id}" value="${esc(x.partner_id)}"></label><button onclick="decide('${x.id}','assign')">Assign</button> <button onclick="decide('${x.id}','approve')">Approve</button> <button onclick="decide('${x.id}','reject')">Reject</button></article>`).join('')||'<div class="empty">No registration requests.</div>'}async function decide(id,action){const partner=document.getElementById('partner-'+id)?.value||'',reason=action==='reject'?prompt('Rejection reason')||'Rejected':'';const r=await fetch(`/api/customer-registration-requests/${id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({partner_id:partner,reason})}),p=await r.json();showToast(p.message||p.detail);if(r.ok)loadRegistrations()}loadRegistrations();</script>'''
+        scripts = '''<script>const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));async function loadRegistrations(){const r=await fetch('/api/customer-registration-requests'),p=await r.json(),box=document.getElementById('registration-requests');box.innerHTML=(p.requests||[]).map(x=>`<article class="feature-card"><strong>${esc(x.display_name)}</strong><p>${esc(x.email)} · ${esc(x.status)} · ${x.email_verified_at?'email confirmed':'email NOT confirmed'}</p><label>Existing partner ID<input id="partner-${x.id}" value="${esc(x.partner_id)}"></label><button onclick="decide('${x.id}','assign')">Assign</button> <button onclick="decide('${x.id}','approve')">Approve</button> <button onclick="decide('${x.id}','resend-verification')">Resend confirmation</button> <button onclick="decide('${x.id}','reject')">Reject</button></article>`).join('')||'<div class="empty">No registration requests.</div>'}async function decide(id,action){const partner=document.getElementById('partner-'+id)?.value||'',reason=action==='reject'?prompt('Rejection reason')||'Rejected':'';const r=await fetch(`/api/customer-registration-requests/${id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({partner_id:partner,reason})}),p=await r.json();showToast(p.message||p.detail);if(r.ok)loadRegistrations()}loadRegistrations();</script>'''
         return page_shell("Customer registrations", "business-users", content, scripts=scripts)

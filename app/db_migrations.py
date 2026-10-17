@@ -1432,6 +1432,14 @@ ALTER TABLE appliances ADD COLUMN version_reported_at TEXT;
     ('20261015_storage_trials_pending_start','''
 UPDATE storage_trials SET status='granted',starts_at='',expires_at='' WHERE status='active' AND stripe_subscription_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_trials_one_open ON storage_trials(customer_id) WHERE status IN ('granted','active');
+'''),    # Owner decision 2026-10-17: a registration request must prove email ownership before approval
+    # (approval attaches pending purchases made under that email). Additive columns only.
+    ('20261017_registration_email_verification','''
+ALTER TABLE customer_registration_requests ADD COLUMN email_verified_at TEXT;
+ALTER TABLE customer_registration_requests ADD COLUMN email_verified_for TEXT;
+ALTER TABLE customer_registration_requests ADD COLUMN verification_token_hash TEXT;
+ALTER TABLE customer_registration_requests ADD COLUMN verification_expires_at TEXT;
+ALTER TABLE customer_registration_requests ADD COLUMN verification_sent_at TEXT
 '''),
 ]
 

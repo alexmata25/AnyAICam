@@ -107,6 +107,22 @@ request_id = db.execute(
 ).fetchone()[0]
 db.close()
 
+# 2026-10-17: approval requires the requester to have confirmed their email first.
+unconfirmed = request(
+    f"/api/customer-registration-requests/{request_id}/approve",
+    json.dumps({"partner_id": "anyaicam-primary"}).encode(),
+    {"Content-Type": "application/json", "X-CSRF-Token": token},
+)
+print(f"APPROVAL_UNCONFIRMED={unconfirmed.status}")
+assert unconfirmed.status == 409
+from customer_registration import issue_registration_verification
+
+confirm_token = issue_registration_verification("customer@cpu-only.test", force=True)
+assert confirm_token
+confirmed = request("/customer-register/verify-email?" + urllib.parse.urlencode({"token": confirm_token}))
+print(f"EMAIL_CONFIRM={confirmed.status}")
+assert confirmed.status == 200
+
 approval = request(
     f"/api/customer-registration-requests/{request_id}/approve",
     json.dumps({"partner_id": "anyaicam-primary"}).encode(),
