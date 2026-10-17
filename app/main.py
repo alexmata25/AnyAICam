@@ -40828,6 +40828,10 @@ PUBLIC_PATH_PREFIXES = (
 
     "/partner.html",
 
+    "/partner-login",
+
+    "/api/website/partner-session",
+
     "/customer-forgot-password",
 
     "/customer-reset-password",

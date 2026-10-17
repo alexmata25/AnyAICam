@@ -174,3 +174,34 @@ def test_partner_html_never_overwrites_nav_links_with_an_unauthenticated_error_b
     assert "typeof session.authenticated==='undefined')return" in source
     assert "if(session.partner_url)document.getElementById('partner-nav').href=session.partner_url" in source
     assert "if(session.customer_url)document.getElementById('customer-nav').href=session.customer_url" in source
+
+
+def test_public_session_endpoint_reaches_its_anonymous_response(http_client, monkeypatch):
+    monkeypatch.setattr(website_partner, "settings", _cloud_production())
+
+    response = http_client.get("/api/website/partner-session")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "authenticated": False,
+        "partner_url": "https://portal.anyaicam.com/partner.html",
+        "customer_url": "https://portal.anyaicam.com/customer-login.html",
+    }
+
+
+def test_normal_partner_login_route_is_public(http_client):
+    response = http_client.get("/partner-login")
+
+    assert response.status_code == 200
+    assert "Partner sign in" in response.text
+    assert "Local emergency recovery sign-in" not in response.text
+
+
+def test_customer_login_nav_keeps_safe_defaults_and_public_support():
+    source = (Path(__file__).resolve().parents[1] / "customer-login.html").read_text(encoding="utf-8")
+    assert 'href="/partner.html">Partner Login' in source
+    assert 'href="/customer-login.html">Customer Login' in source
+    assert 'href="https://anyaicam.com/vms-support.html">Support' in source
+    assert "typeof session.authenticated==='undefined')return" in source
+    assert "if(session.partner_url)document.getElementById('partner-nav').href=session.partner_url" in source
+    assert "if(session.customer_url)document.getElementById('customer-nav').href=session.customer_url" in source

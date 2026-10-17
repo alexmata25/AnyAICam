@@ -14,16 +14,29 @@ from what's actually shipped) and runs it under Node with fake
 fetch/getUserMedia/WebSocket/AudioContext implementations the JS test
 file drives itself.
 
-Skipped, not failed, wherever `node` isn't installed: the production
-Docker image (python:3.12-slim, see Dockerfile) has no Node runtime,
-and this fix is deliberately a code-only frontend change that must not
-force an image rebuild -- adding Node as a new image dependency just to
-run this one test would defeat that. The test still runs for real in
-any development environment that has Node (this one included), and the
+Skipped, not failed, wherever `node` isn't installed AND
+ANYAICAM_REQUIRE_JS_TESTS is not set: the production Docker image
+(python:3.12-slim, see Dockerfile) has no Node runtime, and this fix is
+deliberately a code-only frontend change that must not force an image
+rebuild -- adding Node as a new image dependency just to run this one
+test would defeat that. The test still runs for real in any
+development environment that has Node (this one included), and the
 existing string-content structural test keeps running everywhere
 regardless.
+
+P0 #5 remediation, Phase 5 (2026-09-05, Codex review of a separate,
+unrelated fix that established this same pattern -- see
+test_p05_mobile_poll_js.py): a bare skip, with nothing else watching
+for it, lets "Node isn't installed here" quietly present as "this
+async behavior is covered" in any CI/test pipeline that also never
+provisions Node -- indistinguishable in a green build from the test
+having actually run. Setting ANYAICAM_REQUIRE_JS_TESTS=true (expected
+in a CI/test image that DOES provision Node -- never the production
+runtime image) turns a missing `node` binary into a hard FAILURE
+instead of a skip here too, so that gap can't go unnoticed.
 """
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -39,6 +52,13 @@ _JS_TEST_RUNNER = Path(__file__).parent / "js" / "talk_mic_lifecycle.test.mjs"
 def test_wire_talk_mic_pointer_lifecycle_is_race_free():
     node = shutil.which("node")
     if not node:
+        if os.environ.get("ANYAICAM_REQUIRE_JS_TESTS", "").lower() == "true":
+            pytest.fail(
+                "node is required (ANYAICAM_REQUIRE_JS_TESTS=true) but not "
+                "installed in this environment -- this must be a CI/test "
+                "image that provisions Node, never the production runtime "
+                "image; see this module's own docstring."
+            )
         pytest.skip("node not installed in this environment -- see module docstring")
 
     with tempfile.TemporaryDirectory() as tmp:
