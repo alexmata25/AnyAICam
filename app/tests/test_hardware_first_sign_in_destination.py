@@ -76,3 +76,16 @@ def test_a_refunded_appliance_order_no_longer_counts_as_paid(hw, db_path):
     conn.close()
     with override_target(sqlite_path=str(db_path)):
         assert not billing.hardware_order_paid(customer_id) and not billing.hardware_awaiting_delivery(customer_id)
+
+
+@pytest.mark.parametrize("fulfillment", ["preparing", "delivered"])
+def test_an_appliance_owner_is_never_given_an_own_pc_order_or_charged_the_licence(hw, db_path, fulfillment):
+    import per_camera_billing as billing
+    customer_id = _paid_and_signed_in(hw, db_path)
+    _fulfillment(db_path, fulfillment)
+    response = hw["client"].get("/order-summary?plan=basic_local&cameras=4", follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/customer/orders"
+    with override_target(sqlite_path=str(db_path)):
+        assert billing.build_progress(customer_id) is None  # nothing saved, so no license line can be built
+        billing.save_build_selection(customer_id, billing.purchase_selection("basic_local", "4"))
+        assert not billing.build_progress(customer_id)["own_pc"]  # the appliance includes the license

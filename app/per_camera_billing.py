@@ -435,7 +435,9 @@ def save_build_selection(customer_id: str, selection: dict) -> None:
     now = _now()
     # No AnyAiCam hardware means the customer's own PC, which needs the one-time license -- unless the account
     # already holds it (never charged twice; the order then shows it as already on the account).
-    own_pc = not selection.get("appliance") and not vms_license_owned(customer_id)
+    import customer_entitlements
+    own_pc = (not selection.get("appliance") and not vms_license_owned(customer_id)
+              and not customer_entitlements.appliance_includes_vms_license(customer_id))
     values = (selection["plan"], selection.get("cameras") or MIN_CAMERA_QUANTITY, selection.get("appliance"),
               selection.get("relays"), 1 if own_pc else 0)
     with connection() as db:
