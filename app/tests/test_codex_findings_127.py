@@ -81,7 +81,7 @@ def _reject(conn, email, *, customer_id=None, user_id=None):
 
 def test_a_rejected_request_can_apply_again_and_the_old_decision_stays_audited(db):
     assert create_pending_registration("First Try", "again@example.test", "correct-horse-battery-staple") == ("pending", True)
-    assert verify_registration_email(issue_registration_verification("again@example.test"))
+    assert verify_registration_email(issue_registration_verification("again@example.test"), "correct-horse-battery-staple")
     first = _request(db, "again@example.test")
     _reject(db, "again@example.test")
 

@@ -44738,8 +44738,7 @@ def customer_register_submit(
     # page text below is the same whether or not an email went out.
     if status == "pending":
         try:
-            from direct_onboarding import _base
-            send_registration_verification(normalized_email, _base(request))
+            send_registration_verification(normalized_email)
         except Exception:
             application_logger.exception("registration confirmation email failed")
     if not created:
