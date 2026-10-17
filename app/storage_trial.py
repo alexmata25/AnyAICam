@@ -486,37 +486,116 @@ def _invoice_paid(subscription: dict) -> bool:
     return str(invoice.get("status") or "") == "paid"
 
 
-def _un_cancelled_in_stripe(event: dict, current: dict) -> bool:
-    """A person un-cancelled the subscription in Stripe (customer portal or dashboard): an explicit choice of paid
-    storage. Only a customer.subscription.updated whose previous cancel_at_period_end was true, and which no longer
-    ends, says so."""
-    return (str(event.get("type") or "") == "customer.subscription.updated" and not current.get("cancel_at_period_end")
-            and ((event.get("data") or {}).get("previous_attributes") or {}).get("cancel_at_period_end") is True)
+CONSENT_EXCEPTION_ACTION = "storage_trial.charged_without_authorization"
+BILLING_ALERT_EMAIL_ENV = "ANYAICAM_BILLING_ALERT_EMAIL"
+CONSENT_EXCEPTION_ACTION_REQUIRED = ("Review the charge in Stripe and refund it or confirm it with the customer. "
+                                     "Nothing was cancelled, refunded or changed automatically.")
 
 
-def _record_stripe_authorization(trial: dict, subscription_id: str) -> None:
-    now = _iso(_now())
-    with connection() as db:
-        db.execute("UPDATE storage_trials SET paid_authorized_at=COALESCE(paid_authorized_at,?),"
-                   "paid_authorized_by=COALESCE(paid_authorized_by,'stripe'),updated_at=? WHERE id=?",
-                   (now, now, trial["id"]))
-    audit(_SYSTEM, "storage_trial.paid_authorized", "customer", trial["customer_id"],
-          {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "via": "stripe"})
-
-
-def _flag_unauthorized_charge(trial: dict, subscription_id: str, invoice_id: str) -> None:
-    """Stripe billed a trial subscription nobody authorized (Codex 2026-10-17). Never recorded as a conversion; an
-    administrator reviews it. Audited once per trial and invoice so Stripe's repeated events add nothing."""
-    logger.error("storage_trial.charged_without_authorization trial_id=%s customer_id=%s subscription_id=%s invoice_id=%s",
+def _flag_unauthorized_charge(trial: dict, subscription_id: str, current: dict) -> None:
+    """Billing Consent Exception (Codex / owner 2026-10-17): Stripe billed a trial subscription nobody authorized.
+    Never recorded as a conversion. Recorded once per trial and invoice (Stripe's repeated events add nothing), shown
+    on /admin/storage-trials, and emailed to the billing administrator. Never touches Stripe."""
+    invoice = current.get("latest_invoice")
+    invoice_id = _id(invoice)
+    logger.error("storage_trial.billing_consent_exception trial_id=%s customer_id=%s subscription_id=%s invoice_id=%s",
                  trial["id"], trial["customer_id"], subscription_id, invoice_id)
-    marker = f'%"invoice_id": "{invoice_id}"%'
-    seen = rows("SELECT id FROM audit_logs WHERE action='storage_trial.charged_without_authorization' AND entity_id=? "
-                "AND details_json LIKE ? AND details_json LIKE ?",
-                (trial["customer_id"], f'%"trial_id": "{trial["id"]}"%', marker))
-    if not seen:
-        audit(_SYSTEM, "storage_trial.charged_without_authorization", "customer", trial["customer_id"],
-              {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "invoice_id": invoice_id,
-               "action_required": "review the charge and refund or confirm it with the customer"})
+    seen = rows("SELECT id FROM audit_logs WHERE action=? AND entity_id=? AND details_json LIKE ? AND details_json LIKE ?",
+                (CONSENT_EXCEPTION_ACTION, trial["customer_id"], f'%"trial_id": "{trial["id"]}"%',
+                 f'%"invoice_id": "{invoice_id}"%'))
+    if seen:
+        return
+    details = {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "invoice_id": invoice_id,
+               "stripe_customer_id": _id(current.get("customer")), "subscription_status": str(current.get("status") or ""),
+               "trial_expires_at": trial.get("expires_at"), "paid_authorized_at": trial.get("paid_authorized_at"),
+               "amount_paid": invoice.get("amount_paid") if isinstance(invoice, dict) else None,
+               "currency": invoice.get("currency") if isinstance(invoice, dict) else None,
+               "action_required": CONSENT_EXCEPTION_ACTION_REQUIRED}
+    audit(_SYSTEM, CONSENT_EXCEPTION_ACTION, "customer", trial["customer_id"], details)
+    try:
+        _notify_consent_exception(trial, details)
+    except Exception:  # the alert never breaks webhook processing; the admin page still shows it
+        logger.exception("storage_trial.billing_consent_exception_alert_failed trial_id=%s", trial["id"])
+
+
+def _notify_consent_exception(trial: dict, details: dict) -> dict:
+    import os
+    from purchase_notifications import SUPPORT_EMAIL, _portal_url, _send_once
+    recipient = os.environ.get(BILLING_ALERT_EMAIL_ENV, "").strip() or SUPPORT_EMAIL
+    link = _portal_url("/admin/storage-trials")
+    lines = [f"{key}: {value}" for key, value in details.items() if key != "action_required" and value not in (None, "")]
+    subject = f"Billing Consent Exception: customer {trial['customer_id']}"
+    text = ("Stripe charged a free-storage-trial subscription the customer never authorized to continue as paid.\n\n"
+            + "\n".join(lines) + f"\n\nAction required: {CONSENT_EXCEPTION_ACTION_REQUIRED}\n"
+            f"Review (sign-in required): {link}")
+    html = ("<p>Stripe charged a free-storage-trial subscription the customer never authorized to continue as paid.</p><ul>"
+            + "".join(f"<li>{escape(line)}</li>" for line in lines)
+            + f"</ul><p><strong>Action required:</strong> {escape(CONSENT_EXCEPTION_ACTION_REQUIRED)}</p>"
+            f'<p><a href="{escape(link, quote=True)}">Review on Free storage trials</a> (sign-in required)</p>')
+    return _send_once(event_id=f"billing-consent-exception:{trial['id']}:{details['invoice_id']}",
+                      notification_type="billing_consent_exception", customer_id=trial["customer_id"],
+                      recipient_email=recipient, subject=subject, text=text, html=html,
+                      metadata={"trial_id": trial["id"], "invoice_id": details["invoice_id"]})
+
+
+def stop_unauthorized_renewal(trial_id: str, *, admin: dict, reason: str) -> dict:
+    """An administrator, after reviewing a Billing Consent Exception, stops FUTURE renewals of that subscription:
+    cancel_at_period_end=true, so the period already paid for runs out and nothing more is billed. It never refunds
+    and never cancels immediately (a refund is a separate, deliberate decision). Refused unless the recorded state
+    still holds: an exception exists for this trial, the customer has not since authorized paid storage, and Stripe
+    shows this account's subscription still renewing."""
+    import main
+    import stripe_state
+    reason = _text(reason, "reason", required=True)
+    trial = _with_effective(row("SELECT * FROM storage_trials WHERE id=?", (str(trial_id or ""),)))
+    if not trial:
+        raise TrialError(404, "Storage trial not found.")
+    if not rows("SELECT id FROM audit_logs WHERE action=? AND entity_id=? AND details_json LIKE ?",
+                (CONSENT_EXCEPTION_ACTION, trial["customer_id"], f'%"trial_id": "{trial["id"]}"%')):
+        raise TrialError(409, "No Billing Consent Exception is recorded for this trial.")
+    if trial.get("paid_authorized_at"):
+        raise TrialError(409, "The customer has since authorized paid storage; there is nothing to stop.")
+    subscription_id = str(trial.get("stripe_subscription_id") or "")
+    if not subscription_id:
+        raise TrialError(409, "This trial has no Stripe subscription.")
+    current = stripe_state.current_subscription(subscription_id)
+    owner = str((current.get("metadata") or {}).get("anyaicam_customer_id") or trial["customer_id"])
+    if owner != trial["customer_id"]:
+        raise TrialError(409, "The Stripe subscription does not belong to this trial's account.")
+    status = str(current.get("status") or "")
+    if status in stripe_state.ENDED_STATUSES:
+        raise TrialError(409, f"The subscription has already ended ({status}).")
+    if current.get("cancel_at_period_end"):
+        return {"status": "already_stopped", "current_period_end": current.get("current_period_end")}
+    main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [("cancel_at_period_end", "true")],
+                         idempotency_key=f"anyaicam-consent-exception-stop-{subscription_id}-{uuid.uuid4().hex}")
+    audit(admin, "storage_trial.consent_exception_renewal_stopped", "customer", trial["customer_id"],
+          {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "reason": reason,
+           "subscription_status": status, "current_period_end": current.get("current_period_end"),
+           "refund": "not issued (a separate decision)"})
+    return {"status": "renewal_stopped", "current_period_end": current.get("current_period_end")}
+
+
+def consent_exceptions(limit: int = 200) -> list[dict]:
+    """Every Billing Consent Exception, newest first, with its audit details."""
+    import json
+    found = []
+    for item in rows("SELECT entity_id, created_at, details_json FROM audit_logs WHERE action=? "
+                     "ORDER BY created_at DESC, id DESC LIMIT ?", (CONSENT_EXCEPTION_ACTION, limit)):
+        try:
+            details = json.loads(item["details_json"] or "{}")
+        except ValueError:
+            details = {}
+        found.append({"customer_id": item["entity_id"], "flagged_at": item["created_at"], **details})
+    stopped = {}
+    for item in rows("SELECT details_json, created_at FROM audit_logs WHERE action='storage_trial.consent_exception_renewal_stopped'"):
+        try:
+            stopped.setdefault(json.loads(item["details_json"] or "{}").get("trial_id"), item["created_at"])
+        except ValueError:
+            continue
+    for entry in found:
+        entry["renewal_stopped_at"] = stopped.get(entry.get("trial_id"))
+    return found
 
 
 def sync_from_stripe_event(event: dict) -> dict:
@@ -564,13 +643,14 @@ def sync_from_stripe_event(event: dict) -> dict:
             withdraw_paid_authorization(subscription_id, by=_SYSTEM)
             return {"status": "paid_authorization_withdrawn"}
         if event_type in _GUARD_EVENTS and not authorized and not current.get("cancel_at_period_end"):
-            if _un_cancelled_in_stripe(event, current):
-                # A person un-cancelled it in Stripe (customer portal or
-                # dashboard): an explicit choice of paid storage.
-                _record_stripe_authorization(trial, subscription_id)
-                return {"status": "paid_authorized_in_stripe"}
+            # Codex 2026-10-17: an un-cancel in Stripe (portal or dashboard) is NOT verifiable customer consent --
+            # a subscription.updated event does not say who did it. Only the owner's in-app "Continue as paid"
+            # (authorize_paid: signed-in customer owner, recorded identity) authorizes paid storage. Anything
+            # else that leaves the trial subscription renewing is guarded back to ending at the trial end.
+            # The key is per event: a per-subscription key made Stripe replay the FIRST guard's answer for 24 h,
+            # so a second guard (e.g. after an un-cancel) changed nothing.
             main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [("cancel_at_period_end", "true")],
-                                 idempotency_key=f"anyaicam-storage-trial-guard-{subscription_id}")
+                                 idempotency_key=f"anyaicam-storage-trial-guard-{subscription_id}-{event.get('id') or uuid.uuid4().hex}")
             return {"status": "guarded", "subscription_id": subscription_id}
         return {"status": "trialing"}
     if trial.get("stripe_subscription_id") != subscription_id:
@@ -578,14 +658,12 @@ def sync_from_stripe_event(event: dict) -> dict:
         return {"status": "ignored", "reason": "another subscription holds this trial"}
     now = _iso(_now())
     if status == "active" and trial["status"] in (ACTIVE, EXPIRED) and _invoice_paid(current):
-        # Paid storage after the trial needs the owner's explicit choice (authorize_paid, or an un-cancel in Stripe).
-        # An active, paid subscription is not that choice: the guard may have failed or been undone, or a person
-        # changed it in Stripe. Only an un-cancel arriving late (after the trial ended) still counts.
+        # Paid storage after the trial needs the owner's verifiable choice (authorize_paid). An active, paid
+        # subscription is not that choice: the guard may have failed or been undone, or a person changed it in
+        # Stripe. That is a Billing Consent Exception, never a conversion.
         if not trial.get("paid_authorized_at"):
-            if not _un_cancelled_in_stripe(event, current):
-                _flag_unauthorized_charge(trial, subscription_id, _id(current.get("latest_invoice")))
-                return {"status": "charged_without_authorization"}
-            _record_stripe_authorization(trial, subscription_id)
+            _flag_unauthorized_charge(trial, subscription_id, current)
+            return {"status": "charged_without_authorization"}
         with connection() as db:
             db.execute("UPDATE storage_trials SET status=?,converted_at=?,ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?",
                        (CONVERTED, now, trial["expires_at"], now, trial["id"]))
@@ -659,7 +737,28 @@ def customer_note_html(customer_id: str, is_owner: bool) -> str:
 
 # ------------------------------------------------------------------ routes
 
-def _admin_page(items: list[dict]) -> str:
+def _consent_exceptions_panel(exceptions: list[dict]) -> str:
+    if not exceptions:
+        return ""
+    body = "".join(
+        f'<tr><td>{escape(str(e.get("flagged_at") or "")[:19])}</td><td>{escape(str(e.get("customer_id") or ""))}</td>'
+        f'<td>{escape(str(e.get("stripe_subscription_id") or ""))}<br><small>{escape(str(e.get("stripe_customer_id") or ""))}</small></td>'
+        f'<td>{escape(str(e.get("invoice_id") or ""))}<br><small>{escape(str(e.get("amount_paid") if e.get("amount_paid") is not None else ""))} '
+        f'{escape(str(e.get("currency") or ""))}</small></td><td>{escape(str(e.get("trial_id") or ""))}</td>'
+        + (f'<td>Future renewals stopped {escape(str(e["renewal_stopped_at"])[:19])}</td></tr>' if e.get("renewal_stopped_at") else
+           '<td><button class="ghost-button" data-stop-renewal="' + escape(str(e.get("trial_id") or ""), quote=True)
+           + '">Stop future renewals</button></td></tr>')
+        for e in exceptions)
+    return f'''<section class="panel" id="billing-consent-exceptions" role="alert" style="border:2px solid #b42318;margin-bottom:14px">
+<h2>Billing Consent Exceptions ({len(exceptions)})</h2>
+<p class="health-detail">Stripe charged a free-storage-trial subscription without the customer's authorization to continue as paid.
+{escape(CONSENT_EXCEPTION_ACTION_REQUIRED)}</p>
+<p class="health-detail">"Stop future renewals" checks the current Stripe state, then sets the subscription to end at the end of
+the period already paid. It does not refund and does not cancel immediately.</p>
+<table><tr><th>Flagged</th><th>Customer</th><th>Subscription / Stripe customer</th><th>Invoice / amount</th><th>Trial</th><th>Review</th></tr>{body}</table></section>'''
+
+
+def _admin_page(items: list[dict], exceptions: list[dict] | None = None) -> str:
     body = "".join(
         f'<tr><td>{escape(t.get("customer_name") or t["customer_id"])}<br><small>{escape(t["customer_id"])}</small></td>'
         f'<td>{escape(t["effective_status"])}</td>'
@@ -670,7 +769,7 @@ def _admin_page(items: list[dict]) -> str:
         f'<td>{"" if t["status"] in (CANCELLED, CONVERTED) else "<button class=ghost-button data-cancel=" + escape(t["id"], quote=True) + ">Cancel</button>"}</td></tr>'
         for t in items) or '<tr><td colspan="8">No storage trials yet.</td></tr>'
     return f'''<header class="topbar"><div><p class="eyebrow">Administrator</p><h1>Free storage trials</h1></div></header>
-<section class="panel"><h2>Grant a 30-day free storage trial</h2>
+{_consent_exceptions_panel(exceptions or [])}<section class="panel"><h2>Grant a 30-day free storage trial</h2>
 <p class="health-detail">Cloud storage plan only (Hybrid). Hardware, licenses and add-ons stay at normal prices. The customer is never
 charged after the trial unless they choose to continue. One trial per customer; a second needs a re-grant approval reason.
 The 30 days start when the customer starts the cloud storage plan (never while hardware is awaiting delivery); a grant unused
@@ -683,6 +782,7 @@ for {GRANT_LAPSE_DAYS} days lapses.</p>
 <script>
 const out=document.getElementById('st-result');
 document.getElementById('st-grant').onclick=async()=>{{const r=await fetch('/api/admin/storage-trials',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{customer_id:document.getElementById('st-customer').value,reason:document.getElementById('st-reason').value,allow_repeat:document.getElementById('st-repeat').checked,repeat_reason:document.getElementById('st-repeat-reason').value}})}});const d=await r.json().catch(()=>({{}}));out.textContent=r.ok?'Trial granted. The 30 days start when the customer starts cloud storage.':(d.detail||'Could not grant the trial.');if(r.ok)setTimeout(()=>location.reload(),900);}};
+document.querySelectorAll('[data-stop-renewal]').forEach(b=>b.onclick=async()=>{{const reason=prompt('Reason for stopping future renewals (no refund is issued)?');if(!reason)return;const r=await fetch('/api/admin/storage-trials/consent-exceptions/'+b.dataset.stopRenewal+'/stop-renewal',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{reason}})}});const d=await r.json().catch(()=>({{}}));out.textContent=r.ok?'Future renewals stopped. No refund was issued.':(d.detail||'Could not stop renewals.');if(r.ok)setTimeout(()=>location.reload(),900);}});
 document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=async()=>{{const reason=prompt('Reason for cancelling this trial?');if(!reason)return;const r=await fetch('/api/admin/storage-trials/'+b.dataset.cancel+'/cancel',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{reason}})}});const d=await r.json().catch(()=>({{}}));out.textContent=r.ok?'Trial cancelled.':(d.detail||'Could not cancel the trial.');if(r.ok)setTimeout(()=>location.reload(),900);}});
 </script>'''
 
@@ -710,7 +810,7 @@ def register_routes(app, shell) -> None:
         items = [_with_effective(t) for t in rows(
             "SELECT t.*, c.name AS customer_name FROM storage_trials t LEFT JOIN customers c ON c.id=t.customer_id "
             "ORDER BY t.granted_at DESC LIMIT 200")]
-        return shell("Free storage trials", "admin-portal", _admin_page(items))
+        return shell("Free storage trials", "admin-portal", _admin_page(items, consent_exceptions()))
 
     @app.get("/api/admin/storage-trials")
     def storage_trials_admin_list(request: Request, customer_id: str = "") -> dict:
@@ -718,6 +818,20 @@ def register_routes(app, shell) -> None:
         if customer_id:
             return {"trials": trials_for(customer_id)}
         return {"trials": [_with_effective(t) for t in rows("SELECT * FROM storage_trials ORDER BY granted_at DESC LIMIT 200")]}
+
+    @app.get("/api/admin/storage-trials/consent-exceptions")
+    def storage_trials_consent_exceptions(request: Request) -> dict:
+        administrator(request)
+        return {"exceptions": consent_exceptions()}
+
+    @app.post("/api/admin/storage-trials/consent-exceptions/{trial_id}/stop-renewal")
+    async def storage_trials_consent_exception_stop(trial_id: str, request: Request) -> dict:
+        admin = administrator(request)
+        payload = await _payload(request)
+        try:
+            return stop_unauthorized_renewal(trial_id, admin=admin, reason=str(payload.get("reason") or ""))
+        except TrialError as error:
+            _raise(error)
 
     @app.post("/api/admin/storage-trials")
     async def storage_trials_admin_grant(request: Request) -> dict:
