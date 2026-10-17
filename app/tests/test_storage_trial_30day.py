@@ -589,3 +589,42 @@ def test_the_single_hook_contract(shop, db_path):
     assert set(direct) == {"trial_end", "trial_settings[end_behavior][missing_payment_method]", "cancel_at_period_end",
                            "metadata[anyaicam_storage_trial]"}
     assert session["subscription_data[trial_end]"] == direct["trial_end"]
+
+
+def test_cancelling_after_choosing_paid_storage_withdraws_that_choice_and_a_new_choice_reaches_stripe(shop, db_path):
+    """Green 2026-10-16: "Continue cloud storage after my trial", then Cancel while still trialing, used to keep
+    paid_authorized_at -- the note kept saying storage continues as paid, and a second Continue answered
+    "already authorized" without telling Stripe, which still ended the subscription."""
+    import storage_trial
+    client, _, stripe = shop
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    sub = _trialing_plan(stripe, db_path, _trial(db_path)["id"])
+    stripe["customers"][sub["customer"]] = {"id": sub["customer"], "invoice_settings": {"default_payment_method": "pm_card_added"}}
+    url = "/api/v2/customer/storage-trial/continue-paid"
+    assert client.post(url, json={"authorize_paid_storage": True}, cookies=_cookie(*OWNER)).status_code == 200
+    assert sub["cancel_at_period_end"] is False and _trial(db_path)["paid_authorized_at"]
+    cancel = client.post("/api/v2/customer/subscription/cancel", cookies=_cookie(*OWNER))
+    assert cancel.status_code == 200, cancel.text
+    assert sub["cancel_at_period_end"] is True and _trial(db_path)["paid_authorized_at"] is None
+    assert _audit(db_path, "storage_trial.paid_authorization_withdrawn")
+    with override_target(sqlite_path=str(db_path)):
+        note = storage_trial.customer_note_html(CUSTOMER, True)
+    assert "chose to continue cloud storage as a paid plan" not in note and "storage-trial-continue" in note
+    again = client.post(url, json={"authorize_paid_storage": True}, cookies=_cookie(*OWNER))
+    assert again.status_code == 200 and again.json()["status"] == "authorized"
+    assert sub["cancel_at_period_end"] is False  # the second choice really reached Stripe
+    keys = [key for path, fields, key in stripe["updates"] if ("cancel_at_period_end", "false") in fields]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+def test_a_cancel_made_in_stripe_after_choosing_paid_storage_also_withdraws_it(shop, db_path):
+    client, _, stripe = shop
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    sub = _trialing_plan(stripe, db_path, _trial(db_path)["id"])
+    stripe["customers"][sub["customer"]] = {"id": sub["customer"], "invoice_settings": {"default_payment_method": "pm_card_added"}}
+    assert client.post("/api/v2/customer/storage-trial/continue-paid", json={"authorize_paid_storage": True},
+                       cookies=_cookie(*OWNER)).status_code == 200
+    sub["cancel_at_period_end"] = True  # cancelled in the Stripe billing portal
+    with override_target(sqlite_path=str(db_path)):
+        result = _sync(_event("customer.subscription.updated", sub, previous_attributes={"cancel_at_period_end": False}))
+    assert result["status"] == "paid_authorization_withdrawn" and _trial(db_path)["paid_authorized_at"] is None

@@ -394,6 +394,23 @@ def link_subscription(trial_id: str, customer_id: str, subscription_id: str, *,
 
 # ------------------------------------------------------------------ explicit paid authorization
 
+def withdraw_paid_authorization(subscription_id: str, *, by: dict) -> bool:
+    """The trial subscription is set to end again (the owner pressed Cancel, or cancelled in Stripe) after the
+    owner had chosen paid storage: that choice no longer holds, so the notes and a later "Continue" follow
+    Stripe again (Green 2026-10-16). True when a recorded authorization was withdrawn."""
+    trial = by_subscription(str(subscription_id or ""))
+    if not trial or not trial.get("paid_authorized_at") or trial["effective_status"] != ACTIVE:
+        return False
+    now = _iso(_now())
+    with connection() as db:
+        withdrawn = db.execute("UPDATE storage_trials SET paid_authorized_at=NULL,paid_authorized_by=NULL,updated_at=? "
+                               "WHERE id=? AND paid_authorized_at IS NOT NULL", (now, trial["id"])).rowcount
+    if withdrawn:
+        audit(by, "storage_trial.paid_authorization_withdrawn", "customer", trial["customer_id"],
+              {"trial_id": trial["id"], "stripe_subscription_id": subscription_id})
+    return bool(withdrawn)
+
+
 def authorize_paid(identity: dict) -> dict:
     """The customer owner explicitly chooses paid cloud storage after the
     trial: the trial subscription stops being set to end at the trial end
@@ -424,8 +441,10 @@ def authorize_paid(identity: dict) -> dict:
             raise TrialError(409, "Add a payment method in Manage billing first, then choose to continue cloud storage "
                                   "after your trial.")
         fields.append(("default_payment_method", method))
+    # One key per attempt: after a cancel withdrew an earlier choice, a second "Continue" must reach Stripe again
+    # (a per-subscription key would replay the first answer and change nothing).
     main.stripe_api_post(f"/v1/subscriptions/{trial['stripe_subscription_id']}", fields,
-                         idempotency_key=f"anyaicam-storage-trial-authorize-{trial['stripe_subscription_id']}")
+                         idempotency_key=f"anyaicam-storage-trial-authorize-{trial['stripe_subscription_id']}-{uuid.uuid4().hex}")
     now = _iso(_now())
     with connection() as db:
         db.execute("UPDATE storage_trials SET paid_authorized_at=?,paid_authorized_by=?,updated_at=? WHERE id=?",
@@ -507,6 +526,10 @@ def sync_from_stripe_event(event: dict) -> dict:
                 db.execute("UPDATE storage_trials SET expires_at=?,updated_at=? WHERE id=?",
                            (_epoch_iso(current["trial_end"]), _iso(_now()), trial["id"]))
         authorized = bound and trial.get("paid_authorized_at")
+        if authorized and current.get("cancel_at_period_end"):
+            # Set to end again after the owner chose paid storage (cancelled in the portal or in Stripe).
+            withdraw_paid_authorization(subscription_id, by=_SYSTEM)
+            return {"status": "paid_authorization_withdrawn"}
         if event_type in _GUARD_EVENTS and not authorized and not current.get("cancel_at_period_end"):
             if event_type == "customer.subscription.updated" and (
                     ((event.get("data") or {}).get("previous_attributes") or {}).get("cancel_at_period_end") is True):
