@@ -292,6 +292,15 @@ def _usable(customer_id: str, plan_key: str) -> dict | None:
     return trial
 
 
+def offer_available(customer_id: str, plan_key: str) -> bool:
+    """Display only: a storage-plan Checkout for this account would carry the
+    30-day trial (subscription_trial_fields would return fields). Starts nothing."""
+    try:
+        return bool(customer_id) and _usable(customer_id, plan_key) is not None
+    except Exception:  # a database before the storage_trials migration
+        return False
+
+
 def _offer_trial_end(trial: dict) -> int:
     """trial_end (epoch seconds) for a storage start now: now + 30 days,
     kept on the record as the provisional expires_at. A repeat within
