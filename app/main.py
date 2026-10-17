@@ -37059,10 +37059,20 @@ def _ai_detection_cache_put(camera_number: int, seq, result: dict) -> dict:
     return result
 
 
+# L-2 (2026-10-17): the AI never analyses a live playlist that has not been
+# written for this long. Live segments are 2 s (-hls_time 2), so a working
+# camera's playlist is rewritten every ~2 s; 15 s is a 7x margin. Without this,
+# in the default "always" live mode a disconnected camera's leftover playlist
+# was read forever (Ryzen 2026-10-17: YOLO/people counting/LPR on frozen video
+# of two unreachable cameras, Python VMS at 360-450 % CPU, ~87 C).
+HLS_ANALYTICS_MAX_AGE_SECONDS = max(4.0, float(os.environ.get("ANYAICAM_HLS_ANALYTICS_MAX_AGE_SECONDS", "15")))
+
+
 def _read_hls_analytics_frame(camera_number: int):
-    """The previous AI frame source, unchanged: one frame of the camera's
-    live HLS playlist via cv2.VideoCapture. (frame, captured_at, None) or
-    (None, None, error result)."""
+    """The previous AI frame source: one frame of the camera's live HLS
+    playlist via cv2.VideoCapture. (frame, captured_at, None) or
+    (None, None, error result). A stale playlist (camera disconnected) is
+    refused in every live mode."""
     manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
     # On-demand live HLS (live_hls_demand.py): this reader keeps the
     # camera's live encoder running, and never analyses a stale playlist
@@ -37079,6 +37089,12 @@ def _read_hls_analytics_frame(camera_number: int):
         return None, None, {
             "ok": False,
             "error": "Live HLS stream is not ready.",
+            "detections": [],
+        }
+    if not live_hls_demand.playlist_fresh(manifest, max_age=HLS_ANALYTICS_MAX_AGE_SECONDS):
+        return None, None, {
+            "ok": False,
+            "error": "Live video is not arriving from this camera.",
             "detections": [],
         }
     # When the frame read below actually happened (detection_timing.py).
