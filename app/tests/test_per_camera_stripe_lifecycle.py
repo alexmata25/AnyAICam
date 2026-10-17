@@ -249,3 +249,36 @@ def test_e1_plan_changes_never_charge_the_one_time_license_again(v2):
     with sqlite3.connect(env["path"]) as db:  # still the one license row, untouched
         assert db.execute("SELECT camera_slot_quantity,status FROM customer_entitlements WHERE customer_id='cust-A' "
                           "AND product='vms_license'").fetchall() == [(8, "active")]
+
+
+def test_a_cancel_after_an_uncancel_in_the_billing_portal_reaches_stripe_again(v2):
+    """Cancel, un-cancel in the Stripe billing portal, cancel again in the same period: the second cancel must reach
+    Stripe (a per-period idempotency key made Stripe replay the first answer, while the page said "will not renew")."""
+    env = v2
+    _checkout_to_active(env, "basic_local", 2)
+    assert _ok(env["client"].post("/api/v2/customer/subscription/cancel"))["status"] == "cancellation_scheduled"
+    env["stripe"][SUB]["cancel_at_period_end"] = False  # the customer un-cancels in the billing portal
+    _deliver(env, _event("evt_uncancel", "customer.subscription.updated", env["stripe"][SUB]))
+    again = _ok(env["client"].post("/api/v2/customer/subscription/cancel"))
+    assert again["status"] == "cancellation_scheduled"
+    assert env["stripe"][SUB]["cancel_at_period_end"] is True
+    cancel_keys = [key for (path, fields), key in zip(env["posts"], env["keys"])
+                   if path == f"/v1/subscriptions/{SUB}" and fields.get("cancel_at_period_end") == "true"]
+    assert len(cancel_keys) == 2 and cancel_keys[0] != cancel_keys[1]
+
+
+def test_a_cancel_stripe_does_not_confirm_is_reported_not_assumed(v2, monkeypatch):
+    import main
+    env = v2
+    _checkout_to_active(env, "basic_local", 2)
+    real_post = main.stripe_api_post
+
+    def ignoring_cancel(path, fields, idempotency_key=None):
+        if path == f"/v1/subscriptions/{SUB}" and ("cancel_at_period_end", "true") in list(fields):
+            return dict(env["stripe"][SUB])  # Stripe answered without scheduling the cancellation
+        return real_post(path, fields, idempotency_key=idempotency_key)
+    monkeypatch.setattr(main, "stripe_api_post", ignoring_cancel)
+    response = env["client"].post("/api/v2/customer/subscription/cancel")
+    assert response.status_code == 502 and "could not be confirmed" in response.json()["detail"]
+    assert env["stripe"][SUB]["cancel_at_period_end"] is False
+    assert "will not renew" not in env["client"].get("/subscription-portal").text
