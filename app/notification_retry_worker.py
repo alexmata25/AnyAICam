@@ -69,14 +69,21 @@ def _due_for_retry(delivery: dict, *, now: datetime) -> bool:
     return now >= last_attempt_at + timedelta(minutes=_backoff_minutes(delivery["attempt"]))
 
 
-def _claim(delivery: dict, *, channel: str, attempt: int, now: datetime) -> bool:
+def _claim(delivery: dict, *, channel: str, attempt: int, now: datetime | None = None) -> bool:
     """Atomically takes the right to make this attempt (Green 2026-10-16).
     Two workers that both read the same failed (or held) row used to both
     send it. Only the worker whose claim row is created (or that retakes a
     stale one) sends -- and only if no newer delivery row for the pair
     exists by then, so a worker holding an old candidate list, or one
     retaking a stale claim whose send did finish, never sends a second
-    copy. The claim is written (and committed) before the provider call."""
+    copy. The claim is written (and committed) before the provider call.
+
+    The lease is stamped with the time the claim is TAKEN (now defaults to
+    datetime.now()), never the start of the pass: a pass can run for minutes
+    (each failed send may wait out an SMTP timeout), and a claim stamped with
+    the pass start could already look stale to another worker the moment it
+    was written -- and be retaken while this send is still in progress."""
+    now = now or datetime.now()
     stale_before = (now - timedelta(seconds=CLAIM_STALE_SECONDS)).isoformat()
     with connection() as db:
         claimed = db.execute(
@@ -150,7 +157,7 @@ def retry_failed_deliveries() -> dict:
         if delivery["channel"] == "sms" and not sms_alert_allowed(str(notification["event_type"] or "")):
             continue
         notification = {key: notification[key] for key in ("id", "title", "message")}
-        if not _claim(delivery, channel=delivery["channel"], attempt=int(delivery["attempt"] or 0) + 1, now=now):
+        if not _claim(delivery, channel=delivery["channel"], attempt=int(delivery["attempt"] or 0) + 1):
             continue  # another worker is making (or already made) this attempt
         attempted += 1
         try:
@@ -233,7 +240,7 @@ def send_pending_media_emails(*, now: datetime | None = None) -> dict:
             held += 1
             continue
         # Resolving a held email (sent or skipped) is claimed like a retry: one worker only.
-        if not _claim(delivery, channel=PENDING_MEDIA_CLAIM_CHANNEL, attempt=1, now=now):
+        if not _claim(delivery, channel=PENDING_MEDIA_CLAIM_CHANNEL, attempt=1):
             continue
         if status is None:
             try:
