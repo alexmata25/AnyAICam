@@ -572,6 +572,11 @@ def customer_note_html(customer_id: str, is_owner: bool) -> str:
     if not trial:
         return ""
     if trial["effective_status"] == GRANTED:
+        # An account already paying for a camera plan cannot start the reserved trial (plan changes never start one),
+        # so it is not promised a trial it will never get (Green 2026-10-16).
+        import per_camera_billing
+        if per_camera_billing.has_camera_plan(customer_id):
+            return ""
         return ('<p class="health-detail" id="storage-trial-note"><strong>A 30-day free cloud storage trial is reserved for '
                 'your account.</strong> The 30 days start only when you start the Hybrid cloud storage plan (for example after '
                 'your equipment is delivered), not before. Hardware, software licenses and add-ons are charged at their normal '
