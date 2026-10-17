@@ -1308,6 +1308,9 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
     placeholder.hidden=false;
     setStatus('Reconnecting…');
     stopPolling();
+    // 1.2.7 transport audit: the failed HLS transport gives up its claim, or the relay re-attach that pollPlaylist()
+    // hands off to is 'blocked' by claimTransport() and a dead WireGuard player never falls back to the relay.
+    if(transport!=='p2p')transport=null;
     pollPlaylist(Date.now()+pollTimeoutMs);
   }}
 
@@ -2052,6 +2055,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     tile.placeholder.hidden=false;
     setStatus(id,'Reconnecting…');
     stopPolling(id);
+    if(tile.transport!=='p2p')tile.transport=null;  // see the single-camera page: lets the relay take over from a dead WireGuard
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
