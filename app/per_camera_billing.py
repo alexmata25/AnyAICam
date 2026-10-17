@@ -400,8 +400,15 @@ def account_activated(customer_id: str) -> bool:
     if not customer_id:
         return False
     legacy = existing_plan(customer_id)
-    if (legacy and legacy["kind"] == "legacy") or deferred_storage_plan(customer_id) is not None or vms_license_owned(customer_id):
+    if (legacy and legacy["kind"] == "legacy") or vms_license_owned(customer_id):
         return True
+    deferred = deferred_storage_plan(customer_id)
+    if deferred is not None:
+        # The storage plan ordered with an appliance counts while that appliance order is still paid (a refunded or
+        # disputed order leaves the row in place), or once the storage subscription exists (Green 2026-10-16).
+        import build_orders
+        if deferred.get("stripe_subscription_id") or build_orders._hardware_still_paid(deferred):
+            return True
     try:
         # Rows exist only once Stripe confirmed a payment (an unpaid or incomplete checkout never writes one, see
         # _upsert_current); a plan whose payment was refunded or disputed does not count.
