@@ -172,7 +172,9 @@ fi
 
 log "Rolling back the VMS to ${ROLLBACK_VERSION:-an unversioned release} (build $ROLLBACK_COMMIT; image $ROLLBACK_IMAGE, code $ROLLBACK_CODE_ARCHIVE, database: $([[ $restore_database == 1 ]] && echo "restore $ROLLBACK_DATABASE_BACKUP" || echo 'keep current'))."
 if [[ "$assume_yes" != "1" ]]; then
-    read -r -p "Proceed? This stops and restarts the VMS. [y/N] " answer
+    # No terminal (unattended, or stdin closed): read hits end-of-input. Treat it as "no" and SAY so -- under set -e a
+    # failed read used to exit 1 with no message at all (1.2.7 lifecycle test). Unattended rollbacks pass --yes.
+    read -r -p "Proceed? This stops and restarts the VMS. [y/N] " answer || answer=""
     [[ "$answer" == "y" || "$answer" == "Y" ]] || die "Cancelled; nothing was changed."
 fi
 

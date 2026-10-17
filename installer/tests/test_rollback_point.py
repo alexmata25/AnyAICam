@@ -197,6 +197,25 @@ deploy_vms clean
         self.assertEqual([p.read_text() for p in kept], ["database after upgrade"])
         self.assertFalse([p for p in self.recordings.iterdir() if "before-rollback" in p.name])
 
+    @unittest.skipUnless(shutil.which("rsync"), "rsync is required to run rollback.sh")
+    def test_rollback_without_yes_and_no_terminal_says_it_cancelled_and_changes_nothing(self):
+        """1.2.7 lifecycle test: unattended, without --yes, the confirmation read hit end-of-input and the script exited
+        1 silently. It must still change nothing, and now explain why."""
+        self.run_bash("create_rollback_point")
+        (self.install_root / "app" / "main.py").write_text("NEW RELEASE CODE
+")
+        self.env_file.write_text(f"ANYAICAM_VMS_COMMIT={NEW}
+ANYAICAM_BUILD_ID={NEW}
+")
+        result = subprocess.run([BASH, "./rollback.sh"], cwd=ROOT, text=True, capture_output=True, stdin=subprocess.DEVNULL,
+                                env=self.env(**self.rollback_paths()))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Cancelled; nothing was changed.", result.stderr)
+        self.assertEqual((self.install_root / "app" / "main.py").read_text(), "NEW RELEASE CODE
+")
+        self.assertIn(f"ANYAICAM_VMS_COMMIT={NEW}", self.env_file.read_text())
+        self.assertNotIn("systemctl stop", self.log.read_text() if self.log.exists() else "")
+
     def test_rollback_sh_refuses_a_missing_or_incomplete_rollback_point(self):
         env = self.env(ANYAICAM_ROLLBACK_ALLOW_NON_ROOT="1")
         missing = subprocess.run([BASH, "./rollback.sh", "--yes", bash_path(self.tmp / "nope.env")], cwd=ROOT, text=True, capture_output=True, env=env)
