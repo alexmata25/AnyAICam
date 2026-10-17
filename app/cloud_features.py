@@ -88,6 +88,49 @@ def _portal_auth_page(title: str, body_html: str, script: str) -> str:
             f'<script>{_PORTAL_AUTH_HELPERS_JS}{script}</script></body></html>')
 
 
+# Edge reset-link host allowlist (2026-10-17, Green's review; pre-existing in RC3): the edge link used to
+# reflect the request's Host / X-Forwarded-Proto verbatim, so anyone able to reach the appliance could
+# request a reset for a victim's email with "Host: attacker.example" and receive the victim's token when
+# the victim clicked the emailed link. Only the appliance's own kinds of address are used now; anything
+# else falls back to the configured reset URL. Extra names: ANYAICAM_EDGE_RESET_LINK_HOSTS (comma list).
+def _edge_reset_link_origin(request: Request) -> str | None:
+    import ipaddress
+    import os
+    scheme = str(request.headers.get('x-forwarded-proto') or request.url.scheme or 'http').split(',')[0].strip().lower()
+    if scheme not in ('http', 'https'):
+        return None
+    host_header = (request.headers.get('host') or request.url.netloc or '').strip()
+    if not host_header or any(ch in host_header for ch in ('/', '\\', '@', '?', '#')) or any(ch.isspace() for ch in host_header):
+        return None
+    if host_header.startswith('['):  # [IPv6]:port
+        hostname, _, rest = host_header[1:].partition(']')
+        port = rest[1:] if rest.startswith(':') else ''
+    else:
+        hostname, _, port = host_header.rpartition(':') if host_header.count(':') == 1 else (host_header, '', '')
+    if port and not (port.isdigit() and 0 < int(port) < 65536):
+        return None
+    name = hostname.strip().lower().rstrip('.')
+    if not name:
+        return None
+    extra = {item.strip().lower() for item in os.environ.get('ANYAICAM_EDGE_RESET_LINK_HOSTS', '').split(',') if item.strip()}
+    allowed = name in extra or name == 'localhost'
+    if not allowed:
+        try:
+            address = ipaddress.ip_address(name)
+            tailscale = ipaddress.ip_network('100.64.0.0/10')
+            allowed = (address.is_loopback or address.is_private or address.is_link_local
+                       or (address.version == 4 and address in tailscale))
+        except ValueError:
+            labels = name.split('.')
+            valid = all(label and len(label) <= 63 and all(c.isalnum() or c == '-' for c in label) for label in labels)
+            allowed = valid and (len(labels) == 1 or name.endswith('.local') or name.endswith('.ts.net')
+                                 or name == 'anyaicam.com' or name.endswith('.anyaicam.com'))
+    if not allowed:
+        return None
+    netloc = (f'[{name}]' if ':' in name else name) + (f':{port}' if port else '')
+    return f'{scheme}://{netloc}'
+
+
 def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.get('/health/live')
     def liveness(): return {'status':'alive'}
@@ -145,11 +188,10 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
             # host for edge_production, see cloud_config.py's effective_
             # trusted_hosts), and guaranteed to be the address that will
             # actually work for whoever just submitted this request.
-            if settings.edge_production:
-                scheme=request.headers.get('x-forwarded-proto',request.url.scheme)
-                host=request.headers.get('host') or request.url.netloc
+            origin=_edge_reset_link_origin(request) if settings.edge_production else None
+            if origin:
                 reset_path='/customer-reset-password' if user['role'] in ('customer_owner','customer_viewer') else '/reset-password'
-                link=f'{scheme}://{host}{reset_path}?token={raw}'
+                link=f'{origin}{reset_path}?token={raw}'
             else:
                 base=customer_reset_url() if user['role'] in CUSTOMER_RESET_ROLES else settings.password_reset_url
                 link=base+'?token='+raw
@@ -205,10 +247,9 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         # self-service request route above -- an admin-initiated reset on
         # an edge appliance must land the customer back on THAT
         # appliance's own real address, never a fixed "localhost" default.
-        if settings.edge_production:
-            scheme=request.headers.get('x-forwarded-proto',request.url.scheme)
-            host=request.headers.get('host') or request.url.netloc
-            link=f'{scheme}://{host}/customer-reset-password?token={raw}'
+        origin=_edge_reset_link_origin(request) if settings.edge_production else None
+        if origin:
+            link=f'{origin}/customer-reset-password?token={raw}'
         else:
             # Always a customer account here (see the role filter above).
             link=customer_reset_url()+'?token='+raw
