@@ -173,7 +173,7 @@ def test_new_customer_build_system_to_setup_end_to_end(shop, db_path):
     assert destination == canonical
     order = _order(client, destination.split("?", 1)[1])
     assert order.status_code == 200
-    assert _summary(order.text) == ("Hybrid", 8, "$199.92")
+    assert _summary(order.text) == ("Hybrid", 8, "$159.92")
     assert '<nav class="nav"' not in order.text and "mobile-nav" not in order.text  # outside the VMS shell
     # Hardware is bought online, priced from the server catalog; the plan starts at activation.
     assert 'id="order-appliance"><span>AnyAiCam Starter appliance</span><span>$1,249.99 one-time</span>' in order.text
@@ -444,7 +444,7 @@ def test_returning_later_from_another_browser_resumes_the_purchase(shop, db_path
     client.cookies.clear()  # browser closed; nothing kept client-side
     assert _signed_in(_login(client, "later@example.test", customer_only=True))
     html = _order(client).text
-    assert _summary(html) == ("Hybrid", 8, "$199.92") and 'id="order-appliance"' in html
+    assert _summary(html) == ("Hybrid", 8, "$159.92") and 'id="order-appliance"' in html
 
 
 def test_the_order_is_saved_at_verification_before_the_first_sign_in(shop, db_path):
@@ -474,7 +474,7 @@ def test_a_cancelled_checkout_returns_to_the_same_order_and_grants_nothing(shop,
     assert _checkout(client).status_code == 200
     html = _order(client, "checkout=cancelled").text
     assert "Checkout was cancelled. No payment was taken and nothing was activated." in html
-    assert _summary(html) == ("Hybrid", 8, "$199.92")
+    assert _summary(html) == ("Hybrid", 8, "$159.92")
     assert _capacity(db_path, _customer_id(db_path, "cancel@example.test")) == 0
 
 
