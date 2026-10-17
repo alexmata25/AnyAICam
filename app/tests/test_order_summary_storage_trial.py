@@ -39,3 +39,13 @@ def test_without_a_trial_or_for_orders_that_never_carry_one_the_full_amount_is_s
     assert '<span>Due today</span><span>$59.96</span>' in local and "free cloud storage trial" not in local
     own_pc = _summary({"plan": "hybrid", "cameras": 4, "own_pc": True})  # license order: never the trial
     assert "free cloud storage trial" not in own_pc and "Due today</span><span>$0.00" not in own_pc
+
+
+def test_the_reserved_trial_is_not_promised_to_an_account_already_paying_for_a_plan(shop, db_path, monkeypatch):
+    import per_camera_billing as billing
+    import storage_trial
+    client, _, _ = shop
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    assert "trial is reserved" in storage_trial.customer_note_html(CUSTOMER, True)
+    monkeypatch.setattr(billing, "has_camera_plan", lambda customer_id, **_: customer_id == CUSTOMER)
+    assert storage_trial.customer_note_html(CUSTOMER, True) == ""
