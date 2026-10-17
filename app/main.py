@@ -143973,16 +143973,16 @@ def _event_media_active_peer(appliance_id: str | None) -> dict | None:
     local-admin-session gate the way this feature's first, unauthenticated
     version did."""
     from live_view_wireguard import EVENT_MEDIA_WIREGUARD_ENABLED
-    from wireguard_remote import active_peers_for_appliance
+    from wireguard_remote import newest_active_peer_for_appliance
     from partner_db import connection
 
     if not EVENT_MEDIA_WIREGUARD_ENABLED or not appliance_id:
         return None
     with connection() as db:
-        peers = active_peers_for_appliance(db, appliance_id)
-    if not peers or not peers[0].get("tunnel_address") or not peers[0].get("media_fetch_secret"):
+        peer = newest_active_peer_for_appliance(db, appliance_id)  # 1.2.7 audit: the rotated-in key, not the oldest
+    if not peer or not peer.get("tunnel_address") or not peer.get("media_fetch_secret"):
         return None
-    return peers[0]
+    return peer
 
 
 def _log_event_media_fetch(media_id: str, source: str, bytes_served: int, outcome: str) -> None:

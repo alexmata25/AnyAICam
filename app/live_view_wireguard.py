@@ -93,12 +93,13 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request, Response
 
 from partner_db import connection
 from partner_portal import partner_identity
-from wireguard_remote import active_peers_for_appliance
+from wireguard_remote import newest_active_peer_for_appliance
 
 log = logging.getLogger("anyaicam.live_view_wireguard")
 
@@ -121,6 +122,9 @@ GATEWAY_FETCH_TIMEOUT_SECONDS = float(os.environ.get("ANYAICAM_WIREGUARD_GATEWAY
 _SEGMENT_NAME_RE = re.compile(r"camera(\d+)_[0-9]+\.ts")
 _PLAYLIST_TAG_RE = re.compile(r"#EXT-X-(?:VERSION|TARGETDURATION|MEDIA-SEQUENCE|INDEPENDENT-SEGMENTS):.*")
 _EXTINF_RE = re.compile(r"#EXTINF:[0-9]+(?:\.[0-9]+)?,")
+
+
+LEASE_REFRESH_SECONDS = 60
 
 
 class GatewayUnavailable(Exception):
@@ -149,8 +153,36 @@ def _live_camera_allowed(camera_id: str) -> bool:
 
 
 def _tunnel_address_for_appliance(db, appliance_id: str) -> str | None:
-    peers = active_peers_for_appliance(db, appliance_id)
-    return peers[0]['tunnel_address'] if peers else None
+    # 1.2.7 transport audit (defect 5): after a key rotation both peers stay active for a while; the appliance uses
+    # its NEWEST key, so the oldest row's tunnel address was a dead route.
+    peer = newest_active_peer_for_appliance(db, appliance_id)
+    return peer['tunnel_address'] if peer else None
+
+
+def _live_session_for_viewer(db, session_id: str, identity: dict, now: datetime) -> dict:
+    """1.2.7 transport audit (defect 3): the WireGuard fetch used to accept ANY session row of the customer -- a
+    stopped or expired one, another user's, or one whose viewer had since lost can_live. It now requires the viewer's
+    own live session and re-checks the live permission on every fetch, like the relay playlist route."""
+    from live_view_sessions import _authorized_camera as _authorized_live_camera
+    session = _own_session(db, session_id, identity)
+    if str(session.get('requested_by') or '').lower() != str(identity.get('email') or '').lower():
+        raise HTTPException(status_code=404, detail='Live view session not found.')
+    if session.get('state') != 'requested' or str(session.get('expires_at') or '') <= now.isoformat():
+        raise HTTPException(status_code=409, detail='Live view session is not active.')
+    _authorized_live_camera(db, session['camera_id'], identity)
+    return session
+
+
+def _lease_wireguard_session(db, session_id: str, now: datetime) -> None:
+    """A WireGuard viewer never fetches the relay playlist either, so its playlist fetches extend the session lease
+    (only expires_at -- never last_seen_at, the relay demand), at most once per LEASE_REFRESH_SECONDS."""
+    from live_relay_idle_sweep import SESSION_LEASE_SECONDS
+    lease_until = now + timedelta(seconds=SESSION_LEASE_SECONDS)
+    refresh_before = lease_until - timedelta(seconds=LEASE_REFRESH_SECONDS)
+    db.execute(
+        "UPDATE live_view_sessions SET expires_at=? WHERE id=? AND state='requested' AND expires_at>? AND expires_at<?",
+        (lease_until.isoformat(), session_id, now.isoformat(), refresh_before.isoformat()),
+    )
 
 
 def _fetch_via_gateway(tunnel_address: str, port: int, path: str) -> bytes:
@@ -208,8 +240,9 @@ def register_live_view_wireguard_routes(app: FastAPI) -> None:
     @app.get('/api/customer/live/sessions/{session_id}/wireguard/{filename}')
     def wireguard_fetch(request: Request, session_id: str, filename: str):
         identity = _customer_identity(request)
+        now = datetime.now()
         with connection() as db:
-            session = _own_session(db, session_id, identity)
+            session = _live_session_for_viewer(db, session_id, identity, now)
             if not _live_camera_allowed(session['camera_id']):
                 raise HTTPException(status_code=404, detail='WireGuard live view is not enabled for this camera.')
             camera = db.execute(
@@ -218,6 +251,8 @@ def register_live_view_wireguard_routes(app: FastAPI) -> None:
             if not camera or not camera['appliance_id'] or camera['camera_number'] is None:
                 raise HTTPException(status_code=404, detail='Camera is not eligible for WireGuard live view.')
             tunnel_address = _tunnel_address_for_appliance(db, camera['appliance_id'])
+            if tunnel_address and filename == 'playlist.m3u8':
+                _lease_wireguard_session(db, session_id, now)
         if not tunnel_address:
             raise HTTPException(status_code=503, detail='No active WireGuard tunnel for this appliance.')
 

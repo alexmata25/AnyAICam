@@ -282,6 +282,12 @@ def active_peers_for_appliance(db, appliance_id: str) -> list[dict]:
     ]
 
 
+def newest_active_peer_for_appliance(db, appliance_id: str) -> dict | None:
+    """The peer the appliance is actually using: its most recent enrollment (a rotation leaves older rows active)."""
+    peers = active_peers_for_appliance(db, appliance_id)
+    return peers[-1] if peers else None
+
+
 def register_wireguard_remote_appliance_routes(app: FastAPI) -> None:
     @app.post("/api/appliance/wireguard/enroll")
     def wireguard_enroll(request: Request, payload: dict) -> dict:
