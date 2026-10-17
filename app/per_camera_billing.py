@@ -76,11 +76,11 @@ REMOTE_PHONE_SUPPORT = "Free remote technical support by phone, Monday through S
 FEATURE_LABELS = {
     "local_vms": "Local VMS", "local_recording": "Local recording", "local_playback": "Local playback",
     "basic_motion_events": "Basic motion and events", "standard_camera_management": "Camera management",
-    "remote_viewing_where_supported": "Remote viewing where supported", "person_vehicle_detection": "Person and vehicle detection",
+    "remote_viewing_where_supported": "Remote viewing: watch your cameras from anywhere using your phone or computer", "person_vehicle_detection": "Person and vehicle detection",
     "smart_motion": "Smart Motion", "ai_event_search_filtering": "AI event search and filters",
     "intelligent_notifications": "Intelligent notifications", "core_aaco_retrieval": "Core AACO video and event retrieval",
     "supported_talk_down": "Talk Down / two-way audio on supported cameras", "hybrid_cloud_services": "Hybrid cloud services",
-    "remote_cloud_services": "Remote cloud services", "cloud_event_protection": "Cloud event protection",
+    "remote_cloud_services": "Cloud Video Backup: an extra copy of your event video clips, stored online", "cloud_event_protection": "Cloud event protection",
     # Owner approval 2026-10-17: included with every plan (Basic Local, AI Local and Hybrid).
     "remote_phone_support": REMOTE_PHONE_SUPPORT,
 }

@@ -105,7 +105,7 @@ def test_hybrid_shows_ai_features_plus_cloud_event_retention(db_path, monkeypatc
     _plan(db_path, monkeypatch, "hybrid")
     included = _included(_page(db_path))
     for label in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio on supported cameras",
-                  "Hybrid cloud services", "Remote cloud services",
+                  "Hybrid cloud services", "Cloud Video Backup: an extra copy of your event video clips, stored online",
                   "Cloud event storage: 14 days (event clips, not continuous recording)", "Local recording retention: 7 days standard"):
         assert label in included
 

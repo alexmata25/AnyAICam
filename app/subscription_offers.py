@@ -44,7 +44,7 @@ PACKAGE_NAMES = {
 }
 # Plan features shown with customer wording (keys from per_camera_billing.FEATURE_LABELS).
 PLAN_FEATURE_WORDING = {
-    "remote_viewing_where_supported": "Remote viewing where supported",
+    "remote_viewing_where_supported": "Remote viewing: watch your cameras from anywhere using your phone or computer",
 }
 # Features a plan's gating treats as included (analytics_entitlements.account_wide_feature_active).
 # voice_call is deliberately absent: ordinary Talk Down does not include AAC Voice Call.

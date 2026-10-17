@@ -106,3 +106,16 @@ def test_my_subscription_comparison_and_inclusions_show_the_prices_and_phone_sup
     assert row.count("<td>✓</td>") == 3  # included with Basic Local, AI Local and Hybrid
     for key in billing.PLANS:
         assert f'data-included="{billing.REMOTE_PHONE_SUPPORT}"' in subscription_offers.plan_inclusions_html(key), key
+
+
+def test_the_plan_comparison_says_every_plan_watches_remotely_and_only_hybrid_has_cloud_video_backup():
+    """Owner request 2026-10-17: everyday wording; remote viewing is not a Hybrid feature."""
+    import subscription_offers
+    table = subscription_offers.plan_comparison_html()
+
+    def row(label):
+        return table.split(label, 1)[1].split("</tr>", 1)[0]
+    assert row("Remote viewing: watch your cameras from anywhere using your phone or computer").count("<td>✓</td>") == 3
+    backup = row("Cloud Video Backup: an extra copy of your event video clips, stored online")
+    assert backup.count("<td>✓</td>") == 1 and backup.count("Not included") == 2
+    assert "Remote cloud services" not in table and "Remote viewing where supported" not in table
