@@ -276,3 +276,20 @@ def test_an_unpaid_appliance_checkout_never_activates(env):
                      "anyaicam_camera_quantity": "4", "anyaicam_hardware_items": "AIC-APPLIANCE-RYZEN-STARTER:1"}}}}
     assert _deliver(env, event).status_code == 200
     assert _nothing_granted(env)
+
+
+def _old_flow_appliance(env, order_status):
+    """A Build Your System appliance order from before hardware-first: the order plus its deferred storage plan."""
+    _exec(env, "INSERT INTO hardware_orders(id,customer_id,sku,product_name,stripe_price_id,quantity,amount_cents,status,"
+               "stripe_checkout_session_id,created_at,updated_at) VALUES('hw-old',?,'AIC-APPLIANCE-RYZEN-STARTER','AnyAiCam Starter',"
+               "'price_hw',1,124999,?,'cs_old',?,?)", (CID, order_status, _now(), _now()))
+    _exec(env, "INSERT INTO deferred_storage_plans(customer_id,plan_key,camera_quantity,checkout_session_id,state,created_at,updated_at) "
+               "VALUES(?,'hybrid',4,'cs_old','pending_activation',?,?)", (CID, _now(), _now()))
+
+
+@pytest.mark.parametrize("order_status,activated", [("paid", True), ("refunded", False), ("disputed", False)])
+def test_an_old_flow_storage_plan_counts_only_while_its_appliance_is_paid(env, order_status, activated):
+    """Green 2026-10-16: a refund or dispute leaves deferred_storage_plans in place; it no longer activates."""
+    import per_camera_billing as billing
+    _old_flow_appliance(env, order_status)
+    assert billing.account_activated(CID) is activated
