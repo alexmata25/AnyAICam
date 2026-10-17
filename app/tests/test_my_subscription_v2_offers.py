@@ -111,7 +111,7 @@ def test_hybrid_shows_ai_features_plus_cloud_event_retention(db_path, monkeypatc
 
 
 @pytest.mark.parametrize("plan_key,expected", [("basic_local", "$9.99 per camera/month · $39.96"), ("ai_local", "$14.99 per camera/month · $59.96"),
-                                               ("hybrid", "$24.99 per camera/month · $99.96")])
+                                               ("hybrid", "$19.99 per camera/month · $79.96")])
 def test_current_plan_states_cameras_and_monthly_cost(db_path, monkeypatch, prices, plan_key, expected):
     _plan(db_path, monkeypatch, plan_key, quantity=4)
     html = _page(db_path)
@@ -234,7 +234,7 @@ def test_without_a_plan_the_three_plans_are_compared_from_the_catalog(db_path, m
     seed_customer(db_path)
     html = _page(db_path)
     table = re.search(r'id="v2-plan-compare".*?</table>', html, re.S).group(0)
-    assert "$9.99 per camera/month" in table and "$14.99 per camera/month" in table and "$24.99 per camera/month" in table
+    assert "$9.99 per camera/month" in table and "$14.99 per camera/month" in table and "$19.99 per camera/month" in table
     assert "Cloud event storage" in table and "14 days" in table
     assert 'id="v2-checkout-button"' in html
 

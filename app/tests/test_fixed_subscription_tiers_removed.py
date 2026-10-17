@@ -1,7 +1,7 @@
 """Owner decision 2026-10-08: camera plans are per camera only. The fixed
 8/16/32/64-camera Local and Hybrid subscription tiers are removed from the
 catalog, the customer pages and every checkout / plan-change path. The
-per-camera plans (Basic Local $9.99, AI Local $14.99, Hybrid $24.99 per
+per-camera plans (Basic Local $9.99, AI Local $14.99, Hybrid $19.99 per
 camera per month) and the separate one-time VMS software licences stay
 exactly as they were, Stripe Price ID env vars included."""
 import inspect
@@ -69,7 +69,7 @@ def test_the_catalog_has_no_fixed_subscription_tiers():
 
 def test_the_per_camera_plans_are_unchanged():
     prices = {key: plan["monthly_cents_per_camera"] for key, plan in per_camera_billing.PLANS.items()}
-    assert prices == {"basic_local": 999, "ai_local": 1499, "hybrid": 2499}
+    assert prices == {"basic_local": 999, "ai_local": 1499, "hybrid": 1999}
     assert per_camera_billing.PRICE_ENV == {"basic_local": "ANYAICAM_STRIPE_PRICE_BASIC_LOCAL",
                                             "ai_local": "ANYAICAM_STRIPE_PRICE_AI_LOCAL",
                                             "hybrid": "ANYAICAM_STRIPE_PRICE_HYBRID"}

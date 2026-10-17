@@ -82,7 +82,7 @@ def test_customer_with_no_plan_gets_the_billing_v2_plan_picker(http_client, db_p
     html = response.text
     assert "No per-camera plan selected yet" in html
     assert 'id="v2-checkout-button"' in html and "/api/v2/customer/subscription/checkout" in html
-    for option in ("Basic Local · $9.99 per camera/month", "AI Local · $14.99 per camera/month", "Hybrid · $24.99 per camera/month"):
+    for option in ("Basic Local · $9.99 per camera/month", "AI Local · $14.99 per camera/month", "Hybrid · $19.99 per camera/month"):
         assert option in html
     assert 'id="choose-plan-button"' not in html and "Local vs Hybrid" not in html
 

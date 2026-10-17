@@ -302,7 +302,7 @@ def test_my_subscription_offers_a_new_direct_owner_the_billing_v2_plans(site, db
     _direct_owner(client, mail, "chooser@example.test")
     page = client.get("/subscription-portal").text
     assert 'id="v2-checkout-button"' in page and "/api/v2/customer/subscription/checkout" in page
-    for option in ("Basic Local · $9.99", "AI Local · $14.99", "Hybrid · $24.99"):
+    for option in ("Basic Local · $9.99", "AI Local · $14.99", "Hybrid · $19.99"):
         assert option in page
     assert 'id="choose-plan-button"' not in page and 'value="local|1-8"' not in page
     customer_id = _one(db_path, "SELECT id FROM customers WHERE email='chooser@example.test'")["id"]
