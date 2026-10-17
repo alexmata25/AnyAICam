@@ -324,7 +324,11 @@ def test_smart_motion_off_with_lpr_on_creates_no_person_vehicle_events(monkeypat
         "ok": True, "frame": None, "frame_captured_at": None,
         "detections": [{"class_name": "person", "confidence": 0.9, "x": 1, "y": 1, "width": 50, "height": 90}]})
     monkeypatch.setattr(main, "save_yolo_events", fake_save)
-    monkeypatch.setattr(main.lpr, "LPR_ENABLED", False)
+    # LPR is genuinely enabled on this appliance and camera (2026-10-17 activation
+    # gate: an LPR camera flag only starts the detector when LPR itself is on);
+    # frame is None, so no LPR scan runs and only the event gate is exercised.
+    monkeypatch.setattr(main.lpr, "LPR_ENABLED", True)
+    monkeypatch.setattr(main.lpr, "is_camera_enabled", lambda camera: True)
     monkeypatch.setattr(main.asyncio, "to_thread", direct)
     monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
     class ImmediateSemaphore:

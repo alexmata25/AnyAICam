@@ -394,6 +394,10 @@ def test_people_counting_and_ai_person_detector_cannot_run_inference_concurrentl
         main.recording_uploader, "_camera_identity",
         lambda cam: {"people_counting_enabled": True},
     )
+    # People Counting is a real, appliance-enabled analytic here (its worker is
+    # only spawned when PEOPLE_COUNTING_ENABLED): since the 2026-10-17
+    # activation gate, a camera flag alone no longer starts the detector.
+    monkeypatch.setattr(main, "PEOPLE_COUNTING_ENABLED", True)
     monkeypatch.setattr(
         main, "_load_people_counting_rule",
         lambda cam: {

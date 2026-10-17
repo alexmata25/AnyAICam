@@ -39366,6 +39366,48 @@ async def people_counting_worker(camera_number: int) -> None:
         await asyncio.sleep(PEOPLE_COUNTING_INTERVAL_SECONDS)
 
 
+# Analytics activation gate (2026-10-17, Yellow's Ryzen finding): a camera's
+# analytic counts as active only when BOTH its camera-level flag (cloud/RDM
+# entitlement + operational switch, via recording_uploader's camera map) AND
+# the appliance-wide switch / pilot scope that the analytic's own processing
+# already checks allow it. Before this, a camera with ppe_enabled=1 kept the
+# shared YOLO detector and its full-resolution AI frame reader running while
+# PPE was disabled appliance-wide (ANYAICAM_PPE_ENABLED=false): Ryzen cameras
+# 2/3, every analytic off in the UI, 20-27 % CPU each decoding 1440p.
+def _analytic_globally_enabled(flag: str, camera_number: int) -> bool:
+    """The appliance-wide condition each analytic's own processing applies."""
+    if flag == "smart_motion_enabled":
+        return True  # the detector itself (AI_PERSON_DETECTION_ENABLED gates the whole worker)
+    if flag == "people_counting_enabled":
+        return PEOPLE_COUNTING_ENABLED
+    if flag == "lpr_enabled":
+        return bool(lpr.LPR_ENABLED and lpr.is_camera_enabled(camera_number))
+    if flag == "ppe_enabled":
+        return bool(ppe.PPE_ENABLED and ppe.is_camera_enabled(camera_number))
+    if flag == "facial_recognition_enabled":
+        return bool(facial_recognition.FACIAL_RECOGNITION_ENABLED
+                    and facial_recognition.is_camera_enabled(camera_number))
+    return False
+
+
+AI_DETECTOR_ANALYTIC_FLAGS = ("smart_motion_enabled", "people_counting_enabled", "lpr_enabled", "ppe_enabled",
+                              "facial_recognition_enabled")
+
+
+def effective_analytics(identity, camera_number: int, flags=AI_DETECTOR_ANALYTIC_FLAGS) -> list:
+    """The analytics actually active on this camera: camera flag AND appliance-wide switch. Never raises."""
+    if not identity:
+        return []
+    active = []
+    for flag in flags:
+        try:
+            if bool(identity.get(flag)) and _analytic_globally_enabled(flag, camera_number):
+                active.append(flag)
+        except Exception:
+            continue  # fail closed for that analytic
+    return active
+
+
 async def ai_person_detector(camera_number: int) -> None:
     # Startup stagger -- see AI_DETECTOR_STARTUP_STAGGER_SECONDS's own
     # comment. All 5 of these tasks are created back-to-back with no gap
@@ -39502,9 +39544,7 @@ async def ai_person_detector(camera_number: int) -> None:
             # when this camera has no effective analytics authorization;
             # recording and video workers are separate tasks and continue.
             runtime_identity = recording_uploader._camera_identity(camera_number)
-            if not runtime_identity or not any(bool(runtime_identity.get(flag)) for flag in (
-                    "smart_motion_enabled", "people_counting_enabled", "lpr_enabled", "ppe_enabled",
-                    "facial_recognition_enabled")):
+            if not effective_analytics(runtime_identity, camera_number):
                 state.update(status="paused", error=None, pause_reason="analytics_disabled")
                 await asyncio.sleep(AI_DETECTION_INTERVAL_SECONDS)
                 continue
@@ -39620,7 +39660,7 @@ async def ai_person_detector(camera_number: int) -> None:
 
                 detections
                 and not stationary_repeat
-                and any(bool(runtime_identity.get(flag)) for flag in (
+                and effective_analytics(runtime_identity, camera_number, (
                     "smart_motion_enabled", "ppe_enabled", "facial_recognition_enabled"))
 
 
