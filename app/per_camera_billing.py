@@ -1390,11 +1390,14 @@ def register_routes(app: FastAPI) -> None:
         entitlement, current = _owner_subscription(identity)
         if current.get("cancel_at_period_end"):
             return {"status": "already_scheduled", "effective_at": _period_end(current)}
-        main.stripe_api_post(f"/v1/subscriptions/{current['id']}", [("cancel_at_period_end", "true")],
-                             idempotency_key=f"anyaicam-v2-cancel-{current['id']}-{_period_end(current) or ''}")
-        current = stripe_state.current_subscription(str(current["id"])) or current
-        _upsert_current(current)
-        with connection() as db:
-            db.execute("UPDATE camera_plan_entitlements_v2 SET cancel_at_period_end=1,updated_at=? WHERE id=?",
-                       (_now(), entitlement["id"]))
+        # One key per attempt: a cancel, an un-cancel in the billing portal and a second cancel in the same period must
+        # each reach Stripe (a per-period key made Stripe replay its first answer and change nothing). Setting
+        # cancel_at_period_end=true twice is harmless, so a double click needs no shared key.
+        answer = main.stripe_api_post(f"/v1/subscriptions/{current['id']}", [("cancel_at_period_end", "true")],
+                                      idempotency_key=f"anyaicam-v2-cancel-{current['id']}-{uuid.uuid4().hex}")
+        current = stripe_state.current_subscription(str(current["id"])) or answer or current
+        _upsert_current(current)  # the local state follows what Stripe reports, never an assumption
+        if not current.get("cancel_at_period_end"):
+            logger.warning("per_camera_billing.cancel_not_confirmed subscription=%s", current.get("id"))
+            raise HTTPException(status_code=502, detail="Your cancellation could not be confirmed. Please try again in a moment.")
         return {"status": "cancellation_scheduled", "effective_at": _period_end(current)}
