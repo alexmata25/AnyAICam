@@ -70,3 +70,10 @@ def test_signaling_storage_rejects_oversized_payload_instead_of_truncating_json(
                                      now=datetime.now())
     assert rejected.value.status_code == 413
     assert db.params is None
+
+
+def test_disabled_p2p_flag_fails_closed_at_signaling_layer(monkeypatch):
+    monkeypatch.setattr(live_view_p2p, "LIVE_P2P_ENABLED", False)
+    with pytest.raises(HTTPException) as rejected:
+        live_view_p2p._require_p2p_enabled()
+    assert rejected.value.status_code == 404

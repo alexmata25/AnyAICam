@@ -31,6 +31,12 @@ import partner_portal
 from database_backend import override_target
 
 
+@pytest.fixture(autouse=True)
+def p2p_routes_enabled_for_test(monkeypatch):
+    import live_view_p2p
+    monkeypatch.setattr(live_view_p2p, "LIVE_P2P_ENABLED", True)
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_live_view_p2p_signaling.db"

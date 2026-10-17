@@ -175,6 +175,12 @@ def _customer_identity(request: Request) -> dict:
     return identity
 
 
+def _require_p2p_enabled() -> None:
+    """Keep disabled P2P signaling routes closed server-side as well as in UI."""
+    if not LIVE_P2P_ENABLED:
+        raise HTTPException(status_code=404, detail='P2P signaling is not enabled.')
+
+
 def _own_session(db, session_id: str, identity: dict) -> dict:
     session = db.execute(
         'SELECT * FROM live_view_sessions WHERE id=? AND customer_id=?',
@@ -239,6 +245,7 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
     @app.post('/api/customer/live/sessions/{session_id}/p2p/offer')
     def submit_offer(request: Request, session_id: str, payload: dict) -> dict:
         identity = _customer_identity(request)
+        _require_p2p_enabled()
         sdp = str(payload.get('sdp', ''))
         if not sdp.strip():
             raise HTTPException(status_code=400, detail='sdp is required.')
@@ -257,6 +264,7 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
     @app.post('/api/customer/live/sessions/{session_id}/p2p/ice')
     def submit_client_ice(request: Request, session_id: str, payload: dict) -> dict:
         identity = _customer_identity(request)
+        _require_p2p_enabled()
         candidate = payload.get('candidate')
         if not isinstance(candidate, dict) or not str(candidate.get('candidate', '')).strip():
             raise HTTPException(status_code=400, detail='candidate is required.')
@@ -273,6 +281,7 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
     @app.get('/api/customer/live/sessions/{session_id}/p2p/answer')
     def poll_answer(request: Request, session_id: str) -> dict:
         identity = _customer_identity(request)
+        _require_p2p_enabled()
         now = datetime.now()
         with connection() as db:
             _own_session(db, session_id, identity)
@@ -361,6 +370,7 @@ def register_live_view_p2p_appliance_routes(app: FastAPI) -> None:
         The response echoes long_poll_seconds so the appliance knows this
         cloud honored the wait and can re-poll immediately."""
         appliance = await asyncio.to_thread(authenticate_appliance, request)
+        _require_p2p_enabled()
         wait_seconds = max(0.0, min(float(wait or 0.0), MAX_PENDING_WAIT_SECONDS))
         # Registered BEFORE the first check, so a signal committed between
         # the check and the wait still wakes this request.
@@ -390,6 +400,7 @@ def register_live_view_p2p_appliance_routes(app: FastAPI) -> None:
     @app.post('/api/appliance/live/{camera_id}/p2p/answer')
     def submit_answer(request: Request, camera_id: str, payload: dict) -> dict:
         appliance = authenticate_appliance(request)
+        _require_p2p_enabled()
         _authorized_camera(appliance, camera_id)
         session_id = str(payload.get('session_id', '')).strip()
         sdp = str(payload.get('sdp', ''))
@@ -409,6 +420,7 @@ def register_live_view_p2p_appliance_routes(app: FastAPI) -> None:
     @app.post('/api/appliance/live/{camera_id}/p2p/ice')
     def submit_appliance_ice(request: Request, camera_id: str, payload: dict) -> dict:
         appliance = authenticate_appliance(request)
+        _require_p2p_enabled()
         _authorized_camera(appliance, camera_id)
         session_id = str(payload.get('session_id', '')).strip()
         candidate = payload.get('candidate')
