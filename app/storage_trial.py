@@ -441,14 +441,28 @@ def authorize_paid(identity: dict) -> dict:
             raise TrialError(409, "Add a payment method in Manage billing first, then choose to continue cloud storage "
                                   "after your trial.")
         fields.append(("default_payment_method", method))
-    # One key per attempt: after a cancel withdrew an earlier choice, a second "Continue" must reach Stripe again
-    # (a per-subscription key would replay the first answer and change nothing).
-    main.stripe_api_post(f"/v1/subscriptions/{trial['stripe_subscription_id']}", fields,
-                         idempotency_key=f"anyaicam-storage-trial-authorize-{trial['stripe_subscription_id']}-{uuid.uuid4().hex}")
+    # The owner's choice is recorded BEFORE Stripe is asked (Green review of 90f061c): Stripe's own
+    # customer.subscription.updated (cancel_at_period_end true -> false) can reach the webhook before this call
+    # returns, and the guard must then see an authorized trial -- otherwise it would set the subscription to end again
+    # and silently undo the customer's explicit choice. If the Stripe call fails, the record is withdrawn again (only
+    # the value written here, never a later one).
     now = _iso(_now())
     with connection() as db:
-        db.execute("UPDATE storage_trials SET paid_authorized_at=?,paid_authorized_by=?,updated_at=? WHERE id=?",
-                   (now, identity.get("email") or "", now, trial["id"]))
+        claimed = db.execute("UPDATE storage_trials SET paid_authorized_at=?,paid_authorized_by=?,updated_at=? "
+                             "WHERE id=? AND paid_authorized_at IS NULL",
+                             (now, identity.get("email") or "", now, trial["id"])).rowcount
+    if not claimed:
+        return {"status": "already_authorized", "expires_at": trial["expires_at"]}
+    # One key per attempt: after a cancel withdrew an earlier choice, a second "Continue" must reach Stripe again
+    # (a per-subscription key would replay the first answer and change nothing).
+    try:
+        main.stripe_api_post(f"/v1/subscriptions/{trial['stripe_subscription_id']}", fields,
+                             idempotency_key=f"anyaicam-storage-trial-authorize-{trial['stripe_subscription_id']}-{uuid.uuid4().hex}")
+    except Exception:
+        with connection() as db:
+            db.execute("UPDATE storage_trials SET paid_authorized_at=NULL,paid_authorized_by=NULL,updated_at=? "
+                       "WHERE id=? AND paid_authorized_at=?", (_iso(_now()), trial["id"], now))
+        raise
     audit(identity, "storage_trial.paid_authorized", "customer", customer_id,
           {"trial_id": trial["id"], "stripe_subscription_id": trial["stripe_subscription_id"], "starts_paid_at": trial["expires_at"]})
     try:

@@ -461,6 +461,51 @@ def test_conversion_to_paid_storage_needs_the_customers_explicit_authorization(s
     assert stored["status"] == "converted" and stored["converted_at"] and _audit(db_path, "storage_trial.converted")
 
 
+def test_stripes_own_update_arriving_during_continue_as_paid_is_never_guarded_back(shop, db_path, monkeypatch):
+    """Green review of 90f061c: Stripe's customer.subscription.updated for the owner's own "Continue" can reach the
+    webhook before authorize_paid returns. The choice is recorded first, so the guard leaves it alone."""
+    import main
+    client, _, stripe = shop
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    sub = _trialing_plan(stripe, db_path, _trial(db_path)["id"])
+    stripe["customers"][sub["customer"]] = {"id": sub["customer"], "invoice_settings": {"default_payment_method": "pm_card_added"}}
+    real_post, webhook_results = main.stripe_api_post, []
+
+    def post_then_webhook(path, fields, idempotency_key=None):
+        result = real_post(path, fields, idempotency_key=idempotency_key)
+        if dict(fields).get("cancel_at_period_end") == "false":  # Stripe notifies before the API call returns
+            event = _event("customer.subscription.updated", sub, previous_attributes={"cancel_at_period_end": True})
+            event["id"] = "evt_owner_continue"
+            webhook_results.append(_sync(event))
+        return result
+
+    monkeypatch.setattr(main, "stripe_api_post", post_then_webhook)
+    response = client.post("/api/v2/customer/storage-trial/continue-paid", json={"authorize_paid_storage": True},
+                           cookies=_cookie(*OWNER))
+    assert response.status_code == 200, response.text
+    assert webhook_results == [{"status": "trialing"}]  # not "guarded"
+    assert sub["cancel_at_period_end"] is False
+    assert [u for u in stripe["updates"] if dict(u[1]) == {"cancel_at_period_end": "true"}][1:] == []  # no guard after
+    assert _trial(db_path)["paid_authorized_by"] == "owner@example.test"
+
+
+def test_a_failed_stripe_call_withdraws_the_recorded_choice(shop, db_path, monkeypatch):
+    import main
+    client, _, stripe = shop
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    sub = _trialing_plan(stripe, db_path, _trial(db_path)["id"])
+    stripe["customers"][sub["customer"]] = {"id": sub["customer"], "invoice_settings": {"default_payment_method": "pm_card_added"}}
+
+    def stripe_down(path, fields, idempotency_key=None):
+        raise RuntimeError("stripe unavailable")
+
+    monkeypatch.setattr(main, "stripe_api_post", stripe_down)
+    with pytest.raises(Exception):
+        client.post("/api/v2/customer/storage-trial/continue-paid", json={"authorize_paid_storage": True},
+                    cookies=_cookie(*OWNER))
+    assert _trial(db_path)["paid_authorized_at"] is None and _audit(db_path, "storage_trial.paid_authorized") == []
+
+
 def test_an_unpaid_post_trial_invoice_is_not_a_conversion(shop, db_path):
     client, _, stripe = shop
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
