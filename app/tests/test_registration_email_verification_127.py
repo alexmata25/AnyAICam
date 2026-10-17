@@ -405,3 +405,58 @@ def test_a_failed_first_confirmation_email_leaves_no_hold(db, monkeypatch):
     item = _request(db)
     assert item["verification_token_hash"] is None and item["verification_sent_at"] is None
     assert cr.issue_registration_verification(EMAIL)  # a re-submission can issue a link at once
+
+
+# Codex 2026-10-17 finding 5: concurrent resends ------------------------------------------------------------------------
+def test_of_two_simultaneous_link_issues_only_one_succeeds_and_only_its_token_works(db, monkeypatch):
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    real_token, inner = cr.secrets.token_urlsafe, {}
+
+    def racing_token(n):
+        token = real_token(n)
+        if "raw" not in inner:
+            inner["raw"] = None
+            inner["raw"] = cr.issue_registration_verification(EMAIL, force=True)  # lands between SELECT and UPDATE
+        return token
+
+    monkeypatch.setattr(cr.secrets, "token_urlsafe", racing_token)
+    outer = cr.issue_registration_verification(EMAIL, force=True)
+    monkeypatch.setattr(cr.secrets, "token_urlsafe", real_token)
+    assert inner["raw"] and outer is None              # exactly one link was issued
+    assert cr.verify_registration_email(inner["raw"], PASSWORD, "Owner") is True
+
+
+def test_simultaneous_resends_email_exactly_one_link_and_it_is_the_valid_one(db, client, monkeypatch):
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    sent = []
+    import email_service
+
+    class Capture:
+        def send(self, message_type, to, subject, text, **kw):
+            sent.append(text.split("token=", 1)[1].split()[0])
+            return {"status": "sent"}
+
+    monkeypatch.setattr(email_service, "get_email_service", lambda: Capture())
+    monkeypatch.setenv("ANYAICAM_PUBLIC_URL", "https://app.example.test")
+    real_token, fired = cr.secrets.token_urlsafe, []
+
+    def racing_token(n):
+        token = real_token(n)
+        if not fired:
+            fired.append(None)
+            fired[0] = cr.send_registration_verification(EMAIL, force=True)  # a second resend, concurrently
+        return token
+
+    monkeypatch.setattr(cr.secrets, "token_urlsafe", racing_token)
+    outer = cr.send_registration_verification(EMAIL, force=True)
+    monkeypatch.setattr(cr.secrets, "token_urlsafe", real_token)
+    assert sorted([outer, fired[0]]) == [False, True] and len(sent) == 1
+    assert cr.verify_registration_email(sent[0], PASSWORD, "Owner") is True   # the one delivered token works
+
+
+def test_a_first_link_is_also_compare_and_set(db, monkeypatch):
+    """No earlier link (hash NULL): the guard compares against '' and still lets exactly one issue win."""
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    assert _request(db)["verification_token_hash"] is None
+    first = cr.issue_registration_verification(EMAIL)
+    assert first and _request(db)["verification_token_hash"]

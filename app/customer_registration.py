@@ -40,7 +40,7 @@ def issue_registration_verification(email: str, *, now: datetime | None = None, 
     now = now or datetime.now()
     with connection() as db:
         item = db.execute(
-            "SELECT id,email_verified_at,verification_sent_at FROM customer_registration_requests "
+            "SELECT id,email_verified_at,verification_sent_at,verification_token_hash FROM customer_registration_requests "
             "WHERE email=? AND status='pending'", (normalized,)).fetchone()
         if not item or item["email_verified_at"]:
             return None
@@ -51,11 +51,16 @@ def issue_registration_verification(email: str, *, now: datetime | None = None, 
             except ValueError:
                 pass
         raw = secrets.token_urlsafe(32)
-        db.execute(
+        # Codex 2026-10-17 (concurrent resends): compare-and-set on the link this call read. Of two simultaneous
+        # issues only the first replaces it; the other gets None and sends nothing, so no email ever carries a
+        # token that a concurrent issue has already made invalid.
+        replaced = db.execute(
             "UPDATE customer_registration_requests SET verification_token_hash=?,verification_expires_at=?,"
-            "verification_sent_at=? WHERE id=? AND status='pending' AND email_verified_at IS NULL",
-            (_token_hash(raw), (now + timedelta(hours=VERIFY_TTL_HOURS)).isoformat(), now.isoformat(), item["id"]))
-    return raw
+            "verification_sent_at=? WHERE id=? AND status='pending' AND email_verified_at IS NULL "
+            "AND COALESCE(verification_token_hash,'')=?",
+            (_token_hash(raw), (now + timedelta(hours=VERIFY_TTL_HOURS)).isoformat(), now.isoformat(), item["id"],
+             item["verification_token_hash"] or "")).rowcount
+    return raw if replaced == 1 else None
 
 
 def _link_base() -> str:
