@@ -54,12 +54,25 @@ def dollars(cents: int) -> float:
 # --------------------------------------------------------------------------
 VMS_LICENSE_PRODUCT = "vms_license"
 VMS_LICENSES = [
-    # camera capacity, one-time price (cents), Stripe Price ID env var
-    (8, _cents("49.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8"),
-    (16, _cents("79.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_16"),
-    (32, _cents("129.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_32"),
-    (64, _cents("199.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"),
+    # camera capacity, one-time price (cents), Stripe Price ID env var.
+    # Owner approval 2026-10-17: about half the earlier $49.99 / $79.99 / $129.99 / $199.99.
+    (8, _cents("24.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8"),
+    (16, _cents("37.49"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_16"),
+    (32, _cents("62.49"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_32"),
+    (64, _cents("99.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"),
 ]
+# Stripe Prices are immutable, so each tier's env var above names the NEW Price used by every new checkout (the
+# price guard refuses one that does not charge the catalog amount). A tier's earlier Price IDs stay recognized
+# for the SAME capacity through <env var>_PREVIOUS (comma-separated): a checkout opened before the switch still
+# grants its license, and refunds/disputes of earlier purchases still resolve. Never offered for a new purchase.
+PREVIOUS_PRICE_SUFFIX = "_PREVIOUS"
+
+
+def vms_license_price_ids(env_var: str) -> list[str]:
+    """The tier's current Price ID (first, if configured) and its previous ones."""
+    current = os.environ.get(env_var, "").strip()
+    previous = [item.strip() for item in os.environ.get(env_var + PREVIOUS_PRICE_SUFFIX, "").split(",") if item.strip()]
+    return ([current] if current else []) + [item for item in previous if item != current]
 
 # --------------------------------------------------------------------------
 # 3. Included in every paid Local or Hybrid plan -- never charged for.

@@ -631,9 +631,10 @@ def _load_vms_license_map() -> dict:
     """Stripe Price ID -> one-time VMS license capacity; unset env vars
     contribute nothing (fail closed)."""
     mapping = {}
+    from pricing_catalog import vms_license_price_ids
     for capacity, _cents, env_var in _CATALOG_VMS_LICENSES:
-        price_id = os.environ.get(env_var, "").strip()
-        if price_id:
+        # Current and earlier Price IDs of the tier map to the same capacity (2026-10-17 repricing).
+        for price_id in vms_license_price_ids(env_var):
             mapping[price_id] = {"product": VMS_LICENSE_PRODUCT, "camera_slot_maximum": capacity, "billing_type": "one_time"}
     return mapping
 

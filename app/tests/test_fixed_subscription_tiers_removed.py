@@ -78,8 +78,8 @@ def test_the_per_camera_plans_are_unchanged():
 
 def test_the_one_time_vms_licences_are_unchanged():
     assert pricing_catalog.VMS_LICENSES == [
-        (8, 4999, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8"), (16, 7999, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_16"),
-        (32, 12999, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_32"), (64, 19999, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64")]
+        (8, 2499, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8"), (16, 3749, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_16"),
+        (32, 6249, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_32"), (64, 9999, "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64")]
     assert [lic["capacity"] for lic in pricing_catalog.public_catalog()["vms_licenses"]] == [8, 16, 32, 64]
 
 
