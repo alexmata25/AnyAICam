@@ -38533,7 +38533,9 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # per real continuous event, not one per scan" -- reused here so
         # PPE gets the identical, already-proven duplicate-suppression
         # semantics instead of a second, bespoke mechanism.
-        if class_name == "person" and ppe.is_camera_enabled(camera_number) and bool(ppe_identity and ppe_identity.get("ppe_enabled")) and not is_duplicate:
+        # 2026-10-17 (frame demand): the appliance-wide PPE switch is checked too, BEFORE the person crop --
+        # _crop_full_frame() can grab a main-stream frame over RTSP, which must never happen for a disabled PPE.
+        if class_name == "person" and not is_duplicate and effective_analytics(ppe_identity, camera_number, ("ppe_enabled",)):
             for person_detection in class_detections:
                 try:
                     hx, hy, hw, hh = (
@@ -38608,7 +38610,10 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # _build_payload() and appliance_cloud.py's facial_events
         # detail-row creation in analytics_event_available() for the
         # cloud-side half of this.
-        if class_name == "person" and facial_recognition.is_camera_enabled(camera_number):
+        # 2026-10-17 (frame demand): camera authorization + appliance switch + scope BEFORE the full-resolution
+        # crop and the database work. record_facial_events() still applies its own checks (entitlement row).
+        if class_name == "person" and effective_analytics(recording_uploader._camera_identity(camera_number), camera_number,
+                                                          ("facial_recognition_enabled",)):
             for person_detection in class_detections:
                 try:
                     fx, fy, fw, fh = (

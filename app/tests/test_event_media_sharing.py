@@ -214,11 +214,15 @@ def scan(monkeypatch, tmp_path, pipeline, background_loop):
     # Person/vehicle events exist only while Smart Motion is on (Control Center,
     # bf05889); this scenario needs the person event, so the camera has it on.
     identity = {"ppe_enabled": False, "smart_motion_enabled": True, "cloud_recording_mode": "motion"}
-    monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda camera: identity)
+    faces = {"on": False, "next": 0}
+    # 2026-10-17: facial recognition runs only for an authorized camera with the appliance switch on.
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity",
+                        lambda camera: dict(identity, facial_recognition_enabled=faces["on"]))
+    monkeypatch.setattr(main.ppe, "PPE_ENABLED", True)
+    monkeypatch.setattr(main.facial_recognition, "FACIAL_RECOGNITION_ENABLED", True)
     monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera: identity["ppe_enabled"])
     monkeypatch.setattr(main.ppe, "detect_ppe", lambda crop, camera_number=None: {"hard_hat_present": False, "safety_vest_present": True, "confidence": 0.8})
     monkeypatch.setattr(main.lpr, "is_camera_enabled", lambda camera: False)
-    faces = {"on": False, "next": 0}
     monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda camera: faces["on"])
 
     @contextmanager

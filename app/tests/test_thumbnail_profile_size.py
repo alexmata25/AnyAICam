@@ -94,6 +94,7 @@ def test_ppe_crop_comes_from_the_main_stream_frame(save_env, monkeypatch):
     import ppe
     crops = []
     monkeypatch.setattr(ppe, "is_camera_enabled", lambda n: True)
+    monkeypatch.setattr(ppe, "PPE_ENABLED", True)
     monkeypatch.setattr(ppe, "detect_ppe", lambda crop, camera_number=None: crops.append(crop.shape) or None)
     monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda n: {"ppe_enabled": True})
     monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda n: False)
@@ -111,6 +112,7 @@ def test_ppe_crop_on_hls_frame_is_the_frame_crop_as_before(save_env, monkeypatch
     import ppe
     crops = []
     monkeypatch.setattr(ppe, "is_camera_enabled", lambda n: True)
+    monkeypatch.setattr(ppe, "PPE_ENABLED", True)
     monkeypatch.setattr(ppe, "detect_ppe", lambda crop, camera_number=None: crops.append(crop.shape) or None)
     monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda n: {"ppe_enabled": True})
     monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda n: False)
