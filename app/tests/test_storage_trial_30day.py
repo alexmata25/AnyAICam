@@ -503,17 +503,76 @@ def test_a_paid_subscription_nobody_authorized_is_never_recorded_as_a_conversion
     assert len(_audit(db_path, "storage_trial.charged_without_authorization")) == 2
 
 
-def test_an_un_cancel_in_stripe_that_arrives_after_the_trial_ended_is_still_the_owners_choice(shop, db_path):
+def test_a_paid_subscription_update_is_not_customer_consent_even_if_it_clears_end_of_period(shop, db_path):
     client, _, stripe = shop
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
     sub = _trialing_plan(stripe, db_path, _trial(db_path)["id"])
     _billed_after_trial(stripe, sub, cancel_at_period_end=False)
     with override_target(sqlite_path=str(db_path)):
         result = _sync(_event("customer.subscription.updated", sub, previous_attributes={"cancel_at_period_end": True}))
-    assert result["status"] == "converted"
+    assert result["status"] == "charged_without_authorization"
     stored = _trial(db_path)
-    assert stored["status"] == "converted" and stored["paid_authorized_by"] == "stripe"
-    assert _audit(db_path, "storage_trial.paid_authorized") and _audit(db_path, "storage_trial.charged_without_authorization") == []
+    assert stored["status"] == "active" and stored["paid_authorized_at"] is None
+    assert stored["converted_at"] is None
+    assert _audit(db_path, "storage_trial.paid_authorized") == []
+    assert _audit(db_path, "storage_trial.charged_without_authorization")
+
+
+def test_unauthorized_charge_is_visible_and_admin_can_schedule_only_period_end_stop(shop, db_path):
+    client, _, stripe = shop
+    admin = _make_global_admin(db_path)
+    assert _grant(client, admin).status_code == 200
+    trial = _trial(db_path)
+    sub = _trialing_plan(stripe, trial["id"])
+    _billed_after_trial(stripe, sub, cancel_at_period_end=False)
+    with override_target(sqlite_path=str(db_path)):
+        assert _sync(_event("invoice.paid", {"id": "in_paid_1", "subscription": "sub_trial"}))[
+            "status"] == "charged_without_authorization"
+    assert stripe["updates"] == [] and stripe["deletes"] == []
+
+    page = client.get("/admin/storage-trials", cookies=admin)
+    assert page.status_code == 200
+    assert "Unauthorized paid storage exceptions" in page.text
+    assert "sub_trial" in page.text and "in_paid_1" in page.text
+    assert "Review and stop future renewal" in page.text
+
+    endpoint = f"/api/admin/storage-trials/{trial['id']}/prevent-unauthorized-renewal"
+    mismatch = client.post(endpoint, json={"customer_id": CUSTOMER, "subscription_id": "sub_trial",
+                                          "invoice_id": "in_other", "reason": "Reviewed in Stripe"}, cookies=admin)
+    assert mismatch.status_code == 409 and stripe["updates"] == []
+    result = client.post(endpoint, json={"customer_id": CUSTOMER, "subscription_id": "sub_trial",
+                                        "invoice_id": "in_paid_1", "reason": "Reviewed invoice and customer authorization"},
+                         cookies=admin)
+    assert result.status_code == 200, result.text
+    assert result.json() == {"status": "renewal_scheduled_to_stop", "subscription_id": "sub_trial",
+                             "refund_issued": False, "immediate_cancellation": False}
+    assert stripe["updates"][-1][1] == [("cancel_at_period_end", "true")]
+    assert stripe["deletes"] == []
+    review = _audit(db_path, "storage_trial.unauthorized_renewal_prevented")
+    assert len(review) == 1 and "Reviewed invoice" in review[0]["details_json"]
+    assert "Period-end stop recorded" in client.get("/admin/storage-trials", cookies=admin).text
+
+
+def test_admin_review_of_already_scheduled_stop_is_audited_without_a_stripe_write(shop, db_path):
+    client, _, stripe = shop
+    admin = _make_global_admin(db_path)
+    assert _grant(client, admin).status_code == 200
+    trial = _trial(db_path)
+    sub = _trialing_plan(stripe, trial["id"])
+    _billed_after_trial(stripe, sub, cancel_at_period_end=True)
+    with override_target(sqlite_path=str(db_path)):
+        assert _sync(_event("invoice.paid", {"id": "in_paid_1", "subscription": "sub_trial"}))[
+            "status"] == "charged_without_authorization"
+
+    endpoint = f"/api/admin/storage-trials/{trial['id']}/prevent-unauthorized-renewal"
+    result = client.post(endpoint, json={"customer_id": CUSTOMER, "subscription_id": "sub_trial",
+                                        "invoice_id": "in_paid_1", "reason": "Verified existing stop in Stripe"},
+                         cookies=admin)
+    assert result.status_code == 200 and result.json()["status"] == "already_scheduled"
+    assert stripe["updates"] == [] and stripe["deletes"] == []
+    review = _audit(db_path, "storage_trial.unauthorized_renewal_prevented")
+    assert len(review) == 1 and "already_set" in review[0]["details_json"]
+    assert "Period-end stop recorded" in client.get("/admin/storage-trials", cookies=admin).text
 
 
 def test_a_subscription_still_set_to_end_is_not_an_un_cancel(shop, db_path):
@@ -526,18 +585,19 @@ def test_a_subscription_still_set_to_end_is_not_an_un_cancel(shop, db_path):
     assert result["status"] == "charged_without_authorization" and _trial(db_path)["paid_authorized_at"] is None
 
 
-def test_an_un_cancel_by_a_person_in_stripe_counts_as_authorization_but_nothing_else_does(shop, db_path):
+def test_un_cancelled_trial_event_is_re_scheduled_to_end_without_recording_consent(shop, db_path):
     client, _, stripe = shop
     assert _grant(client, _make_global_admin(db_path)).status_code == 200
     trial = _trial(db_path)
     sub = _trialing_plan(stripe, db_path, trial["id"])
     sub["cancel_at_period_end"] = False
-    with override_target(sqlite_path=str(db_path)):  # some other update: guarded again
-        assert _sync(_event("customer.subscription.updated", sub))["status"] == "guarded"
-        sub["cancel_at_period_end"] = False
-        result = _sync(_event("customer.subscription.updated", sub, previous_attributes={"cancel_at_period_end": True}))
-    assert result["status"] == "paid_authorized_in_stripe"
-    assert _trial(db_path)["paid_authorized_by"] == "stripe"
+    with override_target(sqlite_path=str(db_path)):
+        result = _sync(_event("customer.subscription.updated", sub,
+                              previous_attributes={"cancel_at_period_end": True}))
+    assert result["status"] == "guarded"
+    assert sub["cancel_at_period_end"] is True
+    assert _trial(db_path)["paid_authorized_at"] is None
+    assert _audit(db_path, "storage_trial.paid_authorized") == []
 
 
 def test_plan_changes_wait_until_the_trial_is_over(shop, db_path):
