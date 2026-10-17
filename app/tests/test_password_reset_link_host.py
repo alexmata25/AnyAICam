@@ -248,3 +248,46 @@ def test_reset_page_has_a_show_hide_password_toggle_defaulting_to_masked(http_cl
     assert 'id="show-password" class="show-password" type="button">Show<' in text
     assert "input.type==='password'?'text':'password'" in text
     assert "button.textContent=input.type==='password'?'Show':'Hide'" in text
+
+
+# ---- 2026-10-17 (Green's review): the edge link no longer reflects ANY Host header -------------------------------
+@pytest.mark.parametrize("hostile", ["attacker.example", "attacker.example:8000", "8.8.8.8",
+                                     "anyaicam.com.attacker.example", "192.168.0.1@evil.com"])
+def test_edge_production_never_puts_a_foreign_host_in_the_reset_link(http_client, db_path, monkeypatch, hostile):
+    """Before: "Host: attacker.example" on an edge appliance emailed the victim a link to the attacker's site
+    carrying a valid reset token. Now only the appliance's own kinds of address are used; otherwise the
+    configured reset URL."""
+    _seed_admin(db_path)
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    monkeypatch.setattr(cloud_features, "settings", _edge_production())
+
+    response = http_client.post("/api/password-reset/request", json={"email": "admin@example.test"},
+                                headers={"host": hostile})
+
+    assert response.status_code in (200, 400)  # TrustedHost may refuse a malformed host outright
+    for sent in capturing.sent:
+        assert "attacker" not in sent["text"] and "8.8.8.8" not in sent["text"] and "evil.com" not in sent["text"]
+
+
+def test_edge_production_refuses_a_non_http_forwarded_scheme(http_client, db_path, monkeypatch):
+    _seed_admin(db_path)
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    monkeypatch.setattr(cloud_features, "settings", _edge_production())
+
+    http_client.post("/api/password-reset/request", json={"email": "admin@example.test"},
+                     headers={"host": "192.168.0.165:8000", "x-forwarded-proto": "javascript"})
+
+    assert "javascript:" not in capturing.sent[0]["text"]
+    assert "192.168.0.165:8000" not in capturing.sent[0]["text"]  # fell back to the configured URL
+
+
+@pytest.mark.parametrize("host,origin", [
+    ("localhost:8000", "http://localhost:8000"), ("anyaicam-ryzen.local:8000", "http://anyaicam-ryzen.local:8000"),
+    ("box.tail1234.ts.net", "http://box.tail1234.ts.net"), ("[fe80::1]:8000", "http://[fe80::1]:8000"),
+])
+def test_edge_reset_link_origin_accepts_the_appliances_own_addresses(host, origin):
+    import types
+    request = types.SimpleNamespace(headers={"host": host}, url=types.SimpleNamespace(scheme="http", netloc=""))
+    assert cloud_features._edge_reset_link_origin(request) == origin
