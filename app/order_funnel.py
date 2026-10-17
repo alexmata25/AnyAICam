@@ -101,7 +101,7 @@ def _order_lines(selection: dict, customer_id: str | None = None) -> tuple[str, 
     unit = int(plan["monthly_cents_per_camera"])
     retention = f"{plan['local_retention_days']}-day local recording retention"
     if plan.get("cloud_event_storage"):
-        retention += f" · {plan['cloud_event_retention_days']}-day cloud event retention"
+        retention += " · Cloud Video Backup (event clips stored online)"  # no day count until the expiry is enforced
     line_ids = {build_orders.RELAY_SKU: "order-relays"}
     lines = (f'<div class="order-line" id="order-plan"><span>AnyAiCam {escape(plan["display_name"])}</span><span>{_cameras(quantity)}</span></div>'
              f'<div class="order-line"><span>{_money(unit)} per camera/month</span><span>{retention}</span></div>')

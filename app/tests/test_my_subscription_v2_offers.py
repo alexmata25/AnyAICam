@@ -105,8 +105,8 @@ def test_hybrid_shows_ai_features_plus_cloud_event_retention(db_path, monkeypatc
     _plan(db_path, monkeypatch, "hybrid")
     included = _included(_page(db_path))
     for label in ("Person and vehicle detection", "Smart Motion", "Talk Down / two-way audio on supported cameras",
-                  "Cloud Video Backup: an extra copy of your event video clips, kept online for 14 days",
-                  "Cloud event storage: 14 days (event clips, not continuous recording)",
+                  "Cloud Video Backup: an extra copy of your event video clips, stored online",
+                  "Cloud event storage: event clips stored online (not continuous recording)",
                   "Local recording: up to 7 days (depends on the storage available on your AnyAiCam system)"):
         assert label in included
     for merged in ("Hybrid cloud services", "Cloud event protection"):  # one Cloud Video Backup line (2026-10-17)

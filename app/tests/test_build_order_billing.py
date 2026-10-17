@@ -349,7 +349,11 @@ def test_no_phone_ordering_anywhere_in_the_funnel(shop, db_path):
     client.cookies.clear()
     _new_customer(client, mail, "nophone2@example.test", APPLIANCE_RELAYS)
     pages.append(_order(client).text)
+    import per_camera_billing
     for html in pages:
+        # The plans' free remote technical SUPPORT by phone (owner approval 2026-10-17) is not ordering by phone:
+        # only that exact approved sentence is set aside; any other "by phone" wording still fails.
+        html = html.replace(per_camera_billing.REMOTE_PHONE_SUPPORT, "")
         for phrase in ("by phone", "call (346)", "arranged with AnyAiCam", "not in this online checkout"):
             assert phrase not in html
     import order_funnel

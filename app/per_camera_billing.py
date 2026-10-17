@@ -80,7 +80,7 @@ FEATURE_LABELS = {
     "smart_motion": "Smart Motion", "ai_event_search_filtering": "AI event search and filters",
     "intelligent_notifications": "Intelligent notifications", "core_aaco_retrieval": "Core AACO video and event retrieval",
     "supported_talk_down": "Talk Down / two-way audio on supported cameras", "hybrid_cloud_services": "Hybrid cloud services",
-    "remote_cloud_services": "Cloud Video Backup: an extra copy of your event video clips, kept online for 14 days", "cloud_event_protection": "Cloud event protection",
+    "remote_cloud_services": "Cloud Video Backup: an extra copy of your event video clips, stored online", "cloud_event_protection": "Cloud event protection",
     # Owner approval 2026-10-17: included with every plan (Basic Local, AI Local and Hybrid).
     "remote_phone_support": REMOTE_PHONE_SUPPORT,
 }
@@ -1066,7 +1066,8 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                         f"${payload['monthly_base_total']:.2f} per month in total")
         retention = f"{payload['local_retention_days']}-day local retention"
         if payload["cloud_event_storage"]:
-            retention += f" · {payload['cloud_event_retention_days']}-day cloud event storage"
+            # No day count (owner 2026-10-17): the cloud clip expiry is not enforced yet (S3 lifecycle check).
+            retention += " · Cloud Video Backup (event clips stored online)"
         current_html = f'<div class="health-row"><span>Licensed cameras</span><span>{payload["camera_quantity"]}</span></div><div class="health-row"><span>Retention</span><span>{retention}</span></div>'
     # What the plan includes, from PLANS (subscription_offers, 2026-10-05):
     # features, retention, cloud EVENT retention, the VMS license. Without a

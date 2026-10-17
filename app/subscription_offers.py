@@ -110,7 +110,8 @@ def plan_inclusions_html(plan_key: str, payload: dict | None = None) -> str:
     local_days = (payload or {}).get("local_retention_days") or plan["local_retention_days"]
     rows.append((f"Local recording: up to {local_days} days ({LOCAL_RETENTION_NOTE})", "Included"))
     if plan["cloud_event_storage"]:
-        rows.append((f"Cloud event storage: {plan['cloud_event_retention_days']} days (event clips, not continuous recording)", "Included"))
+        # No day count (owner 2026-10-17): the cloud clip expiry is not enforced yet (S3 lifecycle verified 2026-10-17).
+        rows.append(("Cloud event storage: event clips stored online (not continuous recording)", "Included"))
     html ="".join(f'<div class="health-row" data-included="{escape(label, quote=True)}"><span>{escape(label)}</span>'
                    f'<span class="pill">{escape(state)}</span></div>' for label, state in rows)
     if not plan["cloud_event_storage"]:
@@ -144,7 +145,7 @@ def plan_comparison_html() -> str:
     body += (f"<tr><th scope=\"row\">Local recording (up to; {LOCAL_RETENTION_NOTE})</th>"
              + "".join(f"<td>up to {per_camera_billing.PLANS[k]['local_retention_days']} days</td>" for k in keys) + "</tr>")
     body += ("<tr><th scope=\"row\">Cloud event storage</th>"
-             + "".join(f"<td>{per_camera_billing.PLANS[k]['cloud_event_retention_days']} days</td>" if per_camera_billing.PLANS[k]["cloud_event_storage"]
+             + "".join("<td>✓</td>" if per_camera_billing.PLANS[k]["cloud_event_storage"]
                        else "<td>—</td>" for k in keys) + "</tr>")
     return ('<div style="overflow-x:auto"><table class="plan-compare" id="v2-plan-compare" style="width:100%;border-collapse:collapse;font-size:14px">'
             f'<thead><tr><th></th>{head}</tr></thead><tbody>{body}</tbody></table></div>')

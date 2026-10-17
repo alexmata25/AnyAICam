@@ -116,6 +116,21 @@ def test_the_plan_comparison_says_every_plan_watches_remotely_and_only_hybrid_ha
     def row(label):
         return table.split(label, 1)[1].split("</tr>", 1)[0]
     assert row("Remote viewing: watch your cameras from anywhere using your phone or computer").count("<td>✓</td>") == 3
-    backup = row("Cloud Video Backup: an extra copy of your event video clips, kept online for 14 days")
+    backup = row("Cloud Video Backup: an extra copy of your event video clips, stored online")
     assert backup.count("<td>✓</td>") == 1 and backup.count("Not included") == 2
     assert "Remote cloud services" not in table and "Remote viewing where supported" not in table
+
+
+def test_no_customer_facing_14_day_cloud_promise_while_the_expiry_is_not_enforced():
+    """Owner 2026-10-17: the S3 lifecycle check showed no 14-day expiry is enforced (clips are kept), so the portal must
+    not promise 14 days. Wording only -- the plan's configured value and every retention mechanism are unchanged."""
+    import re
+    import order_funnel
+    import subscription_offers
+    assert billing.PLANS["hybrid"]["cloud_event_retention_days"] == 14  # configuration untouched
+    lines, notes = order_funnel._order_lines({"plan": "hybrid", "cameras": 4})
+    pages = [subscription_offers.plan_comparison_html(), subscription_offers.plan_inclusions_html("hybrid"), lines + notes,
+             " ".join(billing.FEATURE_LABELS.values())]
+    for html in pages:
+        assert not re.search(r"14[- ]day|14 days", html), html[:200]
+    assert "event clips stored online" in subscription_offers.plan_inclusions_html("hybrid")
