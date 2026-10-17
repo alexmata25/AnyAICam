@@ -326,6 +326,17 @@ _P2P_JS = """
     return timer;
   };
 
+  // 1.2.7 transport audit (defect 4): an HLS transport is reported when its first frame actually plays, not when its
+  // player is attached (an attach that never plays used to be recorded as a success). isCurrent() drops the report
+  // when a later attach or a P2P upgrade superseded this one.
+  window.reportLiveTransportOnPlay = function(video, isCurrent, report){
+    const onPlay = () => {
+      video.removeEventListener('playing', onPlay);
+      if (isCurrent()) report();
+    };
+    video.addEventListener('playing', onPlay);
+  };
+
   window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
     if (!sessionId) return;
     fetch(`/api/customer/live/sessions/${sessionId}/transport-outcome`, {
@@ -1234,7 +1245,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
   const stopButton=document.getElementById('live-view-stop');
   const retryButton=document.getElementById('live-view-retry');
   let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
-  let transport=null, p2pConnection=null, startedAt=null;
+  let transport=null, p2pConnection=null, startedAt=null, attachSeq=0;
   const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
 
   function setStatus(text){{statusLabel.textContent=text}}
@@ -1271,6 +1282,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
 
   function showUnavailable(){{
     stopPolling();
+    if(!transport)reportLiveTransportOutcome(sessionId,'failed',null,'no transport delivered video');  // 1.2.7 audit: failures were never recorded
     setStatus('Live view unavailable right now.');
     retryButton.hidden=false;
   }}
@@ -1355,7 +1367,8 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
     }}else{{
       setStatus('This browser cannot play live video.');
     }}
-    if(claim==='claimed')reportLiveTransportOutcome(sessionId,transport,startedAt?Date.now()-startedAt:null,null);
+    const seq=++attachSeq, playedOver=transport;
+    if(claim==='claimed')reportLiveTransportOnPlay(video,()=>seq===attachSeq&&!stopped,()=>reportLiveTransportOutcome(sessionId,playedOver,startedAt?Date.now()-startedAt:null,null));
   }}
 
   function attemptP2P(){{
@@ -1373,6 +1386,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
       video.srcObject=result.stream;
       p2pConnection=result.pc;
       video.play().catch(()=>{{}});
+      attachSeq++;  // a relay/WireGuard attach still waiting for its first frame is superseded
       if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
       keepLiveSessionLeased(sessionId,()=>!stopped&&p2pConnection===result.pc);
       window.watchLiveP2P(result.pc,()=>{{
@@ -2034,6 +2048,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   function showUnavailable(id){{
     stopPolling(id);
+    if(!tiles[id].transport)reportLiveTransportOutcome(tiles[id].sessionId,'failed',null,'no transport delivered video');
     setStatus(id,tiles[id].offline?'Camera offline':'Live view unavailable right now.');
   }}
 
@@ -2107,7 +2122,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }}else{{
       setStatus(id,'This browser cannot play live video.');
     }}
-    if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,transport,tile.startedAt?Date.now()-tile.startedAt:null,null);
+    const seq=tile.attachSeq=(tile.attachSeq||0)+1;
+    if(claim==='claimed')reportLiveTransportOnPlay(tile.video,()=>seq===tile.attachSeq&&!tile.stopped,()=>reportLiveTransportOutcome(tile.sessionId,transport,tile.startedAt?Date.now()-tile.startedAt:null,null));
   }}
 
   function attemptP2PForTile(id){{
@@ -2128,6 +2144,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       tile.video.srcObject=result.stream;
       tile.p2pConnection=result.pc;
       tile.video.play().catch(()=>{{}});
+      tile.attachSeq=(tile.attachSeq||0)+1;
       if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
       keepLiveSessionLeased(tile.sessionId,()=>!tile.stopped&&tile.p2pConnection===result.pc);
       window.watchLiveP2P(result.pc,()=>{{

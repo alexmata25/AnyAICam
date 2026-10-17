@@ -20,8 +20,8 @@ NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(not NODE, reason="needs node to execute the page script")
 
 
-def _function(html: str, name: str) -> str:
-    start = html.index(f"function {name}(")
+def _function(html: str, name: str, *, start_text: str | None = None) -> str:
+    start = html.index(start_text or f"function {name}(")
     depth = 0
     for index in range(html.index("{", start), len(html)):
         depth += {"{": 1, "}": -1}.get(html[index], 0)
@@ -92,3 +92,57 @@ def test_the_relay_attach_still_stops_when_blocked(client):
     """The fix releases the claim; it does not weaken claimTransport() -- a loser is still blocked."""
     for html in (_single_html(client), _grid_html(client)):
         assert re.search(r"if\(claim==='blocked'\)\{stopPolling\((id)?\);return\}", html)
+
+
+# ------------------------------------------------------- defect 4: the transport is reported when video plays
+
+
+ON_PLAY = """
+const listeners=[];
+const video={addEventListener(e,f){listeners.push(f)},removeEventListener(e,f){const i=listeners.indexOf(f);if(i>=0)listeners.splice(i,1)}};
+const window={};
+"""
+
+
+def _on_play_helper(html):
+    return _function(html, "", start_text="window.reportLiveTransportOnPlay = function") + ";"
+
+
+def test_an_attached_transport_is_reported_only_once_its_first_frame_plays(client):
+    script = ON_PLAY + _on_play_helper(_grid_html(client)) + """
+const reports=[];
+window.reportLiveTransportOnPlay(video,()=>true,()=>reports.push('relay'));
+const beforePlay=reports.length;
+listeners.slice().forEach(f=>f()); listeners.slice().forEach(f=>f());
+console.log(JSON.stringify({beforePlay,reports,left:listeners.length}));"""
+    assert _run(script) == {"beforePlay": 0, "reports": ["relay"], "left": 0}
+
+
+def test_a_superseded_attach_never_reports(client):
+    script = ON_PLAY + _on_play_helper(_single_html(client)) + """
+const reports=[]; let seq=1;
+window.reportLiveTransportOnPlay(video,()=>seq===1,()=>reports.push('wireguard'));
+seq=2;  // a P2P upgrade or a later attach happened before the first frame
+listeners.slice().forEach(f=>f());
+console.log(JSON.stringify({reports,left:listeners.length}));"""
+    assert _run(script) == {"reports": [], "left": 0}
+
+
+def test_both_pages_report_on_play_and_record_failures(client):
+    for html in (_single_html(client), _grid_html(client)):
+        assert "reportLiveTransportOnPlay(" in html
+        assert "'failed',null,'no transport delivered video'" in html
+        # P2P supersedes any pending HLS first-frame report
+        assert "attachSeq++;" in html or "tile.attachSeq=(tile.attachSeq||0)+1;" in html
+
+
+def test_single_camera_unavailable_without_any_transport_is_reported_as_failed(client):
+    html = _single_html(client)
+    script = f"""
+const reports=[]; let transport=null, sessionId='s1';
+function stopPolling(){{}} function setStatus(){{}} const retryButton={{hidden:true}};
+function reportLiveTransportOutcome(...a){{reports.push(a)}}
+""" + _function(html, "showUnavailable") + """
+showUnavailable(); transport='relay'; showUnavailable();
+console.log(JSON.stringify(reports));"""
+    assert _run(script) == [["s1", "failed", None, "no transport delivered video"]]
