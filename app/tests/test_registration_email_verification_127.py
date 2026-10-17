@@ -203,6 +203,29 @@ def test_posting_the_form_confirms_and_sets_the_password(db, client):
     assert authenticate_detailed(EMAIL, "chosen-password-22")[1] == "ok"
 
 
+def test_a_used_link_replayed_through_the_form_changes_nothing(db, client):
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    raw = cr.issue_registration_verification(EMAIL)
+    form = {"token": raw, "password": "owner-chosen-pass-1", "confirm_password": "owner-chosen-pass-1"}
+    assert client.post("/customer-register/verify-email", data=form).status_code == 200
+    replay = {"token": raw, "password": "replayed-pass-999", "confirm_password": "replayed-pass-999"}
+    assert client.post("/customer-register/verify-email", data=replay).status_code == 400
+    cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
+    assert authenticate_detailed(EMAIL, "replayed-pass-999")[0] is None
+    assert authenticate_detailed(EMAIL, "owner-chosen-pass-1")[1] == "ok"
+
+
+def test_a_link_from_before_a_rejection_never_confirms_the_reopened_request(db, client):
+    cr.create_pending_registration("A", EMAIL, PASSWORD)
+    old = cr.issue_registration_verification(EMAIL)  # never used
+    db.execute("UPDATE customer_registration_requests SET status='rejected',decided_at='x',decided_by='admin' WHERE email=?", (EMAIL,))
+    db.commit()
+    assert cr.create_pending_registration("B", EMAIL, "another-long-passphrase-1") == ("pending", True)
+    response = client.post("/customer-register/verify-email",
+                           data={"token": old, "password": PASSWORD, "confirm_password": PASSWORD})
+    assert response.status_code == 400 and _request(db)["email_verified_at"] is None
+
+
 @pytest.mark.parametrize("token", ["", "x", "not-a-real-token", "a" * 500])
 def test_unknown_or_malformed_links_reveal_nothing(db, client, token):
     assert cr.verify_registration_email(token, PASSWORD) is False
