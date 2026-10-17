@@ -88,7 +88,10 @@ def test_an_appliance_owner_is_never_given_an_own_pc_order_or_charged_the_licenc
     with override_target(sqlite_path=str(db_path)):
         assert billing.build_progress(customer_id) is None  # nothing saved, so no license line can be built
         billing.save_build_selection(customer_id, billing.purchase_selection("basic_local", "4"))
-        assert not billing.build_progress(customer_id)["own_pc"]  # the appliance includes the license
+        progress = billing.build_progress(customer_id)
+        # build_progress omits falsy fields, so an appliance owner's selection has no own_pc key at all
+        # (the appliance includes the license); product callers read it with .get().
+        assert progress is not None and not progress.get("own_pc")
 
 
 def test_my_orders_offers_no_second_plan_once_one_is_active(hw, db_path, monkeypatch):
