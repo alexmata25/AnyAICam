@@ -432,8 +432,13 @@ def test_lpr_hls_source_keeps_the_previous_buffer_path(monkeypatch):
     buffer_calls = []
     monkeypatch.setattr(lpr, "latest_full_resolution_frame", lambda n, folder: buffer_calls.append(str(folder)) or None)
     monkeypatch.setattr(main, "ai_full_resolution_frame", lambda *a: pytest.fail("no RTSP grab on the HLS path"))
-    monkeypatch.setattr(lpr, "scan_frame", lambda *a, **k: [])
+    seen = {}
+    monkeypatch.setattr(lpr, "scan_frame", lambda *a, **k: seen.update(k) or [])
     main.run_lpr_scan(1, {"frame": np.zeros((2160, 3840, 3), np.uint8), "frame_source": "hls", "detections": []})
+    # 2026-10-17: the same recording-buffer frame, but decoded lazily (only when a vehicle is
+    # read or the no-vehicle fallback is due) -- never eagerly on every AI pass.
+    assert buffer_calls == [] and callable(seen["full_frame"]) and seen["full_frame_for_fallback"] is True
+    seen["full_frame"]()
     assert buffer_calls and buffer_calls[0].endswith("_event_buffer")
 
 

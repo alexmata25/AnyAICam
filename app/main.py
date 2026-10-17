@@ -38886,17 +38886,25 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
     vehicles = [d for d in result.get("detections", []) if d.get("class_name") in lpr.LPR_VEHICLE_CLASSES]
     boxes = [(d["x"], d["y"], d["width"], d["height"]) for d in vehicles]
     full_frame = None
+    fallback_full_frame = False
     if lpr.LPR_FULL_RES_FRAMES:
         if result.get("frame_source") in (None, "hls"):
-            # ANYAICAM_AI_SOURCE=hls / fallback: the previous behaviour exactly.
-            full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+            # ANYAICAM_AI_SOURCE=hls / fallback: the newest recording-buffer frame.
+            # Lazy since 2026-10-17: it used to be decoded (ffmpeg -> PNG, ~0.45-0.8 CPU-s
+            # at 1080p-1440p) on EVERY AI pass, even with no vehicle and the LPR scan not
+            # due. Now it is decoded only when a vehicle box is read or the no-vehicle
+            # full-frame fallback is due -- the same frame, used exactly where it was.
+            full_frame = lambda: lpr.latest_full_resolution_frame(
+                camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+            fallback_full_frame = True
         elif boxes:
             # Analytics-stream frame (video-pipeline P2a): one main-stream frame,
             # grabbed only if LPR actually reads one of these vehicle boxes
             # (Event-mode buffer first, else one RTSP frame -- also in
             # Continuous mode). lpr.scan_frame() calls this at most once.
             full_frame = lambda: ai_full_resolution_frame(camera_number, result)
-    confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame)
+    extra = {"full_frame_for_fallback": True} if fallback_full_frame else {}
+    confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame, **extra)
     events = []
     from detection_timing import plate_event_span
     import lpr_vehicle
