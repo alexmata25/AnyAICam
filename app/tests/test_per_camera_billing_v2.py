@@ -70,7 +70,8 @@ def test_v2_catalog_is_customer_safe_and_keeps_premium_analytics_separate():
 
 
 @pytest.mark.parametrize(("plan_key", "unit_cents"), [
-    ("basic_local", 999), ("ai_local", 1499), ("hybrid", 2499),
+    # The owner-approved 2026-10-17 prices (Green f6e42be..); Codex's original pin predates the repricing.
+    ("basic_local", 999), ("ai_local", 1499), ("hybrid", 1999),
 ])
 @pytest.mark.parametrize("quantity", [1, 5])
 def test_v2_checkout_uses_approved_monthly_unit_price_and_camera_quantity(
