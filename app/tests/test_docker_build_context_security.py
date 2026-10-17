@@ -104,8 +104,14 @@ def test_docker_build_inputs_and_runtime_credentials_code_remain_in_context():
         assert not _is_excluded(path, rules), f"required build input was excluded: {path}"
 
 
-def test_tracked_aws_environment_file_is_excluded_without_reading_contents():
-    # This repository currently tracks aws.env. Assert only its pathname;
-    # never read, print, hash, or otherwise expose its contents in test output.
-    assert (REPO_ROOT / "aws.env").is_file()
+def test_aws_environment_file_is_untracked_ignored_and_excluded_without_reading_contents():
+    # aws.env stopped being tracked on 2026-10-17 (no runtime reads it; production uses
+    # /etc/anyaicam-staging/vms-staging.env, appliances their installer-written vms.env). A local copy may still
+    # exist in a checkout: assert only pathnames -- never read, print or hash its contents.
+    import subprocess
+    tracked = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "--error-unmatch", "aws.env"],
+                             capture_output=True, text=True)
+    assert tracked.returncode != 0, "aws.env must not be tracked"
+    ignored = subprocess.run(["git", "-C", str(REPO_ROOT), "check-ignore", "-q", "aws.env"])
+    assert ignored.returncode == 0, "aws.env must be git-ignored"
     assert _is_excluded("aws.env", _rules())
