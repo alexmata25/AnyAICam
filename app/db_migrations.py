@@ -1433,6 +1433,16 @@ ALTER TABLE appliances ADD COLUMN version_reported_at TEXT;
 UPDATE storage_trials SET status='granted',starts_at='',expires_at='' WHERE status='active' AND stripe_subscription_id IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_trials_one_open ON storage_trials(customer_id) WHERE status IN ('granted','active');
 '''),
+    # Notification retry claims (notification_retry_worker.py, Green 2026-10-16):
+    # one row per (notification, channel, attempt) a worker is about to send, so
+    # two retry workers (several processes, or an old and a new container during
+    # a deploy) never both re-send the same failed delivery. Additive.
+    ('20261016_notification_delivery_claims','''
+CREATE TABLE IF NOT EXISTS notification_delivery_claims(
+ notification_id TEXT NOT NULL, channel TEXT NOT NULL, attempt INTEGER NOT NULL, claimed_at TEXT NOT NULL,
+ PRIMARY KEY(notification_id, channel, attempt)
+);
+'''),
 ]
 
 

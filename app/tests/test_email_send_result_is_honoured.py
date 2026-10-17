@@ -97,3 +97,42 @@ def test_an_old_undelivered_confirmation_is_no_longer_retried(hw, db_path, provi
     provider["failing"] = False
     assert _retry(db_path) == 0 and provider["delivered"] == []
     assert _confirmation_row(db_path, checkout_id)["status"] == "failed"  # kept, visible to support
+
+
+def test_a_second_retry_worker_running_during_a_send_never_sends_a_second_confirmation(hw, db_path, monkeypatch, provider):
+    """Green 2026-10-16: a reused 'failed' outbox row used to stay 'failed' while it was being sent, so another
+    worker (another process, or the old container during a deploy) sent the same confirmation again."""
+    import purchase_notifications
+    checkout_id = _paid_checkout(hw, db_path)  # the provider is failing: the row is 'failed'
+    assert _confirmation_row(db_path, checkout_id)["status"] == "failed"
+    delivered, inner = [], {}
+
+    class _Mail:
+        def send(self, message_type, to, subject, text, html=None, metadata=None, images=None):
+            delivered.append(to)
+            if len(delivered) == 1:
+                inner["sent"] = _retry(db_path)  # the other worker, mid-send
+                inner["row"] = _confirmation_row(db_path, checkout_id)
+            return {"type": message_type, "to": to, "status": "sent"}
+    monkeypatch.setattr(purchase_notifications, "get_email_service", lambda: _Mail())
+    assert _retry(db_path) == 1
+    assert delivered == ["buyer@example.test"] and inner["sent"] == 0
+    assert inner["row"]["status"] == "pending"  # claimed while the send was in progress
+    assert _confirmation_row(db_path, checkout_id)["status"] == "sent"
+
+
+def test_a_claimed_send_left_pending_by_a_crash_is_retried_once_stale(hw, db_path, provider):
+    import purchase_notifications
+    checkout_id = _paid_checkout(hw, db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE provisioning_notifications SET status='pending',updated_at=? WHERE stripe_event_id=?",
+                 (datetime.now().isoformat(), f"hardware-checkout-confirmed:{checkout_id}"))
+    conn.commit()
+    provider["failing"] = False
+    assert _retry(db_path) == 0 and provider["delivered"] == []  # possibly still being sent elsewhere
+    stale = (datetime.now() - timedelta(seconds=purchase_notifications.OUTBOX_CLAIM_STALE_SECONDS + 60)).isoformat()
+    conn.execute("UPDATE provisioning_notifications SET updated_at=? WHERE stripe_event_id=?",
+                 (stale, f"hardware-checkout-confirmed:{checkout_id}"))
+    conn.commit()
+    conn.close()
+    assert _retry(db_path) == 1 and len(provider["delivered"]) == 1
