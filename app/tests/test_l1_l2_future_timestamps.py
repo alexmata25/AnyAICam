@@ -15,6 +15,7 @@ after a clock step a camera's newly written segment / rewritten playlist is
 used again at once.
 """
 import os
+import shutil
 import subprocess
 import time
 
@@ -123,7 +124,8 @@ def test_file_age_is_unchanged_for_its_other_callers(tmp_path):
 @pytest.fixture()
 def hls(tmp_path, monkeypatch):
     import main
-    if subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0:
+    # shutil.which first: a missing binary raises FileNotFoundError from subprocess.run (an ERROR, not a skip).
+    if not shutil.which("ffmpeg") or subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0:
         pytest.skip("ffmpeg not available")
     folder = tmp_path / "hls"
     folder.mkdir()

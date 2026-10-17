@@ -16,6 +16,7 @@ reusing live_hls_demand.playlist_fresh()). Live detection, reconnection and the
 missing-playlist message are unchanged.
 """
 import os
+import shutil
 import subprocess
 import time
 
@@ -28,7 +29,8 @@ def hls(tmp_path, monkeypatch):
     """A real two-segment live HLS playlist for camera 9 in a temporary folder."""
     import live_hls_demand
     import main
-    if subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0:
+    # shutil.which first: a missing binary raises FileNotFoundError from subprocess.run (an ERROR, not a skip).
+    if not shutil.which("ffmpeg") or subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode != 0:
         pytest.skip("ffmpeg not available")
     folder = tmp_path / "hls"
     folder.mkdir()
