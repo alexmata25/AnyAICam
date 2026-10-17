@@ -16231,6 +16231,20 @@ async def refresh_live_copy_probe(camera_number: int) -> None:
         print(f"Camera {camera_number} live video: camera sends {codec or 'an unknown codec'}; using {decision}.")
 
 
+def note_live_stream_recovered(camera_number: int) -> None:
+    """Clear per-camera source fallbacks after the live worker proves recovery."""
+    cached = _live_copy_probe.get(camera_number)
+    if cached and not cached[1]:
+        # Unknown answers are retried; a prior outage must not keep the old
+        # unknown-codec result alive after the stream starts producing video.
+        _live_copy_probe.pop(camera_number, None)
+    _motion_source_selector.forget(camera_number)
+    try:
+        ai_frames.clear_fallback(camera_number)
+    except Exception:
+        pass
+
+
 def note_live_copy_run(camera_number: int, copy_used: bool, seconds: float, watchdog_restart: bool) -> None:
     """After a live worker ends: a copied stream that ended quickly or stalled
     counts as a failure; enough in a row send the camera back to x264."""
@@ -17276,6 +17290,7 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
             await _wait_for_live_hls_demand(camera_number)
         camera_process_state[camera_number][mode] = "connecting"
         live_copy_used = False
+        recovery_pending = mode == "live" and camera_reconnect_counts[camera_number] > 0
         if mode == "live":
             # Stream copy (2026-10-08): codec verified before the worker starts.
             await refresh_live_copy_probe(camera_number)
@@ -17418,6 +17433,9 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         playlist_age = time.monotonic() - watchdog_started
 
                     if playlist_age <= 45:
+                        if recovery_pending:
+                            note_live_stream_recovered(camera_number)
+                            recovery_pending = False
                         continue
 
                     watchdog_restart = True
