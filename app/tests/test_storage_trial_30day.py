@@ -846,3 +846,157 @@ def test_a_cancel_made_in_stripe_after_choosing_paid_storage_also_withdraws_it(s
     with override_target(sqlite_path=str(db_path)):
         result = _sync(_event("customer.subscription.updated", sub, previous_attributes={"cancel_at_period_end": False}))
     assert result["status"] == "paid_authorization_withdrawn" and _trial(db_path)["paid_authorized_at"] is None
+
+
+# ---------------------------------------------------------------- Codex 2026-10-17: timeouts and races
+CONTINUE = "/api/v2/customer/storage-trial/continue-paid"
+
+
+def _continue_ready(shop, db_path):
+    client, _, stripe = shop
+    assert _grant(client, _make_global_admin(db_path)).status_code == 200
+    sub = _trialing_plan(stripe, db_path, _trial(db_path)["id"])
+    stripe["customers"][sub["customer"]] = {"id": sub["customer"], "invoice_settings": {"default_payment_method": "pm_card_added"}}
+    return client, stripe, sub
+
+
+def test_a_timeout_after_stripe_applied_continue_keeps_the_choice_and_the_delayed_webhook_agrees(shop, db_path, monkeypatch):
+    """Finding 2: Stripe applied cancel_at_period_end=false but the response timed out. Stripe is read back first;
+    the choice stays, and Stripe's delayed webhook is not guarded back."""
+    import main
+    client, stripe, sub = _continue_ready(shop, db_path)
+    real_post = main.stripe_api_post
+
+    def applied_then_timeout(path, fields, idempotency_key=None):
+        result = real_post(path, fields, idempotency_key=idempotency_key)
+        if dict(fields).get("cancel_at_period_end") == "false":
+            raise TimeoutError("read timed out")
+        return result
+
+    monkeypatch.setattr(main, "stripe_api_post", applied_then_timeout)
+    response = client.post(CONTINUE, json={"authorize_paid_storage": True}, cookies=_cookie(*OWNER))
+    assert response.status_code == 200 and response.json()["status"] == "authorized"
+    assert _trial(db_path)["paid_authorized_at"] and _audit(db_path, "storage_trial.paid_authorization_reconciled")
+    late = _event("customer.subscription.updated", sub, previous_attributes={"cancel_at_period_end": True})
+    late["id"] = "evt_delayed_continue"
+    with override_target(sqlite_path=str(db_path)):
+        assert _sync(late) == {"status": "trialing"}
+    assert sub["cancel_at_period_end"] is False
+
+
+def test_a_timeout_when_stripe_did_not_apply_continue_withdraws_the_choice(shop, db_path, monkeypatch):
+    import main
+    client, stripe, sub = _continue_ready(shop, db_path)
+
+    def not_applied(path, fields, idempotency_key=None):
+        raise TimeoutError("connect timed out")
+
+    monkeypatch.setattr(main, "stripe_api_post", not_applied)
+    with pytest.raises(TimeoutError):
+        client.post(CONTINUE, json={"authorize_paid_storage": True}, cookies=_cookie(*OWNER))
+    assert _trial(db_path)["paid_authorized_at"] is None and sub["cancel_at_period_end"] is True
+
+
+def test_when_stripe_cannot_be_read_back_the_choice_waits_for_the_webhook_to_settle_it(shop, db_path, monkeypatch):
+    """Unknown outcome: the customer is told it will be confirmed; the record stays; the next trialing event settles
+    it (still ending -> withdrawn)."""
+    import main
+    import stripe_state
+    client, stripe, sub = _continue_ready(shop, db_path)
+    real_current = stripe_state.current_subscription
+    outage = {"on": False}
+
+    def timeout_and_outage(path, fields, idempotency_key=None):
+        outage["on"] = True
+        raise TimeoutError("read timed out")
+
+    def current(subscription_id):
+        if outage["on"]:
+            raise RuntimeError("stripe unreachable")
+        return real_current(subscription_id)
+
+    monkeypatch.setattr(main, "stripe_api_post", timeout_and_outage)
+    monkeypatch.setattr(stripe_state, "current_subscription", current)
+    response = client.post(CONTINUE, json={"authorize_paid_storage": True}, cookies=_cookie(*OWNER))
+    assert response.status_code == 503 and "confirmed automatically" in response.json()["detail"]
+    assert _trial(db_path)["paid_authorized_at"]
+    outage["on"] = False
+    event = _event("customer.subscription.updated", sub)  # Stripe never applied it: still ending
+    event["id"] = "evt_settle"
+    with override_target(sqlite_path=str(db_path)):
+        assert _sync(event)["status"] == "paid_authorization_withdrawn"
+    assert _trial(db_path)["paid_authorized_at"] is None
+
+
+def test_admin_stop_during_customer_continue_cannot_undo_the_customers_choice(shop, db_path, monkeypatch):
+    """Finding 3, one order: the customer's Continue is in flight (trialing) when an administrator presses Stop."""
+    import main
+    client, stripe, sub = _continue_ready(shop, db_path)
+    import storage_trial
+    trial_id = _trial(db_path)["id"]
+    real_post, admin_result = main.stripe_api_post, []
+
+    def post(path, fields, idempotency_key=None):
+        result = real_post(path, fields, idempotency_key=idempotency_key)
+        if dict(fields).get("cancel_at_period_end") == "false" and not admin_result:
+            try:  # the administrator's Stop, while the customer's Continue is in flight
+                storage_trial.stop_unauthorized_renewal(trial_id, admin={"email": "admin@example.test", "role": "administrator"},
+                                                        reason="race")
+                admin_result.append(200)
+            except storage_trial.TrialError as error:
+                admin_result.append(error.status_code)
+        return result
+
+    monkeypatch.setattr(main, "stripe_api_post", post)
+    assert client.post(CONTINUE, json={"authorize_paid_storage": True}, cookies=_cookie(*OWNER)).status_code == 200
+    assert admin_result == [409]
+    assert sub["cancel_at_period_end"] is False and _trial(db_path)["paid_authorized_at"]
+
+
+def test_customer_continue_during_admin_stop_is_refused_and_the_stop_holds(shop, db_path, monkeypatch):
+    """Finding 3, other order: after the trial (an exception), Stop is in flight when the customer presses Continue."""
+    import main
+    client, stripe, admin, sub, url = _exception(shop, db_path)
+    stripe["customers"][sub["customer"]] = {"id": sub["customer"], "invoice_settings": {"default_payment_method": "pm_card_added"}}
+    import storage_trial
+    real_post, customer_result = main.stripe_api_post, []
+
+    def post(path, fields, idempotency_key=None):
+        result = real_post(path, fields, idempotency_key=idempotency_key)
+        if "consent-exception-stop" in str(idempotency_key) and not customer_result:
+            try:  # the customer's Continue, while the administrator's Stop is in flight
+                storage_trial.authorize_paid({"customer_id": CUSTOMER, "email": OWNER[0], "role": "customer_owner"})
+                customer_result.append(200)
+            except storage_trial.TrialError as error:
+                customer_result.append(error.status_code)
+        return result
+
+    monkeypatch.setattr(main, "stripe_api_post", post)
+    assert client.post(url, json={"reason": "no consent"}, cookies=admin).json()["status"] == "renewal_stopped"
+    assert customer_result == [409]
+    assert sub["cancel_at_period_end"] is True and _trial(db_path)["paid_authorized_at"] is None
+
+
+def test_if_consent_lands_while_a_stop_is_in_flight_consent_wins_and_stripe_agrees(shop, db_path, monkeypatch):
+    """Defence in depth for finding 3: the stop re-reads the record after its Stripe call."""
+    import main
+    client, stripe, admin, sub, url = _exception(shop, db_path)
+    real_post = main.stripe_api_post
+
+    def post(path, fields, idempotency_key=None):
+        result = real_post(path, fields, idempotency_key=idempotency_key)
+        if "consent-exception-stop" in str(idempotency_key):
+            _exec(db_path, "UPDATE storage_trials SET paid_authorized_at='2026-10-17T12:00:00',paid_authorized_by=? "
+                           "WHERE customer_id=?", (OWNER[0], CUSTOMER))
+        return result
+
+    monkeypatch.setattr(main, "stripe_api_post", post)
+    response = client.post(url, json={"reason": "no consent"}, cookies=admin)
+    assert response.json()["status"] == "superseded_by_customer_consent"
+    assert sub["cancel_at_period_end"] is False and _audit(db_path, "storage_trial.consent_exception_stop_superseded")
+
+
+def test_stop_is_refused_while_the_subscription_is_still_in_its_trial(shop, db_path):
+    client, stripe, admin, sub, url = _exception(shop, db_path)
+    sub["status"] = "trialing"
+    assert client.post(url, json={"reason": "x"}, cookies=admin).status_code == 409

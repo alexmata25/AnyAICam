@@ -458,11 +458,29 @@ def authorize_paid(identity: dict) -> dict:
     try:
         main.stripe_api_post(f"/v1/subscriptions/{trial['stripe_subscription_id']}", fields,
                              idempotency_key=f"anyaicam-storage-trial-authorize-{trial['stripe_subscription_id']}-{uuid.uuid4().hex}")
-    except Exception:
-        with connection() as db:
-            db.execute("UPDATE storage_trials SET paid_authorized_at=NULL,paid_authorized_by=NULL,updated_at=? "
-                       "WHERE id=? AND paid_authorized_at=?", (_iso(_now()), trial["id"], now))
-        raise
+    except Exception as error:
+        # Codex 2026-10-17: a failed call is not proof the change failed -- Stripe may have applied it and only the
+        # response was lost (timeout). Ask Stripe what is true before touching the customer's recorded choice.
+        applied = _renewal_applied(trial["stripe_subscription_id"])
+        if applied is True:
+            logger.warning("storage_trial.authorize_reconciled trial_id=%s error_type=%s: Stripe applied the change",
+                           trial["id"], type(error).__name__)
+            audit(identity, "storage_trial.paid_authorization_reconciled", "customer", customer_id,
+                  {"trial_id": trial["id"], "stripe_subscription_id": trial["stripe_subscription_id"],
+                   "error_type": type(error).__name__})
+        elif applied is False:
+            with connection() as db:
+                db.execute("UPDATE storage_trials SET paid_authorized_at=NULL,paid_authorized_by=NULL,updated_at=? "
+                           "WHERE id=? AND paid_authorized_at=?", (_iso(_now()), trial["id"], now))
+            raise
+        else:
+            # Stripe can't be read either. The choice stays recorded: if Stripe did not apply it, the next trialing
+            # event (authorized + still ending) withdraws it (withdraw_paid_authorization); if it did, the delayed
+            # webhook finds it authorized and is never guarded back. No charge either way without Stripe agreeing.
+            logger.warning("storage_trial.authorize_unconfirmed trial_id=%s error_type=%s",
+                           trial["id"], type(error).__name__)
+            raise TrialError(503, "We couldn't confirm your choice with our payment provider yet. It will be "
+                                  "confirmed automatically; check My subscription again in a few minutes.") from error
     audit(identity, "storage_trial.paid_authorized", "customer", customer_id,
           {"trial_id": trial["id"], "stripe_subscription_id": trial["stripe_subscription_id"], "starts_paid_at": trial["expires_at"]})
     try:
@@ -470,6 +488,19 @@ def authorize_paid(identity: dict) -> dict:
     except Exception:
         logger.info("storage_trial.entitlement_waits_for_webhook customer_id=%s", customer_id)
     return {"status": "authorized", "expires_at": trial["expires_at"]}
+
+
+def _renewal_applied(subscription_id: str):
+    """After a failed "Continue" call: True if Stripe shows the subscription renewing (cancel_at_period_end false),
+    False if it still ends at the trial end, None if Stripe can't be read."""
+    import stripe_state
+    try:
+        current = stripe_state.current_subscription(subscription_id) or {}
+    except Exception:
+        return None
+    if str(current.get("status") or "") in stripe_state.ENDED_STATUSES:
+        return False
+    return not bool(current.get("cancel_at_period_end"))
 
 
 def _id(value) -> str:
@@ -579,10 +610,21 @@ def stop_unauthorized_renewal(trial_id: str, *, admin: dict, reason: str) -> dic
     status = str(current.get("status") or "")
     if status in stripe_state.ENDED_STATUSES:
         raise TrialError(409, f"The subscription has already ended ({status}).")
+    if status == "trialing":
+        # Still in its free trial: that is the customer's "Continue as paid" decision window, never an exception.
+        raise TrialError(409, "The subscription is still in its free trial; the customer's choice decides it.")
     if current.get("cancel_at_period_end"):
         return {"status": "already_stopped", "current_period_end": current.get("current_period_end")}
     main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [("cancel_at_period_end", "true")],
                          idempotency_key=f"anyaicam-consent-exception-stop-{subscription_id}-{uuid.uuid4().hex}")
+    # Codex 2026-10-17 (admin/customer race): if the customer's explicit choice was recorded while this stop was in
+    # flight, the customer's consent wins -- put renewal back so Stripe and our record agree.
+    if (row("SELECT paid_authorized_at FROM storage_trials WHERE id=?", (trial["id"],)) or {}).get("paid_authorized_at"):
+        main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [("cancel_at_period_end", "false")],
+                             idempotency_key=f"anyaicam-consent-exception-restore-{subscription_id}-{uuid.uuid4().hex}")
+        audit(admin, "storage_trial.consent_exception_stop_superseded", "customer", trial["customer_id"],
+              {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "reason": reason})
+        return {"status": "superseded_by_customer_consent"}
     audit(admin, "storage_trial.consent_exception_renewal_stopped", "customer", trial["customer_id"],
           {"trial_id": trial["id"], "stripe_subscription_id": subscription_id, "reason": reason,
            "subscription_status": status, "current_period_end": current.get("current_period_end"),
