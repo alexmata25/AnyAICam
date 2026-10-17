@@ -11,7 +11,6 @@ housekeeping kills the reader's ffmpeg; turning an analytic on again
 starts a fresh reader; recovery clears the HLS fallback but never starts
 a reader by itself.
 """
-import io
 import threading
 import time
 
@@ -32,21 +31,19 @@ class Clock:
 
 
 class FakeProcess:
-    """One 8x6 BGR frame, then blocks like a live camera until killed."""
+    """A continuing 8x6 BGR stream until the fixture terminates it."""
 
     def __init__(self):
-        self._data = io.BytesIO(b"\x07" * (8 * 6 * 3))
         self._block = threading.Event()
         self.killed = False
         self.returncode = None
         self.stdout = self
 
     def read(self, n):
-        chunk = self._data.read(n)
-        if not chunk:
-            self._block.wait(10)
+        self._block.wait(0.001)
+        if self.killed:
             return b""
-        return chunk
+        return b"\x07" * n
 
     def poll(self):
         return self.returncode
@@ -109,12 +106,17 @@ def test_an_effective_analytic_keeps_its_reader_and_a_new_one_starts_on_demand(f
     assert main.effective_analytics(identity, 2) == ["lpr_enabled"]
     for _ in range(5):  # the detector keeps asking: the reader is never idle
         assert f.get_frame(2, wait=5)["ok"]
-        clock.now += analytics_frames.IDLE_STOP_SECONDS / 2
+        # Keep each synthetic interval below the reader's stall threshold;
+        # requests remain frequent enough to stay below the idle-stop window.
+        clock.now += analytics_frames.STALL_SECONDS / 2
         f.housekeeping()
     assert len(processes) == 1 and not processes[0].killed
     clock.now += analytics_frames.IDLE_STOP_SECONDS + 1  # LPR switched off: no more requests
     f.housekeeping()
     assert processes[0].killed
+    reader = f._readers[2]
+    reader._thread.join(timeout=2)  # let the asynchronous stop finish before simulating re-enable
+    assert not reader._thread.is_alive()
     assert f.get_frame(2, wait=5)["ok"]  # switched on again: a fresh reader
     assert len(processes) == 2 and not processes[1].killed
 
