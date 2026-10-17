@@ -23,6 +23,13 @@ from fastapi.testclient import TestClient
 
 from database_backend import override_target
 
+
+@pytest.fixture(autouse=True)
+def p2p_routes_enabled_for_test(monkeypatch):
+    """The P2P routes now fail closed when LIVE_P2P_ENABLED is off (Codex ae7cb6e); these tests exercise them on."""
+    import live_view_p2p
+    monkeypatch.setattr(live_view_p2p, "LIVE_P2P_ENABLED", True)
+
 with override_target(sqlite_path="/tmp/test_p2p_pending_long_poll_import.db"):
     import live_view_p2p
     import live_view_sessions

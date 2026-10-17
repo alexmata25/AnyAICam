@@ -68,8 +68,8 @@ def test_a_session_past_its_lease_gets_no_video_even_before_the_lazy_sweep(clien
 def test_another_user_of_the_same_customer_cannot_use_the_session(client, db_path, wireguard_on):
     session_id, _ = _start_session(client, "cust-a", "owner-a@example.test", "cam-a")
     _db(db_path, "INSERT INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
-                 "VALUES('user-a2','viewer-a@example.test','customer_viewer','cust-a','x','all','2026-10-17')")
-    viewer = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer-a@example.test", "customer_viewer", None, "cust-a", None)}
+                 "VALUES('user-a2','viewer-a2@example.test','customer_viewer','cust-a','x','all','2026-10-17')")
+    viewer = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer-a2@example.test", "customer_viewer", None, "cust-a", None)}
     assert _playlist(client, session_id, viewer).status_code == 404
 
 
@@ -83,7 +83,7 @@ def test_a_revoked_live_permission_cuts_the_wireguard_stream(client, db_path, wi
     session_id = started.json()["session_id"]
     assert _playlist(client, session_id, viewer).status_code == 200
     _db(db_path, "UPDATE customer_camera_permissions SET can_live=0 WHERE user_id='user-v' AND camera_id='cam-a'")
-    assert _playlist(client, session_id, viewer).status_code == 403
+    assert _playlist(client, session_id, viewer).status_code == 404  # indistinguishable (Codex a0a305c)
 
 
 def test_wireguard_playback_leases_the_session_without_holding_the_relay(client, db_path, wireguard_on):

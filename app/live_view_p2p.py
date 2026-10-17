@@ -301,6 +301,7 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
         from live_relay_idle_sweep import SESSION_LEASE_SECONDS
         from live_view_sessions import _authorized_camera as _authorized_live_camera
         identity = _customer_identity(request)
+        _require_p2p_enabled()
         now = datetime.now()
         lease_until = (now + timedelta(seconds=SESSION_LEASE_SECONDS)).isoformat()
         with connection() as db:

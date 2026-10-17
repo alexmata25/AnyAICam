@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import partner_portal
 from database_backend import override_target
 from tests.test_live_view_p2p_signaling import (  # noqa: F401  (fixtures)
-    _owner_cookie, _start_session, client, db_path,
+    _owner_cookie, _start_session, client, db_path, p2p_routes_enabled_for_test,
 )
 
 
@@ -86,8 +86,8 @@ def test_another_customer_cannot_lease_the_session(client, db_path):
 def test_another_user_of_the_same_customer_cannot_lease_the_session(client, db_path):
     session_id, _ = _start_session(client, db_path)
     _set(db_path, "INSERT INTO partner_users(id,email,role,customer_id,password_hash,camera_access_mode,created_at) "
-                  "VALUES('user-a2','viewer-a@example.test','customer_viewer','cust-a','x','all','2026-10-17')", ())
-    viewer = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer-a@example.test", "customer_viewer", None, "cust-a", None)}
+                  "VALUES('user-a2','viewer-a2@example.test','customer_viewer','cust-a','x','all','2026-10-17')", ())
+    viewer = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer-a2@example.test", "customer_viewer", None, "cust-a", None)}
     assert _keepalive(client, session_id, viewer).status_code == 404
 
 
@@ -101,7 +101,8 @@ def test_a_revoked_live_permission_ends_the_lease(client, db_path):
     session_id = started.json()["session_id"]
     assert _keepalive(client, session_id, viewer).status_code == 200
     _set(db_path, "UPDATE customer_camera_permissions SET can_live=0 WHERE user_id='user-v' AND camera_id='cam-a'", ())
-    assert _keepalive(client, session_id, viewer).status_code == 403
+    # 404, not 403: an inaccessible session is indistinguishable from someone else's (Codex 70db3a4)
+    assert _keepalive(client, session_id, viewer).status_code == 404
 
 
 def test_both_pages_lease_the_session_only_while_their_own_p2p_connection_plays():
