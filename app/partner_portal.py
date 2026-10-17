@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from pricing_config import calculate_partner_quote, load_pricing, public_pricing, save_pricing
-from partner_db import authenticate_detailed, audit, allowed, connection, password_hash
+from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
@@ -120,15 +120,53 @@ def _save_quotes(quotes: list) -> None:
     temp.write_text(json.dumps(quotes, indent=2), encoding='utf-8'); temp.replace(QUOTES_FILE)
 
 
+def _partner_users_exist() -> bool:
+    with connection() as db:
+        return db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None
+
+
 def register_partner_routes(app: FastAPI, shell: Callable) -> None:
     @app.get('/api/public-pricing')
     def public_prices() -> dict:
         return public_pricing()
 
+    @app.get('/setup', response_class=HTMLResponse)
+    def first_admin_setup(request: Request):
+        # The secure, interactive counterpart to the
+        # ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD env-var path
+        # (bootstrap_admin(), partner_db.py) -- a genuinely fresh edge
+        # appliance has neither var set, so without this there is no
+        # way at all to create a first identity except a plaintext
+        # password sitting in a persistent env file. Disables itself
+        # the instant any partner_users row exists: 404, indistinguishable
+        # from a route that was never there, never revealing whether
+        # setup has already run to an anonymous visitor.
+        if _partner_users_exist():
+            raise HTTPException(status_code=404)
+        content='''<header class="topbar"><div><p class="eyebrow">First-time setup</p><h1>Create the administrator account</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><p class="health-detail">This appliance has no administrator yet. This one-time setup page disables itself permanently once this account is created.</p><form class="rule-form" id="first-admin-form"><label>Email<input id="setup-email" type="email" required></label><label>Password<input id="setup-password" type="password" minlength="12" required></label><label>Confirm password<input id="setup-password-confirm" type="password" minlength="12" required></label><button class="action-button">Create administrator account</button></form></section>'''
+        scripts='''<script>document.getElementById('first-admin-form').addEventListener('submit',async e=>{e.preventDefault();const password=document.getElementById('setup-password').value;if(password!==document.getElementById('setup-password-confirm').value){showToast('Passwords do not match.');return}const response=await fetch('/api/setup/first-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('setup-email').value,password:password})}),result=await response.json();if(!response.ok){showToast(result.detail);return}showToast(result.message);setTimeout(()=>location.href=result.destination,500)})</script>'''
+        return shell('First-time setup','partner-login',content,scripts)
+
+    @app.post('/api/setup/first-admin')
+    def create_first_admin_submit(payload: dict) -> dict:
+        email=str(payload.get('email','')).strip().lower()
+        password=str(payload.get('password',''))
+        if not email or '@' not in email:
+            raise HTTPException(status_code=400,detail='A valid email is required.')
+        if len(password)<12:
+            raise HTTPException(status_code=400,detail='Use at least 12 characters.')
+        try:
+            user_id=create_first_admin(email,password)
+        except FirstAdminAlreadyExists as error:
+            raise HTTPException(status_code=409,detail='An administrator account already exists. Use Partner Login instead.') from error
+        audit({'email':email,'role':'administrator'},'setup.first_admin_created','partner_user',user_id)
+        return {'message':'Administrator account created. Sign in below.','destination':'/partner-login'}
+
     @app.get('/partner-login', response_class=HTMLResponse)
     def partner_login(request: Request) -> str:
         current=_identity(request)
         if current: return RedirectResponse(destination_for_role(current['role']), status_code=303)
+        if not _partner_users_exist(): return RedirectResponse('/setup', status_code=303)
         configured = bool(ADMIN_EMAIL and ADMIN_PASSWORD)
         note = 'Partner access is configured.' if configured else 'Set ANYAICAM_ADMIN_EMAIL and ANYAICAM_ADMIN_PASSWORD in the private server environment to activate protected access.'
         content=f'''<header class="topbar"><div><p class="eyebrow">Protected portal</p><h1>Partner sign in</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><p class="health-detail">{note}</p><form class="rule-form" id="partner-login-form"><label>Email<input id="partner-email" type="email" required></label><label>Password<input id="partner-password" type="password" required></label><button class="action-button">Sign in</button><a class="download" href="/forgot-password">Forgot password?</a></form></section>'''
