@@ -28,6 +28,10 @@ class PostgreSQLEmailInsertionOrderTests(unittest.TestCase):
         with psycopg.connect(TEST_URL) as db:
             db.execute("DELETE FROM notification_deliveries"); db.execute("DELETE FROM email_messages")
 
+    # The fixture rows have no parent notification; never leave them behind (a pg_dump/pg_restore of the database
+    # would then fail re-adding the foreign key).
+    tearDown = setUp
+
     def insert(self, sql, args):
         # Parent rows (notifications, customers) are irrelevant here; skip the foreign-key triggers for the fixture.
         with psycopg.connect(TEST_URL) as db:
