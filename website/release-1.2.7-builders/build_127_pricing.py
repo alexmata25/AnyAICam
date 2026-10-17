@@ -148,6 +148,15 @@ def home(html, page="index.html"):
             if row.count('class="aic-yes"') != 1:
                 raise Mismatch(f"{page}: '{label}' is not a Hybrid-only row; refusing to remove it")
             html = html.replace(row, "", 1)
+    # The unverified "Cloud event retention: 14 days" row goes, as on the live homepage since 2026-10-17 (the S3 expiry
+    # is not enforced; Cloud Video Backup itself stays).
+    marker = '<th scope="row">Cloud event retention</th>'
+    if marker in html:
+        start = html.rfind("<tr", 0, html.index(marker))
+        row = html[start:html.index("</tr>", start) + len("</tr>")]
+        if "14 days" not in row or html.count(marker) != 1:
+            raise Mismatch(f"{page}: the 'Cloud event retention' row is not the expected 14-day row; refusing to remove it")
+        html = html.replace(row, "", 1)
     if KEPT not in html:
         anchor = html.index('<tr><th scope="row">Local recording</th>')
         anchor_end = html.index("</tr>", anchor) + len("</tr>")

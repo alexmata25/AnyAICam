@@ -58,6 +58,9 @@ import re as _re
 for name, html in _pages.items():
     for claim in _re.findall(r"[^<>]{0,40}(?:14[- ]day cloud|cloud for 14 days|online for 14 days|14 days online|14 days of cloud)[^<>]{0,20}", html):
         problems.append(f"{name}: promises a cloud day count the storage does not enforce: {claim.strip()!r}")
+    # The comparison-table form ("Cloud event retention" row with a day count), removed from the live homepage 2026-10-17.
+    if "Cloud event retention" in html:
+        problems.append(f"{name}: still has the 'Cloud event retention' row/heading (unverified cloud day count)")
 if pricing.KEPT not in _home:
     problems.append("index.html: the comparison table does not show how long recordings are kept")
 if 'data-plan="hybrid" data-plan-price="19.99"' not in _pages["plans.html"] or "hybrid:19.99" not in _pages["build-your-system.html"]:
