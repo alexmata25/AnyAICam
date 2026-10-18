@@ -1,9 +1,14 @@
 param(
     [Parameter(Mandatory=$true)][string]$Version,
+    # Requirement 9 (1.2.7): the cloud's entitlement-signing PUBLIC keyset and its SHA-256, pinned out of band
+    # (docs/entitlement-signing-keys.md). Without it a Windows install trusts no signed capacity: 0 cameras.
+    [Parameter(Mandatory=$true)][string]$EntitlementKeyset,
+    [Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256,
     [switch]$Sign,
     [switch]$AzureSign
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'publisher-pin.ps1')
 if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Version must look like 1.2.4 (got '$Version')." }
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
@@ -93,6 +98,10 @@ if ($AzureSign) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib
 if ($Sign -or $AzureSign) {
     if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
     if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
+    if ($AzureSign) {
+        $publisherProblem = Get-AnyAiCamPublisherProblem (Get-AuthenticodeSignature -LiteralPath $catalog)
+        if ($publisherProblem) { throw "Publisher pin failed for the runtime catalog: $publisherProblem" }
+    }
     & $signTool verify /pa $catalog | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
     # Every catalogued file must verify against it.
@@ -101,6 +110,14 @@ if ($Sign -or $AzureSign) {
     if ($LASTEXITCODE -ne 0) { throw "A catalogued file does not verify against the runtime catalog: $($sample.Name)" }
     Write-Output 'Runtime catalog signed and verified.'
 }
+# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
+# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
+if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
+$keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
+& py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset was refused; nothing was built.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
+$compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
 $compilerArguments += "/DAppVersion=$Version"
 $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript
@@ -115,6 +132,10 @@ if ($Sign -or $AzureSign) {
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
         if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed: $($file.FullName)" }
         if ($Sign -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) { throw "Signer certificate mismatch: $($file.FullName)" }
+        if ($AzureSign) {
+            $publisherProblem = Get-AnyAiCamPublisherProblem $signature
+            if ($publisherProblem) { throw "Publisher pin failed for $($file.FullName): $publisherProblem" }
+        }
         & $signTool verify /pa /all $file.FullName | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "SignTool verification failed: $($file.FullName)" }
     }

@@ -124,7 +124,8 @@ class CatalogWiringTests(unittest.TestCase):
         iss = read("AnyAiCam-VMS.iss")
         self.assertIn('Source: "output\\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall', iss)
         self.assertIn('Source: "runtime-catalog.ps1"; DestDir: "{app}\\installer"; Flags: ignoreversion', iss)
-        self.assertIn("-RuntimeCatalog \"' + ExpandConstant('{tmp}\\AnyAiCamRuntime.cat') + '\"'", iss)
+        # Other arguments (the entitlement keyset, the product mode) follow it since Windows steps 2 and 5.
+        self.assertIn("-RuntimeCatalog \"' + ExpandConstant('{tmp}\\AnyAiCamRuntime.cat') + '\" ", iss)
         uninstall = iss.split("[UninstallRun]", 1)[1].split("[UninstallDelete]", 1)[0]
         self.assertIn('runtime-catalog.ps1"" -Remove"', uninstall)
         self.assertLess(uninstall.index('AnyAiCamVMS.exe"; Parameters: "uninstall"'), uninstall.index("runtime-catalog.ps1"))

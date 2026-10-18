@@ -14,7 +14,13 @@ param(
     # 2026-10-08: the signed catalog of the runtime's native files
     # (runtime-catalog.ps1), registered before anything native is loaded, so
     # Smart App Control lets the bundled runtime run.
-    [Parameter(Mandatory=$true)][string]$RuntimeCatalog
+    [Parameter(Mandatory=$true)][string]$RuntimeCatalog,
+    # Requirement 9 (1.2.7): the entitlement-signing PUBLIC keyset and its pinned SHA-256 (build.ps1).
+    [Parameter(Mandatory=$true)][string]$EntitlementKeyset,
+    [Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256,
+    # Requirement 9 (1.2.7): Local or Hybrid, chosen in Setup (or /ProductMode= for a silent install). Empty on an
+    # upgrade, which keeps the saved mode. Mirrors installer/03-product-mode.sh.
+    [string]$ProductMode = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
@@ -95,7 +101,44 @@ if (Test-Path -LiteralPath $environmentFile) {
 # to every existing and future file and folder, which keep inheritance on.
 & icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
+# Trust anchors (Requirement 9, the Windows counterpart of Linux /etc/anyaicam-update): %ProgramData%\AnyAiCam\update
+# holds the entitlement keyset and the accepted / fallback VMS capacity. The VMS (app/platform_paths.py) trusts an
+# entry only if it is owned by SYSTEM or Administrators, nobody else may modify it, and it is not a link. A file an
+# administrator creates is owned by that user, so ownership is set explicitly.
+$updateRoot = Join-Path $DataRoot 'update'
+if ((Test-Path -LiteralPath $updateRoot) -and ((Get-Item -LiteralPath $updateRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$updateRoot is a link; refusing to use it as the trust folder." }
+New-Item -ItemType Directory -Force -Path $updateRoot | Out-Null
+& icacls.exe $updateRoot /setowner '*S-1-5-32-544' /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $updateRoot (icacls exit $LASTEXITCODE)." }
+& icacls.exe $updateRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $updateRoot (icacls exit $LASTEXITCODE)." }
+if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'The pinned entitlement keyset SHA-256 is malformed.' }
+$keysetBytes = [IO.File]::ReadAllBytes($EntitlementKeyset)
+$keysetText = [Text.Encoding]::ASCII.GetString($keysetBytes).ToUpperInvariant()
+if ($keysetText.Contains('PRIVATE') -or $keysetText.Contains('BEGIN') -or $keysetText.Contains('OPENSSH')) { throw 'The packaged entitlement keyset contains private key material; refusing to install it.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $EntitlementKeyset).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The packaged entitlement keyset does not match its pinned SHA-256; refusing to trust it.' }
+$keysetTarget = Join-Path $updateRoot 'entitlement_signing_keys.json'
+$keysetTemp = Join-Path $updateRoot ('.entitlement_signing_keys.' + [guid]::NewGuid().ToString('N') + '.tmp')
+[IO.File]::WriteAllBytes($keysetTemp, $keysetBytes)
+Move-Item -LiteralPath $keysetTemp -Destination $keysetTarget -Force
+& icacls.exe $keysetTarget /setowner '*S-1-5-32-544' /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $keysetTarget (icacls exit $LASTEXITCODE)." }
+& icacls.exe $keysetTarget /reset /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the trust folder's permissions to $keysetTarget (icacls exit $LASTEXITCODE)." }
+Write-Output 'Entitlement keyset installed in the protected trust folder.'
+# Camera capacity fallback (Linux installer step 15) is deliberately NOT migrated on Windows. Windows 1.3.x kept its
+# unsigned capacity in C:\opt\anyaicam\data\config\vms_capacity.json, a folder any signed-in user may modify by
+# default, so that number cannot become a trusted limit. Cameras start after the cloud's first signed capacity
+# (vms_capacity accepted file); a fallback file, if one ever exists here, is trusted only under the
+# SYSTEM/Administrators-only rule (app/platform_paths.py).
+$legacyCapacity = Join-Path $env:SystemDrive 'opt\anyaicam\data\config\vms_capacity.json'
+if (Test-Path -LiteralPath $legacyCapacity) {
+    Write-Output 'Camera capacity: the earlier release''s unsigned capacity is not carried over; cameras start after the cloud''s first signed capacity (usually within minutes of linking).'
+} else {
+    Write-Output 'Camera capacity: cameras start after the cloud''s first signed capacity.'
+}
 $values = [ordered]@{}
+$hadEnvironmentFile = Test-Path -LiteralPath $environmentFile
 if (Test-Path -LiteralPath $environmentFile) {
     foreach ($line in Get-Content -LiteralPath $environmentFile) {
         if (-not $line -or $line.TrimStart().StartsWith('#')) { continue }
@@ -122,6 +165,23 @@ $values['ANYAICAM_SECURE_COOKIES'] = 'false'
 $values['ANYAICAM_PUBLIC_URL'] = 'http://127.0.0.1:8000'
 $values['ANYAICAM_VMS_COMMIT'] = $SourceCommit
 $values['ANYAICAM_BUILD_ID'] = $SourceCommit
+# Local / Hybrid (Requirement 9): the same rules as Linux installer/03-product-mode.sh. A new installation records
+# the chosen mode as the bootstrap mode (used until the cloud reports one); Setup never switches a saved mode; an
+# earlier installation that never recorded one is left unset, so its runtime defaults are kept exactly.
+$savedMode = ''
+foreach ($key in @('ANYAICAM_PRODUCT_MODE', 'ANYAICAM_PRODUCT_MODE_BOOTSTRAP')) {
+    if (-not $savedMode -and $values.Contains($key)) {
+        $savedMode = [string]$values[$key]
+        if ($savedMode -cnotin @('local', 'hybrid')) { throw "$key in vms.env must be exactly local or hybrid; fix it before installing." }
+    }
+}
+if ($ProductMode) {
+    if ($ProductMode -cnotin @('local', 'hybrid')) { throw 'The product mode must be exactly local or hybrid.' }
+    if ($savedMode -and $savedMode -ne $ProductMode) { throw "Setup cannot switch the existing product mode ($savedMode); change it from your AnyAiCam account instead." }
+    if (-not $savedMode) { $values['ANYAICAM_PRODUCT_MODE_BOOTSTRAP'] = $ProductMode }
+} elseif (-not $hadEnvironmentFile) {
+    throw 'A new installation needs a product mode: choose Local or Hybrid (silent install: /ProductMode=local or /ProductMode=hybrid).'
+}
 # What /version reports (the Linux installer writes the same key).
 $values['ANYAICAM_VERSION'] = $AppVersion
 $content = @('# Managed by the AnyAiCam Windows installer. Persistent across repair and uninstall.')

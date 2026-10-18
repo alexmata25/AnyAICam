@@ -81,7 +81,10 @@ def _parse_time(value) -> datetime | None:
 # Installed by the installer, root:root 0644 in a root:root 0755 directory.
 # Deliberately not configurable from the environment: vms.env is writable by
 # the unprivileged anyaicam user.
-TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
+# On Windows: %ProgramData%\AnyAiCam\update (platform_paths; SYSTEM/Administrators only, checked below).
+from platform_paths import UPDATE_DIR as _UPDATE_DIR  # noqa: E402
+
+TRUST_ANCHOR_FILE = _UPDATE_DIR / "entitlement_signing_keys.json"
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -99,8 +102,20 @@ def ownership_problem(info) -> str:
 
 def _anchor_file_problem(path: Path) -> str:
     """The keyset and its directory must be root-owned, not symlinks, and not
-    writable by anyone else -- or a less-privileged user could swap it. (POSIX
-    only; a Windows development checkout has no such ownership model.)"""
+    writable by anyone else -- or a less-privileged user could swap it. On
+    Windows the same rule is: owned by and writable only by SYSTEM or
+    Administrators, and not a reparse point (platform_paths). Other platforms
+    (a development checkout) are not checked."""
+    if os.name == "nt":
+        import platform_paths
+        for candidate in (path.parent, path):
+            try:
+                problem = platform_paths.windows_write_problem(candidate)
+            except OSError:
+                return f"{candidate} is missing"
+            if problem:
+                return f"{candidate} {problem}"
+        return ""
     if os.name != "posix":
         return ""
     for candidate in (path.parent, path):
