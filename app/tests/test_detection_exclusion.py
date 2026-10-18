@@ -148,8 +148,10 @@ def test_detect_objects_frame_applies_the_zone_for_every_downstream_analytic(db,
     """The single YOLO call behind person/vehicle/Smart Motion, PPE, Facial
     Recognition, LPR, People Counting and Intrusion/Line Crossing."""
     _add_zone()
-    for number in (1, 2):
-        (tmp_path / f"camera{number}.m3u8").write_text("#EXTM3U")
+    for number in (1, 2):  # live playlists with a current segment (L-2 refuses an empty or stale one)
+        (tmp_path / f"camera{number}_000001.ts").write_bytes(b"ts")
+        (tmp_path / f"camera{number}.m3u8").write_text(
+            f"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000000,\ncamera{number}_000001.ts\n")
     monkeypatch.setattr(main, "HLS_FOLDER", tmp_path)
     monkeypatch.setattr(main, "YOLO", object())
     monkeypatch.setattr(main.ai_frames, "mode", "hls")  # frames from the live HLS playlist (ANYAICAM_AI_SOURCE=hls)

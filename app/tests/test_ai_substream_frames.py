@@ -311,7 +311,9 @@ def test_reader_not_ready_is_an_error_not_an_hls_read(monkeypatch):
 def test_hls_mode_is_the_previous_path_and_keeps_the_encoder(monkeypatch, tmp_path, isolated_camera_map):
     live_hls_demand.configure(mode="on_demand", idle_seconds=60, clock=Clock())
     monkeypatch.setattr(main, "HLS_FOLDER", tmp_path)
-    (tmp_path / "camera6.m3u8").write_text("#EXTM3U\n")
+    # a live playlist with a current segment (L-2: an empty or stale playlist is refused before VideoCapture)
+    (tmp_path / "camera6_000001.ts").write_bytes(b"ts")
+    (tmp_path / "camera6.m3u8").write_text("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000000,\ncamera6_000001.ts\n")
     calls = []
     _yolo(monkeypatch, [(10, 20, 60, 120)], calls)
 
