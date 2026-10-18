@@ -132,3 +132,38 @@ def test_the_entry_repair_only_skips_icacls_for_already_clean_entries_and_still_
     assert "if (-not $clean) {" in entry and "/setowner '*S-1-5-32-544'" in entry and "/reset" in entry
     assert "EnumerateFileSystemInfos()" in entry  # always descends, clean or not
     assert "catch { $clean = $false }" in entry  # an unreadable ACL is repaired, never trusted
+
+
+# Codex RC6 review: an adversarial case for EACH non-secret data subtree, not only recordings.
+SUBTREES = ("recordings", "hls", "logs", "mediamtx")
+
+
+@windows_only
+@pytest.mark.parametrize("subtree", SUBTREES)
+def test_a_junction_planted_as_any_data_subtree_is_refused_before_any_acl_change(tmp_path, subtree):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "system.dat").write_text("do not touch", encoding="utf-8")
+    root = tmp_path / "AnyAiCam"
+    root.mkdir()
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(root / subtree), str(outside)], capture_output=True, text=True)
+    assert made.returncode == 0, made.stdout + made.stderr
+    result = _ps(f"Set-AnyAiCamDescendantAcl '{root}'")
+    assert result.returncode != 0 and "Refusing to repair permissions through link" in result.stderr and subtree in result.stderr
+    assert (outside / "system.dat").read_text(encoding="utf-8") == "do not touch"
+
+
+@windows_only
+@pytest.mark.parametrize("subtree", SUBTREES)
+def test_a_junction_planted_deep_inside_any_data_subtree_is_found_without_traversal(tmp_path, subtree):
+    outside = tmp_path / "outside"
+    (outside / "deep").mkdir(parents=True)
+    root = tmp_path / "AnyAiCam"
+    nested = root / subtree / "camera1" / "2026-10-18"
+    nested.mkdir(parents=True)
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(nested / "planted"), str(outside)], capture_output=True, text=True)
+    assert made.returncode == 0, made.stdout + made.stderr
+    found = _ps(f"Get-AnyAiCamDataRootLink '{root}'")
+    assert found.returncode == 0 and found.stdout.strip() == str(nested / "planted")
+    refused = _ps(f"Assert-AnyAiCamDataRootHasNoLinks '{root}'")
+    assert refused.returncode != 0 and "is a link" in refused.stderr
