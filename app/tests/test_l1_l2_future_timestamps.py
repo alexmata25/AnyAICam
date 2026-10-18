@@ -181,6 +181,9 @@ def test_analysis_resumes_when_the_live_writer_rewrites_after_a_clock_step(hls):
     import main
     _date(hls, time.time() + HOUR)
     assert main._read_hls_analytics_frame(9)[0] is None
-    os.utime(hls / "camera9.m3u8", None)  # the live worker writes the playlist again on the corrected clock
+    # the live worker writes segments and the playlist again on the corrected clock (a playlist alone over the
+    # future-dated segments stays refused -- test_l2_hls_segment_freshness.py)
+    for path in hls.iterdir():
+        os.utime(path, None)
     frame, captured_at, error = main._read_hls_analytics_frame(9)
     assert error is None and frame is not None

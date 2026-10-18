@@ -105,7 +105,10 @@ def test_detection_resumes_when_the_camera_reconnects(hls):
     import main
     _age(hls, 600)
     main._read_hls_analytics_frame(9)  # whatever happens while it is gone
-    os.utime(hls / "camera9.m3u8", None)  # the live worker writes a new playlist again
+    # the live worker writes new segments and a new playlist again (a playlist rewritten over the OLD segments is
+    # still refused -- L-2 segment freshness, test_l2_hls_segment_freshness.py)
+    for path in hls.iterdir():
+        os.utime(path, None)
     frame, captured_at, error = main._read_hls_analytics_frame(9)
     assert error is None and frame is not None
 
