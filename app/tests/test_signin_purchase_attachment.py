@@ -275,3 +275,48 @@ def test_eight_parallel_sign_in_attachments_on_sqlite_grant_exactly_once(site, d
     assert sum(len(r.get("attached", [])) for r in results) == 1
     assert _counts(db_path, customer_id) == {"slots": 10, "attachments": 1, "audits": 1}
     assert len(notices["sent"]) == 1
+
+
+def test_a_recorded_refund_rejects_a_pending_checkout_before_grant(db_path):
+    """A refund received between checkout completion and account attachment must not create an active license."""
+    from database_backend import override_target
+    import billing_status
+    with override_target(sqlite_path=str(db_path)):
+        with sqlite3.connect(db_path) as db:
+            db.execute("INSERT OR IGNORE INTO partners(id,name,created_at) VALUES('p-refund','P','now')")
+            db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,created_at) "
+                       "VALUES('c-refund','p-refund','Refund Owner','refund@example.test','active','now')")
+        event = {"id": "evt-refund-before-attach", "data": {"object": {
+            "payment_intent": "pi_refunded_before_attach", "charge": "ch_refunded_before_attach"}}}
+        link = ce.create_pending_link(email="refund@example.test", product="camera_slots_local",
+                                      camera_slot_quantity=8, raw_event=event)
+        billing_status.record_reversal("ch_refunded_before_attach", "pi_refunded_before_attach", "", "refunded")
+        token = spa.claim(LINKS, link["id"], "refund@example.test")
+        assert token
+        assert spa.finalize("plan", LINKS, link["id"], token, customer_id="c-refund",
+                            email="refund@example.test", label="camera plan") is None
+        state = _q(db_path, f"SELECT status FROM {LINKS} WHERE id=?", (link["id"],))[0][0]
+        assert state == "reversed"
+        assert _q(db_path, "SELECT COUNT(*) FROM customer_entitlements WHERE customer_id='c-refund'")[0][0] == 0
+        assert _q(db_path, "SELECT COUNT(*) FROM purchase_attachments WHERE source_id=?", (link["id"],))[0][0] == 0
+        assert _q(db_path, "SELECT COUNT(*) FROM audit_logs WHERE action='signin.purchase_attached'")[0][0] == 0
+
+
+def test_attached_plan_keeps_stripe_references_for_later_reversal(db_path):
+    from database_backend import override_target
+    with override_target(sqlite_path=str(db_path)):
+        with sqlite3.connect(db_path) as db:
+            db.execute("INSERT OR IGNORE INTO partners(id,name,created_at) VALUES('p-refs','P','now')")
+            db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,created_at) "
+                       "VALUES('c-refs','p-refs','Reference Owner','refs@example.test','active','now')")
+        event = {"id": "evt-refs", "data": {"object": {
+            "payment_intent": "pi_keep_for_reversal", "subscription": "sub_keep_for_reversal"}}}
+        link = ce.create_pending_link(email="refs@example.test", product="camera_slots_local",
+                                      camera_slot_quantity=8, raw_event=event)
+        token = spa.claim(LINKS, link["id"], "refs@example.test")
+        assert token
+        assert spa.finalize("plan", LINKS, link["id"], token, customer_id="c-refs",
+                            email="refs@example.test", label="camera plan")
+        license_row = _q(db_path, "SELECT stripe_payment_intent_id,stripe_subscription_id FROM customer_entitlements "
+                         "WHERE customer_id='c-refs' AND product='camera_slots_local'")[0]
+        assert license_row == ("pi_keep_for_reversal", "sub_keep_for_reversal")

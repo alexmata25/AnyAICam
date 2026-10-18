@@ -36,10 +36,11 @@ Fenced protocol per purchase row (Codex blocker 2; condition d):
 from __future__ import annotations
 
 import logging
+import json
 import secrets
 from datetime import datetime, timedelta
 
-from partner_db import audit, connection, transaction
+from partner_db import audit, backend, connection, transaction
 
 logger = logging.getLogger("anyaicam.signin_purchase_attachment")
 CLAIM_LEASE_SECONDS = 120
@@ -61,6 +62,39 @@ def _normalize(email) -> str:
 
 def _now() -> datetime:
     return datetime.now()
+
+
+def _stripe_refs(link: dict) -> dict[str, str]:
+    """Recover durable Stripe identifiers from the verified checkout event."""
+    try:
+        event = json.loads(str(link.get("raw_event_json") or "{}"))
+    except (TypeError, ValueError):
+        event = {}
+    obj = ((event.get("data") or {}).get("object") or {}) if isinstance(event, dict) else {}
+    return {
+        "payment_intent": str(obj.get("payment_intent") or ""),
+        "charge": str(obj.get("charge") or ""),
+        "invoice": str(obj.get("invoice") or ""),
+        "subscription": str(obj.get("subscription") or ""),
+    }
+
+
+def _recorded_reversal(db, kind: str, table: str, link: dict) -> str | None:
+    """Return a durable reversal for a pending purchase, without making a network call."""
+    refs = _stripe_refs(link)
+    if table == GUEST_CHECKOUTS:
+        order = db.execute(
+            "SELECT stripe_payment_intent_id,status FROM hardware_orders WHERE stripe_checkout_session_id=? LIMIT 1",
+            (link.get("stripe_checkout_session_id"),),
+        ).fetchone()
+        if order:
+            if str(order["status"] or "") in ("refunded", "disputed"):
+                return str(order["status"])
+            refs["payment_intent"] = refs["payment_intent"] or str(order["stripe_payment_intent_id"] or "")
+    if not any(refs.values()):
+        return None
+    import billing_status
+    return billing_status.reversal_reason(refs["charge"], refs["payment_intent"], refs["invoice"])
 
 
 # ------------------------------------------------------------------ eligibility (a), (b)
@@ -102,23 +136,31 @@ def account_address_confirmed(db, *, customer_id: str, email: str) -> bool:
 # ------------------------------------------------------------------ grants (joined into the finalize transaction)
 
 def _grant(kind: str, link: dict, customer_id: str) -> None:
+    refs = _stripe_refs(link)
     if kind == "plan":
         import customer_entitlements as ce
         ce.upsert_entitlement(customer_id=customer_id, product=link["product"],
                               camera_slot_quantity=link["camera_slot_quantity"], status="active",
                               stripe_customer_id=link["stripe_customer_id"],
+                              stripe_subscription_id=refs["subscription"] or None,
                               stripe_checkout_session_id=link["stripe_checkout_session_id"],
                               stripe_price_id=link.get("stripe_price_id"))
+        if refs["payment_intent"]:
+            with connection() as db:
+                db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=? WHERE customer_id=? AND product=?",
+                           (refs["payment_intent"], customer_id, link["product"]))
     elif kind == "hardware":
         import hardware_orders as ho
         ho.upsert_order(customer_id=customer_id, sku=link["sku"], product_name=link["product_name"],
                         stripe_price_id=link["stripe_price_id"], quantity=link["quantity"],
                         amount_cents=link["amount_cents"], stripe_checkout_session_id=link["stripe_checkout_session_id"],
+                        stripe_payment_intent_id=refs["payment_intent"] or None,
                         stripe_customer_id=link["stripe_customer_id"], status="paid")
     elif kind == "analytics":
         import analytics_entitlements as ae
         ae.upsert_analytics_subscription(customer_id=customer_id, analytic_key=link["analytic_key"], status="active",
                                          stripe_customer_id=link["stripe_customer_id"],
+                                         stripe_subscription_id=refs["subscription"] or None,
                                          stripe_price_id=link["stripe_price_id"],
                                          licensed_quantity=int(link.get("licensed_quantity") or 1))
         addon = ae.resolve_addon(link["stripe_price_id"])
@@ -126,6 +168,7 @@ def _grant(kind: str, link: dict, customer_id: str) -> None:
             ae.upsert_addon_subscription(customer_id=customer_id, addon_key=addon["addon_key"], status="active",
                                          quantity=int(link.get("licensed_quantity") or 1),
                                          stripe_customer_id=link["stripe_customer_id"],
+                                         stripe_subscription_id=refs["subscription"] or None,
                                          stripe_price_id=link["stripe_price_id"])
     elif kind == "guest_hardware":
         with connection() as db:
@@ -156,25 +199,45 @@ def claim(table: str, row_id: str, email: str, *, now: datetime | None = None) -
     return token if moved == 1 else None
 
 
-def finalize(kind: str, table: str, row_id: str, token: str, *, customer_id: str, email: str, label: str) -> str:
+def finalize(kind: str, table: str, row_id: str, token: str, *, customer_id: str, email: str, label: str) -> str | None:
     """Step 2. Transition (fenced by token) + grant + attachment record + audit, all or nothing. Returns the
-    attachment id; raises FenceLost (nothing granted) when the claim is no longer ours."""
+    attachment id; raises FenceLost (nothing granted) when the claim is no longer ours. A payment already marked
+    refunded/disputed is durably rejected before any ownership or entitlement change."""
     attachment_id = secrets.token_hex(16)
     now = _now().isoformat()
     with transaction() as db:
         if table == GUEST_CHECKOUTS:
+            link_row = db.execute("SELECT * FROM hardware_checkouts WHERE id=? AND claim_token=? AND customer_id IS NULL "
+                                  "AND status='paid' AND lower(email)=?", (row_id, token, email)).fetchone()
+            if not link_row:
+                raise FenceLost(f"{table}:{row_id}")
+            link = dict(link_row)
+            if _recorded_reversal(db, kind, table, link):
+                return None
             moved = db.execute(
                 "UPDATE hardware_checkouts SET customer_id=?,linked_at=?,updated_at=?,claim_token=NULL WHERE id=? "
                 "AND claim_token=? AND customer_id IS NULL AND status='paid' AND lower(email)=?",
                 (customer_id, now, now, row_id, token, email)).rowcount
         else:
+            select = f"SELECT * FROM {table} WHERE id=? AND status='attaching' AND claim_token=? AND normalized_email=?"
+            if backend() == "postgresql":
+                select += " FOR UPDATE"
+            link_row = db.execute(select, (row_id, token, email)).fetchone()
+            if not link_row:
+                raise FenceLost(f"{table}:{row_id}")
+            link = dict(link_row)
+            reason = _recorded_reversal(db, kind, table, link)
+            if reason:
+                db.execute(f"UPDATE {table} SET status='reversed',claim_token=NULL,claimed_at=NULL WHERE id=? "
+                           "AND status='attaching' AND claim_token=? AND normalized_email=?",
+                           (row_id, token, email))
+                return None
             moved = db.execute(
                 f"UPDATE {table} SET status='resolved',resolved_at=?,resolved_customer_id=? WHERE id=? "
                 "AND status='attaching' AND claim_token=? AND normalized_email=?",
                 (now, customer_id, row_id, token, email)).rowcount
         if moved != 1:
             raise FenceLost(f"{table}:{row_id}")
-        link = dict(db.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone())
         _grant(kind, link, customer_id)
         db.execute("INSERT INTO purchase_attachments(id,source_table,source_id,customer_id,normalized_email,kind,"
                    "attached_at) VALUES(?,?,?,?,?,?,?)", (attachment_id, table, row_id, customer_id, email, label, now))
@@ -224,6 +287,8 @@ def attach_for_customer(customer_id: str, email: str, *, only_session_id: str | 
         except Exception:
             logger.exception("signin_attachment.finalize_failed table=%s id=%s", table, row_id)
             continue  # rolled back: still 'attaching' under our token; retried after the lease
+        if not attachment_id:
+            continue
         attached.append({"kind": label, "attachment_id": attachment_id})
         _deliver_email(attachment_id)
     return attached
