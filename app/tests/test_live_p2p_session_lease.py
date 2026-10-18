@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 import partner_portal
 from database_backend import override_target
-from tests.test_live_view_p2p_signaling import (  # noqa: F401  (fixtures)
+from test_live_view_p2p_signaling import (  # noqa: F401  (fixtures)
     _owner_cookie, _start_session, client, db_path, p2p_routes_enabled_for_test,
 )
 

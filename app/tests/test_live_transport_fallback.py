@@ -12,7 +12,7 @@ import subprocess
 
 import pytest
 
-from tests.test_live_view_hls_fatal_error_recovery import (  # noqa: F401  (fixtures)
+from test_live_view_hls_fatal_error_recovery import (  # noqa: F401  (fixtures)
     _grid_html, _single_html, client, db_path,
 )
 

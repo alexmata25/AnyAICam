@@ -11,7 +11,7 @@ import live_view_wireguard
 import partner_portal
 import wireguard_remote
 from database_backend import override_target
-from tests.test_live_view_wireguard import (  # noqa: F401  (fixtures)
+from test_live_view_wireguard import (  # noqa: F401  (fixtures)
     _enable_flags, _start_session, client, db_path,
 )
 
