@@ -76,6 +76,59 @@ def estimate_hls_frame_time(
     return newest_segment_end - timedelta(seconds=lead)
 
 
+# L-2 segment freshness (Codex RC6 review, 2026-10-18): a playlist can be freshly rewritten while the segments it
+# lists -- the ones FFmpeg actually decodes -- are stale (left over from before an outage) or future-dated (written
+# before a clock step back). The playlist check alone let those frames reach YOLO/LPR, and an implausible segment time
+# then silently became "now". The live analytics reader therefore validates the segments FFmpeg will open (the last
+# -FFMPEG_HLS_LIVE_START_INDEX listed) and refuses the frame instead of guessing its time.
+# How far the derived frame time may lie in the future (file-timestamp jitter); anything later is refused.
+FRAME_TIME_FUTURE_SKEW_SECONDS = 2.0
+
+
+def hls_live_segments_problem(
+    folder,
+    segments: list[tuple[str, float]],
+    *,
+    now: float,
+    max_age: float,
+    live_start_index: int = FFMPEG_HLS_LIVE_START_INDEX,
+) -> tuple[Optional[datetime], Optional[str]]:
+    """(frame_time, None) when every segment FFmpeg will decode from this live playlist exists and is current; else
+    (None, reason). `now` is time.time(). A consumed segment is stale when it is older than max_age plus the duration
+    of the segments listed after it (it finished that much earlier), and future-dated when its mtime is more than
+    max_age ahead -- the same symmetric bound as the playlist (live_hls_demand.playlist_fresh) and L-1. frame_time is
+    the estimated wall-clock time of the first frame FFmpeg returns; it must be plausible (at most
+    FRAME_TIME_FUTURE_SKEW_SECONDS ahead, at most MAX_PLAUSIBLE_FRAME_AGE_SECONDS old) or the frame is refused --
+    never replaced by "now"."""
+    from pathlib import Path
+    if not segments:
+        return None, "the playlist lists no segments"
+    start = max(0, len(segments) + live_start_index) if live_start_index < 0 else min(live_start_index, len(segments) - 1)
+    consumed = segments[start:]
+    newest_mtime = None
+    for index, (name, _duration) in enumerate(consumed):
+        if "/" in name or "\\" in name or ".." in name or ":" in name:
+            return None, f"unexpected segment reference {name!r}"
+        try:
+            mtime = (Path(folder) / name).stat().st_mtime
+        except OSError:
+            return None, f"segment {name} is missing"
+        later = sum(duration for _, duration in consumed[index + 1:])
+        age = now - mtime
+        if age < -max_age:
+            return None, f"segment {name} is future-dated ({-age:.0f} s ahead)"
+        if age > max_age + later:
+            return None, f"segment {name} is stale ({age:.0f} s old)"
+        newest_mtime = mtime
+    frame_time = estimate_hls_frame_time(consumed, datetime.fromtimestamp(newest_mtime), live_start_index=0)
+    now_dt = datetime.fromtimestamp(now)
+    if frame_time is None or frame_time > now_dt + timedelta(seconds=FRAME_TIME_FUTURE_SKEW_SECONDS):
+        return None, "the frame time would be in the future"
+    if (now_dt - frame_time).total_seconds() > MAX_PLAUSIBLE_FRAME_AGE_SECONDS:
+        return None, "the frame time would be implausibly old"
+    return min(frame_time, now_dt), None
+
+
 def plausible_frame_time(candidate: Optional[datetime], now: datetime) -> Optional[datetime]:
     if candidate is None or candidate > now:
         return None

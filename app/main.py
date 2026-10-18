@@ -37220,8 +37220,23 @@ def _read_hls_analytics_frame(camera_number: int):
             "error": "Live video is not arriving from this camera.",
             "detections": [],
         }
-    # When the frame read below actually happened (detection_timing.py).
-    frame_captured_at = _hls_read_frame_time(manifest)
+    # L-2 segment freshness (Codex RC6 review): the playlist being fresh is not enough -- the segments FFmpeg will
+    # decode must be current too, and the frame's time must be plausible, or the frame is refused (never re-dated to
+    # "now"). Checked BEFORE cv2.VideoCapture, so a rejected segment never reaches YOLO or LPR.
+    from detection_timing import hls_live_segments_problem, parse_hls_segments
+    try:
+        listed = parse_hls_segments(manifest.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        listed = []
+    frame_captured_at, segment_problem = hls_live_segments_problem(
+        manifest.parent, listed, now=time.time(), max_age=HLS_ANALYTICS_MAX_AGE_SECONDS)
+    if segment_problem:
+        logging.getLogger("anyaicam").warning("ai.hls_segments_refused camera=%s reason=%s", camera_number, segment_problem)
+        return None, None, {
+            "ok": False,
+            "error": "Live video is not arriving from this camera.",
+            "detections": [],
+        }
     capture = cv2.VideoCapture(str(manifest))
     try:
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
