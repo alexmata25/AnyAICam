@@ -109,9 +109,15 @@ def test_aws_environment_file_is_untracked_ignored_and_excluded_without_reading_
     # /etc/anyaicam-staging/vms-staging.env, appliances their installer-written vms.env). A local copy may still
     # exist in a checkout: assert only pathnames -- never read, print or hash its contents.
     import subprocess
+    gitignore = [line.strip() for line in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
+    assert "aws.env" in gitignore, "aws.env must be listed in .gitignore"
+    assert _is_excluded("aws.env", _rules())
+    if not (REPO_ROOT / ".git").exists():
+        # A plain source copy (the regression container gets `git ls-files` output, no repository): only the
+        # .gitignore/.dockerignore rules above can be checked here; tracking is checked wherever .git exists.
+        return
     tracked = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "--error-unmatch", "aws.env"],
                              capture_output=True, text=True)
     assert tracked.returncode != 0, "aws.env must not be tracked"
     ignored = subprocess.run(["git", "-C", str(REPO_ROOT), "check-ignore", "-q", "aws.env"])
     assert ignored.returncode == 0, "aws.env must be git-ignored"
-    assert _is_excluded("aws.env", _rules())
