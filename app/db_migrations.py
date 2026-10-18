@@ -1457,6 +1457,24 @@ CREATE TABLE IF NOT EXISTS notification_delivery_claims(
 ALTER TABLE provisioning_notifications ADD COLUMN body_text TEXT;
 ALTER TABLE provisioning_notifications ADD COLUMN body_html TEXT
 '''),
+    # Sign-in purchase attachment (signin_purchase_attachment.py, Green 2026-10-17, post-RC5): fenced claim token +
+    # lease on every attachable purchase row, and one durable attachment record per attached purchase (also the email
+    # outbox for "added to your account"). Additive.
+    ('20261017_purchase_attachment_fencing','''
+ALTER TABLE pending_customer_links ADD COLUMN claim_token TEXT;
+ALTER TABLE pending_customer_links ADD COLUMN claimed_at TEXT;
+ALTER TABLE pending_hardware_order_links ADD COLUMN claim_token TEXT;
+ALTER TABLE pending_hardware_order_links ADD COLUMN claimed_at TEXT;
+ALTER TABLE pending_analytics_links ADD COLUMN claim_token TEXT;
+ALTER TABLE pending_analytics_links ADD COLUMN claimed_at TEXT;
+ALTER TABLE hardware_checkouts ADD COLUMN claim_token TEXT;
+ALTER TABLE hardware_checkouts ADD COLUMN claimed_at TEXT;
+CREATE TABLE IF NOT EXISTS purchase_attachments(
+ id TEXT PRIMARY KEY, source_table TEXT NOT NULL, source_id TEXT NOT NULL, customer_id TEXT NOT NULL,
+ normalized_email TEXT NOT NULL, kind TEXT NOT NULL, attached_at TEXT NOT NULL, email_sent_at TEXT,
+ UNIQUE(source_table, source_id)
+)
+'''),
 ]
 
 

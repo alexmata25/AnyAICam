@@ -164,12 +164,14 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
         # re-validated there and again on sign-in (plan/cameras only).
         next_path = purchase_intent_next(payload.get("next"))
         next_query = f"&next={quote(next_path, safe='')}" if next_path else ""
+        from email_layout import support_contact
         from email_service import get_email_service
         if raw:
             link = f"{_base(request)}/customer/verify-email?token={raw}{next_query}"
             subject = "Confirm your AnyAiCam account"
             text = (f"Confirm your email address to finish creating your AnyAiCam account:\n{link}\n\n"
-                    f"This link works once and expires in {VERIFY_TTL_HOURS} hours. If you didn't ask for this, ignore this email.")
+                    f"This link works once and expires in {VERIFY_TTL_HOURS} hours. If you didn't ask for this, ignore this email."
+                    f"\n\n{support_contact()[0]}")
         else:
             subject = "Your AnyAiCam account"
             text = ("Someone tried to create an AnyAiCam account with this email address, which already has one. "
@@ -204,11 +206,10 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         audit({"email": created["email"], "role": "customer_owner"}, "direct_signup.verified", "customer", created["customer_id"],
               {"channel": DIRECT_CHANNEL})
-        try:  # a hardware order paid before the account existed (hardware_checkout.py)
-            from hardware_checkout import link_paid_orders
-            link_paid_orders(created["customer_id"], created["email"])
-        except Exception:
-            logger.exception("direct_signup.hardware_orders_not_linked")
+        # Post-RC5 (Green 2026-10-17; Codex review, owner-accepted): confirming the email creates the account but
+        # attaches NO purchase. Purchases bought with this address before the account existed are attached only after
+        # the owner's first fully successful sign-in (signin_purchase_attachment.attach_after_signin), which also
+        # sends the "added to your account" email.
         next_path = purchase_intent_next(next)
         if next_path and "?" in next_path:
             # Kept on the new account, so the selection survives even if the

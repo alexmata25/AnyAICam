@@ -40,7 +40,9 @@ def _db(db_path):
 MASTER_ACTOR = {"master": True, "email": "master@example.test", "partner_id": None}
 
 
-def test_a_purchase_made_before_registration_is_granted_automatically_on_approval(db_path):
+def test_a_purchase_made_before_registration_is_granted_at_the_owner_s_first_sign_in(db_path):
+    """Post-RC5 (owner 2026-10-17, Codex review): approval attaches nothing; the purchase is attached after the
+    approved owner's first fully successful sign-in."""
     with override_target(sqlite_path=db_path):
         # The customer paid through Stripe under this email first...
         ce.create_pending_link(
@@ -54,8 +56,16 @@ def test_a_purchase_made_before_registration_is_granted_automatically_on_approva
         assert verify_registration_email(issue_registration_verification("new-customer@example.test", force=True), "correct-horse-battery-staple", "Confirmed Owner")  # requester confirms (2026-10-17)
 
         result = approve_registration(request_id, "partner-a", MASTER_ACTOR)
+        assert ce.total_camera_slots(result["customer_id"]) == 0
+        status = lambda: conn.execute("SELECT status FROM pending_customer_links WHERE normalized_email=?", ("new-customer@example.test",)).fetchone()[0]
+        assert status() == "pending"
+        from partner_db import authenticate_detailed
+        from signin_purchase_attachment import attach_after_signin
+        user, reason = authenticate_detailed("new-customer@example.test", "correct-horse-battery-staple")
+        assert reason == "ok"
+        assert attach_after_signin(user)["status"] == "attached"
         total_slots = ce.total_camera_slots(result["customer_id"])
-        pending_status = conn.execute("SELECT status FROM pending_customer_links WHERE normalized_email=?", ("new-customer@example.test",)).fetchone()[0]
+        pending_status = status()
 
     assert total_slots == 10
     assert pending_status == "resolved"

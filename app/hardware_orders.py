@@ -298,26 +298,11 @@ def create_pending_link(
 
 
 def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
-    """Mirrors customer_entitlements.resolve_pending_links_for_customer()
-    -- call only against an email the caller has already verified belongs
-    to this customer (e.g. right after registration approval)."""
-    normalized = normalize_email(email)
-    pending = rows("SELECT * FROM pending_hardware_order_links WHERE normalized_email=? AND status='pending'", (normalized,))
-    resolved_ids = []
-    for link in pending:
-        upsert_order(
-            customer_id=customer_id, sku=link["sku"], product_name=link["product_name"],
-            stripe_price_id=link["stripe_price_id"], quantity=link["quantity"], amount_cents=link["amount_cents"],
-            stripe_checkout_session_id=link["stripe_checkout_session_id"],
-            stripe_customer_id=link["stripe_customer_id"], status="paid",
-        )
-        with connection() as db:
-            db.execute(
-                "UPDATE pending_hardware_order_links SET status='resolved',resolved_at=?,resolved_customer_id=? WHERE id=?",
-                (_now(), customer_id, link["id"]),
-            )
-        resolved_ids.append(link["id"])
-    return resolved_ids
+    """Post-RC5 (Green 2026-10-17, Codex review): delegates to the one fenced, transactional attachment protocol
+    (signin_purchase_attachment). The only remaining caller path is a fully successful customer-owner sign-in;
+    email confirmation and registration approval no longer attach purchases."""
+    from signin_purchase_attachment import attach_for_customer
+    return [item["attachment_id"] for item in attach_for_customer(customer_id, email, kinds=("hardware",))]
 
 
 # --------------------------------------------------------- Stripe webhook bridge

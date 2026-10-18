@@ -97,6 +97,9 @@ CANCELLED_STATUSES = {"cancelled"}
 # the production host is only the fallback when nothing is configured.
 DEFAULT_PORTAL_URL = "https://app.anyaicam.com"
 CUSTOMER_REGISTER_PATH = "/customer-register"
+# Owner 2026-10-17: guest buyers create their own account (self-service, email confirmed) instead of waiting in the
+# manual /customer-register approval queue; the confirmation link attaches what they bought (direct_onboarding).
+CUSTOMER_SIGNUP_PATH = "/customer-signup"
 CUSTOMER_SIGN_IN_PATH = "/customer-login.html"
 
 
@@ -292,8 +295,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"Plan: {plan_label}\n"
         f"Camera capacity: {camera_slot_maximum}\n\n"
         f"Sign in to set up your AnyAiCam appliance and cameras: {_sign_in_link()}\n\n"
-        f"If you need help getting started, our support team is here for you.\n\n"
-        f"— The AnyAiCam Team"
+        f"{_SUPPORT_FOOTER_TEXT}"
     )
     html = (
         f"<p>Hi {first_name},</p>"
@@ -301,8 +303,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"<p><strong>Plan:</strong> {plan_label}<br><strong>Camera capacity:</strong> {camera_slot_maximum}</p>"
         f'<p>Sign in to set up your AnyAiCam appliance and cameras: '
         f'<a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
-        f"<p>If you need help getting started, our support team is here for you.</p>"
-        f"<p>— The AnyAiCam Team</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
     )
     return subject, text, html
 
@@ -312,15 +313,20 @@ def _setup_required_email(plan_label: str, camera_slot_maximum: int) -> tuple[st
     text = (
         f"Hi there,\n\n"
         f"Your AnyAiCam purchase is confirmed ({plan_label}, {camera_slot_maximum} cameras).\n\n"
-        f"Complete your account setup to activate your service: {_portal_url(CUSTOMER_REGISTER_PATH)}\n\n"
-        f"— The AnyAiCam Team"
+        f"Create your AnyAiCam account with this email address to activate your service: "
+        f"{_portal_url(CUSTOMER_SIGNUP_PATH)}\n\n"
+        f"We'll email you a link to confirm the address; your purchase is added to your account as soon as you "
+        f"confirm it.\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
     )
     html = (
         f"<p>Hi there,</p>"
         f"<p>Your AnyAiCam purchase is confirmed ({plan_label}, {camera_slot_maximum} cameras).</p>"
-        f'<p>Complete your account setup to activate your service: '
-        f'<a href="{_portal_url(CUSTOMER_REGISTER_PATH)}">{_portal_url(CUSTOMER_REGISTER_PATH)}</a></p>'
-        f"<p>— The AnyAiCam Team</p>"
+        f'<p>Create your AnyAiCam account with this email address to activate your service: '
+        f'<a href="{_portal_url(CUSTOMER_SIGNUP_PATH)}">{_portal_url(CUSTOMER_SIGNUP_PATH)}</a></p>'
+        f"<p>We'll email you a link to confirm the address; your purchase is added to your account as soon as you "
+        f"confirm it.</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
     )
     return subject, text, html
 
@@ -331,32 +337,36 @@ def _plan_updated_email(first_name: str, plan_label: str, camera_slot_maximum: i
         f"Hi {first_name},\n\n"
         f"Your AnyAiCam plan has been updated to {camera_slot_maximum} cameras ({plan_label}).\n\n"
         f"Sign in at {_sign_in_link()} to see your updated plan.\n\n"
-        f"— The AnyAiCam Team"
+        f"{_SUPPORT_FOOTER_TEXT}"
     )
     html = (
         f"<p>Hi {first_name},</p>"
         f"<p>Your AnyAiCam plan has been updated to <strong>{camera_slot_maximum} cameras</strong> ({plan_label}).</p>"
         f'<p>Sign in at <a href="{_sign_in_link()}">{_sign_in_link()}</a> to see your updated plan.</p>'
-        f"<p>— The AnyAiCam Team</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
     )
     return subject, text, html
 
 
 def _plan_cancelled_email(first_name: str, plan_label: str) -> tuple[str, str, str]:
-    subject = "Your AnyAiCam camera-slot subscription has been cancelled"
+    # Green 2026-10-17: plain wording (no legacy "camera-slot licensing"), a way back, and a real contact.
+    link = _portal_url("/subscription-portal")
+    subject = "Your AnyAiCam subscription has been cancelled"
     text = (
         f"Hi {first_name},\n\n"
-        f"Your AnyAiCam {plan_label} camera-slot subscription has been cancelled.\n\n"
-        f"Your account and any connected appliances remain in place -- only camera-slot licensing has changed.\n\n"
-        f"If this wasn't expected, contact our support team.\n\n"
-        f"— The AnyAiCam Team"
+        f"Your AnyAiCam {plan_label} subscription has been cancelled.\n\n"
+        f"Your account and any connected appliances stay in place. You can start a plan again at any time on "
+        f"My subscription: {link}\n\n"
+        f"If you didn't expect this, please get in touch.\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
     )
     html = (
         f"<p>Hi {first_name},</p>"
-        f"<p>Your AnyAiCam {plan_label} camera-slot subscription has been cancelled.</p>"
-        f"<p>Your account and any connected appliances remain in place — only camera-slot licensing has changed.</p>"
-        f"<p>If this wasn't expected, contact our support team.</p>"
-        f"<p>— The AnyAiCam Team</p>"
+        f"<p>Your AnyAiCam {plan_label} subscription has been cancelled.</p>"
+        f"<p>Your account and any connected appliances stay in place. You can start a plan again at any time on "
+        f'<a href="{link}">My subscription</a>.</p>'
+        f"<p>If you didn't expect this, please get in touch.</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
     )
     return subject, text, html
 
@@ -1317,6 +1327,28 @@ def send_getting_started_email(customer_id: str) -> dict:
         customer_id=customer_id, recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"camera_slot_summary": bool(camera_slot_summary)},
     )
+
+
+def notify_purchase_attached(customer_id: str, kind: str, link_id: str) -> dict:
+    """"A purchase was added to your account" -- one per attached purchase (signin_purchase_attachment, post-RC5).
+    Keyed by the attached link, so a repeat never sends a second copy. Never raises."""
+    try:
+        customer = _customer_row(customer_id)
+        if not customer:
+            return {"status": "ignored", "reason": "customer row no longer exists"}
+        first_name = _first_name(customer.get("name"))
+        link = _portal_url("/subscription-portal" if kind != "hardware order" else "/customer/orders")
+        subject = "A purchase was added to your AnyAiCam account"
+        body = (f"The {kind} you bought with this email address is now part of your AnyAiCam account. "
+                "If you didn't make this purchase, please get in touch right away.")
+        text = f"Hi {first_name},\n\n{body}\n\nSee it here: {link}\n\n{_SUPPORT_FOOTER_TEXT}"
+        html = (f"<p>Hi {first_name},</p><p>{body}</p><p>See it here: <a href=\"{link}\">{link}</a></p>"
+                f"{_SUPPORT_FOOTER_HTML}")
+        return _send_once(event_id=f"signin-attached:{link_id}", notification_type="purchase_attached",
+                          customer_id=customer_id, recipient_email=str(customer.get("email") or ""),
+                          subject=subject, text=text, html=html, metadata={"attached_kind": kind})
+    except Exception as exc:
+        return {"status": "error", "reason": type(exc).__name__}
 
 
 def notify_registration_decision(request_id: str, decision: str) -> dict:

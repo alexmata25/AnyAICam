@@ -235,24 +235,20 @@ def test_pending_customer_gets_setup_email_then_ready_email_only_after_registrat
     assert len(previews) == 1
     assert previews[0]["type"] == "setup_required"
 
-    # 2) Customer completes registration; the pending purchase resolves.
+    # 2) The customer has an account and signs in (post-RC5, owner 2026-10-17: purchases attach only through the
+    # fenced sign-in protocol, which sends the "added to your account" email).
     _seed_customer(db_path, customer_id="cust-new", email="new-buyer@example.test", name="Nia Buyer")
     with override_target(sqlite_path=db_path):
-        ce.resolve_pending_links_for_customer("cust-new", "new-buyer@example.test")
-        ready_results = pn.notify_registration_resolved("cust-new")
-
-    assert len(ready_results) == 1
-    assert ready_results[0]["status"] == "sent"
+        attached = ce.resolve_pending_links_for_customer("cust-new", "new-buyer@example.test")
+    assert len(attached) == 1
     previews_after = _read_previews(tmp_path)
-    assert len(previews_after) == 2  # the earlier setup_required + this new account_ready
+    assert len(previews_after) == 2  # the earlier setup_required + this new purchase_attached
     types = sorted(p["type"] for p in previews_after)
-    assert types == ["account_ready", "setup_required"]
+    assert types == ["purchase_attached", "setup_required"]
 
-    # 3) Calling registration-resolved notification again (e.g. a retried
-    # approval request) must not double-send the ready email.
+    # 3) A repeat (another sign-in, a retried request) attaches nothing and sends nothing more.
     with override_target(sqlite_path=db_path):
-        again = pn.notify_registration_resolved("cust-new")
-    assert again[0]["status"] == "skipped"
+        assert ce.resolve_pending_links_for_customer("cust-new", "new-buyer@example.test") == []
     assert len(_read_previews(tmp_path)) == 2
 
 

@@ -540,33 +540,11 @@ def create_pending_link(
 
 
 def resolve_pending_links_for_customer(customer_id: str, email: str) -> list[str]:
-    """Mirrors customer_entitlements.resolve_pending_links_for_customer()
-    and hardware_orders.resolve_pending_links_for_customer() exactly --
-    call only against an email the caller has already verified belongs
-    to this customer (e.g. right after registration approval)."""
-    normalized = (email or "").strip().lower()
-    pending = rows("SELECT * FROM pending_analytics_links WHERE normalized_email=? AND status='pending'", (normalized,))
-    resolved_ids = []
-    for link in pending:
-        upsert_analytics_subscription(
-            customer_id=customer_id, analytic_key=link["analytic_key"], status="active",
-            stripe_customer_id=link["stripe_customer_id"], stripe_price_id=link["stripe_price_id"],
-            licensed_quantity=int(link.get("licensed_quantity") or 1),
-        )
-        with connection() as db:
-            db.execute(
-                "UPDATE pending_analytics_links SET status='resolved',resolved_at=?,resolved_customer_id=? WHERE id=?",
-                (datetime.now().isoformat(), customer_id, link["id"]),
-            )
-        resolved_ids.append(link["id"])
-        addon = resolve_addon(link["stripe_price_id"])
-        if addon:
-            upsert_addon_subscription(
-                customer_id=customer_id, addon_key=addon["addon_key"], status="active",
-                quantity=int(link.get("licensed_quantity") or 1),
-                stripe_customer_id=link["stripe_customer_id"], stripe_price_id=link["stripe_price_id"],
-            )
-    return resolved_ids
+    """Post-RC5 (Green 2026-10-17, Codex review): delegates to the one fenced, transactional attachment protocol
+    (signin_purchase_attachment). The only remaining caller path is a fully successful customer-owner sign-in;
+    email confirmation and registration approval no longer attach purchases."""
+    from signin_purchase_attachment import attach_for_customer
+    return [item["attachment_id"] for item in attach_for_customer(customer_id, email, kinds=("analytics",))]
 
 
 def apply_addon_state(addon: dict, *, status: str, suspended_reason: str | None) -> None:

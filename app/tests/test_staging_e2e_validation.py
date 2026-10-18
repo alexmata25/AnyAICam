@@ -229,13 +229,13 @@ def test_pending_customer_full_stack_setup_email_then_ready_email(client, db_pat
         import customer_entitlements as ce
         import purchase_notifications as pn
         _seed_customer(db_path, customer_id="cust-pending", email="new-staging-buyer@example.test", name="New Staging Buyer")
-        ce.resolve_pending_links_for_customer("cust-pending", "new-staging-buyer@example.test")
-        results = pn.notify_registration_resolved("cust-pending")
-    assert results and results[0]["status"] == "sent"
+        # Post-RC5 (owner 2026-10-17): attached through the fenced sign-in protocol, which sends "added to your account".
+        attached = ce.resolve_pending_links_for_customer("cust-pending", "new-staging-buyer@example.test")
+    assert len(attached) == 1
 
     previews_after = _previews(tmp_path)
     assert len(previews_after) == 2
-    assert sorted(p["type"] for p in previews_after) == ["account_ready", "setup_required"]
+    assert sorted(p["type"] for p in previews_after) == ["purchase_attached", "setup_required"]
 
 
 # =============================================================== ITEM 7

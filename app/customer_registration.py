@@ -86,10 +86,12 @@ def send_registration_verification(email: str, base_url: str | None = None, *, f
     if not raw:
         return False
     link = f"{base_url.rstrip('/')}/customer-register/verify-email?token={raw}"
+    from email_layout import support_contact
     subject = "Confirm your email for your AnyAiCam account request"
     text = ("Confirm this email address and choose your password to complete your AnyAiCam account request:\n"
             f"{link}\n\nThis link works once and expires in {VERIFY_TTL_HOURS} hours. "
-            "Your request is reviewed only after the address is confirmed. If you didn't ask for this, ignore this email.")
+            "Your request is reviewed only after the address is confirmed. If you didn't ask for this, ignore this email."
+            f"\n\n{support_contact()[0]}")
     try:
         from email_service import get_email_service
         result = get_email_service().send("email_verification", normalized, subject, text)
@@ -312,60 +314,10 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
             "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
             (actor["email"], "administrator" if actor["master"] else "partner_owner", "customer_registration.approved", "customer_registration", request_id, '{}', now),
         )
-    # Provisioning Phase 1: this is the exact moment a brand-new customer's
-    # authoritative identity (customers.id) first exists with a verified
-    # email -- the safe point to attach any Stripe purchase that completed
-    # under this email before the account existed (see customer_
-    # entitlements.create_pending_link()/resolve_pending_links_for_
-    # customer()'s own docstring for why this must only ever run against
-    # an email the approval flow has already verified, never an
-    # unauthenticated caller-supplied one). A brand-new approval can never
-    # have a pending link to resolve except in this exact race, so this is
-    # a no-op the overwhelming majority of the time; kept best-effort so a
-    # customer's account approval is never blocked by it.
-    try:
-        from customer_entitlements import resolve_pending_links_for_customer
-        resolve_pending_links_for_customer(customer_id, item["email"])
-    except Exception:
-        logging.getLogger("anyaicam.customer_registration").exception(
-            "Failed to resolve pending entitlement links for newly approved customer %s", customer_id
-        )
-    # Same best-effort, checkout-before-registration reconciliation as
-    # above, for one-time HARDWARE purchases (see hardware_orders.py) --
-    # a separate call because it's a separate table/pending-link kind,
-    # never conflated with camera-slot entitlements.
-    try:
-        from hardware_orders import resolve_pending_links_for_customer as resolve_pending_hardware_links
-        resolve_pending_hardware_links(customer_id, item["email"])
-    except Exception:
-        logging.getLogger("anyaicam.customer_registration").exception(
-            "Failed to resolve pending hardware order links for newly approved customer %s", customer_id
-        )
-    # Same best-effort, checkout-before-registration reconciliation as
-    # above, for ANALYTICS add-on purchases (see analytics_entitlements.py) --
-    # its own separate table/pending-link kind, never conflated with
-    # camera-slot entitlements or hardware orders.
-    try:
-        from analytics_entitlements import resolve_pending_links_for_customer as resolve_pending_analytics_links
-        resolve_pending_analytics_links(customer_id, item["email"])
-    except Exception:
-        logging.getLogger("anyaicam.customer_registration").exception(
-            "Failed to resolve pending analytics links for newly approved customer %s", customer_id
-        )
-    # Provisioning Phase 6: now that any pending purchase (camera-slot
-    # entitlement and/or hardware order) has been attached to this real
-    # account, send the final customer-facing "ready"/order-confirmation
-    # email(s) -- see purchase_notifications.py's module docstring for
-    # why this uses its own idempotency key here rather than a Stripe
-    # event id. Best-effort: a notification failure must never fail
-    # account approval, which has already fully succeeded by this point.
-    try:
-        from purchase_notifications import notify_registration_resolved
-        notify_registration_resolved(customer_id)
-    except Exception:
-        logging.getLogger("anyaicam.customer_registration").exception(
-            "Failed to send post-registration purchase notifications for customer %s", customer_id
-        )
+    # Post-RC5 (Green 2026-10-17; Codex review, owner-accepted): approval creates the account but attaches NO
+    # purchase. Purchases bought with this address before the account existed are attached only after the owner's
+    # first fully successful sign-in (signin_purchase_attachment.attach_after_signin), with its own audit record
+    # and "added to your account" email.
     from purchase_notifications import notify_registration_decision
     notify_registration_decision(request_id, "approved")  # never raises
     return {"status": "complete", "message": "Customer account approved.", "customer_id": customer_id, "user_id": user_id}

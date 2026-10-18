@@ -115443,6 +115443,14 @@ BILLING_GRACE_SWEEP_SECONDS = 900
 async def _billing_grace_worker() -> None:
     while True:
         try:
+            # "Added to your account" emails not delivered yet (signin_purchase_attachment, post-RC5); never raises.
+            from signin_purchase_attachment import retry_purchase_attached_emails
+            await asyncio.to_thread(retry_purchase_attached_emails)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
             import billing_status
             await asyncio.to_thread(billing_status.sweep_grace)
             # Failed-renewal emails that could not be sent yet (outbox retry).

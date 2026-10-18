@@ -39,10 +39,42 @@ _initialized_targets: set = set()
 _initialization_lock = threading.Lock()
 
 
+import contextvars
+# Inside transaction(), every connection()/row()/rows()/audit() in this thread of work reuses that one connection, so
+# several existing helpers commit or roll back TOGETHER (Green 2026-10-17, post-RC5: sign-in purchase attachment --
+# the purchase transition, the grant and the audit record must never be half-applied). Unset everywhere else: the
+# behaviour of connection() outside transaction() is unchanged.
+_shared_connection: 'contextvars.ContextVar' = contextvars.ContextVar('anyaicam_shared_connection', default=None)
+
+
 @contextmanager
 def connection():
+    shared = _shared_connection.get()
+    if shared is not None:
+        yield shared  # the enclosing transaction() commits or rolls back
+        return
     ensure_database_initialized()
     with database_connect() as db: yield db
+
+
+@contextmanager
+def transaction():
+    """One atomic unit of work: commits when the block ends normally, rolls everything back on any exception. SQLite
+    takes the write lock up front (BEGIN IMMEDIATE), so competing writers wait instead of interleaving; PostgreSQL row
+    locks taken by conditional UPDATEs are held to the end. Nested use joins the outer transaction."""
+    shared = _shared_connection.get()
+    if shared is not None:
+        yield shared
+        return
+    ensure_database_initialized()
+    with database_connect() as db:
+        if backend() == 'sqlite':
+            db.execute('BEGIN IMMEDIATE')
+        token = _shared_connection.set(db)
+        try:
+            yield db
+        finally:
+            _shared_connection.reset(token)
 
 
 def ensure_database_initialized() -> None:

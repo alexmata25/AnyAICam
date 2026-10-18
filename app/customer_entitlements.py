@@ -576,37 +576,11 @@ def create_pending_link(
 
 
 def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
-    """Call this once a customer account exists with a VERIFIED email --
-    e.g. immediately after customer_registration.py confirms/approves the
-    account, or on first authenticated login. Attaches every still-
-    pending purchase made under that email before the account existed.
-
-    Callers must never invoke this on unverified say-so (a bare
-    query-string email, an unauthenticated form field): resolving a
-    pending link is what turns a Stripe purchase into real camera-slot
-    entitlement, so it must only ever run against an email the caller
-    has already proven the customer owns (matching this module's
-    'server-side verification of entitlements' requirement)."""
-    normalized = normalize_email(email)
-    pending = rows("SELECT * FROM pending_customer_links WHERE normalized_email=? AND status='pending'", (normalized,))
-    resolved_ids = []
-    for link in pending:
-        upsert_entitlement(
-            customer_id=customer_id,
-            product=link["product"],
-            camera_slot_quantity=link["camera_slot_quantity"],
-            status="active",
-            stripe_customer_id=link["stripe_customer_id"],
-            stripe_checkout_session_id=link["stripe_checkout_session_id"],
-            stripe_price_id=link.get("stripe_price_id"),
-        )
-        with connection() as db:
-            db.execute(
-                "UPDATE pending_customer_links SET status='resolved',resolved_at=?,resolved_customer_id=? WHERE id=?",
-                (_now(), customer_id, link["id"]),
-            )
-        resolved_ids.append(link["id"])
-    return resolved_ids
+    """Post-RC5 (Green 2026-10-17, Codex review): delegates to the one fenced, transactional attachment protocol
+    (signin_purchase_attachment). The only remaining caller path is a fully successful customer-owner sign-in;
+    email confirmation and registration approval no longer attach purchases."""
+    from signin_purchase_attachment import attach_for_customer
+    return [item["attachment_id"] for item in attach_for_customer(customer_id, email, kinds=("plan",))]
 
 
 # --------------------------------------------------------- Stripe webhook bridge

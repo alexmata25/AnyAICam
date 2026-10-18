@@ -331,7 +331,17 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
             destination=next_path
         else:
             destination=destination_for_role(role)
-        return establish_partner_session(destination, request=request, email=email, role=role, user=user)
+        response=establish_partner_session(destination, request=request, email=email, role=role, user=user)
+        # Post-RC5 (Green 2026-10-17): after the session fully exists, attach this customer owner's pending guest
+        # purchases if their own address was confirmed (signin_purchase_attachment: Red's conditions a-g). Never
+        # raises and never touches the response, session, role or destination.
+        if role=='customer_owner' and user:
+            try:
+                from signin_purchase_attachment import attach_after_signin
+                attach_after_signin(user)
+            except Exception:
+                pass
+        return response
 
     @app.post('/partner-logout')
     def partner_logout(request: Request):

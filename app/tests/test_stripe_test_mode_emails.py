@@ -159,7 +159,9 @@ def test_catalog_amount_is_only_a_fallback_when_stripe_sends_no_amount(db_path, 
 def test_setup_email_links_to_this_environments_customer_sign_up(db_path, tmp_path, monkeypatch):
     monkeypatch.setenv("ANYAICAM_PUBLIC_URL", "https://portal-staging.example")
     subject, text, html = pn._setup_required_email("Local", 8)
-    assert "https://portal-staging.example/customer-register" in text and 'href="https://portal-staging.example/customer-register"' in html
+    # Owner 2026-10-17: self-service signup, not the manual /customer-register approval queue.
+    assert "https://portal-staging.example/customer-signup" in text and 'href="https://portal-staging.example/customer-signup"' in html
+    assert "/customer-register" not in text + html
     assert "app.anyaicam.com" not in text + html
 
 

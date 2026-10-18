@@ -294,8 +294,11 @@ def test_a_guest_creates_the_account_with_the_order_email_and_sees_the_order(hw,
     verified = _signup_and_verify(hw, "buyer@example.test", next_path="/customer/orders")
     assert "Sign in to see your hardware order" in verified.text and "next=%2Fcustomer%2Forders" in verified.text
     customer_id = _customer_id(db_path, "buyer@example.test")
-    assert {row[5] for row in _orders(db_path, "cs_test_hw000001")} == {customer_id}
+    # Post-RC5 (owner 2026-10-17, Codex review): confirming the email attaches nothing; the order is attached at the
+    # owner's first successful sign-in (the address was confirmed after the order was paid).
+    assert {row[5] for row in _orders(db_path, "cs_test_hw000001")} == {None}
     assert _signed_in(_login(hw["client"], "buyer@example.test", customer_only=True))
+    assert {row[5] for row in _orders(db_path, "cs_test_hw000001")} == {customer_id}
     orders = hw["client"].get("/customer/orders").text
     assert ("Your AnyAiCam system has been ordered. Your equipment is being prepared for shipment. You do not need to "
             "activate or pay for your camera subscription yet. Return here when your equipment arrives.") in orders

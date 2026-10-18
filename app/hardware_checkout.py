@@ -682,7 +682,12 @@ def register_hardware_checkout_routes(app: FastAPI) -> None:
             # email, holding this order's own session id.
             if (identity and identity.get("role") == "customer_owner" and not record.get("customer_id")
                     and str(identity.get("email") or "").strip().lower() == str(record.get("email") or "").lower()):
-                link_paid_orders(identity["customer_id"], record["email"], session_id=session_id)
+                # Post-RC5 (Green 2026-10-17): the same fenced, audited protocol as sign-in, which also requires
+                # the account's own address to have been confirmed; only this order's checkout is considered.
+                from signin_purchase_attachment import attach_after_signin
+                account = row("SELECT * FROM partner_users WHERE lower(email)=? AND customer_id=?",
+                              (str(identity.get("email") or "").strip().lower(), identity["customer_id"]))
+                attach_after_signin(account, only_session_id=session_id)
                 record = checkout_row(session_id=session_id)
             try:
                 send_confirmation(record["id"])  # no-op once sent; a retry if the webhook's send failed

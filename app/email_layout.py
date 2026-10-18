@@ -11,6 +11,17 @@ import html
 BRAND = "#0e7c7b"
 
 
+def support_contact() -> tuple[str, str]:
+    """(text, html) "Need help?" line with the configured support address and page (Green 2026-10-17: the
+    password-reset and email-confirmation emails gave a stuck customer no way to reach anyone)."""
+    from purchase_notifications import SUPPORT_EMAIL, SUPPORT_LINK
+    text = f"Need help? Contact {SUPPORT_EMAIL} or visit {SUPPORT_LINK}."
+    markup = (f'<p style="color:#475467;font-size:13px">Need help? Contact '
+              f'<a href="mailto:{html.escape(SUPPORT_EMAIL, quote=True)}">{html.escape(SUPPORT_EMAIL)}</a> or visit '
+              f'<a href="{html.escape(SUPPORT_LINK, quote=True)}">{html.escape(SUPPORT_LINK)}</a>.</p>')
+    return text, markup
+
+
 def button(label: str, url: str) -> str:
     return (f'<a href="{html.escape(url, quote=True)}" style="background:{BRAND};color:#ffffff;padding:12px 18px;'
             f'border-radius:6px;text-decoration:none;display:inline-block;font-weight:bold">{html.escape(label)}</a>')
@@ -35,8 +46,10 @@ def password_reset_email(link: str, *, initiated_by_admin: bool = False) -> tupl
     subject = "Reset your AnyAiCam password"
     intro = ("An AnyAiCam administrator started a password reset for your account."
              if initiated_by_admin else "We received a request to reset the password for your AnyAiCam account.")
+    help_text, help_html = support_contact()
     text = (f"{intro}\n\nChoose a new password with this link (it expires in one hour):\n{link}\n\n"
             "If you didn't ask for this, you can ignore this email; your current password keeps working.\n\n"
+            f"{help_text}\n\n"
             "— The AnyAiCam Team")
     body = (
         '<h2 style="margin:0 0 10px;font-size:20px">Reset your password</h2>'
@@ -45,5 +58,6 @@ def password_reset_email(link: str, *, initiated_by_admin: bool = False) -> tupl
         '<p style="color:#475467;font-size:13px">This link expires in one hour. If the button doesn\'t work, copy this address into your browser:<br>'
         f'<span style="word-break:break-all">{html.escape(link)}</span></p>'
         '<p style="color:#475467;font-size:13px">If you didn\'t ask for this, you can ignore this email; your current password keeps working.</p>'
+        f"{help_html}"
     )
     return subject, text, wrap(body, preheader="Choose a new password for your AnyAiCam account.")

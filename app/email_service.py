@@ -45,6 +45,8 @@ EMAIL_TYPES={
     'registration_approved','registration_rejected',
     # Service paused / active again (Green 2026-10-17, billing_status.py via purchase_notifications).
     'service_suspended','service_restored',
+    # A guest purchase attached to the existing account at sign-in (signin_purchase_attachment.py, post-RC5).
+    'purchase_attached',
 }
 
 

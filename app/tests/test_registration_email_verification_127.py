@@ -81,17 +81,21 @@ def test_unverified_request_cannot_be_approved_and_the_pending_purchase_stays_pe
 
 
 # 3 + 7 ------------------------------------------------------------------------------------------------------------
-def test_verify_then_approve_attaches_the_pending_purchase_without_a_new_checkout(db):
+def test_verify_then_approve_then_sign_in_attaches_the_pending_purchase_without_a_new_checkout(db):
+    """Post-RC5 (owner 2026-10-17, Codex review): approval attaches nothing; the owner's first successful sign-in does."""
+    from signin_purchase_attachment import attach_after_signin
     _paid_before_registration()
     cr.create_pending_registration("Real Buyer", EMAIL, PASSWORD)
     raw = cr.issue_registration_verification(EMAIL)
     assert raw and cr.verify_registration_email(raw, PASSWORD, "Confirmed Owner")
     result = cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
     assert result["status"] == "complete"
-    assert ce.total_camera_slots(result["customer_id"]) == 10
-    assert _link_status(db) == "resolved"
+    assert ce.total_camera_slots(result["customer_id"]) == 0 and _link_status(db) == "pending"
     user, reason = authenticate_detailed(EMAIL, PASSWORD)
     assert reason == "ok" and user
+    assert attach_after_signin(user)["status"] == "attached"
+    assert ce.total_camera_slots(result["customer_id"]) == 10
+    assert _link_status(db) == "resolved"
 
 
 def test_a_confirmation_link_works_once_and_expires(db):
@@ -168,10 +172,12 @@ def test_an_impostors_earlier_request_never_gets_the_buyers_account(db):
     assert cr.create_pending_registration("Real Buyer", EMAIL, "buyer-password-456") == ("pending", False)
     assert _confirm(password="buyer-password-456")
     result = cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
-    assert result["status"] == "complete" and _link_status(db) == "resolved"
+    assert result["status"] == "complete" and _link_status(db) == "pending"  # post-RC5: attached at sign-in, not here
     assert authenticate_detailed(EMAIL, "impostor-password-123")[0] is None
     user, reason = authenticate_detailed(EMAIL, "buyer-password-456")
     assert reason == "ok" and user
+    from signin_purchase_attachment import attach_after_signin
+    assert attach_after_signin(user)["status"] == "attached" and _link_status(db) == "resolved"  # the buyer's sign-in
 
 
 # 6 / Green F2 + F5: GET never confirms; the page carries no referrer and is not cached --------------------------------
