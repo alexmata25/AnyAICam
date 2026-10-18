@@ -391,7 +391,10 @@ class FixedPathTests(KeysetTestCase):
     def test_the_applier_and_the_vms_use_the_same_fixed_path(self):
         self.assertEqual(ar.Paths().entitlement_keys, Path("/etc/anyaicam-update/entitlement_signing_keys.json"))
         app_source = (Path(__file__).resolve().parents[2] / "app" / "appliance_entitlements.py").read_text(encoding="utf-8")
-        self.assertIn('TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")', app_source)
+        # Windows step 1: the VMS takes the directory from platform_paths, fixed per platform (Linux unchanged)
+        self.assertIn('TRUST_ANCHOR_FILE = _UPDATE_DIR / "entitlement_signing_keys.json"', app_source)
+        paths_source = (Path(__file__).resolve().parents[2] / "app" / "platform_paths.py").read_text(encoding="utf-8")
+        self.assertIn('UPDATE_DIR = Path("/etc/anyaicam-update")', paths_source)
 
     def test_the_applier_takes_no_arguments_or_environment_for_the_path(self):
         source = (Path(__file__).resolve().parents[1] / "system" / "apply_release.py").read_text(encoding="utf-8")

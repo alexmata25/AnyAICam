@@ -409,7 +409,9 @@ class TrustBoundaryTests(unittest.TestCase):
 
     def test_the_app_reads_the_installed_path(self):
         source = _text(REPO / "app" / "appliance_entitlements.py")
-        self.assertIn('TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")', source)
+        # Windows step 1: the directory comes from platform_paths, fixed per platform (Linux unchanged)
+        self.assertIn('TRUST_ANCHOR_FILE = _UPDATE_DIR / "entitlement_signing_keys.json"', source)
+        self.assertIn('UPDATE_DIR = Path("/etc/anyaicam-update")', _text(REPO / "app" / "platform_paths.py"))
         step = _text(INSTALLER / "13-entitlement-signing-keys.sh")
         self.assertIn('ENTITLEMENT_KEYS_DIR="/etc/anyaicam-update"\n', step)
         self.assertNotIn("ANYAICAM_UPDATE_KEY_DIR", step)
