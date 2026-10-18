@@ -164,5 +164,53 @@ class PostgreSQLSigninAttachmentRaceTests(unittest.TestCase):
         self.assertEqual(self.counts(), {"entitlements": 0, "attachments": 0, "audits": 0, "link": "pending"})
 
 
+    # ---------------------------------------------------------------- refund / dispute before attachment (Codex 7080e193)
+
+    def _reversed_link(self, reason, suffix):
+        import billing_status
+        import customer_entitlements as ce
+        with self.db() as db:
+            db.execute("DELETE FROM pending_customer_links")
+        event = {"id": f"evt-{suffix}", "data": {"object": {"payment_intent": f"pi_{suffix}", "charge": f"ch_{suffix}"}}}
+        link = ce.create_pending_link(email=EMAIL, product="professional", camera_slot_quantity=10, raw_event=event)
+        billing_status.record_reversal(f"ch_{suffix}", f"pi_{suffix}", "", reason)
+        return link["id"]
+
+    def test_a_refund_or_dispute_recorded_before_attachment_grants_nothing(self):
+        import signin_purchase_attachment as spa
+        for reason in ("refunded", "disputed"):
+            with self.subTest(reason=reason):
+                link_id = self._reversed_link(reason, f"{reason}-pg")
+                token = spa.claim("pending_customer_links", link_id, EMAIL)
+                self.assertTrue(token)
+                self.assertIsNone(spa.finalize("plan", "pending_customer_links", link_id, token, customer_id=CUSTOMER,
+                                               email=EMAIL, label="camera plan"))
+                c = self.counts()
+                self.assertEqual((c["entitlements"], c["attachments"], c["audits"], c["link"]), (0, 0, 0, "reversed"))
+
+    def test_parallel_sign_ins_never_attach_a_refunded_purchase(self):
+        import signin_purchase_attachment as spa
+        self._reversed_link("refunded", "refunded-race")
+        results = self.run_together(lambda: spa.attach_after_signin(self.user()))
+        self.assertEqual(sum(len(r.get("attached", [])) for r in results), 0)
+        c = self.counts()
+        self.assertEqual((c["entitlements"], c["attachments"], c["audits"], c["link"]), (0, 0, 0, "reversed"))
+
+    def test_an_attached_purchase_keeps_its_stripe_references_for_a_later_refund(self):
+        import customer_entitlements as ce
+        import signin_purchase_attachment as spa
+        with self.db() as db:
+            db.execute("DELETE FROM pending_customer_links")
+        event = {"id": "evt-refs-pg", "data": {"object": {"payment_intent": "pi_refs_pg", "subscription": "sub_refs_pg"}}}
+        link = ce.create_pending_link(email=EMAIL, product="professional", camera_slot_quantity=10, raw_event=event)
+        token = spa.claim("pending_customer_links", link["id"], EMAIL)
+        self.assertTrue(spa.finalize("plan", "pending_customer_links", link["id"], token, customer_id=CUSTOMER,
+                                     email=EMAIL, label="camera plan"))
+        with self.db() as db:
+            row = db.execute("SELECT stripe_payment_intent_id,stripe_subscription_id FROM customer_entitlements "
+                             "WHERE customer_id=%s AND product='professional'", (CUSTOMER,)).fetchone()
+        self.assertEqual((row["stripe_payment_intent_id"], row["stripe_subscription_id"]), ("pi_refs_pg", "sub_refs_pg"))
+
+
 if __name__ == "__main__":
     unittest.main()
