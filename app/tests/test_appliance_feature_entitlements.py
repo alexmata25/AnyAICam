@@ -521,7 +521,8 @@ def test_the_anchor_path_is_fixed_in_code():
     assert 'TRUST_ANCHOR_FILE = _UPDATE_DIR / "entitlement_signing_keys.json"' in source
     import platform_paths
     if not platform_paths.WINDOWS:
-        assert str(appliance_entitlements.TRUST_ANCHOR_FILE) == "/etc/anyaicam-update/entitlement_signing_keys.json"
+        # conftest redirects TRUST_ANCHOR_FILE to tmp for every test; check the path the module derives in code
+        assert str(appliance_entitlements._UPDATE_DIR / "entitlement_signing_keys.json") == "/etc/anyaicam-update/entitlement_signing_keys.json"
     paths_source = inspect.getsource(platform_paths)
     assert "os.getenv" not in paths_source and "os.environ" not in paths_source  # never read from the environment
     assert "ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS" not in source.split('"""', 2)[2]  # never read

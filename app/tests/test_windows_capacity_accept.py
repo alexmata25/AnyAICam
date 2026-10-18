@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+import types
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -171,7 +172,8 @@ def test_windows_sync_promotes_the_staged_snapshot_only_on_the_real_path(tmp_pat
     monkeypatch.setattr(vms_capacity, "_stage_snapshot", lambda path, snapshot: True)
     monkeypatch.setattr(windows_accept, "accept_pending", lambda: calls.append("accept") or "accepted")
     monkeypatch.setitem(sys.modules, "capacity_accept_windows", windows_accept)
-    monkeypatch.setattr(vms_capacity.os, "name", "nt")
+    # only vms_capacity sees Windows: patching the shared os module would make pathlib build WindowsPath on Linux
+    monkeypatch.setattr(vms_capacity, "os", types.SimpleNamespace(name="nt"))
     monkeypatch.setattr(vms_capacity, "SIGNED_FILE", vms_capacity._DEFAULT_SIGNED_FILE)  # conftest redirects it
     assert vms_capacity.apply_sync({}, {"signature": {}}) == "accepted" and calls == ["accept"]
 
