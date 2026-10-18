@@ -36018,7 +36018,7 @@ def camera_in_service(camera_number: int) -> bool:
 def retire_camera_pipeline(camera_number: int) -> None:
     """Drop every per-camera resource this pipeline keeps: HLS demand and
     holds, the motion source bookkeeping, the AI frame reader (its ffmpeg is
-    stopped), cached main-stream frames, the profile and the YOLO cache."""
+    stopped), cached main-stream frames, the profile, YOLO cache and LPR state."""
     number = int(camera_number)
     try:
         with _ai_detection_cache_lock:
@@ -36034,6 +36034,14 @@ def retire_camera_pipeline(camera_number: int) -> None:
         _ai_detection_cache.pop(number, None)
     except NameError:  # defined further down in this module
         pass
+    try:
+        import lpr
+        lpr.retire_camera_state(number)
+    except Exception as error:
+        logging.getLogger("anyaicam").warning(
+            "camera_pipeline.lpr_state_retire_failed camera=%s error=%s",
+            number, type(error).__name__,
+        )
     camera_video_profiles.invalidate(number)
 
 

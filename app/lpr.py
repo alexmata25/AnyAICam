@@ -527,6 +527,15 @@ def confirm_plate(camera_number, result, *, now: float | None = None):
         agreeing = sum(1 for _, v in recent if v == text)
         if agreeing < LPR_CONFIRM_READS:
             return None
+        # Keep only the history that can still suppress a repeat or a likely
+        # OCR near-miss. Without pruning, each unique plate seen over the
+        # lifetime of a configured camera remains in this process forever.
+        expired = [
+            emitted_key for emitted_key, emitted_at in _emitted.items()
+            if now - emitted_at >= LPR_REPEAT_COOLDOWN_SECONDS
+        ]
+        for emitted_key in expired:
+            _emitted.pop(emitted_key, None)
         last = _emitted.get((key, text))
         if last is not None and now - last < LPR_REPEAT_COOLDOWN_SECONDS:
             return None
@@ -737,6 +746,25 @@ def reset_scan_state() -> None:
     with _scan_lock:
         _last_scan.clear()
         _last_full_frame.clear()
+
+
+def retire_camera_state(camera_number) -> None:
+    """Release LPR state, including decoded full-resolution frames, on camera removal.
+
+    Camera numbers may be reused after removal, so all per-camera history must
+    be dropped before a new camera is configured at the same number.
+    """
+    with _votes_lock:
+        _votes.pop(camera_number, None)
+        for emitted_key in [key for key in _emitted if key[0] == camera_number]:
+            _emitted.pop(emitted_key, None)
+    with _full_frame_lock:
+        _full_frame_cache.pop(camera_number, None)
+    with _tracks_lock:
+        _tracks.pop(camera_number, None)
+    with _scan_lock:
+        _last_scan.pop(camera_number, None)
+        _last_full_frame.pop(camera_number, None)
 
 
 def _due(table: dict, camera_number, interval: float, now: float) -> bool:
