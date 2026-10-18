@@ -74,16 +74,18 @@ try {
     Copy-Item -Path (Join-Path $mediamtxTemp 'mediamtx.exe'), (Join-Path $mediamtxTemp 'LICENSE') -Destination $mediamtxRoot -Force
 } finally { if (Test-Path $mediamtxTemp) { Remove-Item $mediamtxTemp -Recurse -Force } }
 
-foreach ($directory in @('config', 'database', 'recordings', 'hls', 'logs', 'mediamtx')) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot $directory) | Out-Null
-}
 # The data folder holds the app secrets (config\vms.env), the account database
 # and recordings: only the service (LocalSystem) and administrators may read it.
 # ProgramData's default would let every local user read and create files here.
 # Codex 1.2.7 Windows review: a standard user may pre-create %ProgramData%\AnyAiCam (ProgramData lets users create
-# folders) and plant a junction or symbolic link in it. Refuse any link BEFORE the recursive repair below or any write,
-# then make Administrators the owner of the root (an owner can always rewrite a folder's permissions).
+# folders) and plant a junction or symbolic link in it. Refuse links before creating child paths or running recursive
+# ACL repair, then make Administrators the owner of the root (an owner can always rewrite a folder's permissions).
 . (Join-Path $PSScriptRoot 'data-root-guard.ps1')
+Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # catch DataRoot itself if it was pre-planted as a junction
+if (-not (Test-Path -LiteralPath $DataRoot)) {
+    New-Item -ItemType Directory -Path $DataRoot -Force | Out-Null
+}
+Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # root creation must not have resolved to a reparse point
 & icacls.exe $DataRoot /setowner '*S-1-5-32-544' /C /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $DataRoot (icacls exit $LASTEXITCODE)." }
 # The root only (never /T): its inheritable SYSTEM/Administrators entries flow to every existing and future file and
@@ -91,7 +93,13 @@ if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $DataRoot (icacls e
 & icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
 Assert-AnyAiCamDataRootHasNoLinks $DataRoot
+foreach ($directory in @('config', 'database', 'recordings', 'hls', 'logs', 'mediamtx')) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot $directory) | Out-Null
+}
 $environmentFile = Join-Path $DataRoot 'config\vms.env'
+# Remember whether the complete legacy tree was already repaired so the three
+# secret folders are not walked twice on that path.
+$repairedLegacyTree = $false
 # Repair (2026-10-07): the unreleased 1.3.0 candidates ran the restriction
 # below with /T, which on a reinstall left every existing file with an EMPTY
 # permission list -- unreadable even by the service and administrators. Such an
@@ -102,25 +110,24 @@ if (Test-Path -LiteralPath $environmentFile) {
     $readable = $true
     try { [void][IO.File]::ReadAllBytes($environmentFile) } catch { $readable = $false }
     if (-not $readable) {
-        & takeown.exe /F $DataRoot /R /A /D Y | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Could not take ownership of $DataRoot to repair its permissions (takeown exit $LASTEXITCODE)." }
-        & icacls.exe $DataRoot /reset /T /C /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Could not repair permissions under $DataRoot (icacls exit $LASTEXITCODE)." }
-        # /reset /T also reset the root itself to ProgramData's defaults: restrict it again.
+        # Walk one entry at a time. The helper rejects reparse points, secures
+        # each directory before enumerating it, and never gives icacls a tree
+        # recursion flag that could follow an attacker-planted link.
+        Set-AnyAiCamDescendantAcl $DataRoot
         & icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
+        $repairedLegacyTree = $true
     }
 }
 # The secret-bearing folders (app secrets, account database, cloud-agent credential) must not keep anything a user
-# planted before the install: Administrators own every item and every item inherits the root's SYSTEM/Administrators
-# entries again (explicit entries removed). Recursion is safe here: the tree was just proven to contain no link.
-foreach ($secretFolder in @('config', 'database', 'agent')) {
-    $secretPath = Join-Path $DataRoot $secretFolder
-    if (-not (Test-Path -LiteralPath $secretPath)) { continue }
-    & icacls.exe $secretPath /setowner '*S-1-5-32-544' /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $secretPath (icacls exit $LASTEXITCODE)." }
-    & icacls.exe $secretPath /reset /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not reset the permissions of $secretPath (icacls exit $LASTEXITCODE)." }
+# planted before the install. Parent directories are restricted first; then each child is checked, owned and reset
+# without recursive traversal before its descendants are enumerated.
+if (-not $repairedLegacyTree) {
+    foreach ($secretFolder in @('config', 'database', 'agent')) {
+        $secretPath = Join-Path $DataRoot $secretFolder
+        if (-not (Test-Path -LiteralPath $secretPath)) { continue }
+        Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $secretPath -Force)
+    }
 }
 Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # again, now that nothing below is user-writable
 # Trust anchors (Requirement 9, the Windows counterpart of Linux /etc/anyaicam-update): %ProgramData%\AnyAiCam\update
@@ -128,12 +135,8 @@ Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # again, now that nothing below is 
 # entry only if it is owned by SYSTEM or Administrators, nobody else may modify it, and it is not a link. A file an
 # administrator creates is owned by that user, so ownership is set explicitly.
 $updateRoot = Join-Path $DataRoot 'update'
-if ((Test-Path -LiteralPath $updateRoot) -and ((Get-Item -LiteralPath $updateRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$updateRoot is a link; refusing to use it as the trust folder." }
-New-Item -ItemType Directory -Force -Path $updateRoot | Out-Null
-& icacls.exe $updateRoot /setowner '*S-1-5-32-544' /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $updateRoot (icacls exit $LASTEXITCODE)." }
-& icacls.exe $updateRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $updateRoot (icacls exit $LASTEXITCODE)." }
+if (-not (Test-Path -LiteralPath $updateRoot)) { New-Item -ItemType Directory -Path $updateRoot -Force | Out-Null }
+Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $updateRoot -Force)
 if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'The pinned entitlement keyset SHA-256 is malformed.' }
 $keysetBytes = [IO.File]::ReadAllBytes($EntitlementKeyset)
 $keysetText = [Text.Encoding]::ASCII.GetString($keysetBytes).ToUpperInvariant()

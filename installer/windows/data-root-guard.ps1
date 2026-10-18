@@ -8,9 +8,12 @@
 # '' when there is none. It never follows a link, so a link pointing outside the tree is reported, not traversed.
 
 function Get-AnyAiCamDataRootLink([string]$Root) {
-    $rootInfo = New-Object IO.DirectoryInfo $Root
-    if (-not $rootInfo.Exists) { return '' }
+    # Get-Item detects an existing dangling reparse entry too; DirectoryInfo.Exists
+    # reports false when a directory junction's target has been removed.
+    $rootInfo = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+    if ($null -eq $rootInfo) { return '' }
     if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $rootInfo.FullName }
+    if ($rootInfo -isnot [IO.DirectoryInfo]) { return '' }
     $pending = New-Object 'System.Collections.Generic.Stack[IO.DirectoryInfo]'
     $pending.Push($rootInfo)
     while ($pending.Count -gt 0) {
@@ -28,5 +31,37 @@ function Assert-AnyAiCamDataRootHasNoLinks([string]$Root) {
     $link = Get-AnyAiCamDataRootLink $Root
     if ($link) {
         throw "Refusing to install: $link is a link (junction or symbolic link) inside the AnyAiCam data folder. Remove it, then run the setup again."
+    }
+}
+
+# Reset one entry without a recursive icacls/takeown operation. The caller has
+# already restricted the parent directory, so a standard user cannot replace
+# this entry while its ACL is repaired. Directories are reset before they are
+# enumerated; this removes their explicit writable ACEs before the walk moves
+# further down. Reparse points are rejected before any ACL tool sees the path.
+function Set-AnyAiCamEntryAcl([System.IO.FileSystemInfo]$Entry) {
+    if ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to repair permissions through link $($Entry.FullName)."
+    }
+    & icacls.exe $Entry.FullName /setowner '*S-1-5-32-544' /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $($Entry.FullName) (icacls exit $LASTEXITCODE)." }
+    & icacls.exe $Entry.FullName /reset /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not reset the permissions of $($Entry.FullName) (icacls exit $LASTEXITCODE)." }
+    if ($Entry -is [IO.DirectoryInfo]) {
+        foreach ($child in $Entry.EnumerateFileSystemInfos()) {
+            Set-AnyAiCamEntryAcl $child
+        }
+    }
+}
+
+function Set-AnyAiCamDescendantAcl([string]$Root) {
+    $rootInfo = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+    if ($null -eq $rootInfo) { return }
+    if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to repair permissions through link $($rootInfo.FullName)."
+    }
+    if ($rootInfo -isnot [IO.DirectoryInfo]) { return }
+    foreach ($child in $rootInfo.EnumerateFileSystemInfos()) {
+        Set-AnyAiCamEntryAcl $child
     }
 }

@@ -131,18 +131,15 @@ class RuntimeScriptTests(unittest.TestCase):
         self.assertNotIn("/inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T", self.text)
 
     def test_damaged_install_is_repaired_before_vms_env_is_read(self):
-        repair = self.text.index("[IO.File]::ReadAllBytes($environmentFile)")
-        self.assertLess(repair, self.text.index("& takeown.exe /F $DataRoot /R /A /D Y"))
-        self.assertLess(self.text.index("& takeown.exe /F $DataRoot /R /A /D Y"), self.text.index("& icacls.exe $DataRoot /reset /T /C /Q"))
-        # Codex 1.2.7: the root is restricted BEFORE the repair (so nothing new can be planted while it is checked for
-        # links) and again right after the repair's /reset /T, which also resets the root -- still before vms.env is read.
-        reset = self.text.index("& icacls.exe $DataRoot /reset /T /C /Q")
-        self.assertLess(self.text.index("& icacls.exe $DataRoot /inheritance:r"), reset)
-        restricted_again = self.text.index("& icacls.exe $DataRoot /inheritance:r", reset)
-        self.assertLess(restricted_again, self.text.index("foreach ($line in Get-Content -LiteralPath $environmentFile)"))
+        detection = self.text.index("[IO.File]::ReadAllBytes($environmentFile)")
+        repair = self.text.index("Set-AnyAiCamDescendantAcl $DataRoot")
+        self.assertLess(detection, repair)
+        # The root remains restricted while the manual reparse-safe walk repairs the descendants.
+        self.assertLess(self.text.index("& icacls.exe $DataRoot /inheritance:r"), repair)
+        self.assertLess(repair, self.text.index("foreach ($line in Get-Content -LiteralPath $environmentFile)"))
         self.assertIn("if (-not $readable) {", self.text)  # healthy installs skip the repair
-        for failure in ("(takeown exit $LASTEXITCODE)", "Could not repair permissions under $DataRoot (icacls exit $LASTEXITCODE)"):
-            self.assertIn(failure, self.text)  # a failed repair stops setup
+        self.assertNotIn("takeown.exe", self.text)
+        self.assertNotIn("/reset /T", self.text)  # no recursive ACL tool can traverse a link
 
     def test_secrets_are_generated_once_and_kept(self):
         self.assertIn("if (-not $values.Contains('ANYAICAM_APP_SECRETS'))", self.text)

@@ -75,14 +75,15 @@ def test_build_requires_the_keyset_and_its_pin_and_hands_both_to_setup():
 def test_install_creates_a_protected_trust_folder_and_verifies_before_writing():
     script = _text("install-runtime.ps1")
     block = script[script.index("$updateRoot = Join-Path $DataRoot 'update'"):script.index("Entitlement keyset installed")]
-    order = ["ReparsePoint", "/setowner '*S-1-5-32-544'", "/inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'",
+    order = ["Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $updateRoot -Force)",
              "Contains('PRIVATE')", "Get-FileHash -Algorithm SHA256 -LiteralPath $EntitlementKeyset",
              "WriteAllBytes($keysetTemp", "Move-Item -LiteralPath $keysetTemp", "$keysetTarget /setowner '*S-1-5-32-544'",
              "$keysetTarget /reset"]
     positions = [block.index(step) for step in order]
     assert positions == sorted(positions), "trust-folder steps out of order"
     assert "entitlement_signing_keys.json" in block
-    assert block.count("if ($LASTEXITCODE -ne 0) { throw") >= 4      # every icacls step fails the install loudly
+    guard = (ROOT / "installer" / "windows" / "data-root-guard.ps1").read_text(encoding="utf-8-sig")
+    assert guard.count("if ($LASTEXITCODE -ne 0) { throw") >= 2  # entry ACL failures stop setup
 
 
 def test_the_vms_reads_the_keyset_from_the_folder_the_installer_writes():

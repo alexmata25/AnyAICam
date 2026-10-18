@@ -75,19 +75,27 @@ def _runtime() -> str:
 def test_install_runtime_restricts_the_root_and_refuses_links_before_any_recursive_operation():
     text = _runtime()
     load = text.index(". (Join-Path $PSScriptRoot 'data-root-guard.ps1')")
+    first_check = text.index("Assert-AnyAiCamDataRootHasNoLinks $DataRoot")
+    create_root = text.index("New-Item -ItemType Directory -Path $DataRoot -Force")
     owner = text.index("& icacls.exe $DataRoot /setowner '*S-1-5-32-544' /C /Q")
     restrict = text.index("& icacls.exe $DataRoot /inheritance:r /grant:r")
-    first_check = text.index("Assert-AnyAiCamDataRootHasNoLinks $DataRoot")
-    takeown = text.index("& takeown.exe /F $DataRoot /R")
-    reset_tree = text.index("& icacls.exe $DataRoot /reset /T")
+    make_children = text.index("foreach ($directory in @('config', 'database', 'recordings', 'hls', 'logs', 'mediamtx'))")
+    reset_tree = text.index("Set-AnyAiCamDescendantAcl $DataRoot")
     secret = text.index("foreach ($secretFolder in @('config', 'database', 'agent'))")
-    assert load < owner < restrict < first_check < takeown < reset_tree < secret
-    # the legacy repair's /reset /T also resets the root: it is restricted again right after
-    after_repair = text[reset_tree:secret]
-    assert "& icacls.exe $DataRoot /inheritance:r /grant:r" in after_repair
+    assert load < first_check < create_root < owner < restrict < make_children < reset_tree < secret
+    # No child under DataRoot is created until the root is owned/restricted and the tree scan passes.
+    assert make_children < text.index("$environmentFile = Join-Path $DataRoot 'config\\vms.env'")
+    # Repairs use the checked, one-entry-at-a-time walker instead of recursive ACL tools.
+    assert "takeown.exe" not in text and "/reset /T" not in text and "/setowner '*S-1-5-32-544' /T" not in text
+    helper = (WIN / "data-root-guard.ps1").read_text(encoding="utf-8-sig")
+    link_check = helper.index("if ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint)")
+    set_owner = helper.index("& icacls.exe $Entry.FullName /setowner")
+    reset_entry = helper.index("& icacls.exe $Entry.FullName /reset")
+    enumerate_children = helper.index("$Entry.EnumerateFileSystemInfos()")
+    assert link_check < set_owner < reset_entry < enumerate_children
     # and a second check once the secret folders are Administrators-only
-    assert text.count("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") == 2
-    assert text.index("Assert-AnyAiCamDataRootHasNoLinks $DataRoot", first_check + 1) > secret
+    assert text.count("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") == 4
+    assert text.rindex("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") > secret
 
 
 def test_the_setup_ships_the_guard_beside_install_runtime():
