@@ -82,6 +82,9 @@ try {
 # ACL repair, then make Administrators the owner of the root (an owner can always rewrite a folder's permissions).
 . (Join-Path $PSScriptRoot 'data-root-guard.ps1')
 Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # catch DataRoot itself if it was pre-planted as a junction
+# Decided BEFORE the root is touched: was this already a genuine (admin-owned, protected) AnyAiCam data root? If
+# not -- a first install, or a tree someone else prepared -- every entry is repaired below, not only the secret folders.
+$rootWasTrusted = Test-AnyAiCamDataRootTrusted $DataRoot
 if (-not (Test-Path -LiteralPath $DataRoot)) {
     New-Item -ItemType Directory -Path $DataRoot -Force | Out-Null
 }
@@ -122,6 +125,12 @@ if (Test-Path -LiteralPath $environmentFile) {
 # The secret-bearing folders (app secrets, account database, cloud-agent credential) must not keep anything a user
 # planted before the install. Parent directories are restricted first; then each child is checked, owned and reset
 # without recursive traversal before its descendants are enumerated.
+if (-not $repairedLegacyTree -and -not $rootWasTrusted) {
+    # First install or a pre-prepared tree: recordings, hls, logs and mediamtx may hold user-writable entries or
+    # foreign owners too. Walk and repair the whole tree (no recursive ACL tool; links refused before any change).
+    Set-AnyAiCamDescendantAcl $DataRoot
+    $repairedLegacyTree = $true
+}
 if (-not $repairedLegacyTree) {
     foreach ($secretFolder in @('config', 'database', 'agent')) {
         $secretPath = Join-Path $DataRoot $secretFolder
