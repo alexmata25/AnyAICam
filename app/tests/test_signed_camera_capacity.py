@@ -309,8 +309,20 @@ def test_a_huge_fallback_file_is_ignored(licensed, appliance):
 def test_the_fallback_path_is_fixed_beside_the_trust_anchor():
     import importlib
     source = open(vms_capacity.__file__, encoding="utf-8").read()
-    assert 'FALLBACK_FILE = Path("/etc/anyaicam-update/vms_capacity_fallback.json")' in source
+    # Windows step 1 (P3): the directory comes from platform_paths -- fixed per platform in code, never the
+    # environment -- and on Linux it is still /etc/anyaicam-update, beside the entitlement trust anchor.
+    assert 'FALLBACK_FILE = _UPDATE_DIR / "vms_capacity_fallback.json"' in source
+    import appliance_entitlements
+    import platform_paths
     assert importlib.import_module("vms_capacity").__name__ == "vms_capacity"
+    # beside the trust anchor: both are defined from the same fixed platform directory (fixtures may redirect the
+    # live module attributes, so the definitions are checked)
+    anchor_source = open(appliance_entitlements.__file__, encoding="utf-8").read()
+    assert 'TRUST_ANCHOR_FILE = _UPDATE_DIR / "entitlement_signing_keys.json"' in anchor_source
+    if not platform_paths.WINDOWS:
+        assert str(platform_paths.UPDATE_DIR / "vms_capacity_fallback.json") == "/etc/anyaicam-update/vms_capacity_fallback.json"
+    paths_source = open(platform_paths.__file__, encoding="utf-8").read()
+    assert "os.getenv" not in paths_source and "os.environ" not in paths_source
 
 
 # ------------------------------------------------------------------ end to end with the migration
