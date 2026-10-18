@@ -245,3 +245,33 @@ def test_the_order_confirmation_page_attaches_only_that_guest_checkout(site, db_
     assert [item["kind"] for item in result["attached"]] == ["hardware order"]
     assert _q(db_path, "SELECT customer_id FROM hardware_checkouts WHERE id='hc-1'")[0][0] == customer_id
     assert _link_state(db_path)[0] == "pending"                     # the camera plan waits for a normal sign-in
+
+
+def test_eight_parallel_sign_in_attachments_on_sqlite_grant_exactly_once(site, db_path, notices):
+    """Real threads released together (Codex 2026-10-18: SQLite race evidence). BEGIN IMMEDIATE serializes writers;
+    every loser's conditional UPDATE changes no row."""
+    import threading
+    from database_backend import override_target
+    from partner_db import authenticate_detailed
+    client, _, mail = site
+    customer_id = _verified_owner(client, mail, db_path, "parallel@example.test")
+    _buy_as_guest("parallel@example.test", "evt_parallel")
+    user, _ = authenticate_detailed("parallel@example.test", PASSWORD)
+    barrier, results, errors = threading.Barrier(8), [], []
+
+    def worker():
+        try:
+            with override_target(sqlite_path=str(db_path)):
+                barrier.wait(timeout=10)
+                results.append(spa.attach_after_signin(user))
+        except Exception as exc:
+            errors.append(repr(exc))
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert errors == []
+    assert sum(len(r.get("attached", [])) for r in results) == 1
+    assert _counts(db_path, customer_id) == {"slots": 10, "attachments": 1, "audits": 1}
+    assert len(notices["sent"]) == 1
