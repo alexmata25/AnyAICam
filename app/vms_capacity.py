@@ -29,13 +29,16 @@ import tempfile
 
 logger = logging.getLogger("anyaicam.vms_capacity")
 
-STATE_FILE = Path("/opt/anyaicam/data/config/vms_capacity.json")
+from platform_paths import CONFIG_DIR as _CONFIG_DIR, UPDATE_DIR as _UPDATE_DIR  # noqa: E402
+
+STATE_FILE = _CONFIG_DIR / "vms_capacity.json"
 # Fixed input path: runtime environment from vms.env must not redirect staging.
-SIGNED_FILE = Path("/opt/anyaicam/data/config/vms_capacity_signed.json")
-# Root-owned beside the entitlement trust anchor; never environment-configurable.
-ACCEPTED_FILE = Path("/etc/anyaicam-update/vms_capacity_accepted.json")
+SIGNED_FILE = _CONFIG_DIR / "vms_capacity_signed.json"
+_DEFAULT_SIGNED_FILE = SIGNED_FILE  # tests redirect SIGNED_FILE; only the real path triggers acceptance
+# Root-owned (Windows: SYSTEM/Administrators-only) beside the entitlement trust anchor; never environment-configurable.
+ACCEPTED_FILE = _UPDATE_DIR / "vms_capacity_accepted.json"
 _DEFAULT_ACCEPTED_FILE = ACCEPTED_FILE
-FALLBACK_FILE = Path("/etc/anyaicam-update/vms_capacity_fallback.json")
+FALLBACK_FILE = _UPDATE_DIR / "vms_capacity_fallback.json"
 MAX_CAMERA_SLOTS = 10_000
 _MAX_FILE_BYTES = 512 * 1024
 
@@ -83,6 +86,12 @@ def _accepted_signed() -> tuple[bool, dict | None]:
     import appliance_entitlements
 
     try:
+        if os.name == "nt" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE:
+            import platform_paths
+            if platform_paths.windows_write_problem(ACCEPTED_FILE.parent):
+                return os.path.lexists(ACCEPTED_FILE), None
+            if os.path.lexists(ACCEPTED_FILE) and platform_paths.windows_write_problem(ACCEPTED_FILE):
+                return True, None
         parent = os.lstat(ACCEPTED_FILE.parent)
         if (stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode) or
                 (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
@@ -231,7 +240,27 @@ def apply_sync(breakdown, snapshot) -> str:
     if not isinstance(snapshot, dict):
         logger.warning("vms_capacity.stage_rejected reason=malformed_snapshot")
         return "stage_failed"
-    return "staged" if _stage_snapshot(SIGNED_FILE, snapshot) else "stage_failed"
+    if not _stage_snapshot(SIGNED_FILE, snapshot):
+        return "stage_failed"
+    if os.name == "nt" and SIGNED_FILE == _DEFAULT_SIGNED_FILE:
+        return _accept_on_windows()
+    return "staged"
+
+
+def _accept_on_windows() -> str:
+    """Windows step 4 (Codex 07e934a, ported): there is no separate root service to promote the staged snapshot --
+    the VMS service already runs as LocalSystem -- so the acceptance helper runs here, with its own fixed paths, the
+    trust-folder ACL checks and the release keyset. It never raises; any refusal keeps the last accepted capacity."""
+    import sys
+    system_dir = str(Path(__file__).resolve().parents[1] / "agent" / "system")
+    if system_dir not in sys.path:
+        sys.path.insert(0, system_dir)
+    try:
+        import capacity_accept_windows
+        return capacity_accept_windows.accept_pending()
+    except Exception as error:
+        logger.warning("vms_capacity.accept_rejected error=%s", type(error).__name__)
+        return "accept_rejected"
 
 
 def load_capacity() -> dict | None:

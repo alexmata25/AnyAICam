@@ -132,6 +132,10 @@ function Install-RuntimeCatalog([string]$CatalogPath) {
     if (-not (Test-Path -LiteralPath $CatalogPath)) { throw "Runtime catalog not found: $CatalogPath" }
     $signature = Get-AuthenticodeSignature -LiteralPath $CatalogPath
     if ($signature.Status -ne 'Valid') { return "AnyAiCam runtime catalog not registered: it is not validly signed ($($signature.Status)); Smart App Control will block the runtime." }
+    # Codex 2026-10-17: a valid signature from any OTHER publisher must not be trusted (publisher-pin.ps1).
+    . (Join-Path $PSScriptRoot 'publisher-pin.ps1')
+    $publisherProblem = Get-AnyAiCamPublisherProblem $signature
+    if ($publisherProblem) { return "AnyAiCam runtime catalog not registered: $publisherProblem." }
     Use-CatalogAdmin {
         param($api, $admin)
         $info = $api::CryptCATAdminAddCatalog($admin, $CatalogPath, $CatalogBaseName, 0)

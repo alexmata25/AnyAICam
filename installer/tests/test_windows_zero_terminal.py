@@ -277,7 +277,8 @@ class InnoCompileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="anyaicam-iss-") as folder:
             script = Path(folder) / "AnyAiCam-VMS.iss"
             script.write_text(text, encoding="utf-8")
-            result = subprocess.run([str(ISCC), "/O-", "/Q", "/DAppVersion=1.3.0", f"/DSourceCommit={COMMIT}", str(script)],
+            result = subprocess.run([str(ISCC), "/O-", "/Q", "/DAppVersion=1.3.0", f"/DSourceCommit={COMMIT}",
+                                     "/DKeysetSha256=" + "0" * 64, str(script)],  # KeysetSha256 is required since Windows step 2
                                     capture_output=True, text=True, timeout=300)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

@@ -76,9 +76,13 @@ PRODUCT_MODE_ENV = "ANYAICAM_PRODUCT_MODE"
 BOOTSTRAP_MODE_ENV = "ANYAICAM_PRODUCT_MODE_BOOTSTRAP"
 VALID_MODES = ("local", "hybrid")
 
+from platform_paths import CONFIG_DIR as _CONFIG_DIR  # noqa: E402  (Windows: %ProgramData%\AnyAiCam\config)
+
+# Linux: /opt/anyaicam/data/config/product_mode.json (unchanged). Windows: the SYSTEM/Administrators-only config folder;
+# the old POSIX default resolved to C:\opt\..., which any signed-in user may modify (Requirement 9, 2026-10-17).
 STATE_FILE = Path(os.environ.get(
     "ANYAICAM_PRODUCT_MODE_STATE_FILE",
-    "/opt/anyaicam/data/config/product_mode.json",
+    str(_CONFIG_DIR / "product_mode.json"),
 ))
 
 

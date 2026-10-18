@@ -9,6 +9,9 @@
   #define SourceCommit "0000000000000000000000000000000000000000"
 #endif
 #define ShortCommit Copy(SourceCommit, 1, 7)
+#ifndef KeysetSha256
+  #error KeysetSha256 is required: build with build.ps1 -EntitlementKeyset ... -EntitlementKeysetSha256 ...
+#endif
 [Setup]
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
 AppName={#AppName}
@@ -56,6 +59,8 @@ Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*"; 
 Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
@@ -63,6 +68,10 @@ Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 ; run on the bundled Python as the AnyAiCamAgent service.
 Source: "..\..\appliance-agent\anyaicam_agent\*"; DestDir: "{app}\agent\anyaicam_agent"; Excludes: "__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "agent-main.py"; DestDir: "{app}\agent"; Flags: ignoreversion
+; Windows step 4 (signed capacity acceptance, Codex 07e934a ported): the Windows helper reuses the Linux helper's pure
+; signed-format / identity / expiry / replay policy; vms_capacity.apply_sync() runs it from {app}\agent\system.
+Source: "..\..\appliance-agent\system\capacity_accept.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
+Source: "..\..\appliance-agent\system\capacity_accept_windows.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
 Source: "agent-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "AnyAiCamAgent.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamAgent.exe"; Flags: ignoreversion
@@ -70,6 +79,7 @@ Source: "cloud-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; 2026-10-08: the signed catalog of the runtime's native files (build.ps1,
 ; runtime-catalog.ps1); Smart App Control blocks them without it.
 Source: "runtime-catalog.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "publisher-pin.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "output\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "open-claim-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
@@ -114,6 +124,41 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -N
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+var
+  ProductModePage: TInputOptionWizardPage;
+
+// Requirement 9 (1.2.7): Local or Hybrid. An existing installation keeps its saved mode (no page, nothing passed).
+function ExistingInstall(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'));
+end;
+
+procedure InitializeWizard;
+begin
+  ProductModePage := CreateInputOptionPage(wpSelectDir, 'How will you use AnyAiCam?',
+    'You can change this later from your AnyAiCam account.',
+    'Choose the mode for this computer, then click Next.', True, False);
+  ProductModePage.Add('Local: cameras, recording and live view stay on this computer');
+  ProductModePage.Add('Hybrid: adds Cloud Video Backup and remote features (needs an AnyAiCam plan)');
+  ProductModePage.SelectedValueIndex := 0;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = ProductModePage.ID) and (ExistingInstall() or (ExpandConstant('{param:ProductMode|}') <> ''));
+end;
+
+// What install-runtime.ps1 receives. A silent NEW install without /ProductMode= passes nothing, so it is refused
+// there -- the same rule as the Linux unattended install (never a silent default).
+function ProductModeChoice(): String;
+begin
+  Result := Lowercase(ExpandConstant('{param:ProductMode|}'));
+  if (Result = '') and not ExistingInstall() and not WizardSilent() then
+  begin
+    if ProductModePage.SelectedValueIndex = 1 then Result := 'hybrid' else Result := 'local';
+  end;
+end;
+
 var VcRuntimeNeedsRestart: Boolean;
 
 procedure ExecRequired(const FileName, Parameters, Description: String);
@@ -251,7 +296,7 @@ begin
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -AppVersion "{#AppVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -AppVersion "{#AppVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');

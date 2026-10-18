@@ -517,7 +517,13 @@ def test_the_anchor_must_be_root_owned_and_not_writable_by_others():
 def test_the_anchor_path_is_fixed_in_code():
     import inspect
     source = inspect.getsource(appliance_entitlements)
-    assert 'TRUST_ANCHOR_FILE = Path("/etc/anyaicam-update/entitlement_signing_keys.json")' in source
+    # Windows step 1: the directory comes from platform_paths (fixed per platform, never the environment).
+    assert 'TRUST_ANCHOR_FILE = _UPDATE_DIR / "entitlement_signing_keys.json"' in source
+    import platform_paths
+    if not platform_paths.WINDOWS:
+        assert str(appliance_entitlements.TRUST_ANCHOR_FILE) == "/etc/anyaicam-update/entitlement_signing_keys.json"
+    paths_source = inspect.getsource(platform_paths)
+    assert "os.getenv" not in paths_source and "os.environ" not in paths_source  # never read from the environment
     assert "ANYAICAM_CLOUD_SIGNING_PUBLIC_KEYS" not in source.split('"""', 2)[2]  # never read
 
 
