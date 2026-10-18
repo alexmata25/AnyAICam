@@ -55,3 +55,40 @@ def test_the_billing_worker_runs_the_outbox_retry():
 
     import main
     assert "retry_outbox_emails" in inspect.getsource(main._billing_grace_worker)
+
+
+# Red review 2026-10-17: no customer mail copies kept indefinitely.
+def test_a_delivered_email_keeps_no_copy(db, mail):
+    _verified_request()
+    cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
+    row = _outbox(db, "registration_approved")
+    assert row["status"] == "sent" and row["body_text"] is None and row["body_html"] is None
+
+
+def test_a_copy_is_dropped_once_the_failed_email_is_resent(db, mail):
+    _verified_request()
+    mail["failing"].append(True)
+    cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
+    assert _outbox(db, "registration_approved")["body_text"]
+    mail["failing"].clear()
+    assert pn.retry_outbox_emails() == 1
+    assert _outbox(db, "registration_approved")["body_text"] is None
+
+
+def test_types_that_are_never_resent_from_a_copy_never_store_one(db, mail):
+    mail["failing"].append(True)
+    pn._send_once(event_id="evt-test-service", notification_type="service_suspended", customer_id=None,
+                  recipient_email="a@example.test", subject="s", text="body", html="<p>body</p>")
+    row = _outbox(db, "service_suspended")
+    assert row["status"] == "failed" and row["body_text"] is None
+
+
+def test_copies_older_than_the_retry_window_are_purged(db, mail):
+    _verified_request()
+    mail["failing"].append(True)
+    cr.approve_registration(_request(db)["id"], "partner-a", MASTER)
+    old = (datetime.now() - timedelta(hours=pn.RETRY_OUTBOX_MAX_AGE_HOURS + 1)).isoformat()
+    db.execute("UPDATE provisioning_notifications SET created_at=?", (old,))
+    db.commit()
+    assert pn.purge_outbox_bodies() == 1
+    assert _outbox(db, "registration_approved")["body_text"] is None

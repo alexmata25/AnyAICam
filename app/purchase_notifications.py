@@ -196,7 +196,9 @@ def _claim_attempt(
         ).rowcount
         if not taken:
             return None
-    if body_text is not None:  # the exact final copy, for retry_outbox_emails (Green 2026-10-17)
+    # The exact final copy, kept ONLY for the types retry_outbox_emails re-sends, and only until it is sent or
+    # RETRY_OUTBOX_MAX_AGE_HOURS have passed (Red review 2026-10-17: no customer mail copies kept indefinitely).
+    if body_text is not None and notification_type in RETRY_OUTBOX_TYPES:
         db.execute("UPDATE provisioning_notifications SET body_text=?,body_html=? WHERE stripe_event_id=? AND notification_type=?",
                    (body_text, body_html, event_id, notification_type))
     return _existing_notification(event_id, notification_type, db)
@@ -211,6 +213,8 @@ def _mark_result(notification_id: str, *, status: str, error_detail: Optional[st
         "UPDATE provisioning_notifications SET status=?,error_detail=?,updated_at=?,sent_at=? WHERE id=?",
         (status, error_detail, now, now if status == "sent" else None, notification_id),
     )
+    if status == "sent":  # delivered: the stored copy is no longer needed
+        db.execute("UPDATE provisioning_notifications SET body_text=NULL,body_html=NULL WHERE id=?", (notification_id,))
 
 
 # Stripe test mode (2026-09-28): set per webhook event by
@@ -1138,6 +1142,19 @@ RETRY_OUTBOX_TYPES = ("account_ready", "setup_required", "plan_updated", "plan_c
 RETRY_OUTBOX_MAX_AGE_HOURS = 48
 
 
+def purge_outbox_bodies(older_than: Optional[str] = None) -> int:
+    """Drop stored email copies that can no longer be re-sent (past RETRY_OUTBOX_MAX_AGE_HOURS) or were never meant
+    to be kept. Returns how many rows were cleared."""
+    from datetime import timedelta
+    older_than = older_than or (datetime.now() - timedelta(hours=RETRY_OUTBOX_MAX_AGE_HOURS)).isoformat()
+    placeholders = ",".join("?" for _ in RETRY_OUTBOX_TYPES)
+    with connection() as db:
+        return db.execute(
+            "UPDATE provisioning_notifications SET body_text=NULL,body_html=NULL WHERE body_text IS NOT NULL AND "
+            f"(created_at<? OR status='sent' OR notification_type NOT IN ({placeholders}))",
+            (older_than, *RETRY_OUTBOX_TYPES)).rowcount
+
+
 def retry_outbox_emails(limit: int = 50) -> int:
     """Billing-worker pass: re-send failed (or interrupted) emails of RETRY_OUTBOX_TYPES. Returns how many were sent."""
     from datetime import timedelta
@@ -1146,6 +1163,7 @@ def retry_outbox_emails(limit: int = 50) -> int:
     stale_before = (now - timedelta(seconds=OUTBOX_CLAIM_STALE_SECONDS)).isoformat()
     oldest = (now - timedelta(hours=RETRY_OUTBOX_MAX_AGE_HOURS)).isoformat()
     placeholders = ",".join("?" for _ in RETRY_OUTBOX_TYPES)
+    purge_outbox_bodies(oldest)
     sent = 0
     for pending in rows(f"SELECT * FROM provisioning_notifications WHERE notification_type IN ({placeholders}) "
                         "AND body_text IS NOT NULL AND created_at>=? "
