@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from partner_db import connection, row, rows
+from partner_db import connection, row, rows, transaction
 
 logger = logging.getLogger("anyaicam.billing_status")
 
@@ -308,7 +308,9 @@ def _is_reversed(charge_id: str, intent: str, invoice_id: str) -> bool:
 
 
 def record_reversal(charge_id: str, intent: str, invoice_id: str, reason: str) -> None:
-    _record_reversal(charge_id, intent, invoice_id, reason)
+    with transaction() as db:
+        lock_payment(db, payment_keys(charge_id, intent, invoice_id))
+        _record_reversal(charge_id, intent, invoice_id, reason)
 
 
 # ------------------------------------------------------------------ per-invoice payment state (finding 6)
@@ -418,10 +420,56 @@ def restore_hardware_orders(intent: str) -> int:
                           (datetime.now().isoformat(), intent)).rowcount
 
 
+# ------------------------------------------------------------------ payment serialization (Green 2026-10-18, post-RC5)
+#
+# Codex review of 7080e193: a refund/dispute could be recorded (its own transaction) between the sign-in attachment's
+# "not reversed" check and its commit, so a refunded purchase could still get an active entitlement under PostgreSQL
+# READ COMMITTED. Every path that reverses, restores or attaches a purchase now takes the same per-payment lock
+# (payment_locks rows keyed by payment intent / charge / invoice, in sorted order) inside the transaction that does
+# its work: whichever commits first, the other then sees it.
+
+def payment_keys(charge_id: str = "", intent: str = "", invoice_id: str = "") -> list[str]:
+    return sorted({f"{prefix}:{value}" for prefix, value in (("ch", charge_id), ("pi", intent), ("in", invoice_id)) if value})
+
+
+def lock_payment(db, keys: list[str]) -> None:
+    """Take the per-payment lock(s) inside the caller's transaction (SQLite: BEGIN IMMEDIATE already serializes all
+    writers; PostgreSQL: a row lock held until commit)."""
+    from database_backend import backend
+    now = _now().isoformat()
+    for key in sorted(set(keys)):
+        db.execute("INSERT INTO payment_locks(key,created_at) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (key, now))
+        if backend() == "postgresql":
+            db.execute("SELECT key FROM payment_locks WHERE key=? FOR UPDATE", (key,))
+
+
+def _restore_disputed_pending(db, charge_id: str, intent: str) -> int:
+    """A won dispute makes a pending purchase that attachment had set aside as 'disputed' claimable again (Codex:
+    dispute-won recovery). Refund-reversed purchases stay terminal."""
+    restored = 0
+    for column, value in (("charge_id", charge_id), ("payment_intent", intent)):
+        if not value:
+            continue
+        for item in db.execute(f"SELECT * FROM pending_reversals WHERE {column}=? AND reason='disputed'", (value,)).fetchall():
+            table = item["source_table"]
+            if table not in ("pending_customer_links", "pending_hardware_order_links", "pending_analytics_links"):
+                continue
+            restored += db.execute(f"UPDATE {table} SET status='pending',claim_token=NULL,claimed_at=NULL "
+                                   "WHERE id=? AND status='reversed'", (item["source_id"],)).rowcount
+            db.execute("DELETE FROM pending_reversals WHERE id=?", (item["id"],))
+    return restored
+
+
 def _reverse_purchase(event: dict, reason: str) -> dict:
     charge_id, intent, invoice_id, full = _charge_parts(event)
     if not full:
         return {"status": "ignored", "reason": "partial refund: service unchanged (owner decision pending)"}
+    with transaction() as db:  # the reversal record and every suspension commit together, under the payment lock
+        lock_payment(db, payment_keys(charge_id, intent, invoice_id))
+        return _reverse_purchase_locked(charge_id, intent, invoice_id, reason)
+
+
+def _reverse_purchase_locked(charge_id: str, intent: str, invoice_id: str, reason: str) -> dict:
     payment = _payment_for_charge(charge_id, intent, invoice_id)
     _record_reversal(charge_id, intent, (payment or {}).get("id") or invoice_id, reason)
     if payment is None:
@@ -450,6 +498,14 @@ def _dispute_closed(event: dict) -> dict:
     if str(obj.get("status") or "") != "won":
         return {"status": "ignored", "reason": "dispute not won: service stays suspended"}
     charge_id, intent = str(obj.get("charge") or ""), str(obj.get("payment_intent") or "")
+    with transaction() as db:
+        lock_payment(db, payment_keys(charge_id, intent))
+        result = _dispute_won_locked(charge_id, intent)
+        result["pending_reinstated"] = _restore_disputed_pending(db, charge_id, intent)
+    return result
+
+
+def _dispute_won_locked(charge_id: str, intent: str) -> dict:
     payment = _payment_for_charge(charge_id, intent, "")
     with connection() as db:  # the payment stands: no longer a reversal
         db.execute(REVERSALS_DDL)

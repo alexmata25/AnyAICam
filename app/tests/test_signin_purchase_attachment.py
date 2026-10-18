@@ -320,3 +320,30 @@ def test_attached_plan_keeps_stripe_references_for_later_reversal(db_path):
         license_row = _q(db_path, "SELECT stripe_payment_intent_id,stripe_subscription_id FROM customer_entitlements "
                          "WHERE customer_id='c-refs' AND product='camera_slots_local'")[0]
         assert license_row == ("pi_keep_for_reversal", "sub_keep_for_reversal")
+
+
+def _dispute_event(kind, suffix, **extra):
+    return {"id": f"evt-{kind}-{suffix}", "type": kind, "data": {"object": {
+        "id": f"dp_{suffix}", "object": "dispute", "charge": f"ch_{suffix}", "payment_intent": f"pi_{suffix}", **extra}}}
+
+
+def test_a_won_dispute_reinstates_a_set_aside_purchase_and_the_next_sign_in_attaches_it(site, db_path, notices, monkeypatch):
+    """Codex (P2): a purchase set aside as 'reversed' because its payment was disputed becomes claimable again when the
+    dispute is won; a refund or a lost dispute stays terminal. SQLite counterpart of the PostgreSQL test."""
+    import billing_status
+    import sales_commissions
+    from partner_db import authenticate_detailed
+    monkeypatch.setattr(billing_status, "_stripe_invoice_subscription", lambda intent: None)
+    monkeypatch.setattr(sales_commissions, "_invoice_for_payment_intent", lambda intent: None)
+    client, _, mail = site
+    customer_id = _verified_owner(client, mail, db_path, "won@example.test")
+    ce.create_pending_link(email="won@example.test", product="professional", camera_slot_quantity=10,
+                           raw_event={"id": "evt-won", "data": {"object": {"payment_intent": "pi_won", "charge": "ch_won"}}})
+    user, _ = authenticate_detailed("won@example.test", PASSWORD)
+    billing_status.sync_from_stripe_event(_dispute_event("charge.dispute.created", "won"))
+    assert spa.attach_after_signin(user)["status"] == "nothing to attach"
+    assert _link_state(db_path)[0] == "reversed"
+    assert billing_status.sync_from_stripe_event(_dispute_event("charge.dispute.closed", "won", status="won"))["pending_reinstated"] == 1
+    assert _link_state(db_path)[0] == "pending"
+    assert len(spa.attach_after_signin(user)["attached"]) == 1
+    assert _counts(db_path, customer_id) == {"slots": 10, "attachments": 1, "audits": 1}

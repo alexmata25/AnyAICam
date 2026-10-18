@@ -79,18 +79,26 @@ def _stripe_refs(link: dict) -> dict[str, str]:
     }
 
 
-def _recorded_reversal(db, kind: str, table: str, link: dict) -> str | None:
-    """Return a durable reversal for a pending purchase, without making a network call."""
+def _payment_refs(db, table: str, link: dict) -> dict[str, str]:
+    """The purchase's Stripe payment identifiers (a guest hardware checkout's intent comes from its order)."""
     refs = _stripe_refs(link)
-    if table == GUEST_CHECKOUTS:
-        order = db.execute(
-            "SELECT stripe_payment_intent_id,status FROM hardware_orders WHERE stripe_checkout_session_id=? LIMIT 1",
-            (link.get("stripe_checkout_session_id"),),
-        ).fetchone()
+    if table == GUEST_CHECKOUTS and not refs["payment_intent"]:
+        order = db.execute("SELECT stripe_payment_intent_id FROM hardware_orders WHERE stripe_checkout_session_id=? LIMIT 1",
+                           (link.get("stripe_checkout_session_id"),)).fetchone()
         if order:
-            if str(order["status"] or "") in ("refunded", "disputed"):
-                return str(order["status"])
-            refs["payment_intent"] = refs["payment_intent"] or str(order["stripe_payment_intent_id"] or "")
+            refs["payment_intent"] = str(order["stripe_payment_intent_id"] or "")
+    return refs
+
+
+def _recorded_reversal(db, kind: str, table: str, link: dict) -> str | None:
+    """Return a durable reversal for a pending purchase, without making a network call. Called only while the
+    payment lock is held (finalize), so a reversal cannot commit between this check and the grant."""
+    refs = _payment_refs(db, table, link)
+    if table == GUEST_CHECKOUTS:
+        order = db.execute("SELECT status FROM hardware_orders WHERE stripe_checkout_session_id=? LIMIT 1",
+                           (link.get("stripe_checkout_session_id"),)).fetchone()
+        if order and str(order["status"] or "") in ("refunded", "disputed"):
+            return str(order["status"])
     if not any(refs.values()):
         return None
     import billing_status
@@ -206,6 +214,15 @@ def finalize(kind: str, table: str, row_id: str, token: str, *, customer_id: str
     attachment_id = secrets.token_hex(16)
     now = _now().isoformat()
     with transaction() as db:
+        # Payment lock FIRST (Codex review of 7080e193): reversal ingestion and dispute-won recovery take the same lock
+        # in their own transaction, so a refund either commits before this check (seen: nothing granted) or after this
+        # commit (it then finds and suspends the entitlement). Same lock order everywhere: payment, then purchase row.
+        current = db.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+        if not current:
+            raise FenceLost(f"{table}:{row_id}")
+        import billing_status
+        refs = _payment_refs(db, table, dict(current))
+        billing_status.lock_payment(db, billing_status.payment_keys(refs["charge"], refs["payment_intent"], refs["invoice"]))
         if table == GUEST_CHECKOUTS:
             link_row = db.execute("SELECT * FROM hardware_checkouts WHERE id=? AND claim_token=? AND customer_id IS NULL "
                                   "AND status='paid' AND lower(email)=?", (row_id, token, email)).fetchone()
@@ -231,6 +248,12 @@ def finalize(kind: str, table: str, row_id: str, token: str, *, customer_id: str
                 db.execute(f"UPDATE {table} SET status='reversed',claim_token=NULL,claimed_at=NULL WHERE id=? "
                            "AND status='attaching' AND claim_token=? AND normalized_email=?",
                            (row_id, token, email))
+                # Remembered so a WON dispute can make this purchase claimable again (billing_status
+                # ._restore_disputed_pending); a refund stays terminal.
+                db.execute("INSERT INTO pending_reversals(id,source_table,source_id,charge_id,payment_intent,reason,created_at) "
+                           "VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_table,source_id) DO UPDATE SET reason=excluded.reason",
+                           (secrets.token_hex(16), table, row_id, refs["charge"] or None, refs["payment_intent"] or None,
+                            reason, now))
                 return None
             moved = db.execute(
                 f"UPDATE {table} SET status='resolved',resolved_at=?,resolved_customer_id=? WHERE id=? "

@@ -1475,6 +1475,16 @@ CREATE TABLE IF NOT EXISTS purchase_attachments(
  UNIQUE(source_table, source_id)
 )
 '''),
+    # Payment serialization (billing_status.lock_payment, Green 2026-10-18, post-RC5; Codex review of 7080e193): one row
+    # per payment key, locked by reversal, dispute-won and attachment in the same transaction as their work; and the
+    # pending purchases attachment set aside because their payment was disputed (reinstated when the dispute is won).
+    ('20261018_payment_reversal_serialization','''
+CREATE TABLE IF NOT EXISTS payment_locks(key TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_reversals(
+ id TEXT PRIMARY KEY, source_table TEXT NOT NULL, source_id TEXT NOT NULL, charge_id TEXT, payment_intent TEXT,
+ reason TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(source_table, source_id)
+)
+'''),
 ]
 
 
