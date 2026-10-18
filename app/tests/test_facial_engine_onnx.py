@@ -25,6 +25,9 @@ match accuracy) is exactly what the Phase 2 report's own "next exact
 action" defers to real-camera validation.
 """
 
+import hashlib
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -80,29 +83,51 @@ def test_ensure_model_rejects_a_hash_mismatch(tmp_path, monkeypatch):
     supply-chain check: a tampered or substituted file at the source
     URL is rejected exactly like corruption would be."""
     monkeypatch.setattr(engine_module, "MODEL_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(engine_module.urllib.request, "urlretrieve",
+                        lambda _url, destination: Path(destination).write_bytes(b"tampered model"))
     result = engine_module._ensure_model(engine_module._DETECTOR_URL, "test_model.onnx", "0" * 64)
     assert result is None
     assert not (tmp_path / "test_model.onnx").exists()
     assert not (tmp_path / "test_model.onnx.part").exists()  # no partial download left behind either
 
 
-def test_ensure_model_caches_and_does_not_redownload(tmp_path, monkeypatch, onnx_models_available):
+def test_ensure_model_caches_and_does_not_redownload(tmp_path, monkeypatch):
+    payload = b"verified model fixture"
+    expected = hashlib.sha256(payload).hexdigest()
+    downloads = []
+
+    def download(url, destination):
+        downloads.append(url)
+        Path(destination).write_bytes(payload)
+
     monkeypatch.setattr(engine_module, "MODEL_CACHE_DIR", tmp_path)
-    first = engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, engine_module._DETECTOR_SHA256)
+    monkeypatch.setattr(engine_module.urllib.request, "urlretrieve", download)
+    first = engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, expected)
     mtime_after_first = first.stat().st_mtime
-    second = engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, engine_module._DETECTOR_SHA256)
+    second = engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, expected)
     assert second == first
     assert second.stat().st_mtime == mtime_after_first  # not rewritten -- the cached copy's own hash already matched
+    assert downloads == [engine_module._DETECTOR_URL]
 
 
-def test_ensure_model_repairs_a_corrupted_cached_file(tmp_path, monkeypatch, onnx_models_available):
+def test_ensure_model_repairs_a_corrupted_cached_file(tmp_path, monkeypatch):
+    payload = b"verified model fixture"
+    expected = hashlib.sha256(payload).hexdigest()
+    downloads = []
+
+    def download(url, destination):
+        downloads.append(url)
+        Path(destination).write_bytes(payload)
+
     monkeypatch.setattr(engine_module, "MODEL_CACHE_DIR", tmp_path)
-    engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, engine_module._DETECTOR_SHA256)
+    monkeypatch.setattr(engine_module.urllib.request, "urlretrieve", download)
+    engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, expected)
     cached_path = tmp_path / engine_module._DETECTOR_FILENAME
     cached_path.write_bytes(b"corrupted")
-    repaired = engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, engine_module._DETECTOR_SHA256)
+    repaired = engine_module._ensure_model(engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, expected)
     assert repaired is not None
-    assert engine_module._sha256(repaired) == engine_module._DETECTOR_SHA256
+    assert engine_module._sha256(repaired) == expected
+    assert downloads == [engine_module._DETECTOR_URL, engine_module._DETECTOR_URL]
 
 
 # --------------------------------------------------------------- capability / lifecycle
