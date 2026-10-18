@@ -7,10 +7,16 @@ metadata, and private-key material excluded while retaining VMS runtime code.
 
 from fnmatch import fnmatchcase
 from pathlib import Path
+import shutil
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
+
+
+def _git_tracking_check_available(repo_root: Path) -> bool:
+    """A source export can contain Git metadata without the Git CLI being installed."""
+    return (repo_root / ".git").exists() and shutil.which("git") is not None
 
 
 def _rules():
@@ -112,12 +118,21 @@ def test_aws_environment_file_is_untracked_ignored_and_excluded_without_reading_
     gitignore = [line.strip() for line in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
     assert "aws.env" in gitignore, "aws.env must be listed in .gitignore"
     assert _is_excluded("aws.env", _rules())
-    if not (REPO_ROOT / ".git").exists():
-        # A plain source copy (the regression container gets `git ls-files` output, no repository): only the
-        # .gitignore/.dockerignore rules above can be checked here; tracking is checked wherever .git exists.
+    if not _git_tracking_check_available(REPO_ROOT):
+        # Plain source exports, or minimal regression images without the Git CLI, can only check ignore/build rules.
+        # When both metadata and Git are available, the tracking assertion below still runs.
         return
     tracked = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "--error-unmatch", "aws.env"],
                              capture_output=True, text=True)
     assert tracked.returncode != 0, "aws.env must not be tracked"
     ignored = subprocess.run(["git", "-C", str(REPO_ROOT), "check-ignore", "-q", "aws.env"])
     assert ignored.returncode == 0, "aws.env must be git-ignored"
+
+
+def test_git_tracking_check_requires_metadata_and_git_cli(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    assert not _git_tracking_check_available(tmp_path)
+
+    monkeypatch.setattr(shutil, "which", lambda _name: "git.exe")
+    assert _git_tracking_check_available(tmp_path)
