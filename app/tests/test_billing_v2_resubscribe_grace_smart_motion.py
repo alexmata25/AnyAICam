@@ -280,7 +280,9 @@ def test_a_cancelled_v2_plan_is_never_sent_a_payment_failed_email(v2, mail):
             db.execute("INSERT INTO billing_invoice_states(invoice_id,subscription_id,state,updated_at) "
                        "VALUES('in_after_cancel',?,'failed','2026-10-10')", (SUB,))
         assert purchase_notifications.notify_payment_failed("in_after_cancel")["status"] == "ignored"
-    assert not mail["sent"]
+    # No payment-failed email. (Since Green 2026-10-17 the purchase and the cancellation themselves are emailed.)
+    assert [m for m in mail["sent"] if m["type"] == "payment_failed"] == []
+    assert [m["type"] for m in mail["sent"]] == ["account_ready", "plan_cancelled"]
 
 
 def test_the_shell_banner_warns_instead_of_payment_complete(v2):

@@ -20,7 +20,7 @@ def _now() -> str:
 VERIFY_TTL_HOURS = 48
 VERIFY_RESEND_SECONDS = 120  # reviewer resend throttle
 VERIFY_REISSUE_HOLD_SECONDS = 3600  # a public re-submission keeps a link this young valid instead of replacing it
-MIN_PASSWORD = 10  # the /customer-register form's rule
+MIN_PASSWORD = 12  # the /customer-register rule: the same 12 as self-service signup and password reset (owner 2026-10-17)
 VERIFIED_MESSAGE = ("Thank you. Your email address is confirmed and your password is set. An administrator will "
                     "review your AnyAiCam account request; you'll be able to sign in once it is approved.")
 VERIFY_INVALID_MESSAGE = ("This confirmation link is invalid or has expired. Submit the registration form again "
@@ -151,8 +151,8 @@ def _verify_form(token: str, error: str = "") -> str:
             f'<input type="hidden" name="token" value="{escape(token or "", quote=True)}">'
             '<input type="hidden" name="csrf_token" value="">'
             '<label>Full name<br><input name="display_name" minlength="2" maxlength="120" autocomplete="name" required></label><br>'
-            '<label>Password<br><input name="password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
-            '<label>Confirm password<br><input name="confirm_password" type="password" minlength="10" autocomplete="new-password" required></label><br>'
+            f'<label>Password<br><input name="password" type="password" minlength="{MIN_PASSWORD}" autocomplete="new-password" required></label><br>'
+            f'<label>Confirm password<br><input name="confirm_password" type="password" minlength="{MIN_PASSWORD}" autocomplete="new-password" required></label><br>'
             '<button type="submit">Confirm email</button></form>'
             # Drop the token from the address bar at once (history and any later Referer); the hidden field above
             # still carries it for the POST (Green journey REG6, 2026-10-17).
@@ -366,6 +366,8 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
         logging.getLogger("anyaicam.customer_registration").exception(
             "Failed to send post-registration purchase notifications for customer %s", customer_id
         )
+    from purchase_notifications import notify_registration_decision
+    notify_registration_decision(request_id, "approved")  # never raises
     return {"status": "complete", "message": "Customer account approved.", "customer_id": customer_id, "user_id": user_id}
 
 
@@ -396,6 +398,8 @@ def reject_registration(request_id: str, reason: str, actor: dict) -> dict:
             db.execute("UPDATE customers SET status='suspended' WHERE id=?", (item["customer_id"],))
         db.execute("UPDATE customer_registration_requests SET status='rejected',decided_at=?,decided_by=?,rejection_reason=? WHERE id=?", (now, actor["email"], reason.strip()[:1000], request_id))
         db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)", (actor["email"], "administrator" if actor["master"] else "partner_owner", "customer_registration.rejected", "customer_registration", request_id, '{}', now))
+    from purchase_notifications import notify_registration_decision
+    notify_registration_decision(request_id, "rejected")  # never raises; the reason stays internal
     return {"status": "complete", "message": "Customer registration rejected."}
 
 
@@ -459,7 +463,7 @@ def register_customer_registration_routes(app, page_shell, current_user, is_mast
         if not 2 <= len(display_name.strip()) <= 120:
             return _verify_page("Confirm your email", _verify_form(token, "Enter your full name."), status_code=422)
         if len(password) < MIN_PASSWORD or password != confirm_password:
-            error = ("Password must contain at least 10 characters." if len(password) < MIN_PASSWORD
+            error = (f"Password must contain at least {MIN_PASSWORD} characters." if len(password) < MIN_PASSWORD
                      else "The two passwords do not match.")
             return _verify_page("Confirm your email", _verify_form(token, error), status_code=422)
         if verify_registration_email(token, password, display_name):

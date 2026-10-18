@@ -112,6 +112,8 @@ def _suspend(subscription_id: str, reason: str) -> int:
         pass  # retain compatibility with databases before billing v2
     if changed:
         logger.info("billing.suspended subscription=%s reason=%s rows=%s", subscription_id, reason, changed)
+        from purchase_notifications import notify_service_suspended
+        notify_service_suspended(subscription_id, reason)  # never raises; once per episode
     return changed
 
 
@@ -166,6 +168,9 @@ def payment_recovered(subscription_id: str) -> int:
         changed += per_camera_billing._resume_paid(subscription_id)
     except Exception:
         pass
+    if changed:
+        from purchase_notifications import notify_service_restored
+        notify_service_restored(subscription_id)  # never raises
     return changed
 
 
@@ -454,6 +459,9 @@ def _dispute_closed(event: dict) -> dict:
     restored = 0
     if payment and payment.get("stripe_subscription_id"):
         restored = _restore(payment["stripe_subscription_id"], ("disputed",))
+        if restored:
+            from purchase_notifications import notify_service_restored
+            notify_service_restored(payment["stripe_subscription_id"])  # never raises
     elif intent:
         for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='suspended' "
                                 "AND suspended_reason='disputed'", (intent,)):

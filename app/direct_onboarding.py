@@ -122,6 +122,17 @@ def verify_signup(db, *, raw: str, now: datetime) -> dict:
     return {"customer_id": customer_id, "user_id": user_id, "email": email}
 
 
+def account_created_by(db, *, raw: str) -> bool:
+    """True when this confirmation link was already used and its account exists (Green 2026-10-17): mail scanners
+    (Outlook Safe Links, Gmail) open links before the customer does, so the customer's own click must not end on
+    "This link can't be used" for an account that is ready."""
+    if not raw or len(raw) > 200:
+        return False
+    used = db.execute("SELECT customer_id FROM direct_signups WHERE token_hash=? AND verified_at IS NOT NULL "
+                      "AND customer_id IS NOT NULL", (_hash(raw),)).fetchone()
+    return bool(used)
+
+
 def _base(request: Request) -> str:
     import os
     base = os.environ.get("ANYAICAM_PUBLIC_URL", "").strip().rstrip("/")
@@ -184,6 +195,11 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
             with connection() as db:
                 created = verify_signup(db, raw=token, now=datetime.now())
         except ValueError as error:
+            with connection() as db:
+                already = account_created_by(db, raw=token)
+            if already:  # the link was opened before (often by a mail scanner): the account is ready
+                return HTMLResponse(_ready_page(purchase_intent_next(next)),
+                                    headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
             return HTMLResponse(_page("This link can't be used", str(error)), status_code=400,
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         audit({"email": created["email"], "role": "customer_owner"}, "direct_signup.verified", "customer", created["customer_id"],
@@ -203,17 +219,18 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                 save_build_selection(created["customer_id"], selection_from_query(parse_qs(urlsplit(next_path).query)))
             except Exception:
                 logger.exception("direct_signup.selection_not_saved")
-        if next_path == "/customer/orders":
-            ready = _page("Your account is ready", "Sign in to see your hardware order and its status.",
-                          link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and view my order"))
-        elif next_path:
-            ready = _page("Your account is ready", "Sign in to review your order and continue to secure checkout.",
-                          link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and continue"))
-        else:
-            ready = _page("Your account is ready", "Sign in, then choose a plan and camera count on My subscription.",
-                          link=("/customer-login.html", "Sign in"))
-        return HTMLResponse(ready,
+        return HTMLResponse(_ready_page(next_path),
                             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    def _ready_page(next_path: str) -> str:
+        if next_path == "/customer/orders":
+            return _page("Your account is ready", "Sign in to see your hardware order and its status.",
+                         link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and view my order"))
+        if next_path:
+            return _page("Your account is ready", "Sign in to review your order and continue to secure checkout.",
+                         link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and continue"))
+        return _page("Your account is ready", "Sign in, then choose a plan and camera count on My subscription.",
+                     link=("/customer-login.html", "Sign in"))
 
     @app.get("/customer-signup", response_class=HTMLResponse)
     def signup_page(request: Request, next: str = ""):

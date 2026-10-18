@@ -131,6 +131,51 @@ def _edge_reset_link_origin(request: Request) -> str | None:
     return f'{scheme}://{netloc}'
 
 
+def quote_delivery_email(quote: dict) -> tuple[str, str, str]:
+    """The quote email a partner sends a customer (Green 2026-10-17: it was the bare sentence "Your AnyAiCam quote is
+    ready for review." with no quote and no link). Only an ALLOW-LIST of customer-facing values is used: cameras,
+    the price per camera per month and the monthly total the partner quoted. totals_json also holds the partner's
+    confidential cost, wholesale price, profit and margin, and legacy retention terms -- none of those is ever read.
+    The link is the customer sign-in (the partner's quote page is partner-only)."""
+    try:
+        totals = json.loads(quote.get('totals_json') or '{}') or {}
+    except (TypeError, ValueError):
+        totals = {}
+
+    def money(key):
+        try:
+            value = float(totals.get(key))
+        except (TypeError, ValueError):
+            return ''
+        return f'${value:,.2f}' if value >= 0 else ''
+    try:
+        cameras = int(totals.get('quantity') or 0)
+    except (TypeError, ValueError):
+        cameras = 0
+    per_camera, monthly = money('selling_price_per_camera'), money('monthly_customer_revenue')
+    reference = str(quote.get('id') or '')[:40]
+    import os
+    base = (os.environ.get('ANYAICAM_PUBLIC_URL', '').strip().rstrip('/') or 'https://app.anyaicam.com')
+    sign_in = f'{base}/customer-login.html'
+    lines = [f'Quote reference: {reference}'] if reference else []
+    if cameras:
+        lines.append(f'Cameras: {cameras}')
+    if per_camera:
+        lines.append(f'Price per camera: {per_camera} per month')
+    if monthly:
+        lines.append(f'Monthly total: {monthly} per month')
+    subject = 'Your AnyAiCam quote'
+    text = ('Hello,\n\nYour AnyAiCam installer has prepared a quote for you.\n\n' + '\n'.join(lines)
+            + '\n\nThis is an estimate; your installer will confirm the final details with you before anything is'
+            f' ordered.\n\nSign in to your AnyAiCam account: {sign_in}\n\n— The AnyAiCam Team')
+    html = ('<p>Hello,</p><p>Your AnyAiCam installer has prepared a quote for you.</p><p>'
+            + '<br>'.join(escape(line) for line in lines)
+            + '</p><p>This is an estimate; your installer will confirm the final details with you before anything is'
+            f' ordered.</p><p>Sign in to your AnyAiCam account: <a href="{escape(sign_in, quote=True)}">'
+            f'{escape(sign_in)}</a></p><p>— The AnyAiCam Team</p>')
+    return subject, text, html
+
+
 def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.get('/health/live')
     def liveness(): return {'status':'alive'}
@@ -467,4 +512,4 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
             quote=db.execute('SELECT * FROM quotes WHERE id=?',(quote_id,)).fetchone()
             if not quote or not tenant_owns_partner(db,identity,quote['partner_id']):
                 raise HTTPException(status_code=404,detail='Quote not found.')
-        recipient=str(payload.get('email','')).strip(); message=get_email_service().send('quote_delivery',recipient,'Your AnyAiCam quote','Your AnyAiCam quote is ready for review.',metadata={'quote_id':quote_id}); audit(identity,'quote.delivered','quote',quote_id,{'recipient':recipient,'provider':settings.email_backend}); return {'message':'Quote delivery processed.','status':message['status']}
+        recipient=str(payload.get('email','')).strip(); subject,text,html=quote_delivery_email(dict(quote)); message=get_email_service().send('quote_delivery',recipient,subject,text,html=html,metadata={'quote_id':quote_id}); audit(identity,'quote.delivered','quote',quote_id,{'recipient':recipient,'provider':settings.email_backend}); return {'message':'Quote delivery processed.','status':message['status']}

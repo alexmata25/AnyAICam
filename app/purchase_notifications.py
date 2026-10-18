@@ -156,7 +156,7 @@ OUTBOX_CLAIM_STALE_SECONDS = 300
 
 def _claim_attempt(
     *, event_id: str, notification_type: str, customer_id: Optional[str], recipient_email: str, subject: str,
-    db=None,
+    db=None, body_text: Optional[str] = None, body_html: Optional[str] = None,
 ) -> Optional[dict]:
     """Atomically takes the right to send this (event, type) email, or
     returns None when it is already sent or another worker is sending it
@@ -177,7 +177,8 @@ def _claim_attempt(
     if db is None:
         with connection() as own:
             return _claim_attempt(event_id=event_id, notification_type=notification_type, customer_id=customer_id,
-                                  recipient_email=recipient_email, subject=subject, db=own)
+                                  recipient_email=recipient_email, subject=subject, db=own,
+                                  body_text=body_text, body_html=body_html)
     from datetime import timedelta
     now = _now()
     stale_before = (datetime.now() - timedelta(seconds=OUTBOX_CLAIM_STALE_SECONDS)).isoformat()
@@ -195,6 +196,9 @@ def _claim_attempt(
         ).rowcount
         if not taken:
             return None
+    if body_text is not None:  # the exact final copy, for retry_outbox_emails (Green 2026-10-17)
+        db.execute("UPDATE provisioning_notifications SET body_text=?,body_html=? WHERE stripe_event_id=? AND notification_type=?",
+                   (body_text, body_html, event_id, notification_type))
     return _existing_notification(event_id, notification_type, db)
 
 
@@ -246,7 +250,7 @@ def _send_once(
         html = email_layout.wrap(html, preheader=subject)
     tracking = _claim_attempt(
         event_id=event_id, notification_type=notification_type, customer_id=customer_id,
-        recipient_email=recipient_email, subject=subject, db=db,
+        recipient_email=recipient_email, subject=subject, db=db, body_text=text, body_html=html,
     )
     if tracking is None:
         # Sent meanwhile, or another worker is sending it now: never a second copy.
@@ -353,7 +357,17 @@ def _plan_cancelled_email(first_name: str, plan_label: str) -> tuple[str, str, s
     return subject, text, html
 
 
-SUPPORT_EMAIL = "amata@anyaicam.com"
+def _support_email(default: str = "amata@anyaicam.com") -> str:
+    """The support address printed in order, payment and shipping emails: ANYAICAM_SUPPORT_EMAIL, else the owner's
+    address (Green 2026-10-17: it was hardcoded). A malformed value falls back to the default, never into an email."""
+    value = os.environ.get("ANYAICAM_SUPPORT_EMAIL", "").strip()
+    local, _, domain = value.partition("@")
+    if local and "." in domain and not any(c.isspace() or c in '<>"\'' for c in value) and len(value) <= 254:
+        return value
+    return default
+
+
+SUPPORT_EMAIL = _support_email()
 SUPPORT_LINK = "https://anyaicam.com/support.html"
 # The dedicated policy pages (shipping-policy / hardware-return-refund-
 # policy / cancellation-policy.html) were never published, so these links
@@ -947,6 +961,244 @@ def notify_hardware_shipped(order_id: str) -> dict:
         )
 
 
+# ------------------------------------------------- service paused / restored
+#
+# Green 2026-10-17: when the grace period after a failed renewal ran out, or a refund or dispute suspended a plan,
+# the customer got no email (only the first payment-failed one), and nothing said when service came back. Called by
+# billing_status after it actually changed a plan's state (never for a no-op), once per episode: the failed-payment
+# date for a grace expiry, the day otherwise.
+
+_SUSPENSION_COPY = {
+    "payment_failed": ("Your AnyAiCam service is paused: payment needed",
+                       "We still haven't been able to collect your AnyAiCam subscription payment, and the grace period "
+                       "has ended, so your camera service is paused. Update your payment method on My subscription "
+                       "and your service resumes as soon as the payment goes through."),
+    "refunded": ("Your AnyAiCam service is paused",
+                 "The payment for your AnyAiCam subscription was refunded, so your camera service is paused. "
+                 "Visit My subscription to restart it."),
+    "disputed": ("Your AnyAiCam service is paused",
+                 "The payment for your AnyAiCam subscription is being disputed with your bank, so your camera service "
+                 "is paused while the dispute is open."),
+}
+
+
+def _subscription_customer(subscription_id: str) -> Optional[dict]:
+    for query in ("SELECT customer_id,payment_failed_at FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?",
+                  "SELECT customer_id,payment_failed_at FROM customer_entitlements WHERE stripe_subscription_id=?"):
+        try:
+            found = row(query, (subscription_id,))
+        except Exception:
+            continue
+        if found and found.get("customer_id"):
+            return dict(found)
+    return None
+
+
+def _service_email(subscription_id: str, *, kind: str, key: str, subject: str, body: str) -> dict:
+    owner = _subscription_customer(subscription_id)
+    customer = _customer_row(str(owner["customer_id"])) if owner else None
+    if not customer:
+        return {"status": "ignored", "reason": "no customer for this subscription"}
+    first_name = _first_name(customer.get("name"))
+    link = _portal_url("/subscription-portal")
+    text = f"Hi {first_name},\n\n{body}\n\nMy subscription: {link}\n\n{_SUPPORT_FOOTER_TEXT}"
+    html = (f"<p>Hi {first_name},</p><p>{body}</p><p>My subscription: <a href=\"{link}\">{link}</a></p>"
+            f"{_SUPPORT_FOOTER_HTML}")
+    return _send_once(event_id=key, notification_type=kind, customer_id=customer["id"],
+                      recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
+                      metadata={"stripe_subscription_id": subscription_id})
+
+
+def notify_service_suspended(subscription_id: str, reason: str) -> dict:
+    """Never raises."""
+    try:
+        if reason not in _SUSPENSION_COPY:
+            return {"status": "ignored", "reason": "no customer email for this suspension reason"}
+        owner = _subscription_customer(subscription_id) or {}
+        episode = (str(owner.get("payment_failed_at") or "") if reason == "payment_failed" else "") or datetime.now().date().isoformat()
+        subject, body = _SUSPENSION_COPY[reason]
+        return _service_email(subscription_id, kind="service_suspended",
+                              key=f"service-suspended:{subscription_id}:{reason}:{episode}", subject=subject, body=body)
+    except Exception as exc:
+        return {"status": "error", "reason": type(exc).__name__}
+
+
+def notify_service_restored(subscription_id: str) -> dict:
+    """Never raises."""
+    try:
+        return _service_email(subscription_id, kind="service_restored",
+                              key=f"service-restored:{subscription_id}:{datetime.now().date().isoformat()}",
+                              subject="Your AnyAiCam service is active again",
+                              body="Thanks — your AnyAiCam subscription is in good standing again and your camera "
+                                   "service is active.")
+    except Exception as exc:
+        return {"status": "error", "reason": type(exc).__name__}
+
+
+# ------------------------------------------------- billing v2 (My subscription) plan emails
+#
+# Green 2026-10-17: plans bought, changed or cancelled on My subscription (per_camera_billing, billing v2) sent no
+# email at all -- the account-ready / plan-updated / plan-cancelled emails were only wired to the legacy entitlement
+# path. Driven by the same verified webhook, AFTER per_camera_billing.sync_from_stripe_event, from the stored v2 row
+# (never from the event's claims alone), keyed by the Stripe event id (one email per event, retried by Stripe's own
+# redelivery). Build Your System orders keep their own order confirmation (order_funnel) and get nothing extra here;
+# ordinary renewals (customer.subscription.updated without a plan or quantity change) send nothing.
+
+V2_CHECKOUT_EVENTS = ("checkout.session.completed", "checkout.session.async_payment_succeeded")
+
+
+def _v2_entitlement(subscription_id: str) -> Optional[dict]:
+    if not subscription_id:
+        return None
+    try:
+        found = row("SELECT * FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (subscription_id,))
+    except Exception:
+        return None
+    return dict(found) if found else None
+
+
+def _v2_plan_label(entitlement: dict) -> str:
+    from per_camera_billing import PLANS
+    return str((PLANS.get(entitlement.get("plan_key")) or {}).get("display_name") or "AnyAiCam")
+
+
+def notify_plan_v2(event: dict) -> dict:
+    """Never raises: an email problem must not fail the webhook step or touch the plan."""
+    try:
+        token = _TEST_MODE.set(stripe_mode.is_test_mode(event=event))
+        try:
+            return _notify_plan_v2(event)
+        finally:
+            _TEST_MODE.reset(token)
+    except Exception as exc:
+        return {"status": "error", "reason": type(exc).__name__}
+
+
+def _notify_plan_v2(event: dict) -> dict:
+    event_id = str(event.get("id") or "")
+    event_type = str(event.get("type") or "")
+    data = event.get("data") or {}
+    obj = data.get("object") or {}
+    if not event_id:
+        return {"status": "ignored", "reason": "event missing id"}
+    if event_type in V2_CHECKOUT_EVENTS:
+        if str((obj.get("metadata") or {}).get("anyaicam_billing_version") or "") != "2":
+            return {"status": "ignored", "reason": "not a billing v2 checkout"}
+        entitlement = _v2_entitlement(str(obj.get("subscription") or ""))
+        if not entitlement or entitlement.get("status") != "active":
+            return {"status": "ignored", "reason": "no active v2 plan for this checkout"}
+        import per_camera_billing as billing
+        progress = billing.build_progress(str(entitlement["customer_id"])) if billing.order_paid(str(entitlement["customer_id"])) else None
+        if progress and progress.get("state") == billing.BUILD_PAID:
+            # The same test order_funnel.send_order_confirmation uses: that email covers this purchase.
+            return {"status": "ignored", "reason": "a Build Your System order confirmation covers this purchase"}
+        kind = "account_ready"
+        build = _account_ready_email
+    elif event_type == "customer.subscription.updated":
+        previous = data.get("previous_attributes") or {}
+        if "items" not in previous and "quantity" not in previous:
+            return {"status": "ignored", "reason": "no plan or camera-count change"}
+        entitlement = _v2_entitlement(str(obj.get("id") or ""))
+        if not entitlement or entitlement.get("status") != "active":
+            return {"status": "ignored", "reason": "no active v2 plan for this subscription"}
+        kind = "plan_updated"
+        build = _plan_updated_email
+    elif event_type == "customer.subscription.deleted":
+        entitlement = _v2_entitlement(str(obj.get("id") or ""))
+        if not entitlement or entitlement.get("status") == "active":
+            return {"status": "ignored", "reason": "no ended v2 plan for this subscription"}
+        kind = "plan_cancelled"
+        build = None
+    else:
+        return {"status": "ignored", "reason": "not a v2 plan event"}
+    customer = _customer_row(str(entitlement["customer_id"]))
+    if not customer:
+        return {"status": "ignored", "reason": "customer row no longer exists"}
+    first_name = _first_name(customer.get("name"))
+    label = _v2_plan_label(entitlement)
+    if build is None:
+        subject, text, html = _plan_cancelled_email(first_name, label)
+    else:
+        subject, text, html = build(first_name, label, int(entitlement.get("camera_quantity") or 0))
+    return _send_once(
+        event_id=event_id, notification_type=kind, customer_id=customer["id"],
+        recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
+        metadata={"billing_version": "2", "plan_key": entitlement.get("plan_key"),
+                  "stripe_subscription_id": entitlement.get("stripe_subscription_id")},
+    )
+
+
+# Purchase emails nothing else retries (Green 2026-10-17): _send_once records a failed send and never raises, and the
+# webhook still answers 200, so Stripe never redelivers -- the email was simply lost. These types are re-sent from
+# the outbox copy (the exact final subject/text/HTML, same Message-ID), never re-rendered. Only types whose message
+# stays true later, and only for RETRY_OUTBOX_MAX_AGE_HOURS: a "your service is paused" email is NOT on the list (its
+# state may have changed), and payment-failed, shipping and order confirmations have their own state-checked retries.
+RETRY_OUTBOX_TYPES = ("account_ready", "setup_required", "plan_updated", "plan_cancelled",
+                      "registration_approved", "registration_rejected")
+RETRY_OUTBOX_MAX_AGE_HOURS = 48
+
+
+def retry_outbox_emails(limit: int = 50) -> int:
+    """Billing-worker pass: re-send failed (or interrupted) emails of RETRY_OUTBOX_TYPES. Returns how many were sent."""
+    from datetime import timedelta
+    from partner_db import rows
+    now = datetime.now()
+    stale_before = (now - timedelta(seconds=OUTBOX_CLAIM_STALE_SECONDS)).isoformat()
+    oldest = (now - timedelta(hours=RETRY_OUTBOX_MAX_AGE_HOURS)).isoformat()
+    placeholders = ",".join("?" for _ in RETRY_OUTBOX_TYPES)
+    sent = 0
+    for pending in rows(f"SELECT * FROM provisioning_notifications WHERE notification_type IN ({placeholders}) "
+                        "AND body_text IS NOT NULL AND created_at>=? "
+                        "AND (status='failed' OR (status='pending' AND updated_at<?)) ORDER BY updated_at LIMIT ?",
+                        (*RETRY_OUTBOX_TYPES, oldest, stale_before, limit)):
+        item = dict(pending)
+        try:
+            tracking = _claim_attempt(event_id=item["stripe_event_id"], notification_type=item["notification_type"],
+                                      customer_id=item.get("customer_id"), recipient_email=item["recipient_email"],
+                                      subject=item["subject"])
+            if tracking is None:  # sent meanwhile, or another worker has it
+                continue
+            from email_service import stable_message_id
+            metadata = {"message_id": stable_message_id("outbox", item["stripe_event_id"], item["notification_type"]),
+                        "outbox_retry": True}
+            try:
+                result = get_email_service().send(item["notification_type"], item["recipient_email"], item["subject"],
+                                                  item["body_text"], html=item.get("body_html"), metadata=metadata)
+            except Exception as exc:
+                _mark_result(tracking["id"], status="failed", error_detail=str(exc)[:500])
+                continue
+            if isinstance(result, dict) and str(result.get("status") or "").lower() in ("failed", "error"):
+                _mark_result(tracking["id"], status="failed",
+                             error_detail=str(result.get("error") or "email provider reported a failed send")[:500])
+                continue
+            _mark_result(tracking["id"], status="sent")
+            sent += 1
+        except Exception:
+            continue
+    return sent
+
+
+def retry_hardware_shipped_notifications(limit: int = 50) -> int:
+    """Resend shipping emails (carrier and tracking) that were not delivered yet (Green 2026-10-17: a failed
+    send was never retried, so the customer never got tracking by email). Each goes back through
+    notify_hardware_shipped, so an order refunded, disputed or cancelled meanwhile is still never emailed."""
+    from datetime import timedelta
+    from partner_db import rows
+    stale_before = (datetime.now() - timedelta(seconds=PAYMENT_FAILED_STALE_SECONDS)).isoformat()
+    sent = 0
+    for pending in rows("SELECT stripe_event_id FROM provisioning_notifications WHERE notification_type='hardware_shipped' "
+                        "AND (status='failed' OR (status='pending' AND updated_at<?)) ORDER BY updated_at LIMIT ?",
+                        (stale_before, limit)):
+        key = str(pending["stripe_event_id"] or "")
+        if key.startswith("hardware-shipped:"):
+            try:
+                if notify_hardware_shipped(key.split(":", 1)[1]).get("status") == "sent":
+                    sent += 1
+            except Exception:
+                continue
+    return sent
+
+
 def notify_hardware_cancellation(order_id: str) -> dict:
     order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
     if not order:
@@ -1047,6 +1299,40 @@ def send_getting_started_email(customer_id: str) -> dict:
         customer_id=customer_id, recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"camera_slot_summary": bool(camera_slot_summary)},
     )
+
+
+def notify_registration_decision(request_id: str, decision: str) -> dict:
+    """Tell the person who asked for an account on /customer-register what was decided (Green 2026-10-17: they
+    were never told; the page only says to sign in "once yours is approved"). decision is 'approved' or 'rejected'.
+    The administrator's rejection reason is internal and is never put in the email. Once per (request, decision);
+    never raises -- the decision itself has already been saved."""
+    try:
+        if decision not in ("approved", "rejected"):
+            return {"status": "ignored", "reason": "unknown decision"}
+        request = row("SELECT * FROM customer_registration_requests WHERE id=?", (request_id,))
+        if not request or request.get("status") != decision:
+            return {"status": "ignored", "reason": "the request is not in that state"}
+        first_name = _first_name(request.get("display_name"))
+        if decision == "approved":
+            subject = "Your AnyAiCam account is approved"
+            text = (f"Hi {first_name},\n\nYour AnyAiCam account request has been approved. Sign in with the email "
+                    f"address and password you chose: {_sign_in_link()}\n\n{_SUPPORT_FOOTER_TEXT}")
+            html = (f"<p>Hi {first_name},</p><p>Your AnyAiCam account request has been approved. Sign in with the "
+                    f'email address and password you chose: <a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
+                    f"{_SUPPORT_FOOTER_HTML}")
+        else:
+            subject = "Your AnyAiCam account request"
+            text = (f"Hi {first_name},\n\nWe weren't able to approve your AnyAiCam account request. If you think this "
+                    f"is a mistake, or you'd like to talk it through, please get in touch.\n\n{_SUPPORT_FOOTER_TEXT}")
+            html = (f"<p>Hi {first_name},</p><p>We weren't able to approve your AnyAiCam account request. If you think "
+                    f"this is a mistake, or you'd like to talk it through, please get in touch.</p>{_SUPPORT_FOOTER_HTML}")
+        return _send_once(
+            event_id=f"registration-{decision}:{request_id}", notification_type=f"registration_{decision}",
+            customer_id=request.get("customer_id"), recipient_email=str(request.get("email") or ""),
+            subject=subject, text=text, html=html, metadata={"registration_request_id": request_id},
+        )
+    except Exception as exc:
+        return {"status": "error", "reason": type(exc).__name__}
 
 
 def notify_registration_resolved(customer_id: str) -> list:

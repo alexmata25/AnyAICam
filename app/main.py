@@ -42931,7 +42931,10 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
-    if path in {"/favicon.ico", "/manifest.webmanifest", "/offline", "/claim", "/mobile-push-sw.js", "/api/mobile/push/config", "/api/mobile/push/firebase-config.js"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
+    if path in {"/favicon.ico", "/manifest.webmanifest", "/offline", "/claim", "/mobile-push-sw.js", "/api/mobile/push/config", "/api/mobile/push/firebase-config.js",
+                # The /accept-invite page posts here before the invitee has any session; the handler checks the signed,
+                # 7-day, pending-only invitation token itself (Green 2026-10-17: was 401 "Authentication required").
+                "/api/user-invites/accept"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
 
 
 
@@ -43207,6 +43210,8 @@ PARTNER_IDENTITY_ONLY_NAV_KEYS = {
     "live", "appliances", "partner",
     "partner-sales", "partner-quotes", "partner-install", "partner-performance",
     "setup", "subscription", "pricing",
+    # My orders (/customer/orders) lists one customer's own orders.
+    "customer-orders",
     # Secure Edge (/customer-security) needs a customer identity (2026-09-30).
     "security",
 }
@@ -44228,7 +44233,7 @@ def customer_register_page_html(error: str = "", message: str = "") -> str:
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register" id="customer-register-form"><input type="hidden" name="csrf_token" value=""><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required aria-describedby="password-hint"></label><div class="health-detail" id="password-hint" style="margin-top:-6px">At least 10 characters.</div><button class="action-button" type="submit">Submit customer account request</button><div class="auth-footer" style="margin-top:4px">By creating an account you agree to the AnyAiCam <a href="https://anyaicam.com/terms.html" target="_blank" rel="noopener">Terms of Service</a> and <a href="https://anyaicam.com/privacy-policy.html" target="_blank" rel="noopener">Privacy Policy</a>.</div></form><script>document.getElementById('customer-register-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-login.html">Already approved? Sign in</a></div><div class="auth-footer">AnyAiCam reviews new account requests. Once yours is approved, sign in to reach your cameras and alerts. Questions? <a href="https://anyaicam.com/vms-support.html" target="_blank" rel="noopener">Contact support</a>.</div></section></main></body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register" id="customer-register-form"><input type="hidden" name="csrf_token" value=""><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="12" autocomplete="new-password" required aria-describedby="password-hint"></label><div class="health-detail" id="password-hint" style="margin-top:-6px">At least 12 characters.</div><button class="action-button" type="submit">Submit customer account request</button><div class="auth-footer" style="margin-top:4px">By creating an account you agree to the AnyAiCam <a href="https://anyaicam.com/terms.html" target="_blank" rel="noopener">Terms of Service</a> and <a href="https://anyaicam.com/privacy-policy.html" target="_blank" rel="noopener">Privacy Policy</a>.</div></form><script>document.getElementById('customer-register-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-login.html">Already approved? Sign in</a></div><div class="auth-footer">AnyAiCam reviews new account requests. Once yours is approved, sign in to reach your cameras and alerts. Questions? <a href="https://anyaicam.com/vms-support.html" target="_blank" rel="noopener">Contact support</a>.</div></section></main></body></html>"""
 
 
 
@@ -44687,7 +44692,7 @@ def customer_register_submit(
 
 
 
-    if len(password) < 10:
+    if len(password) < 12:  # owner 2026-10-17: the same 12 as signup and password reset
 
 
 
@@ -44714,7 +44719,7 @@ def customer_register_submit(
 
 
 
-                "Password must contain at least 10 characters."
+                "Password must contain at least 12 characters."
 
 
 
@@ -48033,6 +48038,7 @@ NAV_ITEMS = [
 
 
     ("subscription-portal", "/subscription-portal", "◈", "My subscription"),
+    ("customer-orders", "/customer/orders", "▤", "My orders"),
 
 
 
@@ -48536,7 +48542,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "subscription-portal",
+            "subscription-portal", "customer-orders",
 
 
 
@@ -115439,6 +115445,12 @@ async def _billing_grace_worker() -> None:
             await asyncio.to_thread(retry_order_confirmation_notifications)
             from hardware_checkout import retry_confirmations as retry_hardware_confirmations
             await asyncio.to_thread(retry_hardware_confirmations)
+            # Shipping emails (carrier + tracking) that could not be sent yet (same outbox).
+            from purchase_notifications import retry_hardware_shipped_notifications
+            await asyncio.to_thread(retry_hardware_shipped_notifications)
+            # Account-ready, setup-required, plan and registration-outcome emails, re-sent from the outbox copy.
+            from purchase_notifications import retry_outbox_emails
+            await asyncio.to_thread(retry_outbox_emails)
             # Appliance storage plans whose start at activation has not
             # happened yet or failed transiently (build_orders.py).
             from build_orders import retry_storage_starts
@@ -115464,6 +115476,9 @@ def _stripe_webhook_steps() -> list:
         # after the plan exists; never raises.
         from order_funnel import notify_order_confirmed
         notify_order_confirmed(event)
+        # My subscription purchases, plan/camera-count changes and cancellations (Green 2026-10-17); never raises.
+        from purchase_notifications import notify_plan_v2
+        notify_plan_v2(event)
 
     def hardware(event):
         from hardware_orders import sync_hardware_order_from_stripe_event
@@ -134823,7 +134838,7 @@ def partner_sales_command_center(request: Request) -> Response:
 
 
 
-                <a href="/onboarding">Start onboarding</a>
+                <a href="/partner/onboarding">Start onboarding</a>
 
 
 
@@ -135264,7 +135279,7 @@ def partner_sales_command_center(request: Request) -> Response:
 
 
 
-          <a href="/onboarding">Customer onboarding</a>
+          <a href="/partner/onboarding">Customer onboarding</a>
 
 
 

@@ -40,6 +40,11 @@ EMAIL_TYPES={
     # Billing Consent Exception (2026-10-17, storage_trial.py): the administrator alert for a paid trial
     # subscription without the customer's authorization. Additive only.
     'billing_consent_exception',
+    # Account requests on /customer-register (Green 2026-10-17, customer_registration.py): the requester is told
+    # the outcome -- approved (sign in) or not approved. Additive only.
+    'registration_approved','registration_rejected',
+    # Service paused / active again (Green 2026-10-17, billing_status.py via purchase_notifications).
+    'service_suspended','service_restored',
 }
 
 

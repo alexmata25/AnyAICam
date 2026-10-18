@@ -471,7 +471,7 @@ def test_customer_sign_in_page_links_to_real_support_signup_and_legal_pages():
 
 def test_registration_page_states_terms_and_plain_language_approval(http_client):
     html = http_client.get("/customer-register").text
-    assert "Terms of Service" in html and "Privacy Policy" in html and "At least 10 characters." in html
+    assert "Terms of Service" in html and "Privacy Policy" in html and "At least 12 characters." in html  # owner 2026-10-17: same 12 as signup and reset
     assert "master administrator" not in html
 
 

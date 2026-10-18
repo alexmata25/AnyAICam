@@ -236,7 +236,9 @@ def test_duplicate_signups_and_link_replays_never_create_a_second_identity(site,
     assert first != second and _count(db_path, "SELECT COUNT(*) FROM direct_signups WHERE verified_at IS NULL") == 1
     assert client.get(f"/customer/verify-email?token={first}").status_code == 400  # replaced
     assert client.get(f"/customer/verify-email?token={second}").status_code == 200
-    assert client.get(f"/customer/verify-email?token={second}").status_code == 400  # single use
+    # Single use: a replay creates nothing; it only says the account is ready (a mail scanner may have opened it first).
+    replay = client.get(f"/customer/verify-email?token={second}")
+    assert replay.status_code == 200 and "Your account is ready" in replay.text
     assert _count(db_path, "SELECT COUNT(*) FROM customers WHERE email='dup@example.test'") == 1
     assert _count(db_path, "SELECT COUNT(*) FROM partner_users WHERE email='dup@example.test'") == 1
     # Signing up again with a live account sends a "you already have one" note, no link.
@@ -317,3 +319,23 @@ def test_my_subscription_offers_a_new_direct_owner_the_billing_v2_plans(site, db
     after = client.get("/subscription-portal").text
     assert 'id="v2-checkout-button"' not in after  # offered only while there is no plan
     assert "AI Local · 2 licensed cameras" in after
+
+
+def test_a_link_opened_first_by_a_mail_scanner_still_shows_the_customer_a_ready_account(site, db_path):
+    """Green 2026-10-17: Outlook/Gmail link scanners open the confirmation link before the customer. The account is
+    created by that first open; the customer's own click must say the account is ready (with the order step kept),
+    not "This link can't be used". Nothing is created twice, and an unknown token is still refused."""
+    client, _, mail = site
+    _signup(client, "scanned@example.test")
+    token = _token(mail, "scanned@example.test")
+    next_query = "&next=%2Fcustomer%2Forders"
+    assert client.get(f"/customer/verify-email?token={token}{next_query}").status_code == 200  # the scanner
+    customer_click = client.get(f"/customer/verify-email?token={token}{next_query}")
+    assert customer_click.status_code == 200
+    assert "Your account is ready" in customer_click.text and "Sign in and view my order" in customer_click.text
+    # The replay never signs anyone in and shows nothing account-specific (Red review 2026-10-17).
+    assert "set-cookie" not in {k.lower() for k in customer_click.headers}
+    assert "scanned@example.test" not in customer_click.text
+    assert _count(db_path, "SELECT COUNT(*) FROM customers WHERE email='scanned@example.test'") == 1
+    assert _count(db_path, "SELECT COUNT(*) FROM partner_users WHERE email='scanned@example.test'") == 1
+    assert client.get("/customer/verify-email?token=never-issued-token").status_code == 400

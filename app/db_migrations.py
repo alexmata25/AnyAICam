@@ -1451,6 +1451,12 @@ CREATE TABLE IF NOT EXISTS notification_delivery_claims(
  PRIMARY KEY(notification_id, channel, attempt)
 );
 '''),
+    # Purchase-email outbox bodies (purchase_notifications.retry_outbox_emails, Green 2026-10-17): the exact final
+    # text/HTML of each email, so a failed send can be re-sent as the same message instead of being lost. Additive.
+    ('20261017_provisioning_notification_bodies','''
+ALTER TABLE provisioning_notifications ADD COLUMN body_text TEXT;
+ALTER TABLE provisioning_notifications ADD COLUMN body_html TEXT
+'''),
 ]
 
 
