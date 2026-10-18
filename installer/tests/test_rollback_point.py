@@ -202,17 +202,13 @@ deploy_vms clean
         """1.2.7 lifecycle test: unattended, without --yes, the confirmation read hit end-of-input and the script exited
         1 silently. It must still change nothing, and now explain why."""
         self.run_bash("create_rollback_point")
-        (self.install_root / "app" / "main.py").write_text("NEW RELEASE CODE
-")
-        self.env_file.write_text(f"ANYAICAM_VMS_COMMIT={NEW}
-ANYAICAM_BUILD_ID={NEW}
-")
+        (self.install_root / "app" / "main.py").write_text("NEW RELEASE CODE\n")
+        self.env_file.write_text(f"ANYAICAM_VMS_COMMIT={NEW}\nANYAICAM_BUILD_ID={NEW}\n")
         result = subprocess.run([BASH, "./rollback.sh"], cwd=ROOT, text=True, capture_output=True, stdin=subprocess.DEVNULL,
                                 env=self.env(**self.rollback_paths()))
         self.assertEqual(result.returncode, 1)
         self.assertIn("Cancelled; nothing was changed.", result.stderr)
-        self.assertEqual((self.install_root / "app" / "main.py").read_text(), "NEW RELEASE CODE
-")
+        self.assertEqual((self.install_root / "app" / "main.py").read_text(), "NEW RELEASE CODE\n")
         self.assertIn(f"ANYAICAM_VMS_COMMIT={NEW}", self.env_file.read_text())
         self.assertNotIn("systemctl stop", self.log.read_text() if self.log.exists() else "")
 
