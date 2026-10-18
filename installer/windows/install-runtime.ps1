@@ -80,6 +80,17 @@ foreach ($directory in @('config', 'database', 'recordings', 'hls', 'logs', 'med
 # The data folder holds the app secrets (config\vms.env), the account database
 # and recordings: only the service (LocalSystem) and administrators may read it.
 # ProgramData's default would let every local user read and create files here.
+# Codex 1.2.7 Windows review: a standard user may pre-create %ProgramData%\AnyAiCam (ProgramData lets users create
+# folders) and plant a junction or symbolic link in it. Refuse any link BEFORE the recursive repair below or any write,
+# then make Administrators the owner of the root (an owner can always rewrite a folder's permissions).
+. (Join-Path $PSScriptRoot 'data-root-guard.ps1')
+& icacls.exe $DataRoot /setowner '*S-1-5-32-544' /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $DataRoot (icacls exit $LASTEXITCODE)." }
+# The root only (never /T): its inheritable SYSTEM/Administrators entries flow to every existing and future file and
+# folder that keeps inheritance on. Done FIRST, so no new top-level entry can be planted while the tree is checked.
+& icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
+Assert-AnyAiCamDataRootHasNoLinks $DataRoot
 $environmentFile = Join-Path $DataRoot 'config\vms.env'
 # Repair (2026-10-07): the unreleased 1.3.0 candidates ran the restriction
 # below with /T, which on a reinstall left every existing file with an EMPTY
@@ -95,12 +106,23 @@ if (Test-Path -LiteralPath $environmentFile) {
         if ($LASTEXITCODE -ne 0) { throw "Could not take ownership of $DataRoot to repair its permissions (takeown exit $LASTEXITCODE)." }
         & icacls.exe $DataRoot /reset /T /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Could not repair permissions under $DataRoot (icacls exit $LASTEXITCODE)." }
+        # /reset /T also reset the root itself to ProgramData's defaults: restrict it again.
+        & icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
     }
 }
-# The root only (never /T): its inheritable SYSTEM/Administrators entries flow
-# to every existing and future file and folder, which keep inheritance on.
-& icacls.exe $DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not restrict access to $DataRoot (icacls exit $LASTEXITCODE)." }
+# The secret-bearing folders (app secrets, account database, cloud-agent credential) must not keep anything a user
+# planted before the install: Administrators own every item and every item inherits the root's SYSTEM/Administrators
+# entries again (explicit entries removed). Recursion is safe here: the tree was just proven to contain no link.
+foreach ($secretFolder in @('config', 'database', 'agent')) {
+    $secretPath = Join-Path $DataRoot $secretFolder
+    if (-not (Test-Path -LiteralPath $secretPath)) { continue }
+    & icacls.exe $secretPath /setowner '*S-1-5-32-544' /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $secretPath (icacls exit $LASTEXITCODE)." }
+    & icacls.exe $secretPath /reset /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not reset the permissions of $secretPath (icacls exit $LASTEXITCODE)." }
+}
+Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # again, now that nothing below is user-writable
 # Trust anchors (Requirement 9, the Windows counterpart of Linux /etc/anyaicam-update): %ProgramData%\AnyAiCam\update
 # holds the entitlement keyset and the accepted / fallback VMS capacity. The VMS (app/platform_paths.py) trusts an
 # entry only if it is owned by SYSTEM or Administrators, nobody else may modify it, and it is not a link. A file an

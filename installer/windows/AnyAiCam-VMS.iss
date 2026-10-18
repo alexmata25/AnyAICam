@@ -59,6 +59,7 @@ Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*"; 
 Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion

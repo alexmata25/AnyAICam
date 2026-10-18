@@ -134,8 +134,12 @@ class RuntimeScriptTests(unittest.TestCase):
         repair = self.text.index("[IO.File]::ReadAllBytes($environmentFile)")
         self.assertLess(repair, self.text.index("& takeown.exe /F $DataRoot /R /A /D Y"))
         self.assertLess(self.text.index("& takeown.exe /F $DataRoot /R /A /D Y"), self.text.index("& icacls.exe $DataRoot /reset /T /C /Q"))
-        self.assertLess(self.text.index("& icacls.exe $DataRoot /reset /T /C /Q"), self.text.index("& icacls.exe $DataRoot /inheritance:r"))
-        self.assertLess(self.text.index("& icacls.exe $DataRoot /inheritance:r"), self.text.index("foreach ($line in Get-Content -LiteralPath $environmentFile)"))
+        # Codex 1.2.7: the root is restricted BEFORE the repair (so nothing new can be planted while it is checked for
+        # links) and again right after the repair's /reset /T, which also resets the root -- still before vms.env is read.
+        reset = self.text.index("& icacls.exe $DataRoot /reset /T /C /Q")
+        self.assertLess(self.text.index("& icacls.exe $DataRoot /inheritance:r"), reset)
+        restricted_again = self.text.index("& icacls.exe $DataRoot /inheritance:r", reset)
+        self.assertLess(restricted_again, self.text.index("foreach ($line in Get-Content -LiteralPath $environmentFile)"))
         self.assertIn("if (-not $readable) {", self.text)  # healthy installs skip the repair
         for failure in ("(takeown exit $LASTEXITCODE)", "Could not repair permissions under $DataRoot (icacls exit $LASTEXITCODE)"):
             self.assertIn(failure, self.text)  # a failed repair stops setup
