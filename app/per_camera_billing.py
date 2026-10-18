@@ -133,6 +133,7 @@ def previous_prices(plan_key: str) -> dict[str, int]:
     import logging
     env = PREVIOUS_PRICE_ENV.get(plan_key)
     found: dict[str, int] = {}
+    conflicted: set[str] = set()
     for item in (os.environ.get(env, "") if env else "").split(","):
         item = item.strip()
         if not item:
@@ -143,7 +144,19 @@ def previous_prices(plan_key: str) -> dict[str, int]:
             logging.getLogger("anyaicam.per_camera_billing").warning(
                 "per_camera_billing.previous_price_ignored env=%s reason=expected_price_id_colon_cents", env)
             continue
-        found[price_id] = int(cents)
+        if price_id in conflicted:
+            continue
+        amount = int(cents)
+        if price_id in found:
+            if found[price_id] != amount:
+                # A duplicated id with conflicting amounts makes historical billing ambiguous. Fail closed for
+                # that Price instead of letting the last environment entry silently choose the displayed amount.
+                found.pop(price_id, None)
+                conflicted.add(price_id)
+                logging.getLogger("anyaicam.per_camera_billing").warning(
+                    "per_camera_billing.previous_price_ignored env=%s reason=conflicting_duplicate_price_id", env)
+            continue
+        found[price_id] = amount
     return found
 
 

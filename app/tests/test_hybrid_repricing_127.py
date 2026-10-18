@@ -104,6 +104,14 @@ def test_each_previous_price_carries_its_own_amount(monkeypatch):
     assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": NEW}) == 1999
 
 
+def test_conflicting_duplicate_previous_price_id_is_ignored_fail_closed(monkeypatch):
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{OLD}:2499,{OLD}:2999")
+    assert OLD not in billing.previous_prices("hybrid")
+    assert billing.resolve_price(OLD) is None
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": OLD}) == 1999
+
+
 def test_previous_entries_never_swap_meaning(monkeypatch):
     """Even if the env values were swapped (NEW listed as previous), a NEW subscriber is shown $19.99 -- the amount
     recorded with that ID -- never the old $24.99 (Codex 2026-10-18: rollback must not swap the two meanings)."""
