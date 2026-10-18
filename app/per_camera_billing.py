@@ -32,11 +32,13 @@ PRICE_ENV = {
 # Hybrid repricing (owner approval 2026-10-17: $19.99 per camera per month, was $24.99). Stripe Prices are
 # immutable, so ANYAICAM_STRIPE_PRICE_HYBRID names the new $19.99 Price and every NEW checkout uses it (the price
 # guard refuses a Price that does not charge the catalog amount). Subscriptions still on an earlier Hybrid Price
-# stay fully recognized -- same plan, features and commission -- through ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS
-# (comma-separated Price IDs), and are shown at what that Price really bills. Nothing moves them: what existing
-# subscribers pay is an open owner decision. A previous Price is never offered for a new purchase.
+# stay fully recognized -- same plan, features and commission -- through ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS and
+# are shown at what THAT Price bills. Each entry names the Price and its own monthly amount per camera in cents,
+# "price_id:cents" (comma-separated), e.g. "price_1UMz...:2499" -- the amount travels with the ID, so no swap of
+# values can ever show a subscriber another Price's amount (Codex 2026-10-18). An entry without a valid amount is
+# ignored and logged, never guessed. Nothing moves existing subscribers: what they pay is an open owner decision.
+# A previous Price is never offered for a new purchase.
 PREVIOUS_PRICE_ENV = {"hybrid": "ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS"}
-PREVIOUS_MONTHLY_CENTS_PER_CAMERA = {"hybrid": 2499}
 PLANS = {
     "basic_local": {
         "display_name": "Basic Local", "monthly_cents_per_camera": 999,
@@ -44,7 +46,7 @@ PLANS = {
         "cloud_event_retention_days": None, "mode": "local", "commission_percent": 0,
         "resolution_classes": ["standard", "high_resolution"],
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
-                     "standard_camera_management", "remote_viewing_where_supported", "remote_phone_support"],
+                     "standard_camera_management", "remote_viewing_where_supported"],
     },
     "ai_local": {
         "display_name": "AI Local", "monthly_cents_per_camera": 1499,
@@ -54,7 +56,7 @@ PLANS = {
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
-                     "core_aaco_retrieval", "supported_talk_down", "remote_phone_support"],
+                     "core_aaco_retrieval", "supported_talk_down"],
     },
     "hybrid": {
         "display_name": "Hybrid", "monthly_cents_per_camera": 1999,
@@ -65,10 +67,9 @@ PLANS = {
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
                      "core_aaco_retrieval", "supported_talk_down", "hybrid_cloud_services",
-                     "remote_cloud_services", "cloud_event_protection", "remote_phone_support"],
+                     "remote_cloud_services", "cloud_event_protection"],
     },
 }
-REMOTE_PHONE_SUPPORT = "Free remote technical support by phone, Monday through Sunday, during business hours"
 FEATURE_LABELS = {
     "local_vms": "Local VMS", "local_recording": "Local recording", "local_playback": "Local playback",
     "basic_motion_events": "Basic motion and events", "standard_camera_management": "Camera management",
@@ -77,8 +78,6 @@ FEATURE_LABELS = {
     "intelligent_notifications": "Intelligent notifications", "core_aaco_retrieval": "Core AACO video and event retrieval",
     "supported_talk_down": "Talk Down / two-way audio on supported cameras", "hybrid_cloud_services": "Hybrid cloud services",
     "remote_cloud_services": "Remote cloud services", "cloud_event_protection": "Cloud event protection",
-    # Owner approval 2026-10-17: included with every plan (Basic Local, AI Local and Hybrid).
-    "remote_phone_support": REMOTE_PHONE_SUPPORT,
 }
 
 
@@ -119,28 +118,45 @@ def _configured_prices() -> dict[str, dict]:
             if price_id in found:
                 raise ValueError("A Stripe Price ID is configured for more than one per-camera plan.")
             found[price_id] = {**plan, "plan_key": key, "product": "camera_plan_v2", "price_id": price_id}
-    for key, env in PREVIOUS_PRICE_ENV.items():
-        for price_id in previous_price_ids(key):
+    for key in PREVIOUS_PRICE_ENV:
+        for price_id, cents in previous_prices(key).items():
             if price_id in found:
                 raise ValueError("A previous Stripe Price ID is also configured as a current per-camera Price.")
             found[price_id] = {**PLANS[key], "plan_key": key, "product": "camera_plan_v2", "price_id": price_id,
-                               "monthly_cents_per_camera": PREVIOUS_MONTHLY_CENTS_PER_CAMERA[key], "previous_price": True}
+                               "monthly_cents_per_camera": cents, "previous_price": True}
+    return found
+
+
+def previous_prices(plan_key: str) -> dict[str, int]:
+    """Earlier Stripe Prices of a plan that existing subscriptions may still be on (never sold again), each with
+    the monthly amount per camera THAT Price bills, from "price_id:cents" entries. Malformed entries are ignored."""
+    import logging
+    env = PREVIOUS_PRICE_ENV.get(plan_key)
+    found: dict[str, int] = {}
+    for item in (os.environ.get(env, "") if env else "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        price_id, sep, cents = item.partition(":")
+        price_id, cents = price_id.strip(), cents.strip()
+        if not sep or not price_id.startswith("price_") or not cents.isdigit() or not 0 < int(cents) <= 100_000:
+            logging.getLogger("anyaicam.per_camera_billing").warning(
+                "per_camera_billing.previous_price_ignored env=%s reason=expected_price_id_colon_cents", env)
+            continue
+        found[price_id] = int(cents)
     return found
 
 
 def previous_price_ids(plan_key: str) -> list[str]:
-    """Earlier Stripe Price IDs of a plan that existing subscriptions may still be on (never sold again)."""
-    env = PREVIOUS_PRICE_ENV.get(plan_key)
-    return [item.strip() for item in os.environ.get(env, "").split(",") if item.strip()] if env else []
+    return list(previous_prices(plan_key))
 
 
 def billed_cents_per_camera(entitlement: dict) -> int:
-    """What this subscription is really billed per camera: its earlier Hybrid Price, if it is still on one,
-    otherwise the catalog price."""
+    """What this subscription is really billed per camera: the amount recorded with its earlier Price, if it is
+    still on one, otherwise the catalog price."""
     plan_key = str(entitlement.get("plan_key") or "")
-    if str(entitlement.get("stripe_price_id") or "") in previous_price_ids(plan_key):
-        return PREVIOUS_MONTHLY_CENTS_PER_CAMERA[plan_key]
-    return int(PLANS[plan_key]["monthly_cents_per_camera"])
+    earlier = previous_prices(plan_key).get(str(entitlement.get("stripe_price_id") or ""))
+    return earlier if earlier is not None else int(PLANS[plan_key]["monthly_cents_per_camera"])
 
 
 def resolve_price(price_id: str) -> Optional[dict]:
