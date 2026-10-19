@@ -290,6 +290,29 @@ def test_facial_child_uses_frame_time_when_processing_lags(scan):
     assert scan.facial_call_times == [(processing_time, frame_time)]
 
 
+def test_facial_child_accepts_a_text_frame_time_at_the_input_boundary(scan):
+    """Red 2026-10-18: an ISO-text frame time (the form 5c5971c1's first test used) once killed the worker thread with
+    TypeError str > datetime in detection_timing. It is now normalized at the boundary: same result as a datetime."""
+    scan.faces["on"] = True
+    processing_time = datetime(2026, 10, 18, 12, 0, 20)
+    frame_time = processing_time - timedelta(seconds=20)
+    events = scan.run(at=processing_time, frame_at=frame_time.isoformat())
+    face = _of(events, "facial_recognition")[0]
+
+    assert face["timestamp"] == frame_time.isoformat()
+    assert scan.facial_call_times == [(processing_time, frame_time)]
+
+
+def test_unparseable_frame_time_falls_back_to_processing_time_without_crashing(scan):
+    scan.faces["on"] = True
+    processing_time = datetime(2026, 10, 18, 12, 0, 20)
+    events = scan.run(at=processing_time, frame_at="not-a-time")
+    face = _of(events, "facial_recognition")[0]
+
+    assert face["timestamp"] == processing_time.isoformat()
+    assert scan.facial_call_times == [(processing_time, processing_time)]
+
+
 def test_facial_recognition_later_in_the_activity_shares_its_clip(scan, monkeypatch):
     monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))
     now = datetime.now()  # the activity finaliser runs on the real clock

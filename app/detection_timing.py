@@ -25,8 +25,9 @@ The fix has two parts, both here:
    clip."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 # FFmpeg's HLS demuxer default for live playlists (libavformat/hls.c).
 FFMPEG_HLS_LIVE_START_INDEX = -3
@@ -129,7 +130,44 @@ def hls_live_segments_problem(
     return min(frame_time, now_dt), None
 
 
-def plausible_frame_time(candidate: Optional[datetime], now: datetime) -> Optional[datetime]:
+_log = logging.getLogger("anyaicam.detection_timing")
+# Epoch seconds outside this window are not a camera frame time (e.g. a counter or milliseconds).
+_EPOCH_MIN, _EPOCH_MAX = 946684800.0, 4102444800.0          # 2000-01-01 .. 2100-01-01 UTC
+
+
+def normalize_frame_time(value: Any) -> Optional[datetime]:
+    """The single input boundary for frame timestamps (Red 2026-10-18, after a str reached a datetime comparison).
+
+    Every real producer passes a naive local datetime (_read_hls_analytics_frame, analytics_frames' wall clock,
+    ai_last_frame_time). Anything else is normalized to that form or rejected -- never compared raw:
+      * naive datetime -> unchanged; aware datetime -> converted to naive local time;
+      * ISO-8601 text (a trailing 'Z' is UTC) -> parsed, then as above;
+      * int/float epoch seconds within 2000..2100 -> naive local time;
+      * anything else (bool, unparseable text, other types, out-of-range numbers) -> None, logged once per call.
+    None means "unknown": callers fall back to `now`, exactly as for a missing frame time."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone().replace(tzinfo=None) if value.tzinfo is not None else value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
+        except ValueError:
+            _log.warning("detection_timing.frame_time_rejected reason=unparseable_text")
+            return None
+        return normalize_frame_time(parsed)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if _EPOCH_MIN <= float(value) <= _EPOCH_MAX:
+            return datetime.fromtimestamp(float(value))
+        _log.warning("detection_timing.frame_time_rejected reason=epoch_out_of_range")
+        return None
+    _log.warning("detection_timing.frame_time_rejected reason=unsupported_type type=%s", type(value).__name__)
+    return None
+
+
+def plausible_frame_time(candidate: Any, now: datetime) -> Optional[datetime]:
+    candidate = normalize_frame_time(candidate)
     if candidate is None or candidate > now:
         return None
     if (now - candidate).total_seconds() > MAX_PLAUSIBLE_FRAME_AGE_SECONDS:
@@ -138,8 +176,8 @@ def plausible_frame_time(candidate: Optional[datetime], now: datetime) -> Option
 
 
 def detection_event_span(
-    frame_time: Optional[datetime],
-    previous_frame_time: Optional[datetime],
+    frame_time: Any,
+    previous_frame_time: Any,
     *,
     now: datetime,
     scan_interval_seconds: float,
@@ -151,6 +189,7 @@ def detection_event_span(
     the object was not detected there, so it entered after it -- or, with
     no usable previous frame, one scan interval before the detection. It is
     never more than MAX_EVENT_LEAD_SECONDS before the detection."""
+    previous_frame_time = normalize_frame_time(previous_frame_time)
     moment = plausible_frame_time(frame_time, now) or now
     earliest = moment - timedelta(seconds=MAX_EVENT_LEAD_SECONDS)
     if previous_frame_time is not None and earliest <= previous_frame_time < moment:
