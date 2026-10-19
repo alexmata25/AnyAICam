@@ -174,6 +174,43 @@ if ($acceptance.keyset_kind -eq 'synthetic-test') {
     }
 }
 
+# ---------------------------------------------------------------- downgrade prevention (owner/Codex 2026-10-18)
+$uninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1'
+$realVersion = (Get-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -ErrorAction SilentlyContinue).DisplayVersion
+Check "1.2.7 downgrade: the uninstall entry reports the installed version ($realVersion)" {
+    if ($realVersion -ne $expectedVersion) { throw "DisplayVersion '$realVersion', expected '$expectedVersion'" }; $realVersion
+}
+Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value '9.9.9'      # pretend a NEWER release is installed
+Check '1.2.7 downgrade: Setup refuses to replace a newer installed version (9.9.9) and changes nothing' {
+    $before = Get-FileHash (Join-Path $data 'config\vms.env')
+    $log = Join-Path $results 'setup-downgrade-refused.log'
+    $p = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + $log + '"') -Wait -PassThru
+    if ($p.ExitCode -eq 0) { throw 'setup ran over a newer version' }
+    if (-not (Select-String -LiteralPath $log -SimpleMatch 'Downgrade refused: AnyAiCam VMS 9.9.9 is installed' -Quiet)) { throw 'no refusal in the setup log' }
+    if ((Get-FileHash (Join-Path $data 'config\vms.env')).Hash -ne $before.Hash) { throw 'vms.env changed' }
+    if (-not (WaitHealthy 60)) { throw 'VMS not healthy after the refused setup' }
+    "exit $($p.ExitCode); refusal logged; vms.env unchanged; VMS still healthy"
+}
+Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $realVersion  # restore
+Check '1.2.7 downgrade: with the real version restored, a repair of the same version still runs (exit 0)' {
+    $p = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-same-version-repair.log') + '"') -Wait -PassThru
+    if ($p.ExitCode -ne 0) { throw "exit $($p.ExitCode)" }; if (-not (WaitHealthy 180)) { throw 'not healthy' }; 'exit 0; healthy'
+}
+
+# ---------------------------------------------------------------- entitlement files: only SYSTEM/Administrators may write
+Check '1.2.7 entitlement security: trust anchor, accepted capacity and staging are writable only by SYSTEM/Administrators' {
+    $files = @((Join-Path $data 'update\entitlement_signing_keys.json'), (Join-Path $data 'update\vms_capacity_accepted.json'),
+               (Join-Path $data 'update'), (Join-Path $data 'config'))
+    $writeMask = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, Delete, ChangePermissions, TakeOwnership'
+    $bad = foreach ($f in $files) {
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $acl = Get-Acl -LiteralPath $f
+        if ((SidOf ($acl.GetOwner([Security.Principal.SecurityIdentifier]))) -notin $SY, $BA) { "owner of $f" }
+        foreach ($r in $acl.Access) { if ($r.AccessControlType -eq 'Allow' -and (SidOf $r.IdentityReference) -notin $SY, $BA -and ($r.FileSystemRights -band $writeMask)) { "$(SidOf $r.IdentityReference) may write $f" } }
+    }
+    if ($bad) { throw ($bad -join ' | ') }; "$($files.Count) entitlement paths: SY/BA only"
+}
+
 # ---------------------------------------------------------------- installed ACLs (recursive) and reparse points
 function AclProblems([string]$Root) {
     $problems = New-Object System.Collections.Generic.List[string]

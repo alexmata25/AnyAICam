@@ -133,6 +133,66 @@ begin
   Result := FileExists(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'));
 end;
 
+// Downgrade prevention (Red 2026-10-18, owner/Codex): this setup never replaces a NEWER installed AnyAiCam VMS.
+// The installed version is the DisplayVersion of this AppId's uninstall entry (every AnyAiCam Windows setup,
+// past and future, uses the same AppId). Same version (repair) and older versions (upgrade) are unaffected.
+// A silent install is refused with Setup's initialization failure exit code; the refusal is logged.
+const
+  AnyAiCamUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1';
+
+function NextVersionPart(var S: String): Integer;
+var
+  P: Integer;
+  Part: String;
+begin
+  P := Pos('.', S);
+  if P = 0 then begin Part := S; S := ''; end
+  else begin Part := Copy(S, 1, P - 1); S := Copy(S, P + 1, Length(S)); end;
+  Result := StrToIntDef(Part, -1);
+end;
+
+// 1 when A is newer than B, -1 when older, 0 when equal; -2 when either is not a plain x.y.z.
+function CompareAnyAiCamVersions(A, B: String): Integer;
+var
+  I, X, Y: Integer;
+begin
+  Result := 0;
+  for I := 1 to 3 do begin
+    X := NextVersionPart(A);
+    Y := NextVersionPart(B);
+    if (X < 0) or (Y < 0) then begin Result := -2; exit; end;
+    if X > Y then begin Result := 1; exit; end;
+    if X < Y then begin Result := -1; exit; end;
+  end;
+  if (A <> '') or (B <> '') then Result := -2;
+end;
+
+function InstalledAnyAiCamVersion(): String;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKLM64, AnyAiCamUninstallKey, 'DisplayVersion', Result) then
+    if not RegQueryStringValue(HKLM32, AnyAiCamUninstallKey, 'DisplayVersion', Result) then
+      Result := '';
+end;
+
+function InitializeSetup(): Boolean;
+var
+  Installed: String;
+begin
+  Result := True;
+  Installed := InstalledAnyAiCamVersion();
+  if Installed = '' then exit;
+  if CompareAnyAiCamVersions(Installed, '{#AppVersion}') = 1 then begin
+    Log('Downgrade refused: AnyAiCam VMS ' + Installed + ' is installed; this setup is {#AppVersion}.');
+    if not WizardSilent() then
+      MsgBox('AnyAiCam VMS ' + Installed + ' is already installed on this computer. This setup is the older ' +
+        'version {#AppVersion} and cannot replace it. Download the current AnyAiCam setup from your AnyAiCam account.',
+        mbError, MB_OK);
+    Result := False;
+  end else
+    Log('Installed AnyAiCam VMS: ' + Installed + '; this setup: {#AppVersion}.');
+end;
+
 procedure InitializeWizard;
 begin
   ProductModePage := CreateInputOptionPage(wpSelectDir, 'How will you use AnyAiCam?',
