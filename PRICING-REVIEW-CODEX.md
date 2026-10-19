@@ -36,9 +36,14 @@ Raw focused logs are in this directory's `review-evidence/` folder. The baseline
 
 ## AWS identity and permission finding
 
-No AWS API, SSM command, production command, or credential file was read or run. Therefore there is no evidence that AWS IAM denied the request or which effective IAM statement was missing. Red's runbook describes the refusal as Claude Code's local auto-mode approval, which occurs before it proves an AWS `AccessDenied`. Do not grant IAM permissions based solely on that refusal.
+Read-only AWS evidence obtained 2026-10-18:
 
-The local AWS config names the `anyaicam-deploy` profile and intended SSO role; that is configuration, not proof of the active caller identity or effective permissions. The approved wrapper calls only `sts:GetCallerIdentity`, `ssm:SendCommand`, and `ssm:GetCommandInvocation`.
+- `sts:GetCallerIdentity` succeeded for profile `anyaicam-deploy`, account `880690594006`, assumed role `AWSReservedSSO_AnyAiCamCloudDeploy`.
+- `ssm:DescribeInstanceInformation` succeeded for the single approved target `i-0a082abd812929bb4`: Linux, SSM `Online`, agent `3.3.4793.0`.
+- An IAM simulation attempt was denied because this deployment role lacks `iam:SimulatePrincipalPolicy`. That is a review/admin diagnostic permission, not a permission the deployment wrapper needs; do not add it to the deploy role. Use an AWS administrator's IAM simulator or permission-set review instead.
+- No `SendCommand`, customer-data read, IAM policy change, credential-file read, production shell command, or deployment was performed. There is still no evidence that AWS IAM denied `SendCommand` itself. Red's runbook describes the prior refusal as Claude Code's local auto-mode approval, which is separate from IAM. Do not grant deployment permissions based solely on that refusal.
+
+The approved wrapper calls `sts:GetCallerIdentity`, `ssm:SendCommand`, and `ssm:GetCommandInvocation`. Its caller identity is now verified, but its effective permission for the latter two actions remains unverified.
 
 Minimum AWS permission delta to investigate, not apply:
 
@@ -55,6 +60,6 @@ Deployment-kit runtime gate: `02-db-backup.sh` runs the boto3 uploader inside th
 
 ## Before requesting IAM changes
 
-Ask the account administrator to inspect the Identity Center permission set and attached managed/inline policies, permissions boundary, SCP, target instance managed-node status, instance profile, and KMS/bucket policy. Obtain only a sanitized denial record containing the denied action, resource, caller role name, and policy-evaluation reason (no credential material). Then prepare a policy diff for owner approval. Keep the Claude Code rule separate: a narrowly approved local command rule is not an AWS IAM permission and must not allow arbitrary commands or bypass per-step owner approval.
+Ask an AWS administrator (using an administrator identity, not by expanding the deploy role) to inspect the Identity Center permission set and attached managed/inline policies, permissions boundary, SCP, target instance profile, and KMS/bucket policies. Use IAM simulation against the exact `AWSReservedSSO_AnyAiCamCloudDeploy` role in Identity Center home region `us-east-2`, and separately check `ssm:SendCommand` against the exact instance/document pair and `ssm:GetCommandInvocation` against `*`. Obtain only a sanitized result with action, resource, decision, and policy-evaluation reason (no credential material). Then prepare a policy diff for owner approval. Keep the Claude Code rule separate: a narrowly approved local command rule is not an AWS IAM permission and must not allow arbitrary commands or bypass per-step owner approval.
 
 Deployment remains unapproved and unperformed. Red must review both commits and the deployment-security note before any later integration or deployment decision.
