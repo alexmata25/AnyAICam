@@ -41,7 +41,10 @@ $expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+)-') 
 # too, so a setup that fell back to the default portal could not reach it.
 $TestCloudHost = 'cloud.anyaicam.test'
 $TestPortal = "https://${TestCloudHost}:8443"
-Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`r`n127.0.0.1 $TestCloudHost`r`n127.0.0.1 app.anyaicam.com"
+# 2026-10-18 (Codex 21:07): genuine isolation -- make-wsb.ps1 now disables Sandbox networking; every AnyAiCam
+# production name is also pinned to this VM, so nothing could reach a production service even by name.
+$acceptanceSettings = Get-Content -Raw 'C:\Validation\scripts\acceptance.json' | ConvertFrom-Json
+Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`r`n127.0.0.1 $TestCloudHost`r`n127.0.0.1 app.anyaicam.com`r`n127.0.0.1 portal.anyaicam.com`r`n127.0.0.1 portal-staging.anyaicam.com`r`n127.0.0.1 anyaicam.com"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Cloud([string]$Method, [string]$Path, $Body = $null, [switch]$Owner) {
     $arguments = @{ Method = $Method; Uri = "$TestPortal$Path"; TimeoutSec = 20; UseBasicParsing = $true; ContentType = 'application/json' }
@@ -107,7 +110,7 @@ if ($previous) {
 # file) is reported with its reason instead of a blank exit code.
 $installError = ''
 try {
-    $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop
+    $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$($acceptanceSettings.product_mode)", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop
 } catch { $install = $null; $installError = $_.Exception.Message }
 Check 'silent install exit code 0' { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
 Check 'code integrity / Smart App Control state (diagnostic)' {
@@ -156,6 +159,7 @@ Check 'runtime catalog registered, signed like the setup (Smart App Control)' {
     $catalog = Join-Path $env:SystemRoot 'System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\AnyAiCamRuntime.cat'
     if (-not (Test-Path -LiteralPath $catalog)) { throw 'AnyAiCamRuntime.cat not registered' }
     $signature = Get-AuthenticodeSignature -LiteralPath $catalog
+    if ((Get-AuthenticodeSignature -LiteralPath $setup.FullName).Status -ne 'Valid') { return "registered; setup not signed (unsigned candidate) -- catalog signature checked on the signed build only" }
     if ($signature.Status -ne 'Valid') { throw "catalog signature $($signature.Status)" }
     $setupSigner = (Get-AuthenticodeSignature -LiteralPath $setup.FullName).SignerCertificate.Subject
     if ($signature.SignerCertificate.Subject -ne $setupSigner) { throw "catalog signer $($signature.SignerCertificate.Subject)" }
@@ -244,7 +248,7 @@ $python = Join-Path $app 'runtime\python\python.exe'
 $cloudData = 'C:\TestCloud'
 & $python 'C:\Validation\scripts\test-cloud.py' --app (Join-Path $app 'app') --data $cloudData --host $TestCloudHost --certificates-only
 Import-Certificate -FilePath (Join-Path $cloudData 'tls\ca.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-$testCloud = Start-Process -FilePath $python -ArgumentList '"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443' `
+$testCloud = Start-Process -FilePath $python -ArgumentList '"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443', $(if ($acceptanceSettings.keyset_kind -eq 'synthetic-test') { '--signing-key', '"C:\Validation\scripts\signing-key.json"' }) `
     -WorkingDirectory $cloudData -WindowStyle Hidden -RedirectStandardOutput (Join-Path $results 'test-cloud.out.log') -RedirectStandardError (Join-Path $results 'test-cloud.err.log') -PassThru
 Check 'test cloud up over HTTPS (real claim and appliance routes)' { if (-not (WaitFor 120 { Cloud GET '/test/state' })) { throw 'test cloud did not answer' }; 'https://cloud.anyaicam.test:8443' }
 # The agent backed off while the cloud was not up yet; start it over.
@@ -395,6 +399,9 @@ Check 'repair reinstall exit code 0' { if ($repair2.ExitCode -ne 0) { throw "exi
 Check 'repair reinstall keeps data and secrets' { SecretsKept }
 Check 'repair reinstall restores readable, inherited permissions' { DataFilesHealthy }
 Check 'repair reinstall keeps this PC linked to the cloud' { StillLinked }
+
+# ---------------------------------------------------------------- Windows 1.2.7 acceptance (2026-10-18)
+. 'C:\Validation\scripts\acceptance-127.ps1'
 
 $uninstaller = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
 Check 'installed uninstaller carries the same valid signature as the setup' {

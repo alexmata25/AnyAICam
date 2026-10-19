@@ -11,6 +11,12 @@ that CA inside the Sandbox only). Test-only additions, under /test/:
     seeded customer owner (the real portal session check otherwise);
   * GET  /test/state    claims, appliances and commands, without secrets;
   * POST /test/command  queue a confirmed command for the linked appliance.
+  * POST /test/entitlement  (2026-10-18) add a SYNTHETIC entitlement row for the test customer
+                            {"product": vms_license|camera_slots_local|camera_slots_hybrid, "quantity": N};
+  * GET  /test/capacity     (2026-10-18) the cloud's own capacity_breakdown() for the test customer.
+With --signing-key (2026-10-18) the cloud signs with the SYNTHETIC Sandbox key (make-synthetic-keyset.py, key id
+sandbox-test-*) instead of a random one, so a TEST-ONLY build carrying that public keyset accepts it end to end.
+No production key, customer or database is ever used.
 
     python test-cloud.py --app "C:\\Program Files\\AnyAiCam\\app" --data C:\\TestCloud
         [--host cloud.anyaicam.test] [--port 8443] [--certificates-only]
@@ -61,7 +67,7 @@ def make_certificates(folder: Path, host: str) -> None:
     (folder / 'server.pem').write_bytes(server.public_bytes(serialization.Encoding.PEM))
 
 
-def build_app(data: Path, app_dir: Path):
+def build_app(data: Path, app_dir: Path, signing_key: Path | None = None):
     from cryptography.fernet import Fernet
     key_file = data / 'claim_flow_key'
     if not key_file.is_file():
@@ -83,6 +89,13 @@ def build_app(data: Path, app_dir: Path):
         db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,created_at) VALUES(?,?,?,?,?,?)",
                    (CUSTOMER_ID, PARTNER_ID, 'Test Customer', OWNER['email'], 'active', now))
         db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (SITE_ID, CUSTOMER_ID, 'Test Site', now))
+        if signing_key is not None:
+            key = json.loads(signing_key.read_text(encoding='ascii'))
+            if not str(key['key_id']).startswith('sandbox-test-'):
+                raise SystemExit('refusing a signing key that is not a synthetic sandbox-test key')
+            # Seeded before any request, so appliance_identity.ensure_signing_key() returns it (newest active key).
+            db.execute("INSERT OR IGNORE INTO identity_signing_keys(key_id,public_key_b64,private_key_b64,created_at) VALUES(?,?,?,?)",
+                       (key['key_id'], key['public_key_b64'], key['private_key_b64'], '2999-01-01T00:00:00'))
 
     import appliance_claims
     import appliance_cloud
@@ -118,6 +131,25 @@ def build_app(data: Path, app_dir: Path):
                         created.isoformat(), (created + datetime.timedelta(minutes=30)).isoformat(), OWNER['email']))
         return {'id': command_id}
 
+    @app.post('/test/entitlement')
+    def test_entitlement(request: Request, payload: dict) -> dict:
+        if request.headers.get('X-Test-Owner') != 'yes':
+            raise HTTPException(status_code=403, detail='test owner only')
+        product, quantity = str(payload['product']), int(payload['quantity'])
+        if product not in ('vms_license', 'camera_slots_local', 'camera_slots_hybrid') or not 0 <= quantity <= 64:
+            raise HTTPException(status_code=400, detail='synthetic products only')
+        stamp = datetime.datetime.now().isoformat()
+        with partner_db.connection() as db:
+            db.execute("DELETE FROM customer_entitlements WHERE customer_id=? AND product=?", (CUSTOMER_ID, product))
+            db.execute("INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                       (uuid.uuid4().hex, CUSTOMER_ID, product, quantity, 'active', stamp, stamp))
+        return {'product': product, 'quantity': quantity}
+
+    @app.get('/test/capacity')
+    def test_capacity() -> dict:
+        import customer_entitlements
+        return customer_entitlements.capacity_breakdown(CUSTOMER_ID)
+
     return app
 
 
@@ -128,13 +160,14 @@ def main() -> None:
     parser.add_argument('--host', default='cloud.anyaicam.test')
     parser.add_argument('--port', type=int, default=8443)
     parser.add_argument('--certificates-only', action='store_true')
+    parser.add_argument('--signing-key', help='synthetic sandbox-test signing key (TEST-ONLY build acceptance)')
     args = parser.parse_args()
     data = Path(args.data)
     data.mkdir(parents=True, exist_ok=True)
     make_certificates(data / 'tls', args.host)
     if args.certificates_only:
         return
-    app = build_app(data, Path(args.app))
+    app = build_app(data, Path(args.app), Path(args.signing_key) if args.signing_key else None)
     import uvicorn
     uvicorn.run(app, host='127.0.0.1', port=args.port, ssl_certfile=str(data / 'tls' / 'server.pem'),
                 ssl_keyfile=str(data / 'tls' / 'server.key'), log_level='info')
