@@ -142,13 +142,20 @@ def normalize_frame_time(value: Any) -> Optional[datetime]:
     ai_last_frame_time). Anything else is normalized to that form or rejected -- never compared raw:
       * naive datetime -> unchanged; aware datetime -> converted to naive local time;
       * ISO-8601 text (a trailing 'Z' is UTC) -> parsed, then as above;
-      * int/float epoch seconds within 2000..2100 -> naive local time;
-      * anything else (bool, unparseable text, other types, out-of-range numbers) -> None, logged once per call.
+      * int/float epoch seconds within 2000..2100 -> naive local time (range checked before any conversion);
+      * anything else (bool, unparseable text, other types, out-of-range or non-finite numbers, integers too large
+        for a float, datetimes outside the local range) -> None, logged once per call -- never an exception.
     None means "unknown": callers fall back to `now`, exactly as for a missing frame time."""
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.astimezone().replace(tzinfo=None) if value.tzinfo is not None else value
+        if value.tzinfo is None:
+            return value
+        try:
+            return value.astimezone().replace(tzinfo=None)
+        except (OverflowError, ValueError, OSError):   # e.g. datetime.max in UTC+14 -> beyond the local range
+            _log.warning("detection_timing.frame_time_rejected reason=out_of_range_datetime")
+            return None
     if isinstance(value, str):
         text = value.strip()
         try:
@@ -158,8 +165,14 @@ def normalize_frame_time(value: Any) -> Optional[datetime]:
             return None
         return normalize_frame_time(parsed)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if _EPOCH_MIN <= float(value) <= _EPOCH_MAX:
-            return datetime.fromtimestamp(float(value))
+        # Compare BEFORE any float()/fromtimestamp(): Python compares an int of any size with a float exactly, so a
+        # huge integer (e.g. 10**400) is rejected here instead of raising OverflowError (Codex 2026-10-18). NaN fails
+        # both comparisons; +/-inf is out of range.
+        if _EPOCH_MIN <= value <= _EPOCH_MAX:
+            try:
+                return datetime.fromtimestamp(float(value))
+            except (OverflowError, ValueError, OSError):
+                pass
         _log.warning("detection_timing.frame_time_rejected reason=epoch_out_of_range")
         return None
     _log.warning("detection_timing.frame_time_rejected reason=unsupported_type type=%s", type(value).__name__)

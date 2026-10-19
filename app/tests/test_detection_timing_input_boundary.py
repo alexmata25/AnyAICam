@@ -85,3 +85,27 @@ def test_aware_now_comparison_never_raises_for_naive_producers():
     aware = (NOW - timedelta(seconds=5)).astimezone()
     _, moment = dt.detection_event_span(aware, None, now=NOW, scan_interval_seconds=2.0)
     assert moment == NOW - timedelta(seconds=5)
+
+
+# Codex 2026-10-18: a huge integer used to reach float() and raise OverflowError instead of being rejected.
+@pytest.mark.parametrize('huge', [10 ** 400, -(10 ** 400), 2 ** 1024, 10 ** 20])
+def test_integers_too_large_for_a_float_are_rejected_not_raised(huge, caplog):
+    assert dt.normalize_frame_time(huge) is None
+    assert 'epoch_out_of_range' in caplog.text
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), float('-inf'), 1e308])
+def test_non_finite_and_extreme_floats_are_rejected(bad):
+    assert dt.normalize_frame_time(bad) is None
+
+
+def test_an_aware_datetime_outside_the_local_range_is_rejected_not_raised():
+    extreme = datetime.max.replace(tzinfo=timezone(timedelta(hours=-14)))
+    got = dt.normalize_frame_time(extreme)
+    assert got is None or got.tzinfo is None   # rejected (overflow) or converted -- never an exception
+
+
+@pytest.mark.parametrize('huge', [10 ** 400, float('nan'), 2 ** 1024])
+def test_detection_event_span_survives_huge_values_and_falls_back_to_now(huge):
+    start, moment = dt.detection_event_span(huge, huge, now=NOW, scan_interval_seconds=2.0)
+    assert (start, moment) == (NOW - timedelta(seconds=2.0), NOW)
