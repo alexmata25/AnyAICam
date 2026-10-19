@@ -164,12 +164,18 @@ def previous_price_ids(plan_key: str) -> list[str]:
     return list(previous_prices(plan_key))
 
 
-def billed_cents_per_camera(entitlement: dict) -> int:
-    """What this subscription is really billed per camera: the amount recorded with its earlier Price, if it is
-    still on one, otherwise the catalog price."""
+def billed_cents_per_camera(entitlement: dict) -> int | None:
+    """Return the configured amount for this subscription's exact Stripe Price.
+
+    Rows without a Price ID predate exact-price tracking and retain the historical catalog fallback. A row with a
+    Price ID that is unknown or ambiguous must not be represented as the current catalog amount.
+    """
     plan_key = str(entitlement.get("plan_key") or "")
-    earlier = previous_prices(plan_key).get(str(entitlement.get("stripe_price_id") or ""))
-    return earlier if earlier is not None else int(PLANS[plan_key]["monthly_cents_per_camera"])
+    current = int(PLANS[plan_key]["monthly_cents_per_camera"])
+    price_id = str(entitlement.get("stripe_price_id") or "").strip()
+    if not price_id or price_id == price_id_for(plan_key):
+        return current
+    return previous_prices(plan_key).get(price_id)
 
 
 def resolve_price(price_id: str) -> Optional[dict]:
@@ -453,9 +459,11 @@ def entitlement_payload(entitlement: dict | None) -> dict | None:
     return {
         "plan_key": entitlement["plan_key"], "display_name": plan["display_name"],
         "status": entitlement.get("status"), "stripe_status": entitlement.get("stripe_status"),
-        "camera_quantity": quantity, "monthly_per_camera_amount": billed / 100,
-        "monthly_base_total": billed * quantity / 100,
-        "previous_price": billed != int(plan["monthly_cents_per_camera"]),
+        "camera_quantity": quantity,
+        "monthly_per_camera_amount": billed / 100 if billed is not None else None,
+        "monthly_base_total": billed * quantity / 100 if billed is not None else None,
+        "billing_amount_unknown": billed is None,
+        "previous_price": billed is not None and billed != int(plan["monthly_cents_per_camera"]),
         "local_retention_days": int(entitlement.get("local_retention_days") or plan["local_retention_days"]),
         "cloud_event_storage": bool(entitlement.get("cloud_event_storage")),
         "cloud_event_retention_days": entitlement.get("cloud_event_retention_days"),
@@ -846,9 +854,13 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                         f"{_camera_count(deferred['camera_quantity'], 'licensed camera')} · ordered with your appliance. "
                         "Your storage plan starts when you activate the appliance.")
     if payload:
-        plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
-                        f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
-                        f"${payload['monthly_base_total']:.2f} monthly base total")
+        if payload["billing_amount_unknown"]:
+            plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
+                            "billing amount unavailable; contact AnyAiCam support")
+        else:
+            plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
+                            f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
+                            f"${payload['monthly_base_total']:.2f} monthly base total")
         retention = f"{payload['local_retention_days']}-day local retention"
         if payload["cloud_event_storage"]:
             retention += f" · {payload['cloud_event_retention_days']}-day cloud EVENT retention"

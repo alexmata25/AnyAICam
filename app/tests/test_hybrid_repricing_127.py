@@ -109,7 +109,19 @@ def test_conflicting_duplicate_previous_price_id_is_ignored_fail_closed(monkeypa
     monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{OLD}:2499,{OLD}:2999")
     assert OLD not in billing.previous_prices("hybrid")
     assert billing.resolve_price(OLD) is None
-    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": OLD}) == 1999
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": OLD}) is None
+    payload = billing.entitlement_payload({**BASE, "stripe_price_id": OLD})
+    assert payload["billing_amount_unknown"] is True
+    assert payload["monthly_per_camera_amount"] is None
+    assert payload["monthly_base_total"] is None
+
+
+def test_unknown_historical_price_is_not_misreported_as_current(monkeypatch):
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], "")
+    payload = billing.entitlement_payload({**BASE, "stripe_price_id": "price_unmapped_older"})
+    assert payload["billing_amount_unknown"] is True
+    assert payload["monthly_per_camera_amount"] is None
 
 
 def test_previous_entries_never_swap_meaning(monkeypatch):
