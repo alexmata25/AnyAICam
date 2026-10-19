@@ -242,6 +242,7 @@ def create_match_event(
     face_bbox: dict | None,
     face_thumbnail_path: str | None,
     now,
+    event_time=None,
 ) -> dict:
     """Writes one detection_events row (event_type='facial_recognition',
     the same generic table every other analytic writes into) plus this
@@ -251,7 +252,9 @@ def create_match_event(
     never independently skewed from the frame it came from."""
     detection_event_id = _new_id("devt")
     event_id = _new_id("fevt")
-    timestamp = now.isoformat() if hasattr(now, "isoformat") else str(now)
+    created_at = now.isoformat() if hasattr(now, "isoformat") else str(now)
+    timestamp_value = event_time if event_time is not None else now
+    timestamp = timestamp_value.isoformat() if hasattr(timestamp_value, "isoformat") else str(timestamp_value)
     db.execute(
         "INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,confidence,object_count,detections_json,event_timestamp,created_at) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -267,7 +270,7 @@ def create_match_event(
             1,
             json.dumps({"match_state": match_state, "matched_person_name": (matched_person or {}).get("display_name")}),
             timestamp,
-            timestamp,
+            created_at,
         ),
     )
     db.execute(
@@ -289,7 +292,7 @@ def create_match_event(
             engine_version,
             json.dumps(face_bbox) if face_bbox else None,
             face_thumbnail_path,
-            timestamp,
+            created_at,
         ),
     )
     return {
@@ -306,7 +309,8 @@ def create_match_event(
         "confidence": round(float(confidence), 4),
         "engine": engine,
         "engine_version": engine_version,
-        "created_at": timestamp,
+        "event_timestamp": timestamp,
+        "created_at": created_at,
     }
 
 
@@ -419,6 +423,7 @@ def record_facial_events(
     appliance_id: str | None,
     person_crop_bgr,
     now,
+    event_time=None,
     relay_provider: "relay_control.RelayProvider | None" = None,
     engine: "facial_recognition.FaceEngine | None" = None,
 ) -> list[dict]:
@@ -537,6 +542,7 @@ def record_facial_events(
             },
             face_thumbnail_path=thumbnail_path,
             now=now,
+            event_time=event_time,
         )
         created.append(event)
         # Face Access -- Door/Relay Control (2026-09-17): everything

@@ -38768,6 +38768,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                     with aac_connect() as aac_db:
                         aac_events_created = facial_events.record_facial_events(
                             aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now,
+                            event_time=event_moment,
                             relay_provider=relay_control.get_provider() if relay_control.FACIAL_ACCESS_CONTROL_ENABLED else None,
                             appliance_id=active_appliance_id(),
                         )
@@ -38776,7 +38777,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                             "id": aac_event["id"],
                             "camera": camera_number,
                             "event_type": "facial_recognition",
-                            "timestamp": now.isoformat(),
+                            "timestamp": event_moment.isoformat(),
                             "confidence": aac_event["confidence"],
                             "object_count": 1,
                             "thumbnail": thumbnail_url,
@@ -39467,6 +39468,7 @@ async def people_counting_worker(camera_number: int) -> None:
                                 site="home",
                                 rule_name=f"People Counting ({rule.get('name', 'counting line')})",
                                 event_type=f"people_counting_{event.direction}",
+                                timestamp=now,
                                 direction=event.direction,
                                 confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
                                 thumbnail=thumbnail_url,
