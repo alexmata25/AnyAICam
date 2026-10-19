@@ -185,7 +185,7 @@ def _person_scan(frame_captured_at=None):
     result = {"detections": [{"x": 10, "y": 10, "width": 40, "height": 40, "class_name": "person", "confidence": 0.9}],
               "frame": np.zeros((120, 160, 3), dtype=np.uint8)}
     if frame_captured_at is not None:
-        result["frame_captured_at"] = frame_captured_at.isoformat()
+        result["frame_captured_at"] = frame_captured_at   # a datetime, as _read_hls_analytics_frame / the shared live frame supply it
     return result
 
 
