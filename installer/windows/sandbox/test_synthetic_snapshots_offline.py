@@ -42,8 +42,8 @@ def check(name, cond, detail=""):
 
 def outcome(snapshot, state):
     try:
-        new_state = capacity_accept._advance(snapshot, public_keys, identity, state, verifier=verifier)
-        return "accepted", new_state
+        new_state, label = capacity_accept._advance(snapshot, public_keys, identity, state, verifier=verifier)
+        return label, new_state   # _advance returns (state record, outcome)
     except capacity_accept.Reject as e:
         return str(e), state
 
