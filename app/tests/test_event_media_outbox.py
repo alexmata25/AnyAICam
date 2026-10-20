@@ -1,8 +1,10 @@
 from datetime import datetime
 import asyncio
+import os
 
 import pytest
 
+import platform_paths
 import event_media_outbox as outbox
 import event_media_uploader as uploader
 import recording_retention_sweep as sweep
@@ -215,7 +217,10 @@ def test_outbox_file_default_is_the_writable_data_config_directory_not_the_read_
     across-repair-installs home is /opt/anyaicam/data/config (see this
     constant's own module-level comment) -- must never silently drift
     back under /var/lib/anyaicam."""
-    assert str(outbox.OUTBOX_FILE).replace("\\", "/") == "/opt/anyaicam/data/config/event_media_outbox.json"
+    # Windows 1.3.2: the same file under the protected %ProgramData%\AnyAiCam\config (platform_paths.native_path).
+    expected = ("/opt/anyaicam/data/config/event_media_outbox.json" if os.name != "nt" else
+                str(platform_paths._windows_program_data() / "AnyAiCam" / "config" / "event_media_outbox.json").replace("\\", "/"))
+    assert str(outbox.OUTBOX_FILE).replace("\\", "/") == expected
     assert not str(outbox.OUTBOX_FILE).replace("\\", "/").startswith("/var/lib/anyaicam")
 
 

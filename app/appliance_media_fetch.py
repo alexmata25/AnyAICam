@@ -38,6 +38,7 @@ import hashlib
 import hmac
 import json
 import os
+import platform_paths
 import time
 from pathlib import Path
 
@@ -52,7 +53,7 @@ TOKEN_TTL_SECONDS = int(os.environ.get("ANYAICAM_MEDIA_FETCH_TOKEN_TTL_SECONDS",
 # (see appliance-agent/anyaicam_agent/config.py), read here only, never
 # written by this module (provisioning is a separate, later concern).
 MEDIA_FETCH_SECRET_FILE = Path(
-    os.environ.get("ANYAICAM_MEDIA_FETCH_SECRET_FILE", "/etc/anyaicam/media_fetch_secret.json")
+    os.environ.get("ANYAICAM_MEDIA_FETCH_SECRET_FILE", platform_paths.native_path("/etc/anyaicam/media_fetch_secret.json", "config", "media_fetch_secret.json"))
 )
 
 # The minimum plausible size for a real video response -- rejects an

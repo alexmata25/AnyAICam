@@ -14,6 +14,7 @@ the caller's own detection/recording pipeline.
 """
 
 import os
+import platform_paths
 import re
 import time
 
@@ -251,7 +252,7 @@ import threading
 
 import numpy as np
 
-LPR_PLATE_MODEL_PATH = os.environ.get("ANYAICAM_LPR_PLATE_MODEL", "/opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt")
+LPR_PLATE_MODEL_PATH = os.environ.get("ANYAICAM_LPR_PLATE_MODEL", platform_paths.native_path("/opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt", "models", "lpr", "license-plate-finetune-v1n.pt"))
 LPR_PLATE_MIN_DETECTOR_CONFIDENCE = float(os.environ.get("ANYAICAM_LPR_PLATE_MIN_DETECTOR_CONFIDENCE", "0.35"))
 LPR_MIN_VEHICLE_WIDTH = max(0, int(os.environ.get("ANYAICAM_LPR_MIN_VEHICLE_WIDTH", "220")))
 LPR_CONFIRM_READS = max(1, int(os.environ.get("ANYAICAM_LPR_CONFIRM_READS", "2")))

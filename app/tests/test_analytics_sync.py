@@ -16,9 +16,11 @@ another's.
 """
 
 import json
+import os
 
 import pytest
 
+import platform_paths
 import analytics_sync as asy
 
 
@@ -1026,7 +1028,10 @@ def test_sync_state_file_default_is_the_writable_data_config_directory_not_the_r
     import importlib
     reloaded = importlib.reload(asy)
     try:
-        assert str(reloaded.SYNC_STATE_FILE).replace("\\", "/") == "/opt/anyaicam/data/config/analytics_sync_state.json"
+        # Windows 1.3.2: the same file under the protected %ProgramData%\AnyAiCam\config (platform_paths.native_path).
+        expected = ("/opt/anyaicam/data/config/analytics_sync_state.json" if os.name != "nt" else
+                    str(platform_paths._windows_program_data() / "AnyAiCam" / "config" / "analytics_sync_state.json").replace("\\", "/"))
+        assert str(reloaded.SYNC_STATE_FILE).replace("\\", "/") == expected
         assert not str(reloaded.SYNC_STATE_FILE).replace("\\", "/").startswith("/var/lib/anyaicam")
         assert str(reloaded.STATE_DIR).replace("\\", "/") == "/var/lib/anyaicam", \
             "STATE_DIR itself must stay pointed at the real, read-only-mounted directory -- " \

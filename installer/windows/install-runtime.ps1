@@ -192,6 +192,14 @@ if (-not $values.Contains('ANYAICAM_CAMERA_CREDENTIAL_KEY')) {
     try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     $values['ANYAICAM_CAMERA_CREDENTIAL_KEY'] = [Convert]::ToBase64String($bytes).Replace('+','-').Replace('/','_')
 }
+# On-device analytics whose code default is off (the Linux installer's 06-deploy-vms.sh defaults, 1.3.2): People
+# Counting and the customer rule analytics (line crossing, intrusion, loitering) still run only for a camera the cloud
+# licensed and a customer configured. Add-if-missing: an explicit true or false is never changed. LPR is not
+# defaulted on Windows (no Tesseract OCR engine is bundled; app/analytics_platform.py reports it unavailable), and
+# facial recognition stays an explicit opt-in, as on Linux.
+foreach ($analyticsFlag in @('PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED')) {
+    if (-not $values.Contains($analyticsFlag)) { $values[$analyticsFlag] = 'true' }
+}
 $values['ANYAICAM_RUNTIME_ROLE'] = 'edge'
 $values['ANYAICAM_ENV'] = 'production'
 $values['ANYAICAM_FORCE_HTTPS'] = 'false'

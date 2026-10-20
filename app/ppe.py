@@ -21,9 +21,13 @@ interrupt recording/live view/relay/People Counting/Smart Motion.
 
 import os
 
+import analytics_platform
+
 from ultralytics import YOLO
 
-PPE_ENABLED = os.environ.get("ANYAICAM_PPE_ENABLED", "true").strip().lower() == "true"
+# 1.3.2: unset means on only when the PPE model is installed (always on the Linux image; never on Windows,
+# which ships no PPE model) -- analytics_platform.ppe_switch_default().
+PPE_ENABLED = analytics_platform.ppe_switch_default()
 
 # Absolute path, deliberately outside /app (2026-09-17, real bug
 # confirmed live on Ryzen): the real appliance's docker-compose.yml
@@ -35,7 +39,7 @@ PPE_ENABLED = os.environ.get("ANYAICAM_PPE_ENABLED", "true").strip().lower() == 
 # time -- see Dockerfile's own comment on this exact path for the full
 # trace. /opt/anyaicam-ppe-model is never bind-mounted over by anything
 # in docker-compose.yml.
-PPE_MODEL_NAME = os.environ.get("ANYAICAM_PPE_MODEL", "/opt/anyaicam-ppe-model/yolov8n-ppe.pt")
+PPE_MODEL_NAME = analytics_platform.PPE_MODEL_PATH  # Windows: %ProgramData%\AnyAiCam\models\ppe (platform_paths.native_path)
 
 # Ultralytics confidence is 0-1 (unlike tesseract's 0-100 in lpr.py) --
 # kept in that native range rather than rescaling, so it reads

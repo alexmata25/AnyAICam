@@ -17,6 +17,14 @@ from database_backend import override_target
 from partner_db import connection, initialize_database
 
 
+@pytest.fixture(autouse=True)
+def _platform_independent_runtime(monkeypatch):
+    # The licensing rules tested here hold on every platform; on a Windows test host analytics_platform would
+    # report LPR/PPE/People Counting unavailable (Windows 1.3.2) -- that gate has its own tests
+    # (test_windows_analytics_paths_132.py).
+    monkeypatch.setattr(acc.analytics_platform, "unavailable_reason", lambda key: None)
+
+
 @pytest.fixture(scope="module")
 def _module_db_path(tmp_path_factory):
     # Without the CI runner's process-wide ANYAICAM_PARTNER_DB (the plain

@@ -208,7 +208,9 @@ def test_ppe_model_is_fetched_and_loaded_from_a_path_the_apps_bind_mount_never_s
         # this test exists to catch from ever recurring.
         assert "-o /app/yolov8n-ppe.pt" not in content
 
-    assert ppe.PPE_MODEL_NAME == model_path
+    # Linux: exactly that path. Windows 1.3.2: the protected %ProgramData%\AnyAiCam\models\ppe (never C:\opt).
+    import platform_paths
+    assert ppe.PPE_MODEL_NAME == platform_paths.native_path(model_path, "models", "ppe", "yolov8n-ppe.pt")
 
     # The real compose file's bind mounts, read directly rather than
     # re-implementing docker's own mount-shadowing semantics: none of

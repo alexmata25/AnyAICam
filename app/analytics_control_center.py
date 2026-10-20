@@ -18,6 +18,7 @@ from typing import Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+import analytics_platform
 from partner_db import connection
 from partner_portal import partner_identity
 from customer_analytics_panel import analytics_license_summary, assign_entitlement, remove_entitlement, LicenseLimitExceeded
@@ -368,7 +369,7 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
         async function body(r){try{return await r.json()}catch(e){return {}}}
         function msg(d,fallback){const t=d&&d.detail;return typeof t==='string'&&t&&!/test lab|grant/i.test(t)?t:fallback}
         function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-        async function load(){if(!sel.value){list.textContent='No cameras are assigned to this account.';return}let r,d;try{r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value));d=await body(r)}catch(e){list.textContent='Analytics could not be loaded. Check your connection and try again.';return}if(!r.ok||!Array.isArray(d.analytics)){list.textContent=msg(d,'Analytics could not be loaded. Try again.');return}list.innerHTML=d.analytics.map(a=>{const q=a.license;const qty=a.assignment_required===false?'Included with Smart Motion':q.purchase_kind==='included'?'Included for eligible cameras':`Purchased ${q.purchased_quantity} / assigned ${q.assigned_quantity} / available ${q.available_quantity}`;const state=a.system_paused?'Temporarily paused by system'+(a.system_pause_reason?': '+esc(a.system_pause_reason):''):a.assigned?(a.customer_enabled?'On':'Off'):'Unassigned';return `<div class="health-row"><span><b>${esc(a.label)}</b><br><span class="health-detail">${qty} · ${state}${a.dependency_ready?'':' · Configure prerequisites'}</span></span><span><button class="ghost-button" type="button" data-assign="${esc(a.key)}" ${a.assignment_required&&a.can_assign?'':'disabled'} ${a.assignment_required?'':'hidden'}>${a.assigned?'Unassign':'Assign'}</button> <button class="ghost-button" type="button" data-key="${esc(a.key)}" ${a.assigned&&(a.customer_enabled||a.can_enable)?'':'disabled'}>${a.customer_enabled?'Turn off':'Turn on'}</button></span></div>`}).join('');list.querySelectorAll('button[data-key]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.key);const next=!a.customer_enabled;if(!next&&!confirm('Turn off '+a.label+' on this camera? Its license assignment stays in place. Recording, live view, and playback continue.'))return;set(a.key,next)});list.querySelectorAll('button[data-assign]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.assign);const next=!a.assigned;if(!next&&!confirm('Release this camera’s '+a.label+' license assignment? Its purchased subscription remains active.'))return;assign(a.key,next)})}
+        async function load(){if(!sel.value){list.textContent='No cameras are assigned to this account.';return}let r,d;try{r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value));d=await body(r)}catch(e){list.textContent='Analytics could not be loaded. Check your connection and try again.';return}if(!r.ok||!Array.isArray(d.analytics)){list.textContent=msg(d,'Analytics could not be loaded. Try again.');return}list.innerHTML=d.analytics.map(a=>{const q=a.license;const qty=a.assignment_required===false?'Included with Smart Motion':q.purchase_kind==='included'?'Included for eligible cameras':`Purchased ${q.purchased_quantity} / assigned ${q.assigned_quantity} / available ${q.available_quantity}`;const state=a.runtime_available===false?'Not available on this computer: '+esc(a.runtime_unavailable_reason):a.system_paused?'Temporarily paused by system'+(a.system_pause_reason?': '+esc(a.system_pause_reason):''):a.assigned?(a.customer_enabled?'On':'Off'):'Unassigned';return `<div class="health-row"><span><b>${esc(a.label)}</b><br><span class="health-detail">${qty} · ${state}${a.dependency_ready?'':' · Configure prerequisites'}</span></span><span><button class="ghost-button" type="button" data-assign="${esc(a.key)}" ${a.assignment_required&&a.can_assign?'':'disabled'} ${a.assignment_required?'':'hidden'}>${a.assigned?'Unassign':'Assign'}</button> <button class="ghost-button" type="button" data-key="${esc(a.key)}" ${a.assigned&&(a.customer_enabled||a.can_enable)?'':'disabled'}>${a.customer_enabled?'Turn off':'Turn on'}</button></span></div>`}).join('');list.querySelectorAll('button[data-key]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.key);const next=!a.customer_enabled;if(!next&&!confirm('Turn off '+a.label+' on this camera? Its license assignment stays in place. Recording, live view, and playback continue.'))return;set(a.key,next)});list.querySelectorAll('button[data-assign]').forEach(b=>b.onclick=()=>{const a=d.analytics.find(item=>item.key===b.dataset.assign);const next=!a.assigned;if(!next&&!confirm('Release this camera’s '+a.label+' license assignment? Its purchased subscription remains active.'))return;assign(a.key,next)})}
         async function set(key,enabled){const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value)+'/'+encodeURIComponent(key),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})}).catch(()=>null);if(!r){note('Could not update analytics. Check your connection and try again.');return}if(!r.ok)note(msg(await body(r),'Could not update analytics.'));await load()}
         async function assign(key,assigned){const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value)+'/'+encodeURIComponent(key)+'/assignment',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned})}).catch(()=>null);if(!r){note('Could not update the license assignment. Check your connection and try again.');return}if(!r.ok)note(msg(await body(r),'Could not update the license assignment.'));await load()}
         document.getElementById('acc-off').onclick=async()=>{if(!confirm('Turn off all your analytics for this camera? License assignments and subscriptions stay in place. Recording, live view, and playback continue.'))return;const r=await fetch('/api/customer/analytics-control/cameras/'+encodeURIComponent(sel.value)+'/turn-all-off',{method:'POST'}).catch(()=>null);if(!r){note('Could not turn analytics off. Check your connection and try again.');return}if(!r.ok)note(msg(await body(r),'Could not turn analytics off.'));await load()};sel.onchange=load;load();</script>'''.replace('__CAMERA_OPTIONS__', options)
@@ -443,14 +444,20 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                 system_pause_reason = state["system_pause_reason"] or (
                     "Purchased quantity is below the current camera assignments; release a seat or restore the license quantity."
                     if license_paused else None)
-                enabled = state["effective_enabled"] and assigned and bool(paid or lab) and rule_ready and parent_ready
-                can_enable = assigned and bool(paid or lab) and rule_ready and parent_ready
+                # Windows 1.3.2: an analytic this computer cannot run is never shown as on, cannot be turned on and
+                # takes no new license seat (analytics_platform; always available on Linux).
+                runtime_reason = analytics_platform.unavailable_reason(key)
+                enabled = (state["effective_enabled"] and assigned and bool(paid or lab) and rule_ready and parent_ready
+                           and runtime_reason is None)
+                can_enable = assigned and bool(paid or lab) and rule_ready and parent_ready and runtime_reason is None
                 can_assign = (False if rule_analytic else assigned or license_counts["purchase_kind"] == "included"
                               or bool(license_counts["available_quantity"]) or bool(lab))
+                can_assign = can_assign and (runtime_reason is None or assigned)
                 data.append({"key": key, "label": spec["label"], "dependency": spec["dependency"], "enabled": enabled,
                              "assigned": assigned, "customer_enabled": state["customer_enabled"],
                              "system_paused": system_paused, "system_pause_reason": system_pause_reason,
-                             "operational_status": "system_paused" if system_paused else "customer_off" if not state["customer_enabled"] else "on" if enabled else "off",
+                             "runtime_available": runtime_reason is None, "runtime_unavailable_reason": runtime_reason,
+                             "operational_status": "unavailable" if runtime_reason else "system_paused" if system_paused else "customer_off" if not state["customer_enabled"] else "on" if enabled else "off",
                              "license": license_counts, "can_assign": can_assign,
                              "assignment_required": not rule_analytic,
                              "license_basis": "smart_motion" if rule_analytic else key,
@@ -472,6 +479,9 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                 raise HTTPException(status_code=404, detail="Customer account not found.")
             camera = camera_access(db, camera_id, who, edit=True)
             if enabled:
+                runtime_reason = analytics_platform.unavailable_reason(analytic_key)
+                if runtime_reason:
+                    raise HTTPException(status_code=409, detail=runtime_reason)
                 rule_analytic = analytic_key in RULE_TYPES
                 license_key = "smart_motion" if rule_analytic else analytic_key
                 row = db.execute("SELECT status FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=?",
@@ -547,6 +557,9 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
             if not lock_customer_camera_capacity(db, camera["customer_id"]):
                 raise HTTPException(status_code=404, detail="Customer account not found.")
             if payload["assigned"]:
+                runtime_reason = analytics_platform.unavailable_reason(analytic_key)
+                if runtime_reason:
+                    raise HTTPException(status_code=409, detail=runtime_reason)
                 existing = db.execute("SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=? AND status='active'",
                                       (camera_id, analytic_key)).fetchone()
                 lab = active_lab_grant(db, camera, analytic_key) if not existing else None
