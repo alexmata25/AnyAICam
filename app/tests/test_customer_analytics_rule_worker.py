@@ -55,6 +55,12 @@ def _seeded_db(db_path):
             db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) VALUES('cam-1','cust-1','site-1','appl-1','Camera 1',1,'configured',?)", (now,))
             db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) VALUES('cam-2','cust-1','site-1','appl-1','Camera 2',2,'configured',?)", (now,))
             db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,created_at) VALUES('cam-other','cust-1','site-1','appl-1','Camera Other',3,'configured',?)", (now,))
+            # Premium analytics default OFF (2026-10-19): the customer has turned Smart Motion and the rule analytics ON
+            # on these cameras (an explicit operational row; licensing itself is covered elsewhere).
+            for cam in ("cam-1", "cam-2", "cam-other"):
+                for key in ("smart_motion", "line_crossing", "intrusion", "loitering"):
+                    db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                               "VALUES(?,?,1,?,'owner')", (cam, key, now))
     with override_target(sqlite_path=str(db_path)):
         yield
 

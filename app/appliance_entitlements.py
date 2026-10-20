@@ -298,7 +298,66 @@ def feature_allowed(feature: str, customer_id: str | None = None) -> bool:
         return False
 
 
+# ---------------------------------------------------------------- premium analytics (2026-10-19)
+# Owner: premium analytics default OFF and run only with a valid entitlement, enforced in the processing pipeline.
+# The cloud signs, per camera, the premium analytics the camera is commercially authorized for
+# ("camera_analytics": {camera_id: [keys]}, feature_entitlements.appliance_snapshot). recording_uploader's camera map
+# ANDs every premium flag with this grant on an edge runtime. Same verification as the paid features above:
+# signature from the provisioned keyset, this appliance's identity, and NOT expired -- offline, premium analytics
+# keep running only until the snapshot's TTL (default 24 h, at most 168 h) and then stop; basic motion, recording,
+# live view and playback never consult this. Missing field (an older cloud), invalid or expired snapshot -> nothing.
+PREMIUM_ANALYTICS = ("smart_motion", "people_counting", "lpr", "ppe", "facial_recognition")
+_GRANT_CACHE_SECONDS = 10.0
+_grant_cache: dict = {"at": None, "mtime": None, "grants": None}
+
+
+def camera_analytic_grants(now: datetime | None = None) -> dict[str, frozenset]:
+    """{camera_id: frozenset(premium keys)} from a currently valid snapshot, else {} (deny all). Never raises.
+    Re-verified at most every _GRANT_CACHE_SECONDS and whenever the cached file changes; expiry is always
+    re-checked against the cached snapshot's expires_at."""
+    import time
+    try:
+        current = now or datetime.now(timezone.utc)
+        try:
+            mtime = STATE_FILE.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        cached = _grant_cache
+        if (now is None and cached["grants"] is not None and cached["mtime"] == mtime
+                and time.monotonic() - cached["at"] < _GRANT_CACHE_SECONDS):
+            expires = cached.get("expires")
+            if expires is not None and expires > current:
+                return cached["grants"]
+        snapshot = _read_state().get("snapshot")
+        reason = verify(snapshot, _trusted_keys(), identity=_local_identity(), now=current)
+        grants: dict[str, frozenset] = {}
+        expires = None
+        if reason:
+            logger.info("appliance_entitlements.analytics_denied reason=%s", reason)
+        else:
+            raw = snapshot.get("camera_analytics")
+            if isinstance(raw, dict):
+                for camera_id, keys in raw.items():
+                    if isinstance(camera_id, str) and camera_id and isinstance(keys, list):
+                        grants[camera_id] = frozenset(k for k in keys if k in PREMIUM_ANALYTICS)
+            expires = _parse_time(snapshot.get("expires_at"))
+        if now is None:
+            _grant_cache.update({"at": time.monotonic(), "mtime": mtime, "grants": grants, "expires": expires})
+        return grants
+    except Exception:
+        logger.exception("appliance_entitlements.analytics_check_failed")
+        return {}
+
+
+def camera_analytic_allowed(camera_id: str | None, analytic_key: str) -> bool:
+    """Whether this appliance holds a valid, unexpired entitlement for one premium analytic on one camera."""
+    if not isinstance(camera_id, str) or analytic_key not in PREMIUM_ANALYTICS:
+        return False
+    return analytic_key in camera_analytic_grants().get(camera_id, frozenset())
+
+
 def clear() -> None:
+    _grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
     try:
         STATE_FILE.unlink()
     except OSError:

@@ -197,6 +197,10 @@ def _license_people_counting(db_path, camera_id="cam-1"):
                        "VALUES('as-pc','cust-1',NULL,'people_counting','active',1,'2026-10-01')")
             db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
                        "VALUES(?,'people_counting','active','2026-10-01','2026-10-01')", (camera_id,))
+            # Premium analytics default OFF (2026-10-19): the customer's own explicit switch (operational ON); the
+            # administrator flag + licence alone no longer start processing.
+            db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                       "VALUES(?,'people_counting',1,'2026-10-01','owner')", (camera_id,))
 
 
 def test_configuration_route_exposes_people_counting_enabled_true(client, seeded_db_path):

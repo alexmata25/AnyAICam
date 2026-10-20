@@ -34,6 +34,10 @@ def db_path(tmp_path):
                 db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,"
                            "geometry_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                            (rid, "c", "s", "a", "yard", rtype, rid, direction, LINE, enabled, NOW, NOW))
+            # Premium analytics default OFF (2026-10-19): the customer has turned Smart Motion and the rule analytics ON.
+            for key in ("smart_motion", "line_crossing", "intrusion", "loitering"):
+                db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                           "VALUES('yard',?,1,?,'owner')", (key, NOW))
         yield path
 
 

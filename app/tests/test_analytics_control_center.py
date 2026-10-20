@@ -40,7 +40,14 @@ def db_path(_module_db_path, monkeypatch):
 
 
 @pytest.fixture()
-def client(db_path):
+def client(db_path, monkeypatch):
+    # Premium analytics default OFF (2026-10-19): this fixture's customer has ALREADY turned on the analytics assigned
+    # to cam-1 (explicit operational rows, as the upgrade migration records them), and the appliance holds a signed
+    # per-camera entitlement for every premium analytic -- licensing/default-OFF itself is covered by
+    # test_premium_analytics_default_off.py; these tests keep their focus on the control center's own rules.
+    import appliance_entitlements
+    monkeypatch.setattr(appliance_entitlements, "camera_analytic_grants",
+                        lambda now=None: {cam: frozenset(appliance_entitlements.PREMIUM_ANALYTICS) for cam in ("cam-1", "cam-2")})
     with override_target(sqlite_path=db_path):
         initialize_database()
         with connection() as db:
@@ -65,6 +72,9 @@ def client(db_path):
             db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) VALUES('cam-1','smart_motion','active','x','x')")
             db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) VALUES('cam-1','lpr','active','x','x')")
             db.execute("INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,created_at) VALUES('sub','c','s','lpr','active','x')")
+            for key in ("smart_motion", "lpr"):
+                db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                           "VALUES('cam-1',?,1,'x','owner@example.test')", (key,))
             db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,geometry_json,enabled,created_at,updated_at) "
                        "VALUES('r','c','s','a','cam-1','line_crossing','Gate','[]',1,'x','x')")
         # Register just these synchronous routes so tests do not import the
@@ -418,8 +428,11 @@ def test_rule_delivery_honors_individual_switches_preserves_exclusion_and_fails_
                      {"id": "r-ex", "camera_id": "cam-1", "rule_type": "exclusion"},
                      {"id": "r-unknown", "camera_id": "cam-1", "rule_type": "future_rule"}]
             camera = [{"id": "cam-1", "smart_motion_enabled": True, "people_counting_enabled": False}]
+            # Premium analytics default OFF (2026-10-19): the customer has turned Line Crossing ON.
+            db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-1','line_crossing',1,'x')")
             assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r", "r-sec", "r-ex"]
-            db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-1','line_crossing',0,'x')")
+            db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-1','line_crossing',0,'x') "
+                       "ON CONFLICT(camera_id,analytic_key) DO UPDATE SET enabled=excluded.enabled")
             # Owner decision 2026-10-16 (Fix 7): Line Crossing OFF also stops the
             # armed security lines; Smart Motion still gates both.
             assert [r["id"] for r in acc.filter_rule_items(db, rules, camera)] == ["r-ex"]
@@ -622,9 +635,14 @@ def test_expired_lab_lease_is_clamped_in_cached_appliance_identity(monkeypatch):
     import recording_uploader
     future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
     past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    cached = {"lpr_enabled": True, "ppe_enabled": True,
+    cached = {"camera_id": "cam-1", "lpr_enabled": True, "ppe_enabled": True,
               "analytics_lab_leases": {"lpr": past, "ppe": future}}
     monkeypatch.setattr(recording_uploader, "_camera_map", {1: cached})
+    # Premium analytics default OFF (2026-10-19): the appliance holds a signed grant for cam-1, so this test isolates
+    # the lease clamp (the signed-entitlement gate is covered by test_premium_analytics_default_off.py).
+    import appliance_entitlements
+    monkeypatch.setattr(appliance_entitlements, "camera_analytic_grants",
+                        lambda now=None: {"cam-1": frozenset(appliance_entitlements.PREMIUM_ANALYTICS)})
     identity = recording_uploader._camera_identity(1)
     assert identity["lpr_enabled"] is False
     assert identity["ppe_enabled"] is True
