@@ -155,13 +155,13 @@ def analytics_license_summary(db, customer_id: str, site_id: str | None, analyti
         included = bool(plan_included_feature_active(db, customer_id, analytic_key))
     if subscription and subscription["site_id"] is not None:
         assigned = db.execute(
-            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id AND c.status!='removed' "
             "WHERE c.customer_id=? AND c.site_id=? AND e.analytic_key=? AND e.status='active'",
             (customer_id, site_id, analytic_key),
         ).fetchone()["n"]
     else:
         assigned = db.execute(
-            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id AND c.status!='removed' "
             "WHERE c.customer_id=? AND e.analytic_key=? AND e.status='active'",
             (customer_id, analytic_key),
         ).fetchone()["n"]
@@ -244,13 +244,13 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str,
 
     if subscription and subscription["site_id"] is None:
         currently_entitled_count = db.execute(
-            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id AND c.status!='removed' "
             "WHERE c.customer_id=? AND e.analytic_key=? AND e.status='active'",
             (customer_id, analytic_key),
         ).fetchone()["n"]
     else:
         currently_entitled_count = db.execute(
-            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id AND c.status!='removed' "
             "WHERE c.site_id=? AND e.analytic_key=? AND e.status='active'",
             (site_id, analytic_key),
         ).fetchone()["n"]
