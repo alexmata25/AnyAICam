@@ -54,7 +54,7 @@ The only secure shape that reuses the approved trust model is an **offline claim
 
    Each would let one licence run unlimited PCs.
 
-**Decision needed from the owner:** keep the one-time online link as the supported rule for 1.3.2 (recommended; it is what is now implemented and worded), and decide whether to schedule the offline claim above for a later release.
+**Owner decision (2026-10-20):** the one-time online account link is APPROVED as the supported activation rule for 1.3.2. The current implementation and customer wording are kept. Offline first activation is **not** in 1.3.2; the offline-claim design above is retained for a future version and needs a fresh review before implementation.
 
 ## Behaviour today (verified in code at `claude/blue-windows-132`)
 

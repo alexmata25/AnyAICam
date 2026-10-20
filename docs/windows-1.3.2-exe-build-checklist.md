@@ -7,7 +7,7 @@ Owner rule (2026-10-19 / 10-20):
 
 ## Gate 0: the source is complete (all must be true before any build)
 
-| # | Gate | Status (2026-10-20 16:00) |
+| # | Gate | Status (2026-10-20 18:00) |
 |---|---|---|
 | 0.1 | Red's shared 168 h analytics commit merged into `claude/blue-windows-132` | **DONE**: ae23d024 arrives through RC8 be366f8b, merge `179e6ae9` |
 | 0.2 | Red's F1 edge-seed fix + shard-1 fixture fix merged | **DONE** (in ae23d024) |
@@ -15,9 +15,11 @@ Owner rule (2026-10-19 / 10-20):
 | 0.4 | `analytics_entitlements.json` resolves under `%ProgramData%\AnyAiCam\config` on Windows; the AST `native_path` guard passes | **DONE** `c5a0d98f` (test) |
 | 0.5 | Focused Windows suites green on the merge tip (section 3) | **DONE (focused)**: 103/1/0, 99/1/0, 36/0 on the Windows host. Full section 3 (agent suite, installer suite with Inno compile) not rerun |
 | 0.6 | Red's full Linux regression of the shared commits complete with only known environment failures | **DONE for be366f8b** (8163/14/352, all 14 closed by Codex). The Windows tree's own Linux shards are not run |
-| 0.6b | Red's rc8-dev test/LF commits (`ee055c05`) | **not merged** (awaiting Red's final). Trial merge clean; adds no CR failure on the Windows tree |
+| 0.6b | Red's rc8-dev test/LF commits (`ee055c05`) | **DONE**: merged at `40dbb2c2` (ee055c05 = Red's verified RC8 acceptance source); no conflicts |
+| 0.6d | Owner decision on Local licensing | **DONE 2026-10-20**: the one-time online account link is the 1.3.2 rule (63978b7f kept); offline first activation deferred to a future version |
 | 0.6c | W-1: Voice Call speech-to-text on Windows | **DONE (Codex re-review)**: the pinned Vosk model (`30f26242…`) is bundled, verified per file, and installed in the protected data root; vendor copy in `installer\windows\vendor\` |
-| 0.7 | Codex independent review of the exact Windows commit: PASS | requested (`CODEX-REVIEW-WINDOWS-1.3.2.md`) |
+| 0.7 | Codex independent review of the exact Windows commit: PASS | **PASS on `b4185193`** (2026-10-20; all three installer blockers closed). The candidate after it adds only the ee055c05 merge (test/attributes) and docs |
+| 0.7b | Full regression of the integrated candidate (Linux 8 shards of the Windows tree + Windows agent/installer/app suites on the host) | **pending a window agreed with Red** (Ryzen 1.2.7 acceptance has priority) |
 | 0.8 | Owner go-ahead for an **unsigned test-candidate** build | owner |
 
 ## Gate 1: resources and lock (checked right before starting)
