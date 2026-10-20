@@ -36,11 +36,13 @@ PRICE_ENV = {
 # Hybrid repricing (owner approval 2026-10-17: $19.99 per camera per month, was $24.99). Stripe Prices are
 # immutable, so ANYAICAM_STRIPE_PRICE_HYBRID names the new $19.99 Price and every NEW checkout uses it (the price
 # guard refuses a Price that does not charge the catalog amount). Subscriptions still on an earlier Hybrid Price
-# stay fully recognized -- same plan, features and commission -- through ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS
-# (comma-separated Price IDs), and are shown at what that Price really bills. Nothing moves them: what existing
-# subscribers pay is an open owner decision. A previous Price is never offered for a new purchase.
+# stay fully recognized -- same plan, features and commission -- through ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS and
+# are shown at what THAT Price bills. Each entry names the Price and its own monthly amount per camera in cents,
+# "price_id:cents" (comma-separated), e.g. "price_1UMz...:2499" -- the amount travels with the ID, so no swap of
+# values can ever show a subscriber another Price's amount (Codex 2026-10-18). An entry without a valid amount is
+# ignored and logged, never guessed. Nothing moves existing subscribers: what they pay is an open owner decision.
+# A previous Price is never offered for a new purchase.
 PREVIOUS_PRICE_ENV = {"hybrid": "ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS"}
-PREVIOUS_MONTHLY_CENTS_PER_CAMERA = {"hybrid": 2499}
 PLANS = {
     "basic_local": {
         "display_name": "Basic Local", "monthly_cents_per_camera": 999,
@@ -123,28 +125,64 @@ def _configured_prices() -> dict[str, dict]:
             if price_id in found:
                 raise ValueError("A Stripe Price ID is configured for more than one per-camera plan.")
             found[price_id] = {**plan, "plan_key": key, "product": "camera_plan_v2", "price_id": price_id}
-    for key, env in PREVIOUS_PRICE_ENV.items():
-        for price_id in previous_price_ids(key):
+    for key in PREVIOUS_PRICE_ENV:
+        for price_id, cents in previous_prices(key).items():
             if price_id in found:
                 raise ValueError("A previous Stripe Price ID is also configured as a current per-camera Price.")
             found[price_id] = {**PLANS[key], "plan_key": key, "product": "camera_plan_v2", "price_id": price_id,
-                               "monthly_cents_per_camera": PREVIOUS_MONTHLY_CENTS_PER_CAMERA[key], "previous_price": True}
+                               "monthly_cents_per_camera": cents, "previous_price": True}
+    return found
+
+
+def previous_prices(plan_key: str) -> dict[str, int]:
+    """Earlier Stripe Prices of a plan that existing subscriptions may still be on (never sold again), each with
+    the monthly amount per camera THAT Price bills, from "price_id:cents" entries. Malformed entries are ignored."""
+    import logging
+    env = PREVIOUS_PRICE_ENV.get(plan_key)
+    found: dict[str, int] = {}
+    conflicted: set[str] = set()
+    for item in (os.environ.get(env, "") if env else "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        price_id, sep, cents = item.partition(":")
+        price_id, cents = price_id.strip(), cents.strip()
+        if not sep or not price_id.startswith("price_") or not cents.isdigit() or not 0 < int(cents) <= 100_000:
+            logging.getLogger("anyaicam.per_camera_billing").warning(
+                "per_camera_billing.previous_price_ignored env=%s reason=expected_price_id_colon_cents", env)
+            continue
+        if price_id in conflicted:
+            continue
+        amount = int(cents)
+        if price_id in found:
+            if found[price_id] != amount:
+                # A duplicated id with conflicting amounts makes historical billing ambiguous. Fail closed for
+                # that Price instead of letting the last environment entry silently choose the displayed amount.
+                found.pop(price_id, None)
+                conflicted.add(price_id)
+                logging.getLogger("anyaicam.per_camera_billing").warning(
+                    "per_camera_billing.previous_price_ignored env=%s reason=conflicting_duplicate_price_id", env)
+            continue
+        found[price_id] = amount
     return found
 
 
 def previous_price_ids(plan_key: str) -> list[str]:
-    """Earlier Stripe Price IDs of a plan that existing subscriptions may still be on (never sold again)."""
-    env = PREVIOUS_PRICE_ENV.get(plan_key)
-    return [item.strip() for item in os.environ.get(env, "").split(",") if item.strip()] if env else []
+    return list(previous_prices(plan_key))
 
 
-def billed_cents_per_camera(entitlement: dict) -> int:
-    """What this subscription is really billed per camera: its earlier Hybrid Price, if it is still on one,
-    otherwise the catalog price."""
+def billed_cents_per_camera(entitlement: dict) -> int | None:
+    """Return the configured amount for this subscription's exact Stripe Price.
+
+    Rows without a Price ID predate exact-price tracking and retain the historical catalog fallback. A row with a
+    Price ID that is unknown or ambiguous must not be represented as the current catalog amount.
+    """
     plan_key = str(entitlement.get("plan_key") or "")
-    if str(entitlement.get("stripe_price_id") or "") in previous_price_ids(plan_key):
-        return PREVIOUS_MONTHLY_CENTS_PER_CAMERA[plan_key]
-    return int(PLANS[plan_key]["monthly_cents_per_camera"])
+    current = int(PLANS[plan_key]["monthly_cents_per_camera"])
+    price_id = str(entitlement.get("stripe_price_id") or "").strip()
+    if not price_id or price_id == price_id_for(plan_key):
+        return current
+    return previous_prices(plan_key).get(price_id)
 
 
 def resolve_price(price_id: str) -> Optional[dict]:
@@ -601,9 +639,11 @@ def entitlement_payload(entitlement: dict | None) -> dict | None:
     return {
         "plan_key": entitlement["plan_key"], "display_name": plan["display_name"],
         "status": entitlement.get("status"), "stripe_status": entitlement.get("stripe_status"),
-        "camera_quantity": quantity, "monthly_per_camera_amount": billed / 100,
-        "monthly_base_total": billed * quantity / 100,
-        "previous_price": billed != int(plan["monthly_cents_per_camera"]),
+        "camera_quantity": quantity,
+        "monthly_per_camera_amount": billed / 100 if billed is not None else None,
+        "monthly_base_total": billed * quantity / 100 if billed is not None else None,
+        "billing_amount_unknown": billed is None,
+        "previous_price": billed is not None and billed != int(plan["monthly_cents_per_camera"]),
         "local_retention_days": int(entitlement.get("local_retention_days") or plan["local_retention_days"]),
         "cloud_event_storage": bool(entitlement.get("cloud_event_storage")),
         "cloud_event_retention_days": entitlement.get("cloud_event_retention_days"),
@@ -1061,9 +1101,13 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         plan_summary = (f"AnyAiCam {legacy['name']} (earlier plan) · {_camera_count(legacy['quantity'], 'camera')}"
                         + (" · paused because of a billing problem" if legacy["status"] == "suspended" else ""))
     if payload:
-        plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
-                        f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
-                        f"${payload['monthly_base_total']:.2f} per month in total")
+        if payload["billing_amount_unknown"]:
+            plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
+                            "billing amount unavailable; contact AnyAiCam support")
+        else:
+            plan_summary = (f"{escape(payload['display_name'])} · {_camera_count(payload['camera_quantity'], 'licensed camera')} · "
+                            f"${payload['monthly_per_camera_amount']:.2f} per camera/month · "
+                            f"${payload['monthly_base_total']:.2f} per month in total")
         retention = f"{payload['local_retention_days']}-day local retention"
         if payload["cloud_event_storage"]:
             # No day count (owner 2026-10-17): the cloud clip expiry is not enforced yet (S3 lifecycle check).
