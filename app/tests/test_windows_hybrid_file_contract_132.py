@@ -72,3 +72,22 @@ def test_windows_feature_entitlement_snapshot_lives_in_the_protected_config_fold
     finally:
         monkeypatch.undo()
         importlib.reload(appliance_entitlements)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Windows layout")
+def test_windows_premium_analytics_grant_lives_in_the_protected_config_folder(monkeypatch):
+    """The 168 h signed analytics grant (ae23d024) is kept next to the feature snapshot, in the SYSTEM/Administrators-
+    only %ProgramData%\\AnyAiCam\\config -- never C:\\opt or a user-writable folder, where an older grant could be put
+    back or the high-water clock guard deleted."""
+    import appliance_entitlements
+    import platform_paths
+    monkeypatch.delenv("ANYAICAM_FEATURE_ENTITLEMENTS_FILE", raising=False)
+    try:
+        reloaded = importlib.reload(appliance_entitlements)
+        config = platform_paths._windows_program_data() / "AnyAiCam" / "config"
+        assert reloaded.ANALYTICS_STATE_FILE == config / "analytics_entitlements.json"
+        assert reloaded.ANALYTICS_STATE_FILE.parent == reloaded.STATE_FILE.parent
+        assert not str(reloaded.ANALYTICS_STATE_FILE).lower().startswith(("c:\\opt", "c:\\var"))
+    finally:
+        monkeypatch.undo()
+        importlib.reload(appliance_entitlements)
