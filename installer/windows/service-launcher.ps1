@@ -27,6 +27,11 @@ $env:ANYAICAM_HLS_FOLDER = Join-Path $dataRoot 'hls'
 $env:ANYAICAM_PARTNER_DB = Join-Path $dataRoot 'database\partner_portal.db'
 $env:ANYAICAM_MEDIAMTX_BINARY = Join-Path $installRoot 'runtime\tools\mediamtx\mediamtx.exe'
 $env:ANYAICAM_MEDIAMTX_CONFIG = Join-Path $dataRoot 'mediamtx\anyaicam-mediamtx.yml'
+# 1.3.2: the cloud agent's state folder (agent-launcher.ps1 sets the same one). The VMS's Hybrid workers (cloud
+# backup, event media, analytics/facial sync, live relay, P2P, talk-down) read the agent's credential.json,
+# live_relay_commands.json and lan_addresses.json from it; left unset they looked in C:\var\lib\anyaicam and every
+# Hybrid feature stayed off. Set after vms.env, so it is never taken from a file.
+$env:ANYAICAM_STATE_DIR = Join-Path $dataRoot 'agent'
 $env:PYTHONUNBUFFERED = '1'
 $env:PATH = (Join-Path $installRoot 'runtime\tools\ffmpeg') + ';' + $env:PATH
 foreach ($folder in @($env:ANYAICAM_RECORDINGS_FOLDER, $env:ANYAICAM_HLS_FOLDER,
