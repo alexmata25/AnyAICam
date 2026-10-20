@@ -31,12 +31,15 @@ Nothing here runs without the owner approvals listed in section 1.
   documents with the synthetic key only.
 - **Cameras (simulated):** in the guest, MediaMTX 1.21.0 plus FFmpeg `testsrc2`/`sine` publish two authenticated RTSP
   streams. A person/vehicle public-domain clip feeds the YOLO cases.
-- **Gaps that must be closed before the discovery cases:**
-  - **G1:** there is no ONVIF WS-Discovery responder in the repo. Write and review a small in-guest responder (Probe →
-    ProbeMatches with an EndpointReference UUID and scopes, plus GetProfiles/GetStreamUri), or the owner approves one
-    real camera.
-  - **G2:** the off-subnet manual-add case (CAM-5) needs a second private switch and a guest-side route, or a second
-    guest acting as a router.
+- **Discovery gaps** (status 2026-10-20; environment choice in `docs/windows-1.3.2-acceptance-environment.md`):
+  - **G1 CLOSED (tooling):** `installer/windows/sandbox/onvif-camera-sim.py` (stdlib; never packaged) answers WS-Discovery
+    (unicast, plus multicast with `--multicast`) and GetCapabilities / GetDeviceInformation / GetProfiles / GetStreamUri,
+    with optional WS-Security digest authentication. `installer/tests/test_onvif_camera_sim_132.py` drives the agent's
+    real discovery and media resolution against it (7 tests). Pair it with MediaMTX + FFmpeg `testsrc2` for the RTSP stream.
+  - **G2a (default, Sandbox):** add a second address in another subnet to the disposable guest's adapter
+    (`New-NetIPAddress 10.20.30.40/24`) and bind the simulator and the test stream to it. This proves the no-ARP-entry
+    add-by-IP path (`ip-` key), the unicast probe and verification at the stored address.
+  - **G2b (only if a real router is required):** two Private Hyper-V switches plus a router guest. This needs VM creation (owner).
 - **Checkpoints:** `00-clean`, `01-with-1.3.0`, `02-with-1.3.1`. Every run starts from one of them.
 - **Clock:** offline-licensing cases move the guest clock (`Set-Date`, guest only, with time sync disabled in the
   guest). The host clock is never changed.

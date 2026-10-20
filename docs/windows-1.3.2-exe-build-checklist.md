@@ -19,8 +19,8 @@ Owner rule (2026-10-19 / 10-20):
 | 0.6d | Owner decision on Local licensing | **DONE 2026-10-20**: the one-time online account link is the 1.3.2 rule (63978b7f kept); offline first activation deferred to a future version |
 | 0.6c | W-1: Voice Call speech-to-text on Windows | **DONE (Codex re-review)**: the pinned Vosk model (`30f26242…`) is bundled, verified per file, and installed in the protected data root; vendor copy in `installer\windows\vendor\` |
 | 0.7 | Codex independent review of the exact Windows commit: PASS | **PASS on `b4185193`** (2026-10-20; all three installer blockers closed). The candidate after it adds only the ee055c05 merge (test/attributes) and docs |
-| 0.7b | Full regression of the integrated candidate (Linux 8 shards of the Windows tree + Windows agent/installer/app suites on the host) | **pending a window agreed with Red** (Ryzen 1.2.7 acceptance has priority) |
-| 0.8 | Owner go-ahead for an **unsigned test-candidate** build | owner |
+| 0.7b | Full regression of the integrated candidate (Linux 8 shards of the Windows tree + Windows agent/installer/app suites on the host) | **PASS on `3afb6c35`** (2026-10-20, window granted by Red). 8 shards: **8205 passed / 10 failed / 359 skipped**, 8/8 done, 0 watchdog stops (be366f8b baseline 8163/14/352). All 10 failures are closed by a targeted follow-up on the same commit: PG16 1/1 (two disposable databases, including the new `appliances.platform` column), Node 20 JS 4/4, and the HTTP-429 limiter test-order cases pass in isolation (reconnect 25/0, portal compat 12/0, each node ID individually). Host: Windows installer 217/1/0, agent 937/59/1 (known host-only). Evidence: `anyaicam-blue\regression-3afb6c35\` |
+| 0.8 | Owner go-ahead for the **two unsigned test-candidate** builds (production keyset; synthetic keyset DO-NOT-SHIP) | owner. Note: neither can be executed on the Dell (SAC); executing needs a signed build in Sandbox or a SAC-off machine (`docs/windows-1.3.2-acceptance-environment.md`) |
 
 ## Gate 1: resources and lock (checked right before starting)
 
