@@ -48,6 +48,22 @@ expired, future-dated and replayed files are refused with their exact codes (the
 `acceptance-127.ps1` synthetic runs); a standard user cannot write the import folder; a later cloud snapshot supersedes
 the file.
 
+## Premium analytics offline (interaction with the shared premium-default-OFF work, 2026-10-19)
+
+Red's in-progress shared implementation (`claude/red-127-analytics-default-off`, not yet committed) runs a premium
+analytic on an edge only with a valid, **unexpired** per-camera grant in the signed feature-entitlement snapshot. That
+snapshot's TTL is 24 h by default (at most 168 h). So on a Windows PC:
+
+- **never linked** (Local, offline): no snapshot, so no premium analytics. Basic motion, recording, live view and
+  playback are unaffected. This matches the owner rule.
+- **linked, then offline longer than the TTL:** premium analytics stop. Cameras keep recording at the last signed
+  capacity, which is not re-checked for expiry. Codex/owner: is that the intended "authorized offline use" for premium
+  analytics? An offline licence file (option B above) could carry a per-camera analytics grant with a longer, explicit
+  expiry, verified by the same keyset.
+- **On Windows the snapshot is in a protected folder** (`%ProgramData%\AnyAiCam\config\feature_entitlements.json`,
+  SYSTEM/Administrators only, Blue `e1e79e5b`). Before, it was `C:\opt\...`, where a standard user could delete it
+  (premium analytics off) or put back an older, still-valid snapshot.
+
 Related: Red's permanent-Local design (`anyaicam-red\licensing-permanent-local-20261018\DESIGN.md`, D-1..D-6) covers what
 a linked PC keeps after a subscription ends; this proposal covers a PC that is never linked. Both need Codex review
 and owner decisions before any enforcement code changes.
