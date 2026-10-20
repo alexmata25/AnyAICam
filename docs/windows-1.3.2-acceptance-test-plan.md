@@ -57,7 +57,7 @@ Result columns are filled in at run time: PASS / FAIL / BLOCKED, plus an evidenc
 | INS-6 | Firewall | exactly two inbound rules (web 8000 TCP, WebRTC UDP), program-scoped; nothing for discovery | VS |
 | INS-7 | Runtime catalog | registered (relevant only to a signed build) | VS |
 | INS-8 | Repair reinstall, including a damaged vms.env | exit 0; secrets byte-identical (`ANYAICAM_APP_SECRETS`, camera key); permissions restored; still linked | VS |
-| INS-9 | Downgrade guard | installing 1.3.1 over 1.3.2 is refused and nothing changes | AC (d0d59019) |
+| INS-9 | Downgrade guard (`install-version-guard.ps1`, fail closed) | refused, with nothing changed: installed 9.9.9 or 1.3.2.1 over setup 1.3.2; an installed DisplayVersion that is malformed (`1.3.2-rc1`) or empty. Allowed: same-version repair; upgrade from 1.3.0 / 1.3.1 | AC (9.9.9, malformed, empty, repair) + host tests execute the real guard (30 cases) |
 | INS-10 | Uninstall | services and catalog removed; data and the cloud link kept | VS |
 | INS-11 | Reinstall after uninstall | data, cameras and link come back | manual |
 

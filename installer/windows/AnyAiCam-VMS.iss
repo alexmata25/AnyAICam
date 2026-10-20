@@ -60,6 +60,8 @@ Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignorever
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+; Run from {tmp} by InitializeSetup before anything is installed (downgrade / unknown-version guard).
+Source: "install-version-guard.ps1"; Flags: dontcopy
 Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
@@ -133,64 +135,64 @@ begin
   Result := FileExists(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'));
 end;
 
-// Downgrade prevention (Red 2026-10-18, owner/Codex): this setup never replaces a NEWER installed AnyAiCam VMS.
-// The installed version is the DisplayVersion of this AppId's uninstall entry (every AnyAiCam Windows setup,
-// past and future, uses the same AppId). Same version (repair) and older versions (upgrade) are unaffected.
-// A silent install is refused with Setup's initialization failure exit code; the refusal is logged.
+// Downgrade and unknown-version protection (Red 2026-10-18; made fail-closed after Codex's FAIL on ef93b503).
+// install-version-guard.ps1 decides from this AppId's uninstall entry (both registry views), the data folder's vms.env
+// (ANYAICAM_VERSION, which survives an uninstall) and the install folder. Setup continues ONLY when the guard exits 0
+// AND printed its own "install-version-guard: exit 0:" line (a script that fails to parse can exit 0 silently): a
+// clean install, a same-version repair or an upgrade from an older version. A newer recorded version, a missing or
+// malformed installed version, a malformed setup version, a PowerShell that cannot start, or any other result stops
+// the setup before anything is changed. A silent install ends with Setup's initialization failure exit code; the
+// guard's own explanation is in the setup log. There is no override.
 const
-  AnyAiCamUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1';
-
-function NextVersionPart(var S: String): Integer;
-var
-  P: Integer;
-  Part: String;
-begin
-  P := Pos('.', S);
-  if P = 0 then begin Part := S; S := ''; end
-  else begin Part := Copy(S, 1, P - 1); S := Copy(S, P + 1, Length(S)); end;
-  Result := StrToIntDef(Part, -1);
-end;
-
-// 1 when A is newer than B, -1 when older, 0 when equal; -2 when either is not a plain x.y.z.
-function CompareAnyAiCamVersions(A, B: String): Integer;
-var
-  I, X, Y: Integer;
-begin
-  Result := 0;
-  for I := 1 to 3 do begin
-    X := NextVersionPart(A);
-    Y := NextVersionPart(B);
-    if (X < 0) or (Y < 0) then begin Result := -2; exit; end;
-    if X > Y then begin Result := 1; exit; end;
-    if X < Y then begin Result := -1; exit; end;
-  end;
-  if (A <> '') or (B <> '') then Result := -2;
-end;
-
-function InstalledAnyAiCamVersion(): String;
-begin
-  Result := '';
-  if not RegQueryStringValue(HKLM64, AnyAiCamUninstallKey, 'DisplayVersion', Result) then
-    if not RegQueryStringValue(HKLM32, AnyAiCamUninstallKey, 'DisplayVersion', Result) then
-      Result := '';
-end;
+  VersionGuardDowngrade = 10;
+  VersionGuardUnknownInstalled = 11;
 
 function InitializeSetup(): Boolean;
 var
-  Installed: String;
+  ResultCode, I: Integer;
+  Output: TExecOutput;
+  Allowed: Boolean;
+  Message: String;
 begin
-  Result := True;
-  Installed := InstalledAnyAiCamVersion();
-  if Installed = '' then exit;
-  if CompareAnyAiCamVersions(Installed, '{#AppVersion}') = 1 then begin
-    Log('Downgrade refused: AnyAiCam VMS ' + Installed + ' is installed; this setup is {#AppVersion}.');
-    if not WizardSilent() then
-      MsgBox('AnyAiCam VMS ' + Installed + ' is already installed on this computer. This setup is the older ' +
-        'version {#AppVersion} and cannot replace it. Download the current AnyAiCam setup from your AnyAiCam account.',
-        mbError, MB_OK);
-    Result := False;
-  end else
-    Log('Installed AnyAiCam VMS: ' + Installed + '; this setup: {#AppVersion}.');
+  Result := False;
+  ResultCode := -1;
+  Allowed := False;
+  ExtractTemporaryFile('install-version-guard.ps1');
+  if not ExecAndCaptureOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\install-version-guard.ps1') +
+      '" -SetupVersion "{#AppVersion}" -DefaultAppDir "' + ExpandConstant('{autopf}\AnyAiCam') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode, Output) then
+    ResultCode := -1;
+  for I := 0 to GetArrayLength(Output.StdOut) - 1 do begin
+    Log(Output.StdOut[I]);
+    if Pos('install-version-guard: exit 0: ', Output.StdOut[I]) = 1 then Allowed := True;
+  end;
+  for I := 0 to GetArrayLength(Output.StdErr) - 1 do
+    Log(Output.StdErr[I]);
+  if (ResultCode = 0) and Allowed then begin
+    Result := True;
+    exit;
+  end;
+  if ResultCode = 0 then ResultCode := -1;
+  case ResultCode of
+    VersionGuardDowngrade: begin
+      Log('Downgrade refused: a newer AnyAiCam VMS is installed; this setup is {#AppVersion}.');
+      Message := 'A newer AnyAiCam VMS is already installed on this computer. This setup is version {#AppVersion} ' +
+        'and cannot replace it. Download the current AnyAiCam setup from your AnyAiCam account.';
+    end;
+    VersionGuardUnknownInstalled: begin
+      Log('Install refused: the installed AnyAiCam VMS version is missing or not valid; this setup is {#AppVersion}.');
+      Message := 'AnyAiCam VMS is already installed on this computer, but its version cannot be determined. ' +
+        'Setup has stopped without changing anything, so that a newer version is not replaced. ' +
+        'Contact AnyAiCam support.';
+    end;
+  else
+    Log('Install refused: the AnyAiCam version check did not pass (result ' + IntToStr(ResultCode) + ').');
+    Message := 'Setup could not confirm that it is safe to install AnyAiCam VMS {#AppVersion} on this computer ' +
+      'and has stopped without changing anything. Contact AnyAiCam support.';
+  end;
+  if not WizardSilent() then
+    MsgBox(Message, mbError, MB_OK);
 end;
 
 procedure InitializeWizard;

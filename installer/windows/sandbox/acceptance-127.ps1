@@ -186,10 +186,24 @@ Check '1.2.7 downgrade: Setup refuses to replace a newer installed version (9.9.
     $log = Join-Path $results 'setup-downgrade-refused.log'
     $p = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + $log + '"') -Wait -PassThru
     if ($p.ExitCode -eq 0) { throw 'setup ran over a newer version' }
-    if (-not (Select-String -LiteralPath $log -SimpleMatch 'Downgrade refused: AnyAiCam VMS 9.9.9 is installed' -Quiet)) { throw 'no refusal in the setup log' }
+    if (-not (Select-String -LiteralPath $log -SimpleMatch 'Downgrade refused: a newer AnyAiCam VMS is installed' -Quiet)) { throw 'no refusal in the setup log' }
+    if (-not (Select-String -LiteralPath $log -Pattern 'install-version-guard: exit 10: .*9\.9\.9' -Quiet)) { throw 'the guard did not name the installed 9.9.9' }
     if ((Get-FileHash (Join-Path $data 'config\vms.env')).Hash -ne $before.Hash) { throw 'vms.env changed' }
     if (-not (WaitHealthy 60)) { throw 'VMS not healthy after the refused setup' }
     "exit $($p.ExitCode); refusal logged; vms.env unchanged; VMS still healthy"
+}
+foreach ($bad in @('1.3.2-rc1', '')) {                                                   # Codex FAIL ef93b503: fail closed
+    Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $bad
+    Check "1.3.2 downgrade: Setup refuses when the installed version is malformed or empty ('$bad') and changes nothing" {
+        $before = Get-FileHash (Join-Path $data 'config\vms.env')
+        $log = Join-Path $results ('setup-unknown-version-refused-' + ($bad -replace '[^0-9A-Za-z]', '_') + '.log')
+        $p = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + $log + '"') -Wait -PassThru
+        if ($p.ExitCode -eq 0) { throw 'setup ran over an installation of unknown version' }
+        if (-not (Select-String -LiteralPath $log -SimpleMatch 'install-version-guard: exit 11:' -Quiet)) { throw 'no unknown-version refusal in the setup log' }
+        if ((Get-FileHash (Join-Path $data 'config\vms.env')).Hash -ne $before.Hash) { throw 'vms.env changed' }
+        if (-not (WaitHealthy 60)) { throw 'VMS not healthy after the refused setup' }
+        "exit $($p.ExitCode); refusal logged; vms.env unchanged; VMS still healthy"
+    }
 }
 Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $realVersion  # restore
 Check '1.2.7 downgrade: with the real version restored, a repair of the same version still runs (exit 0)' {
