@@ -9,3 +9,12 @@
 # Dockerfile.production predates the LF policy and is stored with CRLF; tell
 # diff checks that its CR is a line terminator rather than trailing content.
 Dockerfile.production whitespace=cr-at-eol
+
+# Non-.sh Linux entry points and configuration consumed by the installer,
+# systemd, or Docker must also stay LF-only on Windows checkouts.
+installer/runtime/anyaicam-webrtc-firewall text eol=lf
+installer/runtime/*.service text eol=lf
+appliance-agent/system/*.service text eol=lf
+appliance-agent/system/*.path text eol=lf
+appliance-agent/systemd/*.service text eol=lf
+docker-compose.yml text eol=lf

@@ -24,6 +24,7 @@ Two independent checks:
      that config value rather than merely being present on the command
      line.
 """
+import io
 import os
 import subprocess
 import sys
@@ -112,6 +113,63 @@ class RunGitAutocrlfOverrideTests(unittest.TestCase):
 
 
 class PackagedShellLineEndingGuardTests(unittest.TestCase):
+    def test_linux_runtime_entrypoints_and_service_configs_are_lf_only(self):
+        root = Path(__file__).resolve().parents[2]
+        paths = (
+            "installer/runtime/anyaicam-webrtc-firewall",
+            "installer/runtime/anyaicam-webrtc-firewall.service",
+            "installer/runtime/anyaicam-vms.service",
+            "appliance-agent/system/anyaicam-capacity-accept.service",
+            "appliance-agent/system/anyaicam-privileged-watcher.service",
+            "appliance-agent/system/anyaicam-capacity-accept.path",
+            "appliance-agent/system/anyaicam-privileged-watcher.path",
+            "appliance-agent/systemd/anyaicam-agent.service",
+            "docker-compose.yml",
+        )
+        # The installer runners test a `git archive` tree with no .git; the
+        # bytes are still checked there, the attribute only in a checkout.
+        in_checkout = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True).returncode == 0
+        for relative in paths:
+            with self.subTest(path=relative):
+                if in_checkout:
+                    result = subprocess.run(
+                        ["git", "check-attr", "eol", "--", relative],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertTrue(result.stdout.rstrip().endswith(": eol: lf"), result.stdout)
+                self.assertNotIn(b"\r", (root / relative).read_bytes())
+
+    def test_release_archives_built_from_head_carry_no_cr_in_linux_text_files(self):
+        # The builder exports from committed blobs via run_git() `git archive`,
+        # not from the working tree, so check those exact exports at HEAD.
+        root = Path(__file__).resolve().parents[2]
+        if subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True).returncode != 0:
+            self.skipTest("not a git checkout")
+        names = set(run_git(root, "ls-tree", "-r", "--name-only", "HEAD").decode().splitlines())
+        dirs = {name.split("/", 1)[0] for name in names if "/" in name}
+        exports = {
+            "installer": tuple(f"installer/{p}" for p in INSTALLER_RUNTIME_FILES) + ("installer/runtime",),
+            "agent": AGENT_RELEASE_PATHS,
+            "vms": REQUIRED_RELEASE_PATHS + tuple(p for p in OPTIONAL_RELEASE_PATHS if p in dirs or p in names),
+        }
+        # Stored with CRLF before the LF policy (see .gitattributes); Docker accepts it.
+        allowed = {"Dockerfile.production"}
+        for label, paths in exports.items():
+            with self.subTest(export=label):
+                archive = run_git(root, "archive", "--format=tar", "HEAD", "--", *paths)
+                with tarfile.open(fileobj=io.BytesIO(archive)) as tf:
+                    offenders = [
+                        member.name
+                        for member in tf.getmembers()
+                        if member.isfile() and member.name not in allowed
+                        for data in (tf.extractfile(member).read(),)
+                        if b"\r" in data and b"\0" not in data[:8000]
+                    ]
+                self.assertEqual(offenders, [], f"CR bytes in the {label} release export")
+
     def test_repository_attributes_force_lf_for_all_shell_scripts(self):
         repo_root = Path(__file__).resolve().parents[2]
         attributes = (repo_root / ".gitattributes").read_text(encoding="utf-8")
