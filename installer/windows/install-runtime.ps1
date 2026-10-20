@@ -177,7 +177,7 @@ $legacyCapacity = Join-Path $env:SystemDrive 'opt\anyaicam\data\config\vms_capac
 if (Test-Path -LiteralPath $legacyCapacity) {
     Write-Output 'Camera capacity: the earlier release''s unsigned capacity is not carried over; cameras start after the cloud''s first signed capacity (usually within minutes of linking).'
 } else {
-    Write-Output 'Camera capacity: cameras start after the cloud''s first signed capacity.'
+    Write-Output 'Camera capacity: cameras start after the cloud''s first signed capacity, which this computer receives once it is linked to an AnyAiCam account (needed once, online). After that, Local cameras keep working without internet.'
 }
 $values = [ordered]@{}
 $hadEnvironmentFile = Test-Path -LiteralPath $environmentFile

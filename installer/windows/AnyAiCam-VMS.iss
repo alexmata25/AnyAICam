@@ -203,10 +203,17 @@ end;
 
 procedure InitializeWizard;
 begin
+  // Supported first-time activation (1.3.2, Codex FAIL on ef93b503): cameras run only after this PC is linked to an
+  // AnyAiCam account ONCE, online (the cloud's first signed camera capacity). After that the accepted capacity has no
+  // expiry, so Local cameras, recording and live view keep working without internet. Never claim fully offline
+  // (air-gapped) activation: there is no approved offline licence yet (docs/windows-1.3.2-local-licensing-proposal.md).
   ProductModePage := CreateInputOptionPage(wpSelectDir, 'How will you use AnyAiCam?',
     'You can change this later from your AnyAiCam account.',
-    'Choose the mode for this computer, then click Next.', True, False);
-  ProductModePage.Add('Local: cameras, recording and live view stay on this computer');
+    'Choose the mode for this computer, then click Next.' + #13#10#13#10 +
+    'Both modes need this computer linked to your AnyAiCam account once, with an internet connection, before your ' +
+    'cameras start. After that, Local mode keeps recording and live view working on this computer without internet.',
+    True, False);
+  ProductModePage.Add('Local: cameras, recording and live view stay on this computer (link once online to activate)');
   ProductModePage.Add('Hybrid: adds Cloud Video Backup and remote features (needs an AnyAiCam plan)');
   ProductModePage.SelectedValueIndex := 0;
 end;
@@ -407,11 +414,14 @@ begin
       'This computer is linked to your AnyAiCam account.'
   else if HasClaimLink then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-      'To see this computer''s cameras from anywhere, keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
+      'Your cameras start once this computer is linked to your AnyAiCam account (needed once, with an internet ' +
+      'connection). Keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
       'Your browser opens AnyAiCam: sign in (or create an account), choose a site and confirm. There is no code to type.' + #13#10#13#10 +
+      'After this first link, Local mode keeps recording without internet. ' +
       'Later: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).'
   else
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-      'To see this computer''s cameras from anywhere, link it to your AnyAiCam account when this PC is online: ' +
-      'Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).';
+      'Your cameras start once this computer is linked to your AnyAiCam account (needed once, with an internet ' +
+      'connection). When this PC is online: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an ' +
+      'administrator of this PC). After this first link, Local mode keeps recording without internet.';
 end;

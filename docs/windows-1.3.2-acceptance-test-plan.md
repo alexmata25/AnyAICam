@@ -75,7 +75,7 @@ Result columns are filled in at run time: PASS / FAIL / BLOCKED, plus an evidenc
 
 | ID | Case | Expected | Automation |
 |---|---|---|---|
-| MOD-1 | Local, never linked | VMS runs; **0 cameras** licensed; the UI explains why | AC |
+| MOD-1 | Local, never linked (supported first-activation rule) | VMS runs with **0 cameras** licensed. The mode page and finish page say cameras start after a one-time online link, and that Local works offline after it. Link once, disconnect the network: cameras keep recording; live view works; premium analytics stop after 168 h | AC + manual; wording host tests |
 | MOD-2 | Hybrid link | an admin link request gives a one-time link; owner confirms; agent saves the credential; the VMS reads it from `%ProgramData%\AnyAiCam\agent` (STATE_DIR fix 2161758c); heartbeat shows platform `windows` | VS |
 | MOD-3 | Hybrid features use the credential | cloud backup upload, event media, live relay and P2P run against the test cloud (none fall back to `C:\var\lib`) | manual with test cloud |
 | MOD-4 | Switch Local → Hybrid → Local | the product-mode page and installer switch keep data; licences follow the signed snapshot | AC + manual |
