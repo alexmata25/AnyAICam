@@ -50,7 +50,7 @@ PLANS = {
         "cloud_event_retention_days": None, "mode": "local", "commission_percent": 0,
         "resolution_classes": ["standard", "high_resolution"],
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
-                     "standard_camera_management", "remote_viewing_where_supported", "remote_phone_support"],
+                     "standard_camera_management", "remote_viewing_where_supported"],
     },
     "ai_local": {
         "display_name": "AI Local", "monthly_cents_per_camera": 1499,
@@ -60,7 +60,7 @@ PLANS = {
         "features": ["local_vms", "local_recording", "local_playback", "basic_motion_events",
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
-                     "core_aaco_retrieval", "supported_talk_down", "remote_phone_support"],
+                     "core_aaco_retrieval", "supported_talk_down"],
     },
     "hybrid": {
         "display_name": "Hybrid", "monthly_cents_per_camera": 1999,
@@ -71,10 +71,9 @@ PLANS = {
                      "standard_camera_management", "remote_viewing_where_supported", "person_vehicle_detection",
                      "smart_motion", "ai_event_search_filtering", "intelligent_notifications",
                      "core_aaco_retrieval", "supported_talk_down", "hybrid_cloud_services",
-                     "remote_cloud_services", "cloud_event_protection", "remote_phone_support"],
+                     "remote_cloud_services", "cloud_event_protection"],
     },
 }
-REMOTE_PHONE_SUPPORT = "Free remote technical support by phone, Monday through Sunday, during business hours"
 FEATURE_LABELS = {
     "local_vms": "Local VMS", "local_recording": "Local recording", "local_playback": "Local playback",
     "basic_motion_events": "Basic motion and events", "standard_camera_management": "Camera management",
@@ -83,8 +82,6 @@ FEATURE_LABELS = {
     "intelligent_notifications": "Intelligent notifications", "core_aaco_retrieval": "Core AACO video and event retrieval",
     "supported_talk_down": "Talk Down / two-way audio on supported cameras", "hybrid_cloud_services": "Hybrid cloud services",
     "remote_cloud_services": "Cloud Video Backup: an extra copy of your event video clips, stored online", "cloud_event_protection": "Cloud event protection",
-    # Owner approval 2026-10-17: included with every plan (Basic Local, AI Local and Hybrid).
-    "remote_phone_support": REMOTE_PHONE_SUPPORT,
 }
 
 

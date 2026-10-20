@@ -19,8 +19,9 @@ for page in ("vms.html", "vms-linux.html"):
         problems.append(f"{page}: release markers are not in the published state")
     if "about 900 MB" in html:
         problems.append(f"{page}: size is an estimate, not the verified byte count")
-# Pricing (owner approvals 2026-10-17): Hybrid $19.99 per camera/month; licenses $24.99/$37.49/$62.49/$99.99;
-# free phone support on all three plans (build_127_pricing.py). An old price or missing support line blocks publication.
+# Pricing (owner approvals 2026-10-17): Hybrid $19.99 per camera/month; licenses $24.99/$37.49/$62.49/$99.99.
+# Owner 2026-10-20: NO phone-support promise anywhere (build_127_pricing.remove_phone_support). An old price or any
+# remaining phone-support wording blocks publication.
 import build_127_pricing as pricing
 _pages = {name: (HERE / "prepared" / "public_html" / name).read_text(encoding="utf-8") for name in pricing.PAGES}
 for name, html in _pages.items():
@@ -28,9 +29,10 @@ for name, html in _pages.items():
                 "$49.99", "$79.99", "$129.99", "$199.99", "49.99]", "79.99]", "129.99]", "199.99]"):
         if old in html:
             problems.append(f"{name}: still shows an old price ({old})")
-for name, expected in (("plans.html", 3), ("build-your-system.html", 3), ("index.html", 4)):
-    if _pages[name].count(pricing.SUPPORT) != expected:
-        problems.append(f"{name}: free phone support shown {_pages[name].count(pricing.SUPPORT)} times, expected {expected}")
+for name, html in _pages.items():
+    for phrase in (pricing.SUPPORT, "Free phone support", "support by phone"):
+        if phrase in html:
+            problems.append(f"{name}: still shows a phone-support promise ({phrase[:30]})")
 # Plan comparison wording (owner request 2026-10-17): remote viewing on all three plans, Cloud Video Backup on Hybrid only.
 for name, html in _pages.items():
     for jargon in ("Remote viewing where supported", "remote viewing where supported", "Remote cloud services"):
