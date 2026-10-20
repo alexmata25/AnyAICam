@@ -126,16 +126,20 @@ class PackagedShellLineEndingGuardTests(unittest.TestCase):
             "appliance-agent/systemd/anyaicam-agent.service",
             "docker-compose.yml",
         )
+        # The installer runners test a `git archive` tree with no .git; the
+        # bytes are still checked there, the attribute only in a checkout.
+        in_checkout = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True).returncode == 0
         for relative in paths:
             with self.subTest(path=relative):
-                result = subprocess.run(
-                    ["git", "check-attr", "eol", "--", relative],
-                    cwd=root,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertTrue(result.stdout.rstrip().endswith(": eol: lf"), result.stdout)
+                if in_checkout:
+                    result = subprocess.run(
+                        ["git", "check-attr", "eol", "--", relative],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertTrue(result.stdout.rstrip().endswith(": eol: lf"), result.stdout)
                 self.assertNotIn(b"\r", (root / relative).read_bytes())
 
     def test_release_archives_built_from_head_carry_no_cr_in_linux_text_files(self):
