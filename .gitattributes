@@ -15,5 +15,6 @@ Dockerfile.production whitespace=cr-at-eol
 installer/runtime/anyaicam-webrtc-firewall text eol=lf
 installer/runtime/*.service text eol=lf
 appliance-agent/system/*.service text eol=lf
+appliance-agent/system/*.path text eol=lf
 appliance-agent/systemd/*.service text eol=lf
 docker-compose.yml text eol=lf
