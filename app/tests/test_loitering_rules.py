@@ -353,6 +353,10 @@ def _seed_cloud(db, *, customer_id="cust-1", appliance_id="appl-1", camera_id="c
                "VALUES(?,?,?,?,?,?,?)", (f"sm-sub-{camera_id}", customer_id, f"site-{customer_id}", "smart_motion", "active", 1, now))
     db.execute("INSERT OR IGNORE INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
                "VALUES(?,?,?,?,?)", (camera_id, "smart_motion", "active", now, now))
+    # Premium analytics default OFF (2026-10-19): the customer has turned Smart Motion, Loitering and Intrusion ON.
+    for key in ("smart_motion", "loitering", "intrusion"):
+        db.execute("INSERT OR IGNORE INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                   "VALUES(?,?,1,?,'owner')", (camera_id, key, now))
     db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,account_status,created_at) "
                "VALUES(?,?,?,?,?,?,?,?,?,?)", (f"owner-{customer_id}", "partner-1", f"owner-{customer_id}@example.test", "Owner",
                                                "customer_owner", password_hash("x"), 1, customer_id, "active", now))
@@ -446,6 +450,10 @@ def edge_db(tmp_path):
             # an actually authorized runtime camera.
             db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,smart_motion_enabled,created_at) "
                        "VALUES('cam-1','cust-1','site-cust-1','appl-1','Front Door',1,'configured',1,?)", (now,))
+            # Premium analytics default OFF (2026-10-19): the customer has turned Smart Motion and Loitering ON.
+            for key in ("smart_motion", "loitering"):
+                db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                           "VALUES('cam-1',?,1,?,'owner')", (key, now))
             _seed_cloud_rule(db, dwell=45, notifications=0)
         yield path
 

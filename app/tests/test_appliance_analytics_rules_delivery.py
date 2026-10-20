@@ -60,6 +60,10 @@ def _seed_smart_motion_assignment(db, camera_id, customer_id):
         "(camera_id,analytic_key,status,created_at,updated_at) VALUES(?,?,?,?,?)",
         (camera_id, "smart_motion", "active", now, now),
     )
+    # Premium analytics default OFF (2026-10-19): the customer has turned Smart Motion and the rule analytics ON.
+    for key in ("smart_motion", "line_crossing", "intrusion", "loitering"):
+        db.execute("INSERT OR IGNORE INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                   "VALUES(?,?,1,?,'owner')", (camera_id, key, now))
 
 
 def _seed_rule(db, rule_id, *, customer_id, site_id, appliance_id, camera_id, rule_type="line_crossing", direction="both", enabled=1, geometry=None, name="Test rule"):

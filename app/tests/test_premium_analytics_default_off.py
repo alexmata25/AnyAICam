@@ -31,10 +31,19 @@ NOW = "2026-10-19T00:00:00"
 
 
 @pytest.fixture(autouse=True)
-def _fresh_grant_cache():
+def _fresh_grant_cache(tmp_path, monkeypatch):
+    # 168 h design: the analytics grant lives in its own MAC-protected state file, keyed from ANYAICAM_APP_SECRETS.
+    monkeypatch.setenv("ANYAICAM_APP_SECRETS", "test-appliance-secret-0123456789abcdef")
+    monkeypatch.setattr(appliance_entitlements, "ANALYTICS_STATE_FILE", tmp_path / "analytics_entitlements.json")
     appliance_entitlements._grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
     yield
     appliance_entitlements._grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
+
+
+def _doc():
+    """The stored (MAC-verified) analytics document, or None."""
+    state = appliance_entitlements._read_analytics_state()
+    return state["grant"] if state else None
 
 
 def _rows(path, sql, params=()):
@@ -149,16 +158,47 @@ def test_cloud_upgrade_preserves_on_only_where_the_entitlement_is_still_valid(db
             assert acc.operational_enabled(conn, "cam-1", "lpr") is True
 
 
-def test_appliance_upgrade_preserves_on_only_with_a_valid_signed_grant(db, monkeypatch):
+def test_appliance_upgrade_defers_and_preserves_on_only_with_a_valid_signed_grant(db, monkeypatch):
+    """Blue's finding: an edge never holds camera_analytics_entitlements and has no grant at first boot. The upgrade
+    records the pairs that were ON (cameras.<flag>=1) and writes explicit ON only once a valid grant covers them."""
     monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
-    monkeypatch.setattr(appliance_entitlements, "camera_analytic_grants", lambda now=None: {"cam-1": frozenset({"lpr"})})
     with override_target(sqlite_path=str(db)):
         with connection() as conn:
-            _assign(conn, "cam-1", "lpr")
-            _assign(conn, "cam-2", "lpr")          # no signed grant for cam-2
-            _assign(conn, "cam-1", "ppe")          # grant covers lpr only
+            conn.execute("UPDATE cameras SET lpr_enabled=1 WHERE id IN ('cam-1','cam-2')")
+            conn.execute("UPDATE cameras SET ppe_enabled=1 WHERE id='cam-1'")
+            conn.execute("UPDATE cameras SET facial_recognition_enabled=1 WHERE id='cam-3'")
+            conn.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-3','facial_recognition',0,'x')")
+            recorded = db_migrations.seed_explicit_analytics_operations(conn)
+            assert recorded == 3                                 # cam-1 lpr+ppe, cam-2 lpr; cam-3 has an explicit OFF
+            assert _ops(conn) == {("cam-3", "facial_recognition"): (0, None)}
+            # no valid grant yet (first boot): nothing written, the list is kept
+            assert db_migrations.complete_pending_analytics_seed(conn, {}, grant_held=False) == 0
+            assert conn.execute("SELECT COUNT(*) AS n FROM analytics_upgrade_seed_pending").fetchone()["n"] == 3
+            # the first valid grant covers cam-1 lpr only
+            written = db_migrations.complete_pending_analytics_seed(conn, {"cam-1": frozenset({"lpr"})}, grant_held=True)
+            assert written == 1
+            ops = _ops(conn)
+            assert ops[("cam-1", "lpr")][0] == 1 and ops[("cam-1", "lpr")][1].endswith(":deferred")
+            assert ("cam-1", "ppe") not in ops and ("cam-2", "lpr") not in ops   # not granted -> stays OFF
+            assert conn.execute("SELECT COUNT(*) AS n FROM analytics_upgrade_seed_pending").fetchone()["n"] == 0  # one-shot
+            # later grants never seed again (lapsed analytics need the customer's explicit ON)
+            assert db_migrations.complete_pending_analytics_seed(conn, {"cam-2": frozenset({"lpr"})}, grant_held=True) == 0
+
+
+def test_blue_reproduction_local_edge_lpr_survives_the_upgrade_with_a_valid_grant(db, monkeypatch):
+    """BLUE.md 22:45: SEEDED 0 / LPR off after upgrade. Now: recorded, then preserved at the first valid grant."""
+    import product_mode
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(recording_uploader, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(product_mode, "current_mode", lambda: "local")
+    monkeypatch.setattr(appliance_entitlements, "camera_analytic_grants", lambda now=None: {"cam-1": frozenset({"lpr"})})
+    monkeypatch.setattr(appliance_entitlements, "analytics_grant_held", lambda now=None: True)
+    with override_target(sqlite_path=str(db)):
+        with connection() as conn:
+            conn.execute("UPDATE cameras SET lpr_enabled=1 WHERE id='cam-1'")
             assert db_migrations.seed_explicit_analytics_operations(conn) == 1
-            assert set(_ops(conn)) == {("cam-1", "lpr")}
+        recording_uploader._refresh_camera_map(prefer_local=True)
+    assert recording_uploader._camera_identity(1)["lpr_enabled"] is True
 
 
 @pytest.mark.parametrize("role", ["", "something-else"])
@@ -282,8 +322,8 @@ def _edge_camera_flag(edge_db):
 
 def test_fresh_install_nothing_premium_is_authorized_or_running(appliance, cloud_db, edge_db, monkeypatch):
     _sync(edge_db)
-    snapshot = _cached()["snapshot"]
-    assert snapshot["camera_analytics"] == {}
+    assert _doc()["camera_analytics"] == {}
+    assert "camera_analytics" not in _cached()["snapshot"]          # the 24 h feature snapshot is back to its RC7 shape
     assert _edge_camera_flag(edge_db) is False
     assert _edge_lpr(monkeypatch) is False        # even a locally forced flag cannot run it
 
@@ -291,7 +331,7 @@ def test_fresh_install_nothing_premium_is_authorized_or_running(appliance, cloud
 def test_purchase_and_assignment_unlock_but_do_not_turn_on(appliance, cloud_db, edge_db, monkeypatch):
     _cloud_lpr_purchase(cloud_db, assign=True, enable=None)
     _sync(edge_db)
-    assert _cached()["snapshot"]["camera_analytics"] == {"cam-1": ["lpr"]}   # available (licensed)
+    assert _doc()["camera_analytics"] == {"cam-1": ["lpr"]}   # available (licensed)
     assert _edge_camera_flag(edge_db) is False                                 # but OFF until the customer turns it on
     assert _edge_lpr(monkeypatch, edge_flag=False) is False
 
@@ -311,7 +351,7 @@ def test_enabled_without_a_license_never_runs(appliance, cloud_db, edge_db, monk
     _exec(cloud_db, "UPDATE cameras SET lpr_enabled=1 WHERE id='cam-1'")
     _exec(cloud_db, "INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at) VALUES('cam-1','lpr',1,?)", (NOW,))
     _sync(edge_db)   # assignment + ON, but no subscription
-    assert _cached()["snapshot"]["camera_analytics"] == {}
+    assert _doc()["camera_analytics"] == {}
     assert _edge_camera_flag(edge_db) is False and _edge_lpr(monkeypatch) is False
 
 
@@ -322,7 +362,7 @@ def test_revocation_stops_processing_at_the_next_sync_even_with_a_stale_local_fl
     assert _edge_lpr(monkeypatch) is True
     _exec(cloud_db, "UPDATE analytics_subscriptions SET status=? WHERE id='sub-lpr'", (ended,))
     _sync(edge_db)
-    assert _cached()["snapshot"]["camera_analytics"] == {}
+    assert _doc()["camera_analytics"] == {}
     assert _edge_lpr(monkeypatch, edge_flag=True) is False
     # the customer's ON choice is preserved: re-subscribing restores it without a new activation
     _exec(cloud_db, "UPDATE analytics_subscriptions SET status='active' WHERE id='sub-lpr'")
@@ -330,32 +370,41 @@ def test_revocation_stops_processing_at_the_next_sync_even_with_a_stale_local_fl
     assert _edge_lpr(monkeypatch) is True
 
 
-def test_offline_use_is_authorized_until_the_snapshot_expires_then_stops(appliance, cloud_db, edge_db, monkeypatch):
+def test_offline_use_is_authorized_until_the_analytics_grant_expires_then_stops(appliance, cloud_db, edge_db, monkeypatch):
     _cloud_lpr_purchase(cloud_db, assign=True, enable=True)
     _sync(edge_db)
-    snapshot = _cached()["snapshot"]
-    expired = _resign(snapshot, cloud_db, expires_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
-    appliance_entitlements.STATE_FILE.write_text(json.dumps({"snapshot": expired}), encoding="utf-8")
+    doc = _doc()
+    now = datetime.now(timezone.utc)
+    expired = _resign(doc, cloud_db, issued_at=(now - timedelta(hours=169)).isoformat(), expires_at=(now - timedelta(hours=1)).isoformat())
+    appliance_entitlements._write_analytics_state(expired, now)
     assert _edge_lpr(monkeypatch) is False
-    fresh = _resign(snapshot, cloud_db, expires_at=(datetime.now(timezone.utc) + timedelta(hours=20)).isoformat())
-    appliance_entitlements.STATE_FILE.write_text(json.dumps({"snapshot": fresh}), encoding="utf-8")
-    assert _edge_lpr(monkeypatch) is True   # cloud unreachable, snapshot still valid -> authorized offline use
+    fresh = _resign(doc, cloud_db, issued_at=(now - timedelta(hours=20)).isoformat(), expires_at=(now + timedelta(hours=148)).isoformat())
+    appliance_entitlements._write_analytics_state(fresh, now)
+    assert _edge_lpr(monkeypatch) is True   # cloud unreachable, grant still valid (20 h after refresh) -> offline use
 
 
-@pytest.mark.parametrize("variant", ["tampered", "older_cloud_without_field", "other_appliance"])
-def test_an_unverifiable_or_older_snapshot_denies_premium_processing(appliance, cloud_db, edge_db, monkeypatch, variant):
+@pytest.mark.parametrize("variant", ["tampered", "other_appliance", "feature_snapshot_as_grant"])
+def test_an_unverifiable_or_foreign_grant_denies_premium_processing(appliance, cloud_db, edge_db, monkeypatch, variant):
     _cloud_lpr_purchase(cloud_db, assign=True, enable=True)
     _sync(edge_db)
-    snapshot = _cached()["snapshot"]
+    doc = _doc()
     if variant == "tampered":
-        bad = dict(snapshot); bad["camera_analytics"] = {"cam-1": ["lpr", "ppe", "facial_recognition"]}
-    elif variant == "older_cloud_without_field":
-        body = {k: v for k, v in snapshot.items() if k not in ("signature", "camera_analytics")}
-        bad = _resign(body, cloud_db)
+        bad = dict(doc); bad["camera_analytics"] = {"cam-1": ["lpr", "ppe", "facial_recognition"]}
+    elif variant == "other_appliance":
+        bad = _resign(doc, cloud_db, appliance_id="appl-other")
     else:
-        bad = _resign(snapshot, cloud_db, appliance_id="appl-other")
-    appliance_entitlements.STATE_FILE.write_text(json.dumps({"snapshot": bad}), encoding="utf-8")
+        bad = _cached()["snapshot"]          # a valid 24 h FEATURE snapshot is never an analytics grant (type)
+    appliance_entitlements._write_analytics_state(bad, datetime.now(timezone.utc))
     assert _edge_lpr(monkeypatch) is False
+
+
+def test_a_cloud_that_stops_sending_the_grant_revokes_at_the_next_sync(appliance, cloud_db, edge_db, monkeypatch):
+    _cloud_lpr_purchase(cloud_db, assign=True, enable=True)
+    _sync(edge_db)
+    assert _edge_lpr(monkeypatch) is True
+    appliance["rewrite"] = lambda response: {k: v for k, v in response.items() if k != "analytics_entitlements"}
+    _sync(edge_db)
+    assert _doc() is None and _edge_lpr(monkeypatch) is False
 
 
 def test_a_grant_for_one_camera_does_not_license_another(appliance, cloud_db, edge_db, monkeypatch):

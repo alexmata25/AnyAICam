@@ -839,9 +839,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         from analytics_control_center import active_lab_grant, operational_enabled
         _analytics: dict={}
         # Premium analytics default OFF (2026-10-19): the per-camera COMMERCIAL authorization (paid assignment + seats,
-        # or an active Test Lab lease) is also signed into the entitlement snapshot below, so the appliance's processing
-        # pipeline enforces it itself -- offline only until the snapshot expires (appliance_entitlements).
+        # or an active Test Lab lease) is also signed -- in its own analytics document (168 h offline window, capped at
+        # the earliest recorded authorization end; feature_entitlements.analytics_entitlement_snapshot) -- so the
+        # appliance's processing pipeline enforces it itself.
         authorized_analytics: dict={}
+        lab_expiries: list=[]
         with connection() as _db:
             for item in camera_items:
                 camera={**item,'customer_id':appliance.get('customer_id'),'appliance_id':appliance.get('id')}
@@ -868,6 +870,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     authorized=paid[key] or key in lab_leases
                     if authorized:
                         authorized_analytics.setdefault(item['id'],[]).append(key)
+                        if key in lab_leases and not paid[key]:
+                            lab_expiries.append(lab_leases[key])
                     effective=authorized and operational_enabled(_db,item['id'],key)
                     field={'smart_motion':'smart_motion_enabled','people_counting':'people_counting_enabled','lpr':'lpr_enabled',
                            'ppe':'ppe_enabled','facial_recognition':'facial_recognition_enabled'}[key]
@@ -985,10 +989,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # (feature_entitlements.appliance_snapshot / appliance_entitlements).
         import feature_entitlements
         import appliance_identity as _identity_keys
-        entitlement_snapshot=feature_entitlements.appliance_snapshot(appliance,camera_analytics=authorized_analytics)
+        entitlement_snapshot=feature_entitlements.appliance_snapshot(appliance)
+        analytics_snapshot=feature_entitlements.analytics_entitlement_snapshot(appliance,authorized_analytics,lab_expiries=lab_expiries)
         with connection() as db:
             signing_public_keys=_identity_keys.active_public_keys(db)
-        return {'feature_entitlements':entitlement_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
+        return {'feature_entitlements':entitlement_snapshot,'analytics_entitlements':analytics_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-

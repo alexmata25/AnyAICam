@@ -298,55 +298,219 @@ def feature_allowed(feature: str, customer_id: str | None = None) -> bool:
         return False
 
 
-# ---------------------------------------------------------------- premium analytics (2026-10-19)
-# Owner: premium analytics default OFF and run only with a valid entitlement, enforced in the processing pipeline.
-# The cloud signs, per camera, the premium analytics the camera is commercially authorized for
-# ("camera_analytics": {camera_id: [keys]}, feature_entitlements.appliance_snapshot). recording_uploader's camera map
-# ANDs every premium flag with this grant on an edge runtime. Same verification as the paid features above:
-# signature from the provisioned keyset, this appliance's identity, and NOT expired -- offline, premium analytics
-# keep running only until the snapshot's TTL (default 24 h, at most 168 h) and then stop; basic motion, recording,
-# live view and playback never consult this. Missing field (an older cloud), invalid or expired snapshot -> nothing.
+# ---------------------------------------------------------------- premium analytics: signed 168 h grant (2026-10-19)
+# Owner-approved design RED-ANALYTICS-OFFLINE-168H-DESIGN-20261019.md (with Green F1/F2). Premium analytics run only
+# with a separately signed "anyaicam.analytics_entitlements" document naming this camera and feature (the customer's
+# explicit ON is a separate, independent requirement). recording_uploader ANDs every premium flag with
+# camera_analytic_grants() on every pipeline read. Talk Down / Voice Call (the 24 h snapshot above) are unaffected.
+#
+# Accepted only if: signed by a key in the provisioned trust anchor; exact type/version; bound to this appliance's
+# activation identity; issued_at not in the future (beyond skew); expires_at > now; expires_at - issued_at <= 168 h
+# (+ skew) -- so no cloud or client configuration can extend authority; camera_analytics well-formed.
+#
+# Persisted state (ANALYTICS_STATE_FILE): {"grant", "high_water", "mac"}; HMAC-SHA256 keyed from this appliance's own
+# ANYAICAM_APP_SECRETS. Missing / corrupt / MAC mismatch / no secret -> no grant (fail closed) until the next sync.
+# high_water = the latest time observed (persisted at most once a minute, and whenever a grant is stored); a clock
+# earlier than high_water - 5 min is a rollback -> no grant until a fresh document verifies.
+# Renewal (store_analytics_grant, called ONLY with a successful authenticated configuration response):
+#   valid and issued_at >= stored -> replaces it;  valid but OLDER than stored (Green F1) -> CLEARS (fail closed);
+#   invalid -> clears;  absent (an older/rolled-back cloud no longer vouching) -> clears.
+# Offline (no successful sync) nothing changes: the grant keeps applying until its own expires_at (<= 168 h after the
+# last successful refresh) -- the explicit, unavoidable offline revocation delay.
+# Software-only limitation: a local administrator who controls the clock AND the state file AND the app secret can
+# forge the local state; the HMAC defeats accidental and unprivileged edits only (see the design document).
+import hashlib as _hashlib
+import hmac as _hmac
+
 PREMIUM_ANALYTICS = ("smart_motion", "people_counting", "lpr", "ppe", "facial_recognition")
+ANALYTICS_TYPE = "anyaicam.analytics_entitlements"
+ANALYTICS_VERSION = 1
+ANALYTICS_MAX_WINDOW = timedelta(hours=168)
+HIGH_WATER_PERSIST = timedelta(minutes=1)
+ANALYTICS_STATE_FILE = STATE_FILE.with_name("analytics_entitlements.json")
 _GRANT_CACHE_SECONDS = 10.0
-_grant_cache: dict = {"at": None, "mtime": None, "grants": None}
+_grant_cache: dict = {"at": None, "mtime": None, "grants": None, "expires": None}
+
+
+def _state_key() -> bytes | None:
+    secret = os.environ.get("ANYAICAM_APP_SECRETS", "").split(",")[0].strip()
+    if not secret:
+        return None
+    return _hashlib.sha256(b"anyaicam.analytics-state.v1\x00" + secret.encode("utf-8")).digest()
+
+
+def _state_mac(key: bytes, grant, high_water: str) -> str:
+    message = json.dumps({"grant": grant, "high_water": high_water}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _hmac.new(key, message, _hashlib.sha256).hexdigest()
+
+
+def _read_analytics_state() -> dict | None:
+    """{"grant", "high_water"} when present, well-formed and authenticated; otherwise None."""
+    key = _state_key()
+    if key is None:
+        return None
+    try:
+        data = json.loads(ANALYTICS_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("grant"), dict) or not isinstance(data.get("high_water"), str):
+        return None
+    if not _hmac.compare_digest(str(data.get("mac") or ""), _state_mac(key, data["grant"], data["high_water"])):
+        logger.warning("appliance_entitlements.analytics_state_rejected reason=mac_mismatch")
+        return None
+    return {"grant": data["grant"], "high_water": data["high_water"]}
+
+
+def _write_analytics_state(grant, high_water: datetime) -> bool:
+    key = _state_key()
+    if key is None:
+        return False
+    stamp = high_water.astimezone(timezone.utc).isoformat()
+    try:
+        ANALYTICS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = ANALYTICS_STATE_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"grant": grant, "high_water": stamp, "mac": _state_mac(key, grant, stamp)}),
+                             encoding="utf-8")
+        temporary.replace(ANALYTICS_STATE_FILE)
+        return True
+    except OSError as error:
+        logger.warning("appliance_entitlements.analytics_persist_failed error=%s", type(error).__name__)
+        return False
+
+
+def clear_analytics() -> None:
+    _grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
+    try:
+        ANALYTICS_STATE_FILE.unlink()
+    except OSError:
+        pass
+
+
+def verify_analytics(document, public_keys: dict[str, str], *, identity, now: datetime | None = None) -> str | None:
+    """None when the analytics document is valid right now for this appliance, else the reason."""
+    if not isinstance(document, dict):
+        return "missing"
+    if not public_keys:
+        return "no_trust_anchor"
+    bound = _bound_identity(identity)
+    if bound is None:
+        return "not_activated"
+    body = {key: value for key, value in document.items() if key != "signature"}
+    try:
+        import appliance_identity
+        appliance_identity.verify_signed_body(body, document.get("signature") or {}, public_keys=public_keys)
+    except Exception:
+        return "bad_signature"
+    if body.get("type") != ANALYTICS_TYPE or body.get("version") != ANALYTICS_VERSION:
+        return "unsupported"
+    for field, reason in (("appliance_id", "other_appliance"), ("cloud_id", "other_cloud_id"), ("customer_id", "other_customer")):
+        value = body.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return "malformed_identity"
+        if value != bound[field]:
+            return reason
+    now = now or datetime.now(timezone.utc)
+    issued, expires = _parse_time(body.get("issued_at")), _parse_time(body.get("expires_at"))
+    if issued is None or expires is None or issued - CLOCK_SKEW > now:
+        return "bad_time"
+    if expires <= issued or expires - issued > ANALYTICS_MAX_WINDOW + CLOCK_SKEW:
+        return "window_too_long"
+    if expires <= now:
+        return "expired"
+    grants = body.get("camera_analytics")
+    if not isinstance(grants, dict) or any(
+            not isinstance(camera, str) or not camera or not isinstance(keys, list)
+            or any(key not in PREMIUM_ANALYTICS for key in keys) for camera, keys in grants.items()):
+        return "malformed_grants"
+    return None
+
+
+def store_analytics_grant(document, *, now: datetime | None = None) -> str:
+    """Call ONLY with a successful, authenticated configuration response (edge_camera_sync). Returns the outcome."""
+    now = now or datetime.now(timezone.utc)
+    _grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
+    if document is None:
+        clear_analytics()
+        logger.warning("appliance_entitlements.analytics_cleared reason=absent_from_sync")
+        return "cleared:absent"
+    reason = verify_analytics(document, _trusted_keys(), identity=_local_identity(), now=now)
+    if reason:
+        clear_analytics()
+        logger.warning("appliance_entitlements.analytics_cleared reason=%s", reason)
+        return f"cleared:rejected:{reason}"
+    stored = _read_analytics_state()
+    issued = _parse_time(document.get("issued_at"))
+    if stored is not None:
+        stored_issued = _parse_time(stored["grant"].get("issued_at"))
+        if stored_issued is not None and issued < stored_issued:
+            clear_analytics()   # Green F1: never keep an older, possibly broader grant
+            logger.warning("appliance_entitlements.analytics_cleared reason=older_from_sync")
+            return "cleared:older_than_stored"
+    if not _write_analytics_state(document, max(now, issued)):
+        clear_analytics()
+        return "cleared:not_persisted"
+    return "stored"
+
+
+def _grants_from_state(current: datetime) -> tuple[dict, datetime | None]:
+    state = _read_analytics_state()
+    if state is None:
+        return {}, None
+    high_water = _parse_time(state["high_water"])
+    reason = verify_analytics(state["grant"], _trusted_keys(), identity=_local_identity(), now=current)
+    if reason:
+        logger.info("appliance_entitlements.analytics_denied reason=%s", reason)
+        return {}, None
+    if high_water is None or current < high_water - CLOCK_SKEW:
+        logger.warning("appliance_entitlements.analytics_denied reason=clock_rollback")
+        return {}, None
+    if current - high_water >= HIGH_WATER_PERSIST:
+        _write_analytics_state(state["grant"], current)
+    grants = {camera_id: frozenset(keys) for camera_id, keys in state["grant"]["camera_analytics"].items()}
+    return grants, _parse_time(state["grant"]["expires_at"])
 
 
 def camera_analytic_grants(now: datetime | None = None) -> dict[str, frozenset]:
-    """{camera_id: frozenset(premium keys)} from a currently valid snapshot, else {} (deny all). Never raises.
-    Re-verified at most every _GRANT_CACHE_SECONDS and whenever the cached file changes; expiry is always
-    re-checked against the cached snapshot's expires_at."""
+    """{camera_id: frozenset(premium keys)} from a valid, unexpired, authenticated grant with a sane clock; else {}.
+    Never raises. Re-verified at most every _GRANT_CACHE_SECONDS (and whenever the state file changes); expiry is
+    re-checked on every call."""
     import time
     try:
         current = now or datetime.now(timezone.utc)
+        cached = _grant_cache
         try:
-            mtime = STATE_FILE.stat().st_mtime_ns
+            mtime = ANALYTICS_STATE_FILE.stat().st_mtime_ns
         except OSError:
             mtime = None
-        cached = _grant_cache
         if (now is None and cached["grants"] is not None and cached["mtime"] == mtime
-                and time.monotonic() - cached["at"] < _GRANT_CACHE_SECONDS):
-            expires = cached.get("expires")
-            if expires is not None and expires > current:
-                return cached["grants"]
-        snapshot = _read_state().get("snapshot")
-        reason = verify(snapshot, _trusted_keys(), identity=_local_identity(), now=current)
-        grants: dict[str, frozenset] = {}
-        expires = None
-        if reason:
-            logger.info("appliance_entitlements.analytics_denied reason=%s", reason)
-        else:
-            raw = snapshot.get("camera_analytics")
-            if isinstance(raw, dict):
-                for camera_id, keys in raw.items():
-                    if isinstance(camera_id, str) and camera_id and isinstance(keys, list):
-                        grants[camera_id] = frozenset(k for k in keys if k in PREMIUM_ANALYTICS)
-            expires = _parse_time(snapshot.get("expires_at"))
+                and time.monotonic() - cached["at"] < _GRANT_CACHE_SECONDS
+                and cached["expires"] is not None and cached["expires"] > current):
+            return cached["grants"]
+        grants, expires = _grants_from_state(current)
         if now is None:
+            try:
+                mtime = ANALYTICS_STATE_FILE.stat().st_mtime_ns
+            except OSError:
+                mtime = None
             _grant_cache.update({"at": time.monotonic(), "mtime": mtime, "grants": grants, "expires": expires})
         return grants
     except Exception:
         logger.exception("appliance_entitlements.analytics_check_failed")
         return {}
+
+
+def analytics_grant_held(now: datetime | None = None) -> bool:
+    """True when a valid analytics document is currently held (it may grant nothing)."""
+    try:
+        state = _read_analytics_state()
+        if state is None:
+            return False
+        current = now or datetime.now(timezone.utc)
+        high_water = _parse_time(state["high_water"])
+        return (verify_analytics(state["grant"], _trusted_keys(), identity=_local_identity(), now=current) is None
+                and high_water is not None and current >= high_water - CLOCK_SKEW)
+    except Exception:
+        return False
 
 
 def camera_analytic_allowed(camera_id: str | None, analytic_key: str) -> bool:
@@ -357,7 +521,6 @@ def camera_analytic_allowed(camera_id: str | None, analytic_key: str) -> bool:
 
 
 def clear() -> None:
-    _grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
     try:
         STATE_FILE.unlink()
     except OSError:

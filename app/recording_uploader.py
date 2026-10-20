@@ -421,6 +421,16 @@ def _refresh_camera_map(*, prefer_local: bool = False) -> None:
     try:
         from partner_db import connection
         with connection() as db:
+            if RUNTIME_ROLE == "edge":
+                # Deferred one-time upgrade seed (2026-10-19, db_migrations.complete_pending_analytics_seed): runs only
+                # once a valid signed analytics document is held; preserves pre-upgrade ON only where it is granted.
+                import appliance_entitlements
+                import db_migrations
+                written = db_migrations.complete_pending_analytics_seed(
+                    db, appliance_entitlements.camera_analytic_grants(),
+                    grant_held=appliance_entitlements.analytics_grant_held())
+                if written:
+                    logger.info("recording_upload.analytics_upgrade_preserved rows=%s", written)
             states = db.execute("SELECT camera_id,analytic_key,enabled,system_paused FROM camera_analytics_operations").fetchall()
         camera_numbers = {value["camera_id"]: number for number, value in mapping.items()}
         explicit_on = set()
