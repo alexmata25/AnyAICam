@@ -13,6 +13,17 @@ The manifest (vosk-model-small-en-us-0.15.sha256) pins the archive and every ext
     left exactly as it was.
 A link (junction / symbolic link) anywhere in models, models\stt or the model folder is refused. The swap uses a staging
 folder beside the model, so a failure never leaves a half-written model in place.
+
+Recovery (Codex FAIL on d919e4c4): a replacement moves the previous model aside to models\stt\.old-<id> before
+promoting the staged one. An .old-* folder may therefore be the ONLY copy of a working model (an install interrupted
+between the two moves, or a failed promotion), and it is never deleted until the active model has verified:
+  * at the start, when the active model is missing or invalid, an .old-* folder that verifies against the manifest is
+    moved back into place first (newest first) -- so a later corrupted or missing archive still ends with the previous
+    working model;
+  * if promoting the staged model fails, the previous model is moved back; if even that fails, its .old-* folder is
+    kept for the next attempt and the setup stops;
+  * .old-* folders are removed only after the active model has verified (kept, restored or newly promoted);
+  * .staging-* folders never hold the only copy (the archive is the source) and are always removable.
 #>
 
 function Get-AnyAiCamSttManifest([string]$Manifest) {
@@ -55,12 +66,30 @@ function Test-AnyAiCamSttModel([string]$Folder, $Spec) {
     return $null
 }
 
+# Every folder move goes through this one function (production never replaces it; a test redefines it to make one
+# step fail).
+function Move-AnyAiCamSttFolder([string]$From, [string]$To) {
+    Move-Item -LiteralPath $From -Destination $To -ErrorAction Stop
+}
+
+function Remove-AnyAiCamSttLeftovers([string]$Stt, [string]$Pattern) {
+    Get-ChildItem -LiteralPath $Stt -Force -Directory | Where-Object { $_.Name -like $Pattern } | ForEach-Object {
+        if ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing a link at $($_.FullName)." }
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function New-AnyAiCamSttAsideName([string]$Stt) {
+    return (Join-Path $Stt ('.old-' + [DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff') + '-' + [guid]::NewGuid().ToString('N')))
+}
+
 function Install-AnyAiCamSttModel {
     param(
         [Parameter(Mandatory=$true)][string]$DataRoot,
         [Parameter(Mandatory=$true)][string]$Archive,
         [Parameter(Mandatory=$true)][string]$Manifest
     )
+    $ErrorActionPreference = 'Stop'
     $spec = Get-AnyAiCamSttManifest $Manifest
     $models = Join-Path $DataRoot 'models'
     $stt = Join-Path $models 'stt'
@@ -71,13 +100,30 @@ function Install-AnyAiCamSttModel {
     }
     $target = Join-Path $stt $spec.Name
     Assert-AnyAiCamSttNoLink $target
-    # Left-overs of an interrupted earlier run (only this script's own names).
-    Get-ChildItem -LiteralPath $stt -Force -Directory | Where-Object { $_.Name -like '.staging-*' -or $_.Name -like '.old-*' } | ForEach-Object {
-        if ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing a link at $($_.FullName)." }
-        Remove-Item -LiteralPath $_.FullName -Recurse -Force
-    }
+    # Staging folders of an interrupted run: never the only copy of a model.
+    Remove-AnyAiCamSttLeftovers $stt '.staging-*'
+    $asides = @(Get-ChildItem -LiteralPath $stt -Force -Directory | Where-Object { $_.Name -like '.old-*' } | Sort-Object Name -Descending)
+    foreach ($aside in $asides) { if ($aside.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing a link at $($aside.FullName)." } }
+
     $problem = Test-AnyAiCamSttModel $target $spec
-    if (-not $problem) { Write-Output "Speech model $($spec.Name): present and verified (kept)."; return }
+    $restored = $null
+    if ($problem) {
+        # An earlier run moved the previous model aside and stopped: put a verified copy back before anything else.
+        foreach ($aside in $asides) {
+            if (Test-AnyAiCamSttModel $aside.FullName $spec) { continue }
+            if (Test-Path -LiteralPath $target) { Move-AnyAiCamSttFolder $target (New-AnyAiCamSttAsideName $stt) }   # keep, never delete
+            Move-AnyAiCamSttFolder $aside.FullName $target
+            $restored = $aside.Name
+            break
+        }
+        if ($restored) { $problem = Test-AnyAiCamSttModel $target $spec }
+    }
+    if (-not $problem) {
+        Remove-AnyAiCamSttLeftovers $stt '.old-*'       # only now: the active model has verified
+        if ($restored) { Write-Output "Speech model $($spec.Name): restored from $restored (an interrupted earlier install) and verified." }
+        else { Write-Output "Speech model $($spec.Name): present and verified (kept)." }
+        return
+    }
 
     if ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $spec.ArchiveSha) {
         throw "The bundled speech model archive does not match its pinned SHA-256; nothing was changed."
@@ -92,16 +138,32 @@ function Install-AnyAiCamSttModel {
         if (@(Get-ChildItem -LiteralPath $staging -Force).Count -ne 1) { throw 'The speech model archive holds more than the model folder; nothing was changed.' }
         $old = $null
         if (Test-Path -LiteralPath $target) {
-            $old = Join-Path $stt ('.old-' + [guid]::NewGuid().ToString('N'))
-            Move-Item -LiteralPath $target -Destination $old
+            $old = New-AnyAiCamSttAsideName $stt
+            Move-AnyAiCamSttFolder $target $old
         }
-        Move-Item -LiteralPath $staged -Destination $target
-        if ($old) { Remove-Item -LiteralPath $old -Recurse -Force }
+        try {
+            Move-AnyAiCamSttFolder $staged $target
+        } catch {
+            $reason = $_.Exception.Message
+            $note = 'nothing was removed'
+            if ($old -and -not (Test-Path -LiteralPath $target)) {
+                $putBack = $false
+                try { Move-AnyAiCamSttFolder $old $target; $putBack = $true } catch { }
+                $note = if ($putBack) { 'the previous model was put back unchanged' } else { "the previous model could not be put back; it is kept in $old for the next attempt" }
+            }
+            throw "Promoting the new speech model failed ($reason); $note."
+        }
+        $after = Test-AnyAiCamSttModel $target $spec
+        if ($after) {
+            # Cannot happen with a verified staging folder; still never lose the previous model.
+            Move-AnyAiCamSttFolder $target (New-AnyAiCamSttAsideName $stt)
+            if ($old) { Move-AnyAiCamSttFolder $old $target }
+            throw "The installed speech model failed verification ($after); the previous model was put back."
+        }
+        Remove-AnyAiCamSttLeftovers $stt '.old-*'       # only now: the new model has verified
     } finally {
         if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
     }
-    $after = Test-AnyAiCamSttModel $target $spec
-    if ($after) { throw "The installed speech model failed verification ($after)." }
     $action = if ($problem -eq 'missing') { 'installed' } else { "replaced ($problem)" }
     Write-Output "Speech model $($spec.Name): $action and verified."
 }
