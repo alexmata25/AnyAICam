@@ -166,8 +166,15 @@ def test_customer_can_recover_their_account_end_to_end(customer, playwright_inst
         while not customer["capturing"].sent and time.monotonic() < deadline:
             page.wait_for_timeout(100)
         assert customer["capturing"].sent, "no reset email was prepared"
-        link = customer["capturing"].sent[-1]["text"].split("\n")[-1].strip()
-        assert "/customer-reset-password?token=" in link
+        # The shared email template adds support details and a signature after
+        # the URL. Find the reset link instead of assuming it is the final line.
+        links = [
+            line.strip()
+            for line in customer["capturing"].sent[-1]["text"].splitlines()
+            if "/customer-reset-password?token=" in line
+        ]
+        assert len(links) == 1, "the reset email must contain exactly one customer reset link"
+        link = links[0]
 
         # 2. The emailed link (host is this test server; path/token unchanged)
         parts = urlsplit(link)
