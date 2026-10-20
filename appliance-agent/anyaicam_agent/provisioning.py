@@ -24,21 +24,32 @@ import secrets
 import socket
 from urllib.parse import urlsplit
 
-from .discovery import scan
+from .discovery import probe_host, scan
 
 _LOG = logging.getLogger('anyaicam.agent')
 
 
-def locate_device(device_key, networks=None):
+def locate_device(device_key, networks=None, known=None):
     """Re-scan the LAN (same engine as onboarding discovery, not a
     second one) and return the candidate whose own device_key matches,
     or None if it isn't currently reachable. device_key is stable
     across IP/DHCP changes for ONVIF and MAC-identified devices (see
     discovery.scan()); a device that has changed IP since the customer
-    selected it in onboarding is still found here."""
+    selected it in onboarding is still found here.
+
+    known (CAM-5, 2026-10-20): the appliance's stored discovery records.
+    A camera the customer added by address (manual_target) may sit
+    outside the scanned networks or ignore WS-Discovery; it is then
+    probed again at its stored address and accepted only if it still
+    presents the SAME device_key."""
     for candidate in scan(networks):
         if candidate.get('device_key') == device_key:
             return candidate
+    for record in known or ():
+        if record.get('device_key') == device_key and record.get('manual_target') and record.get('ip'):
+            candidate = probe_host(record['ip'])
+            if candidate and candidate.get('device_key') == device_key:
+                return candidate
     return None
 
 
@@ -534,12 +545,12 @@ def stream_target(device, device_key, username=None, password=None):
     return port, device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH, 'discovery'
 
 
-def verify_device(device_key, credentials, networks=None):
+def verify_device(device_key, credentials, networks=None, known=None):
     """Top-level entry point used by the provisioning poller
     (service.py's poll_provisioning()). Returns (success, message);
     message is always safe to log and to send back to the cloud as-is
     -- it never contains a credential, an IP, or a MAC address."""
-    device = locate_device(device_key, networks)
+    device = locate_device(device_key, networks, known)
     if not device:
         return False, 'Device is no longer reachable on the network.'
     if not device.get('rtsp_support'):

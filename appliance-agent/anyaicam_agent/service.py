@@ -18,7 +18,7 @@ from .config import AgentConfig,clear_claim_state,load_claim_state,load_credenti
 from .headless_claim import HeadlessClaim, ineligibility as headless_ineligibility
 from .link_server import DEFAULT_PORT as LINK_DEFAULT_PORT, LinkServer
 from .windows_link import LinkRequests
-from .discovery import scan
+from .discovery import manual_target, probe_host, scan
 from .metrics import collect
 from .lan_addresses import publish as publish_lan_addresses
 from .onvif_media import resolve_media_uri
@@ -317,6 +317,16 @@ class ApplianceAgent:
         try:
             response=self.client.request('GET',f'/api/appliance/{self.config.cloud_id}/scan-jobs')
             for job in response.get('jobs',[]):
+                if job.get('target_ip'):
+                    # Manual add by address (CAM-5): one host, the same record
+                    # shape, the same store and the same redaction as a scan.
+                    target=manual_target(job['target_ip'])
+                    if not target:
+                        payload={'status':'error','progress':100,'results':[],'message':'That address is not a local camera address this appliance can check.'}
+                    else:
+                        found=probe_host(target); results=[found] if found else []; self.discovered_store.save_scan(results)
+                        payload={'status':'complete','progress':100,'results':redact_discovery_for_cloud(results),'message':'Found a compatible camera at that address; physical addressing retained on appliance.' if results else 'No compatible camera answered at that address. Check the address and that the camera is powered on and on this network.'}
+                    self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/scan-jobs/{job["id"]}',payload,'scan-'+job['id']); continue
                 results=scan(self.config.discovery_networks); self.discovered_store.save_scan(results); payload={'status':'complete','progress':100,'results':redact_discovery_for_cloud(results),'message':f'Discovered {len(results)} compatible camera endpoints; physical addressing retained on appliance.'}; self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/scan-jobs/{job["id"]}',payload,'scan-'+job['id'])
         except PortalError as error: self.log.debug('Discovery poll unavailable: %s',error)
     def poll_provisioning(self):
@@ -336,7 +346,7 @@ class ApplianceAgent:
             # Never log job['credentials'] or any field derived from it --
             # only the non-secret identifiers below.
             self.log.info('Provisioning job received job_id=%s device_key=%s',job_id,job.get('device_key'))
-            try: success,message=verify_device(job.get('device_key',''),job.get('credentials'),self.config.discovery_networks)
+            try: success,message=verify_device(job.get('device_key',''),job.get('credentials'),self.config.discovery_networks,self.discovered_store.cameras())
             except Exception:
                 self.log.exception('Provisioning verification error job_id=%s',job_id); success,message=False,'Appliance-side verification error.'
             submitted=self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/provisioning-jobs/{job_id}',{'success':success,'message':message},'provision-'+job_id)
@@ -413,7 +423,7 @@ class ApplianceAgent:
         # the path for cameras that never needed a credential at all.
         if not device_key:
             return
-        device=locate_device(device_key,self.config.discovery_networks)
+        device=locate_device(device_key,self.config.discovery_networks,self.discovered_store.cameras())
         if not device or not device.get('ip'):
             return
         try:

@@ -452,13 +452,13 @@ def commercial_camera_analytic_authorized(db, *, customer_id: str, site_id: str 
         return False
     if subscription["site_id"] is not None:
         count = db.execute(
-            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id AND c.status!='removed' "
             "WHERE c.customer_id=? AND c.site_id=? AND e.analytic_key=? AND e.status='active'",
             (customer_id, site_id, analytic_key),
         ).fetchone()["n"]
     else:
         count = db.execute(
-            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+            "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id AND c.status!='removed' "
             "WHERE c.customer_id=? AND e.analytic_key=? AND e.status='active'",
             (customer_id, analytic_key),
         ).fetchone()["n"]

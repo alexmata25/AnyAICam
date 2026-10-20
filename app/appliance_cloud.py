@@ -842,9 +842,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         from analytics_control_center import active_lab_grant, operational_enabled
         _analytics: dict={}
         # Premium analytics default OFF (2026-10-19): the per-camera COMMERCIAL authorization (paid assignment + seats,
-        # or an active Test Lab lease) is also signed into the entitlement snapshot below, so the appliance's processing
-        # pipeline enforces it itself -- offline only until the snapshot expires (appliance_entitlements).
+        # or an active Test Lab lease) is also signed -- in its own analytics document (168 h offline window, capped at
+        # the earliest recorded authorization end; feature_entitlements.analytics_entitlement_snapshot) -- so the
+        # appliance's processing pipeline enforces it itself.
         authorized_analytics: dict={}
+        lab_expiries: list=[]
         with connection() as _db:
             for item in camera_items:
                 camera={**item,'customer_id':appliance.get('customer_id'),'appliance_id':appliance.get('id')}
@@ -871,6 +873,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     authorized=paid[key] or key in lab_leases
                     if authorized:
                         authorized_analytics.setdefault(item['id'],[]).append(key)
+                        if key in lab_leases and not paid[key]:
+                            lab_expiries.append(lab_leases[key])
                     effective=authorized and operational_enabled(_db,item['id'],key)
                     field={'smart_motion':'smart_motion_enabled','people_counting':'people_counting_enabled','lpr':'lpr_enabled',
                            'ppe':'ppe_enabled','facial_recognition':'facial_recognition_enabled'}[key]
@@ -988,10 +992,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # (feature_entitlements.appliance_snapshot / appliance_entitlements).
         import feature_entitlements
         import appliance_identity as _identity_keys
-        entitlement_snapshot=feature_entitlements.appliance_snapshot(appliance,camera_analytics=authorized_analytics)
+        entitlement_snapshot=feature_entitlements.appliance_snapshot(appliance)
+        analytics_snapshot=feature_entitlements.analytics_entitlement_snapshot(appliance,authorized_analytics,lab_expiries=lab_expiries)
         with connection() as db:
             signing_public_keys=_identity_keys.active_public_keys(db)
-        return {'feature_entitlements':entitlement_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
+        return {'feature_entitlements':entitlement_snapshot,'analytics_entitlements':analytics_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -2022,7 +2027,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
     def secure_scan_jobs(request: Request,cloud_id: str) -> dict:
         appliance=authenticate_appliance(request)
         if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
-        jobs=rows("SELECT id,status,created_at FROM camera_scan_jobs WHERE appliance_id=? AND status IN ('queued','waiting_for_appliance') ORDER BY created_at",(appliance['id'],))
+        jobs=rows("SELECT id,status,created_at,target_ip FROM camera_scan_jobs WHERE appliance_id=? AND status IN ('queued','waiting_for_appliance') ORDER BY created_at",(appliance['id'],))
+        # target_ip (CAM-5): present only on a customer's manual add-by-address job.
+        jobs=[{key:value for key,value in job.items() if key!='target_ip' or value} for job in jobs]
         with connection() as db:
             for job in jobs: db.execute("UPDATE camera_scan_jobs SET status='running',progress=5,message='Appliance accepted discovery job.',updated_at=? WHERE id=?",(datetime.now().isoformat(),job['id']))
         return {'jobs':jobs}
@@ -2037,6 +2044,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if status not in {'running','complete','error'}: raise HTTPException(status_code=400,detail='Unsupported discovery status.')
         with connection() as db:
             db.execute('UPDATE camera_scan_jobs SET status=?,progress=?,results_json=?,message=?,updated_at=? WHERE id=?',(status,progress,json.dumps(results),str(payload.get('message','Discovery update received.'))[:500],datetime.now().isoformat(),job_id))
+            # The customer-entered LAN address is kept only while the job runs (CAM-5).
+            if status in {'complete','error'}: db.execute('UPDATE camera_scan_jobs SET target_ip=NULL WHERE id=?',(job_id,))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.discovery_result','camera_scan_job',job_id,{'status':status,'count':len(results)}); return {'message':'Discovery result accepted; no camera records created until explicit binding.'}
 
     # ---- Camera provisioning (appliance side). Re-homed here from the

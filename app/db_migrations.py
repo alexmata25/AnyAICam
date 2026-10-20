@@ -2137,6 +2137,11 @@ def apply_migrations():
         camera_columns_now=_columns('cameras')
         if camera_columns_now and 'former_camera_number' not in camera_columns_now:
             db.execute('ALTER TABLE cameras ADD COLUMN former_camera_number INTEGER')
+        # Manual camera add by IP address (CAM-5, 2026-10-20): a discovery job
+        # may target one customer-entered LAN address; cleared when the job ends.
+        scan_job_columns=_columns('camera_scan_jobs')
+        if scan_job_columns and 'target_ip' not in scan_job_columns:
+            db.execute('ALTER TABLE camera_scan_jobs ADD COLUMN target_ip TEXT')
         # Measured stream geometry (2026-10-11, video_profile.py /
         # camera_video_probe.py): what the appliance measured on the camera's
         # main and analytics streams, reported with the camera status.
@@ -2221,15 +2226,18 @@ def hold_pre_cutover_claimed_storage_starts(db) -> int:
 
 # Premium analytics default OFF (owner 2026-10-19, VMS 1.2.7 / Windows 1.3.2). Before it, a missing
 # camera_analytics_operations row meant ON; now it means OFF. Runs ONCE, at the upgrade, guarded by its
-# schema_migrations marker. An analytic that was implicitly ON (active per-camera assignment AND the camera's flag set
-# -- facial recognition: the active assignment alone, as the configuration route computes it -- and no operations
-# row) gets an explicit enabled=1 row ONLY when its entitlement is still valid at the upgrade (owner 2026-10-19 #5):
-#   cloud / combined runtime -- commercial_camera_analytic_authorized (paid assignment within purchased seats; a
-#                               plan-included Smart Motion only while the plan includes it) or an active Test Lab lease;
-#   edge runtime (appliance) -- the persisted, signed, unexpired per-camera grant (appliance_entitlements).
-# An analytic whose entitlement has lapsed gets NO row, so it stays OFF and a later re-purchase never restarts it by
-# itself (the customer turns it on again). Nothing else is touched: an existing row (ON or OFF) is never changed, an
-# unassigned camera gets no row, and a fresh install (no cameras) seeds nothing.
+# schema_migrations marker. An analytic that was ON before keeps an explicit ON row ONLY where its entitlement is still
+# valid (owner 2026-10-19 #5):
+#   cloud / combined -- seeded now: active assignment AND flag (facial: assignment), AND
+#                       commercial_camera_analytic_authorized or an active Test Lab lease;
+#   edge (appliance) -- DEFERRED (Blue's finding, 2026-10-19): edges never hold camera_analytics_entitlements, and at
+#                       the first boot of the new release no signed analytics grant exists yet. The pairs that were ON
+#                       (cameras.<flag>=1, no operations row) are recorded in analytics_upgrade_seed_pending; the first
+#                       time a VALID analytics document is held, complete_pending_analytics_seed() writes explicit ON
+#                       only for pairs still ON and covered by that grant, then clears the list (one-shot). A lapsed
+#                       entitlement gets no row, so a later re-purchase never restarts it by itself.
+# Nothing else is touched: an existing row (ON or OFF) is never changed, an unassigned camera gets no row, and a fresh
+# install (no cameras) records/seeds nothing.
 SEED_EXPLICIT_ANALYTICS_OPERATIONS='20261019_premium_analytics_default_off'
 _SEED_ANALYTIC_COLUMNS=(('smart_motion','smart_motion_enabled'),('people_counting','people_counting_enabled'),
                         ('lpr','lpr_enabled'),('ppe','ppe_enabled'),('facial_recognition',None))
@@ -2242,14 +2250,6 @@ def _entitlement_still_valid(db):
         role=feature_entitlements.runtime_role()
     except Exception:
         role=''
-    if role=='edge':
-        def edge_valid(camera, analytic_key):
-            try:
-                import appliance_entitlements
-                return analytic_key in appliance_entitlements.camera_analytic_grants().get(camera['id'], frozenset())
-            except Exception:
-                return False
-        return edge_valid
     if role in ('cloud','combined'):
         def cloud_valid(camera, analytic_key):
             try:
@@ -2267,10 +2267,41 @@ def _entitlement_still_valid(db):
     return lambda camera, analytic_key: False
 
 
+def _runtime_role() -> str:
+    try:
+        import feature_entitlements
+        return feature_entitlements.runtime_role()
+    except Exception:
+        return ''
+
+
+def _camera_columns(db) -> set:
+    return ({item['name'] for item in db.execute('PRAGMA table_info(cameras)').fetchall()} if _backend_is_sqlite() else
+            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='cameras'").fetchall()})
+
+
+_EDGE_FLAG_COLUMNS=(('smart_motion','smart_motion_enabled'),('people_counting','people_counting_enabled'),('lpr','lpr_enabled'),
+                    ('ppe','ppe_enabled'),('facial_recognition','facial_recognition_enabled'))
+
+
 def seed_explicit_analytics_operations(db) -> int:
+    """Cloud/combined: seeds now and returns the count. Edge: records the pending pairs and returns their count."""
     now=datetime.now().isoformat(); seeded=0
+    camera_columns=_camera_columns(db)
+    if _runtime_role()=='edge':
+        db.execute('CREATE TABLE IF NOT EXISTS analytics_upgrade_seed_pending(camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,'
+                   'created_at TEXT NOT NULL,PRIMARY KEY(camera_id,analytic_key))')
+        for analytic_key,column in _EDGE_FLAG_COLUMNS:
+            if column not in camera_columns:
+                continue
+            for row in db.execute(f"SELECT c.id FROM cameras c WHERE c.{column}=1 AND COALESCE(c.status,'')!='removed' "
+                                  "AND NOT EXISTS(SELECT 1 FROM camera_analytics_operations o WHERE o.camera_id=c.id AND o.analytic_key=?)",
+                                  (analytic_key,)).fetchall():
+                db.execute('INSERT INTO analytics_upgrade_seed_pending(camera_id,analytic_key,created_at) VALUES(?,?,?) '
+                           'ON CONFLICT(camera_id,analytic_key) DO NOTHING',(row['id'],analytic_key,now))
+                seeded+=1
+        return seeded
     valid=_entitlement_still_valid(db)
-    camera_columns={item['name'] for item in db.execute('PRAGMA table_info(cameras)').fetchall()} if _backend_is_sqlite() else                    {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='cameras'").fetchall()}
     for analytic_key,column in _SEED_ANALYTIC_COLUMNS:
         if column is not None and column not in camera_columns:
             continue
@@ -2288,6 +2319,32 @@ def seed_explicit_analytics_operations(db) -> int:
                        (row['id'],analytic_key,now,'migration:'+SEED_EXPLICIT_ANALYTICS_OPERATIONS))
             seeded+=1
     return seeded
+
+
+def complete_pending_analytics_seed(db, grants: dict, *, grant_held: bool) -> int:
+    """Edge, deferred part of the one-time upgrade seed: once a VALID analytics document is held (grant_held, even if it
+    grants nothing), write explicit ON for each recorded pair that is still ON (cameras.<flag>=1, no operations row)
+    AND covered by the grant; then clear the list. Before that, nothing happens. Returns the number of rows written."""
+    if not grant_held:
+        return 0
+    try:
+        pending=db.execute('SELECT camera_id,analytic_key FROM analytics_upgrade_seed_pending').fetchall()
+    except Exception:
+        return 0   # no pending table: nothing recorded (cloud DB, or a database created after the upgrade)
+    columns=dict(_EDGE_FLAG_COLUMNS); camera_columns=_camera_columns(db); now=datetime.now().isoformat(); written=0
+    for row in pending:
+        column=columns.get(row['analytic_key'])
+        if not column or column not in camera_columns or row['analytic_key'] not in grants.get(row['camera_id'], frozenset()):
+            continue
+        still_on=db.execute(f"SELECT 1 FROM cameras c WHERE c.id=? AND c.{column}=1 AND COALESCE(c.status,'')!='removed' "
+                            "AND NOT EXISTS(SELECT 1 FROM camera_analytics_operations o WHERE o.camera_id=c.id AND o.analytic_key=?)",
+                            (row['camera_id'],row['analytic_key'])).fetchone()
+        if still_on:
+            db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) VALUES(?,?,1,?,?)",
+                       (row['camera_id'],row['analytic_key'],now,'migration:'+SEED_EXPLICIT_ANALYTICS_OPERATIONS+':deferred'))
+            written+=1
+    db.execute('DELETE FROM analytics_upgrade_seed_pending')
+    return written
 
 
 def _backend_is_sqlite() -> bool:

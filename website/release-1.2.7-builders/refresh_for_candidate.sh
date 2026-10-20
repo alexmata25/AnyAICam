@@ -17,7 +17,7 @@ py -3.11 build_127_pages.py --filename "$FILE" --sha256 "$SHA" --size "$SIZE"
 py -3.11 build_127_home.py --filename "$FILE" --sha256 "$SHA" --size "$SIZE"
 py -3.11 build_127_signup_links.py
 py -3.11 build_127_header.py
-py -3.11 build_127_pricing.py   # 2026-10-17 prices + free phone support (exact-match edits; stops on any mismatch)
+py -3.11 build_127_pricing.py   # 2026-10-17 prices; phone-support promise removed 2026-10-20 (exact-match edits; stops on any mismatch)
 cmp "prepared/public_html/$FILE.sha256" "$DIR/$FILE.sha256" || { echo "STOP: .sha256 differs from Red's"; exit 1; }
 for f in prepared/public_html/*.html; do grep -q "vms-$SHORT" "$f" || [[ "$f" =~ (plans|build-your-system)\.html$ ]] || { echo "STOP: $f lacks the new installer"; exit 1; }; done
 py -3.11 verify_publishable.py | grep -E "old price|phone support|19\.99" && { echo "STOP: pricing check failed"; exit 1; }

@@ -3,7 +3,9 @@
 * Hybrid $19.99 per camera / month (was $24.99). Basic Local $9.99 and AI Local $14.99 are unchanged.
 * One-time VMS software licenses: 8 / 16 / 32 / 64 cameras $24.99 / $37.49 / $62.49 / $99.99
   (were $49.99 / $79.99 / $129.99 / $199.99).
-* "Free remote technical support by phone, Monday through Sunday, during business hours" on all three plans.
+* REMOVED (owner 2026-10-20): the "Free remote technical support by phone ..." line on all three plans. It is no longer
+  added (INCLUDE_PHONE_SUPPORT = False), and remove_phone_support() strips the copies the 10-17 publication put on the
+  live origin pages (exact fragments, exact counts; anything else stops the build).
 * Plan comparison in everyday language (owner request 2026-10-17): remote viewing is included with ALL three plans;
   "Remote cloud services" becomes "Cloud Video Backup" (Hybrid only: event video clips, never continuous
   recording); how long recordings are kept is shown; the AI Local description is clarified.
@@ -13,12 +15,14 @@ Advanced Analytics add-on, hardware, the new 8-camera license) is touched by acc
 stops the build. Hardware, relay and appliance prices are never edited. Re-running is safe (already applied = skip).
 --dry-run transforms in memory and reports, writing nothing.
 """
+import re
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).parent
 OUT = HERE / "prepared" / "public_html"
 SUPPORT = "Free remote technical support by phone, Monday through Sunday, during business hours"
+INCLUDE_PHONE_SUPPORT = False   # owner 2026-10-20: no phone-support promise in RC8 customer-facing content
 LICENSES_OLD = ("$49.99", "$79.99", "$129.99", "$199.99")
 LICENSES_NEW = ("$24.99", "$37.49", "$62.49", "$99.99")
 REMOTE = "Watch your cameras from anywhere using your phone or computer."
@@ -84,9 +88,10 @@ def plans(html, page="plans.html"):
     if STORAGE_NOTE not in html:
         html = replace(html, '<article class="card" id="plan-estimator"',
                        f'<p class="v2-storage-note">{STORAGE_NOTE}</p>\n\n<article class="card" id="plan-estimator"', page=page)
-    for card in ('id="plan-basic-local"', 'id="plan-ai-local"', 'id="plan-hybrid"'):
-        html = insert_in_card(html, card, "</ul>", f'<li class="v2-support">{SUPPORT}</li>\n', page=page)
-    return html
+    if INCLUDE_PHONE_SUPPORT:
+        for card in ('id="plan-basic-local"', 'id="plan-ai-local"', 'id="plan-hybrid"'):
+            html = insert_in_card(html, card, "</ul>", f'<li class="v2-support">{SUPPORT}</li>\n', page=page)
+    return remove_phone_support(html, page)
 
 
 def build_your_system(html, page="build-your-system.html"):
@@ -111,9 +116,10 @@ def build_your_system(html, page="build-your-system.html"):
     html = replace(html, "Everything in AI Local, plus 14-day cloud event retention. Not continuous cloud recording.",
                    "Everything in AI Local, plus Cloud Video Backup: an extra copy of your event video clips, stored online. "
                    "Not continuous cloud recording.", page=page)
-    for plan in ("basic_local", "ai_local", "hybrid"):
-        html = insert_in_card(html, f'name="subscription_plan" value="{plan}"', "</small>", f" {SUPPORT}.", page=page)
-    return html
+    if INCLUDE_PHONE_SUPPORT:
+        for plan in ("basic_local", "ai_local", "hybrid"):
+            html = insert_in_card(html, f'name="subscription_plan" value="{plan}"', "</small>", f" {SUPPORT}.", page=page)
+    return remove_phone_support(html, page)
 
 
 def home(html, page="index.html"):
@@ -128,9 +134,10 @@ def home(html, page="index.html"):
                    "(cloud overflow coming soon)</li>", page=page)
     html = replace(html, "<p>Local VMS with AI-powered detection and smart alerts. Additional analytics modules may be separately licensed.</p>",
                    f"<p>{AI_LOCAL} Additional analytics modules may be separately licensed.</p>", page=page)
-    for plan in ("Basic Local", "AI Local", "Hybrid"):
-        html = insert_in_card(html, f'<div class="aic-price-body"><h3>{plan}</h3>', '<a class="button',
-                              f'<p class="aic-price-support">{SUPPORT}</p>', page=page)
+    if INCLUDE_PHONE_SUPPORT:
+        for plan in ("Basic Local", "AI Local", "Hybrid"):
+            html = insert_in_card(html, f'<div class="aic-price-body"><h3>{plan}</h3>', '<a class="button',
+                                  f'<p class="aic-price-support">{SUPPORT}</p>', page=page)
     # Comparison table, in everyday language: a label plus an explanation line (mobile-friendly, same columns).
     if ".aic-compare-desc{" not in html:
         html = replace(html, MOBILE_CSS, DESC_CSS + MOBILE_CSS, page=page)
@@ -165,7 +172,7 @@ def home(html, page="index.html"):
                   '<td class="aic-col-recommended aic-compare-kept">Up to 7 days</td></tr>')
         html = html[:anchor_end] + kept + html[anchor_end:]
     # Comparison table: one row, included with all three plans (a copy of the all-included "Local VMS" row).
-    if 'class="aic-compare-desc">' + SUPPORT not in html:
+    if INCLUDE_PHONE_SUPPORT and 'class="aic-compare-desc">' + SUPPORT not in html:
         start = html.index('<tr><th scope="row">Local VMS</th>')
         row = html[start:html.index("</tr>", start) + len("</tr>")]
         if row.count('class="aic-yes"') != 3:
@@ -173,6 +180,36 @@ def home(html, page="index.html"):
         anchor = html.index('<tr><th scope="row">Cloud Video Backup<span class="aic-compare-desc">')
         anchor_end = html.index("</tr>", anchor) + len("</tr>")
         html = html[:anchor_end] + row.replace('<th scope="row">Local VMS</th>', _desc("Free phone support", SUPPORT)) + html[anchor_end:]
+    return remove_phone_support(html, page)
+
+
+# Owner 2026-10-20: strip the phone-support promise the 10-17 publication put on the live pages. Exact fragments only,
+# each at exactly its expected count (or already 0, so re-running is safe); anything else stops the build.
+PHONE_FRAGMENTS = {
+    "plans.html": [(f'<li class="v2-support">{SUPPORT}</li>\n', 3)],
+    "build-your-system.html": [(f" {SUPPORT}.", 3)],
+    "index.html": [(f'<p class="aic-price-support">{SUPPORT}</p>', 3)],
+}
+PHONE_ROW = re.compile(r'<tr><th scope="row">Free phone support<span class="aic-compare-desc">' + re.escape(SUPPORT)
+                       + r'</span></th>(?:(?!</tr>).)*</tr>', re.S)
+
+
+def remove_phone_support(html, page):
+    if INCLUDE_PHONE_SUPPORT:
+        return html
+    for fragment, expected in PHONE_FRAGMENTS.get(page, []):
+        found = html.count(fragment)
+        if found not in (0, expected):
+            raise Mismatch(f"{page}: phone-support fragment found {found} times, expected {expected} or 0")
+        html = html.replace(fragment, "")
+    if page == "index.html":
+        rows = PHONE_ROW.findall(html)
+        if len(rows) not in (0, 1):
+            raise Mismatch(f"{page}: phone-support comparison row found {len(rows)} times, expected 1 or 0")
+        html = PHONE_ROW.sub("", html)
+    for leftover in (SUPPORT, "Free phone support", "support by phone"):
+        if leftover in html:
+            raise Mismatch(f"{page}: a phone-support promise remains in an unexpected place")
     return html
 
 
@@ -197,7 +234,7 @@ def main(argv) -> int:
         before = (OUT / name).read_bytes().decode("utf-8")
         after = transform(before)
         results[name] = after
-        print(f"{name}: {'changed' if after != before else 'already applied'}; support lines "
+        print(f"{name}: {'changed' if after != before else 'already applied'}; phone-support lines (must be 0) "
               f"{after.count(SUPPORT)}; '$24.99' left {after.count('$24.99')} (8-camera license / add-ons only)")
     if dry:
         print("DRY RUN: nothing written")

@@ -200,10 +200,7 @@ def snapshot_ttl() -> timedelta:
     return timedelta(hours=min(168, max(1, hours)))
 
 
-PREMIUM_ANALYTICS = ("smart_motion", "people_counting", "lpr", "ppe", "facial_recognition")
-
-
-def appliance_snapshot(appliance: dict, *, now: datetime | None = None, camera_analytics: dict | None = None) -> dict:
+def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
     """The signed entitlement snapshot for one appliance (cloud side; sent
     with its configuration -- see appliance_entitlements.py). Only the paid
     runtime features the appliance runs, each decided from billing for the
@@ -216,12 +213,8 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None, camera_a
     (vms_capacity.py). Same type and version: a 1.2.4 appliance ignores the
     added field.
 
-    camera_analytics (2026-10-19, premium analytics default OFF): {camera_id: [analytic keys]} -- the premium analytics
-    each camera of this appliance is COMMERCIALLY authorized for (paid assignment within purchased seats, or an active
-    Test Lab lease), computed by the configuration route. Not the customer's ON/OFF choice: that stays a separate,
-    explicit operational switch. Always present in what this build signs (empty = nothing authorized), so an appliance
-    of this release denies premium processing for any camera the snapshot does not name. Same type and version: an
-    older appliance ignores the field."""
+    Premium analytics are NOT in this snapshot (since the 168 h design, 2026-10-19): they have their own separately
+    signed document, analytics_entitlement_snapshot() below, so this 24 h snapshot keeps exactly its RC7 shape."""
     import appliance_identity
     import customer_entitlements
     from partner_db import connection
@@ -242,9 +235,6 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None, camera_a
         "features": {TALK_DOWN: customer_entitled(customer_id, TALK_DOWN),
                      VOICE_CALL: customer_entitled(customer_id, VOICE_CALL)},
         "camera_capacity": camera_capacity,
-        "camera_analytics": {str(camera_id): sorted({key for key in keys if key in PREMIUM_ANALYTICS})
-                             for camera_id, keys in sorted((camera_analytics or {}).items())
-                             if isinstance(camera_id, str) and camera_id and isinstance(keys, (list, tuple, set))},
         "issued_at": now.isoformat(), "expires_at": (now + snapshot_ttl()).isoformat(),
     }
     transition = _capacity_identity_transition(appliance, identity)
@@ -252,4 +242,93 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None, camera_a
         body["identity_transition"] = transition
     with connection() as db:
         key = appliance_identity.ensure_signing_key(db)
+    return {**body, "signature": appliance_identity.sign_body(body, key_id=key["key_id"], private_key_b64=key["private_key_b64"])}
+
+
+# ---------------------------------------------------------------- premium analytics: separately signed, 168 h offline
+# Owner 2026-10-19 (design RED-ANALYTICS-OFFLINE-168H-DESIGN-20261019.md, Green F1/F2): premium analytics get their
+# OWN signed document with its own expiry -- never a stretched 24 h snapshot. The Talk Down / Voice Call snapshot above
+# and its TTL are unchanged. The window is a CONSTANT here (not environment-configurable), and the appliance rejects
+# any document whose window exceeds it, so neither cloud nor client configuration can extend authority.
+ANALYTICS_SNAPSHOT_TYPE = "anyaicam.analytics_entitlements"
+ANALYTICS_SNAPSHOT_VERSION = 1
+ANALYTICS_OFFLINE_GRACE = timedelta(hours=168)
+ANALYTICS_MIN_WINDOW = timedelta(minutes=10)   # never shorter than ~10 syncs, so one missed sync never stops analytics
+PREMIUM_ANALYTICS = ("smart_motion", "people_counting", "lpr", "ppe", "facial_recognition")
+
+
+def _epoch_utc(value) -> datetime | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(number, timezone.utc) if number > 0 else None
+
+
+def _iso_utc(value) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+
+
+def analytics_authorization_end(db, customer_id: str | None, camera_analytics: dict, lab_expiries=()) -> datetime | None:
+    """Green F2: the earliest RECORDED end of any authorization in the document, or None. Only data the cloud stores:
+      * Smart Motion is plan-included: an active per-camera v2 plan set to cancel at period end -> current_period_end;
+        a scheduled change to a plan without Smart Motion -> scheduled_at; a legacy camera-slot entitlement set to
+        cancel at period end -> current_period_end;
+      * a Test Lab lease -> its signed expires_at.
+    Paid add-on / per-analytic subscriptions (LPR, PPE, People Counting, Face Access) record no end time, so they
+    never shorten the window (they end by cancellation, which revokes at the next sync). Any read error -> None
+    (the constant window applies; the verifier's cap is unchanged)."""
+    ends: list[datetime] = []
+    for value in lab_expiries or ():
+        parsed = _iso_utc(value)
+        if parsed:
+            ends.append(parsed)
+    try:
+        if customer_id and any("smart_motion" in keys for keys in camera_analytics.values()):
+            import per_camera_billing
+            row = db.execute("SELECT plan_key,status,current_period_end,cancel_at_period_end,scheduled_plan_key,scheduled_at "
+                             "FROM camera_plan_entitlements_v2 WHERE customer_id=?", (customer_id,)).fetchone()
+            if row and row["status"] == "active":
+                if row["cancel_at_period_end"] and _epoch_utc(row["current_period_end"]):
+                    ends.append(_epoch_utc(row["current_period_end"]))
+                scheduled = row["scheduled_plan_key"]
+                if (scheduled and _epoch_utc(row["scheduled_at"]) and
+                        "smart_motion" not in set(per_camera_billing.PLANS.get(scheduled, {}).get("features") or [])):
+                    ends.append(_epoch_utc(row["scheduled_at"]))
+            for legacy in db.execute("SELECT current_period_end FROM customer_entitlements WHERE customer_id=? AND status='active' "
+                                     "AND cancel_at_period_end=1 AND product IN ('camera_slots_local','camera_slots_hybrid')",
+                                     (customer_id,)).fetchall():
+                if _epoch_utc(legacy["current_period_end"]):
+                    ends.append(_epoch_utc(legacy["current_period_end"]))
+    except Exception:
+        logger.exception("feature_entitlements.analytics_end_lookup_failed customer_id=%s", customer_id)
+    return min(ends) if ends else None
+
+
+def analytics_entitlement_snapshot(appliance: dict, camera_analytics: dict, *, lab_expiries=(), now: datetime | None = None) -> dict:
+    """The separately signed premium-analytics document for one appliance (cloud side; sent with every configuration as
+    "analytics_entitlements"). camera_analytics = {camera_id: [premium keys]}: per camera, per feature COMMERCIAL
+    authorization (paid assignment within seats, or an active Test Lab lease) -- never the customer's ON/OFF choice.
+    expires_at = issued_at + 168 h, shortened to the earliest recorded authorization end (never below 10 min)."""
+    import appliance_identity
+    from partner_db import connection
+    now = now or datetime.now(timezone.utc)
+    grants = {str(camera_id): sorted({key for key in keys if key in PREMIUM_ANALYTICS})
+              for camera_id, keys in sorted((camera_analytics or {}).items())
+              if isinstance(camera_id, str) and camera_id and isinstance(keys, (list, tuple, set))}
+    grants = {camera_id: keys for camera_id, keys in grants.items() if keys}
+    expires = now + ANALYTICS_OFFLINE_GRACE
+    with connection() as db:
+        end = analytics_authorization_end(db, appliance.get("customer_id"), grants, lab_expiries)
+        key = appliance_identity.ensure_signing_key(db)
+    if end is not None:
+        expires = max(min(expires, end), now + ANALYTICS_MIN_WINDOW)
+    body = {"type": ANALYTICS_SNAPSHOT_TYPE, "version": ANALYTICS_SNAPSHOT_VERSION,
+            "appliance_id": str(appliance.get("id") or ""), "cloud_id": str(appliance.get("cloud_id") or ""),
+            "customer_id": str(appliance.get("customer_id") or ""),
+            "camera_analytics": grants, "issued_at": now.isoformat(), "expires_at": expires.isoformat()}
     return {**body, "signature": appliance_identity.sign_body(body, key_id=key["key_id"], private_key_b64=key["private_key_b64"])}

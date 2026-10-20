@@ -41,6 +41,11 @@ def edge(tmp_path, monkeypatch):
             db.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,"
                        "enabled,created_at,updated_at) VALUES('sec-1','cust-1','site-1','appl-1','yard','security_line','Back fence','inbound',?,1,?,?)",
                        (json.dumps(LINE), now, now))
+            # Premium analytics default OFF (2026-10-19): the customer has turned Smart Motion and Line Crossing ON
+            # (security lines ride on Line Crossing, Fix 7); licensing itself is covered elsewhere.
+            for key in ("smart_motion", "line_crossing"):
+                db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                           "VALUES('yard',?,1,?,'owner')", (key, now))
             security_modes.store_synced_state(db, "cust-1", "site-1", "away", {"alarm_cooldown_seconds": 600}, None)
         security_rules.reset_state()
         analytics_rules_engine.reset_camera(1)

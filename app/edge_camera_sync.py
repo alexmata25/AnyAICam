@@ -398,6 +398,9 @@ def sync_provisioned_cameras() -> dict:
     if RUNTIME_ROLE == "edge":
         import appliance_entitlements
         appliance_entitlements.store_snapshot(response.get("feature_entitlements"))
+        # Premium analytics (2026-10-19, 168 h design): the separately signed analytics document. Reaching here means a
+        # successful authenticated response, so an absent / invalid / older document CLEARS the stored grant.
+        appliance_entitlements.store_analytics_grant(response.get("analytics_entitlements"))
 
     from partner_db import connection
     now = datetime.now().isoformat()
