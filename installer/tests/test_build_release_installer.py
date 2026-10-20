@@ -112,6 +112,29 @@ class RunGitAutocrlfOverrideTests(unittest.TestCase):
 
 
 class PackagedShellLineEndingGuardTests(unittest.TestCase):
+    def test_linux_runtime_entrypoints_and_service_configs_are_lf_only(self):
+        root = Path(__file__).resolve().parents[2]
+        paths = (
+            "installer/runtime/anyaicam-webrtc-firewall",
+            "installer/runtime/anyaicam-webrtc-firewall.service",
+            "installer/runtime/anyaicam-vms.service",
+            "appliance-agent/system/anyaicam-capacity-accept.service",
+            "appliance-agent/system/anyaicam-privileged-watcher.service",
+            "appliance-agent/systemd/anyaicam-agent.service",
+            "docker-compose.yml",
+        )
+        for relative in paths:
+            with self.subTest(path=relative):
+                result = subprocess.run(
+                    ["git", "check-attr", "eol", "--", relative],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertTrue(result.stdout.rstrip().endswith(": eol: lf"), result.stdout)
+                self.assertNotIn(b"\r", (root / relative).read_bytes())
+
     def test_repository_attributes_force_lf_for_all_shell_scripts(self):
         repo_root = Path(__file__).resolve().parents[2]
         attributes = (repo_root / ".gitattributes").read_text(encoding="utf-8")
