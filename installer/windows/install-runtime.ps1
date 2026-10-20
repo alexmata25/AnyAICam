@@ -7,6 +7,8 @@ param(
     [Parameter(Mandatory=$true)][string]$WheelRoot,
     [Parameter(Mandatory=$true)][string]$FFmpegArchive,
     [Parameter(Mandatory=$true)][string]$MediaMtxArchive,
+    # 1.3.2: the pinned Vosk speech model for Voice Call listening (install-stt-model.ps1).
+    [Parameter(Mandatory=$true)][string]$SttModelArchive,
     [Parameter(Mandatory=$true)][string]$AppVersion,
     # Setup's /PortalUrl=https://... (empty: keep the saved one, else the
     # AnyAiCam cloud); checked by cloud-link.ps1 before anything is written.
@@ -160,6 +162,12 @@ if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $keysetTarget (icac
 & icacls.exe $keysetTarget /reset /C /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Could not apply the trust folder's permissions to $keysetTarget (icacls exit $LASTEXITCODE)." }
 Write-Output 'Entitlement keyset installed in the protected trust folder.'
+# Voice Call listening (1.3.2): the same pinned Vosk speech model as the Linux images, in the protected data root
+# (%ProgramData%\AnyAiCam\models\stt), where the VMS looks by default. Kept when it verifies; replaced when missing,
+# altered or incomplete. Any failure stops the setup (a bundled model that does not verify is a damaged setup).
+. (Join-Path $PSScriptRoot 'install-stt-model.ps1')
+Install-AnyAiCamSttModel -DataRoot $DataRoot -Archive $SttModelArchive -Manifest (Join-Path $PSScriptRoot 'vosk-model-small-en-us-0.15.sha256')
+Assert-AnyAiCamDataRootHasNoLinks $DataRoot
 # Camera capacity fallback (Linux installer step 15) is deliberately NOT migrated on Windows. Windows 1.3.x kept its
 # unsigned capacity in C:\opt\anyaicam\data\config\vms_capacity.json, a folder any signed-in user may modify by
 # default, so that number cannot become a trusted limit. Cameras start after the cloud's first signed capacity

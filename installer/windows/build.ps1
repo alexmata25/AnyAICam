@@ -33,6 +33,8 @@ $pinned = [ordered]@{
     'ffmpeg-8.1.2-essentials_build.zip'     = 'db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec'
     'mediamtx_v1.21.0_windows_amd64.zip'    = '8a58a9b8c25ee99a96c23dc0a17f39ace3072c01d2e148329073c64ddf83493d'
     'vc_redist.x64-14.44.35211.exe'         = 'cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b'
+    # 1.3.2 Voice Call listening: the Linux Dockerfiles' pin (alphacephei.com/vosk/models, Apache-2.0).
+    'vosk-model-small-en-us-0.15.zip'       = '30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498'
 }
 foreach ($file in $pinned.Keys) {
     $path = Join-Path $vendor $file

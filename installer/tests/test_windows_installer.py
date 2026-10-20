@@ -159,7 +159,7 @@ class PinTests(unittest.TestCase):
         pinned = dict(re.findall(r"'([A-Za-z0-9_.\-]+\.(?:zip|py|exe))'\s*=\s*'([0-9a-f]{64})'", build))
         self.assertEqual(set(pinned), {"python-3.12.10-embed-amd64.zip", "get-pip.py", "WinSW-x64.exe",
                                        "ffmpeg-8.1.2-essentials_build.zip", "mediamtx_v1.21.0_windows_amd64.zip",
-                                       "vc_redist.x64-14.44.35211.exe"})
+                                       "vc_redist.x64-14.44.35211.exe", "vosk-model-small-en-us-0.15.zip"})
         for name, digest in pinned.items():
             self.assertIn(digest, deps, name)
 

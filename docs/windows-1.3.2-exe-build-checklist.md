@@ -16,7 +16,7 @@ Owner rule (2026-10-19 / 10-20):
 | 0.5 | Focused Windows suites green on the merge tip (section 3) | **DONE (focused)**: 103/1/0, 99/1/0, 36/0 on the Windows host. Full section 3 (agent suite, installer suite with Inno compile) not rerun |
 | 0.6 | Red's full Linux regression of the shared commits complete with only known environment failures | **DONE for be366f8b** (8163/14/352, all 14 closed by Codex). The Windows tree's own Linux shards are not run |
 | 0.6b | Red's rc8-dev test/LF commits (`ee055c05`) | **not merged** (awaiting Red's final). Trial merge clean; adds no CR failure on the Windows tree |
-| 0.6c | Open product item **W-1**: Voice Call speech-to-text has no Vosk model on Windows | **owner/Codex decision**: bundle the pinned model, or report it unavailable |
+| 0.6c | W-1: Voice Call speech-to-text on Windows | **DONE (Codex re-review)**: the pinned Vosk model (`30f26242…`) is bundled, verified per file, and installed in the protected data root; vendor copy in `installer\windows\vendor\` |
 | 0.7 | Codex independent review of the exact Windows commit: PASS | requested (`CODEX-REVIEW-WINDOWS-1.3.2.md`) |
 | 0.8 | Owner go-ahead for an **unsigned test-candidate** build | owner |
 

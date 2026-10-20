@@ -144,6 +144,14 @@ $app = Join-Path $env:ProgramFiles 'AnyAiCam'
 $data = Join-Path $env:ProgramData 'AnyAiCam'
 Check 'MediaMTX installed' { Test-Path (Join-Path $app 'runtime\tools\mediamtx\mediamtx.exe') }
 Check 'FFmpeg installed' { Test-Path (Join-Path $app 'runtime\tools\ffmpeg\ffmpeg.exe') }
+Check 'Voice Call speech model installed and verified file by file; licence notice present (1.3.2)' {
+    . (Join-Path $app 'installer\install-stt-model.ps1')
+    $spec = Get-AnyAiCamSttManifest (Join-Path $app 'installer\vosk-model-small-en-us-0.15.sha256')
+    $problem = Test-AnyAiCamSttModel (Join-Path $data "models\stt\$($spec.Name)") $spec
+    if ($problem) { throw "speech model: $problem" }
+    if (-not (Test-Path (Join-Path $app 'licenses\vosk-model-small-en-us-0.15-NOTICE.txt'))) { throw 'no licence notice' }
+    "$($spec.Files.Count) files verified"
+}
 Check 'data written under ProgramData, not C:\app' { if (Test-Path 'C:\app') { throw 'C:\app exists' }; if (-not (Test-Path (Join-Path $data 'database\partner_portal.db'))) { throw 'no database under ProgramData' }; 'database under ProgramData' }
 Check 'vms.env has secrets and version' { $e = Get-Content (Join-Path $data 'config\vms.env'); foreach ($k in 'ANYAICAM_APP_SECRETS=', 'ANYAICAM_CAMERA_CREDENTIAL_KEY=', "ANYAICAM_VERSION=$expectedVersion") { if (-not ($e | Where-Object { $_.StartsWith($k) })) { throw "missing $k" } }; 'ok' }
 Check 'data folder: SYSTEM and Administrators only' {

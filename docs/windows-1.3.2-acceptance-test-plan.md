@@ -142,7 +142,7 @@ Result columns are filled in at run time: PASS / FAIL / BLOCKED, plus an evidenc
 | LIC-8 | Reconnect after a revocation | analytic OFF at the first sync | unit PASS; manual |
 | LIC-9 | Capacity snapshot N / N+1, expiry, tamper, other identity | as Linux: refused / limited | AC |
 | LIC-10 | Analytics not available on Windows (LPR without Tesseract, PPE without a model, facial opt-in) | "Not available on this computer"; enable/assign → 409 | manual + unit PASS |
-| LIC-11 | **Voice Call listen (STT)**: open item W-1 | today no Vosk model is installed on Windows, so speech-to-text is unavailable. Expected after W-1 is decided: either works, or is reported unavailable | blocked on W-1 |
+| LIC-11 | **Voice Call listen (STT)** (W-1 resolved: the model is bundled) | the model is in `%ProgramData%\AnyAiCam\models\stt` and verifies file by file; the licence notice is in `{app}\licenses`; a spoken visitor answer during a Voice Call is transcribed; with the model deleted, listening is skipped, and repair restores it | VS (model + notice); host tests: installer 15 cases + real transcription; manual end-to-end call |
 
 ### 3.10 Resilience, security, Software Update
 
