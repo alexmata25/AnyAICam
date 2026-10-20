@@ -145,6 +145,8 @@ def test_a_previous_entry_without_a_valid_amount_is_ignored_never_guessed(monkey
 def test_my_subscription_comparison_shows_the_three_prices():
     import subscription_offers
     table = subscription_offers.plan_comparison_html()
-    for price in ("$9.99/camera/mo", "$14.99/camera/mo", "$19.99/camera/mo"):  # the live build's (9bf3c20) format
+    # RC8 integration (Green 2026-10-20): the 1.2.7 page's format ("$9.99 per camera/month", as
+    # test_my_subscription_v2_offers asserts on this line); the hotfix line tested the live 9bf3c20 format "/camera/mo".
+    for price in ("$9.99 per camera/month", "$14.99 per camera/month", "$19.99 per camera/month"):
         assert price in table, price
     assert "$24.99" not in table
