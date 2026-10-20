@@ -1,10 +1,11 @@
-"""Hybrid repricing and phone support (owner approval 2026-10-17).
+"""Hybrid repricing (owner approval 2026-10-17).
 
-Basic Local $9.99, AI Local $14.99 and Hybrid $19.99 (was $24.99) per camera per month; free remote technical
-support by phone, Monday through Sunday, during business hours, with all three plans. Stripe Prices are immutable:
-new checkouts need the new $19.99 Price (the price guard refuses the old one), while subscriptions still on the
-earlier Hybrid Price stay recognized and are shown at what they are really billed. What existing subscribers pay is
-an open owner decision, so nothing here moves them.
+Basic Local $9.99, AI Local $14.99 and Hybrid $19.99 (was $24.99) per camera per month. Stripe Prices are immutable:
+new checkouts need the new $19.99 Price (the price guard refuses the old one), while subscriptions still on an
+earlier Hybrid Price stay recognized and are shown at what THAT Price bills: ANYAICAM_STRIPE_PRICE_HYBRID_PREVIOUS
+entries carry their own amount ("price_id:cents"), so no swap of values can show a subscriber another Price's amount
+(Codex 2026-10-18). What existing subscribers pay is an open owner decision, so nothing here moves them.
+The unapproved remote-phone-support feature line is NOT part of the pricing-only hotfix (Codex 2026-10-18).
 """
 import pytest
 from fastapi import HTTPException
@@ -17,9 +18,13 @@ OLD, NEW = "price_hybrid_2499_previous", "price_hybrid_1999"
 @pytest.fixture()
 def prices(monkeypatch):
     monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
-    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], OLD)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{OLD}:2499")
     monkeypatch.setenv(billing.PRICE_ENV["ai_local"], "price_ai_1499")
     monkeypatch.setenv(billing.PRICE_ENV["basic_local"], "price_basic_999")
+
+
+BASE = {"plan_key": "hybrid", "camera_quantity": 4, "status": "active", "cloud_event_storage": 1,
+        "cloud_event_retention_days": 14, "local_retention_days": 7}
 
 
 def test_the_three_per_camera_prices():
@@ -33,14 +38,11 @@ def test_hybrid_monthly_totals_for_1_4_and_10_cameras(cameras, monthly_cents):
     assert build_orders.order_quote({"plan": "hybrid", "cameras": cameras})["monthly_cents"] == monthly_cents
 
 
-def test_free_phone_support_is_included_with_every_plan_with_the_same_wording():
-    label = "Free remote technical support by phone, Monday through Sunday, during business hours"
-    assert billing.REMOTE_PHONE_SUPPORT == label
-    catalog = billing.public_catalog()
+def test_no_plan_gains_a_feature_in_the_pricing_only_hotfix():
+    assert "remote_phone_support" not in billing.FEATURE_LABELS
+    assert not hasattr(billing, "REMOTE_PHONE_SUPPORT")
     for key, plan in billing.PLANS.items():
-        assert "remote_phone_support" in plan["features"], key
-    for plan in catalog["plans"]:
-        assert {"key": "remote_phone_support", "label": label} in plan["included_features"], plan["plan_key"]
+        assert "remote_phone_support" not in plan["features"], key
 
 
 def test_hybrid_keeps_every_cloud_feature_and_retention():
@@ -82,55 +84,69 @@ def test_a_previous_price_is_never_offered_for_a_new_purchase(prices):
 
 def test_the_same_price_id_as_current_and_previous_is_refused(monkeypatch):
     monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
-    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{NEW}:1999")
     assert billing.resolve_price(NEW) is None  # ambiguous configuration fails closed
 
 
 def test_my_subscription_shows_what_each_subscriber_is_really_billed(prices):
-    base = {"plan_key": "hybrid", "camera_quantity": 4, "status": "active", "cloud_event_storage": 1,
-            "cloud_event_retention_days": 14, "local_retention_days": 7}
-    previous = billing.entitlement_payload({**base, "stripe_price_id": OLD})
+    previous = billing.entitlement_payload({**BASE, "stripe_price_id": OLD})
     assert (previous["monthly_per_camera_amount"], previous["monthly_base_total"], previous["previous_price"]) == (24.99, 99.96, True)
-    current = billing.entitlement_payload({**base, "stripe_price_id": NEW})
+    current = billing.entitlement_payload({**BASE, "stripe_price_id": NEW})
     assert (current["monthly_per_camera_amount"], current["monthly_base_total"], current["previous_price"]) == (19.99, 79.96, False)
-    assert {"key": "remote_phone_support", "label": billing.REMOTE_PHONE_SUPPORT} in current["included_features"]
 
 
-def test_my_subscription_comparison_and_inclusions_show_the_prices_and_phone_support_for_all_three_plans():
+def test_each_previous_price_carries_its_own_amount(monkeypatch):
+    """Several earlier Prices with different amounts: each subscriber sees exactly what their own Price bills."""
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{OLD}:2499, price_hybrid_2999_older:2999")
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": OLD}) == 2499
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": "price_hybrid_2999_older"}) == 2999
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": NEW}) == 1999
+
+
+def test_conflicting_duplicate_previous_price_id_is_ignored_fail_closed(monkeypatch):
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{OLD}:2499,{OLD}:2999")
+    assert OLD not in billing.previous_prices("hybrid")
+    assert billing.resolve_price(OLD) is None
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": OLD}) is None
+    payload = billing.entitlement_payload({**BASE, "stripe_price_id": OLD})
+    assert payload["billing_amount_unknown"] is True
+    assert payload["monthly_per_camera_amount"] is None
+    assert payload["monthly_base_total"] is None
+
+
+def test_unknown_historical_price_is_not_misreported_as_current(monkeypatch):
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], "")
+    payload = billing.entitlement_payload({**BASE, "stripe_price_id": "price_unmapped_older"})
+    assert payload["billing_amount_unknown"] is True
+    assert payload["monthly_per_camera_amount"] is None
+
+
+def test_previous_entries_never_swap_meaning(monkeypatch):
+    """Even if the env values were swapped (NEW listed as previous), a NEW subscriber is shown $19.99 -- the amount
+    recorded with that ID -- never the old $24.99 (Codex 2026-10-18: rollback must not swap the two meanings)."""
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], OLD)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], f"{NEW}:1999")
+    assert billing.billed_cents_per_camera({**BASE, "stripe_price_id": NEW}) == 1999
+    assert billing.resolve_price(NEW)["monthly_cents_per_camera"] == 1999
+
+
+@pytest.mark.parametrize("entry", ["price_hybrid_2499_previous", "price_x:", "price_x:abc", "price_x:0", "notaprice:2499",
+                                   "price_x:99999999"])
+def test_a_previous_entry_without_a_valid_amount_is_ignored_never_guessed(monkeypatch, entry):
+    monkeypatch.setenv(billing.PRICE_ENV["hybrid"], NEW)
+    monkeypatch.setenv(billing.PREVIOUS_PRICE_ENV["hybrid"], entry)
+    assert billing.previous_prices("hybrid") == {}
+    assert billing.resolve_price(entry.split(":")[0]) is None
+
+
+def test_my_subscription_comparison_shows_the_three_prices():
     import subscription_offers
     table = subscription_offers.plan_comparison_html()
+    # RC8 integration (Green 2026-10-20): the 1.2.7 page's format ("$9.99 per camera/month", as
+    # test_my_subscription_v2_offers asserts on this line); the hotfix line tested the live 9bf3c20 format "/camera/mo".
     for price in ("$9.99 per camera/month", "$14.99 per camera/month", "$19.99 per camera/month"):
         assert price in table, price
     assert "$24.99" not in table
-    row = table.split(billing.REMOTE_PHONE_SUPPORT, 1)[1].split("</tr>", 1)[0]
-    assert row.count("<td>✓</td>") == 3  # included with Basic Local, AI Local and Hybrid
-    for key in billing.PLANS:
-        assert f'data-included="{billing.REMOTE_PHONE_SUPPORT}"' in subscription_offers.plan_inclusions_html(key), key
-
-
-def test_the_plan_comparison_says_every_plan_watches_remotely_and_only_hybrid_has_cloud_video_backup():
-    """Owner request 2026-10-17: everyday wording; remote viewing is not a Hybrid feature."""
-    import subscription_offers
-    table = subscription_offers.plan_comparison_html()
-
-    def row(label):
-        return table.split(label, 1)[1].split("</tr>", 1)[0]
-    assert row("Remote viewing: watch your cameras from anywhere using your phone or computer").count("<td>✓</td>") == 3
-    backup = row("Cloud Video Backup: an extra copy of your event video clips, stored online")
-    assert backup.count("<td>✓</td>") == 1 and backup.count("Not included") == 2
-    assert "Remote cloud services" not in table and "Remote viewing where supported" not in table
-
-
-def test_no_customer_facing_14_day_cloud_promise_while_the_expiry_is_not_enforced():
-    """Owner 2026-10-17: the S3 lifecycle check showed no 14-day expiry is enforced (clips are kept), so the portal must
-    not promise 14 days. Wording only -- the plan's configured value and every retention mechanism are unchanged."""
-    import re
-    import order_funnel
-    import subscription_offers
-    assert billing.PLANS["hybrid"]["cloud_event_retention_days"] == 14  # configuration untouched
-    lines, notes = order_funnel._order_lines({"plan": "hybrid", "cameras": 4})
-    pages = [subscription_offers.plan_comparison_html(), subscription_offers.plan_inclusions_html("hybrid"), lines + notes,
-             " ".join(billing.FEATURE_LABELS.values())]
-    for html in pages:
-        assert not re.search(r"14[- ]day|14 days", html), html[:200]
-    assert "event clips stored online" in subscription_offers.plan_inclusions_html("hybrid")
