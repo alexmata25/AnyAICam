@@ -25,6 +25,10 @@ PPE_MODEL_PATH = os.environ.get(
     platform_paths.native_path("/opt/anyaicam-ppe-model/yolov8n-ppe.pt", "models", "ppe", "yolov8n-ppe.pt"))
 
 RULE_ANALYTICS = ("line_crossing", "intrusion", "loitering")
+# Whether this process applies the Windows availability rules (True only on Windows). The test suite turns it off for
+# the platform-independent licensing tests run on a Windows host (tests/conftest.py); tests of the rules themselves
+# pass windows=True.
+ENFORCED = platform_paths.WINDOWS
 
 
 def _switch(name: str, default: str) -> bool:
@@ -45,7 +49,7 @@ def _tesseract_installed() -> bool:
 
 def unavailable_reason(analytic_key: str, *, windows: bool | None = None) -> str | None:
     """Why this analytic cannot run on this computer, or None when it can (always None on Linux)."""
-    if not (platform_paths.WINDOWS if windows is None else windows):
+    if not (ENFORCED if windows is None else windows):
         return None
     if analytic_key in ("smart_motion", *RULE_ANALYTICS) and not _switch("ANYAICAM_SMART_MOTION_ENABLED", "true"):
         return "Smart Motion is turned off on this computer."
