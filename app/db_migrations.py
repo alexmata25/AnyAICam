@@ -2137,6 +2137,11 @@ def apply_migrations():
         camera_columns_now=_columns('cameras')
         if camera_columns_now and 'former_camera_number' not in camera_columns_now:
             db.execute('ALTER TABLE cameras ADD COLUMN former_camera_number INTEGER')
+        # Manual camera add by IP address (CAM-5, 2026-10-20): a discovery job
+        # may target one customer-entered LAN address; cleared when the job ends.
+        scan_job_columns=_columns('camera_scan_jobs')
+        if scan_job_columns and 'target_ip' not in scan_job_columns:
+            db.execute('ALTER TABLE camera_scan_jobs ADD COLUMN target_ip TEXT')
         # Measured stream geometry (2026-10-11, video_profile.py /
         # camera_video_probe.py): what the appliance measured on the camera's
         # main and analytics streams, reported with the camera status.

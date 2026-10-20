@@ -103,29 +103,79 @@ def scan(networks=None,max_hosts=1024):
         addresses.extend(list(network.hosts())[:max(0,max_hosts-len(addresses))])
         if len(addresses)>=max_hosts: break
     addresses=list({str(item) for item in addresses}|set(onvif)); results=[]
-    def inspect(ip):
-        # Which RTSP port answered, not only whether one did (2026-10-04):
-        # verification must test the port the camera actually serves.
-        rtsp_port=554 if _port(ip,554) else (8554 if _port(ip,8554) else None); rtsp=rtsp_port is not None
-        onvif_info=onvif.get(ip,{}); scopes=onvif_info.get('scopes',''); onvif_supported=bool(scopes) or _port(ip,80) or _port(ip,8000)
-        if not rtsp and not scopes: return None
-        mac=arp.get(ip,'Unknown')
-        # Stable device identity, preferred in this order: the device's
-        # own ONVIF endpoint UUID (survives reboot/DHCP renewal, and is
-        # already a protocol-visible identifier, not raw LAN topology)
-        # > a hash of its MAC address (tied to the NIC, not the lease --
-        # stable across DHCP renewal -- but the raw MAC itself must
-        # never leave the LAN, matching every other 'mac'/'mac_address'
-        # field this same module already treats as forbidden once
-        # results reach the cloud, so only its hash crosses that
-        # boundary) > a hash of its current IP (last resort -- doesn't
-        # survive a DHCP renewal since the input itself changes, but
-        # still never sends a raw IP to the cloud).
-        if onvif_info.get('endpoint'): device_key=onvif_info['endpoint']
-        elif mac!='Unknown': device_key='mac-'+hashlib.sha256(mac.lower().encode()).hexdigest()[:32]
-        else: device_key='ip-'+hashlib.sha256(ip.encode()).hexdigest()[:32]
-        return {'id':'camera-'+ip.replace('.','-'),'device_key':device_key,'name':'Camera '+ip,'ip':ip,'manufacturer':_scope_value(scopes,'manufacturer'),'model':_scope_value(scopes,'model'),'mac_address':mac,'onvif_support':onvif_supported,'rtsp_support':rtsp,'rtsp_port':rtsp_port,'connection_status':'reachable','online':True,'recording':False,'analytics':False,'last_recording_at':None,'last_error':None}
     with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
-        for item in pool.map(inspect,addresses):
+        for item in pool.map(lambda ip:_inspect(ip,onvif,arp),addresses):
             if item: results.append(item)
     return sorted(results,key=lambda item:ipaddress.ip_address(item['ip']))
+
+
+# Manual camera add by IP address (CAM-5, 2026-10-20): the customer may name one
+# camera address when automatic discovery cannot see it (another subnet, or no
+# WS-Discovery). Only a LAN address is ever probed -- the same private ranges the
+# cloud accepts for a camera reconnect (appliance_cloud.RECONNECT_LOCAL_NETWORKS),
+# IPv4 only -- never loopback, multicast, unspecified or a public address.
+MANUAL_TARGET_NETWORKS=tuple(ipaddress.ip_network(item) for item in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16','100.64.0.0/10'))
+
+
+def manual_target(value):
+    # The validated IPv4 address string, or None. No host names: a name
+    # could resolve anywhere, an address literal cannot.
+    try: address=ipaddress.IPv4Address(str(value or '').strip())
+    except (ipaddress.AddressValueError,ValueError): return None
+    if address.is_loopback or address.is_multicast or address.is_unspecified or address.is_reserved: return None
+    if not any(address in network for network in MANUAL_TARGET_NETWORKS): return None
+    return str(address)
+
+
+def _onvif_probe_host(ip,timeout=2):
+    # Unicast WS-Discovery Probe to one address (port 3702): the same
+    # message _onvif_probe() multicasts, answered only by that host.
+    message=f'''<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header><w:MessageID>uuid:{uuid.uuid4()}</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>'''.encode(); sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); sock.settimeout(.25)
+    try:
+        sock.sendto(message,(ip,3702)); end=__import__('time').time()+timeout
+        while __import__('time').time()<end:
+            try: data,address=sock.recvfrom(65535)
+            except socket.timeout: continue
+            if address[0]!=ip: continue
+            text=data.decode(errors='ignore'); scopes=' '.join(re.findall(r'<[^>]*Scopes[^>]*>(.*?)</',text,re.I))
+            return {ip:{'scopes':scopes,'endpoint':_endpoint_uuid(text)}}
+    except OSError: pass
+    finally: sock.close()
+    return {}
+
+
+def probe_host(ip):
+    # One camera at one LAN address, as the SAME record scan() builds for
+    # it (same RTSP/ONVIF checks, same device_key precedence), marked
+    # manual_target so verification can find it again by address when a full
+    # scan cannot. None when the address is refused or no camera answers.
+    ip=manual_target(ip)
+    if not ip: return None
+    onvif=_onvif_probe_host(ip); _port(ip,554,timeout=1)  # wakes the ARP entry before it is read
+    record=_inspect(ip,onvif,arp_table(),timeout=1)
+    if record: record['manual_target']=True
+    return record
+
+
+def _inspect(ip,onvif,arp,timeout=.25):
+    # Which RTSP port answered, not only whether one did (2026-10-04):
+    # verification must test the port the camera actually serves.
+    rtsp_port=554 if _port(ip,554,timeout) else (8554 if _port(ip,8554,timeout) else None); rtsp=rtsp_port is not None
+    onvif_info=onvif.get(ip,{}); scopes=onvif_info.get('scopes',''); onvif_supported=bool(scopes) or _port(ip,80,timeout) or _port(ip,8000,timeout)
+    if not rtsp and not scopes: return None
+    mac=arp.get(ip,'Unknown')
+    # Stable device identity, preferred in this order: the device's
+    # own ONVIF endpoint UUID (survives reboot/DHCP renewal, and is
+    # already a protocol-visible identifier, not raw LAN topology)
+    # > a hash of its MAC address (tied to the NIC, not the lease --
+    # stable across DHCP renewal -- but the raw MAC itself must
+    # never leave the LAN, matching every other 'mac'/'mac_address'
+    # field this same module already treats as forbidden once
+    # results reach the cloud, so only its hash crosses that
+    # boundary) > a hash of its current IP (last resort -- doesn't
+    # survive a DHCP renewal since the input itself changes, but
+    # still never sends a raw IP to the cloud).
+    if onvif_info.get('endpoint'): device_key=onvif_info['endpoint']
+    elif mac!='Unknown': device_key='mac-'+hashlib.sha256(mac.lower().encode()).hexdigest()[:32]
+    else: device_key='ip-'+hashlib.sha256(ip.encode()).hexdigest()[:32]
+    return {'id':'camera-'+ip.replace('.','-'),'device_key':device_key,'name':'Camera '+ip,'ip':ip,'manufacturer':_scope_value(scopes,'manufacturer'),'model':_scope_value(scopes,'model'),'mac_address':mac,'onvif_support':onvif_supported,'rtsp_support':rtsp,'rtsp_port':rtsp_port,'connection_status':'reachable','online':True,'recording':False,'analytics':False,'last_recording_at':None,'last_error':None}

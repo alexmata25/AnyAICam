@@ -143291,7 +143291,7 @@ def _catalog_local_recordings_for_camera(camera_id: str, *, budget_seconds: floa
 
     with connection() as db:
         camera = db.execute(
-            "SELECT id, customer_id, site_id, appliance_id, camera_number "
+            "SELECT id, customer_id, site_id, appliance_id, COALESCE(camera_number, former_camera_number) AS camera_number "
             "FROM cameras WHERE id=?",
             (camera_id,),
         ).fetchone()
@@ -143799,7 +143799,7 @@ def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
     from partner_db import connection
     with connection() as db:
         row = db.execute(
-            "SELECT r.s3_key, c.camera_number "
+            "SELECT r.s3_key, COALESCE(c.camera_number, c.former_camera_number) AS camera_number "
             "FROM recordings r "
             "JOIN cameras c ON c.id=r.camera_id "
             "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
@@ -143826,6 +143826,51 @@ def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
     return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
 
 
+def _customer_removed_playback_cameras(request: Request) -> list[dict] | None:
+    """CAM-R2 (2026-10-20): this identity's own REMOVED cameras whose
+    recordings are kept, for read-only Playback history. Removing a camera
+    keeps its row, recordings and events (DELETE /api/customer/cameras/{id})
+    but clears camera_number, so _customer_playback_cameras() -- and with it
+    every Playback route -- could no longer reach that kept history. The
+    appliance stores the files under the camera's ORIGINAL number
+    (former_camera_number, never given to another camera), which is the
+    number returned here. Same identity and viewer can_playback scoping as
+    _customer_playback_cameras(); returns None for a non-customer caller.
+    Deliberately a separate list: dashboards, analytics, live view and the
+    assistant keep using _customer_playback_cameras() and never see these."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            found = db.execute(
+                "SELECT id, name, former_camera_number AS camera_number FROM cameras "
+                "WHERE customer_id=? AND status='removed' AND camera_number IS NULL AND former_camera_number IS NOT NULL "
+                "ORDER BY former_camera_number, id",
+                (identity["customer_id"],),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            found = db.execute(
+                "SELECT c.id, c.name, c.former_camera_number AS camera_number FROM cameras c "
+                "JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? "
+                "WHERE c.customer_id=? AND p.can_playback=1 AND c.status='removed' AND c.camera_number IS NULL "
+                "AND c.former_camera_number IS NOT NULL ORDER BY c.former_camera_number, c.id",
+                (user["id"], identity["customer_id"]),
+            ).fetchall()
+    return [{**dict(camera), "removed": True} for camera in found]
+
+
 def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
     """Shared authorization check for the two bounded-Playback API
     routes below -- reuses _customer_playback_cameras() exactly, the
@@ -143836,6 +143881,19 @@ def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
     if cameras is None:
         return False
     return camera_id in {camera["id"] for camera in cameras}
+
+
+def _customer_history_camera_id(request: Request, camera_id: str) -> bool:
+    """CAM-R2 (2026-10-20): authorization for READ-ONLY history routes
+    (recording/event lists, media, thumbnails). Everything
+    _customer_authorized_camera_id() allows, plus this identity's own
+    removed cameras whose recordings are kept -- see
+    _customer_removed_playback_cameras(). Live, clip creation and every
+    other route keep _customer_authorized_camera_id() and never reach a
+    removed camera."""
+    if _customer_authorized_camera_id(request, camera_id):
+        return True
+    return camera_id in {camera["id"] for camera in (_customer_removed_playback_cameras(request) or [])}
 
 
 @app.post("/api/customer/clips")
@@ -143917,7 +143975,7 @@ def customer_clip_status(job_id: str, request: Request) -> dict:
 
 @app.get("/api/customer/recordings/{camera_id}")
 def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, before_id: str | None = None, near: str | None = None, date: str | None = None, day_start_utc: str | None = None, day_end_utc: str | None = None, limit: int = 50) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     # date= is a distinct, whole-day query mode -- returns every segment
     # overlapping that customer-local calendar date, chronologically,
@@ -143968,14 +144026,14 @@ def customer_recordings_metadata(camera_id: str, request: Request, before: str |
 
 @app.get("/api/customer/recordings/{camera_id}/dates")
 def customer_recording_dates(camera_id: str, request: Request) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     return {"dates": _customer_recording_dates(camera_id)}
 
 
 @app.get("/api/customer/recordings/{camera_id}/{recording_id}/url")
 def customer_recording_url(camera_id: str, recording_id: str, request: Request) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     url = _customer_recording_url(camera_id, recording_id)
     if not url:
@@ -144059,7 +144117,7 @@ def _log_event_media_fetch(media_id: str, source: str, bytes_served: int, outcom
 
 @app.get("/api/customer/events/{camera_id}/{event_id}/media/url")
 def customer_event_media_url(camera_id: str, event_id: str, request: Request) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     # Cheap, no-network eligibility check only -- the real fetch-with-
@@ -144105,7 +144163,7 @@ def customer_event_media_direct(camera_id: str, event_id: str, request: Request)
     no directory browsing, no session. And it never trusts a 200 alone --
     response_looks_like_real_video() must also agree before this is ever
     logged or served as a real success."""
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     import appliance_media_fetch
@@ -144181,7 +144239,7 @@ def customer_event_media_download(camera_id: str, event_id: str, request: Reques
     a URL presigned with ResponseContentDisposition=attachment. The same
     customer camera authorization as /media/url and /media/direct, checked
     on every request; the clip is looked up scoped to that camera."""
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     row = _event_media_direct_row(camera_id, event_id)
     if not row:
@@ -144371,7 +144429,7 @@ def _card_thumbnail_bytes(s3_key: str) -> bytes | None:
 
 @app.get("/api/customer/events/{camera_id}/{event_id}/thumbnail")
 def customer_event_thumbnail(camera_id: str, event_id: str, request: Request, size: str = ""):
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     key = _customer_event_thumbnail_s3_key(camera_id, event_id)
@@ -144698,14 +144756,14 @@ def customer_recording_media(camera_id: str, recording_id: str, request: Request
     path fails for any reason (network blip, ffmpeg error, role/bucket
     not configured), this fails open to the original redirect-to-
     presigned-URL behavior rather than returning a dead player."""
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     from partner_db import connection
 
     with connection() as db:
         row = db.execute(
-            "SELECT r.s3_key, c.camera_number "
+            "SELECT r.s3_key, COALESCE(c.camera_number, c.former_camera_number) AS camera_number "
             "FROM recordings r "
             "JOIN cameras c ON c.id=r.camera_id "
             "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
@@ -144748,14 +144806,14 @@ def customer_recording_media(camera_id: str, recording_id: str, request: Request
 
 @app.get("/api/customer/recordings/{camera_id}/{recording_id}/local")
 def customer_recording_local(camera_id: str, recording_id: str, request: Request):
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     from partner_db import connection
 
     with connection() as db:
         row = db.execute(
-            "SELECT r.s3_key, c.camera_number "
+            "SELECT r.s3_key, COALESCE(c.camera_number, c.former_camera_number) AS camera_number "
             "FROM recordings r "
             "JOIN cameras c ON c.id=r.camera_id "
             "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
@@ -144790,14 +144848,14 @@ def customer_recording_local(camera_id: str, recording_id: str, request: Request
 
 @app.get("/api/customer/recordings/{camera_id}/{recording_id}/thumbnail")
 def customer_recording_thumbnail(camera_id: str, recording_id: str, request: Request):
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     from partner_db import connection
 
     with connection() as db:
         row = db.execute(
-            "SELECT r.s3_key, c.camera_number "
+            "SELECT r.s3_key, COALESCE(c.camera_number, c.former_camera_number) AS camera_number "
             "FROM recordings r "
             "JOIN cameras c ON c.id=r.camera_id "
             "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
@@ -144982,7 +145040,7 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
     returns -- callers/frontend code don't need to know which query
     produced it."""
     limit = max(1, min(200, int(limit)))
-    if camera_id is not None and not _customer_authorized_camera_id(request, camera_id):
+    if camera_id is not None and not _customer_history_camera_id(request, camera_id):
         return None
     from partner_portal import partner_identity
     identity = partner_identity(request)
@@ -145099,7 +145157,7 @@ def customer_events_recent_for_camera(camera_id: str, request: Request) -> dict:
 
 @app.get("/api/customer/events/{camera_id}")
 def customer_camera_events(camera_id: str, request: Request, date: str | None = None) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
+    if not _customer_history_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
     # that constant's own comment.
@@ -147402,7 +147460,11 @@ def playback(request: Request, response: Response) -> str:
 
     _customer_cameras = _customer_playback_cameras(request)
     if _customer_cameras is not None:
-        return _render_customer_playback(_customer_cameras, request)
+        # CAM-R2 (2026-10-20): a removed camera's kept recordings stay
+        # watchable, read-only, after the active cameras.
+        _removed_cameras = [{**camera, "name": f"{camera.get('name') or 'Camera'} (removed)"}
+                            for camera in (_customer_removed_playback_cameras(request) or [])]
+        return _render_customer_playback([*_customer_cameras, *_removed_cameras], request)
 
     camera_numbers = list(get_camera_numbers())
 

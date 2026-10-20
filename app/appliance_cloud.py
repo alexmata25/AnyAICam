@@ -2024,7 +2024,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
     def secure_scan_jobs(request: Request,cloud_id: str) -> dict:
         appliance=authenticate_appliance(request)
         if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
-        jobs=rows("SELECT id,status,created_at FROM camera_scan_jobs WHERE appliance_id=? AND status IN ('queued','waiting_for_appliance') ORDER BY created_at",(appliance['id'],))
+        jobs=rows("SELECT id,status,created_at,target_ip FROM camera_scan_jobs WHERE appliance_id=? AND status IN ('queued','waiting_for_appliance') ORDER BY created_at",(appliance['id'],))
+        # target_ip (CAM-5): present only on a customer's manual add-by-address job.
+        jobs=[{key:value for key,value in job.items() if key!='target_ip' or value} for job in jobs]
         with connection() as db:
             for job in jobs: db.execute("UPDATE camera_scan_jobs SET status='running',progress=5,message='Appliance accepted discovery job.',updated_at=? WHERE id=?",(datetime.now().isoformat(),job['id']))
         return {'jobs':jobs}
@@ -2039,6 +2041,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if status not in {'running','complete','error'}: raise HTTPException(status_code=400,detail='Unsupported discovery status.')
         with connection() as db:
             db.execute('UPDATE camera_scan_jobs SET status=?,progress=?,results_json=?,message=?,updated_at=? WHERE id=?',(status,progress,json.dumps(results),str(payload.get('message','Discovery update received.'))[:500],datetime.now().isoformat(),job_id))
+            # The customer-entered LAN address is kept only while the job runs (CAM-5).
+            if status in {'complete','error'}: db.execute('UPDATE camera_scan_jobs SET target_ip=NULL WHERE id=?',(job_id,))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.discovery_result','camera_scan_job',job_id,{'status':status,'count':len(results)}); return {'message':'Discovery result accepted; no camera records created until explicit binding.'}
 
     # ---- Camera provisioning (appliance side). Re-homed here from the
