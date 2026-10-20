@@ -85,7 +85,7 @@ def facial_recognition_fires_one_match(monkeypatch):
 
     monkeypatch.setattr(
         main.facial_events, "record_facial_events",
-        lambda db, *, camera_number, appliance_id, person_crop_bgr, now, relay_provider=None: [
+        lambda db, *, camera_number, appliance_id, person_crop_bgr, now, event_time=None, relay_provider=None: [
             {
                 "id": "aac-evt-1",
                 "confidence": 0.95,

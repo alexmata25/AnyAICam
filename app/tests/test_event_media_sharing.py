@@ -181,9 +181,12 @@ def test_link_never_points_an_event_at_itself():
 
 # ------------------------------------------------ save_yolo_events(): PPE and Facial Recognition
 
-def _person_scan():
-    return {"detections": [{"x": 10, "y": 10, "width": 40, "height": 40, "class_name": "person", "confidence": 0.9}],
-            "frame": np.zeros((120, 160, 3), dtype=np.uint8)}
+def _person_scan(frame_captured_at=None):
+    result = {"detections": [{"x": 10, "y": 10, "width": 40, "height": 40, "class_name": "person", "confidence": 0.9}],
+              "frame": np.zeros((120, 160, 3), dtype=np.uint8)}
+    if frame_captured_at is not None:
+        result["frame_captured_at"] = frame_captured_at   # a datetime, as _read_hls_analytics_frame / the shared live frame supply it
+    return result
 
 
 @pytest.fixture
@@ -215,6 +218,7 @@ def scan(monkeypatch, tmp_path, pipeline, background_loop):
     # bf05889); this scenario needs the person event, so the camera has it on.
     identity = {"ppe_enabled": False, "smart_motion_enabled": True, "cloud_recording_mode": "motion"}
     faces = {"on": False, "next": 0}
+    facial_call_times = []
     # 2026-10-17: facial recognition runs only for an authorized camera with the appliance switch on.
     monkeypatch.setattr(main.recording_uploader, "_camera_identity",
                         lambda camera: dict(identity, facial_recognition_enabled=faces["on"]))
@@ -232,6 +236,7 @@ def scan(monkeypatch, tmp_path, pipeline, background_loop):
     monkeypatch.setattr("database_backend.connect", fake_connect)
 
     def record_facial_events(db, **kwargs):
+        facial_call_times.append((kwargs.get("now"), kwargs.get("event_time")))
         faces["next"] += 1
         return [{"id": f"fevt_{faces['next']}", "confidence": 0.9, "match_state": "recognized", "matched_person_id": "p",
                  "matched_person_name": "Ana", "matched_watchlist_id": None, "matched_watchlist_name": None,
@@ -240,15 +245,15 @@ def scan(monkeypatch, tmp_path, pipeline, background_loop):
     monkeypatch.setattr(main.facial_events, "record_facial_events", record_facial_events)
     monkeypatch.setattr(main.aac_voice_call_events if hasattr(main, "aac_voice_call_events") else main, "is_entrance_camera", lambda *a, **k: False, raising=False)
 
-    def run(camera=7, at=None):
+    def run(camera=7, at=None, frame_at=None):
         if at is not None:
             monkeypatch.setattr(main, "datetime", types.SimpleNamespace(now=lambda: at, fromisoformat=datetime.fromisoformat))
         done = threading.Event()
-        threading.Thread(target=lambda: (main.save_yolo_events(camera, _person_scan()), done.set())).start()
+        threading.Thread(target=lambda: (main.save_yolo_events(camera, _person_scan(frame_at)), done.set())).start()
         assert done.wait(5)
         return events
 
-    return types.SimpleNamespace(run=run, events=events, identity=identity, faces=faces, calls=pipeline)
+    return types.SimpleNamespace(run=run, events=events, identity=identity, faces=faces, calls=pipeline, facial_call_times=facial_call_times)
 
 
 def _of(events, event_type):
@@ -272,6 +277,40 @@ def test_facial_recognition_in_the_clip_building_scan_reuses_it(scan):
     assert face["media_parent_event_id"] == person["id"]
     assert _wait_until(lambda: len(scan.calls.shared) == 1)
     assert [u["event_id"] for u in scan.calls.uploads] == [person["id"]]
+
+
+def test_facial_child_uses_frame_time_when_processing_lags(scan):
+    scan.faces["on"] = True
+    processing_time = datetime(2026, 10, 18, 12, 0, 20)
+    frame_time = processing_time - timedelta(seconds=20)
+    events = scan.run(at=processing_time, frame_at=frame_time)
+    face = _of(events, "facial_recognition")[0]
+
+    assert face["timestamp"] == frame_time.isoformat()
+    assert scan.facial_call_times == [(processing_time, frame_time)]
+
+
+def test_facial_child_accepts_a_text_frame_time_at_the_input_boundary(scan):
+    """Red 2026-10-18: an ISO-text frame time (the form 5c5971c1's first test used) once killed the worker thread with
+    TypeError str > datetime in detection_timing. It is now normalized at the boundary: same result as a datetime."""
+    scan.faces["on"] = True
+    processing_time = datetime(2026, 10, 18, 12, 0, 20)
+    frame_time = processing_time - timedelta(seconds=20)
+    events = scan.run(at=processing_time, frame_at=frame_time.isoformat())
+    face = _of(events, "facial_recognition")[0]
+
+    assert face["timestamp"] == frame_time.isoformat()
+    assert scan.facial_call_times == [(processing_time, frame_time)]
+
+
+def test_unparseable_frame_time_falls_back_to_processing_time_without_crashing(scan):
+    scan.faces["on"] = True
+    processing_time = datetime(2026, 10, 18, 12, 0, 20)
+    events = scan.run(at=processing_time, frame_at="not-a-time")
+    face = _of(events, "facial_recognition")[0]
+
+    assert face["timestamp"] == processing_time.isoformat()
+    assert scan.facial_call_times == [(processing_time, processing_time)]
 
 
 def test_facial_recognition_later_in_the_activity_shares_its_clip(scan, monkeypatch):

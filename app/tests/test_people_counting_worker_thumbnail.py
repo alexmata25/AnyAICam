@@ -182,6 +182,35 @@ def test_multiple_crossings_in_one_cycle_share_one_thumbnail_not_one_each(monkey
     assert len(saved_files) == 1, f"expected exactly one thumbnail file for one detection cycle, got {len(saved_files)}"
 
 
+def test_people_counting_event_timestamp_matches_recording_lookup(monkeypatch, _people_counting_setup):
+    from datetime import datetime
+
+    frame = _fake_frame()
+    expected = datetime(2026, 10, 18, 12, 0, 0)
+
+    class _FixedDateTime:
+        @staticmethod
+        def now():
+            return expected
+
+    monkeypatch.setattr(main, "datetime", _FixedDateTime)
+    monkeypatch.setattr(main.people_counting, "PeopleCounter", lambda line: _OneCrossingCounter())
+    monkeypatch.setattr(main, "detect_objects_frame", lambda camera_number: {
+        "ok": True, "frame": frame, "error": None,
+        "detections": [{"class_name": "person", "x": 270, "y": 190, "width": 100, "height": 100}],
+    })
+    recorded = []
+    linked = []
+    monkeypatch.setattr(main, "append_analytics_event", recorded.append)
+    monkeypatch.setattr(main, "linked_recording_for", lambda camera, moment: linked.append((camera, moment)) or None)
+
+    asyncio.run(_run_one_cycle(2, monkeypatch))
+
+    assert len(recorded) == 1
+    assert recorded[0]["timestamp"] == expected.isoformat()
+    assert linked == [(2, expected)]
+
+
 # ---------------------------------------- 2026-09-22: linked_recording gap
 
 

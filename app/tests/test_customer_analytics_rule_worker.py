@@ -154,6 +154,7 @@ def test_persist_rule_event_carries_correct_camera_timestamp_and_rule_metadata(m
     record = worker.persist_rule_event(4, fired, now, None)
 
     assert record["camera"] == 4
+    assert record["timestamp"] == now.isoformat()
     assert record["event_type"] == "intrusion"
     assert record["rule_id"] == "rule-9"
     assert record["track_id"] == 3

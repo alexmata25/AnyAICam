@@ -8,13 +8,16 @@ frames anywhere in this file.
 """
 
 import math
+import os
+import tempfile
 
 import numpy as np
 import pytest
 
 from database_backend import override_target
 
-with override_target(sqlite_path="/tmp/test_facial_events_import.db"):
+_IMPORT_DB = os.path.join(tempfile.gettempdir(), f"test_facial_events_import_{os.getpid()}.db")
+with override_target(sqlite_path=_IMPORT_DB):
     import facial_events
     import facial_people
     import facial_recognition as fr
@@ -123,6 +126,35 @@ def test_returns_empty_when_camera_not_entitled(db):
 def test_returns_empty_when_camera_number_unmapped(db):
     events = facial_events.record_facial_events(db, camera_number=999, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events == []
+
+
+def test_frame_event_time_is_separate_from_processing_and_access_time(db, monkeypatch):
+    """Cloud/media event time follows the frame, while presence and door
+    policy continue to use processing wall time."""
+    from datetime import datetime
+
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
+    facial_people.add_reference_image(
+        db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0),
+        engine="haar_intensity", engine_version="1", now=NOW,
+    )
+    processing_time = datetime(2026, 10, 18, 12, 0, 20)
+    frame_time = datetime(2026, 10, 18, 12, 0, 0)
+    presence_times = []
+    monkeypatch.setattr("face_access_guard.note_presence", lambda *a, **kw: presence_times.append(kw["now"]))
+    engine = _FixedVectorEngine((1.0, 0.0))
+    events = facial_events.record_facial_events(
+        db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(),
+        now=processing_time, event_time=frame_time, engine=engine,
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_timestamp"] == frame_time.isoformat()
+    row = db.execute("SELECT event_timestamp,created_at FROM detection_events WHERE id=?", (events[0]["detection_event_id"],)).fetchone()
+    assert row["event_timestamp"] == frame_time.isoformat()
+    assert row["created_at"] == processing_time.isoformat()
+    assert presence_times == [processing_time]
 
 
 def test_returns_empty_when_no_face_detected(db):

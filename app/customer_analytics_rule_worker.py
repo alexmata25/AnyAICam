@@ -284,6 +284,7 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
         site="home",
         rule_name=f"{label} ({fired.get('zone_name') or 'unnamed rule'})",
         event_type=event_type_for(analytic_type),
+        timestamp=now,
         direction=direction,
         confidence=float(fired.get("confidence") or 0.0),
         thumbnail=thumbnail_url,
