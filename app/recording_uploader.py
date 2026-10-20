@@ -423,11 +423,23 @@ def _refresh_camera_map(*, prefer_local: bool = False) -> None:
         with connection() as db:
             states = db.execute("SELECT camera_id,analytic_key,enabled,system_paused FROM camera_analytics_operations").fetchall()
         camera_numbers = {value["camera_id"]: number for number, value in mapping.items()}
+        explicit_on = set()
         for state in states:
             field = operation_flags.get(state["analytic_key"])
             number = camera_numbers.get(state["camera_id"])
             if field and number is not None and (not bool(state["enabled"]) or bool(state["system_paused"])):
                 mapping[number][field] = False
+            elif field and number is not None:
+                explicit_on.add((number, field))
+        # Premium analytics default OFF (2026-10-19): on a Local appliance the camera rows are the local source of
+        # truth, so a premium analytic runs only after an authorized user turned it ON (an explicit enabled row) --
+        # an assignment or a purchase alone leaves it OFF. Hybrid flags already arrive with the cloud's operational
+        # switch applied (appliance_cloud), so only an explicit local OFF is overlaid there.
+        if product_mode.current_mode() == "local":
+            for number, item in mapping.items():
+                for field in operation_flags.values():
+                    if item.get(field) and (number, field) not in explicit_on:
+                        item[field] = False
     except Exception as error:
         logger.warning("recording_upload.analytics_operations_unavailable error_type=%s", type(error).__name__)
         # Fail closed when operational state cannot be read.
@@ -473,7 +485,36 @@ def _known_camera_numbers() -> list[int]:
         return sorted(_camera_map)
 
 
+_PREMIUM_FIELDS = {"smart_motion": "smart_motion_enabled", "people_counting": "people_counting_enabled",
+                   "lpr": "lpr_enabled", "ppe": "ppe_enabled", "facial_recognition": "facial_recognition_enabled"}
+
+
+def _entitled_identity(identity: dict | None) -> dict | None:
+    """Premium analytics default OFF (2026-10-19): on an appliance (edge runtime) every premium flag also needs a
+    valid, unexpired, signed per-camera entitlement (appliance_entitlements.camera_analytic_grants). Checked on every
+    read, so an expiring offline snapshot or a revocation stops processing at the next pipeline pass. Non-premium
+    fields (camera id, site, recording mode) are never touched: basic motion, recording, live view and playback do
+    not depend on it. Fails closed (premium off) if the check itself fails."""
+    if identity is None or RUNTIME_ROLE != "edge":
+        return identity
+    import copy
+    gated = copy.copy(identity)
+    try:
+        import appliance_entitlements
+        granted = appliance_entitlements.camera_analytic_grants().get(identity.get("camera_id"), frozenset())
+    except Exception:
+        granted = frozenset()
+    for analytic, field in _PREMIUM_FIELDS.items():
+        if gated.get(field) and analytic not in granted:
+            gated[field] = False
+    return gated
+
+
 def _camera_identity(camera_number: int) -> dict | None:
+    return _entitled_identity(_camera_identity_unlicensed(camera_number))
+
+
+def _camera_identity_unlicensed(camera_number: int) -> dict | None:
     with _lock:
         identity = _camera_map.get(camera_number)
         if identity is None:

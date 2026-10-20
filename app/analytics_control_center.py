@@ -174,17 +174,21 @@ def verify_grant(envelope: dict, *, now: float | None = None) -> tuple[dict | No
     return payload, ""
 
 
+# 1.2.7 / 1.3.2 premium-analytics default OFF (owner 2026-10-19): a missing row is OFF. Purchasing, assigning or
+# re-assigning an analytic makes it AVAILABLE; it runs only after an authorized user turns it ON (set_control), which
+# writes an explicit enabled=1 row. Rows that were implicitly ON before this change were made explicit once, at upgrade
+# (db_migrations.seed_explicit_analytics_operations), so nothing that ran before is silently disabled.
 def operational_enabled(db, camera_id: str, analytic_key: str) -> bool:
     row = db.execute("SELECT enabled,system_paused FROM camera_analytics_operations WHERE camera_id=? AND analytic_key=?",
                      (camera_id, analytic_key)).fetchone()
-    return True if row is None else bool(row["enabled"]) and not bool(row["system_paused"])
+    return False if row is None else bool(row["enabled"]) and not bool(row["system_paused"])
 
 
 def operational_status(db, camera_id: str, analytic_key: str) -> dict:
     """Customer preference and temporary system pause are independent state."""
     row = db.execute("SELECT enabled,system_paused,system_pause_reason FROM camera_analytics_operations "
                      "WHERE camera_id=? AND analytic_key=?", (camera_id, analytic_key)).fetchone()
-    customer_enabled = True if row is None else bool(row["enabled"])
+    customer_enabled = False if row is None else bool(row["enabled"])
     paused = bool(row and row["system_paused"])
     return {"customer_enabled": customer_enabled, "system_paused": paused,
             "system_pause_reason": row["system_pause_reason"] if paused else None,
@@ -196,7 +200,9 @@ def set_system_pause(db, camera_id: str, analytic_key: str, *, paused: bool, rea
 
     This is an internal integration point for resource/health governors. It is
     deliberately not exposed as a customer API. A pause must have an auditable
-    reason; clearing it leaves the customer's ON/OFF choice untouched.
+    reason; clearing it leaves the customer's ON/OFF choice untouched. A pause on
+    an analytic with no row yet records the customer preference as OFF (the
+    default), so clearing the pause can never turn an analytic ON by itself.
     """
     if analytic_key not in ANALYTICS or not isinstance(paused, bool):
         raise ValueError("Invalid analytic system-pause request")
@@ -207,7 +213,7 @@ def set_system_pause(db, camera_id: str, analytic_key: str, *, paused: bool, rea
         raise ValueError("System pause reason is too long")
     now = datetime.now(timezone.utc).isoformat()
     db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,system_paused,system_pause_reason,"
-               "system_paused_at,updated_at,updated_by) VALUES(?,?,1,?,?,?,?,'system') "
+               "system_paused_at,updated_at,updated_by) VALUES(?,?,0,?,?,?,?,'system') "
                "ON CONFLICT(camera_id,analytic_key) DO UPDATE SET system_paused=excluded.system_paused,"
                "system_pause_reason=excluded.system_pause_reason,system_paused_at=excluded.system_paused_at,"
                "updated_at=excluded.updated_at,updated_by='system'",
@@ -526,6 +532,14 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
                         raise HTTPException(status_code=409, detail="Smart Motion must be enabled for rule analytics.")
                 if analytic_key == "people_counting" and not _people_counting_line_ready(db, camera_id):
                     raise HTTPException(status_code=409, detail="Configure a counting line on the camera before enabling People Counting.")
+                # Premium analytics default OFF (2026-10-19), after every existing check (403/409 unchanged): on an appliance, turning a premium analytic ON also
+                # needs this camera's valid signed entitlement (the processing pipeline enforces the same grant).
+                import feature_entitlements
+                if feature_entitlements.runtime_role() == "edge":
+                    import appliance_entitlements
+                    if not appliance_entitlements.camera_analytic_allowed(camera_id, license_key):
+                        raise HTTPException(status_code=409, detail="This camera isn't licensed for this analytic. "
+                                                                    "Buy or assign it on My subscription, then turn it on here.")
                 if lab and not paid and not rule_analytic:
                     grant_id = lab["grant_id"]
                     used = db.execute("SELECT COUNT(*) AS n FROM test_lab_analytics_assignments WHERE grant_id=? AND analytic_key=? AND enabled=1",

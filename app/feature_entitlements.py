@@ -200,7 +200,10 @@ def snapshot_ttl() -> timedelta:
     return timedelta(hours=min(168, max(1, hours)))
 
 
-def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
+PREMIUM_ANALYTICS = ("smart_motion", "people_counting", "lpr", "ppe", "facial_recognition")
+
+
+def appliance_snapshot(appliance: dict, *, now: datetime | None = None, camera_analytics: dict | None = None) -> dict:
     """The signed entitlement snapshot for one appliance (cloud side; sent
     with its configuration -- see appliance_entitlements.py). Only the paid
     runtime features the appliance runs, each decided from billing for the
@@ -211,7 +214,14 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
     camera plan and the VMS license -- signed with the features, so the
     appliance accepts a capacity only with a valid signature
     (vms_capacity.py). Same type and version: a 1.2.4 appliance ignores the
-    added field."""
+    added field.
+
+    camera_analytics (2026-10-19, premium analytics default OFF): {camera_id: [analytic keys]} -- the premium analytics
+    each camera of this appliance is COMMERCIALLY authorized for (paid assignment within purchased seats, or an active
+    Test Lab lease), computed by the configuration route. Not the customer's ON/OFF choice: that stays a separate,
+    explicit operational switch. Always present in what this build signs (empty = nothing authorized), so an appliance
+    of this release denies premium processing for any camera the snapshot does not name. Same type and version: an
+    older appliance ignores the field."""
     import appliance_identity
     import customer_entitlements
     from partner_db import connection
@@ -232,6 +242,9 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
         "features": {TALK_DOWN: customer_entitled(customer_id, TALK_DOWN),
                      VOICE_CALL: customer_entitled(customer_id, VOICE_CALL)},
         "camera_capacity": camera_capacity,
+        "camera_analytics": {str(camera_id): sorted({key for key in keys if key in PREMIUM_ANALYTICS})
+                             for camera_id, keys in sorted((camera_analytics or {}).items())
+                             if isinstance(camera_id, str) and camera_id and isinstance(keys, (list, tuple, set))},
         "issued_at": now.isoformat(), "expires_at": (now + snapshot_ttl()).isoformat(),
     }
     transition = _capacity_identity_transition(appliance, identity)

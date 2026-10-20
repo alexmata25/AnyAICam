@@ -19,6 +19,14 @@ FLAG = {"smart_motion": "smart_motion_enabled", "people_counting": "people_count
 NOW = "2026-01-01T00:00:00"
 
 
+@pytest.fixture(autouse=True)
+def _cloud_portal_role(monkeypatch):
+    """These probes model the CLOUD portal (cloud database, configuration route, portal toggles). Since 2026-10-19
+    the analytics control center also checks the appliance's signed entitlement when running as an edge; the probes
+    therefore run as the cloud role (the appliance-side check is covered by test_premium_analytics_default_off.py)."""
+    monkeypatch.setenv("ANYAICAM_RUNTIME_ROLE", "cloud")
+
+
 def _seed(conn):
     conn.execute("INSERT INTO partners(id,name,created_at) VALUES('p','P',?)", (NOW,))
     conn.execute("INSERT INTO customers(id,partner_id,name,email,status,created_at) VALUES('c','p','C','o@example.test','active',?)", (NOW,))
@@ -39,6 +47,12 @@ def _seed(conn):
     for cam in ("cam-1", "cam-2"):
         for key in KEYS:
             panel.assign_entitlement(conn, cam, key, now=NOW)
+    # Premium analytics default OFF (2026-10-19): the probes start from "the customer has turned everything ON",
+    # which is now an explicit operational row per analytic (purchase/assignment alone leaves it OFF).
+    for cam in ("cam-1", "cam-2"):
+        for key in KEYS + ("line_crossing", "intrusion", "loitering"):
+            conn.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                         "VALUES(?,?,1,?,'probe')", (cam, key, NOW))
     conn.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES('cred','a',?,?)",
                  (__import__("partner_db").password_hash("cred-secret"), NOW))
     conn.commit()

@@ -340,9 +340,12 @@ def _seed_appliance(db):
     # counts only for a camera with an active assignment, which is what the
     # customer's own switch (customer_analytics_panel.assign_entitlement)
     # writes together with the flag. cam-1 was switched on that way.
+    # Premium analytics default OFF (2026-10-19): "switched on" is also the customer's explicit operational ON.
     for key in ("smart_motion", "people_counting", "lpr", "ppe"):
         db.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
                    "VALUES('cam-1',?,'active',?,?)", (key, now, now))
+        db.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                   "VALUES('cam-1',?,1,?,'owner')", (key, now))
 
 
 def _v2_plan(db, plan_key="hybrid", status="active"):

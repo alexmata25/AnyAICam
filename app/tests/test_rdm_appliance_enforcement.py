@@ -175,6 +175,9 @@ def test_appliance_configuration_route_exposes_all_four_columns(db_path):
             import customer_analytics_panel as panel
             for key in ("smart_motion", "lpr", "ppe"):
                 panel.assign_entitlement(conn, "cam-1", key, now="2026-01-01T00:01:00")
+                # Premium analytics default OFF (2026-10-19): assignment unlocks; the customer turns each one ON.
+                conn.execute("INSERT INTO camera_analytics_operations(camera_id,analytic_key,enabled,updated_at,updated_by) "
+                             "VALUES('cam-1',?,1,'2026-01-01T00:02:00','owner')", (key,))
             conn.commit()
 
             response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
@@ -239,6 +242,11 @@ def isolated_refresh(monkeypatch, tmp_path):
     import product_mode
     from partner_db import initialize_database
     monkeypatch.setenv(product_mode.PRODUCT_MODE_ENV, "hybrid")
+    # Premium analytics default OFF (2026-10-19): on an edge runtime the map is also gated by the signed per-camera
+    # entitlement; these tests are about map population, so the appliance holds a grant for every premium analytic.
+    import appliance_entitlements
+    monkeypatch.setattr(appliance_entitlements, "camera_analytic_grants",
+                        lambda now=None: {"cam-1": frozenset(appliance_entitlements.PREMIUM_ANALYTICS)})
     with override_target(sqlite_path=tmp_path / "refresh.db"):
         initialize_database()
         yield
