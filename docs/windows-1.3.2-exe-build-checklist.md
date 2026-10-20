@@ -7,21 +7,31 @@ Owner rule (2026-10-19 / 10-20):
 
 ## Gate 0: the source is complete (all must be true before any build)
 
-| # | Gate | Status (2026-10-20 00:30) |
+| # | Gate | Status (2026-10-20 16:00) |
 |---|---|---|
-| 0.1 | Red's shared 168 h analytics commit (`claude/red-127-analytics-offline-168h`) merged into `claude/blue-windows-132` | waiting (branch still at 96d57666) |
-| 0.2 | Red's F1 edge-seed fix + shard-1 fixture fix merged | waiting |
-| 0.3 | Blue's 4 strict-xfails in `app/tests/test_windows_offline_premium_132.py` adapted to the separate `anyaicam.analytics_entitlements` document and passing; the renewal test reads the new document | after 0.1 |
-| 0.4 | Analytics state file (`analytics_entitlements.json`) resolves under `%ProgramData%\AnyAiCam\config` on Windows (a test, after 0.1); the AST `native_path` guard passes | after 0.1 |
-| 0.5 | Focused Windows suites green on the merge tip (section 3) | after 0.1–0.4 |
-| 0.6 | Red's full Linux regression of the shared commits complete with only known environment failures | Red |
-| 0.7 | Codex independent review of the exact Windows commit: PASS | after 0.5 |
+| 0.1 | Red's shared 168 h analytics commit merged into `claude/blue-windows-132` | **DONE**: ae23d024 arrives through RC8 be366f8b, merge `179e6ae9` |
+| 0.2 | Red's F1 edge-seed fix + shard-1 fixture fix merged | **DONE** (in ae23d024) |
+| 0.3 | Blue's 4 strict-xfails adapted to the separate `anyaicam.analytics_entitlements` document and passing | **DONE** `c5a0d98f` |
+| 0.4 | `analytics_entitlements.json` resolves under `%ProgramData%\AnyAiCam\config` on Windows; the AST `native_path` guard passes | **DONE** `c5a0d98f` (test) |
+| 0.5 | Focused Windows suites green on the merge tip (section 3) | **DONE (focused)**: 103/1/0, 99/1/0, 36/0 on the Windows host. Full section 3 (agent suite, installer suite with Inno compile) not rerun |
+| 0.6 | Red's full Linux regression of the shared commits complete with only known environment failures | **DONE for be366f8b** (8163/14/352, all 14 closed by Codex). The Windows tree's own Linux shards are not run |
+| 0.6b | Red's rc8-dev test/LF commits (`ee055c05`) | **not merged** (awaiting Red's final). Trial merge clean; adds no CR failure on the Windows tree |
+| 0.6c | Open product item **W-1**: Voice Call speech-to-text has no Vosk model on Windows | **owner/Codex decision**: bundle the pinned model, or report it unavailable |
+| 0.7 | Codex independent review of the exact Windows commit: PASS | requested (`CODEX-REVIEW-WINDOWS-1.3.2.md`) |
 | 0.8 | Owner go-ahead for an **unsigned test-candidate** build | owner |
 
 ## Gate 1: resources and lock (checked right before starting)
 
 - **C: free ≥ 12 GB.** The setup is about 0.58 GB and `output\` (runtime catalog staging, keyset, setup) about 1.5 GB. Inno's LZMA2 temp is about 2 GB. The shared floor is 8 GB, plus margin.
-- **RAM free ≥ 4.3 GB.** Same start gate as the regressions.
+- **RAM free ≥ 6.2 GB.** Same start gate as the RC8 regressions (raised from 4.3 GB on 2026-10-20).
+- **Prerequisites probed read-only 2026-10-20:** all present for an unsigned build:
+  - ISCC 7, git, `py -3.11` (keyset prep dry-run OK);
+  - 6 pinned vendor files (hashes match);
+  - VC++ with a valid Microsoft signature;
+  - 108 locked wheels (0 missing, 0 unpinned);
+  - makecat and signtool (SDK 10.0.26100);
+  - production keyset `2389a655…`.
+- For `-AzureSign` the dlib and metadata are present, but signing needs an owner-authorized Azure session. For `-Sign`, no code-signing certificate is installed.
 - **The shared lock** `anyaicam-red\.docker-test.lock` must be free. Take it with an owner line `blue windows 1.3.2 unsigned build <commit> <time>` and release only Blue's own line.
 - **No Red, Green or Codex heavy job running.** One heavy job at a time.
 
