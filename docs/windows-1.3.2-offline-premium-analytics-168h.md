@@ -1,13 +1,23 @@
 # Windows 1.3.2: 168 h offline premium analytics: parity checklist, shared-contract proposal, test matrix
 
-Status: **prepared, not implemented.** Owner design 2026-10-19:
+Status: **prepared, not implemented. The shared contract is Red's design (see §1); Blue implements no licensing rule.** Owner design 2026-10-19:
 - premium analytics get a separate 168 h offline authorization;
 - Talk Down and Voice Call keep their 24 h snapshot expiry;
 - the global entitlement TTL is unchanged.
 
 The signed contract is **shared** and authored by Red. Blue adds no Windows-only licensing rule. Windows tip: `claude/blue-windows-132` (see the BLUE.md log for the exact hash).
 
-## 1. Proposed shared contract (for Red to decide; Blue implements none of it)
+## 1. SUPERSEDED: Blue's earlier contract proposal (kept for the record only)
+
+**Red decided the shared contract on 2026-10-19 23:05** (`AnyAiCam-1.2.7-HANDOFF\RED-ANALYTICS-OFFLINE-168H-DESIGN-20261019.md`, branch `claude/red-127-analytics-offline-168h`). That design is the single source of truth, and Blue follows it:
+
+- a **separate** signed document, `anyaicam.analytics_entitlements` v1, with its own `expires_at` (≤ issued_at + 168 h, capped at the earliest recorded authorization end);
+- `camera_analytics` leaves the 24 h feature snapshot, which returns to its RC7 shape;
+- **no document on a successful sync means DENY** (not the "missing → 24 h" fallback proposed below);
+- an older document from sync clears the grant;
+- a MAC'd state file (key derived from `ANYAICAM_APP_SECRETS`) with a high-water clock guard.
+
+The table below is Blue's superseded proposal and is NOT to be implemented.
 
 | Point | Proposal | Why |
 |---|---|---|
@@ -50,8 +60,8 @@ A local administrator can reset them. That is the same trust boundary as Red's D
 | 6 | Upgrade keeps ON only where still entitled | `seed_explicit_analytics_operations` | Same code. **Finding F1:** edge DBs have no `camera_analytics_entitlements` rows (`edge_camera_sync` never writes them), so a Local-mode edge seeds nothing and its premium analytics come out of the upgrade OFF. Windows 1.3.0 kept its snapshot at `C:\opt\...`, so it is not visible at the new path either. | Reported to Red/Codex; not changed by Blue |
 | 7 | Installer preserves authorized settings | add-if-missing | add-if-missing, explicit false kept | `test_an_explicit_false_survives_an_upgrade` (real PowerShell) |
 | 8 | Signed entitlement file protected | root-owned dirs | `%ProgramData%\AnyAiCam\config`, SY/BA only | `test_windows_feature_entitlement_snapshot_lives_in_the_protected_config_folder` |
-| 9 | Offline analytics 168 h, Talk Down/Voice Call 24 h | **pending shared contract** | **pending** (tests prepared) | 3 strict xfail + 4 passing boundary/TTL tests |
-| 10 | Replay / clock rollback rejected | **pending** (proposal §1) | **pending** | 1 strict xfail (replay); clock rollback test to be written with the contract |
+| 9 | Offline analytics 168 h, Talk Down/Voice Call 24 h | **pending Red's separate `anyaicam.analytics_entitlements` document** | **pending**: tests prepared; Windows preconditions (`ANYAICAM_APP_SECRETS` generated, kept, passed to the VMS) **PASS** (`test_windows_app_secret_132`) | 3 strict xfail + 4 passing boundary/TTL tests |
+| 10 | Replay / clock rollback rejected | **pending** (Red's design: older document clears the grant; MAC'd high-water mark) | **pending** | 1 strict xfail (replay); clock rollback test to be written with the contract |
 | 11 | Tamper / corrupt / forged / other-appliance | signature + identity | Same | Red's `test_an_unverifiable_or_older_snapshot...`; Blue's corrupt/truncated/deleted/unsigned on Windows |
 | 12 | Revocation / cancellation / downgrade | next sync | Same | Red's revocation test on Windows (cancelled, suspended) |
 | 13 | Hybrid on Windows reads the agent's files | n/a (container mounts) | `ANYAICAM_STATE_DIR` fix | `test_windows_hybrid_file_contract_132`, launcher tests |

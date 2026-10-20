@@ -24,10 +24,10 @@ from test_premium_analytics_default_off import (  # noqa: F401 -- fixtures and h
     appliance, appliance_cloud, cloud_client, cloud_db, edge_camera_sync, edge_db, edge_env,
     isolated_product_mode_state, prices)
 
-PENDING_168H = pytest.mark.xfail(strict=True, reason="pending Red's shared 168 h premium-analytics offline window "
-                                                      "(owner 2026-10-19); remove when integrated")
-PENDING_REPLAY = pytest.mark.xfail(strict=True, reason="pending shared replay protection (a newer verified snapshot "
-                                                        "must not be replaced by an older one); proposed to Red")
+PENDING_168H = pytest.mark.xfail(strict=True, reason="pending Red's separate signed anyaicam.analytics_entitlements document "
+                                                      "(RED-ANALYTICS-OFFLINE-168H-DESIGN-20261019); adapt + remove when merged")
+PENDING_REPLAY = pytest.mark.xfail(strict=True, reason="pending Red's design (an older analytics document clears the "
+                                                        "grant; MAC'd high-water); adapt + remove when merged")
 
 
 def _licensed_and_on(cloud_db, edge_db):
