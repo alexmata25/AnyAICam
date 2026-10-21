@@ -155,7 +155,33 @@ function Probe([string]$File) {
     $out = & $ffprobe -v error @transport -show_entries stream=codec_type,codec_name,width,height -show_entries format=format_name,duration -of json $File 2>&1 | Out-String
     $out | ConvertFrom-Json
 }
-function Mkv([int]$Number) { @(Get-ChildItem (Join-Path $data "recordings\camera$Number") -Filter '*.mkv' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime) }
+function Mkv([int]$Number) { @(Get-ChildItem (Join-Path $data "recordings\camera$Number") -Filter '*.mkv' -ErrorAction SilentlyContinue | Sort-Object CreationTime) }
+# F-L run 1 (2026-10-21 16:28, 4973d5ab): a directory listing's Length/LastWriteTime of a file FFmpeg still has open is
+# stale on NTFS, so "no recording"/"recording stopped" were read from stale metadata while recording worked. The true
+# size comes from an open handle; "recording" = the newest MKV's true size grows over 15 s.
+function TrueLength([string]$File) {
+    try { $s = [IO.File]::Open($File, 'Open', 'Read', 'ReadWrite, Delete'); try { $s.Length } finally { $s.Close() } } catch { -1 }
+}
+function Growing([int]$Number) {
+    $m = Mkv $Number; if (-not $m.Count) { return $null }
+    $f = $m[-1].FullName; $a = TrueLength $f; Start-Sleep -Seconds 15; $b = TrueLength $f
+    $m2 = Mkv $Number
+    if ($m2.Count -gt $m.Count) { return [pscustomobject]@{ name = $m2[-1].Name; from = 0; to = (TrueLength $m2[-1].FullName); note = 'new segment' } }
+    if ($b -gt $a -and $a -ge 0) { return [pscustomobject]@{ name = $m[-1].Name; from = $a; to = $b; note = 'growing' } }
+    return $null
+}
+function Diag([string]$Label) {
+    # A snapshot for diagnosis: FFmpeg processes (live/recording tasks), HLS and recording files (true sizes), events.
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add("== $Label $(Get-Date -Format o)")
+    Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" } |
+        ForEach-Object { $out.Add("ffmpeg $($_.ProcessId): $($_.CommandLine)") }
+    Get-ChildItem (Join-Path $data 'hls') -ErrorAction SilentlyContinue | Select-Object -Last 8 | ForEach-Object { $out.Add("hls $($_.Name) $(TrueLength $_.FullName)") }
+    Mkv $camNo | ForEach-Object { $out.Add("mkv $($_.Name) created $($_.CreationTime.ToString('s')) true $(TrueLength $_.FullName)") }
+    foreach ($f in 'motion_events.jsonl', 'analytics_events.json') { $p = Join-Path $data "recordings\$f"; $out.Add("$f exists $(Test-Path $p) bytes $(if (Test-Path $p) { TrueLength $p } else { 0 })") }
+    $s = Edge GET '/api/cameras/status'; $out.Add("GET /api/cameras/status -> $($s.status) $((ConvertTo-Json $s.body -Compress -Depth 6) -replace '(.{1500}).*', '$1...')")
+    $out | Set-Content (Join-Path $results "diag-$Label.txt")
+}
 
 # ---------------------------------------------------------------- test cloud (functional routes; synthetic key; Sandbox only)
 & $hp 'C:\Validation\scripts\test-cloud.py' --app $cloudApp --data $cloudData --host $TestCloudHost --certificates-only
@@ -350,14 +376,17 @@ Check 'live view (operator pages): /static/hls/camera<N>.m3u8 -- used by /, /cam
 Info 'live view: WebRTC' { 'not tested: WebRTC signalling runs through the cloud (live_view_p2p), which the test cloud does not serve' }
 
 # ---------------------------------------------------------------- recording, motion, analytics
-Check 'recording: the VMS records the simulated camera to MKV under ProgramData (H.264)' {
-    $f = WaitFor 180 { $m = Mkv $camNo; if ($m.Count -and $m[-1].Length -gt 0) { $m[-1] } }
-    if (-not $f) { throw "no recording in $data\recordings\camera$camNo" }
-    "$($f.Name) $($f.Length) bytes (growing segment)"
+Check 'recording: the VMS records the simulated camera to MKV under ProgramData (true size growing)' {
+    $g = WaitFor 300 { Growing $camNo }
+    Diag 'recording'
+    if (-not $g) { throw "no growing MKV in $data\recordings\camera$camNo ($((Mkv $camNo).Count) file(s)); see diag-recording.txt" }
+    "$($g.name) $($g.from) -> $($g.to) bytes ($($g.note))"
 }
 Check 'motion (basic, default ON): the moving box produces motion events' {
-    $events = WaitFor 180 { $file = Join-Path $data 'recordings\motion_events.jsonl'; if (Test-Path $file) { @(Get-Content $file | Where-Object { $_ -match "`"camera`"\s*:\s*$camNo\b|camera$camNo" }) } }
-    if (-not $events) { throw 'no motion event' }
+    $file = Join-Path $data 'recordings\motion_events.jsonl'
+    $events = WaitFor 300 { if (Test-Path $file) { @([IO.File]::ReadAllLines($file) | Where-Object { $_ -match "`"camera`"\s*:\s*$camNo\b" }) } }
+    Diag 'motion'
+    if (-not $events) { throw "no motion event for camera $camNo (motion_events.jsonl exists: $(Test-Path $file)); see diag-motion.txt" }
     "$(@($events).Count) motion event line(s)"
 }
 Info 'motion: /api/events?camera=<N> with the owner session' { $r = Edge GET "/api/events?camera=$camNo"; "status $($r.status); events $(@($r.body.events).Count)" }
@@ -398,8 +427,9 @@ function SwitchMode([string]$Target, [scriptblock]$Change) {
     }
     Check "mode: after the switch to $Target the camera is still licensed and recording resumes" {
         $l = Licensed $camNo; if ($l -ne "[$camNo]") { throw "licensed $l" }
-        $f = WaitFor 240 { $m = Mkv $camNo; if ($m.Count -and $m[-1].LastWriteTime -gt $at.AddSeconds(30)) { $m[-1] } }
-        if (-not $f) { throw 'no recording written after the switch' }; "licensed; $($f.Name) written after the switch"
+        $g = WaitFor 300 { Growing $camNo }
+        Diag "after-switch-$Target"
+        if (-not $g) { throw "no growing recording after the switch; see diag-after-switch-$Target.txt" }; "licensed; $($g.name) $($g.note) ($($g.from) -> $($g.to) bytes)"
     }
 }
 if ($mode -eq 'local') {
@@ -431,13 +461,16 @@ Check 'offline: the cloud password does not sign in while offline (503)' {
     if ($r.status -ne 503) { throw "status $($r.status)" }; '503'
 }
 Check 'offline: live view still works without the cloud' {
-    $pl = WaitFor 90 { $r = Edge GET "/api/customer/cameras/$camId/live/playlist.m3u8"; if ($r.status -eq 200 -and "$($r.body)" -match '#EXTINF') { $r } }
-    if (-not $pl) { throw 'no live playlist offline' }; 'playlist with segments'
+    $script:lastLive = $null
+    $pl = WaitFor 120 { $r = Edge GET "/api/customer/cameras/$camId/live/playlist.m3u8"; $script:lastLive = $r; if ($r.status -eq 200 -and "$($r.body)" -match '#EXTINF') { $r } }
+    Diag 'offline-live'
+    if (-not $pl) { throw "no live playlist offline: last answer $($script:lastLive.status) $((ConvertTo-Json $script:lastLive.body -Compress) -replace '(.{300}).*', '$1...')" }
+    'playlist with segments'
 }
-$offlineAt = Get-Date
 Check 'offline: recording continues without the cloud' {
-    $f = WaitFor 120 { $m = Mkv $camNo; if ($m.Count -and $m[-1].LastWriteTime -gt $offlineAt) { $m[-1] } }
-    if (-not $f) { throw 'recording stopped' }; "$($f.Name) still growing"
+    $g = WaitFor 180 { Growing $camNo }
+    Diag 'offline-recording'
+    if (-not $g) { throw 'no growing recording offline; see diag-offline-recording.txt' }; "$($g.name) $($g.note) ($($g.from) -> $($g.to) bytes)"
 }
 
 # ---------------------------------------------------------------- playback (offline): a finished 5-minute segment
@@ -482,7 +515,15 @@ Info 'revoked appliance: what the agent and VMS do (observed, no expectation in 
 # ---------------------------------------------------------------- collect, secrets, done
 StopCloud
 foreach ($p in $onvifSim, $camPublisher, $camServer) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
-& robocopy.exe (Join-Path $data 'logs') (Join-Path $results 'service-logs') *.log /B /R:0 /W:0 /NP /NJH /NJS | Out-Null
+Diag 'end'
+# F-L run 1: the app's own WinSW out/err logs were still open, so a copy while the services ran skipped them.
+# The Sandbox is disposable: stop both services first, then collect every log and the small event/JSON stores.
+Stop-Service AnyAiCamVMS, AnyAiCamAgent -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 5
+& robocopy.exe (Join-Path $data 'logs') (Join-Path $results 'service-logs') *.log /B /R:1 /W:1 /NP /NJH /NJS | Out-Null
+& robocopy.exe (Join-Path $data 'agent') (Join-Path $results 'agent-logs') *.log /B /R:1 /W:1 /NP /NJH /NJS | Out-Null
+& robocopy.exe (Join-Path $data 'recordings') (Join-Path $results 'recordings-stores') *.jsonl analytics_events.json /B /R:1 /W:1 /NP /NJH /NJS | Out-Null
+Info 'collected logs' { (@(Get-ChildItem $results -Recurse -File -Include *.log | ForEach-Object { "$($_.Directory.Name)\$($_.Name)" }) -join ', ') }
 $credential = [string](Get-Content -Raw (Join-Path $agentState 'credential.json') -ErrorAction SilentlyContinue | ConvertFrom-Json).credential
 Check 'no link code, credential or synthetic password in any collected log or report' {
     $secrets = @($linkCodes) + @($credential, $cloudPassword, $appliancePassword) | Where-Object { $_ }
