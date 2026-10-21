@@ -354,10 +354,33 @@ def _grant_vms_license(session: dict, customer_id: str, metadata: dict) -> dict:
     # The tier's current or an earlier Price (2026-10-17 repricing: a checkout opened before the switch still grants).
     if not tier or not price_id or price_id not in vms_license_price_ids(tier[2]):
         return {"status": "rejected", "reason": "license metadata does not match the configured license price"}
-    entitlement = upsert_entitlement(customer_id=customer_id, product=VMS_LICENSE_PRODUCT, camera_slot_quantity=capacity,
-                                     stripe_customer_id=str(session.get("customer") or "") or None,
-                                     stripe_checkout_session_id=str(session.get("id") or "") or None,
-                                     stripe_price_id=price_id)
+    # F1 (2026-10-21): the licence is paid on the subscription's first invoice. A full refund or dispute of that
+    # payment suspends it (billing_status._reverse_initial_licence); one recorded BEFORE this grant is honoured here,
+    # under the same per-payment lock, and a redelivered checkout event never re-activates a reversed licence.
+    import billing_status
+    from partner_db import transaction
+    invoice = session.get("invoice")
+    invoice_id = str((invoice.get("id") if isinstance(invoice, dict) else invoice) or "")
+    session_id = str(session.get("id") or "") or None
+    with transaction() as db:
+        if invoice_id:
+            billing_status.lock_payment(db, billing_status.payment_keys(invoice_id=invoice_id))
+        reversal = billing_status.reversal_for_invoice(invoice_id)
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, VMS_LICENSE_PRODUCT))
+        reversed_before = bool(existing and existing.get("status") == "suspended" and session_id
+                               and existing.get("stripe_checkout_session_id") == session_id
+                               and existing.get("suspended_reason") in ("refunded", "disputed"))
+        entitlement = upsert_entitlement(customer_id=customer_id, product=VMS_LICENSE_PRODUCT, camera_slot_quantity=capacity,
+                                         status="suspended" if (reversal or reversed_before) else "active",
+                                         stripe_customer_id=str(session.get("customer") or "") or None,
+                                         stripe_checkout_session_id=session_id,
+                                         stripe_price_id=price_id)
+        if reversal:
+            db.execute("UPDATE customer_entitlements SET suspended_reason=?,stripe_payment_intent_id=COALESCE(?,stripe_payment_intent_id) "
+                       "WHERE id=?", (reversal["reason"], reversal.get("payment_intent"), entitlement["id"]))
+    if reversal or reversed_before:
+        return {"status": "vms_license_not_granted", "entitlement_id": entitlement.get("id"),
+                "reason": f"the payment was {(reversal or {}).get('reason') or existing['suspended_reason']}"}
     return {"status": "vms_license_granted", "entitlement_id": entitlement.get("id"), "capacity": capacity}
 
 

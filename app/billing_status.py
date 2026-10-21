@@ -287,6 +287,11 @@ def _record_reversal(charge_id: str, intent: str, invoice_id: str, reason: str) 
                           (charge_id, intent, reason)).fetchone():
             db.execute("INSERT INTO billing_reversals(charge_id,payment_intent,invoice_id,reason,created_at) VALUES(?,?,?,?,?)",
                        (charge_id or None, intent or None, invoice_id or None, reason, _now().isoformat()))
+        elif invoice_id:
+            # The invoice was identified later (current Stripe API versions: the charge does not name it). Kept, so a
+            # purchase granted later from that invoice sees the reversal (F1, reversal_for_invoice).
+            db.execute("UPDATE billing_reversals SET invoice_id=? WHERE COALESCE(charge_id,'')=? AND COALESCE(payment_intent,'')=? "
+                       "AND reason=? AND invoice_id IS NULL", (invoice_id, charge_id, intent, reason))
 
 
 def reversal_reason(charge_id: str, intent: str, invoice_id: str) -> str | None:
@@ -301,6 +306,18 @@ def reversal_reason(charge_id: str, intent: str, invoice_id: str) -> str | None:
                 if found:
                     return found["reason"]
     return None
+
+
+def reversal_for_invoice(invoice_id: str) -> dict | None:
+    """{'reason', 'payment_intent'} if the payment of this invoice was fully refunded or is disputed (a won dispute
+    no longer counts), else None. Local record only: used when a purchase is granted after its reversal arrived."""
+    if not invoice_id:
+        return None
+    with connection() as db:
+        db.execute(REVERSALS_DDL)
+        found = db.execute("SELECT reason,payment_intent FROM billing_reversals WHERE invoice_id=? AND reason IN ('refunded','disputed') "
+                           "ORDER BY CASE reason WHEN 'refunded' THEN 0 ELSE 1 END LIMIT 1", (invoice_id,)).fetchone()
+    return {"reason": found["reason"], "payment_intent": found["payment_intent"]} if found else None
 
 
 def _is_reversed(charge_id: str, intent: str, invoice_id: str) -> bool:
@@ -460,6 +477,74 @@ def _restore_disputed_pending(db, charge_id: str, intent: str) -> int:
     return restored
 
 
+# ------------------------------------------------------------------ own-PC licence on a subscription's first invoice (F1)
+#
+# An own-PC Build Your System order (build_orders._grant_vms_license) is one subscription Checkout: the plan plus the
+# one-time VMS software licence, both charged on the subscription's FIRST invoice. The licence is a one-time purchase of
+# that payment, so -- like a standalone licence -- a full refund or a dispute of that payment suspends it (whether or not
+# that invoice is still the current period), and only a won dispute restores it; the plan follows the subscription rules
+# above. The licence row records its Checkout Session; the payment that paid for it is bound to the row the first time a
+# reversal of that subscription's first payment arrives (the Session names its first invoice), and from then on the row is
+# found by its PaymentIntent exactly like a standalone licence.
+
+def _is_first_payment(payment: dict) -> bool:
+    first = row("SELECT id FROM subscription_payments WHERE stripe_subscription_id=? ORDER BY period_start ASC, paid_at ASC LIMIT 1",
+                (payment["stripe_subscription_id"],))
+    return bool(first) and first["id"] == payment["id"]
+
+
+def _lock_invoice(invoice_id: str) -> None:
+    """Also serialize with a licence grant for this invoice (build_orders._grant_vms_license takes this key)."""
+    if invoice_id:
+        with connection() as db:  # joins the caller's transaction
+            lock_payment(db, payment_keys(invoice_id=invoice_id))
+
+
+def _bind_initial_licence(invoice_id: str, subscription_id: str, intent: str, customer_ids: set) -> None:
+    """Record the PaymentIntent of this subscription's first invoice on an own-PC licence bought with it (granted
+    before the row kept its payment). Read from Stripe: unreadable -> RetryableStripeEventError (the event is retried)."""
+    import stripe_state
+    from urllib.parse import quote
+    for customer_id in sorted(filter(None, customer_ids)):
+        for licence in rows("SELECT id,stripe_checkout_session_id FROM customer_entitlements WHERE customer_id=? AND product='vms_license' "
+                            "AND stripe_payment_intent_id IS NULL AND stripe_checkout_session_id IS NOT NULL", (customer_id,)):
+            session = stripe_state.stripe_get(f"/v1/checkout/sessions/{quote(str(licence['stripe_checkout_session_id']), safe='')}",
+                                              "the licence's Checkout Session")
+            if stripe_state._id(session.get("subscription")) == subscription_id and stripe_state._id(session.get("invoice")) == invoice_id:
+                with connection() as db:
+                    db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=?,updated_at=? WHERE id=? "
+                               "AND stripe_payment_intent_id IS NULL", (intent, _now().isoformat(), licence["id"]))
+
+
+def _reverse_initial_licence(invoice_id: str, subscription_id: str, intent: str, reason: str, *, first: bool,
+                             customer_ids: set) -> int:
+    """Suspend the one-time licence paid by this (subscription) payment; 0 if it paid for none."""
+    if not intent:
+        return 0
+    if first and invoice_id and subscription_id:
+        customer_ids = set(customer_ids) | {r["customer_id"] for r in rows(
+            "SELECT customer_id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (subscription_id,))}
+        _bind_initial_licence(invoice_id, subscription_id, intent, customer_ids)
+    changed = 0
+    for licence in rows("SELECT id FROM customer_entitlements WHERE stripe_payment_intent_id=? AND product='vms_license' AND status='active'",
+                        (intent,)):
+        _set_plan(licence["id"], "suspended", reason)
+        changed += 1
+    if changed:
+        logger.info("billing.initial_licence_suspended subscription=%s reason=%s rows=%s", subscription_id, reason, changed)
+    return changed
+
+
+def _restore_disputed_licences(intent: str) -> int:
+    """A won dispute: the one-time licence(s) paid by this payment are active again (refunds stay terminal)."""
+    restored = 0
+    for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='suspended' "
+                            "AND suspended_reason='disputed'", (intent,)):
+        _set_plan(license_row["id"], "active", None)
+        restored += 1
+    return restored
+
+
 def _reverse_purchase(event: dict, reason: str) -> dict:
     charge_id, intent, invoice_id, full = _charge_parts(event)
     if not full:
@@ -474,14 +559,29 @@ def _reverse_purchase_locked(charge_id: str, intent: str, invoice_id: str, reaso
     _record_reversal(charge_id, intent, (payment or {}).get("id") or invoice_id, reason)
     if payment is None:
         found = _stripe_invoice_subscription(intent)
-        if found and (_plan_rows(found[1]) or _addon_rows(found[1]) or row(
-                "SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (found[1],))):
+        if found:
+            # Kept with its invoice even when nothing is granted yet, so a licence granted from that invoice later is
+            # granted suspended (F1, build_orders._grant_vms_license).
+            _lock_invoice(found[0])
             _record_reversal(charge_id, intent, found[0], reason)
-            return {"status": "suspended", "rows": _suspend(found[1], reason)}
+            # Not recorded yet locally: the payment is treated as possibly the first one (the bind checks the Session).
+            licences = _reverse_initial_licence(found[0], found[1], intent, reason, first=True, customer_ids=set())
+            if _plan_rows(found[1]) or _addon_rows(found[1]) or row(
+                    "SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (found[1],)):
+                return {"status": "suspended", "rows": _suspend(found[1], reason) + licences}
+            if licences:
+                return {"status": "suspended", "rows": licences}
     if payment and payment.get("stripe_subscription_id"):
+        _lock_invoice(str(payment["id"]))
+        # F1: the one-time own-PC licence bought on this payment goes with it, whatever the period rules say for the plan.
+        licences = _reverse_initial_licence(str(payment["id"]), str(payment["stripe_subscription_id"]),
+                                            intent or str(payment.get("stripe_payment_intent_id") or ""), reason,
+                                            first=_is_first_payment(payment), customer_ids={payment.get("customer_id")})
         if not _covers_current_period(payment):
+            if licences:
+                return {"status": "suspended", "rows": licences, "reason": "an earlier period: only its one-time licence"}
             return {"status": "ignored", "reason": "an earlier period; the current period is paid"}
-        return {"status": "suspended", "rows": _suspend(payment["stripe_subscription_id"], reason)}
+        return {"status": "suspended", "rows": _suspend(payment["stripe_subscription_id"], reason) + licences}
     if intent:  # a one-time purchase (VMS license, hardware)
         changed = 0
         for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='active'", (intent,)):
@@ -518,11 +618,10 @@ def _dispute_won_locked(charge_id: str, intent: str) -> dict:
         if restored:
             from purchase_notifications import notify_service_restored
             notify_service_restored(payment["stripe_subscription_id"])  # never raises
+        # F1: an own-PC licence bought on this (first) payment is restored with it.
+        restored += _restore_disputed_licences(intent or str(payment.get("stripe_payment_intent_id") or ""))
     elif intent:
-        for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='suspended' "
-                                "AND suspended_reason='disputed'", (intent,)):
-            _set_plan(license_row["id"], "active", None)
-            restored += 1
+        restored += _restore_disputed_licences(intent)
         restored += restore_hardware_orders(intent)
     return {"status": "restored" if restored else "ignored", "rows": restored}
 
