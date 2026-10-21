@@ -29,6 +29,23 @@ T 'a 1.3.0 -Previous (downgrade) is refused' { & $make -Setup $setup -Folder (Jo
 T 'an older 1.2.6 -Previous is accepted as an upgrade source' { & $make -Setup $setup -Folder (Join-Path $Work 'u') -ProductMode local -KeysetKind production -ExpectedKeysetSha256 $prod -Previous $older }
 T 'an invalid product mode is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x5') -ProductMode Local2 -KeysetKind production -ExpectedKeysetSha256 $prod } 'ProductMode'
 T 'a malformed keyset pin is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x6') -ProductMode local -KeysetKind production -ExpectedKeysetSha256 'ABC' } 'ExpectedKeysetSha256'
+# Functional scenario F-L / F-H (Blue 2026-10-21): SYNTHETIC-KEYSET / SIMULATED CAMERA only, default folders unchanged.
+T 'functional run: folder prepared, functional entry script + helpers copied, functional=true' {
+    & $make -Setup $setup -Folder (Join-Path $Work 'f') -ProductMode local -KeysetKind synthetic-test -ExpectedKeysetSha256 ('0' * 64) -SyntheticSigningKey $SyntheticKey -Functional
+    foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', 'onvif-camera-sim.py', 'test-cloud.py', 'signing-key.json') { if (-not (Test-Path (Join-Path $Work "f\scripts\$f"))) { throw "missing $f" } }
+    if (-not (Get-Content -Raw (Join-Path $Work 'f\scripts\acceptance.json') | ConvertFrom-Json).functional) { throw 'functional not set' }
+    if (-not (Select-String -Path (Join-Path $Work 'f\AnyAiCam-Validation.wsb') -SimpleMatch 'scripts\functional-in-sandbox.ps1</Command>')) { throw 'logon command is not the functional script' }
+    if (-not (Select-String -Path (Join-Path $Work 'f\AnyAiCam-Validation.wsb') -SimpleMatch '<Networking>Disable</Networking>')) { throw 'networking not disabled' }
+}
+T 'default runs are unchanged: validate-in-sandbox.ps1, no functional key, no functional files' {
+    foreach ($d in 'p', 's') {
+        if (-not (Select-String -Path (Join-Path $Work "$d\AnyAiCam-Validation.wsb") -SimpleMatch 'scripts\validate-in-sandbox.ps1</Command>')) { throw "$d logon command changed" }
+        if ((Get-Content -Raw (Join-Path $Work "$d\scripts\acceptance.json") | ConvertFrom-Json).PSObject.Properties.Name -contains 'functional') { throw "$d has functional" }
+        foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', 'onvif-camera-sim.py') { if (Test-Path (Join-Path $Work "$d\scripts\$f")) { throw "$d has $f" } }
+    }
+}
+T 'functional run with the production keyset is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x7') -ProductMode local -KeysetKind production -ExpectedKeysetSha256 $prod -Functional } 'synthetic-test build only'
+T 'functional run as an upgrade is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x8') -ProductMode local -KeysetKind synthetic-test -ExpectedKeysetSha256 $prod -SyntheticSigningKey $SyntheticKey -Previous $older -Functional } 'fresh install'
 $failed = @($results | Where-Object { -not $_.ok }).Count
 "MAKE-WSB OFFLINE TEST $($results.Count - $failed)/$($results.Count) passed"
 if ($failed) { exit 1 }
