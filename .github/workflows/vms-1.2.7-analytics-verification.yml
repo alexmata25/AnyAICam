@@ -76,6 +76,7 @@ jobs:
             app/tests/test_customer_downloads.py \
             app/tests/test_per_camera_billing_v2.py \
             app/tests/test_aws_cost_dashboard.py \
+            app/tests/test_aws_cost_collection_scheduler.py \
             app/tests/test_live_stream_copy_safety.py \
             app/tests/test_recording_codec_aware.py \
             app/tests/test_recording_uploader_motion_gate.py \

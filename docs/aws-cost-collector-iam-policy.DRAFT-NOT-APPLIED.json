@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AnyAiCamCostExplorerReadOnly",
+      "Effect": "Allow",
+      "Action": "ce:GetCostAndUsage",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AnyAiCamRecordingsLifecycleRead",
+      "Effect": "Allow",
+      "Action": "s3:GetLifecycleConfiguration",
+      "Resource": "arn:aws:s3:::REPLACE_WITH_RECORDINGS_BUCKET"
+    },
+    {
+      "Sid": "AnyAiCamS3InventoryReportRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::REPLACE_WITH_INVENTORY_DESTINATION_BUCKET/REPLACE_WITH_INVENTORY_DESTINATION_PREFIX/*"
+    }
+  ]
+}

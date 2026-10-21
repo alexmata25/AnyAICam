@@ -103,6 +103,7 @@ def test_docker_build_inputs_and_runtime_credentials_code_remain_in_context():
         "requirements-push.txt",
         "app/main.py",
         "app/aws_cost_dashboard.py",
+        "app/aws_cost_collection_scheduler.py",
         "app/recording_credentials.py",
     )
 

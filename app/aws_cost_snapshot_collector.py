@@ -285,9 +285,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--refresh-cost-explorer", action="store_true")
     parser.add_argument("--refresh-lifecycle", action="store_true")
     parser.add_argument("--bucket", default=os.getenv("ANYAICAM_RECORDING_S3_BUCKET", ""))
+    parser.add_argument("--run-daily-collection", action="store_true", help="Run today's scheduled collection now (cloud runtime only) and record its status for the dashboard; retries a failed/partial run of today")
     args = parser.parse_args(argv)
     if os.getenv("ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED", "").strip().lower() != "true":
         parser.error("collector is disabled; set ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED=true for an approved scheduled run")
+    if args.run_daily_collection:
+        from aws_cost_collection_scheduler import run_daily_collection
+        result = run_daily_collection(trigger="manual", retry_failed=True)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("status") in {"succeeded", "already_claimed"} else 1
     actions = 0
     try:
         if args.inventory_csv:

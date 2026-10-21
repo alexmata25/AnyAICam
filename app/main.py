@@ -41095,6 +41095,16 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # Daily read-only AWS cost snapshot collection (aws_cost_collection_scheduler.py):
+    # cloud runtime only (never edge/combined appliances) and only with both
+    # ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED and ANYAICAM_COST_DASHBOARD_AWS_READ_ENABLED
+    # true; the worker re-checks the gate and logs why it is off.
+    import aws_cost_collection_scheduler
+    aws_cost_collection_task = (
+        asyncio.create_task(aws_cost_collection_scheduler.aws_cost_collection_worker(RUNTIME_ROLE, structured_log))
+        if aws_cost_collection_scheduler.scheduler_gate(RUNTIME_ROLE)[0]
+        else None
+    )
     # Orphaned live-HLS segments left by every FFmpeg restart (see
     # hls_segment_sweeper.py): wherever cameras stream locally.
     import hls_segment_sweeper
@@ -41439,6 +41449,8 @@ async def lifespan(app: FastAPI):
             event_media_retry_task.cancel()
         if mobile_push_task:
             mobile_push_task.cancel()
+        if aws_cost_collection_task:
+            aws_cost_collection_task.cancel()
         if notification_retry_task:
             notification_retry_task.cancel()
         if camera_config_sync_task:
@@ -41570,6 +41582,8 @@ async def lifespan(app: FastAPI):
             pending.append(event_media_retry_task)
         if mobile_push_task:
             pending.append(mobile_push_task)
+        if aws_cost_collection_task:
+            pending.append(aws_cost_collection_task)
         if notification_retry_task:
             pending.append(notification_retry_task)
         if camera_config_sync_task:

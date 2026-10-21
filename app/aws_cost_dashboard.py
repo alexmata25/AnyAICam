@@ -2,7 +2,8 @@
 
 The dashboard reads persisted, read-only AWS Cost Explorer and S3 Inventory
 snapshots. It deliberately does not call ListObjects from a browser request or
-store AWS credentials. Collection is a separate, opt-in CLI task.
+store AWS credentials. Collection is a separate, opt-in task: the CLI or the
+cloud-only daily scheduler in aws_cost_collection_scheduler.py.
 """
 from __future__ import annotations
 
@@ -714,6 +715,7 @@ def dashboard_summary(as_of: date | None = None) -> dict:
         delta = {"amount_usd": change, "percent": (change / previous_bill["total_usd"] * 100) if previous_bill["total_usd"] else None, "baseline_month": previous_bill["month"], "current_month": current_bill["month"], "estimated": current_bill["status"] == "estimated"}
     return {
         "as_of": as_of.isoformat(),
+        "collection": _collection_overview(),
         "billing": {
             "current_month": current_bill,
             "previous_month": previous_bill,
@@ -743,10 +745,30 @@ def dashboard_summary(as_of: date | None = None) -> dict:
     }
 
 
-def render_page() -> str:
-    return """<section class=\"panel\"><p class=\"eyebrow\">Internal · platform owner</p><h1>AWS Cost Dashboard</h1>
+def _collection_overview() -> dict:
+    """Collection/scheduler state; never raises and never invents figures."""
+    try:
+        from aws_cost_collection_scheduler import collection_overview
+        return collection_overview()
+    except Exception:
+        return {"status_available": False, "summary_text": "Collection status is unavailable.", "empty_state": None}
+
+
+def render_page(collection: Mapping | None = None) -> str:
+    from html import escape
+    collection = collection or {}
+    summary = escape(str(collection.get("summary_text") or "Collection status is unavailable."))
+    empty = collection.get("empty_state")
+    empty_html = f"<div id=\"aws-cost-empty\" class=\"panel\" role=\"note\">{escape(str(empty))}</div>" if empty else "<div id=\"aws-cost-empty\" hidden></div>"
+    return f"""<section class=\"panel\"><p class=\"eyebrow\">Internal · platform owner</p><h1>AWS Cost Dashboard</h1>
 <p class=\"health-detail\">Billed account totals come from Cost Explorer snapshots. Camera storage is an estimate from S3 Inventory snapshots. Customer allocations are not AWS-billed charges.</p>
-<div id=\"aws-cost-status\" role=\"status\">Loading stored cost and usage snapshots…</div>
+<div id=\"aws-cost-collection\" role=\"status\">{summary}</div>
+{empty_html}
+<div id=\"aws-cost-status\" role=\"status\">Loading stored cost and usage snapshots…</div>""" + _render_page_body()
+
+
+def _render_page_body() -> str:
+    return """
 <section class=\"panel\"><h2>AWS account overview</h2><div id=\"aws-cost-overview\"></div></section>
 <section class=\"panel\"><h2>Service and S3 usage detail</h2><div id=\"aws-cost-usage-detail\"></div></section>
 <section class=\"panel\"><h2>Customer, site, appliance, and camera usage</h2><div id=\"aws-cost-customers\"></div><div id=\"aws-cost-sites\"></div><div id=\"aws-cost-appliances\"></div></section>
@@ -771,7 +793,8 @@ const status=document.getElementById('aws-cost-status');
 const money=value=>value===null||value===undefined?'Not measured':new Intl.NumberFormat(undefined,{style:'currency',currency:'USD'}).format(value);
 const esc=value=>String(value??'—');
 function table(headers,rows){const t=document.createElement('table');const thead=t.createTHead().insertRow();headers.forEach(label=>{const th=document.createElement('th');th.textContent=label;thead.appendChild(th)});const body=t.createTBody();rows.forEach(row=>{const tr=body.insertRow();row.forEach(value=>{const td=tr.insertCell();td.textContent=esc(value)})});return t}
-function showCosts(data){const overview=document.getElementById('aws-cost-overview');const bill=data.billing;const change=bill.month_to_month_change;const summary=[['Current month',bill.current_month?`${bill.current_month.status} · ${money(bill.current_month.total_usd)}`:'Not measured'],['Previous finalized month',bill.previous_month?money(bill.previous_month.total_usd):'Not measured'],['Month-to-month change',change?`${money(change.amount_usd)} (${change.percent===null?'n/a':change.percent.toFixed(1)+'%'}) · ${change.estimated?'current month estimated':''}`:'Not measured'],['S3 current month',bill.current_month?money(bill.current_month.s3_usd):'Not measured'],['S3 previous month',bill.previous_month?money(bill.previous_month.s3_usd):'Not measured'],['Taxes current month',bill.current_month?money(bill.current_month.tax_usd):'Not measured']];overview.appendChild(table(['Measure','Value'],summary));const history=document.createElement('div');history.appendChild(table(['Month','Status','Total','S3','Captured'],bill.history.map(m=>[m.month,m.status,money(m.total_usd),money(m.s3_usd),m.captured_at])));overview.appendChild(history);const services=document.getElementById('aws-cost-usage-detail');services.appendChild(table(['Month','Service','S3 usage type','Category','Amount'],bill.history.flatMap(m=>m.usage_breakdown.map(u=>[m.month,u.service,u.usage_type,u.classification,money(u.amount_usd)]))));if(bill.current_month)services.appendChild(table(['Current-month service','Amount'],Object.entries(bill.current_month.services).map(([k,v])=>[k,money(v)])));
+function showCollection(c){if(!c)return;const line=document.getElementById('aws-cost-collection');if(line&&c.summary_text)line.textContent=c.summary_text;const empty=document.getElementById('aws-cost-empty');if(empty){if(c.empty_state){empty.textContent=c.empty_state;empty.hidden=false}else{empty.hidden=true}}if(c.last_run&&['failed','partial'].includes(c.last_run.status)&&line)line.classList.add('error')}
+function showCosts(data){showCollection(data.collection);const overview=document.getElementById('aws-cost-overview');const bill=data.billing;const change=bill.month_to_month_change;const summary=[['Current month',bill.current_month?`${bill.current_month.status} · ${money(bill.current_month.total_usd)}`:'Not measured'],['Previous finalized month',bill.previous_month?money(bill.previous_month.total_usd):'Not measured'],['Month-to-month change',change?`${money(change.amount_usd)} (${change.percent===null?'n/a':change.percent.toFixed(1)+'%'}) · ${change.estimated?'current month estimated':''}`:'Not measured'],['S3 current month',bill.current_month?money(bill.current_month.s3_usd):'Not measured'],['S3 previous month',bill.previous_month?money(bill.previous_month.s3_usd):'Not measured'],['Taxes current month',bill.current_month?money(bill.current_month.tax_usd):'Not measured']];overview.appendChild(table(['Measure','Value'],summary));const history=document.createElement('div');history.appendChild(table(['Month','Status','Total','S3','Captured'],bill.history.map(m=>[m.month,m.status,money(m.total_usd),money(m.s3_usd),m.captured_at])));overview.appendChild(history);const services=document.getElementById('aws-cost-usage-detail');services.appendChild(table(['Month','Service','S3 usage type','Category','Amount'],bill.history.flatMap(m=>m.usage_breakdown.map(u=>[m.month,u.service,u.usage_type,u.classification,money(u.amount_usd)]))));if(bill.current_month)services.appendChild(table(['Current-month service','Amount'],Object.entries(bill.current_month.services).map(([k,v])=>[k,money(v)])));
 const customerWrap=document.getElementById('aws-cost-customers');customerWrap.appendChild(table(['Customer ID','Customer name','Appliances','Active / registered cameras','Stored camera prefixes','Measured cameras','Known measured GB','Known measured storage subtotal (partial)','Complete storage estimate','Attributed requests/transfers','Shared allocation'],data.customers.map(c=>[c.customer_id,c.customer_name,c.appliance_count,`${c.active_camera_count} / ${c.camera_count}`,c.stored_camera_prefix_count,c.measured_camera_count,c.storage_measured?Number(c.known_storage_decimal_gb).toFixed(3):'Not measured',money(c.known_measured_storage_estimate_usd),money(c.estimated_storage_monthly_usd),'Not attributed','Not allocated'])));
 document.getElementById('aws-cost-sites').appendChild(table(['Customer ID','Site ID','Site name','Appliances','Active / registered cameras','Stored prefixes','Measured cameras','Known measured GB','Complete storage estimate'],data.sites.map(s=>[s.customer_id,s.site_id,s.site_name,s.appliance_count,`${s.active_camera_count} / ${s.camera_count}`,s.stored_camera_prefix_count,s.measured_camera_count,s.measured_camera_count?Number(s.known_storage_decimal_gb).toFixed(3):'Not measured',money(s.estimated_storage_monthly_usd)])));
 document.getElementById('aws-cost-appliances').appendChild(table(['Customer ID','Site ID','Appliance ID','VMS version','Active / registered cameras','Stored prefixes','Measured cameras','Known measured GB','Complete storage estimate'],data.appliances.map(a=>[a.customer_id,a.site_id,a.appliance_id,a.software_version,`${a.active_camera_count} / ${a.camera_count}`,a.stored_camera_prefix_count,a.measured_camera_count,a.measured_camera_count?Number(a.known_storage_decimal_gb).toFixed(3):'Not measured',money(a.estimated_storage_monthly_usd)])));
@@ -789,7 +812,7 @@ def register_aws_cost_dashboard_routes(app: FastAPI, page_shell) -> None:
     def aws_cost_dashboard_page(request: Request):
         identity = require_owner(request)
         _record_view(identity)
-        return page_shell("AWS Cost Dashboard", "admin-portal", render_page(), render_script())
+        return page_shell("AWS Cost Dashboard", "admin-portal", render_page(_collection_overview()), render_script())
 
     @app.get("/api/admin/aws-costs/summary")
     def aws_cost_dashboard_summary(request: Request):
