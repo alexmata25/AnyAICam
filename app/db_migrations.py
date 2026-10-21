@@ -1485,6 +1485,17 @@ CREATE TABLE IF NOT EXISTS pending_reversals(
  reason TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(source_table, source_id)
 )
 '''),
+    # Requirement #11 test-account cleanup (test_account_cleanup.py, Red 2026-10-20): one row per test account the
+    # owner-approved cleanup closed (tombstoned or deleted). The "closed test account" marker is customers.status=
+    # 'closed_test' (customer_lookup.INACTIVE_CUSTOMER_STATUSES); this table is the durable record of who closed it, with
+    # which plan and backup, and makes a re-run of the same plan a no-op. No FK: a deleted account keeps its record.
+    # Emails are kept only as sha256. Additive.
+    ('20261020_test_account_closures','''
+CREATE TABLE IF NOT EXISTS test_account_closures(
+ customer_id TEXT PRIMARY KEY, cleanup_class TEXT NOT NULL, method TEXT NOT NULL, email_sha256 TEXT NOT NULL,
+ plan_sha256 TEXT NOT NULL, closed_at TEXT NOT NULL, closed_by TEXT NOT NULL, backup_sha256 TEXT, details_json TEXT
+)
+'''),
 ]
 
 
