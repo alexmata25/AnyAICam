@@ -273,7 +273,11 @@ $python = Join-Path $app 'runtime\python\python.exe'
 $cloudData = 'C:\TestCloud'
 & $python 'C:\Validation\scripts\test-cloud.py' --app (Join-Path $app 'app') --data $cloudData --host $TestCloudHost --certificates-only
 Import-Certificate -FilePath (Join-Path $cloudData 'tls\ca.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-$testCloud = Start-Process -FilePath $python -ArgumentList '"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443', $(if ($acceptanceSettings.keyset_kind -eq 'synthetic-test') { '--signing-key', '"C:\Validation\scripts\signing-key.json"' }) `
+# 2026-10-20: built as a list -- in a production-keyset run the old inline "$(if ...)" added a $null element, and
+# Start-Process refuses a null in -ArgumentList, so the test cloud never started (every link check then failed).
+$cloudArguments = @('"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443')
+if ($acceptanceSettings.keyset_kind -eq 'synthetic-test') { $cloudArguments += @('--signing-key', '"C:\Validation\scripts\signing-key.json"') }
+$testCloud = Start-Process -FilePath $python -ArgumentList $cloudArguments `
     -WorkingDirectory $cloudData -WindowStyle Hidden -RedirectStandardOutput (Join-Path $results 'test-cloud.out.log') -RedirectStandardError (Join-Path $results 'test-cloud.err.log') -PassThru
 Check 'test cloud up over HTTPS (real claim and appliance routes)' { if (-not (WaitFor 120 { Cloud GET '/test/state' })) { throw 'test cloud did not answer' }; 'https://cloud.anyaicam.test:8443' }
 # The agent backed off while the cloud was not up yet; start it over.
