@@ -1,6 +1,6 @@
 # Test-account cleanup (Requirement #11): owner procedure
 
-Tool: `app/test_account_cleanup.py`. It runs offline against the application database through the app's own DB
+Tool: `app/account_cleanup.py`. It runs offline against the application database through the app's own DB
 layer (`database_backend`), so it works on SQLite and PostgreSQL. It never calls Stripe, AWS, S3 or an appliance.
 
 **A production run needs the owner's written authorization.** Red, Green, Codex and the tool itself cannot give it.
@@ -28,7 +28,7 @@ becomes a pending link. It attaches only to a new, verified account.
    database:
 
    ```sh
-   python test_account_cleanup.py inventory --output inventory.json
+   python account_cleanup.py inventory --output inventory.json
    ```
 
    It lists every customer and login user with its class, reasons, dependency counts, billing rows and
@@ -52,7 +52,7 @@ becomes a pending link. It attaches only to a new, verified account.
 3. **Plan (dry run, read-only).**
 
    ```sh
-   python test_account_cleanup.py plan --approved approved.json --output plan.json
+   python account_cleanup.py plan --approved approved.json --output plan.json
    ```
 
    The whole list is refused if any of these is true:
@@ -79,7 +79,7 @@ becomes a pending link. It attaches only to a new, verified account.
 6. **Apply**, within 30 minutes of the plan (`--max-age-minutes` changes the limit):
 
    ```sh
-   python test_account_cleanup.py apply --plan plan.json --confirm APPLY-<token> --actor "<who>" --backup-dir /backups
+   python account_cleanup.py apply --plan plan.json --confirm APPLY-<token> --actor "<who>" --backup-dir /backups
    ```
 
    Before writing, `apply`:

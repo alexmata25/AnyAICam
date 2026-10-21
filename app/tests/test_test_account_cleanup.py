@@ -1,4 +1,4 @@
-"""Requirement #11 (VMS 1.2.7): test-account cleanup tool (test_account_cleanup.py).
+"""Requirement #11 (VMS 1.2.7): test-account cleanup tool (account_cleanup.py).
 
 Throwaway SQLite databases with the real schema (partner_db.initialize_database + every migration). Covers the
 classification (P/A/B/C), protected and appliance-linked refusals, stale/tampered plans, backup before write,
@@ -13,7 +13,7 @@ from datetime import timedelta
 import pytest
 
 import customer_entitlements
-import test_account_cleanup as tac
+import account_cleanup as tac
 from database_backend import override_target
 from partner_db import initialize_database
 

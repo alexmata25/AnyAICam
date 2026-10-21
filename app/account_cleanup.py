@@ -1,9 +1,9 @@
 """Requirement #11 (VMS 1.2.7): offline admin tool to close the owner's TEST customer accounts safely.
 
-    python test_account_cleanup.py inventory [--approved approved.json] [--output inventory.json]
-    python test_account_cleanup.py plan --approved approved.json --output plan.json
+    python account_cleanup.py inventory [--approved approved.json] [--output inventory.json]
+    python account_cleanup.py plan --approved approved.json --output plan.json
                                         [--allow-appliance-linked --appliance-linked-reason "..."]
-    python test_account_cleanup.py apply --plan plan.json --confirm <token> --actor <who>
+    python account_cleanup.py apply --plan plan.json --confirm <token> --actor <who>
                                          (--backup-dir DIR | --backup-verified DUMP) [--max-age-minutes 30]
 
 It works on the application database through the app's own DB layer (database_backend: SQLite or PostgreSQL via
@@ -45,6 +45,9 @@ from urllib.parse import urlsplit
 
 import database_backend
 
+# File name: account_cleanup.py, not test_*.py -- the release packager and pytest treat test_*.py as test code
+# (installer/build_release_installer.py is_test_only_release_path), which kept this tool out of the payload.
+# TOOL / ACTOR_ROLE / audit action names below keep the stable "test_account_cleanup" identifier.
 TOOL = "test_account_cleanup"
 FORMAT = 1
 CLOSED_STATUS = "closed_test"
@@ -948,7 +951,7 @@ def _write_json(data: dict, output: Path | None) -> None:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="test_account_cleanup.py", description=__doc__,
+    parser = argparse.ArgumentParser(prog="account_cleanup.py", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sqlite-path", type=Path, help="SQLite file to use instead of ANYAICAM_PARTNER_DB (e.g. a copy)")
     sub = parser.add_subparsers(dest="command", required=True)
