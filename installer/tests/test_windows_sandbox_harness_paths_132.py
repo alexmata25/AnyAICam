@@ -43,3 +43,36 @@ def test_the_harness_identity_file_is_the_one_the_service_reads():
     assert "$identityFile = Join-Path $data 'recordings\\appliance_identity.json'" in script
     activation = (ROOT / "app" / "appliance_activation.py").read_text(encoding="utf-8")
     assert 'runtime_paths.recordings_default("appliance_identity.json")' in activation
+
+
+# 2026-10-21 (P-L on a655d3bb): Setup's stop-app-processes.ps1 stops every process still running from the install
+# folder. The test cloud stands in for the real cloud, which never goes away while a PC reinstalls, so it must not run
+# from the install folder (it did: "Stopping python.exe ... still running from the AnyAiCam folder", then no heartbeat).
+def _validator() -> str:
+    return (WIN / "sandbox" / "validate-in-sandbox.ps1").read_text(encoding="utf-8-sig")
+
+
+def test_the_test_cloud_runs_from_its_own_copy_outside_the_install_folder():
+    script = _validator()
+    start = script.index("$testCloud = Start-Process -FilePath $python")
+    setup = script[script.index("$cloudData = 'C:\TestCloud'"):start]
+    assert "$cloudRuntime = Join-Path $cloudData 'runtime'" in setup
+    assert "$python = Join-Path $cloudRuntime 'python\python.exe'" in setup
+    assert "$cloudApp = Join-Path $cloudRuntime 'app'" in setup
+    assert "'--app', ('\"' + $cloudApp + '\"')" in setup
+    assert "--app $cloudApp" in setup                                  # the certificates-only run too
+    assert "$python = Join-Path $app" not in setup
+    assert "if ($LASTEXITCODE -ge 8) { throw" in setup                  # a failed copy stops the run, never a silent fallback
+
+
+def test_stop_app_processes_would_leave_the_test_clouds_copy_alone():
+    stop = (WIN / "stop-app-processes.ps1").read_text(encoding="utf-8-sig")
+    assert "StartsWith(" in stop and "\\" in stop                        # prefix match on <InstallRoot>\ only
+    # C:\TestCloud\runtime\python\python.exe is not under C:\Program Files\AnyAiCam\
+    assert not "C:\TestCloud\runtime\python\python.exe".lower().startswith("C:\Program Files\AnyAiCam\\".lower())
+
+
+def test_bundled_python_lookups_cannot_pick_the_test_cloud():
+    # the VMS-kill check finds "the VMS python" by install path + uvicorn; the test cloud also runs uvicorn
+    script = _validator()
+    assert "$_.ExecutablePath -like \"$env:ProgramFiles\AnyAiCam\*\" -and $_.CommandLine -match $Pattern" in script

@@ -282,13 +282,25 @@ Check 'link requests folder: SYSTEM and Administrators only (inherited)' {
     }
     'SYSTEM, Administrators'
 }
-$python = Join-Path $app 'runtime\python\python.exe'
 $cloudData = 'C:\TestCloud'
-& $python 'C:\Validation\scripts\test-cloud.py' --app (Join-Path $app 'app') --data $cloudData --host $TestCloudHost --certificates-only
+# 2026-10-21 (P-L on a655d3bb): the test cloud stands in for app.anyaicam.com, which stays up while this PC reinstalls.
+# Run from the installed Python it was a process "still running from the AnyAiCam folder", so Setup (stop-app-
+# processes.ps1, correctly) stopped it and every later link check saw no cloud. It now runs from its own copy of the
+# installed runtime and app code, outside the install folder, made once right after the install under test.
+$cloudRuntime = Join-Path $cloudData 'runtime'
+New-Item -ItemType Directory -Force $cloudRuntime | Out-Null
+foreach ($part in 'python', 'app') {
+    $source = if ($part -eq 'python') { Join-Path $app 'runtime\python' } else { Join-Path $app 'app' }
+    & robocopy.exe $source (Join-Path $cloudRuntime $part) /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "could not copy the test cloud's $part (robocopy $LASTEXITCODE)" }
+}
+$python = Join-Path $cloudRuntime 'python\python.exe'
+$cloudApp = Join-Path $cloudRuntime 'app'
+& $python 'C:\Validation\scripts\test-cloud.py' --app $cloudApp --data $cloudData --host $TestCloudHost --certificates-only
 Import-Certificate -FilePath (Join-Path $cloudData 'tls\ca.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
 # 2026-10-20: built as a list -- in a production-keyset run the old inline "$(if ...)" added a $null element, and
 # Start-Process refuses a null in -ArgumentList, so the test cloud never started (every link check then failed).
-$cloudArguments = @('"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443')
+$cloudArguments = @('"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + $cloudApp + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443')
 if ($acceptanceSettings.keyset_kind -eq 'synthetic-test') { $cloudArguments += @('--signing-key', '"C:\Validation\scripts\signing-key.json"') }
 $testCloud = Start-Process -FilePath $python -ArgumentList $cloudArguments `
     -WorkingDirectory $cloudData -WindowStyle Hidden -RedirectStandardOutput (Join-Path $results 'test-cloud.out.log') -RedirectStandardError (Join-Path $results 'test-cloud.err.log') -PassThru
