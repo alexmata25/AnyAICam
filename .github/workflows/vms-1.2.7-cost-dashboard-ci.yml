@@ -58,6 +58,7 @@ jobs:
           set -o pipefail
           pytest -ra --junitxml=linux-auth-and-regression.xml \
             app/tests/test_aws_cost_dashboard.py \
+            app/tests/test_aws_cost_collection_scheduler.py \
             app/tests/test_storage_trial_30day.py \
             app/tests/test_hardware_first_checkout.py \
             app/tests/test_docker_build_context_security.py \

@@ -35,7 +35,31 @@ The storage price is a configurable estimate, not a contract rate. Verify the cu
 1. After a separately approved S3 Inventory configuration exists, an operator/scheduler supplies that report's exact `manifest.json` key. The collector reads only the manifest, its checksum, and the named CSV shards using `GetObject`; it does not list the bucket or fetch recording objects. It checks the manifest and shard MD5 values, streams compressed CSV through a restrictive temporary directory, aggregates camera-prefix bytes/counts in memory, and deletes temporary files on exit.
 2. Camera prefixes are generated through the existing `recording_s3_prefix(customer_id, site_id, appliance_id, camera_id)` contract. The manifest source bucket must match `ANYAICAM_RECORDING_S3_BUCKET`, its destination ARN must match the explicitly requested Inventory bucket, and each CSV row's Bucket field must match that source bucket. The manifest companion MD5 and every listed shard MD5 are required and verified. Shards must stay under the report's `data/` directory. The parser URL-decodes S3 Inventory keys before exact-prefix matching. Unknown prefixes are ignored.
 3. The collector may call Cost Explorer once per scheduled run and save monthly service/record-type snapshots. It may also read the bucket lifecycle configuration and save a separate dated snapshot. All three data sources are read-only.
-4. The dashboard serves cached database snapshots. Schedule collection once daily outside a request path; do not trigger repeated inventory or Cost Explorer calls for every browser refresh.
+4. The dashboard serves cached database snapshots. Collection runs once daily outside a request path; the page never triggers inventory or Cost Explorer calls.
+
+### Automatic daily schedule (1.2.7 RC9)
+
+`app/aws_cost_collection_scheduler.py` is started from the application lifespan in `app/main.py` and calls the collector functions in-process (no subprocess). It runs only when **all** of these are true:
+
+- `ANYAICAM_RUNTIME_ROLE=cloud` — edge and combined appliances never start it (they must not hold AWS billing permissions);
+- `ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED=true`;
+- `ANYAICAM_COST_DASHBOARD_AWS_READ_ENABLED=true`.
+
+Timing: one run `ANYAICAM_COST_SNAPSHOT_STARTUP_DELAY_SECONDS` (default 300) after startup, then daily at `ANYAICAM_COST_SNAPSHOT_SCHEDULE_HOUR_UTC` (0–23, default 6). Each UTC day is claimed in the `aws_cost_collection_runs` table (primary key = run date, migration `20261020_aws_cost_collection_runs`), so several workers or containers on the same database collect at most once per day; a claim left `running` for more than 3 hours (crashed worker) can be reclaimed. A failed day is not retried automatically; the owner can retry it manually (below).
+
+Each run performs, independently:
+
+| Step | Runs when | Reads |
+|---|---|---|
+| `cost_explorer` | always | `ce:GetCostAndUsage`, previous month start to today, grouped by service + record type and service + usage type |
+| `lifecycle` | `ANYAICAM_RECORDING_S3_BUCKET` is set | `s3:GetLifecycleConfiguration` on that bucket |
+| `inventory` | `ANYAICAM_COST_INVENTORY_MANIFEST_S3` is set | `s3:GetObject` on the exact manifest, its checksum and listed shards |
+
+`ANYAICAM_COST_INVENTORY_MANIFEST_S3` is an exact `s3://bucket/key` or a template containing `{date}` (for example `s3://<inventory-bucket>/<prefix>/<recordings-bucket>/<config-id>/{date}T01-00Z/manifest.json`); `{date}` is tried as the run date and then the previous day. Copy the fixed time part (`T01-00Z`) from the first real delivery. Because the role intentionally has no `s3:ListBucket`, S3 answers `AccessDenied` (not `NoSuchKey`) when that day's manifest does not exist.
+
+Outcome per run is `succeeded`, `partial` (some steps failed) or `failed`, stored with an error category (`permission`, `credentials`, `not_found`, `aws_error`, `validation`, `internal`), the AWS error code and an owner-readable instruction — never the raw AWS message, ARNs or credentials. A permission failure is logged as `aws_cost.collection_permission_denied` and stored as a status; no cost row is written for a failed request, so a denied call can never appear as `$0`. The worker catches every error and never stops the application.
+
+The dashboard shows `Last collection: <time> OK` or `Last collection: <time> FAILED: AccessDeniedException — ask an AWS administrator to grant ce:GetCostAndUsage …`, the next scheduled run, and — when no snapshot rows exist — an explicit empty state explaining whether collection is disabled (and which flag/role), not yet run, in progress, or failed. No figures are displayed until real snapshots exist.
 
 The collector defaults off. A scheduled invocation requires explicit `ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED=true`; API reads additionally require `ANYAICAM_COST_DASHBOARD_AWS_READ_ENABLED=true`. Use the cloud workload's approved IAM role/default credential provider. Do not put access keys in code, browser storage, or command arguments. No AWS resource is created or changed by this code.
 
@@ -54,7 +78,7 @@ The command should run inside the cloud app runtime so `ANYAICAM_DATABASE_BACKEN
 
 ## Minimum read-only AWS permissions for collection
 
-No policy is applied by this work. The workload role needs only:
+No policy is applied by this work. A least-privilege draft is in [`aws-cost-collector-iam-policy.DRAFT-NOT-APPLIED.json`](aws-cost-collector-iam-policy.DRAFT-NOT-APPLIED.json); replace the three `REPLACE_WITH_…` placeholders before review. The workload role needs only:
 
 - `ce:GetCostAndUsage` on `Resource: "*"` (Cost Explorer does not support a narrower resource ARN for this API);
 - `s3:GetObject` on the exact S3 Inventory destination prefix containing its manifest/checksum/report CSV files;
@@ -63,6 +87,44 @@ No policy is applied by this work. The workload role needs only:
 If the Inventory destination encrypts report objects with SSE-KMS, S3 reads may also require `kms:Decrypt` on that specific customer-managed key. Add it only after verifying the report encryption, and constrain it to the Inventory destination's encryption context; do not grant decrypt access to the recordings bucket's media key. If report encryption is SSE-S3, no KMS permission is needed.
 
 No S3 listing is necessary when the scheduled job is given the exact manifest path. Do not grant `s3:ListBucket` on recording prefixes, `GetObject` on recording media, any write/delete/tag action, Cost Explorer forecast, or IAM permissions. If a future scheduler must discover the newest manifest, request a separate review for a narrowly prefix-conditioned `s3:ListBucket` on the Inventory destination bucket only.
+
+## Owner procedure to get real AWS data
+
+Every step that changes AWS or the live cloud requires owner/administrator approval. Nothing below is done by the application or by this change.
+
+1. **Apply IAM (owner/AWS administrator approval).**
+   - Identify the role attached to the cloud EC2 instance (EC2 console → instance → Security → IAM role). If none exists, create a dedicated read-only role and instance profile for it.
+   - Fill the placeholders in `docs/aws-cost-collector-iam-policy.DRAFT-NOT-APPLIED.json`, review it (three statements, no `s3:ListBucket`, no write/delete/IAM/KMS actions) and attach it as an inline or customer-managed policy to that role.
+   - Cost Explorer must be enabled for the account (Billing → Cost Explorer → *Launch Cost Explorer*); it can take up to 24 hours before the API returns data. If the account is a member of an AWS Organization, Cost Explorer access may also need to be allowed from the management account.
+   - The app runs in Docker on EC2: set the instance metadata option *HTTP PUT response hop limit* to `2` (IMDSv2) so the container can obtain the role credentials. Never put access keys in the environment file.
+2. **Set up S3 Inventory (optional, for camera-level storage; separate approval because it has a small recurring cost).** On the recordings bucket create a daily CSV Inventory configuration (fields: Size, Last modified date, Storage class; include all versions if versioning is on) delivering to a separate destination bucket/prefix. After the first delivery (up to 48 hours) note the exact `…/<config-id>/<YYYY-MM-DD>THH-MMZ/manifest.json` path and turn it into the `{date}` template. If the destination uses SSE-KMS, review the optional `kms:Decrypt` statement described above.
+3. **Set the cloud environment (deployment change, owner approval).** In the cloud container's environment file:
+   ```
+   ANYAICAM_RUNTIME_ROLE=cloud
+   ANYAICAM_PLATFORM_OWNER_EMAIL=<owner email that signs in to the Admin Portal>
+   ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED=true
+   ANYAICAM_COST_DASHBOARD_AWS_READ_ENABLED=true
+   ANYAICAM_RECORDING_S3_BUCKET=<recordings bucket>
+   ANYAICAM_COST_INVENTORY_MANIFEST_S3=s3://<inventory-bucket>/<prefix>/<recordings-bucket>/<config-id>/{date}T01-00Z/manifest.json   # only after step 2
+   ANYAICAM_COST_SNAPSHOT_SCHEDULE_HOUR_UTC=6
+   AWS_REGION=us-east-1
+   ```
+   Restart the container so the settings and the `20261020_aws_cost_collection_runs` migration apply. The startup log shows `aws_cost.collection_scheduler_started` (or `aws_cost.collection_scheduler_disabled` with the reason).
+4. **Verify one manual run** inside the cloud container (it records its status like a scheduled run and may retry a failed/partial run of the same UTC day):
+   ```
+   docker exec <cloud-container> python /app/aws_cost_snapshot_collector.py --run-daily-collection
+   ```
+   Expect JSON with `"status": "succeeded"` and per-step counts. `AccessDeniedException` on `cost_explorer` → step 1 is not effective (wrong role, policy not attached, or hop limit). `NoCredentialsError` → the container cannot reach the instance role. Then open `/admin/aws-costs` as the owner and confirm `Last collection: … OK` and populated monthly totals.
+5. **Let the schedule run.** The next day after `ANYAICAM_COST_SNAPSHOT_SCHEDULE_HOUR_UTC`, confirm the dashboard shows the new run time, or query `SELECT run_date,status,error_code FROM aws_cost_collection_runs ORDER BY run_date DESC LIMIT 7`. Logs: `aws_cost.collection_finished`, `aws_cost.collection_permission_denied`, `aws_cost.collection_step_failed`.
+
+To disable: set either flag to `false` (or unset) and restart; the stored snapshots remain read-only history.
+
+### Verifying the numbers against the AWS bill
+
+- In the AWS console open **Cost Explorer**, set the same month, granularity *Monthly*, metric **Unblended cost**, group by **Service**, and compare each service to the dashboard's month/service table. Totals should match to the cent for the same capture time; the current month is labelled *estimated* and keeps changing until AWS finalizes it.
+- For a closed month, compare the dashboard total (finalized) with **Billing → Bills** for that month. Expected differences: credits, refunds, savings plans/reserved-instance amortization and support charges appear under their own record types, and tax is shown as the *Tax* service; the dashboard does not net them out.
+- Spot-check S3: the dashboard's S3 usage-type rows (e.g. `TimedStorage-ByteHrs`, `Requests-Tier1`) should match Cost Explorer grouped by **Usage type** filtered to *S3*.
+- Camera storage figures are estimates (Inventory bytes × list price), not billed amounts; compare their sum with the bucket's size in S3 Storage Lens or CloudWatch `BucketSizeBytes` for the same day, not with the bill.
 
 ## Retention interpretation
 

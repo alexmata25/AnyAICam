@@ -1485,6 +1485,16 @@ CREATE TABLE IF NOT EXISTS pending_reversals(
  reason TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(source_table, source_id)
 )
 '''),
+    # Cloud-only daily AWS cost collection (aws_cost_collection_scheduler.py, 1.2.7 RC9): one row per UTC day is the
+    # cross-worker/container claim (primary key) and the owner-visible last-run status. Stores no AWS figures.
+    ('20261020_aws_cost_collection_runs','''
+CREATE TABLE IF NOT EXISTS aws_cost_collection_runs(
+ run_date TEXT PRIMARY KEY, claim_token TEXT NOT NULL, status TEXT NOT NULL, trigger_source TEXT NOT NULL,
+ started_at TEXT NOT NULL, finished_at TEXT, error_category TEXT, error_code TEXT, message TEXT,
+ steps_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_aws_cost_collection_runs_started ON aws_cost_collection_runs(started_at)
+'''),
 ]
 
 
