@@ -180,7 +180,10 @@ def analytics_rows_html(customer_id: str, plan_key: str | None, is_owner: bool, 
             continue  # shown under "Included with your plan", never as an Add
         name = PACKAGE_NAMES.get(key, _label)
         adds = [ANALYTICS_FEATURE_LABELS.get(g) for g in grants if g in ANALYTICS_FEATURE_LABELS]
-        detail = " · ".join(text for text in (_price_text(addon), f"Adds: {', '.join(adds)}" if adds else "",
+        # Owner decision 2026-10-21 (Option B): an add-on with no Stripe Price configured here has no approved LIVE
+        # price yet, so it reads "Coming soon" and shows no amount (the website says the same).
+        coming_soon = offer["state"] not in ("active", "covered", "overlaps") and not os.environ.get(env_var, "").strip()
+        detail = " · ".join(text for text in ("" if coming_soon else _price_text(addon), f"Adds: {', '.join(adds)}" if adds else "",
                                                f"{site_count} sites" if key == "talk_down" and site_count > 1 else "",
                                                "Included with AI Local and Hybrid" if key == "talk_down" and plan_key == "basic_local" else "")
                             if text)
@@ -191,7 +194,9 @@ def analytics_rows_html(customer_id: str, plan_key: str | None, is_owner: bool, 
                       'Voice Call). Talk Down itself is now included with your plan.</span>')
         elif offer["state"] in ("covered", "overlaps"):
             action = f'<span class="health-detail" style="max-width:300px;text-align:right">{escape(offer["reason"])}</span>'
-        elif not os.environ.get(env_var, "").strip() or not analytics.checkout_item(key, customer_id)["sellable"]:
+        elif coming_soon:
+            action = '<span class="pending-badge" aria-disabled="true">Coming soon</span>'
+        elif not analytics.checkout_item(key, customer_id)["sellable"]:
             action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
         elif is_owner:
             quantity = site_count if addon["unit"] == "per_site" else 1
