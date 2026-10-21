@@ -953,7 +953,7 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
                 '<p class="health-detail" id="optional-analytics-note">People Counting (advanced rules and reports), License Plate '
                 'Recognition and PPE detection are not part of any plan. Each package lists exactly what it adds; a package '
                 'is never offered for analytics you already have.</p>',
-                optional or '<p class="health-detail">No optional analytics are available for purchase yet.</p>']
+                optional or '<p class="health-detail">Optional analytics are coming soon.</p>']
     face_rows = []
     for tier in pricing_catalog.face_access_tiers():
         key = f"face_access_{tier['size']}"
@@ -961,6 +961,9 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
         if not is_active and (face_held or key != f"face_access_{face_size}"):
             continue
         item = analytics.checkout_item(key, customer_id)
+        # Owner decision 2026-10-21 (Option B): no Stripe Price configured = no approved LIVE price yet -> "Coming soon",
+        # and no amount is shown (the website says the same).
+        coming_soon = not is_active and not os.environ.get(tier["price_env_var"], "").strip()
         price = f"${tier['monthly_cents_per_door'] / 100:.2f} per door/month"
         detail = f"{door_count} door{'s' if door_count != 1 else ''}" if door_count else "No door cameras set up yet"
         if is_active:
@@ -968,18 +971,22 @@ def _addon_portal_rows(customer_id: str, plan_key: str, is_owner: bool) -> str:
         elif os.environ.get(tier["price_env_var"], "").strip() and not item["sellable"] and item.get("unavailable_reason"):
             # Same as the legacy page: say why (e.g. no door camera yet), not "Not available yet".
             action = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(item["unavailable_reason"])}</span>'
-        elif not os.environ.get(tier["price_env_var"], "").strip() or not item["sellable"]:
+        elif coming_soon:
+            action = '<span class="pending-badge" aria-disabled="true">Coming soon</span>'
+        elif not item["sellable"]:
             action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
         elif is_owner:
             action = '<button class="ghost-button addon-buy-button" data-addon-key="' + escape(key, quote=True) + '" data-quantity="1">Add</button>'
         else:
             action = '<span class="health-detail">Not purchased</span>'
-        face_rows.append(f'<div class="health-row"><span>Face Access / Facial Recognition — {escape(tier["size"].title())}<br><span class="health-detail">{price} · {detail}</span></span>{action}</div>')
+        shown = detail if coming_soon else f"{price} · {detail}"
+        face_rows.append(f'<div class="health-row"><span>Face Access / Facial Recognition — {escape(tier["size"].title())}<br><span class="health-detail">{escape(shown)}</span></span>{action}</div>')
     if "enterprise" == face_size and not face_held:
         face_rows.append('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">More than 500 enrolled people: custom pricing</span></span><span class="health-detail">Contact AnyAiCam</span></div>')
     if face_rows:
         rendered.append('<h3 style="margin:14px 0 4px">Premium: Face Access</h3>'
-                        '<p class="health-detail">Door access by face, a separate product billed per door; not part of any plan.</p>')
+                        '<p class="health-detail">Door access by face, a separate subscription billed per door; not part of any plan and not '
+                        'included with the AnyAiCam Enterprise appliance.</p>')
         rendered += face_rows
     rendered.append('<p class="health-detail">Advanced Line Crossing is not sold separately today; existing Smart Motion and line-crossing '
                     'behavior are unchanged. Turning Line Crossing off also stops security-line alarms.</p>')
@@ -1194,7 +1201,8 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     plan_menu = {key: {"cents": plan["monthly_cents_per_camera"], "label": plan["display_name"]} for key, plan in PLANS.items()}
     addons = _addon_portal_rows(customer_id, plan_key, is_owner)
     if not activated:  # visible, but bought only after activation (require_activated() on the server)
-        addons = ('<p class="health-detail" id="addons-after-activation">Add-ons can be added after you activate your system.</p>'
+        addons = ('<p class="health-detail" id="addons-after-activation">Add-ons that are available can be added after you activate your '
+                  'system; the others are marked Coming soon.</p>'
                   + addons.replace('<button class="ghost-button addon-buy-button"',
                                    '<button class="ghost-button addon-buy-button" disabled aria-disabled="true" title="Available after activation"'))
     # Software License, as three panels (VMS 1.2.7, 2026-10-15): license, registered appliances, downloads.
