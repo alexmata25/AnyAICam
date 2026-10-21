@@ -177,6 +177,12 @@ function Diag([string]$Label) {
     Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" } |
         ForEach-Object { $out.Add("ffmpeg $($_.ProcessId): $($_.CommandLine)") }
     Get-ChildItem (Join-Path $data 'hls') -ErrorAction SilentlyContinue | Select-Object -Last 8 | ForEach-Object { $out.Add("hls $($_.Name) $(TrueLength $_.FullName)") }
+    # F-L run 2: offline the customer playlist came back empty (local_playlist returns empty when os.stat() says the
+    # playlist is older than 20 s). Record exactly what the app sees: os.stat age and the playlist's own lines.
+    $pl = Join-Path $data "hls\camera$camNo.m3u8"
+    $age = & $hp -c "import os, sys, time; p = sys.argv[1]; print(round(time.time() - os.stat(p).st_mtime, 1) if os.path.exists(p) else 'missing')" $pl 2>&1
+    $out.Add("playlist camera$camNo.m3u8 os.stat age $age s")
+    if (Test-Path $pl) { try { [IO.File]::ReadAllLines($pl) | Select-Object -Last 8 | ForEach-Object { $out.Add("  m3u8: $_") } } catch { $out.Add("  m3u8 unreadable: $($_.Exception.Message)") } }
     Mkv $camNo | ForEach-Object { $out.Add("mkv $($_.Name) created $($_.CreationTime.ToString('s')) true $(TrueLength $_.FullName)") }
     foreach ($f in 'motion_events.jsonl', 'analytics_events.json') { $p = Join-Path $data "recordings\$f"; $out.Add("$f exists $(Test-Path $p) bytes $(if (Test-Path $p) { TrueLength $p } else { 0 })") }
     $s = Edge GET '/api/cameras/status'; $out.Add("GET /api/cameras/status -> $($s.status) $((ConvertTo-Json $s.body -Compress -Depth 6) -replace '(.{1500}).*', '$1...')")
