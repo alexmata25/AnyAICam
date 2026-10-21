@@ -10,6 +10,9 @@ param(
     # 1.3.2: the pinned Vosk speech model for Voice Call listening (install-stt-model.ps1).
     [Parameter(Mandatory=$true)][string]$SttModelArchive,
     [Parameter(Mandatory=$true)][string]$AppVersion,
+    # 2026-10-20 (owner): the customer-facing AnyAiCam VMS release (1.2.7). AppVersion stays this Windows setup's own
+    # version (1.3.2), which install-version-guard.ps1 orders by.
+    [Parameter(Mandatory=$true)][ValidatePattern('^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$')][string]$ReleaseVersion,
     # Setup's /PortalUrl=https://... (empty: keep the saved one, else the
     # AnyAiCam cloud); checked by cloud-link.ps1 before anything is written.
     [string]$PortalUrl = '',
@@ -232,15 +235,18 @@ if ($ProductMode) {
 } elseif (-not $hadEnvironmentFile) {
     throw 'A new installation needs a product mode: choose Local or Hybrid (silent install: /ProductMode=local or /ProductMode=hybrid).'
 }
-# What /version reports (the Linux installer writes the same key).
-$values['ANYAICAM_VERSION'] = $AppVersion
+# What /version reports (and the VMS pages show): the customer-facing release, exactly as the Linux installer writes it.
+$values['ANYAICAM_VERSION'] = $ReleaseVersion
+# The Windows setup's own version, which install-version-guard.ps1 reads first (it survives an uninstall with the data).
+# 1.3.0 / 1.3.1 had no such line; their ANYAICAM_VERSION was the setup version, the guard's fallback.
+$values['ANYAICAM_WINDOWS_SETUP_VERSION'] = $AppVersion
 $content = @('# Managed by the AnyAiCam Windows installer. Persistent across repair and uninstall.')
 $content += $values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
 [IO.File]::WriteAllLines($environmentFile, $content, [Text.UTF8Encoding]::new($false))
 
 # Cloud linking (2026-10-07): appliance identity, claim code, cloud portal
 # and installed release for the agent service (see cloud-link.ps1).
-& (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
+& (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -ReleaseVersion $ReleaseVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
 
 # Local-network access to the VMS and live view (see firewall.ps1).
 & (Join-Path $InstallRoot 'installer\firewall.ps1') -Apply -InstallRoot $InstallRoot

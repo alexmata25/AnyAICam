@@ -132,6 +132,43 @@ class GuardExecutionTests(unittest.TestCase):
         self.vms_env("ANYAICAM_VERSION=1.3.1")         # uninstalled: no entry, no program files, data kept
         self.assertDecision(CLEAN)
 
+    # ------------------------------------------------------------------ 1.3.2+: release 1.2.7 vs setup 1.3.2 (owner 2026-10-20)
+    def env_lines(self, *lines):
+        path = self.program_data / "AnyAiCam" / "config" / "vms.env"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(("ANYAICAM_APP_SECRETS=abc",) + lines) + "\n", encoding="utf-8")
+
+    def test_the_setup_version_line_wins_over_the_customer_release(self):
+        # what 1.3.2 writes: ANYAICAM_VERSION is the release (1.2.7), the setup version has its own line
+        self.registry(display_version="1.3.2")
+        self.env_lines("ANYAICAM_VERSION=1.2.7", "ANYAICAM_WINDOWS_SETUP_VERSION=1.3.2")
+        self.assertIn("ANYAICAM_WINDOWS_SETUP_VERSION 1.3.2", self.assertDecision(CLEAN, setup_version="1.3.2"))   # repair
+        self.assertDecision(CLEAN, setup_version="1.3.3")                                                     # upgrade
+
+    def test_a_release_number_above_the_setup_number_never_blocks(self):
+        # a later customer release (e.g. 1.4.0) shipped as Windows setup 1.3.5 must still repair/upgrade
+        self.registry(display_version="1.3.5")
+        self.env_lines("ANYAICAM_VERSION=1.4.0", "ANYAICAM_WINDOWS_SETUP_VERSION=1.3.5")
+        self.assertDecision(CLEAN, setup_version="1.3.5")
+        self.assertDecision(CLEAN, setup_version="1.3.6")
+
+    def test_after_an_uninstall_the_setup_version_line_decides(self):
+        self.env_lines("ANYAICAM_VERSION=1.2.7", "ANYAICAM_WINDOWS_SETUP_VERSION=1.3.2")
+        self.assertDecision(CLEAN, setup_version="1.3.2")          # reinstall of the same setup
+        self.assertDecision(DOWNGRADE, setup_version="1.3.1")      # an older setup over 1.3.2 data is refused
+        self.assertDecision(CLEAN, setup_version="1.3.3")
+
+    def test_a_malformed_setup_version_line_is_not_bypassed_by_the_release_line(self):
+        self.env_lines("ANYAICAM_VERSION=1.2.7", "ANYAICAM_WINDOWS_SETUP_VERSION=1.3.2-rc1")
+        self.assertIn("malformed ANYAICAM_WINDOWS_SETUP_VERSION", self.assertDecision(UNKNOWN))
+
+    def test_a_1_3_0_or_1_3_1_install_still_upgrades_through_its_legacy_line(self):
+        for legacy in ("1.3.0", "1.3.1"):
+            with self.subTest(legacy=legacy):
+                self.registry(display_version=legacy)
+                self.env_lines(f"ANYAICAM_VERSION={legacy}")        # no setup-version line before 1.3.2
+                self.assertIn(f"ANYAICAM_VERSION {legacy}", self.assertDecision(CLEAN, setup_version="1.3.2"))
+
     # ------------------------------------------------------------------ refused: downgrade
     def test_installed_1_3_2_1_refuses_1_3_2(self):
         self.registry(display_version="1.3.2.1")
@@ -219,7 +256,7 @@ class PascalCompileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="aac-iss-") as folder:
             wrapper = Path(folder) / "compile-check.iss"
             wrapper.write_text(
-                '#define AppVersion "1.3.2"\n#define SourceCommit "0000000000000000000000000000000000000000"\n'
+                '#define AppVersion "1.3.2"\n#define ReleaseVersion "1.2.7"\n#define SourceCommit "0000000000000000000000000000000000000000"\n'
                 '#define KeysetSha256 "2389a655fb3e5ed91e8a4a9216f9c45b97feb3847571b0536384b8305979af7c"\n'
                 "[Setup]\nAppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}\nAppName=AnyAiCam VMS compile check\n"
                 "AppVersion={#AppVersion}\nDefaultDirName={autopf}\\AnyAiCamCompileCheck\nPrivilegesRequired=admin\n"

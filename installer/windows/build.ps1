@@ -1,5 +1,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$Version,
+    # 2026-10-20 (owner): the customer-facing AnyAiCam VMS release (1.2.7, as on Linux). -Version stays the Windows
+    # setup's own, always-rising version (1.3.2) that the downgrade guard orders by.
+    [Parameter(Mandatory=$true)][string]$ReleaseVersion,
     # Requirement 9 (1.2.7): the cloud's entitlement-signing PUBLIC keyset and its SHA-256, pinned out of band
     # (docs/entitlement-signing-keys.md). Without it a Windows install trusts no signed capacity: 0 cameras.
     [Parameter(Mandatory=$true)][string]$EntitlementKeyset,
@@ -12,6 +15,7 @@ $ErrorActionPreference = 'Stop'
 if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
 # Three or four decimal parts (1.3.2, or a hotfix 1.3.2.1): exactly what install-version-guard.ps1 accepts.
 if ($Version -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2,3}$') { throw "Version must look like 1.3.2 or 1.3.2.1 (got '$Version')." }
+if ($ReleaseVersion -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$') { throw "ReleaseVersion must look like 1.2.7 (got '$ReleaseVersion')." }
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
 if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
 # The setup is built from a clean, committed tree: its name and the
@@ -122,6 +126,7 @@ if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset was refused; nothing wa
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
 $compilerArguments += "/DAppVersion=$Version"
+$compilerArguments += "/DReleaseVersion=$ReleaseVersion"
 $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript
 & $iscc @compilerArguments

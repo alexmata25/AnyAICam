@@ -6,14 +6,15 @@ can end with exit code 0 without that line. Anything else stops the setup (fail 
 
 Evidence of an existing installation, from the most to the least authoritative:
   1. this AppId's uninstall entry (64-bit and 32-bit registry views): DisplayVersion, InstallLocation;
-  2. %ProgramData%\AnyAiCam\config\vms.env: ANYAICAM_VERSION (written by every Windows setup since 1.3.0; it survives
-     an uninstall together with the data);
+  2. %ProgramData%\AnyAiCam\config\vms.env (it survives an uninstall together with the data):
+     ANYAICAM_WINDOWS_SETUP_VERSION (since 1.3.2), else ANYAICAM_VERSION (1.3.0/1.3.1 wrote the setup version there;
+     since 1.3.2 ANYAICAM_VERSION is the customer release, e.g. 1.2.7, and is never compared with setup versions);
   3. program files in the install folder (the VMS service wrapper) with neither of the above.
 Rules:
   * nothing at all                                     -> clean install                  (exit 0)
   * any recorded version newer than this setup         -> downgrade refused              (exit 10)
   * an uninstall entry without a valid DisplayVersion  -> unknown version, refused       (exit 11)
-  * no uninstall entry and vms.env present without a valid ANYAICAM_VERSION (or unreadable) -> refused (exit 11)
+  * no uninstall entry and vms.env present without a valid setup version (or unreadable) -> refused (exit 11)
   * program files present but no version anywhere      -> refused                        (exit 11)
   * this setup's own version malformed                 -> refused                        (exit 12)
   * otherwise (same version = repair, older = upgrade) -> allowed                        (exit 0)
@@ -82,13 +83,17 @@ function Get-InstallDecision {
     $root = if ($ProgramData) { $ProgramData } else { [Environment]::GetFolderPath('CommonApplicationData') }
     $envFile = Join-Path $root 'AnyAiCam\config\vms.env'
     $envExists = Test-Path -LiteralPath $envFile -PathType Leaf
-    $envVersionText = $null; $envReadable = $false
+    $envVersionText = $null; $envVersionKey = $null; $envReadable = $false
     if ($envExists) {
         try {
             $lines = [IO.File]::ReadAllLines($envFile)
             $envReadable = $true
-            $line = @($lines | Where-Object { $_ -like 'ANYAICAM_VERSION=*' }) | Select-Object -Last 1
-            if ($line) { $envVersionText = $line.Substring('ANYAICAM_VERSION='.Length).Trim() }
+            # The Windows setup version (written since 1.3.2) wins. ANYAICAM_VERSION is used only when that line is
+            # absent: in 1.3.0/1.3.1 it WAS the setup version; since 1.3.2 it is the customer release (1.2.7).
+            foreach ($key in @('ANYAICAM_WINDOWS_SETUP_VERSION', 'ANYAICAM_VERSION')) {
+                $line = @($lines | Where-Object { $_ -like "$key=*" }) | Select-Object -Last 1
+                if ($line) { $envVersionText = $line.Substring($key.Length + 1).Trim(); $envVersionKey = $key; break }
+            }
         } catch { $envReadable = $false }
     }
     $appDirs = @($DefaultAppDir) + @($entries | ForEach-Object { $_.InstallLocation }) | Where-Object { $_ } | Select-Object -Unique
@@ -106,9 +111,9 @@ function Get-InstallDecision {
     }
     $envVersion = if ($envReadable) { ConvertTo-AnyAiCamVersion $envVersionText } else { $null }
     if ($envExists) {
-        if ($null -ne $envVersion) { $found += ,@($envVersion, "data folder vms.env $envVersionText") }
+        if ($null -ne $envVersion) { $found += ,@($envVersion, "data folder vms.env $envVersionKey $envVersionText") }
         elseif (-not $entries.Count) {
-            $why = if (-not $envReadable) { 'cannot be read' } elseif ($null -eq $envVersionText) { 'has no ANYAICAM_VERSION' } else { "has a malformed ANYAICAM_VERSION '$envVersionText'" }
+            $why = if (-not $envReadable) { 'cannot be read' } elseif ($null -eq $envVersionText) { 'has no setup version' } else { "has a malformed $envVersionKey '$envVersionText'" }
             return @{ Code = 11; Reason = "existing AnyAiCam data was found but its vms.env $why" }
         }
         else { [Console]::Out.WriteLine('install-version-guard: vms.env unreadable or without a valid version; the uninstall entry decides (repair)') }

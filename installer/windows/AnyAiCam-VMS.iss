@@ -8,6 +8,12 @@
 #ifndef SourceCommit
   #define SourceCommit "0000000000000000000000000000000000000000"
 #endif
+; 2026-10-20 (owner): the customer-facing AnyAiCam VMS release (1.2.7, the same release as Linux) is separate from
+; this Windows setup's own version (AppVersion, 1.3.2): Windows was published as 1.3.0/1.3.1, and the downgrade guard
+; orders setups by AppVersion, so it must keep rising. build.ps1 passes both. A bare ISCC run shows the setup version.
+#ifndef ReleaseVersion
+  #define ReleaseVersion AppVersion
+#endif
 #define ShortCommit Copy(SourceCommit, 1, 7)
 #ifndef KeysetSha256
   #error KeysetSha256 is required: build with build.ps1 -EntitlementKeyset ... -EntitlementKeysetSha256 ...
@@ -16,6 +22,15 @@
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
 AppName={#AppName}
 AppVersion={#AppVersion}
+; What the customer reads: the wizard title, Apps & Features / uninstall name, the setup file's Product version.
+; DisplayVersion stays AppVersion (the downgrade guard reads it); the build ID is the full source commit.
+AppVerName={#AppName} {#ReleaseVersion}
+UninstallDisplayName={#AppName} {#ReleaseVersion}
+VersionInfoProductName={#AppName}
+VersionInfoProductTextVersion={#ReleaseVersion}
+VersionInfoTextVersion={#AppVersion}
+VersionInfoDescription={#AppName} {#ReleaseVersion} setup (Windows setup {#AppVersion}, build {#SourceCommit})
+VersionInfoCompany=AnyAiCam
 AppPublisher=AnyAiCam
 DefaultDirName={autopf}\AnyAiCam
 DefaultGroupName=AnyAiCam
@@ -182,19 +197,19 @@ begin
   if ResultCode = 0 then ResultCode := -1;
   case ResultCode of
     VersionGuardDowngrade: begin
-      Log('Downgrade refused: a newer AnyAiCam VMS is installed; this setup is {#AppVersion}.');
-      Message := 'A newer AnyAiCam VMS is already installed on this computer. This setup is version {#AppVersion} ' +
-        'and cannot replace it. Download the current AnyAiCam setup from your AnyAiCam account.';
+      Log('Downgrade refused: a newer AnyAiCam VMS is installed; this setup is {#AppVersion} (release {#ReleaseVersion}).');
+      Message := 'A newer AnyAiCam VMS is already installed on this computer. This setup (AnyAiCam VMS {#ReleaseVersion}, ' +
+        'Windows setup {#AppVersion}) cannot replace it. Download the current AnyAiCam setup from your AnyAiCam account.';
     end;
     VersionGuardUnknownInstalled: begin
-      Log('Install refused: the installed AnyAiCam VMS version is missing or not valid; this setup is {#AppVersion}.');
+      Log('Install refused: the installed AnyAiCam VMS version is missing or not valid; this setup is {#AppVersion} (release {#ReleaseVersion}).');
       Message := 'AnyAiCam VMS is already installed on this computer, but its version cannot be determined. ' +
         'Setup has stopped without changing anything, so that a newer version is not replaced. ' +
         'Contact AnyAiCam support.';
     end;
   else
     Log('Install refused: the AnyAiCam version check did not pass (result ' + IntToStr(ResultCode) + ').');
-    Message := 'Setup could not confirm that it is safe to install AnyAiCam VMS {#AppVersion} on this computer ' +
+    Message := 'Setup could not confirm that it is safe to install AnyAiCam VMS {#ReleaseVersion} on this computer ' +
       'and has stopped without changing anything. Contact AnyAiCam support.';
   end;
   if not WizardSilent() then
@@ -371,7 +386,7 @@ begin
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');

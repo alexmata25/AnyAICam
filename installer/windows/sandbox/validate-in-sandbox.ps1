@@ -32,6 +32,15 @@ Set-Content -Path (Join-Path $results 'report.txt') -Value ("AnyAiCam Windows va
 $setup = Get-ChildItem 'C:\Validation\setup' -Filter 'AnyAiCam-VMS-Setup-*.exe' | Select-Object -First 1
 Check 'setup file present' { if (-not $setup) { throw 'no AnyAiCam-VMS-Setup-*.exe' }; "$($setup.Name) $($setup.Length) bytes sha256=$((Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower())" }
 $expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+)-') { $Matches[1] } else { '' }
+# 2026-10-20 (owner): the customer-facing release (1.2.7) is the setup file's own Product version; the Windows setup
+# version (1.3.2) is in the file name. Setups before 1.3.2 had one number for both.
+$expectedCommit = if ($setup -and $setup.Name -match '-([0-9a-f]{7})\.exe$') { $Matches[1] } else { '' }
+$productVersion = if ($setup) { "$((Get-Item $setup.FullName).VersionInfo.ProductVersion)".Trim() } else { '' }
+$expectedRelease = if ($productVersion -match '^\d+\.\d+\.\d+$') { $productVersion } else { $expectedVersion }
+Check 'setup identity: release (Product version), Windows setup version and commit' {
+    if (-not $expectedVersion -or -not $expectedCommit) { throw "setup name $($setup.Name)" }
+    "release $expectedRelease; setup $expectedVersion; commit $expectedCommit"
+}
 
 # ---------------------------------------------------------------- test cloud (2026-10-07)
 # Cloud linking is validated against a disposable cloud INSIDE this Sandbox
@@ -133,8 +142,15 @@ Check 'bundled Python loads torch, cv2, ultralytics (preflight)' {
 $service = Get-Service -Name AnyAiCamVMS -ErrorAction SilentlyContinue
 Check 'service installed, automatic start' { if (-not $service) { throw 'no AnyAiCamVMS service' }; if ($service.StartType -ne 'Automatic') { throw "StartType $($service.StartType)" }; "StartType $($service.StartType)" }
 Check 'service running' { (Get-Service AnyAiCamVMS).Status -eq 'Running' }
+Check 'uninstall entry: customer name with the release, DisplayVersion = setup version, publisher' {
+    $u = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1' -ErrorAction Stop
+    if ($u.DisplayName -ne "AnyAiCam VMS $expectedRelease") { throw "DisplayName '$($u.DisplayName)'" }
+    if ($u.DisplayVersion -ne $expectedVersion) { throw "DisplayVersion '$($u.DisplayVersion)'" }
+    if ($u.Publisher -ne 'AnyAiCam') { throw "Publisher '$($u.Publisher)'" }
+    "DisplayName '$($u.DisplayName)'; DisplayVersion $($u.DisplayVersion); Publisher $($u.Publisher)"
+}
 Check 'VMS answers /health within 3 minutes' { WaitHealthy 180 }
-Check '/version reports the setup version' { $v = (Http '/version').Content | ConvertFrom-Json; if ($expectedVersion -and $v.version -ne $expectedVersion) { throw "version $($v.version), expected $expectedVersion" }; "version $($v.version) build $($v.build_id)" }
+Check '/version reports the customer release and the exact build commit' { $v = (Http '/version').Content | ConvertFrom-Json; if ($expectedRelease -and $v.version -ne $expectedRelease) { throw "version $($v.version), expected $expectedRelease" }; if ($expectedCommit -and -not "$($v.build_id)".StartsWith($expectedCommit)) { throw "build $($v.build_id), expected commit $expectedCommit" }; if ("$($v.build_id)" -notmatch '^[0-9a-f]{40}$') { throw "build id $($v.build_id) is not a full commit" }; "version $($v.version) build $($v.build_id)" }
 Check '/login page served' { (Http '/login').StatusCode -eq 200 }
 Check 'static assets served' { (Http '/static/brand-icon.png').StatusCode -eq 200 }
 Check 'listening on the local network (0.0.0.0:8000)' { $l = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop; if (-not ($l.LocalAddress -contains '0.0.0.0')) { throw "listening on $($l.LocalAddress -join ',')" }; '0.0.0.0:8000' }
@@ -153,7 +169,7 @@ Check 'Voice Call speech model installed and verified file by file; licence noti
     "$($spec.Files.Count) files verified"
 }
 Check 'data written under ProgramData, not C:\app' { if (Test-Path 'C:\app') { throw 'C:\app exists' }; if (-not (Test-Path (Join-Path $data 'database\partner_portal.db'))) { throw 'no database under ProgramData' }; 'database under ProgramData' }
-Check 'vms.env has secrets and version' { $e = Get-Content (Join-Path $data 'config\vms.env'); foreach ($k in 'ANYAICAM_APP_SECRETS=', 'ANYAICAM_CAMERA_CREDENTIAL_KEY=', "ANYAICAM_VERSION=$expectedVersion") { if (-not ($e | Where-Object { $_.StartsWith($k) })) { throw "missing $k" } }; 'ok' }
+Check 'vms.env has secrets and version' { $e = Get-Content (Join-Path $data 'config\vms.env'); foreach ($k in 'ANYAICAM_APP_SECRETS=', 'ANYAICAM_CAMERA_CREDENTIAL_KEY=', "ANYAICAM_VERSION=$expectedRelease", "ANYAICAM_WINDOWS_SETUP_VERSION=$expectedVersion") { if (-not ($e | Where-Object { $_.StartsWith($k) })) { throw "missing $k" } }; 'ok' }
 Check 'data folder: SYSTEM and Administrators only' {
     $acl = Get-Acl $data
     if (-not $acl.AreAccessRulesProtected) { throw 'inheritance not removed' }
@@ -209,7 +225,8 @@ Check 'setup provisioned identity, portal and release; no permanent claim code' 
     if (Test-Path -LiteralPath (Join-Path $data 'config\label_claim.json')) { throw 'config\label_claim.json exists' }
     if (-not (Get-Content (Join-Path $data 'config\agent.env') | Where-Object { $_ -eq "ANYAICAM_PORTAL_URL=$TestPortal" })) { throw 'agent.env does not name the portal given to setup' }
     $release = Get-Content -Raw (Join-Path $data 'config\vms_release.json') | ConvertFrom-Json
-    if ($release.release_version -ne $expectedVersion) { throw "release $($release.release_version)" }
+    if ($release.release_version -ne $expectedRelease) { throw "release $($release.release_version)" }
+    if ($release.installer_version -ne $expectedVersion) { throw "installer_version $($release.installer_version)" }
     $(if ($previous) { 'upgrade: ' } else { '' }) + 'UUIDv4 identity; portal; release; no claim-label.txt or label_claim.json'
 }
 # ---------------------------------------------------------------- zero-terminal linking (2026-10-08)
@@ -317,7 +334,7 @@ Check 'a link request on the linked PC says it is linked' {
 Check 'cloud sees this PC online with its version (heartbeat)' {
     $appliance = WaitFor 180 { @((Cloud GET '/test/state').appliances | Where-Object { $_.last_check_in -and $_.cloud_id -eq $script:applianceId.ToUpper() })[0] }
     if (-not $appliance) { throw 'no heartbeat' }
-    if ($appliance.online_status -ne 'online' -or -not "$($appliance.software_version)".StartsWith("$expectedVersion+")) { throw "status $($appliance.online_status) version $($appliance.software_version)" }
+    if ($appliance.online_status -ne 'online' -or -not "$($appliance.software_version)".StartsWith("$expectedRelease+")) { throw "status $($appliance.online_status) version $($appliance.software_version)" }
     "online, version $($appliance.software_version)"
 }
 function RunCommand([string]$Command) {
