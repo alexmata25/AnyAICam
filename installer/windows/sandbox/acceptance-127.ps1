@@ -50,7 +50,8 @@ function AcceptStaged {
 import capacity_accept, capacity_accept_windows
 try:
     print("OUTCOME " + capacity_accept_windows.accept_pending())
-except capacity_accept.Reject as e:
+except (capacity_accept.Reject, capacity_accept_windows.Reject) as e:
+    # The Windows acceptor re-raises the policy's refusal as its own Reject (same code): both are refusals.
     print("REJECT " + str(e))
 '@
 }
