@@ -1,6 +1,7 @@
 """Small atomic local outbox for idempotent event-media retry."""
 import json
 import os
+import platform_paths
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from pathlib import Path
 # recording_uploader.py both still correctly read credential.json/
 # live_relay_commands.json from the real /var/lib/anyaicam, and must
 # keep doing so unchanged.
-OUTBOX_FILE = Path(os.environ.get("ANYAICAM_EVENT_MEDIA_OUTBOX_FILE", "/opt/anyaicam/data/config/event_media_outbox.json"))
+OUTBOX_FILE = Path(os.environ.get("ANYAICAM_EVENT_MEDIA_OUTBOX_FILE", platform_paths.native_path("/opt/anyaicam/data/config/event_media_outbox.json", "config", "event_media_outbox.json")))
 
 
 def load() -> list[dict]:

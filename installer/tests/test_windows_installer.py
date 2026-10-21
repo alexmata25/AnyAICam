@@ -147,7 +147,9 @@ class RuntimeScriptTests(unittest.TestCase):
         self.assertIn("RandomNumberGenerator", self.text)
 
     def test_version_mediamtx_and_firewall(self):
-        self.assertIn("$values['ANYAICAM_VERSION'] = $AppVersion", self.text)
+        # 1.3.2 (owner 2026-10-20): /version shows the customer release; the setup version has its own line
+        self.assertIn("$values['ANYAICAM_VERSION'] = $ReleaseVersion", self.text)
+        self.assertIn("$values['ANYAICAM_WINDOWS_SETUP_VERSION'] = $AppVersion", self.text)
         self.assertIn("Expand-Archive -LiteralPath $MediaMtxArchive", self.text)
         self.assertIn("installer\\firewall.ps1') -Apply -InstallRoot $InstallRoot", self.text)
 
@@ -159,7 +161,7 @@ class PinTests(unittest.TestCase):
         pinned = dict(re.findall(r"'([A-Za-z0-9_.\-]+\.(?:zip|py|exe))'\s*=\s*'([0-9a-f]{64})'", build))
         self.assertEqual(set(pinned), {"python-3.12.10-embed-amd64.zip", "get-pip.py", "WinSW-x64.exe",
                                        "ffmpeg-8.1.2-essentials_build.zip", "mediamtx_v1.21.0_windows_amd64.zip",
-                                       "vc_redist.x64-14.44.35211.exe"})
+                                       "vc_redist.x64-14.44.35211.exe", "vosk-model-small-en-us-0.15.zip"})
         for name, digest in pinned.items():
             self.assertIn(digest, deps, name)
 
@@ -333,7 +335,7 @@ class CloudAgentServiceTests(unittest.TestCase):
         agent_preflight = self.runtime.index("import anyaicam_agent.service, anyaicam_agent.windows")
         self.assertLess(self.runtime.index("installer\\runtime-preflight.py')"), agent_preflight)
         self.assertIn("throw 'AnyAiCam agent preflight failed", self.runtime)
-        cloud_link = self.runtime.index("installer\\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl")
+        cloud_link = self.runtime.index("installer\\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -ReleaseVersion $ReleaseVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl")
         self.assertLess(self.runtime.index("[IO.File]::WriteAllLines($environmentFile"), cloud_link)
         self.assertLess(cloud_link, self.runtime.index("installer\\firewall.ps1') -Apply"))
 

@@ -7,7 +7,12 @@ param(
     [Parameter(Mandatory=$true)][string]$WheelRoot,
     [Parameter(Mandatory=$true)][string]$FFmpegArchive,
     [Parameter(Mandatory=$true)][string]$MediaMtxArchive,
+    # 1.3.2: the pinned Vosk speech model for Voice Call listening (install-stt-model.ps1).
+    [Parameter(Mandatory=$true)][string]$SttModelArchive,
     [Parameter(Mandatory=$true)][string]$AppVersion,
+    # 2026-10-20 (owner): the customer-facing AnyAiCam VMS release (1.2.7). AppVersion stays this Windows setup's own
+    # version (1.3.2), which install-version-guard.ps1 orders by.
+    [Parameter(Mandatory=$true)][ValidatePattern('^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$')][string]$ReleaseVersion,
     # Setup's /PortalUrl=https://... (empty: keep the saved one, else the
     # AnyAiCam cloud); checked by cloud-link.ps1 before anything is written.
     [string]$PortalUrl = '',
@@ -160,6 +165,12 @@ if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $keysetTarget (icac
 & icacls.exe $keysetTarget /reset /C /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Could not apply the trust folder's permissions to $keysetTarget (icacls exit $LASTEXITCODE)." }
 Write-Output 'Entitlement keyset installed in the protected trust folder.'
+# Voice Call listening (1.3.2): the same pinned Vosk speech model as the Linux images, in the protected data root
+# (%ProgramData%\AnyAiCam\models\stt), where the VMS looks by default. Kept when it verifies; replaced when missing,
+# altered or incomplete. Any failure stops the setup (a bundled model that does not verify is a damaged setup).
+. (Join-Path $PSScriptRoot 'install-stt-model.ps1')
+Install-AnyAiCamSttModel -DataRoot $DataRoot -Archive $SttModelArchive -Manifest (Join-Path $PSScriptRoot 'vosk-model-small-en-us-0.15.sha256')
+Assert-AnyAiCamDataRootHasNoLinks $DataRoot
 # Camera capacity fallback (Linux installer step 15) is deliberately NOT migrated on Windows. Windows 1.3.x kept its
 # unsigned capacity in C:\opt\anyaicam\data\config\vms_capacity.json, a folder any signed-in user may modify by
 # default, so that number cannot become a trusted limit. Cameras start after the cloud's first signed capacity
@@ -169,7 +180,7 @@ $legacyCapacity = Join-Path $env:SystemDrive 'opt\anyaicam\data\config\vms_capac
 if (Test-Path -LiteralPath $legacyCapacity) {
     Write-Output 'Camera capacity: the earlier release''s unsigned capacity is not carried over; cameras start after the cloud''s first signed capacity (usually within minutes of linking).'
 } else {
-    Write-Output 'Camera capacity: cameras start after the cloud''s first signed capacity.'
+    Write-Output 'Camera capacity: cameras start after the cloud''s first signed capacity, which this computer receives once it is linked to an AnyAiCam account (needed once, online). After that, Local cameras keep working without internet.'
 }
 $values = [ordered]@{}
 $hadEnvironmentFile = Test-Path -LiteralPath $environmentFile
@@ -191,6 +202,14 @@ if (-not $values.Contains('ANYAICAM_CAMERA_CREDENTIAL_KEY')) {
     $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     $values['ANYAICAM_CAMERA_CREDENTIAL_KEY'] = [Convert]::ToBase64String($bytes).Replace('+','-').Replace('/','_')
+}
+# On-device analytics whose code default is off (the Linux installer's 06-deploy-vms.sh defaults, 1.3.2): People
+# Counting and the customer rule analytics (line crossing, intrusion, loitering) still run only for a camera the cloud
+# licensed and a customer configured. Add-if-missing: an explicit true or false is never changed. LPR is not
+# defaulted on Windows (no Tesseract OCR engine is bundled; app/analytics_platform.py reports it unavailable), and
+# facial recognition stays an explicit opt-in, as on Linux.
+foreach ($analyticsFlag in @('PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED')) {
+    if (-not $values.Contains($analyticsFlag)) { $values[$analyticsFlag] = 'true' }
 }
 $values['ANYAICAM_RUNTIME_ROLE'] = 'edge'
 $values['ANYAICAM_ENV'] = 'production'
@@ -216,15 +235,18 @@ if ($ProductMode) {
 } elseif (-not $hadEnvironmentFile) {
     throw 'A new installation needs a product mode: choose Local or Hybrid (silent install: /ProductMode=local or /ProductMode=hybrid).'
 }
-# What /version reports (the Linux installer writes the same key).
-$values['ANYAICAM_VERSION'] = $AppVersion
+# What /version reports (and the VMS pages show): the customer-facing release, exactly as the Linux installer writes it.
+$values['ANYAICAM_VERSION'] = $ReleaseVersion
+# The Windows setup's own version, which install-version-guard.ps1 reads first (it survives an uninstall with the data).
+# 1.3.0 / 1.3.1 had no such line; their ANYAICAM_VERSION was the setup version, the guard's fallback.
+$values['ANYAICAM_WINDOWS_SETUP_VERSION'] = $AppVersion
 $content = @('# Managed by the AnyAiCam Windows installer. Persistent across repair and uninstall.')
 $content += $values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
 [IO.File]::WriteAllLines($environmentFile, $content, [Text.UTF8Encoding]::new($false))
 
 # Cloud linking (2026-10-07): appliance identity, claim code, cloud portal
 # and installed release for the agent service (see cloud-link.ps1).
-& (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
+& (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -ReleaseVersion $ReleaseVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
 
 # Local-network access to the VMS and live view (see firewall.ps1).
 & (Join-Path $InstallRoot 'installer\firewall.ps1') -Apply -InstallRoot $InstallRoot

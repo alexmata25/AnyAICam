@@ -17,9 +17,13 @@ param(
     [Parameter(Mandatory=$true)][string]$DataRoot,
     [Parameter(Mandatory=$true)][string]$AppVersion,
     [Parameter(Mandatory=$true)][string]$SourceCommit,
-    [string]$PortalUrl = ''
+    [string]$PortalUrl = '',
+    # 2026-10-20 (owner): the customer-facing release the agent reports (release_version, e.g. 1.2.7). AppVersion is
+    # the Windows setup's own version (installer_version). Older callers pass only AppVersion.
+    [string]$ReleaseVersion = ''
 )
 $ErrorActionPreference = 'Stop'
+if (-not $ReleaseVersion) { $ReleaseVersion = $AppVersion }
 $DefaultPortalUrl = 'https://app.anyaicam.com'
 $utf8 = [Text.UTF8Encoding]::new($false)
 
@@ -92,6 +96,6 @@ foreach ($retired in @((Join-Path $labelDir 'claim-label.txt'), (Join-Path $conf
 if ((Test-Path -LiteralPath $labelDir) -and -not (Get-ChildItem -LiteralPath $labelDir -Force)) { Remove-Item -LiteralPath $labelDir -Force }
 
 # ------------------------------------------------------------ installed release
-$release = [ordered]@{ release_version = $AppVersion; installer_version = $AppVersion; vms_release_commit = $SourceCommit; platform = 'windows'; installed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+$release = [ordered]@{ release_version = $ReleaseVersion; installer_version = $AppVersion; vms_release_commit = $SourceCommit; platform = 'windows'; installed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
 Write-TextFile (Join-Path $config 'vms_release.json') @(($release | ConvertTo-Json))
 'Cloud linking provisioned.'

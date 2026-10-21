@@ -56,6 +56,7 @@ import json
 import logging
 import appliance_config_cache
 import os
+import platform_paths
 import secrets
 import threading
 import time
@@ -97,7 +98,7 @@ CREDENTIAL_FILE = STATE_DIR / "credential.json"
 # own STATE_DIR-derived read paths must keep working unchanged.
 # Overridable purely for tests, matching recording_uploader.py's own
 # CUTOFF_FILE precedent -- production always uses the default.
-SYNC_STATE_FILE = Path(os.environ.get("ANYAICAM_ANALYTICS_SYNC_STATE_FILE", "/opt/anyaicam/data/config/analytics_sync_state.json"))
+SYNC_STATE_FILE = Path(os.environ.get("ANYAICAM_ANALYTICS_SYNC_STATE_FILE", platform_paths.native_path("/opt/anyaicam/data/config/analytics_sync_state.json", "config", "analytics_sync_state.json")))
 # RECORDINGS_FOLDER/ANALYTICS_EVENTS_FILE are intentionally hardcoded to
 # match main.py's own constants exactly -- this must always agree with
 # where save_yolo_events()/append_analytics_event() actually write, not be

@@ -67,6 +67,11 @@ _VERSION = re.compile(r"^\d{1,4}(\.\d{1,4}){1,3}$")
 # AnyAiCam release (its software predates updates from this page).
 ONE_TIME_UPDATE_MESSAGE = ("This appliance needs a one-time update before updates can be installed from here. "
                            "Contact AnyAiCam support to schedule it.")
+# Windows 1.3.2: a Windows PC (its agent reports platform "windows" in the heartbeat) never installs the Linux
+# release; its agent refuses install_update (appliance-agent windows.UPDATES_UNSUPPORTED). It is updated by running
+# the new AnyAiCam Windows setup on that PC, so the System page says so instead of offering Install.
+WINDOWS_UPDATE_MESSAGE = ("This is a Windows computer. Updates are not installed from here: "
+                          "download and run the new AnyAiCam setup on that computer.")
 
 
 # ------------------------------------------------------------------ helpers
@@ -179,9 +184,10 @@ def _in_flight(db, appliance_id: str) -> dict | None:
 def software_status(db, customer_id: str) -> dict:
     release = published_release()
     appliances = []
-    for row in db.execute("SELECT id,cloud_id,software_version,last_check_in,online_status FROM appliances "
+    for row in db.execute("SELECT id,cloud_id,software_version,last_check_in,online_status,platform FROM appliances "
                           "WHERE customer_id=? ORDER BY created_at", (customer_id,)).fetchall():
         version, build = split_release_label(row["software_version"] or "")
+        windows = (row["platform"] or "") == "windows"
         history = [
             {"update_id": item["update_id"], "from_version": item["from_version"], "to_version": item["to_version"],
              "state": item["state"], "label": FINAL_LABELS.get(item["state"]) or IN_PROGRESS_LABELS.get(item["state"], item["state"]),
@@ -195,7 +201,8 @@ def software_status(db, customer_id: str) -> dict:
         appliances.append({
             "id": row["id"], "name": row["cloud_id"], "current_version": version, "current_build": build,
             "last_check_in": row["last_check_in"], "online": (row["online_status"] or "") == "online",
-            "update_available": bool(release and version and is_newer(release["version"], version)),
+            "update_available": bool(release and version and is_newer(release["version"], version)) and not windows,
+            "platform": "windows" if windows else "linux",
             # Checked in, but no valid installed release: a pre-1.2.0 agent
             # that cannot run an owner-requested install (2026-10-03).
             "one_time_update_required": bool(row["last_check_in"]) and not version,
@@ -218,7 +225,9 @@ def request_install(db, *, identity: dict, appliance_id: str, update_id: str, ve
     release = published_release()
     if not release or release["update_id"] != update_id or release["version"] != version:
         raise HTTPException(status_code=409, detail="That release is no longer the published one. Refresh and try again.")
-    row = db.execute("SELECT software_version FROM appliances WHERE id=?", (appliance_id,)).fetchone()
+    row = db.execute("SELECT software_version,platform FROM appliances WHERE id=?", (appliance_id,)).fetchone()
+    if (row["platform"] or "") == "windows":
+        raise HTTPException(status_code=409, detail=WINDOWS_UPDATE_MESSAGE)
     current_version, _build = split_release_label(row["software_version"] or "")
     if not current_version:
         # Never queue a command this appliance cannot run: it would sit at
@@ -255,6 +264,7 @@ const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,
 const when=v=>v?new Date(v).toLocaleString([], {month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}):'';
 const OWNER=document.body.dataset.owner==='1';
 const ONE_TIME=__ONE_TIME_MESSAGE__;
+const WINDOWS=__WINDOWS_MESSAGE__;
 let data=null,timer=null,pending=null;
 const say=(t,ok=true)=>{const m=$('su-message');m.textContent=t;m.style.color=ok?'':'#ffb4c0'};
 async function call(url,method='GET',body){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.detail||'Something went wrong.');return b}
@@ -265,6 +275,7 @@ function render(){
   const cur=a.current_version?`AnyAiCam ${esc(a.current_version)}`:(a.one_time_update_required?'One-time update required':'Version not reported yet');
   let action='';
   if(a.in_progress){action=`<span class="pill">${esc(a.in_progress.label)}</span>`}
+  else if(a.platform==='windows'){action=`<span class="health-detail" style="max-width:340px;display:inline-block">${esc(WINDOWS)}</span>`}
   else if(a.one_time_update_required){action=`<span class="health-detail" style="max-width:340px;display:inline-block">${esc(ONE_TIME)}</span>`}
   else if(!a.current_version){action=''}
   else if(a.update_available&&OWNER){action=`<button class="action-button" data-install="${esc(a.id)}">Install ${esc(rel.version)}</button>`}
@@ -314,7 +325,8 @@ def register_software_update_routes(app: FastAPI, shell: Callable) -> None:
             return shell("System", "settings", content)
         marker = '1' if identity.get("role") == "customer_owner" else '0'
         script = (_SYSTEM_SCRIPT.replace("document.body.dataset.owner==='1'", "'" + marker + "'==='1'")
-                  .replace("__ONE_TIME_MESSAGE__", json.dumps(ONE_TIME_UPDATE_MESSAGE)))
+                  .replace("__ONE_TIME_MESSAGE__", json.dumps(ONE_TIME_UPDATE_MESSAGE))
+                  .replace("__WINDOWS_MESSAGE__", json.dumps(WINDOWS_UPDATE_MESSAGE)))
         return shell("System", "settings", _page(identity), script)
 
     @app.get("/api/customer/software-update")

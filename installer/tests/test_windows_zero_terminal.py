@@ -240,7 +240,8 @@ class InstallerLinkTests(unittest.TestCase):
         self.assertIn("(not PostInstallFailed) and (not IsLinked) and (AccountLink <> '')", has)
         finish = self.iss.split("procedure CurPageChanged", 1)[1]
         self.assertIn("IsLinked or (AccountLinkStatus = 'linked')", finish)
-        self.assertIn("link it to your AnyAiCam account when this PC is online", finish)
+        # 1.3.2 wording (test_windows_local_activation_wording_132): no link this time -> link when the PC is online.
+        self.assertIn("When this PC is online: Start menu > AnyAiCam > Link this computer to AnyAiCam", finish)
 
     def test_only_a_well_formed_link_reaches_powershell(self):
         check = self.code.split("function IsAccountLink", 1)[1].split("\nend;", 1)[0]

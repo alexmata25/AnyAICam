@@ -127,6 +127,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform_paths
 import threading
 import urllib.request
 from pathlib import Path
@@ -140,8 +141,8 @@ from facial_recognition import FaceDetection, FaceEngine
 # lazy download there would write model files into /opt/anyaicam/app on
 # the host. The /app path remains the fallback for a dev run without the
 # baked directory.
-BAKED_MODEL_DIR = Path("/opt/anyaicam-aac-models")
-MODEL_CACHE_DIR = Path(os.environ.get("ANYAICAM_AAC_MODEL_DIR") or (BAKED_MODEL_DIR if BAKED_MODEL_DIR.is_dir() else "/app/models/aac"))
+BAKED_MODEL_DIR = Path(platform_paths.native_path("/opt/anyaicam-aac-models", "models", "aac"))
+MODEL_CACHE_DIR = Path(os.environ.get("ANYAICAM_AAC_MODEL_DIR") or (BAKED_MODEL_DIR if BAKED_MODEL_DIR.is_dir() else platform_paths.native_path("/app/models/aac", "models", "aac")))
 
 # Pinned provenance: URL, filename, and the exact SHA-256 of the file at
 # that URL as verified during development (see this module's own

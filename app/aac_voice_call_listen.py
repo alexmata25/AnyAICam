@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform_paths
 import shutil
 import subprocess
 import threading
@@ -41,7 +42,7 @@ LISTEN_START_DELAY_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_VOICE_CALL_
 BUFFER_FLUSH_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_VOICE_CALL_BUFFER_FLUSH_SECONDS", "2.5")))
 SPEECH_MIN_RMS = max(0, int(os.environ.get("ANYAICAM_VOICE_CALL_SPEECH_MIN_RMS", "300")))
 SPEECH_MIN_ACTIVE_FRACTION = float(os.environ.get("ANYAICAM_VOICE_CALL_SPEECH_MIN_ACTIVE", "0.08"))
-STT_MODEL_PATH = os.environ.get("ANYAICAM_STT_MODEL", "/opt/anyaicam-stt-model/vosk-model-small-en-us-0.15")
+STT_MODEL_PATH = os.environ.get("ANYAICAM_STT_MODEL", platform_paths.native_path("/opt/anyaicam-stt-model/vosk-model-small-en-us-0.15", "models", "stt", "vosk-model-small-en-us-0.15"))
 SAMPLE_RATE = 16000
 
 

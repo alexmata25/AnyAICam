@@ -187,7 +187,10 @@ def initialize_database() -> None:
                                   # disk_capacity/disk_used alone. storage_state is one of 'healthy',
                                   # 'warning', 'cleanup_active', 'critical', or NULL (appliance has never
                                   # reported -- e.g. this feature not yet enabled on that appliance).
-                                  ('storage_state','TEXT'),('storage_free_percent','REAL'),('storage_last_cleanup_at','TEXT')]:
+                                  ('storage_state','TEXT'),('storage_free_percent','REAL'),('storage_last_cleanup_at','TEXT'),
+                                  # Windows 1.3.2: 'windows' once a Windows PC's agent reports it (heartbeat
+                                  # "platform"); NULL for the Linux appliance, which never reports one.
+                                  ('platform','TEXT')]:
             if column not in appliance_columns: db.execute(f'ALTER TABLE appliances ADD COLUMN {column} {definition}')
         # authorization_version: bumped on any grant/role/enabled change
         # for this user -- the deterministic (never clock-based) staleness

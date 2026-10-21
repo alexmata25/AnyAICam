@@ -32,6 +32,15 @@ Set-Content -Path (Join-Path $results 'report.txt') -Value ("AnyAiCam Windows va
 $setup = Get-ChildItem 'C:\Validation\setup' -Filter 'AnyAiCam-VMS-Setup-*.exe' | Select-Object -First 1
 Check 'setup file present' { if (-not $setup) { throw 'no AnyAiCam-VMS-Setup-*.exe' }; "$($setup.Name) $($setup.Length) bytes sha256=$((Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower())" }
 $expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+)-') { $Matches[1] } else { '' }
+# 2026-10-20 (owner): the customer-facing release (1.2.7) is the setup file's own Product version; the Windows setup
+# version (1.3.2) is in the file name. Setups before 1.3.2 had one number for both.
+$expectedCommit = if ($setup -and $setup.Name -match '-([0-9a-f]{7})\.exe$') { $Matches[1] } else { '' }
+$productVersion = if ($setup) { "$((Get-Item $setup.FullName).VersionInfo.ProductVersion)".Trim() } else { '' }
+$expectedRelease = if ($productVersion -match '^\d+\.\d+\.\d+$') { $productVersion } else { $expectedVersion }
+Check 'setup identity: release (Product version), Windows setup version and commit' {
+    if (-not $expectedVersion -or -not $expectedCommit) { throw "setup name $($setup.Name)" }
+    "release $expectedRelease; setup $expectedVersion; commit $expectedCommit"
+}
 
 # ---------------------------------------------------------------- test cloud (2026-10-07)
 # Cloud linking is validated against a disposable cloud INSIDE this Sandbox
@@ -41,7 +50,10 @@ $expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+)-') 
 # too, so a setup that fell back to the default portal could not reach it.
 $TestCloudHost = 'cloud.anyaicam.test'
 $TestPortal = "https://${TestCloudHost}:8443"
-Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`r`n127.0.0.1 $TestCloudHost`r`n127.0.0.1 app.anyaicam.com"
+# 2026-10-18 (Codex 21:07): genuine isolation -- make-wsb.ps1 now disables Sandbox networking; every AnyAiCam
+# production name is also pinned to this VM, so nothing could reach a production service even by name.
+$acceptanceSettings = Get-Content -Raw 'C:\Validation\scripts\acceptance.json' | ConvertFrom-Json
+Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`r`n127.0.0.1 $TestCloudHost`r`n127.0.0.1 app.anyaicam.com`r`n127.0.0.1 portal.anyaicam.com`r`n127.0.0.1 portal-staging.anyaicam.com`r`n127.0.0.1 anyaicam.com"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Cloud([string]$Method, [string]$Path, $Body = $null, [switch]$Owner) {
     $arguments = @{ Method = $Method; Uri = "$TestPortal$Path"; TimeoutSec = 20; UseBasicParsing = $true; ContentType = 'application/json' }
@@ -107,7 +119,7 @@ if ($previous) {
 # file) is reported with its reason instead of a blank exit code.
 $installError = ''
 try {
-    $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop
+    $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$($acceptanceSettings.product_mode)", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop
 } catch { $install = $null; $installError = $_.Exception.Message }
 Check 'silent install exit code 0' { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
 Check 'code integrity / Smart App Control state (diagnostic)' {
@@ -130,8 +142,15 @@ Check 'bundled Python loads torch, cv2, ultralytics (preflight)' {
 $service = Get-Service -Name AnyAiCamVMS -ErrorAction SilentlyContinue
 Check 'service installed, automatic start' { if (-not $service) { throw 'no AnyAiCamVMS service' }; if ($service.StartType -ne 'Automatic') { throw "StartType $($service.StartType)" }; "StartType $($service.StartType)" }
 Check 'service running' { (Get-Service AnyAiCamVMS).Status -eq 'Running' }
+Check 'uninstall entry: customer name with the release, DisplayVersion = setup version, publisher' {
+    $u = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1' -ErrorAction Stop
+    if ($u.DisplayName -ne "AnyAiCam VMS $expectedRelease") { throw "DisplayName '$($u.DisplayName)'" }
+    if ($u.DisplayVersion -ne $expectedVersion) { throw "DisplayVersion '$($u.DisplayVersion)'" }
+    if ($u.Publisher -ne 'AnyAiCam') { throw "Publisher '$($u.Publisher)'" }
+    "DisplayName '$($u.DisplayName)'; DisplayVersion $($u.DisplayVersion); Publisher $($u.Publisher)"
+}
 Check 'VMS answers /health within 3 minutes' { WaitHealthy 180 }
-Check '/version reports the setup version' { $v = (Http '/version').Content | ConvertFrom-Json; if ($expectedVersion -and $v.version -ne $expectedVersion) { throw "version $($v.version), expected $expectedVersion" }; "version $($v.version) build $($v.build_id)" }
+Check '/version reports the customer release and the exact build commit' { $v = (Http '/version').Content | ConvertFrom-Json; if ($expectedRelease -and $v.version -ne $expectedRelease) { throw "version $($v.version), expected $expectedRelease" }; if ($expectedCommit -and -not "$($v.build_id)".StartsWith($expectedCommit)) { throw "build $($v.build_id), expected commit $expectedCommit" }; if ("$($v.build_id)" -notmatch '^[0-9a-f]{40}$') { throw "build id $($v.build_id) is not a full commit" }; "version $($v.version) build $($v.build_id)" }
 Check '/login page served' { (Http '/login').StatusCode -eq 200 }
 Check 'static assets served' { (Http '/static/brand-icon.png').StatusCode -eq 200 }
 Check 'listening on the local network (0.0.0.0:8000)' { $l = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop; if (-not ($l.LocalAddress -contains '0.0.0.0')) { throw "listening on $($l.LocalAddress -join ',')" }; '0.0.0.0:8000' }
@@ -141,8 +160,16 @@ $app = Join-Path $env:ProgramFiles 'AnyAiCam'
 $data = Join-Path $env:ProgramData 'AnyAiCam'
 Check 'MediaMTX installed' { Test-Path (Join-Path $app 'runtime\tools\mediamtx\mediamtx.exe') }
 Check 'FFmpeg installed' { Test-Path (Join-Path $app 'runtime\tools\ffmpeg\ffmpeg.exe') }
+Check 'Voice Call speech model installed and verified file by file; licence notice present (1.3.2)' {
+    . (Join-Path $app 'installer\install-stt-model.ps1')
+    $spec = Get-AnyAiCamSttManifest (Join-Path $app 'installer\vosk-model-small-en-us-0.15.sha256')
+    $problem = Test-AnyAiCamSttModel (Join-Path $data "models\stt\$($spec.Name)") $spec
+    if ($problem) { throw "speech model: $problem" }
+    if (-not (Test-Path (Join-Path $app 'licenses\vosk-model-small-en-us-0.15-NOTICE.txt'))) { throw 'no licence notice' }
+    "$($spec.Files.Count) files verified"
+}
 Check 'data written under ProgramData, not C:\app' { if (Test-Path 'C:\app') { throw 'C:\app exists' }; if (-not (Test-Path (Join-Path $data 'database\partner_portal.db'))) { throw 'no database under ProgramData' }; 'database under ProgramData' }
-Check 'vms.env has secrets and version' { $e = Get-Content (Join-Path $data 'config\vms.env'); foreach ($k in 'ANYAICAM_APP_SECRETS=', 'ANYAICAM_CAMERA_CREDENTIAL_KEY=', "ANYAICAM_VERSION=$expectedVersion") { if (-not ($e | Where-Object { $_.StartsWith($k) })) { throw "missing $k" } }; 'ok' }
+Check 'vms.env has secrets and version' { $e = Get-Content (Join-Path $data 'config\vms.env'); foreach ($k in 'ANYAICAM_APP_SECRETS=', 'ANYAICAM_CAMERA_CREDENTIAL_KEY=', "ANYAICAM_VERSION=$expectedRelease", "ANYAICAM_WINDOWS_SETUP_VERSION=$expectedVersion") { if (-not ($e | Where-Object { $_.StartsWith($k) })) { throw "missing $k" } }; 'ok' }
 Check 'data folder: SYSTEM and Administrators only' {
     $acl = Get-Acl $data
     if (-not $acl.AreAccessRulesProtected) { throw 'inheritance not removed' }
@@ -156,6 +183,7 @@ Check 'runtime catalog registered, signed like the setup (Smart App Control)' {
     $catalog = Join-Path $env:SystemRoot 'System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\AnyAiCamRuntime.cat'
     if (-not (Test-Path -LiteralPath $catalog)) { throw 'AnyAiCamRuntime.cat not registered' }
     $signature = Get-AuthenticodeSignature -LiteralPath $catalog
+    if ((Get-AuthenticodeSignature -LiteralPath $setup.FullName).Status -ne 'Valid') { return "registered; setup not signed (unsigned candidate) -- catalog signature checked on the signed build only" }
     if ($signature.Status -ne 'Valid') { throw "catalog signature $($signature.Status)" }
     $setupSigner = (Get-AuthenticodeSignature -LiteralPath $setup.FullName).SignerCertificate.Subject
     if ($signature.SignerCertificate.Subject -ne $setupSigner) { throw "catalog signer $($signature.SignerCertificate.Subject)" }
@@ -197,7 +225,8 @@ Check 'setup provisioned identity, portal and release; no permanent claim code' 
     if (Test-Path -LiteralPath (Join-Path $data 'config\label_claim.json')) { throw 'config\label_claim.json exists' }
     if (-not (Get-Content (Join-Path $data 'config\agent.env') | Where-Object { $_ -eq "ANYAICAM_PORTAL_URL=$TestPortal" })) { throw 'agent.env does not name the portal given to setup' }
     $release = Get-Content -Raw (Join-Path $data 'config\vms_release.json') | ConvertFrom-Json
-    if ($release.release_version -ne $expectedVersion) { throw "release $($release.release_version)" }
+    if ($release.release_version -ne $expectedRelease) { throw "release $($release.release_version)" }
+    if ($release.installer_version -ne $expectedVersion) { throw "installer_version $($release.installer_version)" }
     $(if ($previous) { 'upgrade: ' } else { '' }) + 'UUIDv4 identity; portal; release; no claim-label.txt or label_claim.json'
 }
 # ---------------------------------------------------------------- zero-terminal linking (2026-10-08)
@@ -244,7 +273,7 @@ $python = Join-Path $app 'runtime\python\python.exe'
 $cloudData = 'C:\TestCloud'
 & $python 'C:\Validation\scripts\test-cloud.py' --app (Join-Path $app 'app') --data $cloudData --host $TestCloudHost --certificates-only
 Import-Certificate -FilePath (Join-Path $cloudData 'tls\ca.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-$testCloud = Start-Process -FilePath $python -ArgumentList '"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443' `
+$testCloud = Start-Process -FilePath $python -ArgumentList '"C:\Validation\scripts\test-cloud.py"', '--app', ('"' + (Join-Path $app 'app') + '"'), '--data', $cloudData, '--host', $TestCloudHost, '--port', '8443', $(if ($acceptanceSettings.keyset_kind -eq 'synthetic-test') { '--signing-key', '"C:\Validation\scripts\signing-key.json"' }) `
     -WorkingDirectory $cloudData -WindowStyle Hidden -RedirectStandardOutput (Join-Path $results 'test-cloud.out.log') -RedirectStandardError (Join-Path $results 'test-cloud.err.log') -PassThru
 Check 'test cloud up over HTTPS (real claim and appliance routes)' { if (-not (WaitFor 120 { Cloud GET '/test/state' })) { throw 'test cloud did not answer' }; 'https://cloud.anyaicam.test:8443' }
 # The agent backed off while the cloud was not up yet; start it over.
@@ -305,7 +334,7 @@ Check 'a link request on the linked PC says it is linked' {
 Check 'cloud sees this PC online with its version (heartbeat)' {
     $appliance = WaitFor 180 { @((Cloud GET '/test/state').appliances | Where-Object { $_.last_check_in -and $_.cloud_id -eq $script:applianceId.ToUpper() })[0] }
     if (-not $appliance) { throw 'no heartbeat' }
-    if ($appliance.online_status -ne 'online' -or -not "$($appliance.software_version)".StartsWith("$expectedVersion+")) { throw "status $($appliance.online_status) version $($appliance.software_version)" }
+    if ($appliance.online_status -ne 'online' -or -not "$($appliance.software_version)".StartsWith("$expectedRelease+")) { throw "status $($appliance.online_status) version $($appliance.software_version)" }
     "online, version $($appliance.software_version)"
 }
 function RunCommand([string]$Command) {
@@ -395,6 +424,9 @@ Check 'repair reinstall exit code 0' { if ($repair2.ExitCode -ne 0) { throw "exi
 Check 'repair reinstall keeps data and secrets' { SecretsKept }
 Check 'repair reinstall restores readable, inherited permissions' { DataFilesHealthy }
 Check 'repair reinstall keeps this PC linked to the cloud' { StillLinked }
+
+# ---------------------------------------------------------------- Windows 1.2.7 acceptance (2026-10-18)
+. 'C:\Validation\scripts\acceptance-127.ps1'
 
 $uninstaller = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
 Check 'installed uninstaller carries the same valid signature as the setup' {

@@ -301,6 +301,21 @@ def _accounts_activated(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _platform_independent_analytics(monkeypatch):
+    """Windows 1.3.2 (analytics_platform): on a Windows test host an analytic whose engine is not installed (LPR, PPE)
+    or whose appliance switch is unset is reported unavailable. The licensing and toggle tests describe rules that hold
+    on every platform, so the suite runs them as on Linux; the availability rules have their own tests
+    (test_windows_analytics_paths_132.py), which pass windows=True explicitly. No effect on Linux."""
+    try:
+        import analytics_platform
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(analytics_platform, "ENFORCED", False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _appliance_entitlements(request, monkeypatch, tmp_path):
     """An appliance (the default edge role) runs Talk Down / Voice Call only
     with a valid signed entitlement snapshot (appliance_entitlements.py).

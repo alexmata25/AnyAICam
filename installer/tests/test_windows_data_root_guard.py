@@ -94,8 +94,10 @@ def test_install_runtime_restricts_the_root_and_refuses_links_before_any_recursi
     enumerate_children = helper.index("$Entry.EnumerateFileSystemInfos()")
     assert link_check < set_owner < reset_entry < enumerate_children
     # and a second check once the secret folders are Administrators-only
-    assert text.count("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") == 4
+    # 1.3.2: and a fifth right after the speech model is installed under models\stt
+    assert text.count("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") == 5
     assert text.rindex("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") > secret
+    assert text.rindex("Assert-AnyAiCamDataRootHasNoLinks $DataRoot") > text.index("Install-AnyAiCamSttModel -DataRoot")
 
 
 def test_the_setup_ships_the_guard_beside_install_runtime():

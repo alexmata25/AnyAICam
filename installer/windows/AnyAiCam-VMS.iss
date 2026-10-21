@@ -8,6 +8,12 @@
 #ifndef SourceCommit
   #define SourceCommit "0000000000000000000000000000000000000000"
 #endif
+; 2026-10-20 (owner): the customer-facing AnyAiCam VMS release (1.2.7, the same release as Linux) is separate from
+; this Windows setup's own version (AppVersion, 1.3.2): Windows was published as 1.3.0/1.3.1, and the downgrade guard
+; orders setups by AppVersion, so it must keep rising. build.ps1 passes both. A bare ISCC run shows the setup version.
+#ifndef ReleaseVersion
+  #define ReleaseVersion AppVersion
+#endif
 #define ShortCommit Copy(SourceCommit, 1, 7)
 #ifndef KeysetSha256
   #error KeysetSha256 is required: build with build.ps1 -EntitlementKeyset ... -EntitlementKeysetSha256 ...
@@ -16,6 +22,15 @@
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
 AppName={#AppName}
 AppVersion={#AppVersion}
+; What the customer reads: the wizard title, Apps & Features / uninstall name, the setup file's Product version.
+; DisplayVersion stays AppVersion (the downgrade guard reads it); the build ID is the full source commit.
+AppVerName={#AppName} {#ReleaseVersion}
+UninstallDisplayName={#AppName} {#ReleaseVersion}
+VersionInfoProductName={#AppName}
+VersionInfoProductTextVersion={#ReleaseVersion}
+VersionInfoTextVersion={#AppVersion}
+VersionInfoDescription={#AppName} {#ReleaseVersion} setup (Windows setup {#AppVersion}, build {#SourceCommit})
+VersionInfoCompany=AnyAiCam
 AppPublisher=AnyAiCam
 DefaultDirName={autopf}\AnyAiCam
 DefaultGroupName=AnyAiCam
@@ -60,6 +75,8 @@ Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignorever
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+; Run from {tmp} by InitializeSetup before anything is installed (downgrade / unknown-version guard).
+Source: "install-version-guard.ps1"; Flags: dontcopy
 Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
@@ -88,6 +105,12 @@ Source: "vendor\get-pip.py"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\wheels\*"; DestDir: "{tmp}\wheels"; Flags: deleteafterinstall recursesubdirs createallsubdirs
 Source: "vendor\ffmpeg-8.1.2-essentials_build.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\mediamtx_v1.21.0_windows_amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; 1.3.2: Voice Call listening -- the Linux images' pinned Vosk small English model (Apache-2.0), extracted and verified
+; file by file by install-stt-model.ps1 into %ProgramData%\AnyAiCam\models\stt; its licence notice ships with the program.
+Source: "vendor\vosk-model-small-en-us-0.15.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "install-stt-model.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "vosk-model-small-en-us-0.15.sha256"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "notices\vosk-model-small-en-us-0.15-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 ; Microsoft Visual C++ 2015-2022 runtime (x64): torch/cv2 DLLs need it and a
 ; clean Windows does not have it. Installed before the Python runtime; left in
 ; place on uninstall (a shared system component other programs may use).
@@ -133,12 +156,79 @@ begin
   Result := FileExists(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'));
 end;
 
+// Downgrade and unknown-version protection (Red 2026-10-18; made fail-closed after Codex's FAIL on ef93b503).
+// install-version-guard.ps1 decides from this AppId's uninstall entry (both registry views), the data folder's vms.env
+// (ANYAICAM_VERSION, which survives an uninstall) and the install folder. Setup continues ONLY when the guard exits 0
+// AND printed its own "install-version-guard: exit 0:" line (a script that fails to parse can exit 0 silently): a
+// clean install, a same-version repair or an upgrade from an older version. A newer recorded version, a missing or
+// malformed installed version, a malformed setup version, a PowerShell that cannot start, or any other result stops
+// the setup before anything is changed. A silent install ends with Setup's initialization failure exit code; the
+// guard's own explanation is in the setup log. There is no override.
+const
+  VersionGuardDowngrade = 10;
+  VersionGuardUnknownInstalled = 11;
+
+function InitializeSetup(): Boolean;
+var
+  ResultCode, I: Integer;
+  Output: TExecOutput;
+  Allowed: Boolean;
+  Message: String;
+begin
+  Result := False;
+  ResultCode := -1;
+  Allowed := False;
+  ExtractTemporaryFile('install-version-guard.ps1');
+  if not ExecAndCaptureOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\install-version-guard.ps1') +
+      '" -SetupVersion "{#AppVersion}" -DefaultAppDir "' + ExpandConstant('{autopf}\AnyAiCam') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode, Output) then
+    ResultCode := -1;
+  for I := 0 to GetArrayLength(Output.StdOut) - 1 do begin
+    Log(Output.StdOut[I]);
+    if Pos('install-version-guard: exit 0: ', Output.StdOut[I]) = 1 then Allowed := True;
+  end;
+  for I := 0 to GetArrayLength(Output.StdErr) - 1 do
+    Log(Output.StdErr[I]);
+  if (ResultCode = 0) and Allowed then begin
+    Result := True;
+    exit;
+  end;
+  if ResultCode = 0 then ResultCode := -1;
+  case ResultCode of
+    VersionGuardDowngrade: begin
+      Log('Downgrade refused: a newer AnyAiCam VMS is installed; this setup is {#AppVersion} (release {#ReleaseVersion}).');
+      Message := 'A newer AnyAiCam VMS is already installed on this computer. This setup (AnyAiCam VMS {#ReleaseVersion}, ' +
+        'Windows setup {#AppVersion}) cannot replace it. Download the current AnyAiCam setup from your AnyAiCam account.';
+    end;
+    VersionGuardUnknownInstalled: begin
+      Log('Install refused: the installed AnyAiCam VMS version is missing or not valid; this setup is {#AppVersion} (release {#ReleaseVersion}).');
+      Message := 'AnyAiCam VMS is already installed on this computer, but its version cannot be determined. ' +
+        'Setup has stopped without changing anything, so that a newer version is not replaced. ' +
+        'Contact AnyAiCam support.';
+    end;
+  else
+    Log('Install refused: the AnyAiCam version check did not pass (result ' + IntToStr(ResultCode) + ').');
+    Message := 'Setup could not confirm that it is safe to install AnyAiCam VMS {#ReleaseVersion} on this computer ' +
+      'and has stopped without changing anything. Contact AnyAiCam support.';
+  end;
+  if not WizardSilent() then
+    MsgBox(Message, mbError, MB_OK);
+end;
+
 procedure InitializeWizard;
 begin
+  // Supported first-time activation (1.3.2, Codex FAIL on ef93b503): cameras run only after this PC is linked to an
+  // AnyAiCam account ONCE, online (the cloud's first signed camera capacity). After that the accepted capacity has no
+  // expiry, so Local cameras, recording and live view keep working without internet. Never claim fully offline
+  // (air-gapped) activation: there is no approved offline licence yet (docs/windows-1.3.2-local-licensing-proposal.md).
   ProductModePage := CreateInputOptionPage(wpSelectDir, 'How will you use AnyAiCam?',
     'You can change this later from your AnyAiCam account.',
-    'Choose the mode for this computer, then click Next.', True, False);
-  ProductModePage.Add('Local: cameras, recording and live view stay on this computer');
+    'Choose the mode for this computer, then click Next.' + #13#10#13#10 +
+    'Both modes need this computer linked to your AnyAiCam account once, with an internet connection, before your ' +
+    'cameras start. After that, Local mode keeps recording and live view working on this computer without internet.',
+    True, False);
+  ProductModePage.Add('Local: cameras, recording and live view stay on this computer (link once online to activate)');
   ProductModePage.Add('Hybrid: adds Cloud Video Backup and remote features (needs an AnyAiCam plan)');
   ProductModePage.SelectedValueIndex := 0;
 end;
@@ -296,7 +386,7 @@ begin
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -AppVersion "{#AppVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');
@@ -339,11 +429,14 @@ begin
       'This computer is linked to your AnyAiCam account.'
   else if HasClaimLink then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-      'To see this computer''s cameras from anywhere, keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
+      'Your cameras start once this computer is linked to your AnyAiCam account (needed once, with an internet ' +
+      'connection). Keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
       'Your browser opens AnyAiCam: sign in (or create an account), choose a site and confirm. There is no code to type.' + #13#10#13#10 +
+      'After this first link, Local mode keeps recording without internet. ' +
       'Later: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).'
   else
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-      'To see this computer''s cameras from anywhere, link it to your AnyAiCam account when this PC is online: ' +
-      'Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).';
+      'Your cameras start once this computer is linked to your AnyAiCam account (needed once, with an internet ' +
+      'connection). When this PC is online: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an ' +
+      'administrator of this PC). After this first link, Local mode keeps recording without internet.';
 end;

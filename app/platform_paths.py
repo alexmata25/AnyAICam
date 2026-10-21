@@ -1,5 +1,8 @@
 """Fixed locations of the appliance's trust anchors, per platform -- never taken from the environment.
 
+native_path() gives every other state or model file's default the same rule on Windows (never a drive-root path
+such as C:\\opt that any signed-in user may create).
+
 The Software Update trust directory holds the entitlement signing keyset and the accepted / fallback VMS capacity.
 On Linux it is root-owned /etc/anyaicam-update (unchanged). On Windows both services run as LocalSystem and the
 installer restricts %ProgramData%\\AnyAiCam to SYSTEM and Administrators; the trust directory is
@@ -45,9 +48,25 @@ if WINDOWS:
     _ROOT = _windows_program_data() / "AnyAiCam"
     UPDATE_DIR = _ROOT / "update"
     CONFIG_DIR = _ROOT / "config"  # the Windows data root is %ProgramData%\AnyAiCam itself (AnyAiCam-VMS.iss)
+    MODELS_DIR = _ROOT / "models"
 else:
+    _ROOT = None
     UPDATE_DIR = Path("/etc/anyaicam-update")
     CONFIG_DIR = Path("/opt/anyaicam/data/config")
+    MODELS_DIR = None  # Linux keeps each module's own image path (/opt/anyaicam-*-model, /app/models)
+
+
+def native_path(linux_path: str, *windows_parts: str, windows: bool = WINDOWS, root: Path | None = None) -> str:
+    """A state or model file's default location: linux_path unchanged on Linux; on Windows the same file under the
+    SYSTEM/Administrators-only data root (%ProgramData%\\AnyAiCam\\<windows_parts>).
+
+    A Linux absolute path such as /opt/... means C:\\opt\\... on Windows, where any signed-in user may create the
+    folder (the system drive's root lets Authenticated Users create folders). The VMS runs as LocalSystem and
+    unpickles model files (ultralytics YOLO) and trusts its state files, so such a default would let a standard
+    user plant a file the service then loads (1.3.2, Blue)."""
+    if not windows:
+        return linux_path
+    return str((root if root is not None else _ROOT).joinpath(*windows_parts))
 
 # ---------------------------------------------------------------- Windows ACL check (pure parser + ctypes reader)
 _TRUSTED_SIDS = {"SY", "BA", "S-1-5-18", "S-1-5-32-544"}

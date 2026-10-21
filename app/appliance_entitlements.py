@@ -56,6 +56,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform_paths
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -67,7 +68,7 @@ SNAPSHOT_VERSION = 1
 FEATURES = ("talk_down", "voice_call")
 CLOCK_SKEW = timedelta(minutes=5)
 
-STATE_FILE = Path(os.environ.get("ANYAICAM_FEATURE_ENTITLEMENTS_FILE", "/opt/anyaicam/data/config/feature_entitlements.json"))
+STATE_FILE = Path(os.environ.get("ANYAICAM_FEATURE_ENTITLEMENTS_FILE", platform_paths.native_path("/opt/anyaicam/data/config/feature_entitlements.json", "config", "feature_entitlements.json")))
 
 
 def _parse_time(value) -> datetime | None:

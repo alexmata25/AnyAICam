@@ -39530,6 +39530,10 @@ async def people_counting_worker(camera_number: int) -> None:
 # 2/3, every analytic off in the UI, 20-27 % CPU each decoding 1440p.
 def _analytic_globally_enabled(flag: str, camera_number: int) -> bool:
     """The appliance-wide condition each analytic's own processing applies."""
+    # Windows 1.3.2: an analytic this computer cannot run (engine or model not installed) never runs. Always
+    # supported on Linux (analytics_platform).
+    if not analytics_platform.runtime_supported(flag.removesuffix("_enabled")):
+        return False
     if flag == "smart_motion_enabled":
         # Codex 2026-10-17: Smart Motion's own appliance-wide switch (smart_motion.py) is part of the gate too.
         return bool(smart_motion.SMART_MOTION_ENABLED)
@@ -40763,6 +40767,7 @@ import recording_retention_sweep
 import analytics_sync
 import event_media_uploader
 import edge_camera_sync
+import analytics_platform
 import lpr
 import ppe
 import smart_motion
