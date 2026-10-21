@@ -151,9 +151,22 @@ function CloudFails([string]$Method, [string]$Path, $Body) {
     try { Cloud $Method $Path $Body -Owner | Out-Null; return $false } catch { return $true }
 }
 function Probe([string]$File) {
-    $transport = if ($File.StartsWith('rtsp://')) { @('-rtsp_transport', 'tcp') } else { @() }
-    $out = & $ffprobe -v error @transport -show_entries stream=codec_type,codec_name,width,height -show_entries format=format_name,duration -of json $File 2>&1 | Out-String
-    $out | ConvertFrom-Json
+    # F-H run 1: an ffprobe of a dead RTSP source blocked the whole script. Hard 30 s limit, then killed.
+    $transport = if ($File.StartsWith('rtsp://')) { @('-rtsp_transport', 'tcp', '-timeout', '10000000') } else { @() }
+    $outFile = Join-Path $env:TEMP ('probe-' + [guid]::NewGuid().ToString('N') + '.json')
+    $argList = @('-v', 'error') + $transport + @('-show_entries', 'stream=codec_type,codec_name,width,height', '-show_entries', 'format=format_name,duration', '-of', 'json', ('"' + $File + '"'))
+    $p = Start-Process -FilePath $ffprobe -ArgumentList $argList -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError ($outFile + '.err')
+    if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }
+    try { (Get-Content -Raw $outFile -ErrorAction Stop) | ConvertFrom-Json } catch { $null } finally { Remove-Item $outFile, ($outFile + '.err') -Force -ErrorAction SilentlyContinue }
+}
+function MediaMtxListeners {
+    # Which ports every MediaMTX on this PC listens on (the VMS's own one in Hybrid, and the simulated camera's).
+    @(Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" | ForEach-Object {
+        $id = $_.ProcessId; $who = if ($_.ExecutablePath -like "$app\*") { 'VMS' } else { 'camera-sim' }
+        $tcp = @(Get-NetTCPConnection -State Listen -OwningProcess $id -ErrorAction SilentlyContinue | ForEach-Object { "tcp $($_.LocalAddress):$($_.LocalPort)" })
+        $udp = @(Get-NetUDPEndpoint -OwningProcess $id -ErrorAction SilentlyContinue | ForEach-Object { "udp $($_.LocalAddress):$($_.LocalPort)" })
+        "$who pid $id [" + (($tcp + $udp | Sort-Object -Unique) -join ', ') + ']'
+    }) -join ' | '
 }
 function Mkv([int]$Number) { @(Get-ChildItem (Join-Path $data "recordings\camera$Number") -Filter '*.mkv' -ErrorAction SilentlyContinue | Sort-Object CreationTime) }
 # F-L run 1 (2026-10-21 16:28, 4973d5ab): a directory listing's Length/LastWriteTime of a file FFmpeg still has open is
@@ -287,7 +300,10 @@ Check 'appliance password: the owner enrols an offline appliance password' {
 # ---------------------------------------------------------------- simulated camera on 127.0.0.5 (loopback only)
 $camHost = '127.0.0.5'
 $rtsp = "rtsp://${camHost}:8554/cam1"
-@('logLevel: info', 'api: no', 'rtsp: yes', "rtspAddress: ${camHost}:8554", 'rtspTransports: [tcp]', 'rtmp: no', 'hls: no', 'webrtc: no', 'srt: no', 'paths:', '  cam1:') |
+# F-H run 1 (6ba2265a): MediaMTX 1.21 also starts a MoQ server on :8892/:8893 by default; in Hybrid the VMS's own
+# MediaMTX already held :8892, so this camera server exited at start. Every listener but RTSP is off here.
+@('logLevel: info', 'api: no', 'metrics: no', 'pprof: no', 'playback: no', 'rtsp: yes', "rtspAddress: ${camHost}:8554", 'rtspTransports: [tcp]',
+  'rtmp: no', 'hls: no', 'webrtc: no', 'srt: no', 'moq: no', 'paths:', '  cam1:') |
     Set-Content -LiteralPath (Join-Path $sim 'camera-mediamtx.yml') -Encoding ASCII
 $camServer = Start-Process -FilePath (Join-Path $sim 'mediamtx\mediamtx.exe') -ArgumentList ('"' + (Join-Path $sim 'camera-mediamtx.yml') + '"') -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $results 'camera-mediamtx.out.log') -RedirectStandardError (Join-Path $results 'camera-mediamtx.err.log')
@@ -312,6 +328,7 @@ Check 'simulated camera: ONVIF device service answers on 127.0.0.5:80' {
     $r = WaitFor 30 { Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://${camHost}/onvif/device_service" -Body $body -ContentType 'application/soap+xml' -TimeoutSec 5 }
     if (-not $r -or $r.Content -notmatch 'AnyAiCamSim') { throw "no ONVIF answer (sim exited $($onvifSim.HasExited))" }; 'GetDeviceInformation: AnyAiCamSim SIM-1'
 }
+Info "MediaMTX listeners ($mode)" { MediaMtxListeners }
 
 # ---------------------------------------------------------------- discovery and provisioning through the real routes
 # LIMITATION (documented): the agent never scans loopback by default (windows.private_networks) and manual add-by-IP
@@ -431,6 +448,7 @@ function SwitchMode([string]$Target, [scriptblock]$Change) {
         if ($wrong) { throw "cloud flags: $(($wrong | ForEach-Object { $_.Name + '=' + $_.Value }) -join ', ')" }
         "persisted $p; restart_vms completed; runtime $m; $($flags.PSObject.Properties.Count) cloud flags $($Target -eq 'hybrid')"
     }
+    Info "MediaMTX listeners after the switch to $Target" { Start-Sleep -Seconds 20; MediaMtxListeners }
     Check "mode: after the switch to $Target the camera is still licensed and recording resumes" {
         $l = Licensed $camNo; if ($l -ne "[$camNo]") { throw "licensed $l" }
         $g = WaitFor 300 { Growing $camNo }
