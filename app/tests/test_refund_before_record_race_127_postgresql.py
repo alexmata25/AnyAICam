@@ -159,5 +159,101 @@ class PostgreSQLRefundGrantRaceTests(unittest.TestCase):
             self.hooks = {}
 
 
+@unittest.skipUnless(TEST_URL, "set ANYAICAM_TEST_POSTGRES_URL to a disposable PostgreSQL database")
+class PostgreSQLRefundSuspensionReactivationTests(unittest.TestCase):
+    """RC10b R1/R4 on PostgreSQL: a healthy customer.subscription.created/updated never lifts a refund suspension; only
+    a later, paid, unreversed invoice covering the current period does; a Stripe outage restores nothing."""
+    SUB, CUSTOMER = "sub_pg_react1", "cust-pg-react-1"
+
+    @classmethod
+    def setUpClass(cls):
+        from partner_db import initialize_database
+        initialize_database()
+
+    def db(self):
+        import psycopg
+        from psycopg.rows import dict_row
+        return psycopg.connect(TEST_URL, row_factory=dict_row, autocommit=True)
+
+    def setUp(self):
+        import billing_status
+        with self.db() as db:
+            for statement in ("DELETE FROM camera_plan_entitlements_v2 WHERE customer_id='cust-pg-react-1'",
+                              "DELETE FROM billing_reversals WHERE payment_intent LIKE 'pi_in_pg_react%'",
+                              "DELETE FROM payment_locks WHERE key LIKE '%pg_react%'"):
+                try:
+                    db.execute(statement)
+                except Exception:
+                    pass  # billing_reversals is created on first use
+            db.execute("INSERT INTO camera_plan_entitlements_v2(id,customer_id,plan_key,camera_quantity,stripe_customer_id,"
+                       "stripe_subscription_id,stripe_subscription_item_id,stripe_price_id,status,stripe_status,suspended_reason,"
+                       "current_period_end,local_retention_days,created_at,updated_at) VALUES(%s,%s,'ai_local',6,'cus_pg_react1',"
+                       "%s,'si_pg_react1','price_pg_ai','suspended','active','refunded',1800000000,30,'now','now')",
+                       ("plan-pg-react-1", self.CUSTOMER, self.SUB))
+        self.down = False
+        self.invoices = {"in_pg_react1": self.invoice("in_pg_react1")}
+        self.subscription = {"id": self.SUB, "object": "subscription", "status": "active", "customer": "cus_pg_react1",
+                             "latest_invoice": "in_pg_react1"}
+        self.patches = [patch("stripe_state._stripe_reader", return_value=self.reader)]
+        for item in self.patches:
+            item.start()
+        billing_status.record_reversal("ch_in_pg_react1", "pi_in_pg_react1", "in_pg_react1", "refunded")
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+
+    @staticmethod
+    def invoice(invoice_id, status="paid"):
+        return {"id": invoice_id, "object": "invoice", "status": status, "amount_paid": 1499 if status == "paid" else 0,
+                "subscription": "sub_pg_react1", "payment_intent": f"pi_{invoice_id}", "charge": f"ch_{invoice_id}"}
+
+    def reader(self, path):
+        if self.down and path.startswith("/v1/invoices/"):
+            raise OSError("Stripe unreachable")
+        if path.startswith("/v1/subscriptions/"):
+            return self.subscription
+        if path.startswith("/v1/invoices/"):
+            return self.invoices[path.rsplit("/", 1)[1]]
+        if path.startswith("/v1/payment_intents/"):
+            intent = path.rsplit("/", 1)[1].split("?", 1)[0]
+            return {"id": intent, "status": "succeeded", "latest_charge": {"id": f"ch_{intent}", "amount": 1499,
+                                                                            "amount_refunded": 0}}
+        raise AssertionError(f"unexpected Stripe read {path}")
+
+    def plan(self):
+        with self.db() as db:
+            return dict(db.execute("SELECT status,suspended_reason FROM camera_plan_entitlements_v2 WHERE customer_id=%s",
+                                   (self.CUSTOMER,)).fetchone())
+
+    def sync(self, event_type, obj, event_id):
+        import billing_status
+        return billing_status.sync_from_stripe_event({"id": event_id, "type": event_type, "data": {"object": obj}})
+
+    def test_a_healthy_subscription_never_lifts_a_refund_suspension_but_a_paid_later_invoice_does(self):
+        for kind in ("created", "updated"):
+            self.assertEqual(self.sync(f"customer.subscription.{kind}", dict(self.subscription), f"evt_pg_sub_{kind}")["status"],
+                             "reconciled")
+            self.assertEqual(self.plan(), {"status": "suspended", "suspended_reason": "refunded"})
+        self.assertEqual(self.sync("invoice.paid", self.invoice("in_pg_react1"), "evt_pg_paid1")["status"], "ignored")
+        self.assertEqual(self.plan()["status"], "suspended")
+        self.invoices["in_pg_react2"] = self.invoice("in_pg_react2")
+        self.subscription["latest_invoice"] = "in_pg_react2"
+        self.assertEqual(self.sync("invoice.paid", self.invoice("in_pg_react2"), "evt_pg_paid2")["status"], "recovered")
+        self.assertEqual(self.plan(), {"status": "active", "suspended_reason": None})
+
+    def test_a_stripe_outage_during_the_check_is_retried_and_restores_nothing(self):
+        import stripe_state
+        self.invoices["in_pg_react2"] = self.invoice("in_pg_react2")
+        self.subscription["latest_invoice"] = "in_pg_react2"
+        self.down = True
+        with self.assertRaises(stripe_state.RetryableStripeEventError):
+            self.sync("customer.subscription.updated", dict(self.subscription), "evt_pg_sub_outage")
+        self.assertEqual(self.plan(), {"status": "suspended", "suspended_reason": "refunded"})
+        self.down = False
+        self.sync("customer.subscription.updated", dict(self.subscription), "evt_pg_sub_outage")
+        self.assertEqual(self.plan(), {"status": "active", "suspended_reason": None})
+
+
 if __name__ == "__main__":
     unittest.main()

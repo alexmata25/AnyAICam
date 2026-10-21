@@ -628,3 +628,166 @@ def test_webhook_route_answers_503_while_stripe_cannot_name_the_refunds_invoice(
     assert _post(client, refund).status_code == 200
     assert _steps(db_path, "evt_route_outage")["billing_status"] == ("completed", 2)
     assert _licence(db_path, customer_id)["status"] == "suspended"
+
+
+# ------------------------------------------------------------------ RC10b R1/R4: no plan re-activation by a healthy subscription
+# Green's RC10b journeys R1/R4: the camera_plan_v2 step created the plan suspended (refunded), then billing_status
+# reconciled customer.subscription.created as "healthy" and restored every refund suspension. A refund suspension now
+# lifts only when the payment covering the current period is a later, paid, unreversed invoice.
+
+def _stripe_subscription(stripe, ids, event, customer_id, latest_invoice=None, status="active"):
+    stripe["now"]["subscriptions"][ids["sub"]] = {
+        "id": ids["sub"], "object": "subscription", "status": status, "customer": event["data"]["object"]["customer"],
+        "latest_invoice": latest_invoice or ids["invoice"], "current_period_end": 1800000000,
+        "metadata": {"anyaicam_customer_id": customer_id, "anyaicam_billing_version": "2"},
+        "items": {"data": [{"id": "si_race", "quantity": 5, "price": {"id": PRICES["ai_local"]}}]}}
+    return stripe["now"]["subscriptions"][ids["sub"]]
+
+
+def _sub_event(stripe, ids, kind="updated", event_id=None):
+    return {"id": event_id or f"evt_sub_{kind}_{ids['sub']}", "type": f"customer.subscription.{kind}",
+            "data": {"object": copy.deepcopy(stripe["now"]["subscriptions"][ids["sub"]])}}
+
+
+def _later_invoice(stripe, ids, invoice_id, *, status="paid"):
+    stripe["now"]["invoices"][invoice_id] = {"id": invoice_id, "object": "invoice", "status": status,
+                                             "amount_paid": AMOUNT if status == "paid" else 0, "subscription": ids["sub"],
+                                             "payment_intent": f"pi_{invoice_id}", "charge": f"ch_{invoice_id}"}
+
+
+@pytest.mark.parametrize("outage_first", [False, True], ids=["R1-refund-first", "R4-outage-then-redelivery"])
+def test_webhook_route_refund_first_then_subscription_created_invoice_paid_checkout_keeps_the_plan_suspended(
+        shop, db_path, stripe, outage_first):
+    client = shop[0]
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _stripe_subscription(stripe, ids, event, customer_id)
+    refund = _refund(ids, "evt_r1_refund")
+    if outage_first:  # R4: Stripe cannot name the refund's invoice, then redelivers the same event
+        stripe["down"].add("/v1/invoice_payments")
+        assert _post(client, refund).status_code == 503
+        assert _reversals(db_path, ids["intent"]) == []
+        stripe["down"].clear()
+    assert _post(client, refund).status_code == 200
+    assert _reversals(db_path, ids["intent"]) == [(ids["charge"], ids["intent"], ids["invoice"], "refunded")]
+    # The held purchase events, in Green's R1 order.
+    assert _post(client, _sub_event(stripe, ids, "created")).status_code == 200
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+    assert _post(client, _invoice_paid(ids)).status_code == 200
+    assert _post(client, event).status_code == 200
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+    licence = _licence(db_path, customer_id)
+    assert (licence["status"], licence["suspended_reason"]) == ("suspended", "refunded")
+    assert _access(db_path, customer_id) == (False, False)
+    # Any later subscription update with no new payment changes nothing.
+    assert _post(client, _sub_event(stripe, ids, "updated")).status_code == 200
+    assert _plan(db_path, customer_id)["status"] == "suspended" and _access(db_path, customer_id) == (False, False)
+
+
+def test_a_normal_refund_then_a_subscription_update_without_a_new_payment_keeps_the_plan_suspended(
+        shop, db_path, stripe, grant_cannot_read_payment):
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _record_build_order(db_path, event)
+    _stripe_subscription(stripe, ids, event, customer_id)
+    _plan_arrives(db_path, customer_id, event, ids)
+    assert _billing(db_path, _refund(ids))["status"] == "suspended"
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+    for kind in ("updated", "created"):
+        assert _billing(db_path, _sub_event(stripe, ids, kind))["status"] == "reconciled"
+        assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+    # A later invoice that exists but is not paid yet is no recovery either.
+    _later_invoice(stripe, ids, "in_race_open2", status="open")
+    _stripe_subscription(stripe, ids, event, customer_id, latest_invoice="in_race_open2")
+    assert _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_open2"))["status"] == "reconciled"
+    assert _plan(db_path, customer_id)["status"] == "suspended" and _access(db_path, customer_id) == (False, False)
+
+
+def test_a_valid_later_payment_restores_the_plan_but_never_the_refunded_licence(shop, db_path, stripe,
+                                                                              grant_cannot_read_payment):
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _record_build_order(db_path, event)
+    _stripe_subscription(stripe, ids, event, customer_id)
+    _plan_arrives(db_path, customer_id, event, ids)
+    assert _billing(db_path, _refund(ids))["status"] == "suspended"
+    # The refunded first invoice paid again (a late or replayed event) is no recovery.
+    assert _billing(db_path, _invoice_paid(ids))["status"] == "ignored"
+    _later_invoice(stripe, ids, "in_race_m2")
+    _stripe_subscription(stripe, ids, event, customer_id, latest_invoice="in_race_m2")
+    assert _billing(db_path, _invoice_paid(ids, "in_race_m2", "pi_in_race_m2"))["status"] == "recovered"
+    assert _plan(db_path, customer_id) == {"status": "active", "suspended_reason": None}
+    assert _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_after_m2"))["status"] == "reconciled"
+    assert _plan(db_path, customer_id)["status"] == "active"
+    licence = _licence(db_path, customer_id)
+    assert (licence["status"], licence["suspended_reason"]) == ("suspended", "refunded")
+
+
+def test_a_paid_invoice_that_is_not_the_current_period_restores_nothing(shop, db_path, stripe, grant_cannot_read_payment):
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _record_build_order(db_path, event)
+    _later_invoice(stripe, ids, "in_race_m2")
+    _stripe_subscription(stripe, ids, event, customer_id, latest_invoice="in_race_m2")
+    _plan_arrives(db_path, customer_id, event, ids, latest_invoice="in_race_m2")
+    # Month 2 is refunded; a late invoice.paid for month 1 (paid, never refunded) does not pay for the current period.
+    stripe["now"]["invoice_payments"]["pi_in_race_m2"] = [{"invoice": "in_race_m2", "status": "paid",
+                                                           "payment": {"type": "payment_intent", "payment_intent": "pi_in_race_m2"}}]
+    refund_m2 = {"id": "evt_refund_m2", "type": "charge.refunded", "data": {"object": {
+        "id": "ch_in_race_m2", "object": "charge", "payment_intent": "pi_in_race_m2", "amount": AMOUNT,
+        "amount_refunded": AMOUNT, "refunded": True}}}
+    assert _billing(db_path, refund_m2)["status"] == "suspended"
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+    assert _billing(db_path, {**_invoice_paid(ids), "id": "evt_late_m1"})["status"] == "recovered"
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+
+
+@pytest.mark.parametrize("down", ["/v1/invoices/", "/v1/payment_intents/"])
+def test_a_stripe_outage_while_checking_the_current_payment_is_retried_and_restores_nothing(
+        shop, db_path, stripe, down, grant_cannot_read_payment):
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _record_build_order(db_path, event)
+    _stripe_subscription(stripe, ids, event, customer_id)
+    _plan_arrives(db_path, customer_id, event, ids)
+    assert _billing(db_path, _refund(ids))["status"] == "suspended"
+    _later_invoice(stripe, ids, "in_race_m2")
+    _stripe_subscription(stripe, ids, event, customer_id, latest_invoice="in_race_m2")
+    stripe["down"].add(down)
+    if down == "/v1/payment_intents/":
+        # The recorded reversals answer for the refunded payment; month 2's own payment state needs Stripe.
+        stripe["down"].discard("/v1/invoices/")
+    with pytest.raises(stripe_state.RetryableStripeEventError):
+        _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_outage"))
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "refunded"}
+    stripe["down"].clear()
+    assert _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_outage"))["status"] == "reconciled"
+    assert _plan(db_path, customer_id)["status"] == "active"  # month 2 was paid and is not reversed
+
+
+def test_failed_payment_recovery_by_a_healthy_subscription_is_unchanged_and_reads_no_invoice(shop, db_path, stripe,
+                                                                                            grant_cannot_read_payment):
+    import billing_status
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _record_build_order(db_path, event)
+    _stripe_subscription(stripe, ids, event, customer_id)
+    _plan_arrives(db_path, customer_id, event, ids)
+    with override_target(sqlite_path=str(db_path)):
+        assert billing_status._suspend(ids["sub"], "payment_failed") == 1
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "payment_failed"}
+    before = len(stripe["reads"])
+    assert _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_recover"))["status"] == "reconciled"
+    assert _plan(db_path, customer_id) == {"status": "active", "suspended_reason": None}
+    assert not [p for p in stripe["reads"][before:] if p.startswith("/v1/invoices/")]
+
+
+@pytest.mark.parametrize("outcome", ["won", "lost"])
+def test_a_disputed_plan_is_never_lifted_by_a_subscription_update_only_by_a_won_dispute(shop, db_path, stripe, outcome,
+                                                                                       grant_cannot_read_payment):
+    customer_id, event, ids = _place(shop, db_path, stripe)
+    _record_build_order(db_path, event)
+    _stripe_subscription(stripe, ids, event, customer_id)
+    _plan_arrives(db_path, customer_id, event, ids)
+    assert _billing(db_path, _dispute(ids, "created"))["status"] == "suspended"
+    assert _plan(db_path, customer_id) == {"status": "suspended", "suspended_reason": "disputed"}
+    assert _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_dispute"))["status"] == "reconciled"
+    assert _plan(db_path, customer_id)["status"] == "suspended"
+    _billing(db_path, _dispute(ids, "closed", outcome))
+    assert _plan(db_path, customer_id)["status"] == ("active" if outcome == "won" else "suspended")
+    assert _billing(db_path, _sub_event(stripe, ids, "updated", "evt_sub_dispute_after"))["status"] == "reconciled"
+    assert _plan(db_path, customer_id)["status"] == ("active" if outcome == "won" else "suspended")

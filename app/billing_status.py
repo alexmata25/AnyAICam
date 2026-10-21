@@ -157,14 +157,14 @@ def mark_payment_failed(subscription_id: str, *, at=None) -> None:
         pass
 
 
-def payment_recovered(subscription_id: str) -> int:
+def payment_recovered(subscription_id: str, reasons: tuple[str, ...] = RESTORED_BY_PAYMENT) -> int:
     with connection() as db:
         db.execute("UPDATE customer_entitlements SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
         try:
             db.execute("UPDATE addon_subscriptions SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
         except Exception:
             pass
-    changed = _restore(subscription_id, RESTORED_BY_PAYMENT)
+    changed = _restore(subscription_id, reasons)
     try:
         import per_camera_billing
         changed += per_camera_billing._resume_paid(subscription_id)
@@ -174,6 +174,47 @@ def payment_recovered(subscription_id: str) -> int:
         from purchase_notifications import notify_service_restored
         notify_service_restored(subscription_id)  # never raises
     return changed
+
+
+def _has_refunded_rows(subscription_id: str) -> bool:
+    """A plan or add-on of this subscription is suspended for a refund."""
+    if row("SELECT 1 FROM customer_entitlements WHERE stripe_subscription_id=? AND status='suspended' "
+           "AND suspended_reason='refunded' AND product<>'vms_license'", (subscription_id,)):
+        return True
+    for table in ("addon_subscriptions", "camera_plan_entitlements_v2"):
+        try:
+            if row(f"SELECT 1 FROM {table} WHERE stripe_subscription_id=? AND status='suspended' AND suspended_reason='refunded'",
+                   (subscription_id,)):
+                return True
+        except Exception:
+            pass  # a database before this table exists
+    return False
+
+
+def _restore_reasons(subscription: dict | None, *, paid_invoice: dict | None = None) -> tuple[str, ...]:
+    """What a healthy subscription or a paid invoice may restore. A failed-payment suspension always; a refund
+    suspension only when a later invoice covering the current period was actually paid and that payment is neither
+    refunded nor disputed (RC10b R1/R4). Stripe saying the subscription is healthy, or the refunded invoice itself,
+    is no recovery. Stripe unreadable -> RetryableStripeEventError (the event is retried, nothing restored)."""
+    import stripe_state
+    from urllib.parse import quote
+    subscription_id = str((subscription or {}).get("id") or "")
+    if not subscription_id or not _has_refunded_rows(subscription_id):
+        return RESTORED_BY_PAYMENT
+    latest = subscription.get("latest_invoice")
+    latest_id = stripe_state._id(latest)
+    if not latest_id:
+        raise stripe_state.RetryableStripeEventError("the subscription's current payment could not be identified")
+    if paid_invoice is not None and str(paid_invoice.get("id") or "") != latest_id:
+        return ("payment_failed",)  # an older invoice paid late does not pay for the current period
+    invoice = stripe_state.stripe_get(f"/v1/invoices/{quote(latest_id, safe='')}", "the subscription's current invoice")
+    if str(invoice.get("id") or "") != latest_id:
+        raise stripe_state.RetryableStripeEventError("Stripe returned an unexpected invoice")
+    if str(invoice.get("status") or "") != "paid":
+        return ("payment_failed",)
+    if stripe_state.subscription_payment_reversal({**subscription, "latest_invoice": invoice}):
+        return ("payment_failed",)  # the current period's payment is the refunded or disputed one
+    return RESTORED_BY_PAYMENT
 
 
 def sweep_grace(now: datetime | None = None, *, customer_id: str | None = None) -> int:
@@ -246,7 +287,7 @@ def apply_subscription_status(subscription: dict) -> None:
         mark_payment_failed(subscription_id)
         sweep_grace()
     elif status in HEALTHY_STRIPE_STATUSES and not _outstanding_failure(subscription_id, subscription=subscription):
-        payment_recovered(subscription_id)
+        payment_recovered(subscription_id, _restore_reasons(subscription))
 
 
 # ------------------------------------------------------------------ 2. refunds and disputes
@@ -765,7 +806,11 @@ def sync_from_stripe_event(event: dict) -> dict:
             return {"status": "ignored", "reason": "this payment was refunded or disputed"}
         if _outstanding_failure(subscription_id, paid_invoice_id=str(obj.get("id") or "")):
             return {"status": "ignored", "reason": "a later renewal is still unpaid: grace continues"}
-        return {"status": "recovered", "rows": payment_recovered(subscription_id)}
+        reasons = RESTORED_BY_PAYMENT
+        if _has_refunded_rows(subscription_id):
+            import stripe_state
+            reasons = _restore_reasons(stripe_state.current_subscription(subscription_id), paid_invoice=obj)
+        return {"status": "recovered", "rows": payment_recovered(subscription_id, reasons)}
     if event_type in ("customer.subscription.updated", "customer.subscription.created"):
         from stripe_state import current_subscription
         current = current_subscription(str(obj.get("id") or "") or None) or obj
