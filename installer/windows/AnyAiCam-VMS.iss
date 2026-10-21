@@ -283,12 +283,58 @@ begin
   Result := VcRuntimeNeedsRestart;
 end;
 
+// The saved Local/Hybrid mode in vms.env (ANYAICAM_PRODUCT_MODE, else ANYAICAM_PRODUCT_MODE_BOOTSTRAP: the same order
+// as install-runtime.ps1). False when vms.env is missing or cannot be read (install-runtime then decides, after its
+// permission repair).
+function SavedProductMode(var Mode: String): Boolean;
+var
+  Lines: TArrayOfString;
+  I, Pass: Integer;
+  Key: String;
+begin
+  Mode := '';
+  Result := LoadStringsFromFile(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'), Lines);
+  if not Result then exit;
+  for Pass := 0 to 1 do begin
+    if Pass = 0 then Key := 'ANYAICAM_PRODUCT_MODE=' else Key := 'ANYAICAM_PRODUCT_MODE_BOOTSTRAP=';
+    for I := 0 to GetArrayLength(Lines) - 1 do
+      if Pos(Key, Lines[I]) = 1 then Mode := Copy(Lines[I], Length(Key) + 1, Length(Lines[I]));
+    if Mode <> '' then exit;
+  end;
+end;
+
+// 1.3.2 Sandbox acceptance (2026-10-20): the product-mode rules are checked HERE, before any file is copied and before
+// the services are stopped. install-runtime.ps1 enforces them too, but only after both services were already
+// uninstalled, so a refused mode switch used to leave the PC with no running VMS (setup exit 20).
+// The rules and messages are exactly install-runtime.ps1's (and Linux installer/03-product-mode.sh):
+//   a requested mode must be exactly local or hybrid; a saved mode must be exactly local or hybrid; Setup never switches it.
+function ProductModeProblem(): String;
+var
+  Requested, Saved: String;
+begin
+  Result := '';
+  Requested := ProductModeChoice();
+  if (Requested <> '') and (Requested <> 'local') and (Requested <> 'hybrid') then begin
+    Result := 'The product mode must be exactly local or hybrid.';
+    exit;
+  end;
+  if not SavedProductMode(Saved) or (Saved = '') then exit;
+  if (Saved <> 'local') and (Saved <> 'hybrid') then
+    Result := 'The product mode saved on this computer (' + Saved + ') is not exactly local or hybrid; fix it before installing.'
+  else if (Requested <> '') and (Requested <> Saved) then
+    Result := 'Setup cannot switch the existing product mode (' + Saved + '); change it from your AnyAiCam account instead.';
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
   ServiceExecutable: String;
 begin
-  Result := '';
+  Result := ProductModeProblem();
+  if Result <> '' then begin
+    Log('Install refused before any change: ' + Result);
+    exit;
+  end;
   // The agent talks to the VMS: stop and remove it first. (No service
   // dependency: the agent restarts the VMS on request, and stopping a
   // service stops its dependents -- the agent itself.)

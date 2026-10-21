@@ -93,3 +93,44 @@ def test_setup_offers_the_choice_only_on_a_new_interactive_install_and_passes_it
 def test_the_persisted_mode_never_defaults_to_a_user_writable_windows_folder():
     source = (ROOT / "app" / "product_mode.py").read_text(encoding="utf-8")
     assert 'str(_CONFIG_DIR / "product_mode.json")' in source and '"/opt/anyaicam/data/config/product_mode.json",' not in source
+
+
+# ------------------------------------------------------------ 1.3.2 Sandbox acceptance (2026-10-20)
+# A refused mode switch used to be decided only in install-runtime.ps1, AFTER PrepareToInstall had stopped and
+# uninstalled both services: the PC was left with no running VMS (setup exit 20). Setup now refuses BEFORE any change.
+def _code():
+    return (WIN / "AnyAiCam-VMS.iss").read_text(encoding="utf-8-sig").split("[Code]", 1)[1]
+
+
+def _function(name):
+    code = _code()
+    return code.split(f"function {name}", 1)[1].split("\nend;\n", 1)[0]
+
+
+def test_setup_checks_the_mode_before_stopping_or_removing_any_service():
+    prepare = _function("PrepareToInstall(var NeedsRestart: Boolean): String;")
+    check = prepare.index("Result := ProductModeProblem();")
+    assert check < prepare.index("if Result <> '' then begin")
+    assert check < prepare.index("'stopwait'") and check < prepare.index("'uninstall'")
+    assert "Log('Install refused before any change: ' + Result);" in prepare
+    assert prepare.index("exit;") < prepare.index("'stopwait'")                       # refused -> returns before any change
+
+
+def test_the_early_check_applies_exactly_install_runtimes_rules_and_messages():
+    problem = _function("ProductModeProblem(): String;")
+    saved = _function("SavedProductMode(var Mode: String): Boolean;")
+    runtime = (WIN / "install-runtime.ps1").read_text(encoding="utf-8-sig")
+    # same requested-mode rule and message
+    assert "Requested := ProductModeChoice();" in problem
+    assert "'The product mode must be exactly local or hybrid.'" in problem
+    assert "throw 'The product mode must be exactly local or hybrid.'" in runtime
+    # same switch refusal message
+    assert "'Setup cannot switch the existing product mode (' + Saved + '); change it from your AnyAiCam account instead.'" in problem
+    assert 'throw "Setup cannot switch the existing product mode ($savedMode); change it from your AnyAiCam account instead."' in runtime
+    # same key order (PRODUCT_MODE before BOOTSTRAP) and exact, case-sensitive values
+    assert saved.index("'ANYAICAM_PRODUCT_MODE='") < saved.index("'ANYAICAM_PRODUCT_MODE_BOOTSTRAP='")
+    assert "foreach ($key in @('ANYAICAM_PRODUCT_MODE', 'ANYAICAM_PRODUCT_MODE_BOOTSTRAP'))" in runtime
+    assert "(Saved <> 'local') and (Saved <> 'hybrid')" in problem
+    # an unreadable vms.env is left to install-runtime (which first repairs the permissions)
+    assert "if not SavedProductMode(Saved) or (Saved = '') then exit;" in problem
+    assert r"LoadStringsFromFile(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'), Lines)" in saved

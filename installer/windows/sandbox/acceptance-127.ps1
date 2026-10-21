@@ -13,6 +13,19 @@ $signer = 'C:\Validation\scripts\synthetic-snapshots.py'
 $staging = Join-Path $data 'config\vms_capacity_signed.json'
 $identityFile = Join-Path $data 'recordings\appliance_identity.json'
 $SY = 'S-1-5-18'; $BA = 'S-1-5-32-544'
+# 2026-10-20 (Blue, Sandbox acceptance): a production run never receives the synthetic key (make-wsb.ps1 refuses to
+# copy one), but its checks need SOME non-production key to sign the snapshot the production build must refuse. Make
+# a throwaway sandbox-test-* Ed25519 key inside this disposable Sandbox (it never leaves it, and nothing trusts it).
+if ($acceptance.keyset_kind -eq 'production' -and -not (Test-Path -LiteralPath $synthKey)) {
+    $synthKey = Join-Path $env:TEMP 'throwaway-sandbox-test-key.json'
+    # Python single quotes only: Windows PowerShell 5.1 strips embedded double quotes from native arguments.
+    $generate = 'import base64, json, secrets, sys; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; ' +
+        'k = Ed25519PrivateKey.generate(); b = lambda x: base64.b64encode(x).decode(); ' +
+        'open(sys.argv[1], ''w'', encoding=''ascii'').write(json.dumps({''key_id'': ''sandbox-test-throwaway-'' + secrets.token_hex(6), ' +
+        '''private_key_b64'': b(k.private_bytes_raw()), ''public_key_b64'': b(k.public_key().public_bytes_raw())}))'
+    & $py -c $generate $synthKey
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $synthKey)) { throw 'could not create the throwaway non-production key' }
+}
 
 function AppPython([string]$Code) {
     # Runs $Code with the installed app + agent on sys.path; product-mode keys (only) from vms.env in the environment.
