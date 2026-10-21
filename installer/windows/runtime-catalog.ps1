@@ -134,7 +134,7 @@ function Install-RuntimeCatalog([string]$CatalogPath) {
     if ($signature.Status -ne 'Valid') { return "AnyAiCam runtime catalog not registered: it is not validly signed ($($signature.Status)); Smart App Control will block the runtime." }
     # Codex 2026-10-17: a valid signature from any OTHER publisher must not be trusted (publisher-pin.ps1).
     . (Join-Path $PSScriptRoot 'publisher-pin.ps1')
-    $publisherProblem = Get-AnyAiCamPublisherProblem $signature
+    $publisherProblem = Get-AnyAiCamPublisherProblem $signature $CatalogPath
     if ($publisherProblem) { return "AnyAiCam runtime catalog not registered: $publisherProblem." }
     Use-CatalogAdmin {
         param($api, $admin)

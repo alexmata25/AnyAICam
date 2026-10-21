@@ -106,8 +106,12 @@ if ($Sign -or $AzureSign) {
     if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
     if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
     if ($AzureSign) {
-        $publisherProblem = Get-AnyAiCamPublisherProblem (Get-AuthenticodeSignature -LiteralPath $catalog)
+        $catalogSignature = Get-AuthenticodeSignature -LiteralPath $catalog
+        $publisherProblem = Get-AnyAiCamPublisherProblem $catalogSignature $catalog
         if ($publisherProblem) { throw "Publisher pin failed for the runtime catalog: $publisherProblem" }
+        # Offline installs (2026-10-20): the catalog must CARRY its issuing CA, not rely on this PC's certificate cache.
+        $issuer = $catalogSignature.SignerCertificate.Issuer
+        if (-not (@(Get-AnyAiCamEmbeddedCertificates $catalog) | Where-Object { $_.Subject -eq $issuer })) { throw "The runtime catalog does not embed its issuing CA ($issuer); it would be refused offline." }
     }
     & $signTool verify /pa $catalog | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
@@ -141,8 +145,10 @@ if ($Sign -or $AzureSign) {
         if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed: $($file.FullName)" }
         if ($Sign -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) { throw "Signer certificate mismatch: $($file.FullName)" }
         if ($AzureSign) {
-            $publisherProblem = Get-AnyAiCamPublisherProblem $signature
+            $publisherProblem = Get-AnyAiCamPublisherProblem $signature $file.FullName
             if ($publisherProblem) { throw "Publisher pin failed for $($file.FullName): $publisherProblem" }
+            $issuer = $signature.SignerCertificate.Issuer
+            if (-not (@(Get-AnyAiCamEmbeddedCertificates $file.FullName) | Where-Object { $_.Subject -eq $issuer })) { throw "$($file.Name) does not embed its issuing CA ($issuer); it would be refused offline." }
         }
         & $signTool verify /pa /all $file.FullName | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "SignTool verification failed: $($file.FullName)" }

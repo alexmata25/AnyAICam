@@ -65,6 +65,50 @@ def test_a_look_alike_certificate_with_the_exact_subject_is_rejected(with_identi
     assert verdict == f"REJECT: {expected}"
 
 
+def _signed_artifacts():
+    candidates = APPROVED_RELEASE.parent
+    if not candidates.exists():
+        return []
+    return sorted(p for p in candidates.glob("*/AnyAiCam-VMS-Setup-*.exe")
+                  if "SIGNED" in p.parent.name.upper() and "UNSIGNED" not in p.parent.name.upper())
+
+
+def test_a_signed_setup_carries_its_whole_chain_and_passes_with_it():
+    """Sandbox acceptance 2026-10-20: a clean, OFFLINE PC has never cached the rotating Azure issuing CA. The pin must
+    build the chain from the certificates the signed file itself carries (leaf -> EOC CA -> PCA -> pinned root)."""
+    files = _signed_artifacts()
+    if not files:
+        pytest.skip("no signed AnyAiCam setup on this machine")
+    for setup in files:
+        out = _ps(
+            f"$s = Get-AuthenticodeSignature -LiteralPath '{setup}'; $e = Get-AnyAiCamEmbeddedCertificates '{setup}'\n"
+            "'ISSUER-EMBEDDED=' + [bool]($e | Where-Object { $_.Subject -eq $s.SignerCertificate.Issuer })\n"
+            "'ROOT-EMBEDDED=' + [bool]($e | Where-Object { $_.Thumbprint -eq $AnyAiCamPublisherRootThumbprint })\n"
+            f"$p = Get-AnyAiCamPublisherProblem $s '{setup}'; if ($p) {{ 'REJECT: ' + $p }} else {{ 'ACCEPT' }}")
+        assert out.splitlines() == ["ISSUER-EMBEDDED=True", "ROOT-EMBEDDED=True", "ACCEPT"], (setup, out)
+
+
+def test_embedded_certificates_of_an_unreadable_or_missing_file_are_empty(tmp_path):
+    (tmp_path / "plain.txt").write_text("not signed", encoding="utf-8")
+    assert _ps(f"(Get-AnyAiCamEmbeddedCertificates '{tmp_path / 'plain.txt'}').Count; "
+               f"(Get-AnyAiCamEmbeddedCertificates '{tmp_path / 'absent.cat'}').Count; "
+               "(Get-AnyAiCamEmbeddedCertificates '').Count").splitlines() == ["0", "0", "0"]
+
+
+def test_every_caller_passes_the_signed_file_and_the_build_proves_offline_verifiability():
+    catalog = (ROOT / "installer" / "windows" / "runtime-catalog.ps1").read_text(encoding="utf-8-sig")
+    assert "Get-AnyAiCamPublisherProblem $signature $CatalogPath" in catalog
+    build = (ROOT / "installer" / "windows" / "build.ps1").read_text(encoding="utf-8-sig")
+    assert "Get-AnyAiCamPublisherProblem $catalogSignature $catalog" in build
+    assert "Get-AnyAiCamPublisherProblem $signature $file.FullName" in build
+    assert "The runtime catalog does not embed its issuing CA" in build
+    assert "does not embed its issuing CA ($issuer); it would be refused offline." in build
+    pin = PIN.read_text(encoding="utf-8-sig")
+    assert "$chain.ChainPolicy.ExtraStore.AddRange($embedded)" in pin
+    assert pin.index("ExtraStore.AddRange") < pin.index("[void]$chain.Build($certificate)")
+    assert "$root.Thumbprint -ne $AnyAiCamPublisherRootThumbprint" in pin        # the trust anchor is unchanged
+
+
 def test_install_and_build_use_the_pin():
     catalog = (ROOT / "installer" / "windows" / "runtime-catalog.ps1").read_text(encoding="utf-8-sig")
     assert ". (Join-Path $PSScriptRoot 'publisher-pin.ps1')" in catalog
