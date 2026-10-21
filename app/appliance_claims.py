@@ -950,7 +950,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         content = f'''<header class="topbar"><div><p class="eyebrow">Add an appliance</p><h1>Claim an appliance</h1></div></header>
         <section class="panel">
           <div id="claim-step-code">
-            <p>Enter the claim code your appliance shows while it waits to be linked: on its screen during setup, on the last page of the Windows installer, or the claim code printed on its label (or scan the label's QR code with your phone). A new appliance can take a few minutes to start after it is plugged into power and your network.</p>
+            <p>Enter the claim code your appliance shows while it waits to be linked: on its screen during setup, the claim code printed on its label (or scan the label's QR code with your phone), or, on a PC still running the older AnyAiCam for Windows 1.3.0, Start menu &gt; AnyAiCam &gt; Show AnyAiCam claim code. The current Windows setup needs no code: it opens this site for you to confirm. A new appliance can take a few minutes to start after it is plugged into power and your network.</p>
             <label>Claim code<input id="claim-code-input" maxlength="20" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="Claim code"></label>
             <button class="action-button" id="claim-lookup-button">Look up</button>
             <p id="claim-lookup-message" class="health-detail"></p>
