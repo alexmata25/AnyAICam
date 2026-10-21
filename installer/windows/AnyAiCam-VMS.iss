@@ -75,6 +75,10 @@ Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignorever
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+; Stops processes still running from {app} after the services are removed (PrepareToInstall from {tmp}; the
+; uninstaller from {app}\installer).
+Source: "stop-app-processes.ps1"; Flags: dontcopy
+Source: "stop-app-processes.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; Run from {tmp} by InitializeSetup before anything is installed (downgrade / unknown-version guard).
 Source: "install-version-guard.ps1"; Flags: dontcopy
 Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
@@ -140,6 +144,8 @@ Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "uninstall"; Flags: run
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVMS"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -Command ""Start-Sleep -Seconds 3"""; Flags: runhidden waituntilterminated; RunOnceId: "WaitForAnyAiCamVMS"
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamVMS"
+; 1.3.2: MediaMTX / FFmpeg children outlive the service; stop them so the program folder can be removed.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\stop-app-processes.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamFolderProcesses"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\firewall.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAnyAiCamFirewall"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\runtime-catalog.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAnyAiCamRuntimeCatalog"
 
@@ -354,6 +360,15 @@ begin
     Exec(ServiceExecutable, 'stopwait', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(3000);
     Exec(ServiceExecutable, 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  // 1.3.2 Sandbox acceptance (P-H): the VMS's child processes (MediaMTX live view, FFmpeg) outlive the service and kept
+  // runtime files locked, so a Hybrid reinstall/upgrade failed (exit 20). Stop whatever still runs from this folder.
+  if DirExists(ExpandConstant('{app}')) then
+  begin
+    ExtractTemporaryFile('stop-app-processes.ps1');
+    ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\stop-app-processes.ps1') +
+      '" -InstallRoot "' + ExpandConstant('{app}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode, nil);
   end;
 end;
 

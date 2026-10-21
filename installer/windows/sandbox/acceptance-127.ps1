@@ -36,6 +36,14 @@ sys.path[:0] = [r'$app\app', r'$app\agent\system', r'$app\agent']
 for line in open(r'$data\config\vms.env', encoding='utf-8-sig'):
     k, _, v = line.strip().partition('=')
     if k in ('ANYAICAM_PRODUCT_MODE', 'ANYAICAM_PRODUCT_MODE_BOOTSTRAP'): os.environ[k] = v
+# The fixed data folders, exactly as service-launcher.ps1 sets them (2026-10-21, S-L 17cf93c): left unset, runtime_paths
+# fell back to C:\app\recordings, the appliance identity read as absent and every accepted capacity read as null HERE
+# although the acceptor (fixed paths) had accepted it.
+os.environ['ANYAICAM_STATIC_FOLDER'] = r'$app\app\static'
+os.environ['ANYAICAM_RECORDINGS_FOLDER'] = r'$data\recordings'
+os.environ['ANYAICAM_HLS_FOLDER'] = r'$data\hls'
+os.environ['ANYAICAM_PARTNER_DB'] = r'$data\database\partner_portal.db'
+os.environ['ANYAICAM_STATE_DIR'] = r'$data\agent'
 os.chdir(r'$app\app')
 "@
     Set-Content -LiteralPath $file -Value ($prelude + "`n" + $Code) -Encoding UTF8
