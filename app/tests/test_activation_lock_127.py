@@ -98,7 +98,8 @@ def test_incomplete_or_reversed_purchases_do_not_activate(env, setup):
     ("/api/v2/customer/subscription/checkout", {"plan_key": "basic_local", "camera_quantity": 1}),
     ("/api/customer/analytics/checkout", {"addon_key": "ai_essentials", "quantity": 1}),
     ("/api/customer/vms-license/checkout", {"capacity": 8}),
-    ("/api/payments/hardware-checkout", {"sku": "AIC-RELAY-NUMATO-3CH", "quantity": 1}),
+    # /api/payments/hardware-checkout is retired (F2: 410 for everyone); relays: test_relay_after_activation_127.py
+    ("/api/customer/relay-checkout", {"quantity": 1}),
 ])
 def test_every_my_subscription_purchase_is_refused_before_activation(env, plan_prices, path, body):
     import per_camera_billing as billing

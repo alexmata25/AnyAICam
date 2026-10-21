@@ -16,6 +16,7 @@ from database_backend import override_target
 from test_direct_onboarding import _login, _one, _signed_in  # noqa: F401
 from test_hardware_delivery_flow import APPLIANCE, OWN_PC, _hardware_order, _paid  # noqa: F401
 from test_hybrid_build_system_flow import (PRICES, _activate_appliance, _checkout, _checkouts, _customer_id, _new_customer,  # noqa: F401
+                                           _legacy_appliance_checkout,
                                            _order, _paid_checkout_event, _pay, _record_build_order,
                                            db_path, license_portal, package, portal, shop, site, storage)
 
@@ -103,11 +104,13 @@ def _capacity(db_path, customer_id):
 
 # ------------------------------------------------------------ appliance: hardware today, storage at activation
 
-def test_the_appliance_and_relays_are_charged_at_checkout_with_the_card_saved(shop, db_path):
+def test_the_appliance_and_relays_were_charged_at_checkout_with_the_card_saved(shop, db_path):
+    # F2 (2026-10-21): this checkout collected no shipping address, so it now refuses appliances (hardware is sold
+    # through hardware_checkout.py). Orders paid through it before then had this shape and are still served below.
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, "hw@example.test", APPLIANCE_RELAYS)
-    assert _checkout(client).status_code == 200
-    fields = _checkouts(captured)[-1]
+    assert _checkout(client).status_code == 409 and _checkouts(captured) == []
+    fields = _legacy_appliance_checkout(captured, db_path, _customer_id(db_path, "hw@example.test"))
     assert fields["mode"] == "payment"
     assert (fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == ("price_hw_starter", "1")
     assert (fields["line_items[1][price]"], fields["line_items[1][quantity]"]) == ("price_hw_relay", "2")
@@ -122,7 +125,7 @@ def test_the_webhook_records_the_hardware_orders_and_no_storage_is_charged_befor
     client, captured, mail, _, sessions = shop
     _new_customer(client, mail, "orders@example.test", APPLIANCE_RELAYS)
     customer_id = _customer_id(db_path, "orders@example.test")
-    assert _checkout(client).status_code == 200
+    _legacy_appliance_checkout(captured, db_path, customer_id)  # paid before F2 retired this checkout
     event = _paid_checkout_event(captured, customer_id)
     assert _record_build_order(db_path, event)["status"] == "appliance_order_recorded"
     assert _record_build_order(db_path, event)["status"] == "appliance_order_recorded"  # redelivery: same rows
@@ -283,12 +286,12 @@ def test_the_browser_cannot_send_prices_price_ids_or_products(shop, db_path, bod
     assert response.status_code == 422 and _checkouts(captured) == []
 
 
-def test_a_missing_hardware_price_is_reported_and_creates_nothing(shop, db_path, monkeypatch):
+def test_an_appliance_order_is_refused_before_any_price_and_creates_nothing(shop, db_path, monkeypatch):
     client, captured, mail, _, _ = shop
     monkeypatch.delenv("ANYAICAM_STRIPE_PRICE_RYZEN_STARTER")
     _new_customer(client, mail, "noprice@example.test", APPLIANCE)
-    response = _checkout(client)
-    assert response.status_code == 503 and "not available yet" in response.json()["detail"] and _checkouts(captured) == []
+    response = _checkout(client)  # F2: an appliance is refused before any price is looked up
+    assert response.status_code == 409 and "/hardware-checkout?" in response.json()["detail"] and _checkouts(captured) == []
 
 
 @pytest.mark.parametrize("change", [{"payment_status": "unpaid"}, {"mode": "subscription"},
@@ -299,7 +302,7 @@ def test_only_a_verified_paid_valid_order_is_recorded(shop, db_path, change):
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, "verify@example.test", APPLIANCE)
     customer_id = _customer_id(db_path, "verify@example.test")
-    assert _checkout(client).status_code == 200
+    _legacy_appliance_checkout(captured, db_path, customer_id)  # paid before F2 retired this checkout
     event = _paid_checkout_event(captured, customer_id)
     session = event["data"]["object"]
     for key, value in change.items():
@@ -316,7 +319,7 @@ def test_returning_from_stripe_grants_nothing_until_the_webhook(shop, db_path):
     client, captured, mail, _, sessions = shop
     _new_customer(client, mail, "return@example.test", APPLIANCE)
     customer_id = _customer_id(db_path, "return@example.test")
-    assert _checkout(client).status_code == 200
+    _legacy_appliance_checkout(captured, db_path, customer_id)  # paid before F2 retired this checkout
     sessions["cs_test_return01"] = {"status": "complete", "payment_status": "paid", "metadata": {"anyaicam_customer_id": customer_id}}
     html = client.get("/order-complete?session_id=cs_test_return01").text
     assert "Activating your AnyAiCam plan" in html and "being prepared" not in html

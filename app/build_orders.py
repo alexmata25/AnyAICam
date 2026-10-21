@@ -141,6 +141,8 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
         ("metadata[anyaicam_camera_quantity]", str(cameras)),
     ]
     if quote["kind"] == APPLIANCE_ORDER:
+        # F2 (2026-10-21): create_checkout() no longer opens this kind (no shipping address was collected). Kept as
+        # the exact shape of appliance orders paid before then, which the webhook below still records and starts.
         catalog = _hardware_catalog()
         fields = [("mode", "payment"), *common,
                   # Saves the card on the account's Stripe customer for the
@@ -220,6 +222,14 @@ def create_checkout(identity: dict) -> dict:
     progress = billing.build_progress(customer_id)
     if not progress or progress["state"] != billing.BUILD_PENDING or not progress.get("plan"):
         raise HTTPException(status_code=409, detail="There is no order to check out. Build your system first.")
+    if order_kind(progress) == APPLIANCE_ORDER:
+        # F2 (2026-10-21): appliances are sold only through the hardware checkout (hardware_checkout.py), which
+        # collects the shipping address. This older appliance checkout collected none, so it is refused here even
+        # for a selection saved before hardware-first (the order summary page already redirects such selections).
+        import hardware_checkout
+        raise HTTPException(status_code=409, detail="AnyAiCam appliances are ordered through the hardware checkout, which collects "
+                                                    "your shipping address. Continue at "
+                                                    f"{hardware_checkout.CHECKOUT_PATH}?{hardware_checkout.selection_query(progress)}")
     try:
         fields, price_id, quantity = _checkout_fields(customer_id, identity.get("email"), progress)
     except friends_family.CheckoutHeld as held:

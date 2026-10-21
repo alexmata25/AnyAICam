@@ -114677,110 +114677,20 @@ def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Reque
 
 
 @app.post("/api/payments/hardware-checkout")
-def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Request) -> dict:
-    """Provisioning Phase 5: one-time HARDWARE purchase checkout (Ryzen
-    appliances, the Numato relay module) -- mode=payment, deliberately
-    separate from create_stripe_checkout() above (subscription mode,
-    legacy plan/camera-slot flow). The customer selects a catalog `sku`
-    (see HardwareCheckoutCreateModel); the Stripe Price ID is resolved
-    server-side from hardware_orders.HARDWARE_CATALOG only -- a browser
-    can never submit an arbitrary Price ID here, matching the same
-    discipline create_stripe_checkout() already applies to `plan`. See
-    hardware_orders.py's module docstring for why this is a separate
-    catalog/table from customer_entitlements' camera-slot tiers, and
-    stays that way end to end: this endpoint never touches
-    customer_entitlements, and the webhook-side sync this feeds
-    (hardware_orders.sync_hardware_order_from_stripe_event()) never
-    grants a camera slot.
-    """
-    user = current_user(request)
-
-    from partner_portal import partner_identity as _authoritative_identity
-    _identity = _authoritative_identity(request)
-    authoritative_customer_id = ""
-    authoritative_email = ""
-    if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
-        authoritative_customer_id = str(_identity["customer_id"])
-        authoritative_email = str(_identity.get("email") or "")
-        import per_camera_billing
-        per_camera_billing.require_activated(authoritative_customer_id)  # VMS 1.2.7: no My subscription purchase before activation
-
-    from hardware_orders import HARDWARE_CATALOG
-    sku = payload.sku.strip()
-    catalog_entry = next((item for item in HARDWARE_CATALOG if item[0] == sku), None)
-    if not catalog_entry:
-        raise HTTPException(status_code=400, detail="Unknown hardware SKU.")
-    _, product, name, amount_cents, env_var = catalog_entry
-    price_id = os.environ.get(env_var, "").strip()
-    if not price_id:
-        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {sku}.")
-
-    quantity = max(1, min(10, int(payload.quantity)))
-
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
-    # Pricing guard (2026-10-04, as for licences, plans and add-ons): the
-    # configured Stripe Price must charge exactly the published one-time price.
-    require_stripe_price_matches_catalog(price_id, amount_cents, None)
-
-    fields = [
-        ("mode", "payment"),
-        ("success_url", f"{PUBLIC_BASE_URL}/subscription-portal?hardware_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
-        ("cancel_url", f"{PUBLIC_BASE_URL}/subscription-portal?hardware_payment=cancelled"),
-        ("line_items[0][price]", price_id),
-        ("line_items[0][quantity]", str(quantity)),
-        ("metadata[anyaicam_stripe_price_id]", price_id),
-        ("metadata[anyaicam_hardware_sku]", sku),
-        ("metadata[anyaicam_hardware_quantity]", str(quantity)),
-        ("allow_promotion_codes", "false"),
-    ]
-    if authoritative_customer_id:
-        fields.append(("metadata[anyaicam_customer_id]", authoritative_customer_id))
-
-    import checkout_guard
-    if authoritative_customer_id:
-        # The account's one canonical Stripe customer, as for licences and plans.
-        fields.append(("customer", checkout_guard.canonical_stripe_customer(authoritative_customer_id, email=authoritative_email)))
-        claim_owner = authoritative_customer_id
-    else:
-        account = billing_account_for_user(user)
-        customer_id_for_stripe = stripe_customer_id_for_account(account)
-        if customer_id_for_stripe:
-            fields.append(("customer", customer_id_for_stripe))
-        elif account.get("billing_email") or user.get("email"):
-            fields.append(("customer_email", str(account.get("billing_email") or user.get("email"))))
-        # Whose purchase this is, for the one-payable-session claim: never a
-        # key shared by unrelated people (the "anonymous" fallback user).
-        if _identity and _identity.get("email"):
-            claim_owner = f"partner:{str(_identity['email']).lower()}"
-        elif user.get("id") and user.get("id") != "anonymous":
-            claim_owner = f"user:{user['id']}"
-        else:
-            raise HTTPException(status_code=401, detail="Sign in to buy hardware.")
-    # One payable Checkout Session per (account, SKU) at a time (2026-10-04):
-    # a double click, a second tab or a retry after a lost answer gets the
-    # same session back; a paid one blocks until its order is recorded.
-    session = checkout_guard.create_session(claim_owner, f"hardware:{sku}", price_id=price_id, quantity=quantity, fields=fields)
-    session_id = str(session.get("id") or "")
-    checkout_url = str(session.get("url") or "")
-    if not session_id or not checkout_url:
-        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
-
-    structured_log(
-        "stripe.hardware_checkout_created",
-        session_id=session_id,
-        sku=sku,
-        quantity=quantity,
-        user_id=user.get("id"),
-    )
-    return {
-        "status": "complete",
-        "session_id": session_id,
-        "checkout_url": checkout_url,
-        "sku": sku,
-        "product_name": name,
-        "message": "Stripe Checkout Session created.",
-    }
+def create_hardware_checkout(request: Request) -> dict:
+    """Retired (F2, 2026-10-21). This Provisioning Phase 5 hardware checkout
+    (one SKU, mode=payment) charged appliance and relay Prices WITHOUT
+    collecting a shipping address. Hardware is sold only through the
+    hardware checkout (hardware_checkout.py: /hardware-checkout for
+    appliances, /api/customer/relay-checkout for relays from My
+    subscription), which collects the shipping address in Stripe Checkout.
+    Refused before any Stripe call, whatever the request carries; nothing in
+    the app or on anyaicam.com calls this route any more. Orders already paid
+    through it are still recorded and refunded by their webhooks
+    (hardware_orders.py, billing_status.py)."""
+    raise HTTPException(status_code=410, detail="This hardware checkout has been retired. Order AnyAiCam appliances at "
+                                                "/hardware-checkout (from Build Your System), and relays from My subscription; "
+                                                "both collect your shipping address.")
 
 
 @app.post("/api/payments/customer-portal")

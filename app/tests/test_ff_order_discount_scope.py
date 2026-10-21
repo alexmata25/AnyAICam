@@ -14,7 +14,7 @@ import pytest
 from database_backend import override_target
 from test_build_order_billing import APPLIANCE, OWN_PC, _activate, _paid, stripe_subscriptions  # noqa: F401
 from test_hybrid_build_system_flow import (PRICES, _checkout, _checkouts, _customer_id, _new_customer,  # noqa: F401
-                                           _paid_checkout_event, _record_build_order,
+                                           _legacy_appliance_checkout, _paid_checkout_event, _record_build_order,
                                            db_path, license_portal, package, portal, shop, site, storage)
 
 pytestmark = pytest.mark.usefixtures("stripe_follows_events")
@@ -107,8 +107,10 @@ def test_hardware_is_never_discounted(shop, db_path, stripe_coupon):
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, "hwff@example.test", APPLIANCE)
     _approve(db_path, _customer_id(db_path, "hwff@example.test"), "hwff@example.test")
-    assert _checkout(client).status_code == 200
-    fields = _checkouts(captured)[-1]
+    # F2: appliances are ordered through the hardware checkout (no discounts: test_pricing_ff_commission); an appliance
+    # Build order paid before then carried none either.
+    assert _checkout(client).status_code == 409 and _checkouts(captured) == []
+    fields = _legacy_appliance_checkout(captured, db_path, _customer_id(db_path, "hwff@example.test"))
     assert "discounts[0][coupon]" not in fields and fields["allow_promotion_codes"] == "false"
 
 
