@@ -231,7 +231,7 @@ class PostgreSQLSigninAttachmentRaceTests(unittest.TestCase):
     def _no_stripe(self):
         import billing_status
         import sales_commissions
-        return (patch.object(billing_status, "_stripe_invoice_subscription", return_value=None),
+        return (patch.object(billing_status, "_stripe_invoice_for_payment", return_value=None),
                 patch.object(sales_commissions, "_invoice_for_payment_intent", return_value=None))
 
     def _entitlement_status(self):
