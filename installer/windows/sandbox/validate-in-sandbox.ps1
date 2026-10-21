@@ -81,6 +81,7 @@ function BundledPython([string]$Pattern) {
 $previous = Get-ChildItem 'C:\Validation\previous' -Filter 'AnyAiCam-VMS-Setup-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
 $previousLabelCode = ''
 $previousIdentity = ''
+$previousRelease = '1.3.0'
 # Simulated upgrade (2026-10-08): C:\Validation\previous\SIMULATE-1.3.0 plants
 # exactly what Windows 1.3.0 (aedecb6) leaves on a PC -- identity, permanent
 # claim code + verifier, "Show AnyAiCam claim code" shortcut -- for a Smart App
@@ -106,11 +107,23 @@ if ($previous) {
     catch { $old = $null; $previousError = $_.Exception.Message }
     Check "previous release $($previous.Name) installed (exit 0)" { if (-not $old) { throw "did not start: $previousError" }; if ($old.ExitCode -ne 0) { throw "exit $($old.ExitCode)" }; 'exit 0' }
     $oldLabel = Join-Path $env:ProgramData 'AnyAiCam\label\claim-label.txt'
-    Check 'previous release created its permanent claim code' {
-        $line = Get-Content $oldLabel -ErrorAction Stop | Where-Object { $_ -like 'Claim code:*' } | Select-Object -First 1
-        $script:previousLabelCode = ($line -replace '^Claim code:\s*', '').Trim()
-        if ($script:previousLabelCode -notmatch '^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$') { throw 'no claim code' }
-        'claim-label.txt present (code not shown)'
+    if ($previous.Name -like 'AnyAiCam-VMS-Setup-1.3.0-*') {
+        Check 'previous release created its permanent claim code' {
+            $line = Get-Content $oldLabel -ErrorAction Stop | Where-Object { $_ -like 'Claim code:*' } | Select-Object -First 1
+            $script:previousLabelCode = ($line -replace '^Claim code:\s*', '').Trim()
+            if ($script:previousLabelCode -notmatch '^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$') { throw 'no claim code' }
+            'claim-label.txt present (code not shown)'
+        }
+    } else {
+        # 2026-10-21 (U131-L on 17cf93c): 1.3.1 already retired the permanent claim code (its cloud-link.ps1 deletes
+        # claim-label.txt), so there is none to retire; what the upgrade must keep is the identity 1.3.1 created.
+        Check "previous release $($previous.Name) has no permanent claim code and created its appliance identity" {
+            if (Test-Path -LiteralPath $oldLabel) { throw 'claim-label.txt present' }
+            $id = [string](Get-Content -Raw (Join-Path $env:ProgramData 'AnyAiCam\config\appliance_identity.json') -ErrorAction Stop | ConvertFrom-Json).appliance_id
+            if ($id -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { throw 'no UUIDv4 appliance identity' }
+            $script:previousIdentity = $id; $script:previousRelease = ($previous.Name -replace '^AnyAiCam-VMS-Setup-([0-9.]+)-.*$', '$1')
+            'no claim-label.txt; UUIDv4 identity'
+        }
     }
 }
 
@@ -238,7 +251,7 @@ $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\A
 $ErrorActionPreference = 'Continue'  # (the helper sets Stop; every check here must run)
 function LinkCodeOf([string]$Link) { if ($Link -cmatch '#code=([0-9A-Z]{8})&link=windows$') { return $Matches[1] }; return '' }
 if ($previousIdentity) {
-    Check 'upgrade keeps the 1.3.0 appliance identity' {
+    Check "upgrade keeps the $previousRelease appliance identity" {
         $now = [string](Get-Content -Raw (Join-Path $data 'config\appliance_identity.json') | ConvertFrom-Json).appliance_id
         if ($now -ne $previousIdentity) { throw 'identity changed' }
         'same appliance_id'
