@@ -20,7 +20,9 @@ def test_page_names_every_place_a_code_comes_from(client, db_path):
     _seeded_customer(db_path)
     body = _page(client)
     assert "on its screen during setup" in body
-    assert "Windows installer" in body
+    # 1.2.7 Windows setup links without a code; only the older Windows 1.3.0 shows one, behind a Start-menu shortcut.
+    assert "AnyAiCam for Windows 1.3.0" in body and "Show AnyAiCam claim code" in body
+    assert "The current Windows setup needs no code" in body
     assert "printed on its label" in body
     assert 'placeholder="Claim code"' in body
     # An 8-character terminal code is sent as claim_code, a 12-character label code as label_code.
