@@ -93,6 +93,55 @@ def _dual_mode_identity(request: Request, *, eligible_roles: set[str] = PARTNER_
     return bridged
 
 
+def _cameras_with_install_state(customer_id: str, appliance_id: str = '') -> list[dict]:
+    """This customer's camera rows (only `appliance_id`'s when given), each
+    with 'has_recording' and 'installed' decided exactly as /customer-account
+    always has (camera_install_state.py). Moved out of customer_account()
+    unchanged (owner VM acceptance 2026-10-19) so /customer/setup and the
+    dashboard can never disagree about whether an owner has a camera."""
+    cameras=rows(
+        'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,c.appliance_id,'
+        'a.cloud_id AS appliance_cloud_id,'
+        'MAX(COALESCE(acs.online,0)) AS appliance_online,'
+        'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
+        'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
+        'LEFT JOIN appliances a ON a.id=c.appliance_id '
+        'WHERE c.customer_id=?'+(' AND c.appliance_id=?' if appliance_id else '')+
+        ' GROUP BY c.id,c.name,c.camera_number,c.status,c.device_key,c.appliance_id,a.cloud_id ORDER BY c.camera_number',
+        (customer_id,appliance_id) if appliance_id else (customer_id,)
+    )
+    for camera in cameras:
+        camera['has_recording']=bool(row('SELECT 1 FROM recordings WHERE camera_id=?',(camera['id'],)))
+        camera['installed']=camera_is_installed(
+            camera_status=camera['status'],
+            device_key=camera['device_key'],
+            appliance_reported_online=bool(camera['appliance_online']),
+            appliance_reported_recording=bool(camera['appliance_recording']),
+            has_cloud_recording=camera['has_recording'],
+        )
+    return cameras
+
+
+def live_view_waits_for_camera_plan(customer_id: str) -> bool:
+    """Owner VM acceptance 2026-10-19 ("Live View redirects to onboarding
+    Step 6"): True exactly when the cloud dashboard sends an owner whose
+    appliance IS activated back to /customer/setup -- the account has no
+    camera plan (no licensed camera slot) and no installed camera, so Live
+    View has nothing to show (/customer-live -> /customer-account ->
+    /customer/setup). That redirect is intended (customer_account() below;
+    tests/test_customer_account_install_state.py::
+    test_truly_unprovisioned_customer_still_goes_to_setup), but setup reopened
+    on whatever step the saved draft held and never said why. /customer/setup
+    and its Confirm step use this to say so and point to the camera plan."""
+    from appliance_readiness import customer_has_activated_appliance
+    from customer_entitlements import total_camera_slots
+    if not customer_id or not customer_has_activated_appliance(customer_id):
+        return False
+    if total_camera_slots(customer_id)>0:
+        return False
+    return not any(camera['installed'] for camera in _cameras_with_install_state(customer_id))
+
+
 def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
     def customer_owner(request: Request) -> dict:
         identity=partner_identity(request)
@@ -522,26 +571,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # partner/technician rather than the customer's own self-service
         # wizard, has real, online, recording cameras that must show as
         # installed without ever touching that wizard.
-        all_customer_cameras=rows(
-            'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,c.appliance_id,'
-            'a.cloud_id AS appliance_cloud_id,'
-            'MAX(COALESCE(acs.online,0)) AS appliance_online,'
-            'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
-            'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
-            'LEFT JOIN appliances a ON a.id=c.appliance_id '
-            'WHERE c.customer_id=?'+(' AND c.appliance_id=?' if appliance_id else '')+
-            ' GROUP BY c.id,c.name,c.camera_number,c.status,c.device_key,c.appliance_id,a.cloud_id ORDER BY c.camera_number',
-            (customer['id'],appliance_id) if appliance_id else (customer['id'],)
-        )
-        for camera in all_customer_cameras:
-            camera['has_recording']=bool(row('SELECT 1 FROM recordings WHERE camera_id=?',(camera['id'],)))
-            camera['installed']=camera_is_installed(
-                camera_status=camera['status'],
-                device_key=camera['device_key'],
-                appliance_reported_online=bool(camera['appliance_online']),
-                appliance_reported_recording=bool(camera['appliance_recording']),
-                has_cloud_recording=camera['has_recording'],
-            )
+        all_customer_cameras=_cameras_with_install_state(customer['id'],appliance_id)
         cameras=[camera for camera in all_customer_cameras if camera['installed']]
 
         # Confirmed live: a purchased-but-undiscovered onboarding
@@ -914,6 +944,52 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         setup_tab_names=['Welcome','Add appliance','Status','Discover','Cameras','Review','Confirm']
         current_step_attr=' aria-current="step"'
         setup_tabs=''.join(f'<button type="button" class="workspace-tab{" active" if i==initial_step else ""}" data-step="{i}"{current_step_attr if i==initial_step else ""} style="cursor:pointer">{i} {name}</button>' for i,name in enumerate(setup_tab_names,1))
+        # Owner VM acceptance 2026-10-19 ("progress indicator inconsistent"):
+        # the tabs and "Step N of 7" above were rendered for initial_step, but
+        # the step panels were hard-coded with step 1 visible and every other
+        # one hidden (and Back hidden / Save and continue shown), so until the
+        # page script's showSetup() ran -- or whenever it did not -- the
+        # indicator said "Step 6" (or 7) over the Welcome panel. The server now
+        # renders the same step the indicator shows; showSetup() is unchanged.
+        def _step_hidden(step: int) -> str:
+            return '' if step==initial_step else ' hidden'
+        # Owner VM acceptance 2026-10-19 ("Live View redirects to onboarding
+        # Step 6"): an activated appliance with no camera plan and no camera is
+        # sent here from Live View on purpose (live_view_waits_for_camera_plan()).
+        # Say so on whatever step the saved draft reopens, with the way forward.
+        needs_camera_plan=live_view_waits_for_camera_plan(identity['customer_id'])
+        plan_suspended=bool(v2_plan and v2_plan.get('status')=='suspended')
+        live_view_notice=''
+        if needs_camera_plan:
+            live_view_notice=('<section class="panel" id="live-view-needs-plan" role="status" style="margin-bottom:14px;border-left:4px solid #f5b942">'
+                              +('<strong>Live View is paused: your camera plan is suspended.</strong><p class="health-detail" style="margin:6px 0 0">'
+                                'Your appliance is linked. Live View and recording resume once the plan is active again.</p>'
+                                if plan_suspended else
+                                '<strong>Live View opens once you choose a camera plan.</strong><p class="health-detail" style="margin:6px 0 0">'
+                                'Your appliance is linked, but this account has no camera plan and no cameras yet, so there is nothing to show in Live View. '
+                                'Choose a plan and your camera count, then discover your cameras here.</p>')
+                              +'<a class="action-button" id="live-view-needs-plan-link" href="/subscription-portal" style="margin-top:10px">'
+                              +('My subscription' if plan_suspended else 'Choose a camera plan')+'</a></section>')
+        # Owner VM acceptance 2026-10-19 ("Step 7 confirmation blank"): Confirm
+        # only said "Confirm the appliance, camera assignments, recording plan,
+        # retention, analytics, and notification preferences." without showing
+        # any of them, and its "open dashboard" landed back here (on Step 7,
+        # the draft's step after confirming) for an account with no camera
+        # plan. It now lists what is being confirmed, from the same values the
+        # Review step shows, and says where the button really leads.
+        selected_appliance=next((a for a in appliances if a['id']==initial_appliance_id),None)
+        selected_installed=sum(1 for c in _cameras_with_install_state(identity['customer_id'],initial_appliance_id) if c['installed']) if selected_appliance else 0
+        confirm_cameras=(f"{selected_installed} of {licensed_slots} licensed camera{'s' if licensed_slots!=1 else ''} added"
+                         if licensed_slots else f"{selected_installed} camera{'s' if selected_installed!=1 else ''} added")
+        confirm_summary=('<div class="panel" id="confirm-setup-summary" style="margin:12px 0">'
+                         f'<p>Appliance: {escape(_appliance_option_label(selected_appliance)) if selected_appliance else "No appliance selected yet"}</p>'
+                         f'<p>Cameras: {confirm_cameras}</p>'
+                         f'<p>Camera plan: {camera_plan_summary}</p>'
+                         f'<p>Analytics: {analytics_summary}</p>'
+                         f'<p>Local recording: {recording_summary}</p></div>')
+        confirm_button_label='Confirm and choose a camera plan' if needs_camera_plan else 'Confirm and open dashboard'
+        confirm_note=('<p class="health-detail" id="confirm-setup-next-note">Live View opens once your account has a camera plan; '
+                      'confirming takes you to My subscription to choose one.</p>') if needs_camera_plan else ''
         # Step 2 notes (kept out of the HTML sent to the browser).
         # Claim with a code (2026-10-08): an appliance installed with
         # `anyaicam-setup --claim` (Linux 1.2.4), a labelled appliance and the
@@ -956,23 +1032,24 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # password-manager-specific ignore attributes are defense in depth on
         # top of that, not a replacement for it -- autocomplete="off" alone is
         # not honored by every browser on username/password-shaped fields.
-        content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div></header>{payment_banner}{appliance_notice}<p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>{initial_step}</strong> of 7</p><section class="panel"><nav class="workspace-tabs" id="customer-setup-tabs" aria-label="Setup steps" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto">{setup_tabs}</nav>
-        <div class="customer-setup-step" data-step="1"><h2>Welcome to AnyAiCam</h2><p>This setup links your appliance, requests camera discovery from that appliance, and saves your camera and subscription settings.</p><div class="mock-banner">The browser does not scan the local network. Camera discovery runs on the assigned appliance.</div></div>
-        <div class="customer-setup-step" data-step="2" hidden><h2>Add appliance</h2>
-        <div id="claim-appliance-panel" class="panel" style="margin-bottom:14px;border-left:4px solid #47d7ac"><h3 style="margin-top:0">Claim your appliance with its code</h3><p>If your appliance shows a <strong>claim code</strong> &mdash; on its screen while it waits to be linked, on its label, or on the last page of the Windows installer &mdash; enter it here, choose the site, and confirm. The appliance links itself; no Cloud ID or activation token is needed.</p><a class="action-button" id="claim-appliance-link" href="/customer/claim-appliance?return=setup">Enter claim code</a><p class="health-detail" style="margin-top:8px">Have a claim code? Use it instead of provisioning a new appliance below, so the same appliance is not added twice.</p></div>
+        content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div></header>{payment_banner}{appliance_notice}{live_view_notice}<p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>{initial_step}</strong> of 7</p><section class="panel"><nav class="workspace-tabs" id="customer-setup-tabs" aria-label="Setup steps" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto">{setup_tabs}</nav>
+        <div class="customer-setup-step" data-step="1"{_step_hidden(1)}><h2>Welcome to AnyAiCam</h2><p>This setup links your appliance, requests camera discovery from that appliance, and saves your camera and subscription settings.</p><div class="mock-banner">The browser does not scan the local network. Camera discovery runs on the assigned appliance.</div></div>
+        <div class="customer-setup-step" data-step="2"{_step_hidden(2)}><h2>Add appliance</h2>
+        <div id="one-click-link-panel" class="panel" style="margin-bottom:14px;border-left:4px solid #47d7ac"><h3 style="margin-top:0">Link from the appliance (recommended)</h3><p>On the appliance, open <strong>AnyAiCam Setup</strong> (it opens by itself when you sign in to the appliance) and choose <strong>Link this appliance</strong>. On a Windows computer, keep <strong>Link this computer to my AnyAiCam account</strong> ticked when the AnyAiCam setup finishes, or choose <strong>Start menu &gt; AnyAiCam &gt; Link this computer to AnyAiCam</strong>.</p><p class="health-detail">Your browser opens AnyAiCam: sign in to this account, choose the site and confirm. No codes to copy &mdash; the appliance links itself.</p></div>
+        <div id="claim-appliance-panel" class="panel" style="margin-bottom:14px"><h3 style="margin-top:0">Or claim your appliance with its code</h3><p>If your appliance shows a <strong>claim code</strong> &mdash; on its screen while it waits to be linked, on its label, or on the last page of the Windows installer &mdash; enter it here, choose the site, and confirm. The appliance links itself; no Cloud ID or activation token is needed.</p><a class="action-button" id="claim-appliance-link" href="/customer/claim-appliance?return=setup">Enter claim code</a><p class="health-detail" style="margin-top:8px">Have a claim code? Use it instead of provisioning a new appliance below, so the same appliance is not added twice.</p></div>
         {provision_first_appliance_panel}
         <input type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;width:1px;height:1px;left:-9999px;opacity:0">
         <input type="password" name="password" autocomplete="current-password" tabindex="-1" aria-hidden="true" style="position:absolute;width:1px;height:1px;left:-9999px;opacity:0">
         <h3 style="margin:14px 0 6px">Or link with a Cloud ID and activation token</h3>
         <label>Cloud ID<input id="customer-cloud-id" name="cloud-id-not-email" placeholder="AIC-XXXXXXXX" autocomplete="off" data-lpignore="true" data-form-type="other"></label><label>Activation token<input id="customer-activation-token" type="password" name="activation-token-not-account-password" autocomplete="new-password" data-lpignore="true" data-form-type="other"></label><label>Or scan a provisioning QR image<input id="customer-qr-file" type="file" accept="image/*"></label><button class="action-button" id="link-customer-appliance">Link appliance</button><p id="link-message" class="health-detail"></p></div>
-        <div class="customer-setup-step" data-step="3" hidden><h2>Appliance status</h2><select id="customer-appliance">{appliance_options}</select><div id="appliance-status" class="panel" style="margin-top:14px"></div></div>
-        <div class="customer-setup-step" data-step="4" hidden><h2>Discover cameras</h2><p>Your AnyAiCam appliance searches your network; results appear below.</p><button class="action-button" id="start-camera-scan"{"" if selected_ready else " disabled"}>Find cameras</button><form id="manual-camera-form" class="health-detail" style="margin-top:10px"><label for="manual-camera-ip">Camera not found? Add it by its local IP address:</label> <input id="manual-camera-ip" inputmode="decimal" autocomplete="off" placeholder="192.168.1.64" maxlength="15" style="max-width:16ch"{"" if selected_ready else " disabled"}> <button class="ghost-button" type="submit" id="manual-camera-add"{"" if selected_ready else " disabled"}>Check address</button></form>{"" if selected_ready else '<p class="health-detail" id="scan-not-ready">Camera discovery is available once this appliance has finished linking (see its status in step 3).</p>'}<div class="storage-bar"><span id="scan-progress" style="width:0%"></span></div><p id="scan-message" class="health-detail"></p><div id="scan-results"></div><dialog class="panel" id="add-camera-dialog" aria-labelledby="add-camera-title" style="max-width:min(460px,calc(100vw - 32px));padding:18px 20px"><form id="add-camera-form"><h2 id="add-camera-title">Add this camera</h2><label style="display:block;margin:10px 0">Camera name <input id="add-camera-name" value="Camera" autocomplete="off" maxlength="120" style="display:block;width:100%;margin-top:4px"></label><label style="display:block;margin:10px 0">Camera username (ONVIF/RTSP; leave blank if none) <input id="add-camera-username" autocomplete="off" style="display:block;width:100%;margin-top:4px"></label><label style="display:block;margin:10px 0">Camera password <input id="add-camera-password" type="password" autocomplete="new-password" style="display:block;width:100%;margin-top:4px"></label><div class="camera-manage-actions"><button class="ghost-button" type="button" id="add-camera-cancel">Cancel</button> <button class="action-button" type="submit" id="add-camera-submit">Add camera</button></div></form></dialog></div>
-        <div class="customer-setup-step" data-step="5" hidden><h2>Camera setup</h2><p class="health-detail" id="camera-progress"></p><div style="overflow:auto"><table class="data-table"><thead><tr><th>Camera</th><th>Rename</th><th>Location/site</th><th>Status</th><th>Video (measured)</th></tr></thead><tbody>{camera_rows}</tbody></table></div><p class="health-detail">Recording, retention, analytics, and notifications use the selected customer plan. Per-camera overrides can be added after activation.</p><button class="ghost-button" id="save-camera-setup">Save camera setup</button></div>
-        <div class="customer-setup-step" data-step="6" hidden><h2>Review your account</h2>
+        <div class="customer-setup-step" data-step="3"{_step_hidden(3)}><h2>Appliance status</h2><select id="customer-appliance">{appliance_options}</select><div id="appliance-status" class="panel" style="margin-top:14px"></div></div>
+        <div class="customer-setup-step" data-step="4"{_step_hidden(4)}><h2>Discover cameras</h2><p>Your AnyAiCam appliance searches your network; results appear below.</p><button class="action-button" id="start-camera-scan"{"" if selected_ready else " disabled"}>Find cameras</button><form id="manual-camera-form" class="health-detail" style="margin-top:10px"><label for="manual-camera-ip">Camera not found? Add it by its local IP address:</label> <input id="manual-camera-ip" inputmode="decimal" autocomplete="off" placeholder="192.168.1.64" maxlength="15" style="max-width:16ch"{"" if selected_ready else " disabled"}> <button class="ghost-button" type="submit" id="manual-camera-add"{"" if selected_ready else " disabled"}>Check address</button></form>{"" if selected_ready else '<p class="health-detail" id="scan-not-ready">Camera discovery is available once this appliance has finished linking (see its status in step 3).</p>'}<div class="storage-bar"><span id="scan-progress" style="width:0%"></span></div><p id="scan-message" class="health-detail"></p><div id="scan-results"></div><dialog class="panel" id="add-camera-dialog" aria-labelledby="add-camera-title" style="max-width:min(460px,calc(100vw - 32px));padding:18px 20px"><form id="add-camera-form"><h2 id="add-camera-title">Add this camera</h2><label style="display:block;margin:10px 0">Camera name <input id="add-camera-name" value="Camera" autocomplete="off" maxlength="120" style="display:block;width:100%;margin-top:4px"></label><label style="display:block;margin:10px 0">Camera username (ONVIF/RTSP; leave blank if none) <input id="add-camera-username" autocomplete="off" style="display:block;width:100%;margin-top:4px"></label><label style="display:block;margin:10px 0">Camera password <input id="add-camera-password" type="password" autocomplete="new-password" style="display:block;width:100%;margin-top:4px"></label><div class="camera-manage-actions"><button class="ghost-button" type="button" id="add-camera-cancel">Cancel</button> <button class="action-button" type="submit" id="add-camera-submit">Add camera</button></div></form></dialog></div>
+        <div class="customer-setup-step" data-step="5"{_step_hidden(5)}><h2>Camera setup</h2><p class="health-detail" id="camera-progress"></p><div style="overflow:auto"><table class="data-table"><thead><tr><th>Camera</th><th>Rename</th><th>Location/site</th><th>Status</th><th>Video (measured)</th></tr></thead><tbody>{camera_rows}</tbody></table></div><p class="health-detail">Recording, retention, analytics, and notifications use the selected customer plan. Per-camera overrides can be added after activation.</p><button class="ghost-button" id="save-camera-setup">Save camera setup</button></div>
+        <div class="customer-setup-step" data-step="6"{_step_hidden(6)}><h2>Review your account</h2>
         <div id="customer-subscription-review" class="panel"><h3 style="margin-top:0">Plan &amp; billing</h3><p>Hardware: {hardware_summary}</p><p>Camera plan: {camera_plan_summary}</p><p>Analytics: {analytics_summary}</p><p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p><div id="camera-plan-purchase"{' hidden' if (camera_entitlement or v2_plan_active) else ''}><p class="health-detail">Choose Basic Local, AI Local or Hybrid and your camera count.</p><a class="action-button" href="/subscription-portal">Choose a camera plan</a></div>{friends_family_panel}
         <div class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local recording configuration</h3><p id="local-recording-summary">{recording_summary}</p><p class="health-detail">Recording length depends on your appliance's available storage, not a separate charge -- this is a configuration setting, not a purchased product.</p></div></div></div>
-        <div class="customer-setup-step" data-step="7" hidden><h2>Confirm and save</h2><p>Confirm the appliance, camera assignments, recording plan, retention, analytics, and notification preferences.</p><button class="action-button" id="confirm-customer-setup">Confirm and open dashboard</button></div>
-        <div class="dialog-actions"><span data-aaco-dock-slot style="margin-right:auto;display:inline-flex"></span><button class="ghost-button" id="customer-setup-back" hidden>Back</button><button class="action-button" id="customer-setup-next">Save and continue</button></div></section>'''
+        <div class="customer-setup-step" data-step="7"{_step_hidden(7)}><h2>Confirm and save</h2><p>Confirm the appliance, camera assignments, recording plan, retention, analytics, and notification preferences.</p>{confirm_summary}{confirm_note}<button class="action-button" id="confirm-customer-setup">{confirm_button_label}</button></div>
+        <div class="dialog-actions"><span data-aaco-dock-slot style="margin-right:auto;display:inline-flex"></span><button class="ghost-button" id="customer-setup-back"{" hidden" if initial_step==1 else ""}>Back</button><button class="action-button" id="customer-setup-next"{" hidden" if initial_step==7 else ""}>Save and continue</button></div></section>'''
         # Discovery (step 4) is for an appliance that has really enrolled
         # (appliance_readiness.py). The page needs it to keep Next/Back/tabs
         # out of step 4 until then; request_camera_scan() enforces it.
@@ -1818,7 +1895,16 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         now_text=datetime.now().isoformat()
         with connection() as db:
             db.execute("UPDATE customer_setup_drafts SET current_step=7,data_json=?,updated_at=?,completed_at=COALESCE(completed_at,?) WHERE customer_id=?",(json.dumps(payload),now_text,now_text,identity['customer_id'])); db.execute("UPDATE customers SET status=CASE WHEN status='pending_installation' THEN 'trial' ELSE status END,trial_status='active' WHERE id=?",(identity['customer_id'],)); db.execute('INSERT INTO service_history(customer_id,event,details,created_at,created_by) VALUES(?,?,?,?,?)',(identity['customer_id'],'Customer setup confirmed','Appliance linked and customer setup wizard completed.',datetime.now().isoformat(),identity['email']))
-        audit(identity,'customer.setup_completed','customer',identity['customer_id']); return {'message':'Setup confirmed and saved.','redirect':'/customer-account'}
+        audit(identity,'customer.setup_completed','customer',identity['customer_id'])
+        # Owner VM acceptance 2026-10-19: with no camera plan and no camera the
+        # cloud dashboard sends the owner straight back here (to Step 7, the
+        # draft's step now), so "Confirm and open dashboard" looked like it did
+        # nothing. Such an owner goes to My subscription, where camera plans are
+        # chosen; on the appliance itself the dashboard always renders.
+        on_edge=os.environ.get('ANYAICAM_RUNTIME_ROLE','').strip().lower()=='edge'
+        if not on_edge and live_view_waits_for_camera_plan(identity['customer_id']):
+            return {'message':'Setup confirmed and saved. Choose a camera plan to start Live View.','redirect':'/subscription-portal'}
+        return {'message':'Setup confirmed and saved.','redirect':'/customer-account'}
 
 
 def render_partner_workspace(request: Request, shell: Callable):
