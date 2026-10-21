@@ -56,6 +56,12 @@ GENUINE = [(SYSTEM, "FullControl", "Allow"), (ADMINS, "FullControl", "Allow")]
     (ADMINS, True, GENUINE + [(AUTH_USERS, "Write", "Allow")], "clean=False trusted=False"),
     (ADMINS, True, GENUINE + [(USERS, "AppendData", "Allow")], "clean=False trusted=False"),   # create sub-folders
     (ADMINS, True, GENUINE + [(USERS, "Write", "Deny")], "clean=True trusted=True"),           # deny never widens
+    # 1.3.2 Sandbox acceptance: an entry SYSTEM/Administrators cannot use is not clean (it must be reset)
+    (ADMINS, True, [], "clean=False trusted=False"),                                          # empty DACL (inheritance:r)
+    (ADMINS, True, [(SYSTEM, "FullControl", "Allow")], "clean=False trusted=False"),          # Administrators missing
+    (ADMINS, True, [(ADMINS, "FullControl", "Allow")], "clean=False trusted=False"),          # SYSTEM (the service) missing
+    (ADMINS, True, [(SYSTEM, "ReadAndExecute", "Allow"), (ADMINS, "FullControl", "Allow")], "clean=False trusted=False"),
+    (ADMINS, True, GENUINE + [(SYSTEM, "Read", "Deny")], "clean=False trusted=False"),         # the service denied
 ])
 def test_the_acl_policy(owner, protected, rules, expected):
     result = _ps(_acl_script(owner, protected, rules))

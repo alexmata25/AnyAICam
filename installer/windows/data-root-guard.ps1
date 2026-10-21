@@ -87,15 +87,29 @@ $AnyAiCamWriteMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -b
 
 # Pure policy over an ACL object (no file system access), so it is testable without administrator rights.
 # Owner is SYSTEM/Administrators and no allow-ACE (explicit or inherited) gives anyone else a modifying right.
+# AND the entry is usable: SYSTEM and Administrators each hold FullControl, and neither is denied anything. Every
+# genuine entry inherits exactly that from the data root (1.3.2 Sandbox acceptance, 2026-10-20: an entry left with an
+# EMPTY or stripped ACL -- the pre-1.3.0 candidates' damage, "icacls /inheritance:r" -- has no foreign write ACE either,
+# so it used to count as clean and the repair skipped it; vms.env stayed unreadable and setup exited 20).
 function Test-AnyAiCamAclClean([System.Security.AccessControl.FileSystemSecurity]$Acl) {
     if ($null -eq $Acl) { return $false }
     $owner = $Acl.GetOwner([Security.Principal.SecurityIdentifier])
     if ($null -eq $owner -or $AnyAiCamTrustedSids -notcontains $owner.Value) { return $false }
+    $fullControl = [int64][System.Security.AccessControl.FileSystemRights]::FullControl
+    $hasFullControl = @{}
     foreach ($rule in $Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if ($AnyAiCamTrustedSids -contains $rule.IdentityReference.Value) { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            if ($AnyAiCamTrustedSids -contains $sid) { return $false }   # SYSTEM/Administrators denied: unusable
+            continue
+        }
+        if ($AnyAiCamTrustedSids -contains $sid) {
+            if (([int64]$rule.FileSystemRights -band $fullControl) -eq $fullControl) { $hasFullControl[$sid] = $true }
+            continue
+        }
         if ([int64]$rule.FileSystemRights -band $AnyAiCamWriteMask) { return $false }
     }
+    foreach ($sid in $AnyAiCamTrustedSids) { if (-not $hasFullControl[$sid]) { return $false } }
     return $true
 }
 
