@@ -89,6 +89,7 @@ import secrets
 from datetime import datetime, timedelta
 from html import escape
 from typing import Callable
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -97,6 +98,12 @@ from appliance_cloud import activation_limiter
 from appliance_protocol import RateLimiter, decrypt_claim_flow_secret, encrypt_claim_flow_secret
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
 from partner_portal import partner_identity
+
+# Where a signed-out customer returns after signing in (or creating an account)
+# to finish a claim; direct_onboarding.py carries exactly these through sign-up.
+CLAIM_PAGE_PATH = '/customer/claim-appliance'
+CLAIM_SETUP_PATH = '/customer/claim-appliance?return=setup'
+CLAIM_SIGN_IN_NEXT_PATHS = frozenset({CLAIM_PAGE_PATH, CLAIM_SETUP_PATH})
 
 logger = logging.getLogger('anyaicam.appliance_claims')
 
@@ -922,7 +929,17 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
     def customer_claim_appliance_page(request: Request):
         identity = partner_identity(request)
         if not identity:
-            return RedirectResponse('/partner-login', status_code=303)
+            # Signed out (2026-10-20, one-click linking): in the full app the
+            # authentication middleware (main.py) already sends a signed-out
+            # /customer/* request to the customer sign-in; this fallback (a
+            # bare app, or if that is ever bypassed) sent "Link this appliance"
+            # -> /claim -> here to /partner-login ("Partner sign in": no Create
+            # account, no way back to the claim). Now the CUSTOMER sign-in too,
+            # with next= one of two fixed paths built here
+            # (CLAIM_SIGN_IN_NEXT_PATHS), never anything taken from the request;
+            # the code itself stays in this tab's sessionStorage (/claim).
+            next_path = CLAIM_SETUP_PATH if request.query_params.get('return') == 'setup' else CLAIM_PAGE_PATH
+            return RedirectResponse('/customer-login.html?next=' + quote(next_path, safe=''), status_code=303)
         if identity.get('role') != 'customer_owner':
             raise HTTPException(status_code=403, detail='Customer owner permission required.')
         sites = rows('SELECT * FROM sites WHERE customer_id=?', (identity['customer_id'],))

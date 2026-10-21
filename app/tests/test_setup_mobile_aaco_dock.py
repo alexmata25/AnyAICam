@@ -34,7 +34,7 @@ def test_setup_action_row_has_the_dock_slot():
     import inspect
     import partner_workspace
     assert ('<div class="dialog-actions"><span data-aaco-dock-slot style="margin-right:auto;display:inline-flex"></span>'
-            '<button class="ghost-button" id="customer-setup-back" hidden>Back</button>') in inspect.getsource(partner_workspace)
+            '<button class="ghost-button" id="customer-setup-back"{" hidden" if initial_step==1 else ""}>Back</button>') in inspect.getsource(partner_workspace)
 
 
 def _overlaps(a, b) -> bool:

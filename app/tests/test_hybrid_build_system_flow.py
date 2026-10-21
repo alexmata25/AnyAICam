@@ -391,7 +391,9 @@ def test_the_sign_in_page_carries_the_order_to_create_an_account():
     import pathlib
     html = (pathlib.Path(__file__).resolve().parents[1] / "customer-login.html").read_text(encoding="utf-8")
     assert 'id="create-account-link"' in html
-    assert r"/^\/(order-summary|subscription-portal)(\?[^\s\\#]*)?$/.test(n))a.href='/customer-signup?next='+encodeURIComponent(n)" in html
+    # 2026-10-20: the same link also carries an appliance claim (test_claim_signed_out_customer_signin_127.py).
+    assert r"(/^\/(order-summary|subscription-portal)(\?[^\s\\#]*)?$/.test(n)||" in html
+    assert r".test(n)))a.href='/customer-signup?next='+encodeURIComponent(n)" in html
 
 
 def test_signed_out_order_pages_go_to_the_customer_sign_in_with_the_order(shop, monkeypatch):

@@ -133,6 +133,21 @@ def account_created_by(db, *, raw: str) -> bool:
     return bool(used)
 
 
+def _claim_next(raw) -> str | None:
+    """An appliance claim to finish after sign-up (2026-10-20): exactly one of
+    appliance_claims.CLAIM_SIGN_IN_NEXT_PATHS, else None. A signed-out "Link
+    this appliance" reaches the customer sign-in with this next=, and Create
+    account carries it here; nothing else is accepted."""
+    from appliance_claims import CLAIM_SIGN_IN_NEXT_PATHS
+    return raw if isinstance(raw, str) and raw in CLAIM_SIGN_IN_NEXT_PATHS else None
+
+
+def signup_next(raw) -> str | None:
+    """The next= a sign-up may carry: a Build Your System purchase intent
+    (purchase_intent_next) or an appliance claim (_claim_next)."""
+    return _claim_next(raw) or purchase_intent_next(raw)
+
+
 def _base(request: Request) -> str:
     import os
     base = os.environ.get("ANYAICAM_PUBLIC_URL", "").strip().rstrip("/")
@@ -162,7 +177,7 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
         email = str(payload.get("email", "")).strip().lower()
         # A Build Your System selection travels in the confirmation link,
         # re-validated there and again on sign-in (plan/cameras only).
-        next_path = purchase_intent_next(payload.get("next"))
+        next_path = signup_next(payload.get("next"))
         next_query = f"&next={quote(next_path, safe='')}" if next_path else ""
         from email_layout import support_contact
         from email_service import get_email_service
@@ -200,7 +215,7 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
             with connection() as db:
                 already = account_created_by(db, raw=token)
             if already:  # the link was opened before (often by a mail scanner): the account is ready
-                return HTMLResponse(_ready_page(purchase_intent_next(next)),
+                return HTMLResponse(_ready_page(signup_next(next)),
                                     headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
             return HTMLResponse(_page("This link can't be used", str(error)), status_code=400,
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
@@ -210,8 +225,8 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
         # attaches NO purchase. Purchases bought with this address before the account existed are attached only after
         # the owner's first fully successful sign-in (signin_purchase_attachment.attach_after_signin), which also
         # sends the "added to your account" email.
-        next_path = purchase_intent_next(next)
-        if next_path and "?" in next_path:
+        next_path = signup_next(next)
+        if next_path and "?" in next_path and not _claim_next(next_path):  # a claim carries no selection
             # Kept on the new account, so the selection survives even if the
             # customer signs in later from another device.
             from urllib.parse import parse_qs, urlsplit
@@ -224,6 +239,10 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
                             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
     def _ready_page(next_path: str) -> str:
+        if _claim_next(next_path):
+            return _page("Your account is ready", "Sign in to finish linking your appliance. If the claim code is not "
+                         "filled in for you, choose Link this appliance on the appliance again.",
+                         link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and link my appliance"))
         if next_path == "/customer/orders":
             return _page("Your account is ready", "Sign in to see your hardware order and its status.",
                          link=(f"/customer-login.html?next={quote(next_path, safe='')}", "Sign in and view my order"))
@@ -235,10 +254,13 @@ def register_direct_onboarding_routes(app: FastAPI) -> None:
 
     @app.get("/customer-signup", response_class=HTMLResponse)
     def signup_page(request: Request, next: str = ""):
-        next_path = purchase_intent_next(next)
+        next_path = signup_next(next)
         sign_in = f"/customer-login.html?next={quote(next_path, safe='')}" if next_path else "/customer-login.html"
         carried = ('<p id="signup-selection">Your Build Your System selection is saved. After you confirm your email and sign in, '
-                   'your order summary will be ready for secure checkout.</p>') if next_path and "?" in next_path else ""
+                   'your order summary will be ready for secure checkout.</p>') if next_path and "?" in next_path and not _claim_next(next_path) else ""
+        if _claim_next(next_path):
+            carried = ('<p id="signup-claim">After you confirm your email, sign in to finish linking your appliance. '
+                       'Signing in from this tab keeps the link you started.</p>')
         form = ('<h2>Create your AnyAiCam account</h2><p>Buy directly from AnyAiCam. We\'ll email you a link to confirm your address.</p>' + carried +
                 '<form id="signup-form"><label>Name<input id="s-name" autocomplete="name" required></label>'
                 '<label>Email<input id="s-email" type="email" autocomplete="email" required></label>'
