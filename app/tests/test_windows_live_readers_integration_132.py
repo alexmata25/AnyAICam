@@ -49,7 +49,7 @@ def camera(tmp_path_factory):
     config.write_text("\n".join(["logLevel: warn", "api: no", "metrics: no", "pprof: no", "playback: no", "rtsp: yes",
                                  "rtspAddress: 127.0.0.5:18554", "rtspTransports: [tcp]", "rtmp: no", "hls: no",
                                  "webrtc: no", "srt: no", "moq: no", "paths:", "  cam1:"]) + "\n", encoding="ascii")
-    server = subprocess.Popen([MEDIAMTX, str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    server = subprocess.Popen([MEDIAMTX, str(config)], cwd=str(folder), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
     publisher = subprocess.Popen([FFMPEG, "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=10",
                                   "-f", "lavfi", "-i", "color=c=white:s=240x180:r=10", "-filter_complex",
@@ -189,7 +189,8 @@ def test_generated_mediamtx_config_moq_off_on_windows_and_webrtc_still_serves(ca
             pytest.skip(f"{host}:{port} is busy on this host")
     config = tmp_path / "mediamtx.yml"
     config.write_text(webrtc_publisher.render_mediamtx_config(windows=windows), encoding="ascii")
-    server = subprocess.Popen([MEDIAMTX, str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # cwd: with MoQ on, MediaMTX writes auto.crt/auto.key into its working folder -- keep them in tmp_path.
+    server = subprocess.Popen([MEDIAMTX, str(config)], cwd=str(tmp_path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(4)
         assert server.poll() is None, "MediaMTX refused the generated config"
