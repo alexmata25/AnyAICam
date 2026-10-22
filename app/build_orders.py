@@ -141,6 +141,8 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
         ("metadata[anyaicam_camera_quantity]", str(cameras)),
     ]
     if quote["kind"] == APPLIANCE_ORDER:
+        # F2 (2026-10-21): create_checkout() no longer opens this kind (no shipping address was collected). Kept as
+        # the exact shape of appliance orders paid before then, which the webhook below still records and starts.
         catalog = _hardware_catalog()
         fields = [("mode", "payment"), *common,
                   # Saves the card on the account's Stripe customer for the
@@ -217,9 +219,19 @@ def create_checkout(identity: dict) -> dict:
     customer_id = identity["customer_id"]
     if billing.has_camera_plan(customer_id) or storage_plan(customer_id):
         raise HTTPException(status_code=409, detail="This account already has a camera plan or a paid order.")
+    # R7 (2026-10-21): an order page opened before the refunded order's subscription ended checks out a new order too.
+    billing.supersede_refunded_order(customer_id)
     progress = billing.build_progress(customer_id)
     if not progress or progress["state"] != billing.BUILD_PENDING or not progress.get("plan"):
         raise HTTPException(status_code=409, detail="There is no order to check out. Build your system first.")
+    if order_kind(progress) == APPLIANCE_ORDER:
+        # F2 (2026-10-21): appliances are sold only through the hardware checkout (hardware_checkout.py), which
+        # collects the shipping address. This older appliance checkout collected none, so it is refused here even
+        # for a selection saved before hardware-first (the order summary page already redirects such selections).
+        import hardware_checkout
+        raise HTTPException(status_code=409, detail="AnyAiCam appliances are ordered through the hardware checkout, which collects "
+                                                    "your shipping address. Continue at "
+                                                    f"{hardware_checkout.CHECKOUT_PATH}?{hardware_checkout.selection_query(progress)}")
     try:
         fields, price_id, quantity = _checkout_fields(customer_id, identity.get("email"), progress)
     except friends_family.CheckoutHeld as held:
@@ -354,10 +366,57 @@ def _grant_vms_license(session: dict, customer_id: str, metadata: dict) -> dict:
     # The tier's current or an earlier Price (2026-10-17 repricing: a checkout opened before the switch still grants).
     if not tier or not price_id or price_id not in vms_license_price_ids(tier[2]):
         return {"status": "rejected", "reason": "license metadata does not match the configured license price"}
-    entitlement = upsert_entitlement(customer_id=customer_id, product=VMS_LICENSE_PRODUCT, camera_slot_quantity=capacity,
-                                     stripe_customer_id=str(session.get("customer") or "") or None,
-                                     stripe_checkout_session_id=str(session.get("id") or "") or None,
-                                     stripe_price_id=price_id)
+    # F1 (2026-10-21): the licence is paid on the subscription's first invoice. A full refund or dispute of that
+    # payment suspends it (billing_status._reverse_initial_licence); one recorded BEFORE this grant is honoured here,
+    # under the same per-payment lock, and a redelivered checkout event never re-activates a reversed licence.
+    import billing_status
+    import stripe_state
+    from partner_db import transaction
+    invoice = session.get("invoice")
+    invoice_id = str((invoice.get("id") if isinstance(invoice, dict) else invoice) or "")
+    session_id = str(session.get("id") or "") or None
+    # RC10b (Codex review of RC10 99a19591): the payment (PaymentIntent and charge) of the first invoice, read before the
+    # lock, so a reversal recorded by PaymentIntent or charge only -- e.g. before this fix, when Stripe could not name
+    # its invoice -- is honoured too, and the licence row records its payment from the start (a later refund finds it
+    # without a Checkout Session lookup). Stripe unreadable: granted on the invoice check alone; a refund of this
+    # payment is always recorded with its invoice now (billing_status._stripe_invoice_for_payment retries otherwise)
+    # and binds the licence through its Checkout Session.
+    intent, charge = "", ""
+    try:
+        intent, charge = billing_status.invoice_payment(invoice_id)
+    except stripe_state.RetryableStripeEventError as error:
+        logger.warning("build_order.licence_payment_unread session=%s invoice=%s error=%s", session_id, invoice_id, error)
+    with transaction() as db:
+        # The same per-payment keys a refund or dispute of this payment takes (billing_status.lock_payment orders them
+        # globally): whichever commits first, the other sees it.
+        billing_status.lock_payment(db, billing_status.payment_keys(charge, intent, invoice_id))
+        reason = billing_status.reversal_reason(charge, intent, invoice_id)
+        invoice_reversal = billing_status.reversal_for_invoice(invoice_id) or {}
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, VMS_LICENSE_PRODUCT))
+        same_order = bool(existing and session_id and existing.get("stripe_checkout_session_id") == session_id)
+        reversed_before = bool(same_order and existing.get("status") == "suspended"
+                               and existing.get("suspended_reason") in ("refunded", "disputed"))
+        if reason and existing and not same_order and existing.get("status") == "active":
+            # A late event for an older, reversed order never suspends the licence another (paid) order holds.
+            return {"status": "vms_license_not_granted", "entitlement_id": existing.get("id"),
+                    "reason": f"the payment was {reason}; the account's licence belongs to another order"}
+        entitlement = upsert_entitlement(customer_id=customer_id, product=VMS_LICENSE_PRODUCT, camera_slot_quantity=capacity,
+                                         status="suspended" if (reason or reversed_before) else "active",
+                                         stripe_customer_id=str(session.get("customer") or "") or None,
+                                         stripe_checkout_session_id=session_id,
+                                         stripe_price_id=price_id)
+        paid_with = intent or invoice_reversal.get("payment_intent") or None
+        if same_order:
+            db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=COALESCE(?,stripe_payment_intent_id),"
+                       "suspended_reason=COALESCE(?,suspended_reason) WHERE id=?", (paid_with, reason, entitlement["id"]))
+        else:
+            # A new order (first grant, or a second own-PC order after an earlier one): the row records THIS order's
+            # payment and reason, never the previous order's PaymentIntent (which would hide this order from a refund).
+            db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=?,suspended_reason=? WHERE id=?",
+                       (paid_with, reason, entitlement["id"]))
+    if reason or reversed_before:
+        return {"status": "vms_license_not_granted", "entitlement_id": entitlement.get("id"),
+                "reason": f"the payment was {reason or existing['suspended_reason']}"}
     return {"status": "vms_license_granted", "entitlement_id": entitlement.get("id"), "capacity": capacity}
 
 

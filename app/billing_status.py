@@ -72,8 +72,10 @@ def _stamp(value) -> str:
 # ------------------------------------------------------------------ rows
 
 def _plan_rows(subscription_id: str) -> list[dict]:
-    return rows("SELECT * FROM customer_entitlements WHERE stripe_subscription_id=? AND status IN ('active','suspended')",
-                (subscription_id,))
+    # A one-time VMS licence is never a subscription's plan row: a renewal or recovery never restores it, even if a
+    # licence row ever carried a subscription id (RC10b hardening, Red F1 follow-up analysis item 2).
+    return rows("SELECT * FROM customer_entitlements WHERE stripe_subscription_id=? AND status IN ('active','suspended') "
+                "AND product<>'vms_license'", (subscription_id,))
 
 
 def _addon_rows(subscription_id: str) -> list[dict]:
@@ -155,14 +157,14 @@ def mark_payment_failed(subscription_id: str, *, at=None) -> None:
         pass
 
 
-def payment_recovered(subscription_id: str) -> int:
+def payment_recovered(subscription_id: str, reasons: tuple[str, ...] = RESTORED_BY_PAYMENT) -> int:
     with connection() as db:
         db.execute("UPDATE customer_entitlements SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
         try:
             db.execute("UPDATE addon_subscriptions SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
         except Exception:
             pass
-    changed = _restore(subscription_id, RESTORED_BY_PAYMENT)
+    changed = _restore(subscription_id, reasons)
     try:
         import per_camera_billing
         changed += per_camera_billing._resume_paid(subscription_id)
@@ -172,6 +174,47 @@ def payment_recovered(subscription_id: str) -> int:
         from purchase_notifications import notify_service_restored
         notify_service_restored(subscription_id)  # never raises
     return changed
+
+
+def _has_refunded_rows(subscription_id: str) -> bool:
+    """A plan or add-on of this subscription is suspended for a refund."""
+    if row("SELECT 1 FROM customer_entitlements WHERE stripe_subscription_id=? AND status='suspended' "
+           "AND suspended_reason='refunded' AND product<>'vms_license'", (subscription_id,)):
+        return True
+    for table in ("addon_subscriptions", "camera_plan_entitlements_v2"):
+        try:
+            if row(f"SELECT 1 FROM {table} WHERE stripe_subscription_id=? AND status='suspended' AND suspended_reason='refunded'",
+                   (subscription_id,)):
+                return True
+        except Exception:
+            pass  # a database before this table exists
+    return False
+
+
+def _restore_reasons(subscription: dict | None, *, paid_invoice: dict | None = None) -> tuple[str, ...]:
+    """What a healthy subscription or a paid invoice may restore. A failed-payment suspension always; a refund
+    suspension only when a later invoice covering the current period was actually paid and that payment is neither
+    refunded nor disputed (RC10b R1/R4). Stripe saying the subscription is healthy, or the refunded invoice itself,
+    is no recovery. Stripe unreadable -> RetryableStripeEventError (the event is retried, nothing restored)."""
+    import stripe_state
+    from urllib.parse import quote
+    subscription_id = str((subscription or {}).get("id") or "")
+    if not subscription_id or not _has_refunded_rows(subscription_id):
+        return RESTORED_BY_PAYMENT
+    latest = subscription.get("latest_invoice")
+    latest_id = stripe_state._id(latest)
+    if not latest_id:
+        raise stripe_state.RetryableStripeEventError("the subscription's current payment could not be identified")
+    if paid_invoice is not None and str(paid_invoice.get("id") or "") != latest_id:
+        return ("payment_failed",)  # an older invoice paid late does not pay for the current period
+    invoice = stripe_state.stripe_get(f"/v1/invoices/{quote(latest_id, safe='')}", "the subscription's current invoice")
+    if str(invoice.get("id") or "") != latest_id:
+        raise stripe_state.RetryableStripeEventError("Stripe returned an unexpected invoice")
+    if str(invoice.get("status") or "") != "paid":
+        return ("payment_failed",)
+    if stripe_state.subscription_payment_reversal({**subscription, "latest_invoice": invoice}):
+        return ("payment_failed",)  # the current period's payment is the refunded or disputed one
+    return RESTORED_BY_PAYMENT
 
 
 def sweep_grace(now: datetime | None = None, *, customer_id: str | None = None) -> int:
@@ -244,22 +287,19 @@ def apply_subscription_status(subscription: dict) -> None:
         mark_payment_failed(subscription_id)
         sweep_grace()
     elif status in HEALTHY_STRIPE_STATUSES and not _outstanding_failure(subscription_id, subscription=subscription):
-        payment_recovered(subscription_id)
+        payment_recovered(subscription_id, _restore_reasons(subscription))
 
 
 # ------------------------------------------------------------------ 2. refunds and disputes
 
 def _payment_for_charge(charge_id: str, intent: str, invoice_id: str) -> dict | None:
+    """The locally recorded subscription payment of this charge. Local records only (RC10b): when there is none, the
+    caller asks Stripe through _stripe_invoice_for_payment, which never mistakes an unreadable Stripe for 'no invoice'."""
     for column, value in (("id", invoice_id), ("stripe_charge_id", charge_id), ("stripe_payment_intent_id", intent)):
         if value:
             found = row(f"SELECT * FROM subscription_payments WHERE {column}=?", (value,))
             if found:
                 return found
-    if intent:
-        import sales_commissions
-        looked_up = sales_commissions._invoice_for_payment_intent(intent)
-        if looked_up:
-            return row("SELECT * FROM subscription_payments WHERE id=?", (looked_up,))
     return None
 
 
@@ -287,6 +327,11 @@ def _record_reversal(charge_id: str, intent: str, invoice_id: str, reason: str) 
                           (charge_id, intent, reason)).fetchone():
             db.execute("INSERT INTO billing_reversals(charge_id,payment_intent,invoice_id,reason,created_at) VALUES(?,?,?,?,?)",
                        (charge_id or None, intent or None, invoice_id or None, reason, _now().isoformat()))
+        elif invoice_id:
+            # The invoice was identified later (current Stripe API versions: the charge does not name it). Kept, so a
+            # purchase granted later from that invoice sees the reversal (F1, reversal_for_invoice).
+            db.execute("UPDATE billing_reversals SET invoice_id=? WHERE COALESCE(charge_id,'')=? AND COALESCE(payment_intent,'')=? "
+                       "AND reason=? AND invoice_id IS NULL", (invoice_id, charge_id, intent, reason))
 
 
 def reversal_reason(charge_id: str, intent: str, invoice_id: str) -> str | None:
@@ -301,6 +346,18 @@ def reversal_reason(charge_id: str, intent: str, invoice_id: str) -> str | None:
                 if found:
                     return found["reason"]
     return None
+
+
+def reversal_for_invoice(invoice_id: str) -> dict | None:
+    """{'reason', 'payment_intent'} if the payment of this invoice was fully refunded or is disputed (a won dispute
+    no longer counts), else None. Local record only: used when a purchase is granted after its reversal arrived."""
+    if not invoice_id:
+        return None
+    with connection() as db:
+        db.execute(REVERSALS_DDL)
+        found = db.execute("SELECT reason,payment_intent FROM billing_reversals WHERE invoice_id=? AND reason IN ('refunded','disputed') "
+                           "ORDER BY CASE reason WHEN 'refunded' THEN 0 ELSE 1 END LIMIT 1", (invoice_id,)).fetchone()
+    return {"reason": found["reason"], "payment_intent": found["payment_intent"]} if found else None
 
 
 def _is_reversed(charge_id: str, intent: str, invoice_id: str) -> bool:
@@ -364,21 +421,61 @@ def _invoice_payment_failed(invoice: dict, subscription_id: str, at) -> dict:
     return {"status": "grace_started", "subscription": subscription_id, "invoice": invoice_id}
 
 
-def _stripe_invoice_subscription(intent: str) -> tuple[str, str] | None:
-    """A refund that arrives before AnyAiCam recorded its invoice: ask Stripe
-    which invoice and subscription the payment belongs to."""
-    if not intent:
-        return None
-    import sales_commissions
-    invoice_id = sales_commissions._invoice_for_payment_intent(intent)
+def _stripe_invoice_for_payment(intent: str, invoice_id: str = "") -> dict | None:
+    """A refund or dispute of a payment AnyAiCam has no local record of yet: ask Stripe which invoice it paid, and that
+    invoice's subscription and Stripe customer -> {'invoice_id', 'subscription_id', 'stripe_customer_id'}.
+    None ONLY when Stripe answers conclusively that this PaymentIntent paid no invoice (a one-time payment). An
+    unreadable or unexpected answer raises RetryableStripeEventError, so the event is retried instead of being
+    acknowledged as unrelated (RC10b: before, every Stripe error here read as 'no invoice')."""
+    import stripe_state
+    from stripe_state import RetryableStripeEventError
+    from urllib.parse import quote
     if not invoice_id:
-        return None
-    try:
-        invoice = sales_commissions._stripe_get(f"/v1/invoices/{invoice_id}")
-    except Exception:
-        return None
-    subscription_id = _invoice_subscription(invoice or {})
-    return (invoice_id, subscription_id) if subscription_id else None
+        if not intent:
+            return None
+        listed = stripe_state.stripe_get(
+            f"/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]={quote(intent, safe='')}&limit=1",
+            "the invoice this payment paid")
+        data = listed.get("data")
+        if not isinstance(data, list):
+            raise RetryableStripeEventError("Stripe returned an unexpected answer for the invoice this payment paid")
+        if not data:
+            return None
+        invoice_id = stripe_state._id((data[0] or {}).get("invoice"))
+        if not invoice_id:
+            raise RetryableStripeEventError("the invoice this payment paid could not be identified")
+    invoice = stripe_state.stripe_get(f"/v1/invoices/{quote(invoice_id, safe='')}", "the invoice this payment paid")
+    if invoice.get("id") and str(invoice["id"]) != invoice_id:
+        raise RetryableStripeEventError("Stripe returned an unexpected invoice")
+    return {"invoice_id": invoice_id, "subscription_id": _invoice_subscription(invoice),
+            "stripe_customer_id": stripe_state._id(invoice.get("customer"))}
+
+
+def invoice_payment(invoice_id: str) -> tuple[str, str]:
+    """(PaymentIntent, charge) that paid this invoice, read from Stripe; ('', '') when the invoice charged nothing.
+    Used when a one-time licence bought on a subscription's first invoice is granted (build_orders._grant_vms_license),
+    so the licence row records its payment from the start. Unreadable -> RetryableStripeEventError."""
+    import stripe_state
+    from stripe_state import RetryableStripeEventError
+    from urllib.parse import quote
+    if not invoice_id:
+        return "", ""
+    invoice = stripe_state.stripe_get(f"/v1/invoices/{quote(invoice_id, safe='')}", "the invoice of this order")
+    if int(invoice.get("amount_paid") or 0) <= 0:
+        return "", ""
+    charge = stripe_state._id(invoice.get("charge"))
+    intent = stripe_state._id(invoice.get("payment_intent"))
+    for item in ((invoice.get("payments") or {}).get("data") or []):
+        intent = intent or stripe_state._id((item.get("payment") or {}).get("payment_intent"))
+    if not intent:
+        listed = stripe_state.stripe_get(f"/v1/invoice_payments?invoice={quote(invoice_id, safe='')}&limit=5",
+                                         "the payment of this order's invoice")
+        for item in listed.get("data") or []:
+            if item.get("status", "paid") == "paid":
+                intent = intent or stripe_state._id((item.get("payment") or {}).get("payment_intent"))
+    if not intent and not charge:
+        raise RetryableStripeEventError("the payment of this order's invoice could not be identified")
+    return intent, charge
 
 
 def reverse_hardware_orders(intent: str, reason: str) -> int:
@@ -428,6 +525,9 @@ def restore_hardware_orders(intent: str) -> int:
 # (payment_locks rows keyed by payment intent / charge / invoice, in sorted order) inside the transaction that does
 # its work: whichever commits first, the other then sees it.
 
+_LOCK_ORDER = {"ch": 0, "pi": 1, "in": 2}
+
+
 def payment_keys(charge_id: str = "", intent: str = "", invoice_id: str = "") -> list[str]:
     return sorted({f"{prefix}:{value}" for prefix, value in (("ch", charge_id), ("pi", intent), ("in", invoice_id)) if value})
 
@@ -437,7 +537,10 @@ def lock_payment(db, keys: list[str]) -> None:
     writers; PostgreSQL: a row lock held until commit)."""
     from database_backend import backend
     now = _now().isoformat()
-    for key in sorted(set(keys)):
+    # One global order -- charge, then PaymentIntent, then invoice (RC10b) -- for every caller, including the invoice
+    # key a reversal adds later in its transaction (_lock_invoice) and a licence grant that holds a PaymentIntent and an
+    # invoice: no two transactions ever wait on each other's keys (PostgreSQL deadlock-free).
+    for key in sorted(set(keys), key=lambda k: (_LOCK_ORDER.get(k.split(":", 1)[0], len(_LOCK_ORDER)), k)):
         db.execute("INSERT INTO payment_locks(key,created_at) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (key, now))
         if backend() == "postgresql":
             db.execute("SELECT key FROM payment_locks WHERE key=? FOR UPDATE", (key,))
@@ -460,6 +563,74 @@ def _restore_disputed_pending(db, charge_id: str, intent: str) -> int:
     return restored
 
 
+# ------------------------------------------------------------------ own-PC licence on a subscription's first invoice (F1)
+#
+# An own-PC Build Your System order (build_orders._grant_vms_license) is one subscription Checkout: the plan plus the
+# one-time VMS software licence, both charged on the subscription's FIRST invoice. The licence is a one-time purchase of
+# that payment, so -- like a standalone licence -- a full refund or a dispute of that payment suspends it (whether or not
+# that invoice is still the current period), and only a won dispute restores it; the plan follows the subscription rules
+# above. The licence row records its Checkout Session; the payment that paid for it is bound to the row the first time a
+# reversal of that subscription's first payment arrives (the Session names its first invoice), and from then on the row is
+# found by its PaymentIntent exactly like a standalone licence.
+
+def _is_first_payment(payment: dict) -> bool:
+    first = row("SELECT id FROM subscription_payments WHERE stripe_subscription_id=? ORDER BY period_start ASC, paid_at ASC LIMIT 1",
+                (payment["stripe_subscription_id"],))
+    return bool(first) and first["id"] == payment["id"]
+
+
+def _lock_invoice(invoice_id: str) -> None:
+    """Also serialize with a licence grant for this invoice (build_orders._grant_vms_license takes this key)."""
+    if invoice_id:
+        with connection() as db:  # joins the caller's transaction
+            lock_payment(db, payment_keys(invoice_id=invoice_id))
+
+
+def _bind_initial_licence(invoice_id: str, subscription_id: str, intent: str, customer_ids: set) -> None:
+    """Record the PaymentIntent of this subscription's first invoice on an own-PC licence bought with it (granted
+    before the row kept its payment). Read from Stripe: unreadable -> RetryableStripeEventError (the event is retried)."""
+    import stripe_state
+    from urllib.parse import quote
+    for customer_id in sorted(filter(None, customer_ids)):
+        for licence in rows("SELECT id,stripe_checkout_session_id FROM customer_entitlements WHERE customer_id=? AND product='vms_license' "
+                            "AND stripe_payment_intent_id IS NULL AND stripe_checkout_session_id IS NOT NULL", (customer_id,)):
+            session = stripe_state.stripe_get(f"/v1/checkout/sessions/{quote(str(licence['stripe_checkout_session_id']), safe='')}",
+                                              "the licence's Checkout Session")
+            if stripe_state._id(session.get("subscription")) == subscription_id and stripe_state._id(session.get("invoice")) == invoice_id:
+                with connection() as db:
+                    db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=?,updated_at=? WHERE id=? "
+                               "AND stripe_payment_intent_id IS NULL", (intent, _now().isoformat(), licence["id"]))
+
+
+def _reverse_initial_licence(invoice_id: str, subscription_id: str, intent: str, reason: str, *, first: bool,
+                             customer_ids: set) -> int:
+    """Suspend the one-time licence paid by this (subscription) payment; 0 if it paid for none."""
+    if not intent:
+        return 0
+    if first and invoice_id and subscription_id:
+        customer_ids = set(customer_ids) | {r["customer_id"] for r in rows(
+            "SELECT customer_id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (subscription_id,))}
+        _bind_initial_licence(invoice_id, subscription_id, intent, customer_ids)
+    changed = 0
+    for licence in rows("SELECT id FROM customer_entitlements WHERE stripe_payment_intent_id=? AND product='vms_license' AND status='active'",
+                        (intent,)):
+        _set_plan(licence["id"], "suspended", reason)
+        changed += 1
+    if changed:
+        logger.info("billing.initial_licence_suspended subscription=%s reason=%s rows=%s", subscription_id, reason, changed)
+    return changed
+
+
+def _restore_disputed_licences(intent: str) -> int:
+    """A won dispute: the one-time licence(s) paid by this payment are active again (refunds stay terminal)."""
+    restored = 0
+    for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='suspended' "
+                            "AND suspended_reason='disputed'", (intent,)):
+        _set_plan(license_row["id"], "active", None)
+        restored += 1
+    return restored
+
+
 def _reverse_purchase(event: dict, reason: str) -> dict:
     charge_id, intent, invoice_id, full = _charge_parts(event)
     if not full:
@@ -469,19 +640,69 @@ def _reverse_purchase(event: dict, reason: str) -> dict:
         return _reverse_purchase_locked(charge_id, intent, invoice_id, reason)
 
 
+def _hardware_payment(intent: str) -> bool:
+    """A hardware order paid with this PaymentIntent: a one-time payment (mode=payment), never a subscription invoice."""
+    if not intent:
+        return False
+    try:
+        return bool(row("SELECT id FROM hardware_orders WHERE stripe_payment_intent_id=? LIMIT 1", (intent,)))
+    except Exception:
+        return False
+
+
 def _reverse_purchase_locked(charge_id: str, intent: str, invoice_id: str, reason: str) -> dict:
+    # The reversal is recorded first, by charge AND PaymentIntent (and invoice when known), whatever is found below: a
+    # purchase granted later from this payment is granted suspended (build_orders._grant_vms_license checks the invoice,
+    # the PaymentIntent and the charge; stripe_state.payment_reversal the PaymentIntent and the charge). A replay finds
+    # the same row (one per charge, PaymentIntent and reason).
     payment = _payment_for_charge(charge_id, intent, invoice_id)
     _record_reversal(charge_id, intent, (payment or {}).get("id") or invoice_id, reason)
-    if payment is None:
-        found = _stripe_invoice_subscription(intent)
-        if found and (_plan_rows(found[1]) or _addon_rows(found[1]) or row(
-                "SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (found[1],))):
-            _record_reversal(charge_id, intent, found[0], reason)
-            return {"status": "suspended", "rows": _suspend(found[1], reason)}
+    found = None
+    if payment is None and not _hardware_payment(intent):
+        # RC10b (Codex review of RC10 99a19591): no local record of this payment yet -- the refund or dispute may have
+        # arrived before invoice.paid and the plan were recorded. Stripe says which invoice, subscription and Stripe
+        # customer it belongs to. An unreadable Stripe raises (the event is retried; this transaction, including the
+        # record above, rolls back) instead of acknowledging the reversal as unrelated.
+        found = _stripe_invoice_for_payment(intent, invoice_id)
+        if found:
+            # Kept with its invoice even when nothing is granted yet, so a licence granted from that invoice later is
+            # granted suspended (F1, build_orders._grant_vms_license takes the same invoice lock).
+            _lock_invoice(found["invoice_id"])
+            _record_reversal(charge_id, intent, found["invoice_id"], reason)
+            payment = row("SELECT * FROM subscription_payments WHERE id=?", (found["invoice_id"],))
+    if payment is None and found and found["subscription_id"]:
+        subscription_id = found["subscription_id"]
+        # Not recorded yet locally: the payment is treated as possibly the first one. The accounts are those of the
+        # invoice's Stripe customer (a granted licence row records it) and of the subscription's plan; the bind still
+        # checks the licence's Checkout Session names this subscription and invoice, so another account's licence is
+        # never bound.
+        import stripe_state
+        accounts = stripe_state.stripe_customer_accounts(found["stripe_customer_id"])
+        licences = _reverse_initial_licence(found["invoice_id"], subscription_id, intent, reason, first=True,
+                                            customer_ids=accounts)
+        if _plan_rows(subscription_id) or _addon_rows(subscription_id) or row(
+                "SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (subscription_id,)):
+            return {"status": "suspended", "rows": _suspend(subscription_id, reason) + licences}
+        if licences:
+            return {"status": "suspended", "rows": licences}
+        if intent and row("SELECT id FROM customer_entitlements WHERE stripe_payment_intent_id=? AND product='vms_license'", (intent,)):
+            return {"status": "ignored", "reason": "already applied to the licence bought with this payment"}
+        # Nothing granted from this invoice yet: the durable record above is applied when it is (2xx, not retried).
+        logger.warning("billing.reversal_recorded_before_purchase invoice=%s subscription=%s reason=%s",
+                       found["invoice_id"], subscription_id, reason)
+        return {"status": "recorded", "reason": "nothing granted from this payment yet; applied when it is granted",
+                "invoice": found["invoice_id"]}
     if payment and payment.get("stripe_subscription_id"):
+        _lock_invoice(str(payment["id"]))
+        # F1: the one-time own-PC licence bought on this payment goes with it, whatever the period rules say for the plan.
+        licences = _reverse_initial_licence(str(payment["id"]), str(payment["stripe_subscription_id"]),
+                                            intent or str(payment.get("stripe_payment_intent_id") or ""), reason,
+                                            first=_is_first_payment(payment), customer_ids={payment.get("customer_id")})
         if not _covers_current_period(payment):
+            if licences:
+                return {"status": "suspended", "rows": licences, "reason": "an earlier period: only its one-time licence"}
             return {"status": "ignored", "reason": "an earlier period; the current period is paid"}
-        return {"status": "suspended", "rows": _suspend(payment["stripe_subscription_id"], reason)}
+        return {"status": "suspended", "rows": _suspend(payment["stripe_subscription_id"], reason) + licences}
     if intent:  # a one-time purchase (VMS license, hardware)
         changed = 0
         for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='active'", (intent,)):
@@ -505,24 +726,52 @@ def _dispute_closed(event: dict) -> dict:
     return result
 
 
+def _disputed_invoice(charge_id: str, intent: str) -> str:
+    """The invoice a dispute of this payment was recorded with (the dispute event found it), else ''."""
+    with connection() as db:
+        db.execute(REVERSALS_DDL)
+        for column, value in (("charge_id", charge_id), ("payment_intent", intent)):
+            if value:
+                found = db.execute(f"SELECT invoice_id FROM billing_reversals WHERE {column}=? AND reason='disputed' "
+                                   "AND invoice_id IS NOT NULL LIMIT 1", (value,)).fetchone()
+                if found:
+                    return str(found["invoice_id"])
+    return ""
+
+
 def _dispute_won_locked(charge_id: str, intent: str) -> dict:
-    payment = _payment_for_charge(charge_id, intent, "")
+    disputed_invoice = _disputed_invoice(charge_id, intent)
+    payment = _payment_for_charge(charge_id, intent, disputed_invoice)
+    subscription_id = ""
+    if payment is None and not _hardware_payment(intent):
+        # RC10b: no local payment record (e.g. the dispute opened before invoice.paid was recorded): the invoice and
+        # subscription it paid, from Stripe (as when the dispute opened); unreadable -> retried, never skipped.
+        found = _stripe_invoice_for_payment(intent, disputed_invoice)
+        if found:
+            _lock_invoice(found["invoice_id"])
+            payment = row("SELECT * FROM subscription_payments WHERE id=?", (found["invoice_id"],))
+            subscription_id = found["subscription_id"] if payment is None else ""
     with connection() as db:  # the payment stands: no longer a reversal
         db.execute(REVERSALS_DDL)
         for column, value in (("charge_id", charge_id), ("payment_intent", intent)):
             if value:
                 db.execute(f"UPDATE billing_reversals SET reason='dispute_won' WHERE {column}=? AND reason='disputed'", (value,))
     restored = 0
-    if payment and payment.get("stripe_subscription_id"):
+    if payment is None and subscription_id:
+        restored = _restore(subscription_id, ("disputed",))
+        if restored:
+            from purchase_notifications import notify_service_restored
+            notify_service_restored(subscription_id)  # never raises
+        restored += _restore_disputed_licences(intent) if intent else 0
+    elif payment and payment.get("stripe_subscription_id"):
         restored = _restore(payment["stripe_subscription_id"], ("disputed",))
         if restored:
             from purchase_notifications import notify_service_restored
             notify_service_restored(payment["stripe_subscription_id"])  # never raises
+        # F1: an own-PC licence bought on this (first) payment is restored with it.
+        restored += _restore_disputed_licences(intent or str(payment.get("stripe_payment_intent_id") or ""))
     elif intent:
-        for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='suspended' "
-                                "AND suspended_reason='disputed'", (intent,)):
-            _set_plan(license_row["id"], "active", None)
-            restored += 1
+        restored += _restore_disputed_licences(intent)
         restored += restore_hardware_orders(intent)
     return {"status": "restored" if restored else "ignored", "rows": restored}
 
@@ -557,7 +806,11 @@ def sync_from_stripe_event(event: dict) -> dict:
             return {"status": "ignored", "reason": "this payment was refunded or disputed"}
         if _outstanding_failure(subscription_id, paid_invoice_id=str(obj.get("id") or "")):
             return {"status": "ignored", "reason": "a later renewal is still unpaid: grace continues"}
-        return {"status": "recovered", "rows": payment_recovered(subscription_id)}
+        reasons = RESTORED_BY_PAYMENT
+        if _has_refunded_rows(subscription_id):
+            import stripe_state
+            reasons = _restore_reasons(stripe_state.current_subscription(subscription_id), paid_invoice=obj)
+        return {"status": "recovered", "rows": payment_recovered(subscription_id, reasons)}
     if event_type in ("customer.subscription.updated", "customer.subscription.created"):
         from stripe_state import current_subscription
         current = current_subscription(str(obj.get("id") or "") or None) or obj

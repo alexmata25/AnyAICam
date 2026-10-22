@@ -18,7 +18,7 @@ import pytest
 from database_backend import override_target
 from test_direct_onboarding import _direct_owner, _login, _one, _signed_in  # noqa: F401
 from test_hybrid_build_system_flow import (_activate_appliance, _checkout, _checkouts, _customer_id, _new_customer, _pay,  # noqa: F401
-                                           _paid_checkout_event, _record_build_order,
+                                           _legacy_appliance_checkout, _paid_checkout_event, _record_build_order,
                                            db_path, license_portal, package, portal, shop, site, storage)
 
 pytestmark = pytest.mark.usefixtures("stripe_follows_events")
@@ -33,7 +33,10 @@ def _paid(client, mail, db_path, email, query, captured):
     plan starts at checkout (its subscription event applied by billing v2)."""
     _new_customer(client, mail, email, query)
     customer_id = _customer_id(db_path, email)
-    assert _checkout(client).status_code == 200
+    if "appliance" in query:  # F2: an appliance order paid before its checkout was retired
+        _legacy_appliance_checkout(captured, db_path, customer_id)
+    else:
+        assert _checkout(client).status_code == 200
     _record_build_order(db_path, _paid_checkout_event(captured, customer_id, f"cs_test_{customer_id[:12]}"))
     if "appliance" not in query:
         plan, cameras = ("ai_local", 5) if "ai_local" in query else ("hybrid", 8)
@@ -239,7 +242,7 @@ def test_appliance_order_confirmation_email_is_sent_once_after_payment(shop, db_
     _new_customer(client, mail, "mail-hw@example.test", APPLIANCE)
     customer_id = _customer_id(db_path, "mail-hw@example.test")
     assert _notify(db_path, _event(customer_id))["status"] == "ignored" and outbox == []  # nothing before payment
-    assert _checkout(client).status_code == 200
+    _legacy_appliance_checkout(captured, db_path, customer_id)  # F2: paid before the appliance Build checkout was retired
     _record_build_order(db_path, _paid_checkout_event(captured, customer_id))  # the verified webhook sends it
     assert len(outbox) == 1
     assert _notify(db_path, _event(customer_id, "evt_build_2"))["status"] == "skipped"  # once per account
@@ -295,8 +298,8 @@ def test_the_v2_webhook_step_sends_the_confirmation_after_granting_the_plan(monk
 def test_an_appliance_checkout_charges_hardware_only_and_an_own_pc_checkout_starts_the_plan(shop, db_path):
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, "billing-start@example.test", APPLIANCE)
-    assert _checkout(client).status_code == 200
-    appliance = _checkouts(captured)[-1]
+    assert _checkout(client).status_code == 409  # F2: appliances are ordered through the hardware checkout
+    appliance = _legacy_appliance_checkout(captured, db_path, _customer_id(db_path, "billing-start@example.test"))
     assert appliance["mode"] == "payment"  # one-time hardware; no subscription created at checkout
     assert not any(key.startswith("subscription_data") for key in appliance)
     client.cookies.clear()

@@ -333,7 +333,7 @@ def test_a_won_dispute_reinstates_a_set_aside_purchase_and_the_next_sign_in_atta
     import billing_status
     import sales_commissions
     from partner_db import authenticate_detailed
-    monkeypatch.setattr(billing_status, "_stripe_invoice_subscription", lambda intent: None)
+    monkeypatch.setattr(billing_status, "_stripe_invoice_for_payment", lambda intent, invoice_id="": None)
     monkeypatch.setattr(sales_commissions, "_invoice_for_payment_intent", lambda intent: None)
     client, _, mail = site
     customer_id = _verified_owner(client, mail, db_path, "won@example.test")

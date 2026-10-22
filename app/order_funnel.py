@@ -364,10 +364,27 @@ ORDER_CONFIRMATION_KEY = "build-order-confirmed:"
 ORDER_CONFIRMATION_STALE_SECONDS = 300
 
 
-def _order_confirmation_attempts(customer_id: str) -> list:
+ORDER_NUMBER_SEPARATOR = ":order-"
+
+
+def _order_confirmation_key(customer_id: str) -> str:
+    """C1 (Green, 2026-10-21): one confirmation per ORDER. The account's first order keeps the original key (so no account
+    that was already confirmed is ever confirmed twice); every order that replaced a refunded-and-ended one (R7,
+    per_camera_billing.supersede_refunded_order, recorded in audit_logs) gets its own key, ":order-2", ":order-3", ..."""
+    from partner_db import row
+    superseded = int((row("SELECT COUNT(*) AS n FROM audit_logs WHERE action=? AND entity_type='build_system_order' "
+                          "AND entity_id=?", (billing.BUILD_ORDER_SUPERSEDED, customer_id)) or {}).get("n") or 0)
+    return ORDER_CONFIRMATION_KEY + customer_id + (f"{ORDER_NUMBER_SEPARATOR}{superseded + 1}" if superseded else "")
+
+
+def _customer_from_confirmation_key(event_id: str) -> str:
+    return str(event_id)[len(ORDER_CONFIRMATION_KEY):].split(ORDER_NUMBER_SEPARATOR, 1)[0]
+
+
+def _order_confirmation_attempts(customer_id: str, key: str | None = None) -> list:
     from partner_db import rows
     return rows("SELECT * FROM provisioning_notifications WHERE stripe_event_id=? ORDER BY created_at",
-                (ORDER_CONFIRMATION_KEY + customer_id,))
+                (key or _order_confirmation_key(customer_id),))
 
 
 def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) -> dict:
@@ -379,7 +396,8 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
     it. Once setup is finished the confirmation is out of date, so an
     unsent attempt is closed ('superseded') instead of retried."""
     import purchase_notifications as pn
-    attempts = _order_confirmation_attempts(customer_id)
+    key = _order_confirmation_key(customer_id)
+    attempts = _order_confirmation_attempts(customer_id, key)
     if any(attempt["status"] == "sent" for attempt in attempts):
         return {"status": "skipped", "reason": "already sent"}
     if not billing.order_paid(customer_id):
@@ -391,7 +409,7 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
             with connection() as db:
                 db.execute("UPDATE provisioning_notifications SET status='superseded',updated_at=? "
                            "WHERE stripe_event_id=? AND status IN ('pending','failed')",
-                           (pn._now(), ORDER_CONFIRMATION_KEY + customer_id))
+                           (pn._now(), key))
         return {"status": "ignored", "reason": "no Build Your System order awaiting setup"}
     customer = pn._customer_row(customer_id) or {}
     plan_name, plan_cameras = _ordered_plan(customer_id)
@@ -402,7 +420,16 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
     if attempts:
         # Retry the same outbox row, never a second one under another type.
         kind = attempts[0]["notification_type"]
-    return pn._send_once(event_id=ORDER_CONFIRMATION_KEY + customer_id, notification_type=kind, customer_id=customer_id,
+    if key != ORDER_CONFIRMATION_KEY + customer_id:
+        # A new order replaced a refunded one: an unsent confirmation of an earlier order is out of date (closed, not retried).
+        from partner_db import connection
+        with connection() as db:
+            # Exact prefix (Red's review): a LIKE pattern would treat '_' / '%' in an id as wildcards.
+            numbered = ORDER_CONFIRMATION_KEY + customer_id + ORDER_NUMBER_SEPARATOR
+            db.execute("UPDATE provisioning_notifications SET status='superseded',updated_at=? WHERE stripe_event_id<>? "
+                       "AND (stripe_event_id=? OR substr(stripe_event_id,1,?)=?) AND status IN ('pending','failed')",
+                       (pn._now(), key, ORDER_CONFIRMATION_KEY + customer_id, len(numbered), numbered))
+    return pn._send_once(event_id=key, notification_type=kind, customer_id=customer_id,
                          recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
                          metadata={"build_system_order": True}, test_mode=test_mode)
 
@@ -436,13 +463,34 @@ def retry_order_confirmation_notifications(limit: int = 50) -> int:
     for pending in rows("SELECT DISTINCT stripe_event_id FROM provisioning_notifications WHERE stripe_event_id LIKE ? "
                         "AND (status='failed' OR (status='pending' AND updated_at<?)) LIMIT ?",
                         (ORDER_CONFIRMATION_KEY + "%", stale_before, limit)):
-        customer_id = str(pending["stripe_event_id"])[len(ORDER_CONFIRMATION_KEY):]
+        customer_id = _customer_from_confirmation_key(pending["stripe_event_id"])
         try:
             if send_order_confirmation(customer_id).get("status") == "sent":
                 sent += 1
         except Exception:
             continue
     return sent
+
+
+def _order_closed_body(customer_id: str) -> str:
+    """C3 (Green, 2026-10-21): the order summary for an account whose earlier order can no longer be checked out (it was
+    paid; nothing new to buy here). The one-time license is never sold twice; a disputed order stays blocked (C4)."""
+    from partner_db import row
+    licence = row("SELECT status,suspended_reason FROM customer_entitlements WHERE customer_id=? AND product='vms_license'",
+                  (customer_id,)) or {}
+    if licence.get("status") == "suspended" and licence.get("suspended_reason") == "disputed":
+        return ('<h2>Your previous order has an open payment dispute</h2>'
+                '<p id="order-dispute-open">A payment dispute on your previous order is still open, so a new order cannot be '
+                'placed yet. Please contact AnyAiCam support and we will help you.</p>'
+                '<a class="submit" id="order-support" href="https://anyaicam.com/vms-support.html">Contact AnyAiCam support</a>')
+    if billing.vms_license_owned(customer_id):
+        return ('<h2>Your VMS software license is already on your account</h2>'
+                '<p id="order-license-owned-plan-ended">Your one-time AnyAiCam VMS software license is still yours. Restart your '
+                'monthly plan in My subscription; the license is not charged again.</p>'
+                '<a class="submit" id="order-manage" href="/subscription-portal">Restart your plan in My subscription</a>')
+    return ('<h2>Your previous order is complete</h2>'
+            '<p id="order-closed">This order can no longer be checked out. Your plan and billing are managed in My subscription.</p>'
+            '<a class="submit" id="order-manage" href="/subscription-portal">Open My subscription</a>')
 
 
 def register_order_funnel_routes(app: FastAPI) -> None:
@@ -478,12 +526,19 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             # My orders after delivery; this account never gets an own-PC order (or the license) here (Green 2026-10-16).
             import hardware_checkout
             return RedirectResponse(hardware_checkout.ORDERS_PATH, status_code=303)
+        # R7 (2026-10-21): a refunded own-PC order whose subscription has ended becomes a new pending order (the old
+        # one is kept in the audit log), instead of a checkout button for an order that can no longer be paid.
+        billing.supersede_refunded_order(customer_id)
         if query_selection.get("plan"):
             billing.save_build_selection(customer_id, query_selection)
         progress = billing.build_progress(customer_id) or {}
         if progress.get("appliance") and progress.get("state") == billing.BUILD_PENDING:
             import hardware_checkout  # a selection saved before 2026-10-15 (see above)
             return RedirectResponse(f"{hardware_checkout.CHECKOUT_PATH}?{hardware_checkout.selection_query(progress)}", status_code=303)
+        if progress.get("plan") and progress.get("state") != billing.BUILD_PENDING:
+            # C3 (Green, 2026-10-21): this order is no longer open for checkout (build_orders.create_checkout would answer
+            # 409 "There is no order to check out"), so no checkout button: say where the customer can actually go.
+            return HTMLResponse(_page("Your AnyAiCam order", _order_closed_body(customer_id)), headers=NO_STORE)
         selection = progress if progress.get("plan") else {}
         cancelled = request.query_params.get("checkout") == "cancelled"
         notice = ('<p class="notice" id="order-cancelled" role="status">Checkout was cancelled. No payment was taken and nothing was activated.</p>'

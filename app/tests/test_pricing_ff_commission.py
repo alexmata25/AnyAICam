@@ -304,8 +304,8 @@ def test_unsellable_items_cannot_be_checked_out(portal, db_path, monkeypatch):
 
 
 def test_hardware_is_never_discounted():
-    import main
-    source = inspect.getsource(main.create_hardware_checkout)
+    import hardware_checkout  # the one hardware checkout (F2: the older main.create_hardware_checkout is retired)
+    source = inspect.getsource(hardware_checkout.create_checkout)
     assert "friends_family" not in source and "discounts[" not in source
     assert '("allow_promotion_codes", "false")' in source
     assert pc.friends_family_percent("hardware") == 0

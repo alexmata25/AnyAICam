@@ -229,9 +229,16 @@ def stripe_follows_events(monkeypatch):
     import sales_commissions
     import stripe_state
 
-    now = {"subscriptions": {}, "invoices": {}, "intents": {}}
+    now = {"subscriptions": {}, "invoices": {}, "intents": {}, "invoice_payments": {}}
 
     def reader(path):
+        if path.startswith("/v1/invoice_payments?"):
+            # RC10b: which invoice a refunded/disputed PaymentIntent paid. A payment paid no invoice unless the test
+            # says so (now["invoice_payments"][payment_intent or invoice] = [{"invoice": ..., "payment": {...}}]).
+            from urllib.parse import parse_qs
+            query = parse_qs(path.split("?", 1)[1])
+            key = (query.get("payment[payment_intent]") or query.get("invoice") or [""])[0]
+            return {"object": "list", "data": list(now["invoice_payments"].get(key) or [])}
         kind, _, ident = path.split("?", 1)[0].rpartition("/")
         if kind == "/v1/subscriptions":
             if ident not in now["subscriptions"]:

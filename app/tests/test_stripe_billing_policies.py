@@ -177,8 +177,14 @@ def test_a_portal_configured_against_policy_is_refused(env, breaks):
 
 # ================================================================ 4. refunds and disputes
 
-def _paid_period(env, event_id="evt_p1", invoice_id="in_p1"):
-    _deliver(env, _invoice(event_id, invoice_id=invoice_id))
+def _paid_period(env, event_id="evt_p1", invoice_id="in_p1", sub_id="sub_A1"):
+    # As Stripe: the paid invoice is the subscription's latest invoice (RC10b: a refund suspension lifts only when
+    # the payment covering the current period is a paid, unreversed later invoice).
+    env["invoices"][invoice_id] = {"id": invoice_id, "object": "invoice", "status": "paid", "amount_paid": 1499,
+                                   "payment_intent": f"pi_{invoice_id}", "charge": f"ch_{invoice_id}"}
+    if sub_id in env["stripe"]:
+        env["stripe"][sub_id]["latest_invoice"] = invoice_id
+    _deliver(env, _invoice(event_id, invoice_id=invoice_id, sub_id=sub_id))
 
 
 def test_a_full_refund_of_the_current_period_suspends_that_plan_only(env, monkeypatch):

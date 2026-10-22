@@ -456,6 +456,67 @@ def vms_license_owned(customer_id: str) -> bool:
                (customer_id,)) is not None
 
 
+def own_pc_licence_reversed(customer_id: str) -> bool:
+    """C5 (owner-authorized correction, 2026-10-21): the account's one-time own-PC VMS licence was paid for and that
+    payment is now REFUNDED or DISPUTED (open or lost; a won dispute restores the licence to active), and nothing else
+    licenses the software: no active licence row and no paid AnyAiCam appliance (whose purchase includes the licence).
+    Such an account must not get the software licence back from a camera plan alone -- not from a plan that keeps
+    running or is restored by a later paid month, and not from a fresh plan bought without the licence. Accounts that
+    never had a licence row (appliance customers, plan-only accounts of the billing-v2 design) are not affected."""
+    if not customer_id or vms_license_owned(customer_id):
+        return False
+    import customer_entitlements
+    if customer_entitlements.appliance_includes_vms_license(customer_id):
+        return False
+    return row("SELECT id FROM customer_entitlements WHERE customer_id=? AND product='vms_license' AND status='suspended' "
+               "AND suspended_reason IN ('refunded','disputed') LIMIT 1", (customer_id,)) is not None
+
+
+def purchase_reversed(customer_id: str) -> bool:
+    """C5 enforcement (owner-authorized, 2026-10-21): the purchase that licensed the software -- the own-PC licence
+    (own_pc_licence_reversed) or an AnyAiCam appliance order (billing_status.reverse_hardware_orders sets it 'refunded'
+    or 'disputed'; a won dispute makes it 'paid' again) -- is refunded or disputed, and nothing else licenses the
+    software (no active licence row, no paid appliance order). A camera plan alone then carries no licence
+    (vms_license_capacity). Accounts that never had a licence or appliance purchase (plan-only billing-v2) are not
+    affected."""
+    if own_pc_licence_reversed(customer_id):
+        return True
+    if not customer_id or vms_license_owned(customer_id):
+        return False
+    import customer_entitlements
+    if customer_entitlements.appliance_includes_vms_license(customer_id):
+        return False
+    return row("SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' "
+               "AND status IN ('refunded','disputed') LIMIT 1", (customer_id,)) is not None
+
+
+PURCHASE_REVERSED = ("Your AnyAiCam software license payment was refunded or is disputed, so this account can run 0 "
+                     "cameras. Add-ons and plan changes are unavailable until that is resolved; you can still cancel your "
+                     "plan. Contact AnyAiCam support for help.")
+
+
+def licence_reversed_detail(customer_id: str) -> dict:
+    """The 409 of the legacy licence-only checkout for an own-PC licence that was refunded (repurchase: a new order in
+    Build Your System, R7) or disputed (support)."""
+    reason = (row("SELECT suspended_reason FROM customer_entitlements WHERE customer_id=? AND product='vms_license' "
+                  "AND status='suspended' LIMIT 1", (customer_id,)) or {}).get("suspended_reason")
+    if reason == "refunded":
+        return {"code": "licence_reversed", "reason": "refunded", "order_url": "/order-summary",
+                "message": "Your previous VMS software license payment was refunded, so a license cannot be bought "
+                           "again here. Place a new order in Build Your System (/order-summary) once your current "
+                           "camera plan has ended."}
+    return {"code": "licence_reversed", "reason": "disputed",
+            "message": "Your previous VMS software license payment is disputed, so a license cannot be bought here. "
+                       "Contact AnyAiCam support to resolve the dispute."}
+
+
+def reversed_without_capacity(customer_id: str) -> bool:
+    """Owner, 2026-10-21: add-on purchases and plan changes are refused while the licensing purchase is reversed AND
+    the account can run no camera (cancellation is never refused)."""
+    import customer_entitlements
+    return purchase_reversed(customer_id) and customer_entitlements.usable_camera_capacity(customer_id) <= 0
+
+
 def account_activated(customer_id: str) -> bool:
     """VMS 1.2.7 activation (owner decision 2026-10-16): the account's initial purchase is verified, so My subscription
     may sell plans and add-ons. Only records the verified Stripe webhook writes count:
@@ -463,7 +524,11 @@ def account_activated(customer_id: str) -> bool:
       that once had one resubscribes here and is never sent back through Build Your System), or an earlier plan;
     * an active one-time VMS software license;
     * a paid AnyAiCam appliance order, or the storage plan ordered with it (hardware-first: the plan follows delivery).
-    A saved Build Your System selection, an open or unpaid checkout, or a refunded/disputed order is not activation."""
+    A saved Build Your System selection, an open or unpaid checkout, or a refunded/disputed order is not activation.
+    C5 (2026-10-21): an ENDED (cancelled) plan does not count while the account's own-PC licence is refunded or disputed
+    (own_pc_licence_reversed): My subscription then sells no plan without the licence, and the customer orders again in
+    Build Your System, which charges the licence (R7). A plan still running keeps the account activated, so its owner
+    can still manage it."""
     if not customer_id:
         return False
     legacy = existing_plan(customer_id)
@@ -478,8 +543,10 @@ def account_activated(customer_id: str) -> bool:
             return True
     try:
         # Rows exist only once Stripe confirmed a payment (an unpaid or incomplete checkout never writes one, see
-        # _upsert_current); a plan whose payment was refunded or disputed does not count.
-        if row("SELECT id FROM camera_plan_entitlements_v2 WHERE customer_id=? AND (status IN ('active','cancelled') OR "
+        # _upsert_current); a plan whose payment was refunded or disputed does not count, nor (C5) an ended plan of an
+        # account whose own-PC licence was refunded or disputed.
+        counted = "'active'" if own_pc_licence_reversed(customer_id) else "'active','cancelled'"
+        if row(f"SELECT id FROM camera_plan_entitlements_v2 WHERE customer_id=? AND (status IN ({counted}) OR "
                "(status='suspended' AND COALESCE(suspended_reason,'') NOT IN ('refunded','disputed'))) LIMIT 1", (customer_id,)):
             return True
     except Exception:  # pre-v2 database
@@ -503,6 +570,7 @@ def save_build_selection(customer_id: str, selection: dict) -> None:
     alone."""
     if not customer_id or not selection.get("plan") or order_paid(customer_id):
         return
+    supersede_refunded_order(customer_id)  # R7: a refunded and ended own-PC order no longer blocks a new one
     existing = row("SELECT state FROM build_system_intents WHERE customer_id=?", (customer_id,))
     if existing and existing["state"] != BUILD_PENDING:
         return
@@ -552,6 +620,96 @@ def build_progress(customer_id: str) -> dict | None:
     return {"state": state, **{key: value for key, value in selection.items() if value}}
 
 
+BUILD_ORDER_SUPERSEDED = "build_order.superseded_after_refund"
+
+
+def previous_order_refunded_and_ended(customer_id: str) -> bool:
+    """R7 (owner-approved correction, 2026-10-21): the account's paid Build Your System order grants nothing any more,
+    so the customer may place a NEW order. All of:
+    * no camera plan that is active or suspended (per-camera or legacy) and no appliance storage plan (order_paid): the
+      order's subscription has ENDED -- a refunded plan whose subscription is still running is suspended, still on
+      Stripe, and stays blocked (no second subscription beside it);
+    * no paid AnyAiCam appliance (whose purchase includes the licence);
+    * the order's one-time VMS licence is suspended because its payment was REFUNDED. Refunds are terminal (only a won
+      dispute restores a licence, billing_status._restore_disputed_licences), so the old licence can never come back
+      beside a new one. A disputed licence (the dispute may still be won) and an active licence keep today's behaviour.
+    """
+    if not customer_id or order_paid(customer_id) or vms_license_owned(customer_id):
+        return False
+    import customer_entitlements
+    if customer_entitlements.appliance_includes_vms_license(customer_id):
+        return False
+    licence = row("SELECT status,suspended_reason FROM customer_entitlements WHERE customer_id=? AND product='vms_license'",
+                  (customer_id,))
+    return bool(licence and licence["status"] == "suspended" and licence["suspended_reason"] == "refunded")
+
+
+def _order_reversals(licence: dict | None, payments: list[dict]) -> list[dict]:
+    """The refund/dispute records (billing_reversals) of an order's licence and subscription payments, for its archive."""
+    keys = {"payment_intent": {str((licence or {}).get("stripe_payment_intent_id") or "")},
+            "charge_id": set(), "invoice_id": set()}
+    for payment in payments:
+        keys["payment_intent"].add(str(payment.get("stripe_payment_intent_id") or ""))
+        keys["charge_id"].add(str(payment.get("stripe_charge_id") or ""))
+        keys["invoice_id"].add(str(payment.get("id") or ""))
+    import billing_status
+    # As billing_status does before reading it: the table is created on first use. A failed SELECT on a missing table
+    # would abort the caller's PostgreSQL transaction, so it is never attempted.
+    with connection() as db:
+        db.execute(billing_status.REVERSALS_DDL)
+    found: dict = {}
+    for column, values in keys.items():
+        for value in sorted(v for v in values if v):
+            for item in rows(f"SELECT * FROM billing_reversals WHERE {column}=? ORDER BY id", (value,)):
+                found[item["id"]] = item
+    return [found[key] for key in sorted(found)]
+
+
+def supersede_refunded_order(customer_id: str) -> bool:
+    """R7: replace the account's paid-but-refunded-and-ended Build Your System order (previous_order_refunded_and_ended)
+    with a NEW pending own-PC order for the same plan and camera count, so the customer can check out again. The account
+    keeps one build_system_intents row (customer_id is its key), so the old order is first copied -- that row, its
+    licence row, its plan row, the payments of its subscription and their refund/dispute records (billing_reversals),
+    with every Stripe reference -- into an append-only
+    audit_logs record (no schema change); the licence, plan, payment and reversal rows are not changed here.
+    Idempotent and race-safe: only the request whose conditional UPDATE moves the paid row writes the copy; any other
+    finds nothing to do. Fails closed (the order stays as it was). Returns True when this call superseded the order."""
+    if not customer_id:
+        return False
+    from partner_db import transaction
+    try:
+        current = row("SELECT state FROM build_system_intents WHERE customer_id=?", (customer_id,))
+        if not current or current["state"] not in (BUILD_PAID, BUILD_DONE) or not previous_order_refunded_and_ended(customer_id):
+            return False  # the usual case: read only, no write transaction for a page view
+        with transaction() as db:
+            intent = row("SELECT * FROM build_system_intents WHERE customer_id=?", (customer_id,))
+            if not intent or intent["state"] not in (BUILD_PAID, BUILD_DONE) or not previous_order_refunded_and_ended(customer_id):
+                return False
+            licence = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product='vms_license'", (customer_id,))
+            plan = entitlement_for_customer(customer_id)
+            payments = rows("SELECT * FROM subscription_payments WHERE stripe_subscription_id=? ORDER BY paid_at",
+                            (plan["stripe_subscription_id"],)) if plan and plan.get("stripe_subscription_id") else []
+            reversals = _order_reversals(licence, payments)
+            now = _now()
+            moved = db.execute("UPDATE build_system_intents SET state=?,own_pc=1,appliance_sku=NULL,relay_modules=NULL,"
+                               "created_at=?,updated_at=?,paid_at=NULL,completed_at=NULL "
+                               "WHERE customer_id=? AND state=? AND updated_at=?",
+                               (BUILD_PENDING, now, now, customer_id, intent["state"], intent["updated_at"])).rowcount
+            if moved != 1:
+                return False
+            details = {"reason": "the previous order's licence was refunded and its subscription has ended",
+                       "previous_order": intent, "licence": licence, "plan": plan, "payments": payments,
+                       "reversals": reversals}
+            db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
+                       "VALUES(?,?,?,?,?,?,?)", ("", "system", BUILD_ORDER_SUPERSEDED, "build_system_order", customer_id,
+                                                 json.dumps(details, default=str, sort_keys=True), now))
+    except Exception:
+        logger.exception("build_order.supersede_failed customer_id=%s", customer_id)
+        return False
+    logger.info("build_order.superseded_after_refund customer_id=%s previous_state=%s", customer_id, intent["state"])
+    return True
+
+
 def purchase_progress_banner(customer_id: str, path: str = "") -> str:
     """The notice on every customer VMS page while a Build Your System
     purchase is unfinished: back to the order summary until paid, then to
@@ -570,6 +728,24 @@ def purchase_progress_banner(customer_id: str, path: str = "") -> str:
             message = '<strong>Plan paused</strong> — Your subscription payment failed. '
         return ('<div class="license-warning-banner" id="purchase-progress-banner" role="alert">' + message +
                 f'<a href="{PURCHASE_INTENT_PATH}">Update payment method</a></div>')
+    # C2 (Green, 2026-10-21): after a refund or a dispute, never "Payment complete -- set up your system".
+    if customer_id and previous_order_refunded_and_ended(customer_id):
+        # The refunded order grants nothing any more (R7): the next step is a new order.
+        if path.rstrip("/") == ORDER_SUMMARY_PATH:
+            return ""
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
+                '<strong>Previous order refunded</strong> — Your earlier order was refunded and its subscription has ended. '
+                f'<a href="{ORDER_SUMMARY_PATH}">Start a new order</a></div>')
+    reversed_plan = entitlement_for_customer(customer_id) if customer_id else None
+    if (reversed_plan and reversed_plan.get("status") == "suspended"
+            and reversed_plan.get("suspended_reason") in ("refunded", "disputed")):
+        if path.rstrip("/") == PURCHASE_INTENT_PATH:
+            return ""  # My subscription shows the reason itself (N1)
+        message = ("<strong>Plan suspended</strong> — The payment for your plan was refunded. "
+                   if reversed_plan["suspended_reason"] == "refunded" else
+                   "<strong>Plan suspended</strong> — A payment dispute on your plan is open. ")
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">' + message +
+                f'<a href="{PURCHASE_INTENT_PATH}">Open My subscription</a></div>')
     deferred = deferred_storage_plan(customer_id)
     if deferred and deferred["state"] == "payment_failed":
         # The appliance is activated but its storage plan's first payment was
@@ -864,8 +1040,14 @@ def product_mode(customer_id: str) -> str:
 
 
 def vms_license_capacity(customer_id: str) -> int:
+    """The software licence an active per-camera plan carries (billing v2). C5 (2026-10-21): none while the account's
+    own-PC licence is refunded or disputed (own_pc_licence_reversed) -- a plan alone never re-licenses the software.
+    Download, signed capacity, camera provisioning and the licence label all read it through
+    customer_entitlements.vms_license_capacity."""
     entitlement = entitlement_for_customer(customer_id)
-    return int(entitlement.get("camera_quantity") or 0) if entitlement and entitlement.get("status") == "active" else 0
+    if not entitlement or entitlement.get("status") != "active" or purchase_reversed(customer_id):
+        return 0
+    return int(entitlement.get("camera_quantity") or 0)
 
 
 def _set_subscription_payment_failed(subscription_id: str, at=None) -> None:
@@ -1477,6 +1659,8 @@ def register_routes(app: FastAPI) -> None:
         identity = partner_identity(request)
         if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
             raise HTTPException(status_code=403, detail="Customer owner permission required.")
+        if reversed_without_capacity(identity["customer_id"]):  # owner 2026-10-21: no upgrade or scheduled downgrade
+            raise HTTPException(status_code=409, detail=PURCHASE_REVERSED)  # (string: the change button shows detail)
         return _change_subscription(identity, payload)
 
     @app.post("/api/v2/customer/subscription/cancel")

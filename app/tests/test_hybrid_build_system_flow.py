@@ -110,6 +110,19 @@ def _checkout(client, plan=None, cameras=None):
     return client.post("/api/v2/customer/build-order/checkout", json={})
 
 
+def _legacy_appliance_checkout(captured, db_path, customer_id):
+    """F2 (2026-10-21): the Build order checkout no longer opens appliance orders (hardware is sold only through
+    hardware_checkout.py, which collects the shipping address). Appliance orders paid through it before then are still
+    recorded by the webhook and their storage plan still starts at activation, so tests of those orders rebuild the
+    Checkout that route sent from the same server-side fields (build_orders._checkout_fields), as Stripe recorded it."""
+    import build_orders
+    import per_camera_billing as billing
+    with override_target(sqlite_path=str(db_path)):
+        fields, _, _ = build_orders._checkout_fields(customer_id, None, billing.build_progress(customer_id))
+    captured.append(dict(fields))
+    return dict(fields)
+
+
 def _paid_checkout_event(captured, customer_id, session_id="cs_test_order0001", event_id=None):
     """The verified checkout.session.completed for the latest checkout, as Stripe sends it."""
     fields = _checkouts(captured)[-1]
@@ -181,15 +194,13 @@ def test_new_customer_build_system_to_setup_end_to_end(shop, db_path):
     # no longer sells an appliance together with a plan.
     assert order.status_code == 303
     assert order.headers["location"] == "/hardware-checkout?appliance=AIC-APPLIANCE-RYZEN-STARTER&relays=2&cameras=8&plan=hybrid"
-    # Below: the older appliance + deferred-plan API path, still served for
-    # orders saved before 2026-10-15.
+    # Below: the older appliance + deferred-plan API path. Since F2 (2026-10-21) its checkout is refused (it
+    # collected no shipping address); orders paid through it before then are still recorded and started.
     customer_id = _customer_id(db_path, "new@example.test")
     assert _checkouts(captured) == [] and _capacity(db_path, customer_id) == 0  # nothing bought yet
-    # Proceed to Secure Checkout: the backend builds the session from the saved order and server prices.
-    response = _checkout(client)
-    assert response.status_code == 200, response.text
-    assert response.json()["checkout_url"].startswith("https://checkout.stripe.test/")
-    fields = _checkouts(captured)[-1]
+    refused = _checkout(client)
+    assert refused.status_code == 409 and "/hardware-checkout?" in refused.json()["detail"] and _checkouts(captured) == []
+    fields = _legacy_appliance_checkout(captured, db_path, customer_id)
     assert fields["mode"] == "payment" and fields["payment_intent_data[setup_future_usage]"] == "off_session"
     assert fields["line_items[0][price]"] == "price_hw_starter" and fields["line_items[0][quantity]"] == "1"
     assert fields["line_items[1][price]"] == "price_hw_relay" and fields["line_items[1][quantity]"] == "2"
@@ -476,7 +487,7 @@ def test_a_customer_who_wanders_into_the_vms_has_a_way_back_to_checkout(shop, db
 def test_a_cancelled_checkout_returns_to_the_same_order_and_grants_nothing(shop, db_path):
     client, _, mail, _, _ = shop
     _new_customer(client, mail, "cancel@example.test")
-    assert _checkout(client).status_code == 200
+    assert _checkout(client).status_code == 409  # F2: an appliance is ordered through the hardware checkout
     back = _order(client, "checkout=cancelled")  # an appliance order returns to the hardware checkout (2026-10-15)
     assert back.status_code == 303 and back.headers["location"].startswith("/hardware-checkout?appliance=AIC-APPLIANCE-RYZEN-STARTER")
     assert _capacity(db_path, _customer_id(db_path, "cancel@example.test")) == 0
@@ -486,7 +497,7 @@ def test_a_failed_payment_grants_nothing(shop, db_path):
     client, _, mail, _, sessions = shop
     _new_customer(client, mail, "failed@example.test")
     customer_id = _customer_id(db_path, "failed@example.test")
-    assert _checkout(client).status_code == 200
+    assert _checkout(client).status_code == 409  # F2: an appliance is ordered through the hardware checkout
     assert _pay(db_path, customer_id, status="incomplete")["status"] == "not_granted"
     sessions["cs_test_failed01"] = {"status": "open", "payment_status": "unpaid", "metadata": {"anyaicam_customer_id": customer_id}}
     html = client.get("/order-complete?session_id=cs_test_failed01").text
@@ -505,7 +516,7 @@ def test_another_accounts_checkout_session_is_not_shown(shop, db_path):
 
 def test_duplicate_clicks_never_create_a_second_checkout_or_subscription(shop, db_path):
     client, captured, mail, keys, _ = shop
-    _new_customer(client, mail, "dupe@example.test")
+    _new_customer(client, mail, "dupe@example.test", "plan=hybrid&cameras=8")  # F2: appliances check out elsewhere
     customer_id = _customer_id(db_path, "dupe@example.test")
     for _ in range(3):  # refreshes create nothing in Stripe
         _order(client)
@@ -524,7 +535,7 @@ def test_duplicate_clicks_never_create_a_second_checkout_or_subscription(shop, d
 def test_a_lost_stripe_response_is_retried_with_the_same_idempotency_key(shop, db_path, monkeypatch):
     import main
     client, captured, mail, keys, _ = shop
-    _new_customer(client, mail, "lost@example.test")
+    _new_customer(client, mail, "lost@example.test", "plan=hybrid&cameras=8")  # F2: appliances check out elsewhere
     recording = main.stripe_api_post
     lost = {"done": False}
 

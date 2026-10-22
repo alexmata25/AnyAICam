@@ -408,6 +408,7 @@ def vms_license_summary(customer_id: str) -> dict:
     appliance_order = appliance_includes_vms_license(customer_id)
     base_rows = [e for e in entitlements if e["product"] in BASE_PLAN_PRODUCTS]
     kind, status = "none", "none"
+    reason = None  # why a suspended license is suspended (refunded / disputed / payment_failed), for the wording (N1)
     if cameras > 0:
         status = "active"
         if v2_capacity and v2_capacity == cameras:
@@ -418,10 +419,13 @@ def vms_license_summary(customer_id: str) -> dict:
             kind = "appliance_included"
     elif plan and plan["kind"] == "per_camera" and plan["entitlement"].get("status") == "suspended":
         kind, status = "per_camera_plan", "suspended"
+        reason = plan["entitlement"].get("suspended_reason")
     elif any(e["status"] == "suspended" for e in licenses):
         kind, status = "one_time_vms_license", "suspended"
+        reason = next((e.get("suspended_reason") for e in licenses if e["status"] == "suspended"), None)
     elif appliance_order and any(e["status"] == "suspended" for e in base_rows):
         kind, status = "appliance_included", "suspended"
+        reason = next((e.get("suspended_reason") for e in base_rows if e["status"] == "suspended"), None)
     elif appliance_order and not (plan and plan["kind"] == "legacy"):
         # Hardware-first (2026-10-15): the appliance is paid for but no camera
         # plan has started yet (awaiting delivery or setup). The license comes
@@ -441,6 +445,14 @@ def vms_license_summary(customer_id: str) -> dict:
         ("appliance_included", "pending"): "VMS software license included with your AnyAiCam appliance (activates when you set up your appliance)",
     }
     label = labels.get((kind, status))
+    # N1 (Green, 2026-10-21): a refund is final and a dispute is not a billing problem the customer can fix, so the
+    # suspended wording names the actual reason; a failed payment keeps "until billing is resolved".
+    if status == "suspended" and reason in ("refunded", "disputed"):
+        source = {"per_camera_plan": "VMS software license for your per-camera plan",
+                  "one_time_vms_license": "One-time stand-alone VMS software license",
+                  "appliance_included": "VMS software license included with your AnyAiCam appliance"}[kind]
+        label = (f"{source} · suspended because the payment was refunded" if reason == "refunded"
+                 else f"{source} · suspended while a payment dispute is open")
     if kind == "legacy_slots":
         label = f"Earlier {plan.get('name') or 'camera'} plan ({_count(int(plan.get('quantity') or 0))}) · no VMS software license on record"
     elif label is None:
@@ -452,6 +464,7 @@ def vms_license_summary(customer_id: str) -> dict:
                  f"{_count(int(breakdown['plan_camera_slots']))}")
     return {
         "kind": kind, "cameras": cameras, "status": status, "label": label,
+        "suspended_reason": reason if status == "suspended" else None,
         "plan_cameras": int(breakdown["plan_camera_slots"]), "usable_cameras": int(breakdown["camera_slot_quantity"]),
         "has_camera_plan": bool(has_plan), "appliance_order": bool(appliance_order),
         "sources": [{"product": e["product"], "qty": int(e["camera_slot_quantity"] or 0), "status": e["status"], "row_id": e["id"]}

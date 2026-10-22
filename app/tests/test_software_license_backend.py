@@ -152,7 +152,9 @@ def test_owner_case_contract_shape_appliance_included_never_stand_alone(license_
     body = response.json()
     assert set(body) == CONTRACT_KEYS
     assert body["account"] == {"customer_id": "cust-1", "name": "Real Customer"}
-    assert set(body["license"]) == {"kind", "cameras", "status", "label", "usable_cameras"}  # usable_cameras: 2026-10-16, compatible addition
+    # usable_cameras: 2026-10-16; suspended_reason: 2026-10-21 (R7 review N1, names a refund/dispute) -- compatible additions
+    assert set(body["license"]) == {"kind", "cameras", "status", "label", "usable_cameras", "suspended_reason"}
+    assert body["license"]["suspended_reason"] is None
     assert body["license"]["kind"] == "appliance_included" and body["license"]["cameras"] == 8
     assert body["license"]["status"] == "active"
     assert "stand-alone" not in body["license"]["label"].lower() and "appliance" in body["license"]["label"]
