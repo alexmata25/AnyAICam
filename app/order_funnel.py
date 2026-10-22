@@ -285,14 +285,35 @@ RETURN_TO_VMS = ('<p class="notice ok" role="status">Payment complete</p><h2 id=
                  '<a class="ghost" id="order-account" href="/customer-account" style="margin-top:10px">Open my AnyAiCam account</a>')
 
 
+# Owner's exact pre-payment notice (Checkout Blocker 3, 2026-10-22), shown on the own-PC order summary.
+INSTALLER_PENDING_NOTICE = ("Your AnyAiCam software installer is not yet available for download. You can complete your purchase "
+                            "now, and the installer will become available in your AnyAiCam account when it is ready.")
+# After payment (order-complete page and confirmation email): the same promise, nothing more.
+INSTALLER_PENDING_TEXT = ("Your AnyAiCam software installer is not yet available for download. Your license and plan are saved "
+                          "to your AnyAiCam account, and the installer will become available there (My subscription) when it "
+                          "is ready. We will email you when it is.")
+
+
+def installer_available() -> bool:
+    """True when a licensed owner can download a Linux installer right now (what /api/customer/downloads/vms-installer
+    serves). Owner 2026-10-22: orders are accepted before the 1.2.7 installer is released; while none is published,
+    own-PC customers are told so before and after payment, never sent to an old or missing download."""
+    try:
+        import customer_downloads
+        return customer_downloads.current_installer("linux") is not None
+    except Exception:
+        return False
+
+
 def _software_body(progress: dict, summary: str, customer_id: str = "") -> str:
     if customer_id and progress.get("own_pc") and linked_pc(customer_id):
         return RETURN_TO_VMS.format(summary=summary)
-    try:
-        import customer_downloads
-        installer = customer_downloads.current_installer("linux")  # what the download link below really serves
-    except Exception:
-        installer = None
+    installer = installer_available()
+    if progress.get("own_pc") and not installer:
+        return ('<p class="notice ok" role="status">Payment complete</p>'
+                '<h2 id="order-ready">Your order is confirmed. Your AnyAiCam installer is coming soon.</h2>' + summary +
+                f'<p class="note" id="order-download-pending">{INSTALLER_PENDING_TEXT}</p>'
+                '<a class="submit" id="order-account" href="/customer-account" style="margin-top:10px">Open my AnyAiCam account</a>')
     if installer:
         download = ('<a class="submit" id="order-download" href="/api/customer/downloads/vms-installer" download>Download AnyAiCam</a>'
                     '<p class="note">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk).</p>')
@@ -337,6 +358,8 @@ def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_li
         if installed:  # already installed and linked on the customer's own PC: never sent to a download
             paragraphs[-1] = ("AnyAiCam is already installed on your computer, so there is nothing to download or reinstall. "
                               "Go back to AnyAiCam on that computer: your plan reaches it within a minute or two, then add your cameras.")
+        elif progress.get("own_pc") and not installer_available():  # owner 2026-10-22: never promise a download that is not out
+            paragraphs[-1] = INSTALLER_PENDING_TEXT
         kind, subject = "account_ready", "Your AnyAiCam subscription is active"
     text = f"Hi {first_name},\n\n" + "\n\n".join(paragraphs) + f"\n\nSign in: {sign_in}\n\n{pn._SUPPORT_FOOTER_TEXT}"
     html = (f"<p>Hi {escape(first_name)},</p>" + "".join(f"<p>{escape(p)}</p>" for p in paragraphs)
@@ -550,7 +573,9 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             return HTMLResponse(_page("Your order", body), headers=NO_STORE)
         lines, hardware = _order_lines(selection, customer_id)
         quantity = int(selection.get("cameras") or billing.MIN_CAMERA_QUANTITY)
-        body = ('<h2>Order summary</h2>' + notice + lines + hardware +
+        pending = (f'<p class="notice" id="order-installer-pending" role="status">{INSTALLER_PENDING_NOTICE}</p>'
+                   if selection.get("own_pc") and not installer_available() else "")
+        body = ('<h2>Order summary</h2>' + notice + pending + lines + hardware +
                 '<p class="note">Stripe shows the final amount, including any discount or tax, before you pay. '
                 'Cancel the monthly subscription any time from My subscription.</p>'
                 f'<button class="submit" id="order-checkout" type="button" data-plan="{escape(selection["plan"], quote=True)}" '

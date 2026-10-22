@@ -98,13 +98,15 @@ def _notify(db_path, event):
 
 # ------------------------------------------------------------ Path A: own PC / software
 
-def test_own_pc_customer_goes_straight_to_download_and_setup(shop, db_path):
+def test_own_pc_customer_goes_straight_to_download_and_setup(shop, db_path, monkeypatch):
+    import customer_downloads
+    monkeypatch.setattr(customer_downloads, "current_installer", lambda platform: {"version": "1.2.7"} if platform == "linux" else None)
     client, captured, mail, _, _ = shop
     _paid(client, mail, db_path, "ownpc@example.test", OWN_PC, captured)
     html = client.get("/order-complete").text
     assert "Your AnyAiCam system is ready to set up." in html
     assert "Download AnyAiCam and install it on your PC." in html
-    assert 'id="order-download-pending"' in html  # no installer published in this test
+    assert 'id="order-download"' in html and 'id="order-download-pending"' not in html  # an installer is published
     assert '<a class="submit" id="order-setup" href="/customer/setup" style="margin-top:10px">Set Up My System</a>' in html
     assert "being prepared" not in html
     assert client.get("/customer-account").headers["location"] == "/customer/setup"
@@ -258,7 +260,9 @@ def test_appliance_order_confirmation_email_is_sent_once_after_payment(shop, db_
     assert "racking" not in email["text"] and "by phone" not in email["text"]  # no tracking invented, no phone ordering
 
 
-def test_own_pc_order_confirmation_email_points_to_download_and_setup(shop, db_path, outbox):
+def test_own_pc_order_confirmation_email_points_to_download_and_setup(shop, db_path, outbox, monkeypatch):
+    import customer_downloads  # an installer is published (the pending case: test_installer_pending_wording_127.py)
+    monkeypatch.setattr(customer_downloads, "current_installer", lambda platform: {"version": "1.2.7"} if platform == "linux" else None)
     client, captured, mail, _, _ = shop
     customer_id = _paid(client, mail, db_path, "mail-sw@example.test", OWN_PC, captured)
     assert _notify(db_path, _event(customer_id))["status"] == "sent"
