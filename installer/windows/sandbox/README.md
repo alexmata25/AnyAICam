@@ -51,3 +51,37 @@ the finish page's entries. In a fresh Sandbox, with a standard
 5. After linking: the Start menu entry says "already linked"; a repair's last
    page says "This computer is linked". With the network cable out, the last
    page says to link later from the Start menu.
+
+## Functional scenarios F-L / F-H (2026-10-21, Blue) -- SYNTHETIC-KEYSET / SIMULATED CAMERA
+
+`make-wsb.ps1 -Functional -KeysetKind synthetic-test -SyntheticSigningKey <key> -ProductMode local|hybrid ...`
+prepares a run of `functional-in-sandbox.ps1` instead of `validate-in-sandbox.ps1` (without `-Functional`
+nothing changes). F-L installs Local, F-H installs Hybrid; each writes its own report. Every report is labelled
+**SYNTHETIC-KEYSET / SIMULATED CAMERA**: a pass is evidence for the product logic on a real Windows install, and
+**never** production-keyset acceptance or physical-camera acceptance.
+
+What a run does, all inside the disposable Sandbox with networking disabled:
+install; the test cloud with `--functional`; a never-linked PC refuses customer sign-in; an invalid, an expired and
+a used link code are refused, a fresh one links; the cloud-signed capacity (synthetic key) is accepted; online
+customer sign-in, a wrong password, the session on a protected API, the offline appliance password; a simulated
+camera is discovered by a cloud scan job, added through the real provisioning routes, verified by the agent and
+synced to the VMS; live view (customer playlist, segment, still; the operator pages' `/static/hls` URL); recording
+(MKV); basic motion events; premium analytics off and LPR/PPE unavailable on Windows; Local -> Hybrid -> Local
+(F-L) or Hybrid -> Local -> Hybrid (F-H) through the cloud and `restart_vms`; with the cloud stopped: offline
+sign-in, wrong-password refusal, live view, recording and playback of a finished segment, then the offline-grace
+expiry; back online; the appliance revoked; no secret in any collected file.
+
+How it differs from a real customer PC and a real camera (the exact limits):
+
+| Area | In the functional run | Real acceptance still needs |
+|---|---|---|
+| Build | the TEST-ONLY synthetic-keyset setup (same source, different public keyset), TEST-signed | the production-keyset, production-signed setup (capacity then comes from the real cloud key) |
+| Camera | `onvif-camera-sim.py` (ONVIF SOAP, unicast WS-Discovery) + FFmpeg test pattern published by a separate MediaMTX, H.264 640x360 10 fps, no audio, no credentials | a physical ONVIF camera: real codecs/profiles, credentials, audio, H.265, network loss, PoE, reconnect |
+| Address | loopback 127.0.0.5; the agent gets `discovery_networks: ["127.0.0.4/30"]` in agent.json because it never scans loopback by default and manual add-by-IP refuses loopback (both by design) | automatic discovery on the LAN (multicast through the Windows firewall, CAM-10), manual add of a LAN address, a second subnet (G2) |
+| Cloud | the in-Sandbox test cloud: the real claim/appliance/customer-camera routes on a fresh SQLite database, a synthetic owner (`/test/owner`), test-only routes for claim expiry, revocation and entitlement status | the real cloud, real accounts, billing-driven entitlements, cloud recording upload and live relay |
+| Mode switch | the synthetic entitlement rows are changed directly (`/test/entitlement`, `/test/entitlement-status`) | a real plan change (Stripe TEST/LIVE) driving the same configuration route |
+| Offline | the test cloud process is stopped (connection refused); the 72 h grace is simulated by moving `last_verified_at` back | a real internet outage of hours/days, DNS failure, captive portal |
+| Live view | HLS through the customer routes; WebRTC is NOT tested (its signalling runs through the cloud) | WebRTC/P2P in a browser on another device, remote live view |
+| Browser | HTTP requests (`edge-http.py`); no page is rendered | the pages in Edge/Chrome/Safari, by a person |
+| Motion | basic pixel motion on a moving box; premium analytics only checked OFF / unavailable | Smart Motion, people counting, rules on real scenes; a physical driveway for LPR (not on Windows) |
+| Duration | about an hour; one 5-minute segment | days of recording, retention and disk-full behaviour, reboot, sleep, Windows Update |

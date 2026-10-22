@@ -11,6 +11,10 @@
 #   -KeysetKind synthetic-test  the TEST-ONLY build of the same source with the synthetic Sandbox keyset
 #                               (make-synthetic-keyset.py): signed capacity limits, expiry, tamper rejection and the
 #                               cloud-authorized mode, signed by the synthetic key only (-SyntheticSigningKey).
+# -Functional (2026-10-21, Blue): the FUNCTIONAL scenario F-L / F-H (functional-in-sandbox.ps1: sign-in, simulated
+# camera, live view, recording, playback, motion, analytics, offline, Local<->Hybrid, link expiry/revocation).
+# SYNTHETIC-KEYSET / SIMULATED CAMERA only: refused for a production-keyset run and with -Previous/-SimulatePrevious.
+# Without -Functional the folder is exactly what it was before (validate-in-sandbox.ps1).
 # -ProductMode local|hybrid is the /ProductMode the run installs with. -Previous must be an OLDER version than -Setup
 # (a downgrade, e.g. from Windows 1.3.x, is refused here).
 param(
@@ -23,7 +27,8 @@ param(
     [string]$Previous = '',
     # 2026-10-08: plant Windows 1.3.0's leftovers instead of running its
     # (unsigned) setup, for Smart App Control machines.
-    [switch]$SimulatePrevious
+    [switch]$SimulatePrevious,
+    [switch]$Functional
 )
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Folder) { throw "Use a new folder: $Folder exists." }
@@ -34,6 +39,8 @@ if ($KeysetKind -eq 'synthetic-test') {
     $syntheticKey = Get-Content -Raw -LiteralPath $SyntheticSigningKey | ConvertFrom-Json
     if ($syntheticKey.key_id -notlike 'sandbox-test-*') { throw 'Not a synthetic sandbox-test signing key.' }
 } elseif ($SyntheticSigningKey) { throw 'A production run never receives a signing key.' }
+if ($Functional -and $KeysetKind -ne 'synthetic-test') { throw 'A functional run uses the synthetic-test build only (SYNTHETIC-KEYSET / SIMULATED CAMERA).' }
+if ($Functional -and ($Previous -or $SimulatePrevious)) { throw 'A functional run is a fresh install: no -Previous or -SimulatePrevious.' }
 $root = New-Item -ItemType Directory -Path $Folder
 foreach ($sub in 'setup', 'results', 'scripts', 'previous') { New-Item -ItemType Directory -Path (Join-Path $root.FullName $sub) | Out-Null }
 Copy-Item -LiteralPath $setupFile.FullName -Destination (Join-Path $root.FullName 'setup')
@@ -53,7 +60,11 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'test-cloud.py') -Destination (J
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'acceptance-127.ps1') -Destination (Join-Path $root.FullName 'scripts')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'synthetic-snapshots.py') -Destination (Join-Path $root.FullName 'scripts')
 if ($KeysetKind -eq 'synthetic-test') { Copy-Item -LiteralPath $SyntheticSigningKey -Destination (Join-Path $root.FullName 'scripts\signing-key.json') }
-[ordered]@{ product_mode = $ProductMode; keyset_kind = $KeysetKind; expected_keyset_sha256 = $ExpectedKeysetSha256 } |
+# Functional scenario (2026-10-21): its entry script, the edge HTTP helper and the simulated ONVIF camera.
+if ($Functional) { foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', 'onvif-camera-sim.py') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $root.FullName 'scripts') } }
+$runSettings = [ordered]@{ product_mode = $ProductMode; keyset_kind = $KeysetKind; expected_keyset_sha256 = $ExpectedKeysetSha256 }
+if ($Functional) { $runSettings.functional = $true }
+$runSettings |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root.FullName 'scripts\acceptance.json') -Encoding ASCII
 $escape = { param($s) [Security.SecurityElement]::Escape($s) }
 $wsb = @"
@@ -66,7 +77,7 @@ $wsb = @"
     <MappedFolder><HostFolder>$(& $escape (Join-Path $root.FullName 'results'))</HostFolder><SandboxFolder>C:\Validation\results</SandboxFolder><ReadOnly>false</ReadOnly></MappedFolder>
   </MappedFolders>
   <LogonCommand>
-    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\validate-in-sandbox.ps1</Command>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\$(if ($Functional) { 'functional-in-sandbox.ps1' } else { 'validate-in-sandbox.ps1' })</Command>
   </LogonCommand>
 </Configuration>
 "@

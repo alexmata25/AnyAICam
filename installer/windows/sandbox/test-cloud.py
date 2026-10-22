@@ -17,6 +17,15 @@ that CA inside the Sandbox only). Test-only additions, under /test/:
 With --signing-key (2026-10-18) the cloud signs with the SYNTHETIC Sandbox key (make-synthetic-keyset.py, key id
 sandbox-test-*) instead of a random one, so a TEST-ONLY build carrying that public keyset accepts it end to end.
 No production key, customer or database is ever used.
+With --functional (2026-10-21, Blue; the F-L/F-H functional scenarios only) the cloud ALSO serves the real customer
+camera routes (partner_workspace: scan, provision) for the test owner, and these test-only routes:
+  * POST /test/owner               seed the test owner as a real cloud account (synthetic password, customer_owner grant)
+  * POST /test/expire-pending-claims  make every pending link code expired (the expired-link checks)
+  * POST /test/revoke-appliance    revoke the linked appliance exactly as /api/admin/appliances/{id}/revoke does
+  * POST /test/entitlement-status  set one synthetic entitlement row active/cancelled (Hybrid -> Local)
+  * GET  /test/cameras             the cloud's camera rows for the test customer (no credentials)
+--functional is refused unless the cloud signs with a synthetic sandbox-test key (--signing-key) and runs as the
+Windows Sandbox account (WDAGUtilityAccount): it can never be switched on next to a real cloud or a real customer.
 
     python test-cloud.py --app "C:\\Program Files\\AnyAiCam\\app" --data C:\\TestCloud
         [--host cloud.anyaicam.test] [--port 8443] [--certificates-only]
@@ -67,7 +76,7 @@ def make_certificates(folder: Path, host: str) -> None:
     (folder / 'server.pem').write_bytes(server.public_bytes(serialization.Encoding.PEM))
 
 
-def build_app(data: Path, app_dir: Path, signing_key: Path | None = None):
+def build_app(data: Path, app_dir: Path, signing_key: Path | None = None, functional: bool = False):
     from cryptography.fernet import Fernet
     key_file = data / 'claim_flow_key'
     if not key_file.is_file():
@@ -150,7 +159,78 @@ def build_app(data: Path, app_dir: Path, signing_key: Path | None = None):
         import customer_entitlements
         return customer_entitlements.capacity_breakdown(CUSTOMER_ID)
 
+    if functional:
+        add_functional_routes(app, partner_db, appliance_claims, HTTPException, Request, HTMLResponse)
     return app
+
+
+def add_functional_routes(app, partner_db, appliance_claims, HTTPException, Request, HTMLResponse) -> None:
+    """F-L / F-H only (2026-10-21). Every route below is test-owner only and exists in this disposable cloud alone."""
+    import partner_workspace
+    # partner_workspace imported partner_identity by name: give it the same test-owner shortcut as the claim routes.
+    partner_workspace.partner_identity = appliance_claims.partner_identity
+    partner_workspace.register_partner_workspace_routes(app, shell=lambda *args, **kwargs: HTMLResponse(''))
+
+    def owner_only(request) -> None:
+        if request.headers.get('X-Test-Owner') != 'yes':
+            raise HTTPException(status_code=403, detail='test owner only')
+
+    @app.post('/test/owner')
+    def test_owner(request: Request, payload: dict) -> dict:
+        owner_only(request)
+        password = str(payload['password'])
+        if len(password) < 12:
+            raise HTTPException(status_code=400, detail='synthetic password of 12+ characters')
+        now = datetime.datetime.now().isoformat()
+        with partner_db.connection() as db:
+            db.execute('DELETE FROM identity_grants WHERE user_id=?', (OWNER['id'],))
+            db.execute('DELETE FROM partner_users WHERE id=?', (OWNER['id'],))
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (OWNER['id'], PARTNER_ID, OWNER['email'], 'Test Owner', OWNER['role'], partner_db.password_hash(password), 1, CUSTOMER_ID, now))
+            db.execute("INSERT INTO identity_grants(id,user_id,role,scope_type,scope_id,granted_at,granted_by) VALUES(?,?,?,?,?,?,?)",
+                       (uuid.uuid4().hex, OWNER['id'], OWNER['role'], 'customer', CUSTOMER_ID, now, 'sandbox-test'))
+        return {'email': OWNER['email'], 'role': OWNER['role']}
+
+    @app.post('/test/expire-pending-claims')
+    def test_expire_pending_claims(request: Request) -> dict:
+        owner_only(request)
+        past = (datetime.datetime.now() - datetime.timedelta(minutes=5)).isoformat()
+        with partner_db.connection() as db:
+            count = db.execute("UPDATE appliance_claims SET expires_at=? WHERE status='pending'", (past,)).rowcount
+        return {'expired': count}
+
+    @app.post('/test/revoke-appliance')
+    def test_revoke_appliance(request: Request) -> dict:
+        owner_only(request)
+        now = datetime.datetime.now().isoformat()
+        with partner_db.connection() as db:
+            appliance = db.execute('SELECT id FROM appliances LIMIT 1').fetchone()
+            if not appliance:
+                raise HTTPException(status_code=409, detail='no linked appliance')
+            # The same two statements as appliance_cloud.revoke_appliance (/api/admin/appliances/{id}/revoke).
+            db.execute('UPDATE appliance_credentials SET revoked_at=? WHERE appliance_id=? AND revoked_at IS NULL', (now, appliance['id']))
+            db.execute("UPDATE appliances SET state='revoked',online_status='revoked',credential_revoked_at=? WHERE id=?", (now, appliance['id']))
+        return {'revoked': appliance['id']}
+
+    @app.post('/test/entitlement-status')
+    def test_entitlement_status(request: Request, payload: dict) -> dict:
+        owner_only(request)
+        product, status = str(payload['product']), str(payload['status'])
+        if product not in ('vms_license', 'camera_slots_local', 'camera_slots_hybrid') or status not in ('active', 'cancelled'):
+            raise HTTPException(status_code=400, detail='synthetic products and active/cancelled only')
+        with partner_db.connection() as db:
+            count = db.execute('UPDATE customer_entitlements SET status=?, updated_at=? WHERE customer_id=? AND product=?',
+                               (status, datetime.datetime.now().isoformat(), CUSTOMER_ID, product)).rowcount
+        return {'product': product, 'status': status, 'rows': count}
+
+    @app.get('/test/cameras')
+    def test_cameras(request: Request) -> dict:
+        owner_only(request)
+        with partner_db.connection() as db:
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(cameras)').fetchall()}
+            wanted = [c for c in ('id', 'appliance_id', 'camera_number', 'device_key', 'name', 'status', 'onvif_endpoint') if c in columns]
+            cameras = [dict(r) for r in db.execute(f"SELECT {','.join(wanted)} FROM cameras WHERE customer_id=?", (CUSTOMER_ID,)).fetchall()]
+        return {'cameras': cameras}
 
 
 def main() -> None:
@@ -161,13 +241,20 @@ def main() -> None:
     parser.add_argument('--port', type=int, default=8443)
     parser.add_argument('--certificates-only', action='store_true')
     parser.add_argument('--signing-key', help='synthetic sandbox-test signing key (TEST-ONLY build acceptance)')
+    parser.add_argument('--functional', action='store_true', help='F-L/F-H functional routes (Windows Sandbox + synthetic key only)')
     args = parser.parse_args()
+    if args.functional:
+        # Refused anywhere but the disposable Windows Sandbox with the synthetic key (never next to a real cloud).
+        if not args.signing_key:
+            raise SystemExit('--functional needs the synthetic --signing-key')
+        if os.environ.get('USERNAME', '').lower() != 'wdagutilityaccount':
+            raise SystemExit('--functional runs only inside Windows Sandbox (WDAGUtilityAccount)')
     data = Path(args.data)
     data.mkdir(parents=True, exist_ok=True)
     make_certificates(data / 'tls', args.host)
     if args.certificates_only:
         return
-    app = build_app(data, Path(args.app), Path(args.signing_key) if args.signing_key else None)
+    app = build_app(data, Path(args.app), Path(args.signing_key) if args.signing_key else None, functional=args.functional)
     import uvicorn
     uvicorn.run(app, host='127.0.0.1', port=args.port, ssl_certfile=str(data / 'tls' / 'server.pem'),
                 ssl_keyfile=str(data / 'tls' / 'server.key'), log_level='info')
