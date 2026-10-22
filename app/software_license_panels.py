@@ -142,6 +142,9 @@ def license_panel(contract: dict) -> str:
     # "pending" (Red, 2026-10-15): a paid appliance order whose license activates when the appliance is set up.
     status = {"active": "Active", "suspended": "Paused (billing problem)", "pending": "Starts when your appliance is set up",
               "none": "—"}.get(license_["status"], escape(str(license_["status"])))
+    if license_["status"] == "suspended":  # N1 (Green, 2026-10-21): a refund or a dispute is not a billing problem to fix
+        status = {"refunded": "Suspended (payment refunded)",
+                  "disputed": "Suspended (payment dispute open)"}.get(license_.get("suspended_reason") or "", status)
     runnable = int(license_["usable_cameras"]) if "usable_cameras" in license_ else int(license_["cameras"] or 0)
     if runnable:
         cameras = f'Up to {runnable} camera{"" if runnable == 1 else "s"}'

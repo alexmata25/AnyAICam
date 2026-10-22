@@ -683,6 +683,24 @@ def purchase_progress_banner(customer_id: str, path: str = "") -> str:
             message = '<strong>Plan paused</strong> — Your subscription payment failed. '
         return ('<div class="license-warning-banner" id="purchase-progress-banner" role="alert">' + message +
                 f'<a href="{PURCHASE_INTENT_PATH}">Update payment method</a></div>')
+    # C2 (Green, 2026-10-21): after a refund or a dispute, never "Payment complete -- set up your system".
+    if customer_id and previous_order_refunded_and_ended(customer_id):
+        # The refunded order grants nothing any more (R7): the next step is a new order.
+        if path.rstrip("/") == ORDER_SUMMARY_PATH:
+            return ""
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">'
+                '<strong>Previous order refunded</strong> — Your earlier order was refunded and its subscription has ended. '
+                f'<a href="{ORDER_SUMMARY_PATH}">Start a new order</a></div>')
+    reversed_plan = entitlement_for_customer(customer_id) if customer_id else None
+    if (reversed_plan and reversed_plan.get("status") == "suspended"
+            and reversed_plan.get("suspended_reason") in ("refunded", "disputed")):
+        if path.rstrip("/") == PURCHASE_INTENT_PATH:
+            return ""  # My subscription shows the reason itself (N1)
+        message = ("<strong>Plan suspended</strong> — The payment for your plan was refunded. "
+                   if reversed_plan["suspended_reason"] == "refunded" else
+                   "<strong>Plan suspended</strong> — A payment dispute on your plan is open. ")
+        return ('<div class="license-warning-banner" id="purchase-progress-banner" role="status">' + message +
+                f'<a href="{PURCHASE_INTENT_PATH}">Open My subscription</a></div>')
     deferred = deferred_storage_plan(customer_id)
     if deferred and deferred["state"] == "payment_failed":
         # The appliance is activated but its storage plan's first payment was
