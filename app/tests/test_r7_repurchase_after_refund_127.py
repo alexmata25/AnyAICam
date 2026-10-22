@@ -194,7 +194,7 @@ def test_r7_full_sequence_new_order_after_refund_and_ended_subscription(shop, db
     old_intent = _intent(db_path, customer_id)
     old_licence, old_plan = _licence_row(db_path, customer_id), _plan_row(db_path, customer_id)
     order1 = _order1_records(db_path, customer_id, ids)
-    assert order1["reversals"] and _access(db_path, customer_id) == (True, False)  # (cancelled plan counts as activated)
+    assert order1["reversals"] and _access(db_path, customer_id) == (False, False)  # C5: not activated
     checkouts_before = len(_checkouts(captured))
 
     # The order summary offers a NEW order (licence + plan) and the checkout opens a NEW Stripe Checkout.

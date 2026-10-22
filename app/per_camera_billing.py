@@ -456,6 +456,22 @@ def vms_license_owned(customer_id: str) -> bool:
                (customer_id,)) is not None
 
 
+def own_pc_licence_reversed(customer_id: str) -> bool:
+    """C5 (owner-authorized correction, 2026-10-21): the account's one-time own-PC VMS licence was paid for and that
+    payment is now REFUNDED or DISPUTED (open or lost; a won dispute restores the licence to active), and nothing else
+    licenses the software: no active licence row and no paid AnyAiCam appliance (whose purchase includes the licence).
+    Such an account must not get the software licence back from a camera plan alone -- not from a plan that keeps
+    running or is restored by a later paid month, and not from a fresh plan bought without the licence. Accounts that
+    never had a licence row (appliance customers, plan-only accounts of the billing-v2 design) are not affected."""
+    if not customer_id or vms_license_owned(customer_id):
+        return False
+    import customer_entitlements
+    if customer_entitlements.appliance_includes_vms_license(customer_id):
+        return False
+    return row("SELECT id FROM customer_entitlements WHERE customer_id=? AND product='vms_license' AND status='suspended' "
+               "AND suspended_reason IN ('refunded','disputed') LIMIT 1", (customer_id,)) is not None
+
+
 def account_activated(customer_id: str) -> bool:
     """VMS 1.2.7 activation (owner decision 2026-10-16): the account's initial purchase is verified, so My subscription
     may sell plans and add-ons. Only records the verified Stripe webhook writes count:
@@ -463,7 +479,11 @@ def account_activated(customer_id: str) -> bool:
       that once had one resubscribes here and is never sent back through Build Your System), or an earlier plan;
     * an active one-time VMS software license;
     * a paid AnyAiCam appliance order, or the storage plan ordered with it (hardware-first: the plan follows delivery).
-    A saved Build Your System selection, an open or unpaid checkout, or a refunded/disputed order is not activation."""
+    A saved Build Your System selection, an open or unpaid checkout, or a refunded/disputed order is not activation.
+    C5 (2026-10-21): an ENDED (cancelled) plan does not count while the account's own-PC licence is refunded or disputed
+    (own_pc_licence_reversed): My subscription then sells no plan without the licence, and the customer orders again in
+    Build Your System, which charges the licence (R7). A plan still running keeps the account activated, so its owner
+    can still manage it."""
     if not customer_id:
         return False
     legacy = existing_plan(customer_id)
@@ -478,8 +498,10 @@ def account_activated(customer_id: str) -> bool:
             return True
     try:
         # Rows exist only once Stripe confirmed a payment (an unpaid or incomplete checkout never writes one, see
-        # _upsert_current); a plan whose payment was refunded or disputed does not count.
-        if row("SELECT id FROM camera_plan_entitlements_v2 WHERE customer_id=? AND (status IN ('active','cancelled') OR "
+        # _upsert_current); a plan whose payment was refunded or disputed does not count, nor (C5) an ended plan of an
+        # account whose own-PC licence was refunded or disputed.
+        counted = "'active'" if own_pc_licence_reversed(customer_id) else "'active','cancelled'"
+        if row(f"SELECT id FROM camera_plan_entitlements_v2 WHERE customer_id=? AND (status IN ({counted}) OR "
                "(status='suspended' AND COALESCE(suspended_reason,'') NOT IN ('refunded','disputed'))) LIMIT 1", (customer_id,)):
             return True
     except Exception:  # pre-v2 database
@@ -955,8 +977,14 @@ def product_mode(customer_id: str) -> str:
 
 
 def vms_license_capacity(customer_id: str) -> int:
+    """The software licence an active per-camera plan carries (billing v2). C5 (2026-10-21): none while the account's
+    own-PC licence is refunded or disputed (own_pc_licence_reversed) -- a plan alone never re-licenses the software.
+    Download, signed capacity, camera provisioning and the licence label all read it through
+    customer_entitlements.vms_license_capacity."""
     entitlement = entitlement_for_customer(customer_id)
-    return int(entitlement.get("camera_quantity") or 0) if entitlement and entitlement.get("status") == "active" else 0
+    if not entitlement or entitlement.get("status") != "active" or own_pc_licence_reversed(customer_id):
+        return 0
+    return int(entitlement.get("camera_quantity") or 0)
 
 
 def _set_subscription_payment_failed(subscription_id: str, at=None) -> None:

@@ -177,7 +177,9 @@ def test_after_a_refund_a_later_paid_renewal_restores_the_plan_as_before_but_not
         billing_status.payment_recovered(SUB)  # a later invoice of the subscription was paid
     assert _plan(db_path, customer_id)["status"] == "active"
     assert _licence(db_path, customer_id)["suspended_reason"] == "refunded"  # the licence money was returned: terminal
-    assert _access(db_path, customer_id) == (True, True)  # the paid plan carries the software use (billing v2), as today
+    # C5 (2026-10-21): the restored plan keeps the account activated (manageable) but no longer carries the software
+    # licence while the own-PC licence is refunded: no download (test_c5_refunded_licence_no_plan_capacity_127.py).
+    assert _access(db_path, customer_id) == (True, False)
 
 
 # ------------------------------------------------------------------ later periods
