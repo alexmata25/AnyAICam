@@ -41,6 +41,13 @@ $settings = Get-Content -Raw 'C:\Validation\scripts\acceptance.json' | ConvertFr
 $mode = $settings.product_mode
 $other = if ($mode -eq 'local') { 'hybrid' } else { 'local' }
 $run = if ($mode -eq 'local') { 'F-L' } else { 'F-H' }
+# 1.3.3 acceptance (2026-10-21): with the accepted 1.3.2 setup in C:\Validation\previous this is the functional UPGRADE
+# scenario U132-L / U132-H: 1.3.2 is installed, linked and records the simulated camera first, then the setup under
+# test runs as an upgrade over it and the rest of the scenario runs on the new version; U132-L ends with a rollback
+# to 1.3.2 (uninstall, then the 1.3.2 setup again).
+$previousSetup = Get-ChildItem 'C:\Validation\previous' -Filter 'AnyAiCam-VMS-Setup-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+$upgrade = [bool]$previousSetup
+if ($upgrade) { $run = if ($mode -eq 'local') { 'U132-L' } else { 'U132-H' } }
 Set-Content -Path (Join-Path $results 'report.txt') -Value @(
     "AnyAiCam Windows FUNCTIONAL scenario $run " + (Get-Date -Format o) + " on " + [Environment]::OSVersion.VersionString,
     "LABEL: SYNTHETIC-KEYSET / SIMULATED CAMERA -- not production-keyset acceptance, not physical-camera acceptance.")
@@ -49,6 +56,11 @@ Check 'setup file present (SYNTHETIC-KEYSET build)' { if (-not $setup) { throw '
 Check 'run settings: synthetic-test keyset (functional runs never use the production build)' {
     if ($settings.keyset_kind -ne 'synthetic-test' -or -not $settings.functional) { throw "keyset_kind $($settings.keyset_kind) functional $($settings.functional)" }
     "keyset synthetic-test; mode $mode"
+}
+if ($upgrade) {
+    Check 'previous setup present (the accepted 1.3.2, SYNTHETIC-KEYSET): installed first, then upgraded' {
+        "$($previousSetup.Name) $($previousSetup.Length) bytes sha256=$((Get-FileHash $previousSetup.FullName -Algorithm SHA256).Hash.ToLower())"
+    }
 }
 
 # ---------------------------------------------------------------- isolation (same rules as validate-in-sandbox.ps1)
@@ -63,9 +75,10 @@ Info 'network adapters in this Sandbox' { (@(Get-NetIPAddress -ErrorAction Silen
 
 # ---------------------------------------------------------------- install
 $installError = ''
-try { $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop }
+$firstSetup = if ($upgrade) { $previousSetup } else { $setup }
+try { $install = Start-Process -FilePath $firstSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop }
 catch { $install = $null; $installError = $_.Exception.Message }
-Check 'install: silent setup exit code 0' { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
+Check "install$(if ($upgrade) { ' (previous 1.3.2)' }): silent setup exit code 0" { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
 Check 'install: VMS answers /health within 3 minutes' { WaitHealthy 180 }
 Check 'install: /version is 1.2.7 with the full build commit' { $v = (Http '/version').Content | ConvertFrom-Json; if ($v.version -ne '1.2.7' -or "$($v.build_id)" -notmatch '^[0-9a-f]{40}$') { throw "version $($v.version) build $($v.build_id)" }; "version $($v.version) build $($v.build_id)" }
 $app = Join-Path $env:ProgramFiles 'AnyAiCam'
@@ -202,6 +215,120 @@ function Diag([string]$Label) {
     $out | Set-Content (Join-Path $results "diag-$Label.txt")
 }
 
+# ---------------------------------------------------------------- 1.3.3 acceptance checks (2026-10-21)
+function PlaylistFresh([string]$Label) {
+    # D2: on Windows a reader of the live playlist froze it (os.stat age grew to minutes); fixed builds keep it fresh.
+    Check "live playlist fresh ($Label): camera<N>.m3u8 rewritten within 10 s (no freeze)" {
+        $pl = Join-Path $data "hls\camera$camNo.m3u8"
+        $age = & $hp -c "import os, sys, time; p = sys.argv[1]; print(round(time.time() - os.stat(p).st_mtime, 1) if os.path.exists(p) else -1)" $pl 2>&1
+        $a = [double]"$age"; if ($a -lt 0) { throw 'no playlist' }; if ($a -ge 10) { throw "age $a s" }; "age $a s"
+    }
+}
+function MotionReaderRtsp([string]$Label) {
+    Check "motion reader ($Label): reads the camera stream over RTSP, never camera<N>.m3u8" {
+        $readers = @(Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" -and $_.CommandLine -match 'scale=160:90' })
+        if (-not $readers) { throw 'no motion reader running' }
+        $bad = @($readers | Where-Object { $_.CommandLine -match '\.m3u8' -or $_.CommandLine -notmatch '-i\s+rtsp://' })
+        if ($bad) { throw "reader not on RTSP: $($bad[0].CommandLine -replace 'rtsp://[^@\s]*@', 'rtsp://***@')" }
+        "$($readers.Count) reader(s) on rtsp://"
+    }
+}
+function MoqCheck([string]$Label) {
+    # O3: MediaMTX 1.21's default MoQ server (8892 TCP/UDP, 8893 UDP) must not run next to the VMS; WebRTC must.
+    Check "MoQ ($Label): the VMS MediaMTX runs, no MoQ listener (8892 TCP/UDP, 8893 UDP), WebRTC 8889 TCP + 8189 UDP present" {
+        $vms = WaitFor 90 { @(Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" })[0] }
+        if (-not $vms) { throw 'no VMS MediaMTX process' }
+        Start-Sleep -Seconds 5
+        $tcp = @(Get-NetTCPConnection -State Listen -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
+        $udp = @(Get-NetUDPEndpoint -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
+        if ($tcp -contains 8892 -or $udp -contains 8892 -or $udp -contains 8893) { throw "MoQ listening: tcp $($tcp -join ',') udp $($udp -join ',')" }
+        if ($tcp -notcontains 8889 -or $udp -notcontains 8189) { throw "WebRTC ports missing: tcp $($tcp -join ',') udp $($udp -join ',')" }
+        "tcp $($tcp -join ','); udp $($udp -join ',')"
+    }
+}
+$edgeExe = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
+$script:proxy = $null
+function StartProxy {
+    # sandbox-proxy.py: Edge renders the REAL pages with the owner's session, and plays WHEP without CORS.
+    if ($script:proxy -and -not $script:proxy.HasExited) { return }
+    $script:proxy = Start-Process -FilePath $hp -ArgumentList @('"C:\Validation\scripts\sandbox-proxy.py"', '--jar', $ownerJar, '--results', $results, '--port', '18080') `
+        -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $results 'sandbox-proxy.out.log') -RedirectStandardError (Join-Path $results 'sandbox-proxy.err.log')
+    [void](WaitFor 20 { try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri 'http://127.0.0.1:18080/__whep.html').StatusCode -eq 200 } catch { $false } })
+}
+function StopEdge {
+    Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CommandLine -like '*C:\Sim\edge-*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+function WebRtcCheck([string]$Label) {
+    Check "WebRTC ($Label): headless Edge plays the camera's VMS MediaMTX path over WHEP (local loopback ICE)" {
+        if (-not (Test-Path -LiteralPath $edgeExe)) { throw "Edge not found at $edgeExe" }
+        StartProxy
+        $result = Join-Path $results 'webrtc-result.json'; Remove-Item $result -Force -ErrorAction SilentlyContinue
+        # Sandbox limit (test-only shim, like discovery_networks): the Sandbox has no network interface, and MediaMTX never
+        # offers a loopback ICE candidate on its own (advertised_hosts() accepts LAN/Tailscale addresses only), so the
+        # harness adds 127.0.0.1 through the VMS MediaMTX's loopback-only API for this check and removes it afterwards.
+        try {
+            Invoke-RestMethod -Method Patch -Uri 'http://127.0.0.1:9997/v3/config/global/patch' -ContentType 'application/json' -TimeoutSec 10 -Body '{"webrtcAdditionalHosts":["127.0.0.1"]}' | Out-Null
+            $shim = 'loopback ICE candidate added by the harness'
+        } catch { $shim = "loopback candidate not added: $($_.Exception.Message)" }
+        [void](Start-Process -FilePath $edgeExe -PassThru -ArgumentList @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+            '--user-data-dir=C:\Sim\edge-webrtc', '--allow-loopback-in-peer-connection', '--autoplay-policy=no-user-gesture-required',
+            "http://127.0.0.1:18080/__whep.html?path=$camId"))
+        $got = WaitFor 90 { if (Test-Path $result) { Get-Content -Raw $result | ConvertFrom-Json } }
+        StopEdge
+        try { Invoke-RestMethod -Method Patch -Uri 'http://127.0.0.1:9997/v3/config/global/patch' -ContentType 'application/json' -TimeoutSec 10 -Body '{"webrtcAdditionalHosts":[]}' | Out-Null } catch { }
+        if (-not $got) { throw 'the WHEP page reported nothing within 90 s' }
+        Copy-Item $result (Join-Path $results "webrtc-result-$Label.json") -Force
+        $frame = Join-Path $results 'webrtc-frame.png'
+        if (Test-Path $frame) { Move-Item $frame (Join-Path $results "webrtc-frame-$Label.png") -Force }
+        if (-not $got.ok) { throw "not playing ($shim): $($got | ConvertTo-Json -Compress)" }
+        "playing $($got.width)x$($got.height), t=$([math]::Round([double]$got.currentTime, 1)) s, ICE $($got.ice); $shim; frame webrtc-frame-$Label.png"
+    }
+}
+function SubscriptionCheck([string]$Label) {
+    # Codex round 5 APPLIANCE-PRICING-DRIFT: on an appliance every add-on is "Coming soon" with no amount.
+    Check "My subscription ($Label): every add-on row 'Coming soon' with no amount; no unapproved price on the page" {
+        $file = Join-Path $results "subscription-portal-$Label.html"
+        $r = Edge GET '/subscription-portal' -Out $file
+        if ($r.status -ne 200) { throw "status $($r.status)" }
+        $html = [IO.File]::ReadAllText($file)
+        $start = $html.IndexOf('Optional analytics</h3>'); $end = $html.IndexOf('Advanced Line Crossing is not sold separately')
+        if ($start -lt 0 -or $end -le $start) { throw 'no add-on section' }
+        $section = $html.Substring($start, $end - $start)
+        $rows = @([regex]::Matches($section, '<div class="health-row">(.*?)</div>', 'Singleline') | ForEach-Object { $_.Groups[1].Value })
+        if (-not $rows) { throw 'no add-on rows' }
+        $priced = @($rows | Where-Object { $_.Contains('$') }); if ($priced) { throw "add-on row with an amount: $($priced[0])" }
+        if ($section -notmatch 'Coming soon') { throw 'no Coming soon' }
+        if ($section -match 'addon-buy-button') { throw 'a buy button is shown' }
+        foreach ($a in '$7.99', '$4.99', '$39.99', '$49.99', '$69.99') { if ($html.Contains($a)) { throw "$a on the page" } }
+        StartProxy
+        $png = Join-Path $results "subscription-portal-$Label.png"
+        $shot = Start-Process -FilePath $edgeExe -PassThru -ArgumentList @('--headless=new', '--disable-gpu', '--no-first-run', '--user-data-dir=C:\Sim\edge-shot',
+            '--window-size=1280,2400', "--screenshot=$png", 'http://127.0.0.1:18080/subscription-portal')
+        if (-not $shot.WaitForExit(60000)) { Stop-Process -Id $shot.Id -Force -ErrorAction SilentlyContinue }
+        StopEdge
+        "$($rows.Count) add-on rows, all Coming soon without an amount; screenshot $(if (Test-Path $png) { 'saved' } else { 'NOT saved' })"
+    }
+}
+function UpgradeState {
+    [ordered]@{
+        appliance_id = [string](Get-Content -Raw (Join-Path $data 'config\appliance_identity.json') | ConvertFrom-Json).appliance_id
+        credential   = (Get-FileHash (Join-Path $agentState 'credential.json')).Hash
+        secrets      = [string](Get-Content (Join-Path $data 'config\vms.env') | Where-Object { $_.StartsWith('ANYAICAM_APP_SECRETS=') })
+        mode         = [string](Get-Content -Raw (Join-Path $data 'config\product_mode.json') | ConvertFrom-Json).mode
+        capacity     = [string](Capacity)
+        camera       = [string](@(EdgeSql "SELECT id, camera_number, onvif_endpoint FROM cameras WHERE id='$camId'")[0] | ConvertTo-Json -Compress)
+        enrolled     = [string]@(EdgeSql "SELECT user_id FROM local_customer_credentials WHERE revoked_at IS NULL").Count
+    }
+}
+function ClipIds {
+    [void](Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true })
+    $r = WaitFor 120 { $x = Edge GET "/api/customer/recordings/$camId"; if ($x.status -eq 200) { $x } }
+    @($r.body.clips | ForEach-Object { [string]$_.id })
+}
+$uninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1'
+function SetupVersionOf($file) { if ($file.Name -match 'Setup-(\d+\.\d+\.\d+)-') { $Matches[1] } else { '?' } }
+
 # ---------------------------------------------------------------- test cloud (functional routes; synthetic key; Sandbox only)
 & $hp 'C:\Validation\scripts\test-cloud.py' --app $cloudApp --data $cloudData --host $TestCloudHost --certificates-only
 Import-Certificate -FilePath (Join-Path $cloudData 'tls\ca.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
@@ -296,6 +423,7 @@ Check 'appliance password: the owner enrols an offline appliance password' {
     $s = (Edge GET '/api/customer/appliance-sign-in').body; if (-not $s.enrolled -or -not $s.offline_ready) { throw "enrolled $($s.enrolled) offline_ready $($s.offline_ready)" }
     'enrolled; offline_ready'
 }
+if (-not $upgrade) { SubscriptionCheck $mode }
 
 # ---------------------------------------------------------------- simulated camera on 127.0.0.5 (loopback only)
 $camHost = '127.0.0.5'
@@ -373,6 +501,59 @@ Check 'edge sync: the camera reaches the VMS with its stream address and is lice
 }
 $camId = if ($camera) { [string]$camera.id } else { 'none' }
 
+# ---------------------------------------------------------------- UPGRADE 1.3.2 -> setup under test (U132-L / U132-H)
+if ($upgrade) {
+    # A finished, listed recording made by 1.3.2: a VMS restart ends the open segment; listed once older than 90 s.
+    $preGrowing = WaitFor 300 { Growing $camNo }
+    Restart-Service AnyAiCamVMS -Force; [void](WaitHealthy 180)
+    $script:preClips = @()
+    Check 'upgrade (before): 1.3.2 recorded the simulated camera and lists a finished clip' {
+        $clips = WaitFor 420 { $r = Edge GET "/api/customer/recordings/$camId"; if ($r.status -eq 200 -and @($r.body.clips).Count) { @($r.body.clips) } }
+        if (-not $clips) { throw "no clip listed under 1.3.2 (recording was growing: $([bool]$preGrowing))" }
+        $script:preClips = @($clips | ForEach-Object { [string]$_.id }); "$($script:preClips.Count) clip(s) before the upgrade"
+    }
+    $beforeState = UpgradeState
+    $beforeBuild = ((Http '/version').Content | ConvertFrom-Json).build_id
+    $beforeState | ConvertTo-Json | Set-Content (Join-Path $results 'upgrade-before.json')
+    $up = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-upgrade.log') + '"') -Wait -PassThru
+    Check 'upgrade: the setup under test runs over 1.3.2 (exit 0) and the VMS is healthy' {
+        if ($up.ExitCode -ne 0) { throw "exit $($up.ExitCode)" }; if (-not (WaitHealthy 240)) { throw 'not healthy' }; 'exit 0; healthy'
+    }
+    Check 'upgrade: the uninstall entry and /version report the new setup' {
+        $u = Get-ItemProperty $uninstallKey; $v = (Http '/version').Content | ConvertFrom-Json
+        if ($u.DisplayVersion -ne (SetupVersionOf $setup)) { throw "DisplayVersion $($u.DisplayVersion), expected $(SetupVersionOf $setup)" }
+        if ($v.build_id -eq $beforeBuild) { throw "build still $($v.build_id)" }
+        "DisplayVersion $($u.DisplayVersion); build $($v.build_id) (was $beforeBuild)"
+    }
+    Check 'upgrade: identity, link credential, secrets, mode, capacity, camera and appliance password are kept' {
+        $after = WaitFor 120 { $s = UpgradeState; if ($s.capacity -eq $beforeState.capacity) { $s } }
+        if (-not $after) { $after = UpgradeState }
+        $after | ConvertTo-Json | Set-Content (Join-Path $results 'upgrade-after.json')
+        $changed = @(foreach ($k in $beforeState.Keys) { if ("$($after[$k])" -ne "$($beforeState[$k])") { $k } })
+        if ($changed) { throw "changed: $($changed -join ', ') (see upgrade-before.json / upgrade-after.json)" }; "all $($beforeState.Keys.Count) kept"
+    }
+    Check 'upgrade: the clips recorded by 1.3.2 are still listed and play (MP4, H.264) on the new version' {
+        $ids = ClipIds
+        $missing = @($script:preClips | Where-Object { $ids -notcontains $_ }); if ($missing) { throw "$($missing.Count) clip(s) missing after the upgrade" }
+        $file = Join-Path $results 'upgrade-old-clip.mp4'
+        $m = Edge GET "/api/customer/recordings/$camId/$($script:preClips[0])/media" -Out $file
+        if ($m.status -eq 302 -and $m.location) { $m = Edge GET $m.location -Out $file }
+        if ($m.status -ne 200) { throw "media $($m.status)" }
+        $p = Probe $file; if (-not ($p.streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'no video in the old clip' }
+        "$($script:preClips.Count) clip(s) kept; the oldest plays"
+    }
+    Check 'upgrade: running the 1.3.2 setup over the new version is refused (downgrade) and changes nothing' {
+        $envBefore = (Get-FileHash (Join-Path $data 'config\vms.env')).Hash
+        $d = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-downgrade-133-refused.log') + '"') -Wait -PassThru
+        if ($d.ExitCode -eq 0) { throw '1.3.2 setup ran over the newer version' }
+        if ((Get-FileHash (Join-Path $data 'config\vms.env')).Hash -ne $envBefore) { throw 'vms.env changed' }
+        if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne (SetupVersionOf $setup)) { throw 'version changed' }
+        if (-not (WaitHealthy 120)) { throw 'not healthy after the refused setup' }
+        "exit $($d.ExitCode); vms.env and version unchanged; healthy"
+    }
+    SubscriptionCheck "$mode-after-upgrade"
+}
+
 # ---------------------------------------------------------------- live view
 $liveStarted = Get-Date
 Check 'live view: the customer live playlist serves fresh segments of the simulated camera' {
@@ -396,7 +577,9 @@ Check 'live view (operator pages): /static/hls/camera<N>.m3u8 -- used by /, /cam
     if ($r.status -ne 200) { throw "HTTP $($r.status) although $($files.Count) playlist file(s) exist in $data\hls (static files are served from $app\app\static)" }
     'served'
 }
-Info 'live view: WebRTC' { 'not tested: WebRTC signalling runs through the cloud (live_view_p2p), which the test cloud does not serve' }
+if ($mode -eq 'hybrid') { MoqCheck $mode; WebRtcCheck $mode }
+else { Info 'live view: WebRTC' { 'Local mode runs no WebRTC publisher (P2P is a Hybrid feature): checked in the Hybrid runs and after each switch to Hybrid' } }
+Info 'live view: WebRTC through the cloud' { 'not tested: cloud signalling / P2P / TURN run through the cloud (live_view_p2p), which the test cloud does not serve' }
 
 # ---------------------------------------------------------------- recording, motion, analytics
 Check 'recording: the VMS records the simulated camera to MKV under ProgramData (true size growing)' {
@@ -405,6 +588,7 @@ Check 'recording: the VMS records the simulated camera to MKV under ProgramData 
     if (-not $g) { throw "no growing MKV in $data\recordings\camera$camNo ($((Mkv $camNo).Count) file(s)); see diag-recording.txt" }
     "$($g.name) $($g.from) -> $($g.to) bytes ($($g.note))"
 }
+PlaylistFresh 'recording'
 Check 'motion (basic, default ON): the moving box produces motion events' {
     $file = Join-Path $data 'recordings\motion_events.jsonl'
     $events = WaitFor 300 { if (Test-Path $file) { @([IO.File]::ReadAllLines($file) | Where-Object { $_ -match "`"camera`"\s*:\s*$camNo\b" }) } }
@@ -412,6 +596,8 @@ Check 'motion (basic, default ON): the moving box produces motion events' {
     if (-not $events) { throw "no motion event for camera $camNo (motion_events.jsonl exists: $(Test-Path $file)); see diag-motion.txt" }
     "$(@($events).Count) motion event line(s)"
 }
+PlaylistFresh 'motion'
+MotionReaderRtsp 'motion'
 Info 'motion: /api/events?camera=<N> with the owner session' { $r = Edge GET "/api/events?camera=$camNo"; "status $($r.status); events $(@($r.body.events).Count)" }
 Check 'analytics: premium analytics are OFF by default on the new camera; Windows-unavailable ones say why' {
     $r = Edge GET "/api/customer/analytics-control/cameras/$camId"
@@ -449,12 +635,15 @@ function SwitchMode([string]$Target, [scriptblock]$Change) {
         "persisted $p; restart_vms completed; runtime $m; $($flags.PSObject.Properties.Count) cloud flags $($Target -eq 'hybrid')"
     }
     Info "MediaMTX listeners after the switch to $Target" { Start-Sleep -Seconds 20; MediaMtxListeners }
+    if ($Target -eq 'hybrid') { MoqCheck "after the switch to hybrid"; WebRtcCheck "after-switch-hybrid" }
     Check "mode: after the switch to $Target the camera is still licensed and recording resumes" {
         $l = Licensed $camNo; if ($l -ne "[$camNo]") { throw "licensed $l" }
         $g = WaitFor 300 { Growing $camNo }
         Diag "after-switch-$Target"
         if (-not $g) { throw "no growing recording after the switch; see diag-after-switch-$Target.txt" }; "licensed; $($g.name) $($g.note) ($($g.from) -> $($g.to) bytes)"
     }
+    PlaylistFresh "after-switch-$Target"
+    MotionReaderRtsp "after-switch-$Target"
 }
 if ($mode -eq 'local') {
     SwitchMode 'hybrid' { [void](Cloud POST '/test/entitlement' @{ product = 'camera_slots_hybrid'; quantity = 2 } -Owner) }
@@ -491,6 +680,7 @@ Check 'offline: live view still works without the cloud' {
     if (-not $pl) { throw "no live playlist offline: last answer $($script:lastLive.status) $((ConvertTo-Json $script:lastLive.body -Compress) -replace '(.{300}).*', '$1...')" }
     'playlist with segments'
 }
+PlaylistFresh 'offline'
 Check 'offline: recording continues without the cloud' {
     $g = WaitFor 180 { Growing $camNo }
     Diag 'offline-recording'
@@ -524,6 +714,29 @@ Check 'online again: the cloud returns and the owner signs in online again' {
     $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\again.cookies'; if ($x.status -eq 303) { $x } }
     if (-not $r) { throw 'online sign-in did not recover' }; '303'
 }
+# ---------------------------------------------------------------- ROLLBACK new -> 1.3.2 (U132-L): uninstall, then the 1.3.2 setup
+if ($upgrade -and $mode -eq 'local') {
+    $rbState = UpgradeState; $rbMkv = (Mkv $camNo).Count; $rbClips = ClipIds
+    $unins = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
+    $rbU = Start-Process -FilePath $unins.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-rollback-uninstall.log') + '"') -Wait -PassThru
+    Check 'rollback: uninstalling the new version (exit 0) keeps data, link credential and recordings' {
+        if ($rbU.ExitCode -ne 0) { throw "exit $($rbU.ExitCode)" }
+        if (-not (Test-Path (Join-Path $agentState 'credential.json'))) { throw 'credential gone' }
+        if ((Mkv $camNo).Count -lt $rbMkv) { throw 'recordings gone' }
+        "exit 0; credential and $rbMkv recording file(s) kept"
+    }
+    $rbI = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+        ('/LOG="' + (Join-Path $results 'setup-rollback-install.log') + '"') -Wait -PassThru
+    Check 'rollback: the accepted 1.3.2 installs again (exit 0), healthy; identity, link, secrets kept; recordings listed' {
+        if ($rbI.ExitCode -ne 0) { throw "exit $($rbI.ExitCode)" }
+        if (-not (WaitHealthy 240)) { throw 'not healthy' }
+        if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne (SetupVersionOf $previousSetup)) { throw "DisplayVersion $((Get-ItemProperty $uninstallKey).DisplayVersion)" }
+        $now = UpgradeState
+        foreach ($k in 'appliance_id', 'credential', 'secrets') { if ("$($now[$k])" -ne "$($rbState[$k])") { throw "$k changed" } }
+        $ids = ClipIds; $missing = @($rbClips | Where-Object { $ids -notcontains $_ }); if ($missing) { throw "$($missing.Count) clip(s) missing" }
+        "1.3.2 again (DisplayVersion $(SetupVersionOf $previousSetup)); identity, link, secrets kept; $($ids.Count) clip(s) listed"
+    }
+}
 [void](Cloud POST '/test/revoke-appliance' -Owner)
 Check 'revoked appliance: the cloud refuses it and online customer sign-in on this PC is refused' {
     $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\revoked.cookies'; if ($x.status -ge 400) { $x } }
@@ -552,7 +765,7 @@ $credential = [string](Get-Content -Raw (Join-Path $agentState 'credential.json'
 Check 'no link code, credential or synthetic password in any collected log or report' {
     $secrets = @($linkCodes) + @($credential, $cloudPassword, $appliancePassword) | Where-Object { $_ }
     if (@($secrets).Count -lt 4) { throw 'secrets unknown; nothing to search for' }
-    $leaks = Get-ChildItem $results -Recurse -File | Where-Object { $_.Extension -in '.log', '.txt', '.json', '.m3u8' } | Where-Object {
+    $leaks = Get-ChildItem $results -Recurse -File | Where-Object { $_.Extension -in '.log', '.txt', '.json', '.m3u8', '.html' } | Where-Object {
         $text = [IO.File]::ReadAllText($_.FullName); @($secrets | Where-Object { $text.Contains($_) }).Count -gt 0 }
     if ($leaks) { throw "found in $($leaks.Name -join ', ')" }; "$(@(Get-ChildItem $results -Recurse -File).Count) files checked"
 }

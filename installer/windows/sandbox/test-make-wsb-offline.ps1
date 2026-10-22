@@ -45,7 +45,15 @@ T 'default runs are unchanged: validate-in-sandbox.ps1, no functional key, no fu
     }
 }
 T 'functional run with the production keyset is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x7') -ProductMode local -KeysetKind production -ExpectedKeysetSha256 $prod -Functional } 'synthetic-test build only'
-T 'functional run as an upgrade is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x8') -ProductMode local -KeysetKind synthetic-test -ExpectedKeysetSha256 $prod -SyntheticSigningKey $SyntheticKey -Previous $older -Functional } 'fresh install'
+# 1.3.3 (2026-10-21): a functional run may be an UPGRADE from a real earlier setup (U132-L / U132-H); never simulated.
+T 'functional upgrade run: the earlier setup is copied, functional_upgrade=true, sandbox-proxy.py copied' {
+    & $make -Setup $setup -Folder (Join-Path $Work 'fu') -ProductMode local -KeysetKind synthetic-test -ExpectedKeysetSha256 ('0' * 64) -SyntheticSigningKey $SyntheticKey -Previous $older -Functional
+    if (-not (Test-Path (Join-Path $Work ('fu\previous\' + (Split-Path $older -Leaf))))) { throw 'previous setup not copied' }
+    $a = Get-Content -Raw (Join-Path $Work 'fu\scripts\acceptance.json') | ConvertFrom-Json
+    if (-not $a.functional -or -not $a.functional_upgrade) { throw ($a | ConvertTo-Json -Compress) }
+    if (-not (Test-Path (Join-Path $Work 'fu\scripts\sandbox-proxy.py'))) { throw 'sandbox-proxy.py missing' }
+}
+T 'functional run with simulated 1.3.0 leftovers is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x8') -ProductMode local -KeysetKind synthetic-test -ExpectedKeysetSha256 $prod -SyntheticSigningKey $SyntheticKey -SimulatePrevious -Functional } 'never plants simulated'
 $failed = @($results | Where-Object { -not $_.ok }).Count
 "MAKE-WSB OFFLINE TEST $($results.Count - $failed)/$($results.Count) passed"
 if ($failed) { exit 1 }

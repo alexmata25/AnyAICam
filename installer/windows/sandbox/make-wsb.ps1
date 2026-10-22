@@ -40,7 +40,8 @@ if ($KeysetKind -eq 'synthetic-test') {
     if ($syntheticKey.key_id -notlike 'sandbox-test-*') { throw 'Not a synthetic sandbox-test signing key.' }
 } elseif ($SyntheticSigningKey) { throw 'A production run never receives a signing key.' }
 if ($Functional -and $KeysetKind -ne 'synthetic-test') { throw 'A functional run uses the synthetic-test build only (SYNTHETIC-KEYSET / SIMULATED CAMERA).' }
-if ($Functional -and ($Previous -or $SimulatePrevious)) { throw 'A functional run is a fresh install: no -Previous or -SimulatePrevious.' }
+# 1.3.3 (2026-10-21): -Functional -Previous <accepted 1.3.2 setup> = the functional UPGRADE scenario U132-L / U132-H.
+if ($Functional -and $SimulatePrevious) { throw 'A functional run never plants simulated 1.3.0 leftovers: use -Previous with a real earlier setup.' }
 $root = New-Item -ItemType Directory -Path $Folder
 foreach ($sub in 'setup', 'results', 'scripts', 'previous') { New-Item -ItemType Directory -Path (Join-Path $root.FullName $sub) | Out-Null }
 Copy-Item -LiteralPath $setupFile.FullName -Destination (Join-Path $root.FullName 'setup')
@@ -61,9 +62,9 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'acceptance-127.ps1') -Destinati
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'synthetic-snapshots.py') -Destination (Join-Path $root.FullName 'scripts')
 if ($KeysetKind -eq 'synthetic-test') { Copy-Item -LiteralPath $SyntheticSigningKey -Destination (Join-Path $root.FullName 'scripts\signing-key.json') }
 # Functional scenario (2026-10-21): its entry script, the edge HTTP helper and the simulated ONVIF camera.
-if ($Functional) { foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', 'onvif-camera-sim.py') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $root.FullName 'scripts') } }
+if ($Functional) { foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', 'onvif-camera-sim.py', 'sandbox-proxy.py') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $root.FullName 'scripts') } }
 $runSettings = [ordered]@{ product_mode = $ProductMode; keyset_kind = $KeysetKind; expected_keyset_sha256 = $ExpectedKeysetSha256 }
-if ($Functional) { $runSettings.functional = $true }
+if ($Functional) { $runSettings.functional = $true; if ($Previous) { $runSettings.functional_upgrade = $true } }
 $runSettings |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root.FullName 'scripts\acceptance.json') -Encoding ASCII
 $escape = { param($s) [Security.SecurityElement]::Escape($s) }
