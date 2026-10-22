@@ -379,6 +379,80 @@ def _ordered_plan(customer_id: str) -> tuple[str | None, int]:
     return None, 0
 
 
+HARDWARE_FULFILLMENT_LABELS = {"unfulfilled": "Awaiting preparation", "paid": "Awaiting preparation", "preparing": "Being prepared",
+                               "configuring": "Being prepared", "testing": "Being prepared", "ready_to_ship": "Ready to ship",
+                               "shipped": "Shipped", "delivered": "Delivered", "cancelled": "Cancelled"}
+PLAN_STATUS_LABELS = {"active": "Active", "trialing": "Trial", "suspended": "Suspended", "past_due": "Payment due",
+                      "canceled": "Ended", "cancelled": "Ended", "ended": "Ended"}
+
+
+def _money(cents: int) -> str:
+    return f"${cents / 100:,.2f}"
+
+
+def _date(epoch) -> str:
+    from datetime import datetime, timezone
+    try:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime("%B %d, %Y").replace(" 0", " ")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def purchases_panel(customer_id: str) -> str:
+    """Owner 2026-10-22: what the customer bought, at what price, and its status -- read only from server records written
+    after Stripe verification (camera plan entitlement and its billed Price, the VMS licence entitlement priced from the
+    server catalog the checkout enforces, paid hardware orders with their recorded amounts). Never from the URL or the
+    browser. Shown on the authenticated order-complete page, which customers can reopen any time."""
+    from partner_db import row, rows
+    import pricing_catalog
+    items = []
+    payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
+    if payload:
+        quantity = int(payload["camera_quantity"])
+        if payload.get("monthly_per_camera_amount") is not None:
+            per = round(payload["monthly_per_camera_amount"] * 100)
+            price = f"{quantity} × {_money(per)} = {_money(per * quantity)}/month"
+        else:
+            price = "see My subscription for the amount"
+        status = PLAN_STATUS_LABELS.get(str(payload.get("status") or "").lower(), str(payload.get("status") or "").title())
+        when = _date(payload.get("billing_period_end"))
+        if when and status == "Active":
+            status += f" · {'ends' if payload.get('cancel_at_period_end') else 'renews'} on {when}"
+        items.append(("order-item-plan", f"AnyAiCam {payload['display_name']} plan · {_cameras(quantity)}", price, status))
+    else:
+        deferred = billing.deferred_storage_plan(customer_id)
+        if deferred and deferred["plan_key"] in billing.PLANS:
+            plan = billing.PLANS[deferred["plan_key"]]
+            quantity = int(deferred["camera_quantity"])
+            per = int(plan["monthly_cents_per_camera"])
+            items.append(("order-item-plan", f"AnyAiCam {plan['display_name']} plan · {_cameras(quantity)}",
+                          f"{quantity} × {_money(per)} = {_money(per * quantity)}/month",
+                          "Starts when you activate your appliance (nothing charged before then)"))
+    licence = row("SELECT camera_slot_quantity,status FROM customer_entitlements WHERE customer_id=? AND product=?",
+                  (customer_id, pricing_catalog.VMS_LICENSE_PRODUCT))
+    if licence:
+        capacity = int(licence["camera_slot_quantity"] or 0)
+        tier = next((cents for cap, cents, _env in pricing_catalog.VMS_LICENSES if cap == capacity), None)
+        items.append(("order-item-licence", f"AnyAiCam VMS software license (up to {capacity} cameras)",
+                      f"{_money(tier)} one-time" if tier is not None else "one-time",
+                      "Active" if licence["status"] == "active" else str(licence["status"] or "").replace("_", " ").title()))
+    for order in rows("SELECT product_name,quantity,amount_cents,status,fulfillment_status FROM hardware_orders "
+                      "WHERE customer_id=? AND status='paid' ORDER BY created_at", (customer_id,)):
+        quantity = int(order["quantity"] or 1)
+        label = HARDWARE_FULFILLMENT_LABELS.get(str(order["fulfillment_status"] or ""), "Awaiting preparation")
+        items.append(("order-item-hardware", f"{order['product_name']}" + (f" × {quantity}" if quantity > 1 else ""),
+                      f"{_money(int(order['amount_cents']))} one-time", label))
+    if not items:
+        return ""
+    lines = "".join(f'<div class="order-line" data-item="{kind}"><span>{escape(name)}<br><small>{escape(status)}</small></span>'
+                    f'<span>{escape(price)}</span></div>' for kind, name, price, status in items)
+    import hardware_checkout
+    return ('<section id="order-purchases" style="margin-top:14px"><h3>Your purchase</h3>' + lines +
+            '<p class="note">Prices before any applicable tax. '
+            f'<a href="{hardware_checkout.ORDERS_PATH}" id="order-my-orders">My orders</a> · '
+            '<a href="/subscription-portal" id="order-my-subscription">My subscription</a></p></section>')
+
+
 # Outbox key for the Build Your System order confirmation: one per account,
 # in purchase_notifications' provisioning_notifications table.
 ORDER_CONFIRMATION_KEY = "build-order-confirmed:"
@@ -625,7 +699,7 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             else:
                 body = ('<h2>Your AnyAiCam plan is active</h2>' + summary +
                         '<a class="submit" href="/customer-account">Open AnyAiCam</a>')
-            return HTMLResponse(_page("Your order", body, script=script), headers=NO_STORE)
+            return HTMLResponse(_page("Your order", body + purchases_panel(customer_id), script=script), headers=NO_STORE)
         if not session_id:
             return RedirectResponse(billing.ORDER_SUMMARY_PATH, status_code=303)
         state = _session_state(customer_id, session_id)
