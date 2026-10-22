@@ -269,10 +269,12 @@ function WebRtcCheck([string]$Label) {
         # harness adds 127.0.0.1 through the VMS MediaMTX's loopback-only API for this check and removes it afterwards.
         try {
             Invoke-RestMethod -Method Patch -Uri 'http://127.0.0.1:9997/v3/config/global/patch' -ContentType 'application/json' -TimeoutSec 10 -Body '{"webrtcAdditionalHosts":["127.0.0.1"]}' | Out-Null
-            $shim = 'loopback ICE candidate added by the harness'
+            $hosts = (Invoke-RestMethod -Uri 'http://127.0.0.1:9997/v3/config/global/get' -TimeoutSec 10).webrtcAdditionalHosts
+            $shim = "loopback ICE host added by the harness (MediaMTX webrtcAdditionalHosts: $($hosts -join ','))"
         } catch { $shim = "loopback candidate not added: $($_.Exception.Message)" }
         [void](Start-Process -FilePath $edgeExe -PassThru -ArgumentList @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
             '--user-data-dir=C:\Sim\edge-webrtc', '--allow-loopback-in-peer-connection', '--autoplay-policy=no-user-gesture-required',
+            '--disable-features=WebRtcHideLocalIpsWithMdns',
             "http://127.0.0.1:18080/__whep.html?path=$camId"))
         $got = WaitFor 90 { if (Test-Path $result) { Get-Content -Raw $result | ConvertFrom-Json } }
         StopEdge
@@ -751,6 +753,10 @@ Info 'revoked appliance: what the agent and VMS do (observed, no expectation in 
 
 # ---------------------------------------------------------------- collect, secrets, done
 StopCloud
+# 1.3.3 F-L run 1: the still-running evidence proxy held sandbox-proxy.err.log open, so the secrets scan threw.
+if ($script:proxy -and -not $script:proxy.HasExited) { Stop-Process -Id $script:proxy.Id -Force -ErrorAction SilentlyContinue }
+StopEdge
+Start-Sleep -Seconds 2
 foreach ($p in $onvifSim, $camPublisher, $camServer) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
 Diag 'end'
 # F-L run 1: the app's own WinSW out/err logs were still open, so a copy while the services ran skipped them.
@@ -766,7 +772,9 @@ Check 'no link code, credential or synthetic password in any collected log or re
     $secrets = @($linkCodes) + @($credential, $cloudPassword, $appliancePassword) | Where-Object { $_ }
     if (@($secrets).Count -lt 4) { throw 'secrets unknown; nothing to search for' }
     $leaks = Get-ChildItem $results -Recurse -File | Where-Object { $_.Extension -in '.log', '.txt', '.json', '.m3u8', '.html' } | Where-Object {
-        $text = [IO.File]::ReadAllText($_.FullName); @($secrets | Where-Object { $text.Contains($_) }).Count -gt 0 }
+        $stream = [IO.File]::Open($_.FullName, 'Open', 'Read', 'ReadWrite, Delete')
+        try { $text = (New-Object IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Close() }
+        @($secrets | Where-Object { $text.Contains($_) }).Count -gt 0 }
     if ($leaks) { throw "found in $($leaks.Name -join ', ')" }; "$(@(Get-ChildItem $results -Recurse -File).Count) files checked"
 }
 $failed = @($checks | Where-Object { -not $_.ok }).Count

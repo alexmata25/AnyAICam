@@ -31,18 +31,22 @@ WHEP_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>WHEP chec
 <script>
 const path = new URLSearchParams(location.search).get('path');
 const state = (s) => { document.getElementById('state').textContent = s; };
-const report = (body) => fetch('/__result', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+let pc = null, answerSdp = '';
+const cands = (sdp) => (sdp || '').split(/\\r?\\n/).filter((l) => l.startsWith('a=candidate')).map((l) => l.slice(12)).slice(0, 12);
+const report = (body) => fetch('/__result', {method: 'POST', headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify(Object.assign(body, {gathering: pc && pc.iceGatheringState, local_candidates: cands(pc && pc.localDescription && pc.localDescription.sdp),
+                                            remote_candidates: cands(answerSdp)}))});
 (async () => {
   const started = Date.now();
   try {
-    const pc = new RTCPeerConnection({iceServers: []});
+    pc = new RTCPeerConnection({iceServers: []});
     pc.addTransceiver('video', {direction: 'recvonly'});
     const video = document.getElementById('v');
     pc.ontrack = (e) => { video.srcObject = e.streams[0] || new MediaStream([e.track]); };
     const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
     await new Promise((r) => { if (pc.iceGatheringState === 'complete') r(); pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); setTimeout(r, 4000); });
     const answer = await fetch('/__whep/' + encodeURIComponent(path), {method: 'POST', headers: {'Content-Type': 'application/sdp'}, body: pc.localDescription.sdp});
-    const sdp = await answer.text();
+    const sdp = await answer.text(); answerSdp = sdp;
     if (!answer.ok) { state('whep ' + answer.status); await report({ok: false, stage: 'whep', status: answer.status, body: sdp.slice(0, 300)}); return; }
     await pc.setRemoteDescription({type: 'answer', sdp});
     state('connecting');
