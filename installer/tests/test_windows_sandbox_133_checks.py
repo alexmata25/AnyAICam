@@ -122,11 +122,38 @@ def test_upgrade_runs_install_the_previous_setup_first_and_upgrade_after_the_cam
         assert expected in block, expected
 
 
-def test_rollback_runs_only_in_the_local_upgrade_scenario_before_the_revocation():
+def test_fix_forward_runs_only_in_the_local_upgrade_scenario_before_the_revocation():
+    # Owner policy 2026-10-22: fix-forward; the 1.3.2 setup must be refused over the newer data and change nothing,
+    # then the setup under test installs again with identity, link and recordings kept. No version-marker reset.
     start = SCRIPT.index("if ($upgrade -and $mode -eq 'local') {")
     assert start < SCRIPT.index("[void](Cloud POST '/test/revoke-appliance' -Owner)")
     block = SCRIPT[start:SCRIPT.index("[void](Cloud POST '/test/revoke-appliance' -Owner)")]
-    assert "rollback: uninstalling the new version" in block and "rollback: the accepted 1.3.2 installs again" in block
+    assert "rollback: uninstalling the new version" in block
+    assert "fix-forward: the 1.3.2 setup is refused over the newer data folder and changes nothing" in block
+    assert "if ($rbI.ExitCode -eq 0) { throw '1.3.2 installed over the newer data folder' }" in block
+    assert "fix-forward: the setup under test installs again (exit 0)" in block
+    assert "Start-Process -FilePath $setup.FullName" in block
+    assert "the accepted 1.3.2 installs again" not in SCRIPT
+    assert "ANYAICAM_WINDOWS_SETUP_VERSION" not in block  # never edits the version marker
+
+
+def test_the_mode_check_looks_at_the_running_vms_not_only_the_mode_file():
+    # D3 on 126863e3: product_mode.json said hybrid while the running VMS kept the Local flags.
+    assert "$proc = WaitFor 180 { VmsStartedAfterModeSaved }" in SCRIPT
+    assert r"uvicorn\s+main:app" in SCRIPT
+    assert "$started -gt $saved" in SCRIPT
+
+
+def test_webrtc_waits_for_the_camera_path_and_requires_one_vms_mediamtx():
+    assert "/v3/paths/get/$camId" in SCRIPT and "$pth.ready" in SCRIPT
+    assert "if ($mtx -ne 1)" in SCRIPT
+
+
+def test_revocation_treats_an_unreachable_vms_as_inconclusive_not_accepted():
+    block = SCRIPT[SCRIPT.index("Check 'revoked appliance: the cloud refuses it"):]
+    block = block[:block.index("Info 'revoked appliance")]
+    assert "inconclusive: the VMS is not healthy" in block
+    assert "[int]$script:lastLogin.status -eq 0" in block
 
 
 def test_the_d2_checks_follow_recording_motion_every_switch_and_offline():

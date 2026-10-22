@@ -135,6 +135,20 @@ function EdgeSql([string]$Sql) {
     ($json | ConvertFrom-Json) | ForEach-Object { $_ }   # one pipeline object per row (none for an UPDATE)
 }
 function CurrentMode { AppPython 'import product_mode; print(product_mode.current_mode())' }
+function VmsProcess {
+    # The running VMS: <app>\runtime\python\python.exe -m uvicorn main:app (the agent uses the same python, other args).
+    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" -and $_.CommandLine -match 'uvicorn\s+main:app' })
+}
+function VmsStartedAfterModeSaved {
+    # 1.3.3 D3: product_mode.json alone gave a false PASS -- the VMS restarted (restart_vms) BEFORE the mode was saved
+    # and kept the old mode's flags. The running VMS must have started after the mode file was last written.
+    $saved = (Get-Item (Join-Path $data 'config\product_mode.json')).LastWriteTime
+    $p = @(VmsProcess)
+    if ($p.Count -ne 1) { return $null }
+    $started = (Get-Process -Id $p[0].ProcessId -ErrorAction SilentlyContinue).StartTime
+    if ($started -and $started -gt $saved) { return "VMS pid $($p[0].ProcessId) started $($started.ToString('HH:mm:ss')) after the mode was saved $($saved.ToString('HH:mm:ss'))" }
+    return $null
+}
 function CloudFlags { AppPython 'import product_mode, json; print(json.dumps({k: product_mode.resolve_cloud_flag(k) for k in product_mode.FLAG_REGISTRY}))' | ConvertFrom-Json }
 function Capacity { AppPython 'import vms_capacity, json; c = vms_capacity.load_capacity(); print(json.dumps(None if c is None else int(c["camera_slot_quantity"])))' }
 function Licensed([int]$Number) { AppPython "import vms_capacity, json; print(json.dumps(vms_capacity.licensed_camera_numbers([$Number])))" }
@@ -264,6 +278,11 @@ function WebRtcCheck([string]$Label) {
         if (-not (Test-Path -LiteralPath $edgeExe)) { throw "Edge not found at $edgeExe" }
         StartProxy
         $result = Join-Path $results 'webrtc-result.json'; Remove-Item $result -Force -ErrorAction SilentlyContinue
+        # F-H on 126863e3: the first WHEP offer came before the camera's path had its source (404 "no stream is available").
+        $ready = WaitFor 120 { $pth = Invoke-RestMethod -Uri "http://127.0.0.1:9997/v3/paths/get/$camId" -TimeoutSec 5; if ($pth.ready) { $pth } }
+        $mtx = @(Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" }).Count
+        if ($mtx -ne 1) { throw "$mtx VMS MediaMTX processes (expected exactly 1)" }
+        $pathNote = if ($ready) { "path ready ($($ready.source.type))" } else { 'path not ready after 120 s' }
         # Sandbox limit (test-only shim, like discovery_networks): the Sandbox has no network interface, and MediaMTX never
         # offers a loopback ICE candidate on its own (advertised_hosts() accepts LAN/Tailscale addresses only), so the
         # harness adds 127.0.0.1 through the VMS MediaMTX's loopback-only API for this check and removes it afterwards.
@@ -283,8 +302,8 @@ function WebRtcCheck([string]$Label) {
         Copy-Item $result (Join-Path $results "webrtc-result-$Label.json") -Force
         $frame = Join-Path $results 'webrtc-frame.png'
         if (Test-Path $frame) { Move-Item $frame (Join-Path $results "webrtc-frame-$Label.png") -Force }
-        if (-not $got.ok) { throw "not playing ($shim): $($got | ConvertTo-Json -Compress)" }
-        "playing $($got.width)x$($got.height), t=$([math]::Round([double]$got.currentTime, 1)) s, ICE $($got.ice); $shim; frame webrtc-frame-$Label.png"
+        if (-not $got.ok) { throw "not playing ($pathNote; $shim): $($got | ConvertTo-Json -Compress)" }
+        "playing $($got.width)x$($got.height), t=$([math]::Round([double]$got.currentTime, 1)) s, ICE $($got.ice); $pathNote; 1 VMS MediaMTX; $shim; frame webrtc-frame-$Label.png"
     }
 }
 function SubscriptionCheck([string]$Label) {
@@ -632,9 +651,12 @@ function SwitchMode([string]$Target, [scriptblock]$Change) {
         if (-not (WaitFor 300 { (RestartCount) -gt $before })) { throw 'no completed restart_vms command' }
         if (-not (WaitHealthy 180)) { throw 'VMS not healthy after the restart' }
         $m = CurrentMode; if ($m -ne $Target) { throw "runtime $m" }
+        $proc = WaitFor 180 { VmsStartedAfterModeSaved }
+        if (-not $proc) { throw "the running VMS started before the new mode was saved (it still runs with the old mode's flags); VMS processes: $(@(VmsProcess).Count)" }
+        if (-not (WaitHealthy 180)) { throw 'VMS not healthy after the mode restart' }
         $flags = CloudFlags; $wrong = $flags.PSObject.Properties | Where-Object { $_.Value -ne ($Target -eq 'hybrid') }
         if ($wrong) { throw "cloud flags: $(($wrong | ForEach-Object { $_.Name + '=' + $_.Value }) -join ', ')" }
-        "persisted $p; restart_vms completed; runtime $m; $($flags.PSObject.Properties.Count) cloud flags $($Target -eq 'hybrid')"
+        "persisted $p; restart_vms completed; runtime $m; $proc; $($flags.PSObject.Properties.Count) cloud flags $($Target -eq 'hybrid')"
     }
     Info "MediaMTX listeners after the switch to $Target" { Start-Sleep -Seconds 20; MediaMtxListeners }
     if ($Target -eq 'hybrid') { MoqCheck "after the switch to hybrid"; WebRtcCheck "after-switch-hybrid" }
@@ -716,7 +738,10 @@ Check 'online again: the cloud returns and the owner signs in online again' {
     $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\again.cookies'; if ($x.status -eq 303) { $x } }
     if (-not $r) { throw 'online sign-in did not recover' }; '303'
 }
-# ---------------------------------------------------------------- ROLLBACK new -> 1.3.2 (U132-L): uninstall, then the 1.3.2 setup
+# ---------------------------------------------------------------- FIX-FORWARD (U132-L): uninstall, 1.3.2 refused, new setup again
+# Owner policy 2026-10-22: fix-forward is the default; version metadata is never reset or downgraded. 1.3.3 on 126863e3
+# showed the 1.3.2 setup refuses over the newer data folder (install-version-guard exit 10). Checked here: that refusal
+# changes nothing, and the setup under test installs again over the kept data with identity, link and recordings.
 if ($upgrade -and $mode -eq 'local') {
     $rbState = UpgradeState; $rbMkv = (Mkv $camNo).Count; $rbClips = ClipIds
     $unins = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
@@ -729,20 +754,38 @@ if ($upgrade -and $mode -eq 'local') {
     }
     $rbI = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
         ('/LOG="' + (Join-Path $results 'setup-rollback-install.log') + '"') -Wait -PassThru
-    Check 'rollback: the accepted 1.3.2 installs again (exit 0), healthy; identity, link, secrets kept; recordings listed' {
-        if ($rbI.ExitCode -ne 0) { throw "exit $($rbI.ExitCode)" }
+    Check 'fix-forward: the 1.3.2 setup is refused over the newer data folder and changes nothing' {
+        if ($rbI.ExitCode -eq 0) { throw '1.3.2 installed over the newer data folder' }
+        $text = [IO.File]::ReadAllText((Join-Path $results 'setup-rollback-install.log'))
+        if ($text -notmatch 'Downgrade refused') { throw "exit $($rbI.ExitCode) without the downgrade refusal" }
+        if (Test-Path $uninstallKey) { throw 'an uninstall entry appeared' }
+        if (-not (Test-Path (Join-Path $agentState 'credential.json'))) { throw 'credential gone' }
+        if ((Mkv $camNo).Count -lt $rbMkv) { throw 'recordings gone' }
+        "exit $($rbI.ExitCode) (downgrade refused); nothing installed; credential and $rbMkv recording file(s) kept"
+    }
+    $ffI = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+        ('/LOG="' + (Join-Path $results 'setup-fixforward-install.log') + '"') -Wait -PassThru
+    Check 'fix-forward: the setup under test installs again (exit 0), healthy; identity, link, secrets kept; recordings listed' {
+        if ($ffI.ExitCode -ne 0) { throw "exit $($ffI.ExitCode)" }
         if (-not (WaitHealthy 240)) { throw 'not healthy' }
-        if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne (SetupVersionOf $previousSetup)) { throw "DisplayVersion $((Get-ItemProperty $uninstallKey).DisplayVersion)" }
+        if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne (SetupVersionOf $setup)) { throw "DisplayVersion $((Get-ItemProperty $uninstallKey).DisplayVersion)" }
         $now = UpgradeState
         foreach ($k in 'appliance_id', 'credential', 'secrets') { if ("$($now[$k])" -ne "$($rbState[$k])") { throw "$k changed" } }
         $ids = ClipIds; $missing = @($rbClips | Where-Object { $ids -notcontains $_ }); if ($missing) { throw "$($missing.Count) clip(s) missing" }
-        "1.3.2 again (DisplayVersion $(SetupVersionOf $previousSetup)); identity, link, secrets kept; $($ids.Count) clip(s) listed"
+        "$(SetupVersionOf $setup) again; identity, link, secrets kept; $($ids.Count) clip(s) listed"
     }
 }
 [void](Cloud POST '/test/revoke-appliance' -Owner)
 Check 'revoked appliance: the cloud refuses it and online customer sign-in on this PC is refused' {
-    $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\revoked.cookies'; if ($x.status -ge 400) { $x } }
-    if (-not $r) { throw 'sign-in still accepted after revocation' }; "status $($r.status) $($r.body.detail)"
+    # U132-L on 126863e3: the VMS was not running (failed rollback), Edge returned status 0, reported as 'accepted'.
+    if (-not (WaitHealthy 180)) { throw 'inconclusive: the VMS is not healthy, so sign-in could not be tried' }
+    $script:lastLogin = $null
+    $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\revoked.cookies'; $script:lastLogin = $x; if ($x.status -ge 400) { $x } }
+    if (-not $r) {
+        if (-not $script:lastLogin -or [int]$script:lastLogin.status -eq 0) { throw 'inconclusive: no answer from the VMS (status 0)' }
+        throw "sign-in still accepted after revocation (status $($script:lastLogin.status))"
+    }
+    "status $($r.status) $($r.body.detail)"
 }
 Info 'revoked appliance: what the agent and VMS do (observed, no expectation in the spec)' {
     Start-Sleep -Seconds 90
