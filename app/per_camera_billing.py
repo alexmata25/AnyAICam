@@ -585,14 +585,16 @@ def _order_reversals(licence: dict | None, payments: list[dict]) -> list[dict]:
         keys["payment_intent"].add(str(payment.get("stripe_payment_intent_id") or ""))
         keys["charge_id"].add(str(payment.get("stripe_charge_id") or ""))
         keys["invoice_id"].add(str(payment.get("id") or ""))
+    import billing_status
+    # As billing_status does before reading it: the table is created on first use. A failed SELECT on a missing table
+    # would abort the caller's PostgreSQL transaction, so it is never attempted.
+    with connection() as db:
+        db.execute(billing_status.REVERSALS_DDL)
     found: dict = {}
     for column, values in keys.items():
         for value in sorted(v for v in values if v):
-            try:
-                for item in rows(f"SELECT * FROM billing_reversals WHERE {column}=? ORDER BY id", (value,)):
-                    found[item["id"]] = item
-            except Exception:
-                return []  # a database before billing_reversals exists: no reversal was ever recorded
+            for item in rows(f"SELECT * FROM billing_reversals WHERE {column}=? ORDER BY id", (value,)):
+                found[item["id"]] = item
     return [found[key] for key in sorted(found)]
 
 

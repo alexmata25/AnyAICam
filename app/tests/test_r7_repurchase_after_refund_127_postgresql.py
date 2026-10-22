@@ -87,9 +87,25 @@ class PostgreSQLRepurchaseTests(unittest.TestCase):
                                  "WHERE customer_id=%s", (customer,)).fetchone()
         return intent, [json.loads(item["details_json"]) for item in audits], licence
 
+    def _payment_and_refund(self, n):
+        """Order n's paid first invoice and its full refund, as billing_status records them."""
+        import billing_status
+        with self.db() as db:
+            db.execute("DELETE FROM subscription_payments WHERE id=%s", (f"in_pg_r7_{n}",))
+            db.execute("INSERT INTO subscription_payments(id,customer_id,stripe_customer_id,stripe_subscription_id,"
+                       "amount_paid_cents,paid_at,stripe_charge_id,stripe_payment_intent_id,status) "
+                       "VALUES(%s,%s,%s,%s,52499,'2026-10-20T10:05:00',%s,%s,'refunded')",
+                       (f"in_pg_r7_{n}", f"cust-pg-r7-{n}", f"cus_pg_r7_{n}", f"sub_pg_r7_{n}", f"ch_pg_r7_{n}", f"pi_pg_r7_{n}"))
+            db.execute("DELETE FROM billing_reversals WHERE payment_intent=%s", (f"pi_pg_r7_{n}",))
+        billing_status.record_reversal(f"ch_pg_r7_{n}", f"pi_pg_r7_{n}", f"in_pg_r7_{n}", "refunded")
+
     def test_concurrent_new_order_requests_supersede_the_refunded_order_exactly_once(self):
+        # Round 0 runs before billing_reversals exists on a fresh database: the archive must create it, never abort the
+        # transaction (a failed read inside it did, at 643ea071). Later rounds carry a payment and its refund.
         for n in range(ROUNDS):
             customer = self._account(n)
+            if n:
+                self._payment_and_refund(n)
             results = self._race(customer)
             intent, audits, licence = self._state(customer)
             self.assertEqual(sorted(results), [False] * (THREADS - 1) + [True], n)
@@ -100,6 +116,14 @@ class PostgreSQLRepurchaseTests(unittest.TestCase):
             self.assertEqual(audits[0]["plan"]["stripe_subscription_id"], f"sub_pg_r7_{n}")
             self.assertEqual(dict(licence), {"status": "suspended", "suspended_reason": "refunded",
                                              "stripe_payment_intent_id": f"pi_pg_r7_{n}"})
+            payments, reversals = audits[0]["payments"], audits[0]["reversals"]
+            if n:
+                self.assertEqual([(p["id"], p["stripe_charge_id"], p["stripe_payment_intent_id"], p["status"]) for p in payments],
+                                 [(f"in_pg_r7_{n}", f"ch_pg_r7_{n}", f"pi_pg_r7_{n}", "refunded")], n)
+                self.assertEqual([(r["charge_id"], r["payment_intent"], r["invoice_id"], r["reason"]) for r in reversals],
+                                 [(f"ch_pg_r7_{n}", f"pi_pg_r7_{n}", f"in_pg_r7_{n}", "refunded")], n)
+            else:
+                self.assertEqual((payments, reversals), ([], []))
 
     def test_an_order_that_still_grants_its_licence_is_never_superseded(self):
         for n, kwargs in enumerate(({"licence_status": "active"}, {"reason": "disputed"},
