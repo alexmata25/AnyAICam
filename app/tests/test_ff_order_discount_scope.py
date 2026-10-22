@@ -17,7 +17,7 @@ from test_hybrid_build_system_flow import (PRICES, _checkout, _checkouts, _custo
                                            _legacy_appliance_checkout, _paid_checkout_event, _record_build_order,
                                            db_path, license_portal, package, portal, shop, site, storage)
 
-pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+pytestmark = [pytest.mark.usefixtures("stripe_follows_events"), pytest.mark.usefixtures("legacy_own_pc_checkout")]  # own-PC orders in their pre-2026-10-22 subscription shape (conftest legacy_own_pc_checkout)
 
 PRODUCTS = {PRICES["ai_local"]: "prod_plan_ai_local", "price_vms_8": "prod_vms_license_8"}
 

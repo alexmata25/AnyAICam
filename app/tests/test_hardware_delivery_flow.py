@@ -38,9 +38,8 @@ def _paid(client, mail, db_path, email, query, captured):
     else:
         assert _checkout(client).status_code == 200
     _record_build_order(db_path, _paid_checkout_event(captured, customer_id, f"cs_test_{customer_id[:12]}"))
-    if "appliance" not in query:
-        plan, cameras = ("ai_local", 5) if "ai_local" in query else ("hybrid", 8)
-        _pay(db_path, customer_id, plan, cameras, f"sub_{customer_id}")
+    # Owner billing rule (2026-10-22): an own-PC order charges the licence only; its plan is saved and starts at
+    # activation (test_activation_billing_127), so no subscription exists after the purchase.
     return customer_id
 
 
@@ -265,10 +264,12 @@ def test_own_pc_order_confirmation_email_points_to_download_and_setup(shop, db_p
     monkeypatch.setattr(customer_downloads, "current_installer", lambda platform: {"version": "1.2.7"} if platform == "linux" else None)
     client, captured, mail, _, _ = shop
     customer_id = _paid(client, mail, db_path, "mail-sw@example.test", OWN_PC, captured)
-    assert _notify(db_path, _event(customer_id))["status"] == "sent"
+    # The paid order is complete at the webhook (licence granted, plan saved), so the webhook already sent it.
+    assert _notify(db_path, _event(customer_id))["status"] in ("sent", "skipped") and len(outbox) == 1
     email = outbox[0]
-    assert email["type"] == "account_ready" and "Your AnyAiCam subscription is active" in email["subject"]
+    assert email["type"] == "account_ready" and email["subject"].endswith("Your AnyAiCam order is confirmed")
     assert "download AnyAiCam" in email["text"] and "being prepared" not in email["text"]
+    assert "starts, with its first monthly charge, when your AnyAiCam system is activated" in email["text"]
 
 
 def test_purchases_without_a_build_system_order_get_no_new_email(shop, db_path, outbox):
@@ -310,5 +311,6 @@ def test_an_appliance_checkout_charges_hardware_only_and_an_own_pc_checkout_star
     _new_customer(client, mail, "billing-start-pc@example.test", OWN_PC)
     assert _checkout(client).status_code == 200
     own_pc = _checkouts(captured)[-1]
-    assert own_pc["mode"] == "subscription"  # the plan starts the day of checkout
+    # Owner billing rule (2026-10-22): the licence only; the plan starts at activation, not the day of checkout.
+    assert own_pc["mode"] == "payment" and not any(key.startswith("subscription_data") for key in own_pc)
     assert not any("trial" in key or "billing_cycle_anchor" in key for key in own_pc)

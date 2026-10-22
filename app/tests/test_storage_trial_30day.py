@@ -236,7 +236,7 @@ def test_hardware_appliance_and_license_orders_are_never_part_of_the_trial(shop,
     assert dict(plan_only)["subscription_data[trial_settings][end_behavior][missing_payment_method]"] == "cancel"
     own_pc, _, _ = build_orders._checkout_fields(CUSTOMER, "owner@example.test", {"plan": "hybrid", "cameras": 4, "own_pc": True})
     own_pc = dict(own_pc)
-    assert own_pc["line_items[1][price]"] == "price_lic_8"  # the license is charged in full
+    assert own_pc["mode"] == "payment" and own_pc["line_items[0][price]"] == "price_lic_8"  # the license, in full
     assert not any(key in own_pc for key in TRIAL_KEYS) and not any(key.startswith("discounts[") for key in own_pc)
     appliance, _, _ = build_orders._checkout_fields(CUSTOMER, "owner@example.test",
                                                     {"plan": "hybrid", "cameras": 4, "appliance": "AIC-APPLIANCE-RYZEN-STARTER"})

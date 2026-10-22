@@ -18,7 +18,7 @@ from test_r7_repurchase_after_refund_127 import (NO_ORDER, SECOND_ORDER_QUERY, _
 from test_r7_repurchase_after_refund_127 import (PRICES, _login, _one, _signed_in, db_path, license_portal, package,  # noqa: F401
                                                  portal, shop, site, storage, stripe)
 
-pytestmark = [pytest.mark.real_activation]
+pytestmark = [pytest.mark.real_activation, pytest.mark.usefixtures("legacy_own_pc_checkout")]  # own-PC orders in their pre-2026-10-22 subscription shape (conftest legacy_own_pc_checkout)
 
 KEY = "build-order-confirmed:"
 

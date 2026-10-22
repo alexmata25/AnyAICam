@@ -27,7 +27,7 @@ from test_hybrid_build_system_flow import (PRICES, _checkout, _checkouts, _paid_
 from test_refund_before_record_race_127 import (_access, _configure, _ids, _invoice_paid, _licence, _place, _post,
                                                 _refund, _reversals, _stripe_subscription, _sub_event, stripe)  # noqa: F401
 
-pytestmark = [pytest.mark.real_activation]
+pytestmark = [pytest.mark.real_activation, pytest.mark.usefixtures("legacy_own_pc_checkout")]  # own-PC orders in their pre-2026-10-22 subscription shape (conftest legacy_own_pc_checkout)
 
 NO_ORDER = "There is no order to check out. Build your system first."
 SECOND_ORDER_QUERY = "plan=ai_local&cameras=10&vms_licence=10"

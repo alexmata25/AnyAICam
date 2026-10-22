@@ -228,27 +228,30 @@ def test_an_appliance_customer_cannot_buy_the_plan_again_before_activation(shop,
     client, captured, mail, _, _ = shop
     _paid(client, mail, db_path, "nobuy@example.test", APPLIANCE, captured)
     refused = client.post("/api/v2/customer/subscription/checkout", json={"plan_key": "hybrid", "camera_quantity": 8})
-    assert refused.status_code == 409 and "starts when you activate" in refused.json()["detail"]
+    assert refused.status_code == 409 and "starts when your AnyAiCam system is activated" in refused.json()["detail"]
     assert _checkout(client).status_code == 409
     page = client.get("/subscription-portal").text
-    assert 'id="v2-checkout-button"' not in page and "Your storage plan starts when you activate the appliance." in page
+    assert 'id="v2-checkout-button"' not in page and "Pending Activation" in page
+    assert "starts, and is first charged, when your AnyAiCam system is activated" in page
     assert len(_checkouts(captured)) == 1
 
 
-# ------------------------------------------------------------ own PC: license + plan at checkout
+# ------------------------------------------------------------ own PC: license at checkout, plan at activation
 
 @pytest.mark.parametrize("cameras,license_price", [(5, "price_vms_8"), (8, "price_vms_8"), (16, "price_vms_16"),
                                                    (17, "price_vms_32"), (64, "price_vms_64")])
-def test_own_pc_charges_the_smallest_license_once_and_starts_the_plan_at_checkout(shop, db_path, cameras, license_price):
+def test_own_pc_charges_only_the_smallest_license_and_saves_the_plan(shop, db_path, cameras, license_price):
+    # Owner billing rule (2026-10-22): the plan is saved with its Price and starts at activation (test_activation_billing_127).
     client, captured, mail, _, _ = shop
     _new_customer(client, mail, f"pc{cameras}@example.test", f"plan=ai_local&cameras={cameras}&vms_licence={cameras}")
     assert _checkout(client).status_code == 200
     fields = _checkouts(captured)[-1]
-    assert fields["mode"] == "subscription"
-    assert (fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == (PRICES["ai_local"], str(cameras))
-    assert (fields["line_items[1][price]"], fields["line_items[1][quantity]"]) == (license_price, "1")
+    assert fields["mode"] == "payment"
+    assert (fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == (license_price, "1")
+    assert "line_items[1][price]" not in fields
     assert list(fields.values()).count(license_price) == 2  # the line and its metadata: charged once
-    assert "payment_intent_data[setup_future_usage]" not in fields
+    assert fields["payment_intent_data[setup_future_usage]"] == "off_session"
+    assert (fields["metadata[anyaicam_plan_price_id]"], fields["metadata[anyaicam_camera_quantity]"]) == (PRICES["ai_local"], str(cameras))
 
 
 def test_own_pc_webhook_grants_the_license_once(shop, db_path):
@@ -262,7 +265,8 @@ def test_own_pc_webhook_grants_the_license_once(shop, db_path):
     rows = sqlite3.connect(db_path).execute("SELECT camera_slot_quantity,status,stripe_price_id FROM customer_entitlements "
                                             "WHERE customer_id=? AND product='vms_license'", (customer_id,)).fetchall()
     assert rows == [(8, "active", "price_vms_8")]
-    assert _storage(db_path, customer_id) is None  # nothing deferred: the plan started at checkout
+    saved = _storage(db_path, customer_id)  # the plan, saved once, starts at activation
+    assert (saved["plan_key"], saved["order_kind"], saved["state"]) == ("ai_local", "own_pc", "awaiting_activation")
 
 
 def test_license_metadata_that_does_not_match_the_configured_price_is_rejected(shop, db_path):

@@ -81,19 +81,34 @@ def test_the_countdown_starts_at_the_storage_subscription_not_at_the_grant_or_du
         assert "reserved" in storage_trial.customer_note_html(CUSTOMER, True)
     assert _trial(db_path)["status"] == "granted"
 
-    # Delivered: the customer starts the separate storage subscription.
+    # Delivered: nothing starts. Owner billing rule (2026-10-22): the Hybrid plan chosen with the order was saved at
+    # purchase with its Price and starts -- here as the 30-day trial -- only when the appliance is activated.
     _fulfillment(db_path, "delivered")
-    response = hw["client"].post("/api/v2/customer/subscription/checkout", json={"plan_key": "hybrid", "camera_quantity": 4},
-                                 cookies=owner)
-    assert response.status_code == 200, response.text
-    fields = [f for f in hw["captured"] if f.get("mode") == "subscription"][-1]
-    trial_end = int(fields["subscription_data[trial_end]"])
-    assert trial_end == int((later + timedelta(days=30)).timestamp())  # start + 30 days, not grant + 30 days
-    assert fields["subscription_data[trial_settings][end_behavior][missing_payment_method]"] == "cancel"
-    assert fields["payment_method_collection"] == "if_required"
-    assert fields["subscription_data[metadata][anyaicam_storage_trial]"] == trial["id"]
-    assert fields["line_items[0][price]"] == "price_srv_hybrid" and "line_items[1][price]" not in fields
-    assert _trial(db_path)["status"] == "granted"  # an unfinished Checkout starts nothing
+    saved = _one(db_path, "SELECT * FROM deferred_storage_plans WHERE customer_id=?", (CUSTOMER,))
+    assert (saved["plan_key"], saved["camera_quantity"], saved["state"]) == ("hybrid", 8, "awaiting_activation")
+    assert _trial(db_path)["status"] == "granted"
+    import build_orders
+    import main
+    original_post, original_get, posted = main.stripe_api_post, main.stripe_api_get, []
+
+    def post(path, fields, idempotency_key=None):
+        if path == "/v1/subscriptions":
+            posted.append(dict(fields))
+            return {"id": "sub_hw_first", "status": "trialing", "metadata": {}}
+        return original_post(path, fields, idempotency_key=idempotency_key)
+    monkeypatch.setattr(main, "stripe_api_post", post)
+    monkeypatch.setattr(main, "stripe_api_get", lambda path: {"data": []} if path.startswith("/v1/subscriptions?") else original_get(path))
+    monkeypatch.setattr(main, "require_stripe_price_matches_catalog", lambda *args: None)
+    monkeypatch.setattr(build_orders, "_appliance_activated", lambda customer_id: True)  # the appliance is activated
+    with override_target(sqlite_path=str(db_path)):
+        assert build_orders.start_storage_plan(CUSTOMER)["status"] == "started"
+    fields = posted[-1]
+    trial_end = int(fields["trial_end"])
+    assert trial_end == int((later + timedelta(days=30)).timestamp())  # activation + 30 days, not grant + 30 days
+    assert fields["trial_settings[end_behavior][missing_payment_method]"] == "cancel"
+    assert fields["metadata[anyaicam_storage_trial]"] == trial["id"]
+    assert fields["items[0][price]"] == "price_srv_hybrid" and fields["items[0][quantity]"] == "8"
+    assert "default_payment_method" not in fields  # a free trial gets no card attached
 
     # Stripe creates the trial subscription: the verified webhook starts the countdown.
     start = int(later.timestamp())

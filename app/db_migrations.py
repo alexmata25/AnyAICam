@@ -2206,6 +2206,14 @@ def apply_migrations():
         storage_columns=_columns('deferred_storage_plans')
         for name in ('hold_reason','held_at','owner_approved_at','owner_approved_by'):
             if storage_columns and name not in storage_columns: db.execute(f'ALTER TABLE deferred_storage_plans ADD COLUMN {name} TEXT')
+        # Owner billing rule (2026-10-22): the plan saved with a purchase keeps its approved monthly Price and the kind
+        # of purchase it came with (appliance / own_pc). Additive and NULL on existing rows (they keep starting at the
+        # plan's current Price, as before).
+        for name,kind in (('stripe_price_id','TEXT'),('monthly_cents_per_camera','INTEGER'),('order_kind','TEXT')):
+            if storage_columns and name not in storage_columns: db.execute(f'ALTER TABLE deferred_storage_plans ADD COLUMN {name} {kind}')
+        checkout_columns=_columns('hardware_checkouts')
+        for name,kind in (('intended_price_id','TEXT'),('intended_monthly_cents','INTEGER')):
+            if checkout_columns and name not in checkout_columns: db.execute(f'ALTER TABLE hardware_checkouts ADD COLUMN {name} {kind}')
         if HOLD_CLAIMED_STORAGE_STARTS not in applied:
             hold_pre_cutover_claimed_storage_starts(db)
             db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(HOLD_CLAIMED_STORAGE_STARTS,datetime.now().isoformat()))

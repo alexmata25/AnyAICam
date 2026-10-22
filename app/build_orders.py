@@ -52,6 +52,10 @@ STORAGE_SUPERSEDED = "superseded"        # the account got a plan another way; n
 # claimed_storage_starts): never started by activation, a claim or the worker;
 # only admin_start_held_storage() releases it.
 STORAGE_HELD = "owner_review"
+SERVICE_ACTIVATION_FIRST = {"code": "activate_service_first",
+                            "message": "Your monthly plan starts when your AnyAiCam system is activated. Install AnyAiCam (or "
+                                       "set up your AnyAiCam appliance) and link it to your account first; nothing is charged "
+                                       "for the plan before then."}
 STARTING_STALE_SECONDS = 300
 RELAY_SKU = "AIC-RELAY-NUMATO-3CH"
 
@@ -114,7 +118,9 @@ def order_quote(progress: dict) -> dict:
                              "name": f"AnyAiCam VMS software license (up to {license_tier['capacity']} cameras)",
                              "quantity": 1, "cents": license_tier["cents"]})
     one_time_total = sum(line["cents"] * line["quantity"] for line in one_time)
-    starts_today = kind != APPLIANCE_ORDER
+    # Owner billing rule (2026-10-22): appliance AND own-PC orders charge only the one-time items at purchase; the
+    # monthly plan (saved with its price) starts at service activation. Only a plan-only order starts today.
+    starts_today = kind == PLAN_ORDER
     return {"kind": kind, "cameras": cameras, "monthly_cents": monthly, "one_time": one_time,
             "due_today_cents": one_time_total + (monthly if starts_today else 0), "plan_starts_today": starts_today}
 
@@ -161,6 +167,30 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
         fields += [("metadata[anyaicam_hardware_items]", ",".join(items)),
                    ("allow_promotion_codes", "false")]  # as the existing hardware checkout
         primary_price, primary_quantity = prices[0], 1
+    elif quote["kind"] == OWN_PC_ORDER:
+        # Owner billing rule (2026-10-22): only the one-time VMS licence is charged now (mode=payment). The monthly plan
+        # and its approved Price are saved with the order (metadata -> deferred_storage_plans) and start, with the card
+        # saved here, when the customer's AnyAiCam service is activated (start_storage_plan). The licence is never
+        # discounted; a Friends & Family discount applies to the plan when it starts.
+        plan = billing.PLANS[plan_key]
+        plan_price = billing.price_id_for(plan_key)
+        if not plan_price:
+            raise HTTPException(status_code=503, detail=f"No Stripe Price is configured for {plan_key}.")
+        main.require_stripe_price_matches_catalog(plan_price, plan["monthly_cents_per_camera"], "month")
+        license_line = quote["one_time"][0]
+        license_price = _configured(vms_license_for(cameras)["env"], "the VMS software license")
+        main.require_stripe_price_matches_catalog(license_price, license_line["cents"], None)
+        fields = [("mode", "payment"), *common,
+                  ("line_items[0][price]", license_price), ("line_items[0][quantity]", "1"),
+                  ("payment_intent_data[setup_future_usage]", "off_session"),
+                  ("payment_intent_data[metadata][anyaicam_customer_id]", customer_id),
+                  ("payment_intent_data[metadata][anyaicam_build_order]", OWN_PC_ORDER),
+                  ("metadata[anyaicam_vms_license_price_id]", license_price),
+                  ("metadata[anyaicam_vms_license_capacity]", str(license_line["capacity"])),
+                  ("metadata[anyaicam_plan_price_id]", plan_price),
+                  ("metadata[anyaicam_plan_monthly_cents]", str(int(plan["monthly_cents_per_camera"]))),
+                  ("allow_promotion_codes", "false")]
+        primary_price, primary_quantity = license_price, 1
     else:
         plan = billing.PLANS[plan_key]
         plan_price = billing.price_id_for(plan_key)
@@ -175,39 +205,11 @@ def _checkout_fields(customer_id: str, email: str | None, progress: dict) -> tup
                   ("subscription_data[metadata][anyaicam_billing_version]", "2"),
                   ("subscription_data[metadata][anyaicam_plan_key]", plan_key),
                   ("subscription_data[metadata][anyaicam_camera_quantity]", str(cameras))]
-        if quote["kind"] == OWN_PC_ORDER:
-            license_line = quote["one_time"][0]
-            license_price = _configured(vms_license_for(cameras)["env"], "the VMS software license")
-            main.require_stripe_price_matches_catalog(license_price, license_line["cents"], None)
-            # A one-time price in a subscription Checkout is charged once, on the first invoice.
-            fields += [("line_items[1][price]", license_price), ("line_items[1][quantity]", "1"),
-                       ("metadata[anyaicam_vms_license_price_id]", license_price),
-                       ("metadata[anyaicam_vms_license_capacity]", str(license_line["capacity"]))]
-            # The one-time license is never discounted (Friends & Family: 50%
-            # of the recurring plan only). A session-level coupon would cover
-            # every line, so the coupon must be verified on Stripe as limited
-            # to the plan's Product; otherwise checkout is refused (fail
-            # closed). Promotion codes cannot be scoped the same way, so this
-            # mixed order does not accept them.
-            discount = friends_family.checkout_discount(customer_id, "base")
-            if discount["coupon"]:
-                try:
-                    friends_family.verify_coupon_scope(discount["coupon"], eligible_price_ids=[plan_price],
-                                                       excluded_price_ids=[license_price])
-                except friends_family.CouponScopeError as error:
-                    logger.error("build_order.friends_family_coupon_scope customer_id=%s reason=%s", customer_id, error)
-                    raise HTTPException(status_code=503, detail="Your Friends & Family pricing can't be applied to this order "
-                                                                "safely right now, so checkout is paused. Please contact AnyAiCam support.")
-                fields.append(("discounts[0][coupon]", discount["coupon"]))
-            else:
-                fields.append(("allow_promotion_codes", "false"))
-            fields.append(("metadata[anyaicam_friends_family]", "approved" if discount["friends_family"] else "none"))
-        else:
-            friends_family.apply_to_checkout_fields(fields, customer_id, "base")
-            # 30-day free storage trial (storage_trial.py): storage-only
-            # subscription Checkout; nothing is added without an active trial.
-            import storage_trial
-            fields += storage_trial.subscription_trial_fields(customer_id, checkout=True, plan_key=plan_key)
+        friends_family.apply_to_checkout_fields(fields, customer_id, "base")
+        # 30-day free storage trial (storage_trial.py): storage-only
+        # subscription Checkout; nothing is added without an active trial.
+        import storage_trial
+        fields += storage_trial.subscription_trial_fields(customer_id, checkout=True, plan_key=plan_key)
         primary_price, primary_quantity = plan_price, cameras
     fields.append(("customer", checkout_guard.canonical_stripe_customer(customer_id, email=email)))
     return fields, primary_price, primary_quantity
@@ -217,13 +219,16 @@ def create_checkout(identity: dict) -> dict:
     import checkout_guard
     import friends_family
     customer_id = identity["customer_id"]
-    if billing.has_camera_plan(customer_id) or storage_plan(customer_id):
+    if billing.has_camera_plan(customer_id) or live_storage_plan(customer_id):
         raise HTTPException(status_code=409, detail="This account already has a camera plan or a paid order.")
     # R7 (2026-10-21): an order page opened before the refunded order's subscription ended checks out a new order too.
     billing.supersede_refunded_order(customer_id)
     progress = billing.build_progress(customer_id)
     if not progress or progress["state"] != billing.BUILD_PENDING or not progress.get("plan"):
         raise HTTPException(status_code=409, detail="There is no order to check out. Build your system first.")
+    if order_kind(progress) == PLAN_ORDER and not service_activated(customer_id):
+        # Owner billing rule (2026-10-22): a monthly plan is charged only once the AnyAiCam service is activated.
+        raise HTTPException(status_code=409, detail=SERVICE_ACTIVATION_FIRST)
     if order_kind(progress) == APPLIANCE_ORDER:
         # F2 (2026-10-21): appliances are sold only through the hardware checkout (hardware_checkout.py), which
         # collects the shipping address. This older appliance checkout collected none, so it is refused here even
@@ -251,6 +256,119 @@ def storage_plan(customer_id: str) -> dict | None:
         return row("SELECT * FROM deferred_storage_plans WHERE customer_id=?", (customer_id,))
     except Exception:
         return None
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_still_paid(plan: dict) -> bool:
+    """Owner billing rule 5 (2026-10-22): the purchase this plan was saved with is still valid -- paid, never refunded,
+    no open dispute. Appliance: its order is still 'paid'. Own PC: the licence bought by that Checkout is active and its
+    payment carries no reversal. Checked before a start is claimed and again right before each Stripe request."""
+    if (plan.get("order_kind") or APPLIANCE_ORDER) != OWN_PC_ORDER:
+        return _hardware_still_paid(plan)
+    licence = row("SELECT status,stripe_payment_intent_id FROM customer_entitlements WHERE customer_id=? AND product='vms_license' "
+                  "AND stripe_checkout_session_id=?", (plan["customer_id"], plan["checkout_session_id"]))
+    if not licence or licence["status"] != "active":
+        return False
+    import billing_status
+    return billing_status.reversal_reason("", str(licence.get("stripe_payment_intent_id") or ""), "") is None
+
+
+def _deferred_alive(plan: dict | None) -> bool:
+    """A saved plan that may still start or has started: not superseded, and either started (a subscription exists) or
+    its purchase still valid. A plan whose purchase was refunded or disputed before it started is not alive: it never
+    starts, it does not block a new order, and a new order replaces it."""
+    if not plan or plan.get("state") == STORAGE_SUPERSEDED:
+        return False
+    if plan.get("stripe_subscription_id") or plan.get("state") in (STORAGE_STARTED, STORAGE_STARTING):
+        return True
+    return _order_still_paid(plan)
+
+
+def live_storage_plan(customer_id: str) -> dict | None:
+    """The account's saved plan that still blocks a second plan or order and counts as a paid order. An appliance plan
+    keeps its behaviour from before 2026-10-22 (any row that is not superseded; it never starts while its order is
+    refunded or disputed, start_storage_plan); an own-PC plan whose licence was refunded or disputed before it started
+    does not (owner billing rule: the customer may order again, R7)."""
+    plan = storage_plan(customer_id)
+    if not plan or plan.get("state") == STORAGE_SUPERSEDED:
+        return None
+    if (plan.get("order_kind") or APPLIANCE_ORDER) != OWN_PC_ORDER:
+        return plan
+    return plan if _deferred_alive(plan) else None
+
+
+def record_deferred_plan(customer_id: str, *, order_kind: str, plan_key: str, cameras: int, stripe_customer_id: str | None,
+                         payment_method_id: str | None, checkout_session_id: str, price_id: str | None = None,
+                         monthly_cents: int | None = None) -> str:
+    """Owner billing rule 2 (2026-10-22): save the plan, camera count and approved monthly Price chosen with a purchase.
+    It starts only at service activation (start_storage_plan). One row per account: a redelivered event for the same
+    Checkout changes nothing; a new order replaces a saved plan only when that plan is no longer alive (its purchase was
+    refunded or disputed and it never started -- the old row is kept in audit_logs). Never for an account that already
+    has a running plan. Returns 'recorded', 'replaced', 'unchanged' or 'skipped'."""
+    import json
+    from partner_db import transaction
+    if not customer_id or plan_key not in billing.PLANS or not checkout_session_id:
+        return "skipped"
+    if not billing.MIN_CAMERA_QUANTITY <= int(cameras or 0) <= billing.MAX_CAMERA_QUANTITY:
+        return "skipped"
+    if billing.has_camera_plan(customer_id):
+        return "skipped"
+    if not price_id:  # an order without a saved Price: the plan's current Price at purchase time
+        price_id = billing.price_id_for(plan_key)
+        monthly_cents = int(billing.PLANS[plan_key]["monthly_cents_per_camera"]) if price_id else None
+    now = datetime.now().isoformat()
+    values = (plan_key, int(cameras), stripe_customer_id, payment_method_id, checkout_session_id, price_id, monthly_cents, order_kind)
+    with transaction() as db:
+        existing = db.execute("SELECT * FROM deferred_storage_plans WHERE customer_id=?", (customer_id,)).fetchone()
+        existing = dict(existing) if existing else None
+        if existing and existing.get("checkout_session_id") == checkout_session_id:
+            return "unchanged"
+        if existing and _deferred_alive(existing):
+            logger.warning("build_order.deferred_plan_kept customer_id=%s existing_session=%s new_session=%s",
+                           customer_id, existing.get("checkout_session_id"), checkout_session_id)
+            return "unchanged"
+        if existing:
+            db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
+                       "VALUES(?,?,?,?,?,?,?)", ("", "system", "deferred_plan.replaced_after_reversal", "deferred_storage_plan",
+                                                 customer_id, json.dumps({"previous": existing}, default=str, sort_keys=True), now))
+            db.execute("UPDATE deferred_storage_plans SET plan_key=?,camera_quantity=?,stripe_customer_id=?,stripe_payment_method_id=?,"
+                       "checkout_session_id=?,stripe_price_id=?,monthly_cents_per_camera=?,order_kind=?,state=?,attempt_round=0,"
+                       "attempts=0,stripe_subscription_id=NULL,last_error=NULL,started_at=NULL,hold_reason=NULL,held_at=NULL,"
+                       "owner_approved_at=NULL,owner_approved_by=NULL,created_at=?,updated_at=? WHERE customer_id=?",
+                       (*values, STORAGE_AWAITING, now, now, customer_id))
+            return "replaced"
+        db.execute("INSERT INTO deferred_storage_plans(customer_id,plan_key,camera_quantity,stripe_customer_id,stripe_payment_method_id,"
+                   "checkout_session_id,stripe_price_id,monthly_cents_per_camera,order_kind,state,attempt_round,attempts,created_at,"
+                   "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?) ON CONFLICT(customer_id) DO NOTHING",
+                   (customer_id, *values, STORAGE_AWAITING, now, now))
+    return "recorded"
+
+
+class SavedPriceError(RuntimeError):
+    """The monthly Price saved at purchase is no longer a Price of that plan at that amount."""
+
+
+def _locked_price(plan: dict) -> tuple[str, int]:
+    """Owner billing rule 2: the plan starts at the Price saved at purchase -- still accepted only while it is this plan's
+    current or grandfathered (_PREVIOUS) Price at exactly the saved amount; otherwise SavedPriceError (the start is held
+    for an owner decision, never re-priced silently). A row saved before the price lock uses the plan's current Price."""
+    stored = str(plan.get("stripe_price_id") or "")
+    if not stored:
+        price_id = billing.price_id_for(plan["plan_key"])
+        if not price_id:
+            raise RuntimeError(f"no Stripe Price is configured for {plan['plan_key']}")
+        return price_id, int(billing.PLANS[plan["plan_key"]]["monthly_cents_per_camera"])
+    resolved = billing.resolve_price(stored) or {}
+    cents = int(plan.get("monthly_cents_per_camera") or 0)
+    if resolved.get("plan_key") != plan["plan_key"] or int(resolved.get("monthly_cents_per_camera") or -1) != cents:
+        raise SavedPriceError(f"the {plan['plan_key']} Price saved at purchase ({stored}, {cents} cents) is no longer configured")
+    return stored, cents
 
 
 def _line_amounts(session: dict) -> dict:
@@ -305,8 +423,20 @@ def sync_from_stripe_event(event: dict) -> dict:
         cameras = 0
     if plan_key not in billing.PLANS or not billing.MIN_CAMERA_QUANTITY <= cameras <= billing.MAX_CAMERA_QUANTITY:
         return {"status": "rejected", "reason": "order metadata is not a valid plan and camera count"}
-    result = (_record_appliance_order(event, session, customer_id, plan_key, cameras) if kind == APPLIANCE_ORDER
-              else _grant_vms_license(session, customer_id, metadata))
+    if kind == APPLIANCE_ORDER:
+        result = _record_appliance_order(event, session, customer_id, plan_key, cameras)
+    else:
+        result = _grant_vms_license(session, customer_id, metadata)
+        if str(session.get("mode") or "") == "payment" and result.get("status") == "vms_license_granted":
+            # Owner billing rule (2026-10-22): the plan chosen with the licence is saved with its approved Price and
+            # starts at service activation -- at once when this account's AnyAiCam is already activated.
+            result["deferred_plan"] = record_deferred_plan(
+                customer_id, order_kind=OWN_PC_ORDER, plan_key=plan_key, cameras=cameras,
+                stripe_customer_id=str(session.get("customer") or "") or None, payment_method_id=_payment_method(session),
+                checkout_session_id=str(session.get("id") or ""),
+                price_id=str(metadata.get("anyaicam_plan_price_id") or "") or None,
+                monthly_cents=_int_or_none(metadata.get("anyaicam_plan_monthly_cents")))
+            result["plan_start"] = on_appliance_activated(customer_id).get("status")
     try:  # the order confirmation (outbox, retried by the worker); never fails the step
         import order_funnel
         import stripe_mode
@@ -343,13 +473,9 @@ def _record_appliance_order(event: dict, session: dict, customer_id: str, plan_k
             stripe_checkout_session_id=str(session.get("id") or "") or None, stripe_payment_intent_id=intent_id,
             stripe_customer_id=stripe_customer, status="paid")
         orders.append(order["id"])
-    now = datetime.now().isoformat()
-    with connection() as db:
-        db.execute("INSERT INTO deferred_storage_plans(customer_id,plan_key,camera_quantity,stripe_customer_id,"
-                   "stripe_payment_method_id,checkout_session_id,state,attempt_round,attempts,created_at,updated_at) "
-                   "VALUES(?,?,?,?,?,?,?,0,0,?,?) ON CONFLICT(customer_id) DO NOTHING",
-                   (customer_id, plan_key, cameras, stripe_customer, _payment_method(session), str(session.get("id") or ""),
-                    STORAGE_AWAITING, now, now))
+    record_deferred_plan(customer_id, order_kind=APPLIANCE_ORDER, plan_key=plan_key, cameras=cameras,
+                         stripe_customer_id=stripe_customer, payment_method_id=_payment_method(session),
+                         checkout_session_id=str(session.get("id") or ""))
     return {"status": "appliance_order_recorded", "order_ids": orders}
 
 
@@ -382,10 +508,15 @@ def _grant_vms_license(session: dict, customer_id: str, metadata: dict) -> dict:
     # payment is always recorded with its invoice now (billing_status._stripe_invoice_for_payment retries otherwise)
     # and binds the licence through its Checkout Session.
     intent, charge = "", ""
-    try:
-        intent, charge = billing_status.invoice_payment(invoice_id)
-    except stripe_state.RetryableStripeEventError as error:
-        logger.warning("build_order.licence_payment_unread session=%s invoice=%s error=%s", session_id, invoice_id, error)
+    if str(session.get("mode") or "") == "payment":
+        # Owner billing rule (2026-10-22): the licence alone, paid by this Checkout's PaymentIntent (no invoice).
+        paid_by = session.get("payment_intent")
+        intent = str((paid_by.get("id") if isinstance(paid_by, dict) else paid_by) or "")
+    else:
+        try:
+            intent, charge = billing_status.invoice_payment(invoice_id)
+        except stripe_state.RetryableStripeEventError as error:
+            logger.warning("build_order.licence_payment_unread session=%s invoice=%s error=%s", session_id, invoice_id, error)
     with transaction() as db:
         # The same per-payment keys a refund or dispute of this payment takes (billing_status.lock_payment orders them
         # globally): whichever commits first, the other sees it.
@@ -439,6 +570,13 @@ def _appliance_activated(customer_id: str) -> bool:
     candidates = rows("SELECT id,activation_status,state FROM appliances WHERE customer_id=? AND (activation_status='activated' OR "
                       "(activated_via='claim' AND activated_at IS NOT NULL))", (customer_id,))
     return any(appliance_activated(candidate) for candidate in candidates)
+
+
+def service_activated(customer_id: str) -> bool:
+    """Owner billing rule (2026-10-22): the account's AnyAiCam service is activated -- an appliance or own PC that went
+    through an activation event and is still in service (_appliance_activated). A monthly plan bought directly (My
+    subscription, a plan-only order) is charged only then."""
+    return _appliance_activated(customer_id)
 
 
 def _start_allowed(customer_id: str, plan: dict) -> bool:
@@ -530,8 +668,8 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
     if billing.has_camera_plan(customer_id):
         _finish(customer_id, STORAGE_SUPERSEDED)
         return {"status": "superseded"}
-    if not _hardware_still_paid(plan):
-        return {"status": "ignored", "reason": "the appliance order is no longer paid (refunded or disputed)"}
+    if not _order_still_paid(plan):
+        return {"status": "ignored", "reason": "the purchase is no longer paid (refunded or disputed)"}
     plan = _claim(customer_id, manual=manual)
     if not plan:
         return {"status": "busy_or_done"}
@@ -542,9 +680,12 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
     def still_allowed() -> bool:
         # Re-checked right before each Stripe request: the appliance may have
         # been revoked or released since the start was claimed.
-        if _start_allowed(customer_id, plan):
+        if not _start_allowed(customer_id, plan):
+            _finish(customer_id, STORAGE_AWAITING, error="no appliance in service")
+        elif not _order_still_paid(plan):  # owner rule 5: refunded or disputed since the start was claimed
+            _finish(customer_id, STORAGE_AWAITING, error="the purchase is no longer paid (refunded or disputed)")
+        else:
             return True
-        _finish(customer_id, STORAGE_AWAITING, error="no appliance in service")
         logger.warning("build_order.storage_start_skipped_not_in_service customer_id=%s", customer_id)
         return False
     if not still_allowed():
@@ -553,10 +694,13 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
         subscription = _existing_subscription(plan)
         if not subscription:
             import friends_family
-            price_id = billing.price_id_for(plan["plan_key"])
-            if not price_id:
-                raise RuntimeError(f"no Stripe Price is configured for {plan['plan_key']}")
-            main.require_stripe_price_matches_catalog(price_id, billing.PLANS[plan["plan_key"]]["monthly_cents_per_camera"], "month")
+            try:
+                price_id, cents = _locked_price(plan)
+            except SavedPriceError as error:
+                _finish(customer_id, STORAGE_HELD, error=str(error)[:300])
+                logger.error("build_order.storage_start_held_price customer_id=%s reason=%s", customer_id, error)
+                return {"status": STORAGE_HELD, "reason": "the saved plan price is no longer configured"}
+            main.require_stripe_price_matches_catalog(price_id, cents, "month")
             quantity = str(int(plan["camera_quantity"]))
             fields = [("customer", plan["stripe_customer_id"]), ("items[0][price]", price_id), ("items[0][quantity]", quantity),
                       ("off_session", "true"), ("payment_behavior", "error_if_incomplete"),
@@ -584,6 +728,8 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
         return {"status": STORAGE_PAYMENT_FAILED if refused else STORAGE_FAILED}
     subscription_id = str(subscription.get("id") or "")
     _finish(customer_id, STORAGE_STARTED, subscription_id=subscription_id)
+    if not _order_still_paid(plan):  # a refund/dispute recorded while Stripe created the subscription
+        logger.error("build_order.storage_started_after_reversal customer_id=%s subscription=%s", customer_id, subscription_id)
     trial_id = str((subscription.get("metadata") or {}).get("anyaicam_storage_trial") or "")
     if trial_id:
         import storage_trial
@@ -654,7 +800,7 @@ def held_storage_starts() -> list[dict]:
             "hold_reason": plan.get("hold_reason"), "held_at": plan.get("held_at"),
             "owner_approved_at": plan.get("owner_approved_at"), "owner_approved_by": plan.get("owner_approved_by"),
             "checkout_session_id": plan["checkout_session_id"], "ordered_at": plan["created_at"],
-            "hardware_still_paid": _hardware_still_paid(plan),
+            "hardware_still_paid": _order_still_paid(plan),
             "appliance_enrolled": customer_has_activated_appliance(plan["customer_id"]),
             "appliances": appliances,
         })
@@ -684,7 +830,7 @@ def admin_start_held_storage(customer_id: str, actor: dict) -> dict:
         return {"status": "unchanged", "state": STORAGE_STARTED, "subscription_id": plan.get("stripe_subscription_id")}
     if plan["state"] != STORAGE_HELD and not plan.get("owner_approved_at"):
         raise HTTPException(status_code=409, detail="This storage plan is not waiting for an owner decision.")
-    if not _hardware_still_paid(plan):
+    if not _order_still_paid(plan):
         raise HTTPException(status_code=409, detail="The appliance order is no longer paid (refunded or disputed).")
     if not customer_has_activated_appliance(customer_id):
         raise HTTPException(status_code=409, detail="No appliance on this account has finished enrolling yet.")

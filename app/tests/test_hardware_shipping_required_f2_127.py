@@ -48,8 +48,9 @@ def test_own_pc_build_orders_still_check_out(shop):
     response = _checkout(client)
     assert response.status_code == 200, response.text
     fields = _checkouts(captured)[-1]
-    assert fields["mode"] == "subscription" and fields["metadata[anyaicam_build_order]"] == "own_pc"
-    assert fields["line_items[0][price]"] == PRICES["ai_local"] and fields["line_items[1][price]"] == "price_vms_8"
+    # Owner billing rule (2026-10-22): the licence now, the plan (its Price saved) from activation.
+    assert fields["mode"] == "payment" and fields["metadata[anyaicam_build_order]"] == "own_pc"
+    assert fields["line_items[0][price]"] == "price_vms_8" and fields["metadata[anyaicam_plan_price_id]"] == PRICES["ai_local"]
 
 
 def test_plan_only_build_orders_still_check_out(shop):
@@ -58,7 +59,8 @@ def test_plan_only_build_orders_still_check_out(shop):
     response = _checkout(client)
     assert response.status_code == 200, response.text
     fields = _checkouts(captured)[-1]
-    assert fields["mode"] == "subscription" and fields["line_items[0][price]"] == PRICES["hybrid"]
+    # A selection without hardware is an own-PC order (licence now, plan from activation, owner rule 2026-10-22).
+    assert fields["mode"] == "payment" and fields["metadata[anyaicam_plan_price_id]"] == PRICES["hybrid"]
 
 
 # ------------------------------------------------------------------ the retired hardware checkout

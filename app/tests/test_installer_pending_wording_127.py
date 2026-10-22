@@ -40,7 +40,7 @@ def test_order_summary_shows_the_owner_notice_before_checkout_session_creation(s
     response = client.post("/api/v2/customer/build-order/checkout", json={})
     assert response.status_code == 200 and response.json().get("checkout_url")  # the purchase can still be completed
     session = [c for c in captured if c.get("mode")][-1]
-    assert session["mode"] == "subscription"  # pricing/checkout unchanged: licence + plan in one Checkout
+    assert session["mode"] == "payment"  # owner billing rule (2026-10-22): the licence now, the plan from activation
 
 
 def test_order_summary_unchanged_when_an_installer_is_published(shop, db_path, installer):

@@ -304,6 +304,13 @@ def _accounts_activated(request, monkeypatch):
         yield
         return
     monkeypatch.setattr(per_camera_billing, "account_activated", lambda customer_id: True)
+    # Owner billing rule (2026-10-22): a plan bought directly is charged only once the service is activated
+    # (build_orders.service_activated). The same convention: tests about activation run the real rule.
+    try:
+        import build_orders
+        monkeypatch.setattr(build_orders, "service_activated", lambda customer_id: True)
+    except ImportError:
+        pass
     yield
 
 
@@ -365,3 +372,12 @@ def fixed_slot_price_map_for_tests() -> dict:
             if price_id:
                 mapping[price_id] = {"product": f"camera_slots_{plan_type}", "camera_slot_maximum": slots, "billing_type": "recurring"}
     return mapping
+
+
+@pytest.fixture()
+def legacy_own_pc_checkout(monkeypatch):
+    """Own-PC orders in their pre-2026-10-22 shape (one mode=subscription Checkout: plan + licence), for the suites that
+    prove how those still-existing orders are refunded, disputed, replayed and re-ordered (legacy_own_pc_checkout.py)."""
+    import build_orders
+    from legacy_own_pc_checkout import legacy_checkout_fields
+    monkeypatch.setattr(build_orders, "_checkout_fields", legacy_checkout_fields)

@@ -277,8 +277,10 @@ def test_each_plan_checks_out_with_its_server_side_price(shop, db_path, plan_key
     _new_customer(client, mail, f"pay-{plan_key}@example.test", f"plan={plan_key}&cameras={cameras}")
     assert _checkout(client, plan_key, cameras).status_code == 200
     fields = _checkouts(captured)[-1]
-    assert fields["line_items[0][price]"] == PRICES[plan_key] and fields["line_items[0][quantity]"] == str(cameras)
-    assert fields["metadata[anyaicam_plan_key]"] == plan_key and fields["metadata[anyaicam_billing_version]"] == "2"
+    # A selection without hardware is an own-PC order: owner billing rule (2026-10-22) -- the licence is charged now,
+    # the plan's server-side Price is saved with the order and charged from activation.
+    assert fields["mode"] == "payment" and fields["metadata[anyaicam_plan_price_id]"] == PRICES[plan_key]
+    assert fields["metadata[anyaicam_plan_key]"] == plan_key and fields["metadata[anyaicam_camera_quantity]"] == str(cameras)
 
 
 # ------------------------------------------------------------ existing account

@@ -36,7 +36,16 @@ from test_refund_before_record_race_127 import (_access, _configure, _dispute, _
 from test_r7_repurchase_after_refund_127 import (_capacity, _end_order1, _licence_row, _new_order, _ok, _order1_paid,
                                                  _order2_paid, _plan_row, _r7_ready, _replay_all, _subscription)
 
-pytestmark = [pytest.mark.real_activation]
+pytestmark = [pytest.mark.real_activation, pytest.mark.usefixtures("legacy_own_pc_checkout")]  # own-PC orders in their pre-2026-10-22 subscription shape (conftest legacy_own_pc_checkout)
+
+
+@pytest.fixture(autouse=True)
+def _service_activated(monkeypatch):
+    """These scenarios are about the licence (C5), not the service-activation rule of 2026-10-22: the customer's PC is
+    linked and running, so a plan bought in My subscription may be charged now (test_activation_billing_127 covers the
+    refusal before activation)."""
+    import build_orders
+    monkeypatch.setattr(build_orders, "service_activated", lambda customer_id: True)
 
 PLAN_CHECKOUT = "/api/v2/customer/subscription/checkout"
 

@@ -25,7 +25,9 @@ def test_own_pc_order_lists_plan_and_licence_with_prices_and_status(shop, db_pat
     client, captured, mail, _, _ = shop
     _paid(client, mail, db_path, "items-ownpc@example.test", OWN_PC, captured)
     panel = _section(client.get("/order-complete").text)
-    assert "AnyAiCam AI Local plan · 5 licensed cameras" in panel and "5 × $14.99 = $74.95/month" in panel and "Active" in panel
+    # Owner billing rule (2026-10-22): the plan is saved at the purchase price and is Pending Activation.
+    assert "AnyAiCam AI Local plan · 5 licensed cameras" in panel and "5 × $14.99 = $74.95/month" in panel
+    assert "Pending Activation" in panel
     assert "AnyAiCam VMS software license (up to 8 cameras)" in panel and "$24.99 one-time" in panel
     assert 'href="/customer/orders"' in panel and 'href="/subscription-portal"' in panel
     assert "Your AnyAiCam installer is coming soon." in client.get("/order-complete").text  # installer pending shown too
@@ -46,7 +48,7 @@ def test_hardware_order_lists_the_appliance_amount_and_preparation_status(shop, 
     panel = _section(html)
     assert "AnyAiCam Starter" in panel and "$1,249.99 one-time" in panel and "Being prepared" in panel
     assert "Hybrid plan · 8 licensed cameras" in panel and "8 × $19.99 = $159.92/month" in panel
-    assert "Starts when you activate your appliance" in panel
+    assert "Pending Activation" in panel and "when your AnyAiCam system is activated" in panel
     assert "Your AnyAiCam system is being prepared." in html
 
 

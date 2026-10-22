@@ -128,8 +128,10 @@ def _order_lines(selection: dict, customer_id: str | None = None) -> tuple[str, 
     elif quote["kind"] == build_orders.OWN_PC_ORDER:
         notes = ('<p class="note" id="order-license-required">A one-time AnyAiCam VMS software license is required when using '
                  'your own computer.</p>'
-                 '<p class="note" id="order-plan-start">Your one-time VMS software license and your first month are charged today; '
-                 'your monthly subscription starts today.</p>'
+                 '<p class="note" id="order-plan-start">Only your one-time VMS software license is charged today. Your monthly '
+                 f'subscription ({_money(unit * quantity)}/month) is saved with your order at today\'s price and starts, with its '
+                 'first charge, when your AnyAiCam system is activated. Nothing is charged for it before then. Stripe saves your '
+                 'card securely at checkout so the subscription can start then without asking for it again.</p>'
                  '<p class="note" id="order-own-pc">Runs on your own Ubuntu 24.04 PC. The license is yours to keep; the '
                  'monthly subscription is separate.</p>')
     elif trial:
@@ -331,7 +333,7 @@ def _software_body(progress: dict, summary: str, customer_id: str = "") -> str:
 
 
 def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_line: str,
-                 installed: bool = False) -> tuple[str, str, str, str]:
+                 installed: bool = False, plan_pending: bool = False) -> tuple[str, str, str, str]:
     """(notification type, subject, text, html) for the Build Your System
     order confirmation."""
     import purchase_notifications as pn
@@ -361,6 +363,12 @@ def _order_email(first_name: str, progress: dict, delivery: dict | None, plan_li
         elif progress.get("own_pc") and not installer_available():  # owner 2026-10-22: never promise a download that is not out
             paragraphs[-1] = INSTALLER_PENDING_TEXT
         kind, subject = "account_ready", "Your AnyAiCam subscription is active"
+        if plan_pending and progress.get("own_pc"):
+            # Owner billing rule (2026-10-22): only the licence was charged; the plan starts at activation.
+            paragraphs[0] = (f"Your payment for your one-time AnyAiCam VMS software license is confirmed. Your {plan_line} is saved "
+                             "with your order and starts, with its first monthly charge, when your AnyAiCam system is activated. "
+                             "Nothing is charged for it before then.")
+            subject = "Your AnyAiCam order is confirmed"
     text = f"Hi {first_name},\n\n" + "\n\n".join(paragraphs) + f"\n\nSign in: {sign_in}\n\n{pn._SUPPORT_FOOTER_TEXT}"
     html = (f"<p>Hi {escape(first_name)},</p>" + "".join(f"<p>{escape(p)}</p>" for p in paragraphs)
             + f'<p><a href="{escape(sign_in, quote=True)}">Sign in to AnyAiCam</a></p>{pn._SUPPORT_FOOTER_HTML}')
@@ -420,14 +428,18 @@ def purchases_panel(customer_id: str) -> str:
             status += f" · {'ends' if payload.get('cancel_at_period_end') else 'renews'} on {when}"
         items.append(("order-item-plan", f"AnyAiCam {payload['display_name']} plan · {_cameras(quantity)}", price, status))
     else:
-        deferred = billing.deferred_storage_plan(customer_id)
+        import build_orders
+        deferred = build_orders.live_storage_plan(customer_id)
         if deferred and deferred["plan_key"] in billing.PLANS:
             plan = billing.PLANS[deferred["plan_key"]]
             quantity = int(deferred["camera_quantity"])
-            per = int(plan["monthly_cents_per_camera"])
+            per = int(deferred.get("monthly_cents_per_camera") or plan["monthly_cents_per_camera"])  # the price saved at purchase
+            status = {"payment_failed": "Pending Activation · the first payment did not go through: update your card in My "
+                                        "subscription, then retry"}.get(deferred["state"], "Pending Activation")
             items.append(("order-item-plan", f"AnyAiCam {plan['display_name']} plan · {_cameras(quantity)}",
                           f"{quantity} × {_money(per)} = {_money(per * quantity)}/month",
-                          "Starts when you activate your appliance (nothing charged before then)"))
+                          f"{status} · starts, with its first charge, when your AnyAiCam system is activated "
+                          "(nothing charged before then)"))
     licence = row("SELECT camera_slot_quantity,status FROM customer_entitlements WHERE customer_id=? AND product=?",
                   (customer_id, pricing_catalog.VMS_LICENSE_PRODUCT))
     if licence:
@@ -513,7 +525,8 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
     plan_line = (f"AnyAiCam {plan_name} subscription for {_cameras(plan_cameras)}" if plan_name else "AnyAiCam subscription")
     kind, subject, text, html = _order_email(pn._first_name(customer.get("name")), progress,
                                              hardware_delivery(customer_id, progress), plan_line,
-                                             installed=bool(progress.get("own_pc")) and linked_pc(customer_id))
+                                             installed=bool(progress.get("own_pc")) and linked_pc(customer_id),
+                                             plan_pending=not billing.has_camera_plan(customer_id))
     if attempts:
         # Retry the same outbox row, never a second one under another type.
         kind = attempts[0]["notification_type"]

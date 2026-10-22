@@ -36,7 +36,8 @@ def test_each_camera_count_buys_the_smallest_license_that_covers_it(cameras, cap
     assert (tier["capacity"], tier["cents"]) == (capacity, cents)
     quote = build_orders.order_quote({"plan": "basic_local", "cameras": cameras, "own_pc": True})
     assert [(line["capacity"], line["cents"]) for line in quote["one_time"]] == [(capacity, cents)]
-    assert quote["due_today_cents"] == cents + 999 * cameras  # the license once, plus the first month
+    # Owner billing rule (2026-10-22): only the licence is due today; the monthly plan starts at activation.
+    assert quote["due_today_cents"] == cents and quote["plan_starts_today"] is False
 
 
 def test_a_license_checkout_on_an_old_stripe_price_is_refused(monkeypatch):

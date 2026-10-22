@@ -22,7 +22,7 @@ from test_hybrid_build_system_flow import (PRICES, _checkout, _customer_id, _new
                                            _record_build_order, db_path, license_portal, package, portal, shop, site,
                                            storage)
 
-pytestmark = [pytest.mark.real_activation]
+pytestmark = [pytest.mark.real_activation, pytest.mark.usefixtures("legacy_own_pc_checkout")]  # own-PC orders in their pre-2026-10-22 subscription shape (conftest legacy_own_pc_checkout)
 
 # test_hybrid_build_system_flow._pay replaces this module attribute for the rest of the session; these tests need
 # Stripe's real reversal check when a plan is created.

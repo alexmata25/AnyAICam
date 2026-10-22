@@ -183,7 +183,7 @@ def link_paid_orders(customer_id: str, email: str, *, session_id: str | None = N
     email = (email or "").strip().lower()
     if not customer_id or not email:
         return 0
-    linked = 0
+    linked, saved = 0, []
     now = _now()
     query = ("SELECT id,stripe_checkout_session_id FROM hardware_checkouts WHERE lower(email)=? AND customer_id IS NULL "
              "AND status='paid'" + (" AND stripe_checkout_session_id=?" if session_id else ""))
@@ -194,7 +194,30 @@ def link_paid_orders(customer_id: str, email: str, *, session_id: str | None = N
             db.execute("UPDATE hardware_checkouts SET customer_id=?,linked_at=?,updated_at=? WHERE id=? AND customer_id IS NULL",
                        (customer_id, now, now, checkout["id"]))
             linked += 1
+            saved.append(checkout["id"])
+    for checkout_id in saved:
+        _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id))
     return linked
+
+
+def _save_intended_plan(customer_id: str | None, record: dict | None, payment_method_id: str | None = None) -> str:
+    """Owner billing rule (2026-10-22): the monthly plan chosen with an appliance order is saved with its approved Price
+    (locked when the checkout opened) once the paid order belongs to an account; it starts only when the appliance is
+    activated (build_orders.start_storage_plan). Relay-only orders and orders without a chosen plan save nothing."""
+    import build_orders
+    if not customer_id or not record or record.get("status") != "paid" or not record.get("intended_plan"):
+        return "skipped"
+    if not any(part.startswith(APPLIANCE_PREFIX) for part in str(record.get("items") or "").split(",")):
+        return "skipped"
+    try:
+        return build_orders.record_deferred_plan(
+            customer_id, order_kind=build_orders.APPLIANCE_ORDER, plan_key=str(record["intended_plan"]),
+            cameras=int(record.get("intended_cameras") or 0), stripe_customer_id=record.get("stripe_customer_id"),
+            payment_method_id=payment_method_id, checkout_session_id=str(record.get("stripe_checkout_session_id") or ""),
+            price_id=record.get("intended_price_id"), monthly_cents=record.get("intended_monthly_cents"))
+    except Exception:
+        logger.exception("hardware_checkout.intended_plan_not_saved checkout=%s", record.get("id"))
+        return "error"
 
 
 # ------------------------------------------------------------------ checkout
@@ -251,6 +274,14 @@ def create_checkout(selection: dict, *, email: str, identity: dict | None) -> di
         metadata["anyaicam_intended_cameras"] = str(selection["cameras"])
     for key, value in metadata.items():
         fields += [(f"metadata[{key}]", value), (f"payment_intent_data[metadata][{key}]", value)]
+    intended_price, intended_cents = None, None
+    if not accessory:
+        # Owner billing rule (2026-10-22): the card is saved for the monthly plan, which starts at activation only.
+        fields.append(("payment_intent_data[setup_future_usage]", "off_session"))
+        import per_camera_billing as billing
+        if selection.get("plan") in billing.PLANS:
+            intended_price = billing.price_id_for(selection["plan"])
+            intended_cents = int(billing.PLANS[selection["plan"]]["monthly_cents_per_camera"]) if intended_price else None
     fields += [
         ("success_url", f"{base}{ORDERS_PATH}?relay_payment=success" if accessory
          else f"{base}{COMPLETE_PATH}?session_id={{CHECKOUT_SESSION_ID}}"),
@@ -268,9 +299,10 @@ def create_checkout(selection: dict, *, email: str, identity: dict | None) -> di
         fields += [("customer_email", email), ("customer_creation", "always")]
     now = _now()
     with connection() as db:
-        db.execute("INSERT INTO hardware_checkouts(id,customer_id,email,items,intended_plan,intended_cameras,status,created_at,updated_at) "
-                   "VALUES(?,?,?,?,?,?,?,?,?)",
-                   (checkout_id, customer_id, email, ",".join(items), selection.get("plan"), selection.get("cameras"), "creating", now, now))
+        db.execute("INSERT INTO hardware_checkouts(id,customer_id,email,items,intended_plan,intended_cameras,intended_price_id,"
+                   "intended_monthly_cents,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   (checkout_id, customer_id, email, ",".join(items), selection.get("plan"), selection.get("cameras"), intended_price,
+                    intended_cents, "creating", now, now))
     _expire_previous(email, checkout_id)
     try:
         session = main.stripe_api_post("/v1/checkout/sessions", fields, idempotency_key=f"anyaicam-hardware-checkout-{checkout_id}")
@@ -373,6 +405,8 @@ def sync_from_stripe_event(event: dict) -> dict:
                    "paid_at=COALESCE(paid_at,?),updated_at=? WHERE id=?",
                    (session_id, email or record.get("email"), customer_id, session.get("amount_total"), intent_id, stripe_customer,
                     json.dumps(_shipping(session)), ",".join(order_ids), now, now, checkout_id))
+    if kind == HARDWARE_ONLY and customer_id:
+        _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id), build_orders._payment_method(session))
     try:  # the confirmation email never fails the step; retried from the outbox and on the order pages
         import stripe_mode
         send_confirmation(checkout_id, test_mode=stripe_mode.is_test_mode(event=event))
@@ -476,7 +510,8 @@ def _checkout_page(selection: dict, identity: dict | None, *, cancelled: bool) -
         parts = [plan["display_name"] if plan else None,
                  f"{selection['cameras']} camera{'s' if selection['cameras'] != 1 else ''}" if selection.get("cameras") else None]
         intent = (f'<p class="note" id="hw-plan-later">Camera plan you chose ({escape(" · ".join(p for p in parts if p))}): '
-                  'not charged today. You choose and start it on My subscription after your equipment arrives.</p>')
+                  "saved with your order at today's price and not charged today. It starts, with its first monthly charge, "
+                  'only when you activate your appliance.</p>')
     notice = ('<p class="notice" id="hw-cancelled" role="status">Checkout was cancelled. No payment was taken.</p>' if cancelled else "")
     if identity:
         who = (f'<p class="note" id="hw-account">Ordering as {escape(email)}. Your order will appear in your account.</p>'

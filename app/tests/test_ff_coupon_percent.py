@@ -12,7 +12,7 @@ from database_backend import override_target
 from test_hybrid_build_system_flow import (PRICES, _checkout, _checkouts, _customer_id, _new_customer,  # noqa: F401
                                            db_path, license_portal, package, portal, shop, site, storage)
 
-pytestmark = pytest.mark.usefixtures("stripe_follows_events")
+pytestmark = [pytest.mark.usefixtures("stripe_follows_events"), pytest.mark.usefixtures("legacy_own_pc_checkout")]  # own-PC orders in their pre-2026-10-22 subscription shape (conftest legacy_own_pc_checkout)
 
 # A first order without hardware is the own-PC order (VMS 1.2.7 activation-first): the AI Local plan plus the one-time
 # licence line, so the base coupon must be scoped on Stripe to the plan's Product (friends_family.verify_coupon_scope).

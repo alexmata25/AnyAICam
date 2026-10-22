@@ -110,8 +110,15 @@ def test_every_my_subscription_purchase_is_refused_before_activation(env, plan_p
     assert "/v1/checkout/sessions" not in _stripe_posts(env)
 
 
-def test_after_activation_the_plan_checkout_is_allowed_again(env, plan_prices):
+def test_after_activation_the_plan_checkout_is_allowed_again(env, plan_prices, monkeypatch):
+    import build_orders
     _plan_row(env, "cancelled")  # an earlier plan: resubscribes here, never back through Build Your System
+    refused = env["client"].post("/api/v2/customer/subscription/checkout", json={"plan_key": "basic_local", "camera_quantity": 1},
+                                 cookies=_cookie(*OWNER_A))
+    # Owner billing rule (2026-10-22): a plan is charged only once the AnyAiCam service (appliance or PC) is activated.
+    assert refused.status_code == 409 and refused.json()["detail"]["code"] == "activate_service_first"
+    assert "/v1/checkout/sessions" not in _stripe_posts(env)
+    monkeypatch.setattr(build_orders, "service_activated", lambda customer_id: True)  # its PC is linked and running
     response = env["client"].post("/api/v2/customer/subscription/checkout", json={"plan_key": "basic_local", "camera_quantity": 1},
                                   cookies=_cookie(*OWNER_A))
     assert response.status_code == 200, response.text
@@ -152,7 +159,8 @@ def test_a_selection_without_hardware_is_the_own_pc_order_with_its_licence(env):
     progress = billing.build_progress(CID)
     assert progress.get("own_pc") and build_orders.order_kind(progress) == build_orders.OWN_PC_ORDER
     quote = build_orders.order_quote(progress)
-    assert [line["cents"] for line in quote["one_time"]] == [2499] and quote["due_today_cents"] == 999 + 2499
+    # Owner billing rule (2026-10-22): the licence today; the plan's first month at activation.
+    assert [line["cents"] for line in quote["one_time"]] == [2499] and quote["due_today_cents"] == 2499
 
 
 def test_an_account_that_owns_the_licence_is_not_charged_it_again(env):

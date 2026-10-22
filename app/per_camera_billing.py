@@ -442,7 +442,12 @@ def order_paid(customer_id: str) -> bool:
     """Checkout is done: a camera plan, or a paid appliance order whose
     storage plan starts at activation. Both come only from verified
     Stripe webhooks."""
-    return has_camera_plan(customer_id) or deferred_storage_plan(customer_id) is not None
+    if has_camera_plan(customer_id):
+        return True
+    # Owner billing rule (2026-10-22): a plan saved with a purchase that was refunded or disputed before it started is
+    # no paid order (it never starts; R7 lets the customer order again).
+    import build_orders
+    return build_orders.live_storage_plan(customer_id) is not None
 
 
 ACTIVATE_URL = "https://anyaicam.com/build-your-system.html?source=installed"
@@ -539,7 +544,7 @@ def account_activated(customer_id: str) -> bool:
         # The storage plan ordered with an appliance counts while that appliance order is still paid (a refunded or
         # disputed order leaves the row in place), or once the storage subscription exists (Green 2026-10-16).
         import build_orders
-        if deferred.get("stripe_subscription_id") or build_orders._hardware_still_paid(deferred):
+        if deferred.get("stripe_subscription_id") or build_orders._order_still_paid(deferred):
             return True
     try:
         # Rows exist only once Stripe confirmed a payment (an unpaid or incomplete checkout never writes one, see
@@ -1277,12 +1282,19 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     plan_summary = ("No per-camera plan selected yet. Choose a plan and licensed camera count to continue." if activated else
                     "Not activated yet. Choose Activate Your System to make your first order in Build Your System.")
     current_html = ""
-    # Ordered with an appliance: paid at activation, never offered again here.
-    deferred = None if payload else deferred_storage_plan(customer_id)
-    if deferred and deferred["state"] != "superseded" and deferred["plan_key"] in PLANS:
-        plan_summary = (f"{escape(PLANS[deferred['plan_key']]['display_name'])} · "
-                        f"{_camera_count(deferred['camera_quantity'], 'licensed camera')} · ordered with your appliance. "
-                        "Your storage plan starts when you activate the appliance.")
+    # Saved with an appliance or licence order: charged from activation, never offered again here.
+    import build_orders
+    deferred = None if payload else build_orders.live_storage_plan(customer_id)
+    if deferred and deferred["plan_key"] in PLANS:
+        saved_cents = int(deferred.get("monthly_cents_per_camera") or PLANS[deferred["plan_key"]]["monthly_cents_per_camera"])
+        quantity = int(deferred["camera_quantity"])
+        source = "your license" if deferred.get("order_kind") == build_orders.OWN_PC_ORDER else "your appliance"
+        status = {"payment_failed": "Pending Activation · payment not completed: update your card in Manage billing, then retry",
+                  "owner_review": "Pending Activation · under review by AnyAiCam"}.get(deferred["state"], "Pending Activation")
+        plan_summary = (f"{escape(PLANS[deferred['plan_key']]['display_name'])} · {_camera_count(quantity, 'licensed camera')} · "
+                        f"${saved_cents / 100:.2f} per camera/month (${saved_cents * quantity / 100:.2f}/month) · ordered with "
+                        f"{source}. {status}: your monthly subscription starts, and is first charged, when your AnyAiCam "
+                        "system is activated. Nothing is charged for it before then.")
     if legacy:
         plan_summary = (f"AnyAiCam {legacy['name']} (earlier plan) · {_camera_count(legacy['quantity'], 'camera')}"
                         + (" · paused because of a billing problem" if legacy["status"] == "suspended" else ""))
@@ -1613,9 +1625,11 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=409, detail="This account already has a camera plan. Use its plan-change action instead.")
         if existing and existing["kind"] == "legacy":
             raise HTTPException(status_code=409, detail=LEGACY_PLAN_REFUSAL if existing["verified"] else LEGACY_PLAN_UNVERIFIED)
-        if deferred_storage_plan(customer_id):
-            # Paid with the appliance order; it starts at activation (build_orders.py).
-            raise HTTPException(status_code=409, detail="Your storage plan was ordered with your appliance and starts when you activate it.")
+        import build_orders
+        if build_orders.live_storage_plan(customer_id):
+            # Saved with the appliance or licence order; it starts at activation (build_orders.py).
+            raise HTTPException(status_code=409, detail="Your monthly plan was saved with your order and starts when your "
+                                                        "AnyAiCam system is activated.")
         import main
         if not main.PUBLIC_BASE_URL:
             raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
@@ -1627,6 +1641,9 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=409, detail=str(held))
         except RuntimeError as missing:
             raise HTTPException(status_code=503, detail=str(missing))
+        if not build_orders.service_activated(customer_id):
+            # Owner billing rule (2026-10-22): no monthly plan is charged before the AnyAiCam service is activated.
+            raise HTTPException(status_code=409, detail=build_orders.SERVICE_ACTIVATION_FIRST)
         import checkout_guard
         fields = [
             ("mode", "subscription"),

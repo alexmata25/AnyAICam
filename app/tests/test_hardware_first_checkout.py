@@ -164,9 +164,11 @@ def test_guest_checkout_is_a_one_time_hardware_payment_with_shipping(hw):
     assert (fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == ("price_hw_starter", "1")
     assert (fields["line_items[1][price]"], fields["line_items[1][quantity]"]) == ("price_hw_relay", "2")
     assert "line_items[2][price]" not in fields
-    # Nothing recurring: no plan price, no subscription, no card saved for later charges.
+    # Nothing recurring now: no plan price, no subscription. Owner billing rule (2026-10-22): the card is saved so the
+    # plan chosen with the order can start at activation (and only then).
     assert not set(PLAN_PRICES.values()) & set(fields.values())
-    assert not any(key.startswith("subscription_data") or "setup_future_usage" in key for key in fields)
+    assert not any(key.startswith("subscription_data") for key in fields)
+    assert fields["payment_intent_data[setup_future_usage]"] == "off_session"
     assert fields["shipping_address_collection[allowed_countries][0]"] == "US"
     assert fields["phone_number_collection[enabled]"] == "true"
     assert (fields["customer_email"], fields["customer_creation"]) == ("buyer@example.test", "always")
