@@ -472,6 +472,51 @@ def own_pc_licence_reversed(customer_id: str) -> bool:
                "AND suspended_reason IN ('refunded','disputed') LIMIT 1", (customer_id,)) is not None
 
 
+def purchase_reversed(customer_id: str) -> bool:
+    """C5 enforcement (owner-authorized, 2026-10-21): the purchase that licensed the software -- the own-PC licence
+    (own_pc_licence_reversed) or an AnyAiCam appliance order (billing_status.reverse_hardware_orders sets it 'refunded'
+    or 'disputed'; a won dispute makes it 'paid' again) -- is refunded or disputed, and nothing else licenses the
+    software (no active licence row, no paid appliance order). A camera plan alone then carries no licence
+    (vms_license_capacity). Accounts that never had a licence or appliance purchase (plan-only billing-v2) are not
+    affected."""
+    if own_pc_licence_reversed(customer_id):
+        return True
+    if not customer_id or vms_license_owned(customer_id):
+        return False
+    import customer_entitlements
+    if customer_entitlements.appliance_includes_vms_license(customer_id):
+        return False
+    return row("SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' "
+               "AND status IN ('refunded','disputed') LIMIT 1", (customer_id,)) is not None
+
+
+PURCHASE_REVERSED = ("Your AnyAiCam software license payment was refunded or is disputed, so this account can run 0 "
+                     "cameras. Add-ons and plan changes are unavailable until that is resolved; you can still cancel your "
+                     "plan. Contact AnyAiCam support for help.")
+
+
+def licence_reversed_detail(customer_id: str) -> dict:
+    """The 409 of the legacy licence-only checkout for an own-PC licence that was refunded (repurchase: a new order in
+    Build Your System, R7) or disputed (support)."""
+    reason = (row("SELECT suspended_reason FROM customer_entitlements WHERE customer_id=? AND product='vms_license' "
+                  "AND status='suspended' LIMIT 1", (customer_id,)) or {}).get("suspended_reason")
+    if reason == "refunded":
+        return {"code": "licence_reversed", "reason": "refunded", "order_url": "/order-summary",
+                "message": "Your previous VMS software license payment was refunded, so a license cannot be bought "
+                           "again here. Place a new order in Build Your System (/order-summary) once your current "
+                           "camera plan has ended."}
+    return {"code": "licence_reversed", "reason": "disputed",
+            "message": "Your previous VMS software license payment is disputed, so a license cannot be bought here. "
+                       "Contact AnyAiCam support to resolve the dispute."}
+
+
+def reversed_without_capacity(customer_id: str) -> bool:
+    """Owner, 2026-10-21: add-on purchases and plan changes are refused while the licensing purchase is reversed AND
+    the account can run no camera (cancellation is never refused)."""
+    import customer_entitlements
+    return purchase_reversed(customer_id) and customer_entitlements.usable_camera_capacity(customer_id) <= 0
+
+
 def account_activated(customer_id: str) -> bool:
     """VMS 1.2.7 activation (owner decision 2026-10-16): the account's initial purchase is verified, so My subscription
     may sell plans and add-ons. Only records the verified Stripe webhook writes count:
@@ -1000,7 +1045,7 @@ def vms_license_capacity(customer_id: str) -> int:
     Download, signed capacity, camera provisioning and the licence label all read it through
     customer_entitlements.vms_license_capacity."""
     entitlement = entitlement_for_customer(customer_id)
-    if not entitlement or entitlement.get("status") != "active" or own_pc_licence_reversed(customer_id):
+    if not entitlement or entitlement.get("status") != "active" or purchase_reversed(customer_id):
         return 0
     return int(entitlement.get("camera_quantity") or 0)
 
@@ -1614,6 +1659,8 @@ def register_routes(app: FastAPI) -> None:
         identity = partner_identity(request)
         if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
             raise HTTPException(status_code=403, detail="Customer owner permission required.")
+        if reversed_without_capacity(identity["customer_id"]):  # owner 2026-10-21: no upgrade or scheduled downgrade
+            raise HTTPException(status_code=409, detail=PURCHASE_REVERSED)  # (string: the change button shows detail)
         return _change_subscription(identity, payload)
 
     @app.post("/api/v2/customer/subscription/cancel")

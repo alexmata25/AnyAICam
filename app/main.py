@@ -114439,8 +114439,13 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         raise HTTPException(status_code=403, detail="Customer owner permission required.")
     import per_camera_billing
     per_camera_billing.require_activated(identity["customer_id"])  # VMS 1.2.7: no My subscription purchase before activation
-    from analytics_entitlements import ANALYTICS_CATALOG, checkout_item
+    from analytics_entitlements import ADDON_KEYS, ANALYTICS_CATALOG, checkout_item
     addon_key = payload.addon_key.strip().lower()
+    # Owner 2026-10-21 (C5 enforcement): no Analytics or Face Access purchase while the licensing purchase is refunded
+    # or disputed and the account can run 0 cameras (Talk Down / Cloud Overflow rules unchanged; held add-ons are kept).
+    if (addon_key in ADDON_KEYS and addon_key not in ("talk_down", "cloud_overflow")
+            and per_camera_billing.reversed_without_capacity(identity["customer_id"])):
+        raise HTTPException(status_code=409, detail={"code": "licence_reversed", "message": per_camera_billing.PURCHASE_REVERSED})
     # In billing v2, supported Talk Down is already part of AI Local and
     # Hybrid. Keep the existing separately billed add-on unchanged for
     # Basic Local and grandfathered legacy accounts, but refuse a duplicate
@@ -114631,6 +114636,10 @@ def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Reque
         raise HTTPException(status_code=409, detail="Your AnyAiCam appliance already includes the VMS software license. There is nothing to pay.")
     import per_camera_billing
     per_camera_billing.require_activated(customer_id)  # VMS 1.2.7: no My subscription purchase before activation
+    if per_camera_billing.own_pc_licence_reversed(customer_id):
+        # Owner 2026-10-21 (C5): this API-only checkout never re-sells a refunded or disputed licence (its paid webhook
+        # would overwrite the reversed row). The refunded row and billing_reversals stay as they are.
+        raise HTTPException(status_code=409, detail=per_camera_billing.licence_reversed_detail(customer_id))
     owned = max((int(e["camera_slot_quantity"] or 0) for e in get_entitlements_for_customer(customer_id)
                  if e["product"] == pricing_catalog.VMS_LICENSE_PRODUCT and e["status"] == "active"), default=0)
     if owned >= license_["capacity"]:

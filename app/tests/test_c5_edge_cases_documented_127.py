@@ -1,16 +1,17 @@
 """C5 edge cases, DOCUMENTED (owner, 2026-10-21: "Document and test the remaining C5 edge cases, especially active paid
 plans with reversed licenses, add-on purchases, and the legacy checkout endpoint. Do not silently expand billing
-behavior.").
+behavior.") -- and the four KNOWN GAPS the owner then CORRECTED (2026-10-21: "For C5, I approve narrowly scoped
+corrections to: 1. Close the legacy license-only API bypass for refunded/disputed licenses. [...] 2. Prevent Analytics
+and Face Access purchases when the account's license is reversed and camera capacity is zero. 3. Prevent paid plan
+upgrades and scheduled downgrades in that same state, but preserve cancellation. 4. Prevent refunded/disputed appliance
+purchases from retaining camera capacity through an active plan alone. [...] Defer cosmetic Talk Down entitlement
+cleanup and the non-bypassing refund replay issue").
 
-TESTS ONLY. Nothing here changes billing: every test pins what the integrated candidate (C5 c1d1bb7b + customer fixes,
-dedc2a35) does TODAY, so any later change to these paths fails a test and has to be made -- and its decision recorded --
-on purpose.
-
-Each case says whether today's behaviour is INTENDED (the C5 design: per_camera_billing.own_pc_licence_reversed,
-account_activated, vms_license_capacity) or a KNOWN GAP (owner decision). Known gaps are asserted as they behave now,
-not as xfail: a pinned value fails on ANY drift (also a partial or accidental one), while xfail(strict) would only notice
-the one outcome somebody guessed as the fix. When the owner decides a gap, the test that pins it is updated together
-with the code.
+Every test pins what the candidate does, so any later change to these paths fails a test and has to be made -- and
+its decision recorded -- on purpose. Each case says INTENDED (the C5 design), CORRECTED (owner, 2026-10-21; one shared
+predicate per_camera_billing.purchase_reversed = own-PC licence or AnyAiCam appliance purchase refunded/disputed with
+nothing else licensing the software; the purchase gates also require usable camera capacity 0,
+per_camera_billing.reversed_without_capacity) or DEFERRED (owner decision: documented, not changed).
 
 The account under test ("reversed + running plan"): an own-PC customer whose one-time VMS licence payment is REFUNDED or
 DISPUTED while a per-camera plan is still RUNNING. Two real ways to get there, both through the webhook route:
@@ -22,31 +23,31 @@ C5 keeps such an account ACTIVATED (its running plan stays manageable) but its p
 download refused, licence / usable / signed capacity 0.
 
 Cases (routes in the candidate):
-1. Add-ons -- POST /api/customer/analytics/checkout (main.py:114407) + the webhook route:
-   KNOWN GAP: Advanced Analytics is sold, paid and granted (and assignable to an existing camera row) although the
-   account can run 0 cameras. Face Access reaches checkout once a door is set up. Talk Down is refused on AI Local as
-   before (included with the plan); Voice Call is not sold on its own (part of the Talk Down add-on).
-2. Legacy / API-only one-time licence checkout -- POST /api/customer/vms-license/checkout (main.py:114611):
-   KNOWN GAP: it sells a NEW licence to the reversed account (it counts only ACTIVE licence rows); the paid webhook
-   (customer_entitlements._sync_checkout_completed -> upsert_entitlement, one row per customer+product) OVERWRITES the
-   refunded/disputed row in place (status, reason, Checkout Session and PaymentIntent replaced), writes NO R7 archive
-   (audit_logs build_order.superseded_after_refund), and the running plan's capacity comes back. The reversal itself
-   stays in billing_reversals; a replay of the old reversal does not suspend the new licence. Before activation (plan
-   ended) the route answers 409 activate_first (INTENDED, C5 gate).
-   Legacy software-tier checkout POST /api/payments/checkout (main.py:113591): 503 while its Price is unset; with a
-   Price configured it opens a Checkout, whose payment grants no camera capacity (no tier maps its Price).
-3. Capacity paths -- POST /api/customer/camera-slots/checkout was removed (404). Build Your System
-   (POST /api/v2/customer/build-order/checkout, build_orders.py:719) refuses a second order while the plan runs (409);
-   /order-summary redirects away; a second plan is refused (409). INTENDED: no plan-only capacity path.
-4. Plan change -- POST /api/v2/customer/subscription/change (per_camera_billing.py:1612): KNOWN GAP: no activation or
-   licence check; upgrades are charged at once (Stripe proration) and scheduled downgrades accepted, while capacity stays
-   0. Cancel (per_camera_billing.py:1619) works: INTENDED (the running plan stays manageable).
+1. Add-ons -- POST /api/customer/analytics/checkout (main.py) + the webhook route:
+   CORRECTED (owner item 2): Advanced Analytics / analytics bundles and Face Access are refused (409 licence_reversed,
+   no Stripe call) while the account can run 0 cameras; add-ons it already holds are kept (not revoked). Talk Down is
+   refused on AI Local as before (included with the plan); Voice Call is not sold on its own: unchanged.
+2. Legacy / API-only one-time licence checkout -- POST /api/customer/vms-license/checkout (main.py):
+   CORRECTED (owner item 1): refused (409 licence_reversed, no Stripe call) while the own-PC licence is refunded or
+   disputed; the refunded row and billing_reversals stay as they are; a refund is bought back through Build Your System
+   (R7, which archives the old order), a dispute goes to support. Before activation (plan ended) the route answers 409
+   activate_first (INTENDED, C5 gate). RESIDUAL (documented): a licence Checkout Session opened before this correction
+   and paid after it is a genuine new payment and is still granted on the same row (the reversal stays in
+   billing_reversals). DEFERRED (owner, item 7): a replay of the old reversal does not re-suspend such a new licence.
+   Legacy software-tier checkout POST /api/payments/checkout: 503 while its Price is unset; with a Price configured it
+   opens a Checkout, whose payment grants no camera capacity (no tier maps its Price).
+3. Capacity paths -- POST /api/customer/camera-slots/checkout was removed (404). Build Your System refuses a second
+   order while the plan runs (409); /order-summary redirects away; a second plan is refused (409). INTENDED.
+4. Plan change -- POST /api/v2/customer/subscription/change (per_camera_billing.py): CORRECTED (owner item 3):
+   upgrades and scheduled downgrades are refused (409, no Stripe call); cancel at period end works (INTENDED). There is
+   no un-cancel route in AnyAiCam (only Stripe's billing portal), so nothing else changes.
 5. Appliance boundary (owner exemption: a PAID AnyAiCam appliance includes the licence): a refunded or disputed appliance
-   order no longer exempts the account, so a refunded own-PC licence row again blocks plan capacity (INTENDED); a won
-   appliance dispute restores it (INTENDED). KNOWN GAP: an appliance order refunded/disputed WITHOUT any own-PC licence
-   row falls back to the billing-v2 rule "an active plan carries the licence" -- full capacity and download.
+   order no longer exempts the account (INTENDED); a won appliance dispute restores it (INTENDED). CORRECTED (owner
+   item 4): an appliance order refunded/disputed WITHOUT any own-PC licence row no longer keeps capacity through the
+   active plan alone (licence / usable / signed 0, no download); a won dispute restores it. Controls unchanged: a paid
+   appliance, an active licence, a plan-only account.
 6. Signed snapshot (feature_entitlements.appliance_snapshot): camera_capacity {0, plan, 0}; talk_down True from the AI
-   Local plan, voice_call False. KNOWN GAP (cosmetic): Talk Down is signed as entitled while no camera may run.
+   Local plan, voice_call False. DEFERRED (owner, cosmetic): Talk Down is signed as entitled while no camera may run.
 
 Real routes and real billing code; Stripe is the fake of test_refund_before_record_race_127.py.
 """
@@ -61,8 +62,8 @@ from test_hybrid_build_system_flow import (PRICES, _checkout, _checkouts, _paid_
                                            db_path, license_portal, package, portal, shop, site, storage)
 from test_refund_before_record_race_127 import (_access, _configure, _dispute, _ids, _invoice_paid, _later_invoice,  # noqa: F401
                                                 _post, _refund, _sub_event, stripe)
-from test_r7_repurchase_after_refund_127 import (_capacity, _end_order1, _licence_row, _ok, _order1_paid, _plan_row,
-                                                 _r7_ready, _subscription, _superseded)
+from test_r7_repurchase_after_refund_127 import (_capacity, _end_order1, _licence_row, _new_order, _ok, _order1_paid,
+                                                 _order2_paid, _plan_row, _r7_ready, _subscription, _superseded)
 from test_c5_refunded_licence_no_plan_capacity_127 import (_account, _entitled, _exec, _open_plan_checkout,
                                                            _pay_plan_checkout, _signed)
 
@@ -74,6 +75,14 @@ LEGACY_CHECKOUT = "/api/payments/checkout"
 CHANGE = "/api/v2/customer/subscription/change"
 CANCEL = "/api/v2/customer/subscription/cancel"
 REVERSED_RUNNING = (True, False, 0, 0, 0)  # activated, no download, licence / usable / signed capacity 0
+FULL_PLAN = (True, True, 6, 6, 6)  # a seeded account's AI Local x6 with its licence
+PURCHASE_REVERSED = ("Your AnyAiCam software license payment was refunded or is disputed, so this account can run 0 "
+                     "cameras. Add-ons and plan changes are unavailable until that is resolved; you can still cancel your "
+                     "plan. Contact AnyAiCam support for help.")
+LICENCE_REFUNDED = ("Your previous VMS software license payment was refunded, so a license cannot be bought again here. "
+                    "Place a new order in Build Your System (/order-summary) once your current camera plan has ended.")
+LICENCE_DISPUTED = ("Your previous VMS software license payment is disputed, so a license cannot be bought here. "
+                    "Contact AnyAiCam support to resolve the dispute.")
 
 
 # ------------------------------------------------------------------ the account under test
@@ -129,12 +138,14 @@ def _addon_paid_event(shop, stripe, customer_id, stripe_customer, sub_id):
         "customer": stripe_customer, "subscription": sub_id, "metadata": _metadata(fields)}}}
 
 
-def _licence_paid_event(shop, stripe_customer, session_id="cs_c5e_licence", intent="pi_c5e_licence"):
-    """checkout.session.completed for the latest one-time licence Checkout (mode=payment)."""
-    fields = [item for item in shop[1] if item.get("mode") == "payment"][-1]
+def _licence_paid_event(customer_id, stripe_customer, session_id="cs_c5e_licence", intent="pi_c5e_licence"):
+    """checkout.session.completed (mode=payment) of a one-time 8-camera licence Checkout Session -- one opened through
+    POST /api/customer/vms-license/checkout before the owner's correction (the metadata that route writes)."""
+    metadata = {"anyaicam_stripe_price_id": "price_vms_8", "anyaicam_customer_id": customer_id,
+                "anyaicam_product_class": "vms_license", "anyaicam_vms_license_capacity": "8"}
     return {"id": f"evt_{session_id}", "type": "checkout.session.completed", "livemode": False, "data": {"object": {
         "id": session_id, "mode": "payment", "payment_status": "paid", "status": "complete", "customer": stripe_customer,
-        "payment_intent": intent, "amount_total": 49999, "metadata": _metadata(fields)}}}
+        "payment_intent": intent, "amount_total": 49999, "metadata": metadata}}}
 
 
 def _camera(db_path, customer_id, camera_id="cam-c5e", door=False):
@@ -172,52 +183,50 @@ def _stripe_writes(monkeypatch, stripe):
     return posts
 
 
+def _refused_licence_reversed(response):
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == {"code": "licence_reversed", "message": PURCHASE_REVERSED}
+
+
+def _predicates(db_path, customer_id):
+    import per_camera_billing
+    with override_target(sqlite_path=str(db_path)):
+        return (per_camera_billing.purchase_reversed(customer_id), per_camera_billing.reversed_without_capacity(customer_id))
+
+
 # ------------------------------------------------------------------ 1. add-ons on a reversed + running-plan account
 
 @BUILDERS
-def test_1_advanced_analytics_add_on_is_sold_and_granted_with_zero_camera_capacity(shop, db_path, stripe, builder):
-    """KNOWN GAP (owner decision): require_activated passes (the running plan keeps the account activated) and no
-    add-on check looks at the licence, so My subscription offers Advanced Analytics, the checkout opens at the server
-    price, the paid webhook grants its analytics and they can be assigned to an existing camera row -- while the signed
-    capacity stays 0, so the appliance may run no camera to use them on. Billed monthly per camera (quantity 2 here)."""
+def test_1_advanced_analytics_add_on_is_refused_with_zero_camera_capacity(shop, db_path, stripe, builder):
+    """CORRECTED (owner item 2; was KNOWN GAP: sold, paid and granted with 0 cameras): My subscription still lists the
+    add-on (page unchanged), but the checkout is refused with 409 licence_reversed before any Stripe call, so nothing is
+    sold or granted; capacity stays 0."""
     client = shop[0]
     customer_id, ids, stripe_customer, _ = _reversed_running(shop, db_path, stripe, builder, "c5e-addon@example.test")
     page = client.get("/subscription-portal")
     assert page.status_code == 200 and "advanced_analytics" in re.findall(r'data-addon-key="([^"]+)"', page.text)
-    before = len(_checkouts(shop[1]))
-    response = client.post(ADDON_CHECKOUT, json={"addon_key": "advanced_analytics", "quantity": 2})
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "complete" and len(_checkouts(shop[1])) == before + 1
-    fields = _checkouts(shop[1])[-1]
-    assert (fields["mode"], fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == ("subscription", "price_adv", "2")
-    assert not any("vms" in str(value).lower() for value in fields.values())  # no licence line, no licence wording
-    _ok(client, _addon_paid_event(shop, stripe, customer_id, stripe_customer, "sub_c5e_addon"))
-    assert _active_analytics(db_path, customer_id) == (["lpr", "people_counting", "ppe"], ["advanced_analytics"])
-    _camera(db_path, customer_id)
-    import customer_analytics_panel as cap
-    from partner_db import connection
-    with override_target(sqlite_path=str(db_path)), connection() as db:
-        cap.assign_entitlement(db, "cam-c5e", "lpr", now="2026-10-21T00:00:00")  # accepted (no capacity check)
-    assert _entitled(db_path, customer_id) == REVERSED_RUNNING  # the add-on restores nothing
+    before = len(shop[1])
+    for addon_key in ("advanced_analytics", "ai_essentials", "ai_professional", "vehicle_intelligence"):
+        _refused_licence_reversed(client.post(ADDON_CHECKOUT, json={"addon_key": addon_key, "quantity": 2}))
+    assert len(shop[1]) == before  # no Stripe call
+    assert _active_analytics(db_path, customer_id) == ([], [])
+    assert _entitled(db_path, customer_id) == REVERSED_RUNNING
     assert _signed(db_path, customer_id) == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0}
 
 
 @BUILDERS
-def test_1_face_access_reaches_checkout_once_a_door_is_set_up(shop, db_path, stripe, builder, monkeypatch):
-    """KNOWN GAP (same as Advanced Analytics): with a test-mode Face Access Price and a door camera, the per-door
-    checkout opens for the reversed account. Without a door it is refused for that reason only (400, no Stripe call)."""
+def test_1_face_access_is_refused_with_or_without_a_door(shop, db_path, stripe, builder, monkeypatch):
+    """CORRECTED (owner item 2; was KNOWN GAP: the per-door checkout opened once a door was set up): every Face Access
+    SKU is refused with 409 licence_reversed, door or not, before any Stripe call."""
     client = shop[0]
     customer_id, *_ = _reversed_running(shop, db_path, stripe, builder, "c5e-face@example.test")
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_FACE_ACCESS_SMALL", "price_face_small")
-    before = len(_checkouts(shop[1]))
-    refused = client.post(ADDON_CHECKOUT, json={"addon_key": "face_access_small"})
-    assert refused.status_code == 400 and "billed per door" in refused.json()["detail"]
-    assert len(_checkouts(shop[1])) == before
+    before = len(shop[1])
+    _refused_licence_reversed(client.post(ADDON_CHECKOUT, json={"addon_key": "face_access_small"}))
     _camera(db_path, customer_id, door=True)
-    response = client.post(ADDON_CHECKOUT, json={"addon_key": "face_access_small"})
-    assert response.status_code == 200, response.text
-    fields = _checkouts(shop[1])[-1]
-    assert (fields["line_items[0][price]"], fields["line_items[0][quantity]"]) == ("price_face_small", "1")
+    for addon_key in ("face_access_small", "face_access_medium", "face_access_large", "facial_recognition"):
+        _refused_licence_reversed(client.post(ADDON_CHECKOUT, json={"addon_key": addon_key}))
+    assert len(shop[1]) == before
     assert _entitled(db_path, customer_id) == REVERSED_RUNNING
 
 
@@ -235,47 +244,74 @@ def test_1_talk_down_is_refused_on_ai_local_and_voice_call_is_not_sold_alone(sho
     assert len(_checkouts(shop[1])) == before
 
 
+def test_1_an_add_on_bought_before_the_reversal_is_kept(shop, db_path, stripe):
+    """Owner: existing valid entitlements are not modified. Advanced Analytics bought (and paid) while the licence was
+    active stays active after the licence refund and the later paid month; only NEW add-on purchases are refused."""
+    client = shop[0]
+    customer_id, ids, events, stripe_customer = _order1_paid(shop, db_path, stripe, "c5e-held@example.test")
+    opened = client.post(ADDON_CHECKOUT, json={"addon_key": "advanced_analytics", "quantity": 2})
+    assert opened.status_code == 200, opened.text
+    _ok(client, _addon_paid_event(shop, stripe, customer_id, stripe_customer, "sub_c5e_held"))
+    held = (["lpr", "people_counting", "ppe"], ["advanced_analytics"])
+    assert _active_analytics(db_path, customer_id) == held
+    _ok(client, _refund(ids, "evt_c5e_held_refund"))
+    _later_invoice(stripe, ids, "in_race_m2")
+    _subscription(stripe, ids, customer_id, stripe_customer, quantity=5, latest_invoice="in_race_m2")
+    _ok(client, _invoice_paid(ids, "in_race_m2", "pi_in_race_m2"))
+    assert _entitled(db_path, customer_id) == REVERSED_RUNNING
+    assert _active_analytics(db_path, customer_id) == held  # kept
+    assert _one(db_path, "SELECT status FROM addon_subscriptions WHERE customer_id=? AND addon_key='advanced_analytics'",
+                (customer_id,))["status"] == "active"
+    before = len(shop[1])
+    _refused_licence_reversed(client.post(ADDON_CHECKOUT, json={"addon_key": "vehicle_intelligence"}))
+    assert len(shop[1]) == before
+
+
 # ------------------------------------------------------------------ 2. the legacy / API-only licence checkout
 
 @BUILDERS
-def test_2_legacy_licence_checkout_sells_a_new_licence_that_overwrites_the_reversed_row(shop, db_path, stripe, builder):
-    """KNOWN GAP (owner decision): POST /api/customer/vms-license/checkout (not linked from My subscription's v2 page;
-    API-only) counts only ACTIVE licence rows, so the reversed account may buy a new one-time licence (8 cameras here).
-    Paid, the webhook updates the SAME customer_entitlements row in place: status active, reason cleared, the old
-    Checkout Session and PaymentIntent replaced by the new ones. No R7 archive is written (R7's audit copy exists only on
-    the Build Your System path). The reversal stays recorded in billing_reversals. Capacity returns: licence min(plan 5,
-    licence 8) -> the running plan's 5 cameras, download allowed. A replay of the OLD reversal (new event id) does not
-    suspend the new licence (it names the old PaymentIntent)."""
+def test_2_legacy_licence_checkout_is_refused_for_a_reversed_licence(shop, db_path, stripe, builder):
+    """CORRECTED (owner item 1; was KNOWN GAP: a new licence was sold and its webhook overwrote the reversed row in place,
+    with no R7 archive): 409 licence_reversed before any Stripe call, for every capacity. The refunded/disputed row and
+    its billing_reversals record stay exactly as they were; nothing is archived or superseded."""
     client = shop[0]
     customer_id, ids, stripe_customer, reason = _reversed_running(shop, db_path, stripe, builder, "c5e-lic@example.test")
     old = dict(_licence_row(db_path, customer_id))
-    reversals_before = _one(db_path, "SELECT COUNT(*) AS n FROM billing_reversals")["n"]
-    response = client.post(LICENCE_CHECKOUT, json={"capacity": 8})
-    assert response.status_code == 200, response.text
-    assert (response.json()["capacity"], response.json()["billing_type"]) == (8, "one_time")
-    fields = [item for item in shop[1] if item.get("mode") == "payment"][-1]
-    assert (fields["line_items[0][price]"], fields["metadata[anyaicam_product_class]"]) == ("price_vms_8", "vms_license")
-    assert _entitled(db_path, customer_id) == REVERSED_RUNNING  # an open checkout grants nothing
-
-    _ok(client, _licence_paid_event(shop, stripe_customer))
-    new = _licence_row(db_path, customer_id)
-    assert new["id"] == old["id"]  # the same row, overwritten
-    assert (new["status"], new["suspended_reason"], new["camera_slot_quantity"]) == ("active", None, 8)
-    assert (new["stripe_checkout_session_id"], new["stripe_payment_intent_id"]) == ("cs_c5e_licence", "pi_c5e_licence")
+    reversals = _one(db_path, "SELECT COUNT(*) AS n FROM billing_reversals")["n"]
+    before = len(shop[1])
+    for capacity in (8, 16):
+        response = client.post(LICENCE_CHECKOUT, json={"capacity": capacity})
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        if reason == "refunded":
+            assert detail == {"code": "licence_reversed", "reason": "refunded", "order_url": "/order-summary",
+                              "message": LICENCE_REFUNDED}
+        else:
+            assert detail == {"code": "licence_reversed", "reason": "disputed", "message": LICENCE_DISPUTED}
+    assert len(shop[1]) == before  # no Stripe call
+    assert dict(_licence_row(db_path, customer_id)) == old
     assert (old["stripe_checkout_session_id"], old["stripe_payment_intent_id"], old["suspended_reason"]) == (
-        "cs_test_race0001", "pi_race1", reason)  # what the row said before -- now only in billing_reversals / Stripe
-    assert _superseded(db_path, customer_id) == []  # no R7 archive
-    assert _one(db_path, "SELECT COUNT(*) AS n FROM billing_reversals")["n"] == reversals_before
+        "cs_test_race0001", "pi_race1", reason)
+    assert _one(db_path, "SELECT COUNT(*) AS n FROM billing_reversals")["n"] == reversals
     assert _one(db_path, "SELECT payment_intent FROM billing_reversals WHERE payment_intent='pi_race1'")
-    assert _entitled(db_path, customer_id) == (True, True, 5, 5, 5)
+    assert _superseded(db_path, customer_id) == []
+    assert _entitled(db_path, customer_id) == REVERSED_RUNNING
 
-    replay = _refund(_ids(1), "evt_c5e_old_refund_again") if reason == "refunded" else _dispute(_ids(1), "created", event_id="evt_c5e_old_dp_again")
-    _ok(client, replay)
-    assert (_licence_row(db_path, customer_id)["status"], _licence_row(db_path, customer_id)["stripe_payment_intent_id"]) == (
-        "active", "pi_c5e_licence")
-    # A second licence is refused as before.
-    again = client.post(LICENCE_CHECKOUT, json={"capacity": 8})
-    assert again.status_code == 409 and "already covers 8" in again.json()["detail"]
+
+def test_2_after_the_refusal_the_r7_order_path_restores_licence_and_capacity(shop, db_path, stripe):
+    """The repurchase path the refusal points to: once the running plan ends, Build Your System places a NEW order
+    (R7 archives order 1) that charges the licence again; paid, licence and capacity return. The legacy route is never
+    needed."""
+    client = shop[0]
+    customer_id, ids, stripe_customer, _ = _reversed_running(shop, db_path, stripe, _later_paid_month, "c5e-r7@example.test")
+    assert client.post(LICENCE_CHECKOUT, json={"capacity": 8}).json()["detail"]["code"] == "licence_reversed"
+    _end_order1(shop, db_path, stripe, customer_id, ids, {}, stripe_customer)
+    _new_order(shop)
+    assert len(_superseded(db_path, customer_id)) == 1  # R7 archive of order 1
+    _order2_paid(shop, db_path, stripe, customer_id, stripe_customer)
+    assert _licence_row(db_path, customer_id)["status"] == "active"
+    assert _entitled(db_path, customer_id) == (True, True, 10, 10, 10)
+    assert _predicates(db_path, customer_id) == (False, False)
 
 
 def test_2_legacy_licence_checkout_before_activation_is_refused(shop, db_path, stripe):
@@ -286,6 +322,32 @@ def test_2_legacy_licence_checkout_before_activation_is_refused(shop, db_path, s
     response = shop[0].post(LICENCE_CHECKOUT, json={"capacity": 8})
     assert response.status_code == 409 and response.json()["detail"]["code"] == "activate_first"
     assert len(shop[1]) == before
+
+
+@BUILDERS
+def test_2_a_licence_session_opened_before_the_correction_and_paid_after_it_is_still_granted(shop, db_path, stripe, builder):
+    """RESIDUAL, documented (not changed): with the gate, no new licence session can be opened for a reversed account
+    (and none while a licence is active: "already covers"), so a licence session paid after a reversal can only be one
+    opened before this correction was deployed (Stripe expires Checkout Sessions within 24 hours). It is a genuine new
+    payment, so the webhook grants it -- blocking the grant would keep the customer's money and license nothing -- on
+    the same row (one per customer+product); the old reversal stays in billing_reversals. DEFERRED (owner item 7): a
+    replay of the OLD reversal (new event id) does not suspend that new licence (it names the old PaymentIntent)."""
+    client = shop[0]
+    customer_id, ids, stripe_customer, reason = _reversed_running(shop, db_path, stripe, builder, "c5e-inflight@example.test")
+    reversals = _one(db_path, "SELECT COUNT(*) AS n FROM billing_reversals")["n"]
+    _ok(client, _licence_paid_event(customer_id, stripe_customer))
+    new = _licence_row(db_path, customer_id)
+    assert (new["status"], new["suspended_reason"], new["camera_slot_quantity"]) == ("active", None, 8)
+    assert (new["stripe_checkout_session_id"], new["stripe_payment_intent_id"]) == ("cs_c5e_licence", "pi_c5e_licence")
+    assert _one(db_path, "SELECT COUNT(*) AS n FROM billing_reversals")["n"] == reversals
+    assert _one(db_path, "SELECT payment_intent FROM billing_reversals WHERE payment_intent='pi_race1'")
+    assert _entitled(db_path, customer_id) == (True, True, 5, 5, 5)
+    replay = _refund(_ids(1), "evt_c5e_old_refund_again") if reason == "refunded" else _dispute(_ids(1), "created", event_id="evt_c5e_old_dp_again")
+    _ok(client, replay)
+    assert (_licence_row(db_path, customer_id)["status"], _licence_row(db_path, customer_id)["stripe_payment_intent_id"]) == (
+        "active", "pi_c5e_licence")
+    again = client.post(LICENCE_CHECKOUT, json={"capacity": 8})
+    assert again.status_code == 409 and "already covers 8" in again.json()["detail"]
 
 
 @BUILDERS
@@ -340,49 +402,40 @@ def test_3_no_capacity_path_is_open_to_the_reversed_account(shop, db_path, strip
 # ------------------------------------------------------------------ 4. plan change on the running plan
 
 @BUILDERS
-def test_4_plan_changes_are_charged_and_capacity_stays_zero(shop, db_path, stripe, builder, monkeypatch):
-    """KNOWN GAP (owner decision): /api/v2/customer/subscription/change checks neither activation nor the licence.
-    More cameras (5 -> 8) and AI Local -> Hybrid are applied at once with Stripe proration (always_invoice), a smaller
-    plan is scheduled for renewal -- the plan grows, the customer pays more, usable / signed capacity stays 0 and
-    nothing on the change tells the customer why. Cancel at period end works: INTENDED (C5: the running plan stays
-    manageable)."""
+def test_4_plan_upgrades_and_downgrades_are_refused_and_cancel_works(shop, db_path, stripe, builder, monkeypatch):
+    """CORRECTED (owner item 3; was KNOWN GAP: upgrades charged at once with proration and downgrades scheduled while
+    capacity stayed 0): more cameras, AI Local -> Hybrid and a smaller plan are each refused with 409 before any Stripe
+    call (the plan row is unchanged). The detail is a plain string because the change button shows data.detail as text.
+    Cancel at period end works: INTENDED (the running plan stays manageable)."""
     client = shop[0]
     customer_id, ids, stripe_customer, _ = _reversed_running(shop, db_path, stripe, builder, "c5e-change@example.test")
     page = client.get("/subscription-portal").text
     assert 'id="v2-change-button"' in page and 'id="v2-activate-first"' not in page
     posts = _stripe_writes(monkeypatch, stripe)
-
-    more = client.post(CHANGE, json={"plan_key": "ai_local", "camera_quantity": 8})
-    assert more.status_code == 200 and more.json()["status"] == "updated", more.text
-    path, write = posts[-1]
-    assert path == f"/v1/subscriptions/{ids['sub']}"
-    assert (write["items[0][quantity]"], write["proration_behavior"]) == ("8", "always_invoice")
-    assert _plan_row(db_path, customer_id)["camera_quantity"] == 8
+    plan_before = dict(_plan_row(db_path, customer_id))
+    for change in ({"plan_key": "ai_local", "camera_quantity": 8}, {"plan_key": "hybrid", "camera_quantity": 5},
+                   {"plan_key": "ai_local", "camera_quantity": 2}, {"plan_key": "basic_local", "camera_quantity": 5}):
+        refused = client.post(CHANGE, json=change)
+        assert refused.status_code == 409 and refused.json()["detail"] == PURCHASE_REVERSED, refused.text
+    assert posts == []  # no Stripe write (the refusal comes before the subscription is even read)
+    assert dict(_plan_row(db_path, customer_id)) == plan_before
     assert _entitled(db_path, customer_id) == REVERSED_RUNNING
-    assert _capacity(db_path, customer_id)["plan_camera_slots"] == 8
-
-    hybrid = client.post(CHANGE, json={"plan_key": "hybrid", "camera_quantity": 8})
-    assert hybrid.status_code == 200 and hybrid.json()["status"] == "updated"
-    assert posts[-1][1]["items[0][price]"] == PRICES["hybrid"] and _plan_row(db_path, customer_id)["plan_key"] == "hybrid"
-    assert _entitled(db_path, customer_id) == REVERSED_RUNNING
-
-    fewer = client.post(CHANGE, json={"plan_key": "hybrid", "camera_quantity": 2})
-    assert fewer.status_code == 200 and fewer.json()["status"] == "scheduled"
-    assert _entitled(db_path, customer_id) == REVERSED_RUNNING
-    assert not any("vms" in str(value).lower() for _, write in posts for value in write.values())  # never a licence line
 
     cancel = client.post(CANCEL)
     assert cancel.status_code == 200 and cancel.json()["status"] == "cancellation_scheduled"
+    assert [path for path, _ in posts] == [f"/v1/subscriptions/{ids['sub']}"]
+    assert posts[-1][1] == {"cancel_at_period_end": "true"}
     assert _entitled(db_path, customer_id) == REVERSED_RUNNING
 
 
 # ------------------------------------------------------------------ 5. the appliance exemption boundary
 
-def _appliance_order(db_path, customer_id, intent):
+def _appliance_order(db_path, customer_id, intent, suffix="", status="paid"):
     _exec(db_path, "INSERT INTO hardware_orders(id,customer_id,sku,product_name,stripe_price_id,stripe_checkout_session_id,"
                    "stripe_payment_intent_id,quantity,amount_cents,currency,status,fulfillment_status,created_at,updated_at) "
-                   "VALUES(?,?,'AIC-APPLIANCE-RYZEN-STARTER','AnyAiCam Starter','price_hw','cs_hw_c5e',?,1,124999,'usd',"
-                   "'paid','delivered','2026-10-01','2026-10-01')", (f"hw-{customer_id}", customer_id, intent))
+                   "VALUES(?,?,'AIC-APPLIANCE-RYZEN-STARTER','AnyAiCam Starter','price_hw',?,?,1,124999,'usd',"
+                   "?,'delivered','2026-10-01','2026-10-01')",
+          (f"hw-{customer_id}{suffix}", customer_id, f"cs_hw_c5e{suffix}", intent, status))
 
 
 def _reverse_appliance(db_path, intent, reason):
@@ -400,7 +453,7 @@ def test_5_reversed_appliance_and_reversed_licence_give_no_plan_capacity(shop, d
     capacity 0, no download; with the plan ended the account is not activated."""
     _account(db_path, "cust-apr", licence=licence)
     _appliance_order(db_path, "cust-apr", "pi_hw_apr")
-    assert _entitled(db_path, "cust-apr") == (True, True, 6, 6, 6)  # paid appliance: exempt (existing C5 test)
+    assert _entitled(db_path, "cust-apr") == FULL_PLAN  # paid appliance: exempt (existing C5 test)
     _reverse_appliance(db_path, "pi_hw_apr", appliance)
     assert _entitled(db_path, "cust-apr") == REVERSED_RUNNING
     _exec(db_path, "UPDATE camera_plan_entitlements_v2 SET status='cancelled',camera_quantity=0 WHERE customer_id='cust-apr'")
@@ -416,23 +469,60 @@ def test_5_a_won_appliance_dispute_restores_the_exemption(shop, db_path):
     assert _entitled(db_path, "cust-apw") == REVERSED_RUNNING
     with override_target(sqlite_path=str(db_path)):
         assert billing_status.restore_hardware_orders("pi_hw_apw") == 1
-    assert _entitled(db_path, "cust-apw") == (True, True, 6, 6, 6)
+    assert _entitled(db_path, "cust-apw") == FULL_PLAN
 
 
 @pytest.mark.parametrize("appliance", ["refunded", "disputed"])
-def test_5_reversed_appliance_without_a_licence_row_keeps_full_plan_capacity(shop, db_path, appliance):
-    """KNOWN GAP (owner decision; outside C5, which keys on an own-PC licence ROW): an appliance customer never had a
-    vms_license row, so after the appliance payment is refunded or disputed own_pc_licence_reversed is False and the
-    billing-v2 rule "an active per-camera plan carries the software licence" gives full capacity and download."""
+def test_5_reversed_appliance_without_a_licence_row_gives_no_plan_capacity(shop, db_path, appliance):
+    """CORRECTED (owner item 4; was KNOWN GAP: full capacity and download through the active plan alone): an appliance
+    customer never had a vms_license row; once the appliance payment is refunded or disputed, purchase_reversed holds,
+    so the plan carries no licence: licence / usable / signed 0, no download, add-ons and plan changes gated. The
+    account stays activated (account_activated is unchanged: an ended plan still counts here, because the R7 new-order
+    path is own-PC only)."""
     _account(db_path, "cust-apn")
     _appliance_order(db_path, "cust-apn", "pi_hw_apn")
+    assert _entitled(db_path, "cust-apn") == FULL_PLAN and _predicates(db_path, "cust-apn") == (False, False)
     _reverse_appliance(db_path, "pi_hw_apn", appliance)
     import customer_entitlements as ce
     import per_camera_billing
     with override_target(sqlite_path=str(db_path)):
         assert ce.appliance_includes_vms_license("cust-apn") is False
         assert per_camera_billing.own_pc_licence_reversed("cust-apn") is False
-    assert _entitled(db_path, "cust-apn") == (True, True, 6, 6, 6)
+    assert _predicates(db_path, "cust-apn") == (True, True)
+    assert _entitled(db_path, "cust-apn") == REVERSED_RUNNING
+    assert _signed(db_path, "cust-apn") == {"camera_slot_quantity": 0, "plan_camera_slots": 6, "vms_license_capacity": 0}
+    _exec(db_path, "UPDATE camera_plan_entitlements_v2 SET status='cancelled',camera_quantity=0 WHERE customer_id='cust-apn'")
+    assert _entitled(db_path, "cust-apn") == (True, False, 0, 0, 0)
+
+
+def test_5_a_won_appliance_dispute_without_a_licence_row_restores_capacity(shop, db_path):
+    import billing_status
+    _account(db_path, "cust-apd")
+    _appliance_order(db_path, "cust-apd", "pi_hw_apd")
+    _reverse_appliance(db_path, "pi_hw_apd", "disputed")
+    assert _entitled(db_path, "cust-apd") == REVERSED_RUNNING
+    with override_target(sqlite_path=str(db_path)):
+        assert billing_status.restore_hardware_orders("pi_hw_apd") == 1
+    assert _entitled(db_path, "cust-apd") == FULL_PLAN and _predicates(db_path, "cust-apd") == (False, False)
+
+
+@pytest.mark.parametrize("kind", ["paid-appliance", "paid-appliance-beside-a-refunded-one", "active-licence",
+                                  "active-licence-beside-a-refunded-appliance", "plan-only"])
+def test_5_controls_paid_appliance_active_licence_and_plan_only_accounts_are_unchanged(shop, db_path, kind):
+    """Controls (owner: existing valid entitlements are not modified): a paid appliance order, an active licence row,
+    or a plan-only account (never a licence or appliance purchase) keeps full plan capacity and is never gated."""
+    customer_id = f"cust-ctl-{kind}"
+    _account(db_path, customer_id)
+    if kind.startswith("paid-appliance"):
+        _appliance_order(db_path, customer_id, "pi_hw_ctl_paid")
+    if kind.endswith("refunded-one") or kind.endswith("refunded-appliance"):
+        _appliance_order(db_path, customer_id, "pi_hw_ctl_refunded", suffix="-2")
+        _reverse_appliance(db_path, "pi_hw_ctl_refunded", "refunded")
+    if kind.startswith("active-licence"):
+        _exec(db_path, "INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,created_at,"
+                       "updated_at) VALUES(?,?,'vms_license',8,'active','2026-10-01','2026-10-01')", (f"lic-{customer_id}", customer_id))
+    assert _predicates(db_path, customer_id) == (False, False)
+    assert _entitled(db_path, customer_id) == FULL_PLAN
 
 
 # ------------------------------------------------------------------ 6. the signed feature / capacity snapshot
@@ -440,8 +530,8 @@ def test_5_reversed_appliance_without_a_licence_row_keeps_full_plan_capacity(sho
 @BUILDERS
 def test_6_signed_snapshot_of_the_reversed_running_plan_account(shop, db_path, stripe, builder):
     """camera_capacity: usable 0, plan 5, licence 0 (INTENDED, C5). features: talk_down True (AI Local includes
-    supported Talk Down, read from the active plan), voice_call False (not part of ordinary Talk Down). KNOWN GAP
-    (cosmetic, owner decision): Talk Down is signed as entitled although the appliance may run no camera."""
+    supported Talk Down, read from the active plan), voice_call False (not part of ordinary Talk Down). DEFERRED
+    (cosmetic, owner 2026-10-21): Talk Down is signed as entitled although the appliance may run no camera."""
     import feature_entitlements
     customer_id, *_ = _reversed_running(shop, db_path, stripe, builder, "c5e-snap@example.test")
     with override_target(sqlite_path=str(db_path)):
