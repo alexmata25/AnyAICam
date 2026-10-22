@@ -577,11 +577,31 @@ def previous_order_refunded_and_ended(customer_id: str) -> bool:
     return bool(licence and licence["status"] == "suspended" and licence["suspended_reason"] == "refunded")
 
 
+def _order_reversals(licence: dict | None, payments: list[dict]) -> list[dict]:
+    """The refund/dispute records (billing_reversals) of an order's licence and subscription payments, for its archive."""
+    keys = {"payment_intent": {str((licence or {}).get("stripe_payment_intent_id") or "")},
+            "charge_id": set(), "invoice_id": set()}
+    for payment in payments:
+        keys["payment_intent"].add(str(payment.get("stripe_payment_intent_id") or ""))
+        keys["charge_id"].add(str(payment.get("stripe_charge_id") or ""))
+        keys["invoice_id"].add(str(payment.get("id") or ""))
+    found: dict = {}
+    for column, values in keys.items():
+        for value in sorted(v for v in values if v):
+            try:
+                for item in rows(f"SELECT * FROM billing_reversals WHERE {column}=? ORDER BY id", (value,)):
+                    found[item["id"]] = item
+            except Exception:
+                return []  # a database before billing_reversals exists: no reversal was ever recorded
+    return [found[key] for key in sorted(found)]
+
+
 def supersede_refunded_order(customer_id: str) -> bool:
     """R7: replace the account's paid-but-refunded-and-ended Build Your System order (previous_order_refunded_and_ended)
     with a NEW pending own-PC order for the same plan and camera count, so the customer can check out again. The account
     keeps one build_system_intents row (customer_id is its key), so the old order is first copied -- that row, its
-    licence row, its plan row and the payments of its subscription, with every Stripe reference -- into an append-only
+    licence row, its plan row, the payments of its subscription and their refund/dispute records (billing_reversals),
+    with every Stripe reference -- into an append-only
     audit_logs record (no schema change); the licence, plan, payment and reversal rows are not changed here.
     Idempotent and race-safe: only the request whose conditional UPDATE moves the paid row writes the copy; any other
     finds nothing to do. Fails closed (the order stays as it was). Returns True when this call superseded the order."""
@@ -600,6 +620,7 @@ def supersede_refunded_order(customer_id: str) -> bool:
             plan = entitlement_for_customer(customer_id)
             payments = rows("SELECT * FROM subscription_payments WHERE stripe_subscription_id=? ORDER BY paid_at",
                             (plan["stripe_subscription_id"],)) if plan and plan.get("stripe_subscription_id") else []
+            reversals = _order_reversals(licence, payments)
             now = _now()
             moved = db.execute("UPDATE build_system_intents SET state=?,own_pc=1,appliance_sku=NULL,relay_modules=NULL,"
                                "created_at=?,updated_at=?,paid_at=NULL,completed_at=NULL "
@@ -608,7 +629,8 @@ def supersede_refunded_order(customer_id: str) -> bool:
             if moved != 1:
                 return False
             details = {"reason": "the previous order's licence was refunded and its subscription has ended",
-                       "previous_order": intent, "licence": licence, "plan": plan, "payments": payments}
+                       "previous_order": intent, "licence": licence, "plan": plan, "payments": payments,
+                       "reversals": reversals}
             db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
                        "VALUES(?,?,?,?,?,?,?)", ("", "system", BUILD_ORDER_SUPERSEDED, "build_system_order", customer_id,
                                                  json.dumps(details, default=str, sort_keys=True), now))

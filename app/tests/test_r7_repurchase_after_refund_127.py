@@ -217,6 +217,8 @@ def test_r7_full_sequence_new_order_after_refund_and_ended_subscription(shop, db
             archived["licence"]["suspended_reason"]) == (ids["session"], ids["intent"], "refunded")
     assert (archived["plan"]["stripe_subscription_id"], archived["plan"]["status"]) == (ids["sub"], "cancelled")
     assert archived["payments"] == order1["payments"]
+    # The refund itself is in the archive (charge, PaymentIntent, invoice, reason).
+    assert [(r["charge_id"], r["payment_intent"], r["invoice_id"], r["reason"]) for r in archived["reversals"]] == order1["reversals"]
     # Nothing of order 1 was changed by starting order 2.
     assert _licence_row(db_path, customer_id) == old_licence and _plan_row(db_path, customer_id) == old_plan
     assert _order1_records(db_path, customer_id, ids) == order1
@@ -277,6 +279,58 @@ def test_r7_order1_replays_before_and_after_order2_change_nothing(shop, db_path,
     _ok(shop[0], _refund(ids2, "evt_r7_refund2"))
     licence = _licence_row(db_path, customer_id)
     assert (licence["status"], licence["suspended_reason"], licence["stripe_payment_intent_id"]) == ("suspended", "refunded", ids2["intent"])
+
+
+def _order_n_paid(shop, db_path, stripe, customer_id, stripe_customer, n):
+    """Order n (the account's current pending order) paid through the webhook route, like _order2_paid."""
+    client, captured = shop[0], shop[1]
+    ids_n = _ids(n)
+    event = _paid_checkout_event(captured, customer_id, ids_n["session"])
+    obj = event["data"]["object"]
+    obj["invoice"], obj["payment_intent"], obj["subscription"], obj["customer"] = ids_n["invoice"], None, ids_n["sub"], stripe_customer
+    _configure(stripe, ids_n, stripe_customer)
+    _subscription(stripe, ids_n, customer_id, stripe_customer, quantity=10)
+    events_n = {"checkout": event, "invoice": _invoice_paid(ids_n), "created": _sub_event(stripe, ids_n, "created")}
+    for name in ("checkout", "invoice", "created"):
+        _ok(client, events_n[name])
+    return ids_n, events_n
+
+
+def test_r7_repeated_repurchases_keep_every_orders_history_and_old_replays_never_touch_the_newest(shop, db_path, stripe):
+    customer_id, ids1, events1, stripe_customer = _r7_ready(shop, db_path, stripe)
+    order1 = _order1_records(db_path, customer_id, ids1)
+    _new_order(shop)
+    ids2, events2 = _order2_paid(shop, db_path, stripe, customer_id, stripe_customer)
+    # Order 2 is also refunded and its subscription ends: a third order opens, and order 2 is archived in turn.
+    events2["refund"] = _refund(ids2, "evt_r7_refund2")
+    _ok(shop[0], events2["refund"])
+    _subscription(stripe, ids2, customer_id, stripe_customer, quantity=10, status="canceled")
+    events2["deleted"] = _sub_event(stripe, ids2, "deleted")
+    _ok(shop[0], events2["deleted"])
+    order2 = _order1_records(db_path, customer_id, ids2)
+    assert order2["reversals"]
+    _new_order(shop)
+    ids3, _ = _order_n_paid(shop, db_path, stripe, customer_id, stripe_customer, 3)
+    licence3, plan3 = _licence_row(db_path, customer_id), _plan_row(db_path, customer_id)
+    assert (licence3["status"], licence3["stripe_checkout_session_id"], licence3["stripe_payment_intent_id"]) == (
+        "active", ids3["session"], ids3["intent"])
+    assert (plan3["status"], plan3["stripe_subscription_id"]) == ("active", ids3["sub"])
+
+    # The complete history, oldest first: one archive per superseded order, each with its own references.
+    first, second = _superseded(db_path, customer_id)
+    for archived, ids, records in ((first, ids1, order1), (second, ids2, order2)):
+        assert (archived["licence"]["stripe_checkout_session_id"], archived["licence"]["stripe_payment_intent_id"],
+                archived["licence"]["suspended_reason"]) == (ids["session"], ids["intent"], "refunded")
+        assert (archived["plan"]["stripe_subscription_id"], archived["plan"]["status"]) == (ids["sub"], "cancelled")
+        assert archived["previous_order"]["paid_at"] and archived["payments"] == records["payments"]
+        assert [(r["charge_id"], r["payment_intent"], r["invoice_id"], r["reason"]) for r in archived["reversals"]] == records["reversals"]
+    assert _order1_records(db_path, customer_id, ids1) == order1 and _order1_records(db_path, customer_id, ids2) == order2
+
+    # Replays of orders 1 and 2 never touch order 3.
+    _replay_all(shop, stripe, ids1, events1, "o3a")
+    _replay_all(shop, stripe, ids2, events2, "o3b")
+    assert _licence_row(db_path, customer_id) == licence3 and _plan_row(db_path, customer_id) == plan3
+    assert _access(db_path, customer_id) == (True, True) and len(_superseded(db_path, customer_id)) == 2
 
 
 def test_r7_building_the_new_order_again_is_idempotent(shop, db_path, stripe):
