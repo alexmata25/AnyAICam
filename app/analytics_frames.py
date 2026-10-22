@@ -54,6 +54,12 @@ from datetime import datetime
 from typing import Callable, Optional
 
 AI_SOURCE_MODES = ("main", "auto", "substream", "hls")
+# Windows (2026-10-21, Blue; same defect class as the motion reader, functional Sandbox D2): a reader of the live
+# camera<N>.m3u8 (cv2.VideoCapture is FFmpeg underneath) makes the live encoder's playlist rename fail, silently, so
+# the playlist freezes and every live viewer gets an empty playlist. On Windows the AI frames therefore always come
+# from the camera stream reader: "hls" means "main", and repeated reader failures keep retrying the camera stream
+# instead of falling back to HLS. Linux is unchanged.
+WINDOWS = os.name == "nt"
 # Reader scale interpolation (ffmpeg swscale flags). See
 # docs/video-pipeline-20261011.md 4.8: chosen to match what YOLO sees today.
 READER_SCALE_FLAGS = (os.environ.get("ANYAICAM_AI_READER_SCALE_FLAGS", "area").strip().lower() or "area")
@@ -373,8 +379,11 @@ class AnalyticsFrames:
     def __init__(self, resolve: Callable[[int], Optional[SourceSpec]], *, mode: str = None,
                  reader_factory: Callable = None, clock: Callable[[], float] = time.monotonic,
                  log: Callable[[str], None] = print, start_housekeeping: bool = True,
-                 in_service: Callable[[int], bool] = None):
+                 in_service: Callable[[int], bool] = None, windows: bool = None):
         self.mode = configured_mode(mode) if mode is not None else AI_SOURCE
+        self.windows = WINDOWS if windows is None else bool(windows)
+        if self.windows and self.mode == "hls":
+            self.mode = "main"
         self._in_service = in_service
         self._resolve = resolve
         self._clock = clock
@@ -456,10 +465,16 @@ class AnalyticsFrames:
         with self._lock:
             failures = self._failures.get(camera_number, 0) + 1
             self._failures[camera_number] = failures
-            fall_back = self.mode in ("auto", "main") and failures >= MAX_FAILURES
+            fall_back = self.mode in ("auto", "main") and failures >= MAX_FAILURES and not self.windows
+            windows_retry = self.windows and failures >= MAX_FAILURES
+            if windows_retry:
+                self._failures[camera_number] = 0
             if fall_back:
                 self._failures[camera_number] = 0
                 self._hls_until[camera_number] = self._clock() + RETRY_SECONDS
+        if windows_retry:
+            self._log(f"Camera {camera_number} AI frame reader failed {failures} times ({error or 'no frames'}); "
+                      f"retrying the camera stream (on Windows the live HLS playlist is never read).")
         if fall_back:
             self._log(f"Camera {camera_number} AI frame reader failed {failures} times ({error or 'no frames'}); "
                       f"using the live HLS stream for {int(RETRY_SECONDS // 60)} minutes.")
@@ -468,6 +483,8 @@ class AnalyticsFrames:
                 reader.stop()
 
     def uses_hls(self, camera_number: int) -> bool:
+        if self.windows:
+            return False
         if self.mode == "hls":
             return True
         if self.mode in ("auto", "main"):
