@@ -178,3 +178,11 @@ def test_pricing_is_checked_on_the_version_under_test_only():
 
 def test_saved_pages_are_included_in_the_secrets_scan():
     assert "'.log', '.txt', '.json', '.m3u8', '.html'" in SCRIPT
+
+
+def test_offline_recording_compares_against_the_segment_at_check_start_for_longer_than_one_segment():
+    # 906f7819 U132-L/H false FAIL: 256 KiB MKV steps at ~1 KB/s vs a 180 s window of 15 s samples.
+    block = SCRIPT[SCRIPT.index("Check 'offline: recording continues without the cloud'"):]
+    block = block[:block.index("Diag 'offline-recording'")]
+    assert '$g = WaitFor 330 {' in block and '$baseName' in block and '$baseLen' in block
+    assert 'WaitFor 180 { Growing $camNo }' not in block

@@ -708,7 +708,17 @@ Check 'offline: live view still works without the cloud' {
 }
 PlaylistFresh 'offline'
 Check 'offline: recording continues without the cloud' {
-    $g = WaitFor 180 { Growing $camNo }
+    # 906f7819 U132-L/U132-H: the simulated camera's ~1 KB/s stream is written in 256 KiB MKV steps, so within 180 s a
+    # 15 s sample often saw neither growth nor a rollover although new segments kept appearing offline. Compare against
+    # the newest segment when the check starts and allow longer than one 300 s segment: a stopped recorder still fails.
+    $base = @(Mkv $camNo)
+    $baseName = if ($base.Count) { $base[-1].Name } else { '' }
+    $baseLen = if ($base.Count) { TrueLength $base[-1].FullName } else { -1 }
+    $g = WaitFor 330 {
+        $now = @(Mkv $camNo)
+        if ($now.Count -and $now[-1].Name -ne $baseName) { [pscustomobject]@{ name = $now[-1].Name; from = 0; to = (TrueLength $now[-1].FullName); note = "new segment since the check began (after $baseName)" } }
+        elseif ($now.Count -and (TrueLength $now[-1].FullName) -gt $baseLen) { [pscustomobject]@{ name = $now[-1].Name; from = $baseLen; to = (TrueLength $now[-1].FullName); note = 'growing' } }
+    }
     Diag 'offline-recording'
     if (-not $g) { throw 'no growing recording offline; see diag-offline-recording.txt' }; "$($g.name) $($g.note) ($($g.from) -> $($g.to) bytes)"
 }
