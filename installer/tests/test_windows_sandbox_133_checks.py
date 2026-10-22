@@ -145,7 +145,7 @@ def test_the_mode_check_looks_at_the_running_vms_not_only_the_mode_file():
 
 
 def test_webrtc_waits_for_the_camera_path_and_requires_one_vms_mediamtx():
-    assert "/v3/paths/get/$camId" in SCRIPT and "$pth.ready" in SCRIPT
+    assert "/v3/config/paths/get/$camId" in SCRIPT and "$pth.name -eq $camId" in SCRIPT
     assert "if ($mtx -ne 1)" in SCRIPT
 
 

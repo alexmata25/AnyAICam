@@ -279,10 +279,12 @@ function WebRtcCheck([string]$Label) {
         StartProxy
         $result = Join-Path $results 'webrtc-result.json'; Remove-Item $result -Force -ErrorAction SilentlyContinue
         # F-H on 126863e3: the first WHEP offer came before the camera's path had its source (404 "no stream is available").
-        $ready = WaitFor 120 { $pth = Invoke-RestMethod -Uri "http://127.0.0.1:9997/v3/paths/get/$camId" -TimeoutSec 5; if ($pth.ready) { $pth } }
+        # The camera path is on demand (ready only once a reader connects), so wait for it to be CONFIGURED in the VMS MediaMTX
+        # (8f7a24b0 F-H: 'ready' stayed false although WHEP then played).
+        $ready = WaitFor 120 { $pth = Invoke-RestMethod -Uri "http://127.0.0.1:9997/v3/config/paths/get/$camId" -TimeoutSec 5; if ($pth.name -eq $camId) { $pth } }
         $mtx = @(Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" }).Count
         if ($mtx -ne 1) { throw "$mtx VMS MediaMTX processes (expected exactly 1)" }
-        $pathNote = if ($ready) { "path ready ($($ready.source.type))" } else { 'path not ready after 120 s' }
+        $pathNote = if ($ready) { "path configured (source $($ready.source))" } else { 'path not configured after 120 s' }
         # Sandbox limit (test-only shim, like discovery_networks): the Sandbox has no network interface, and MediaMTX never
         # offers a loopback ICE candidate on its own (advertised_hosts() accepts LAN/Tailscale addresses only), so the
         # harness adds 127.0.0.1 through the VMS MediaMTX's loopback-only API for this check and removes it afterwards.
