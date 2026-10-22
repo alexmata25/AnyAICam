@@ -478,6 +478,9 @@ def register_order_funnel_routes(app: FastAPI) -> None:
             # My orders after delivery; this account never gets an own-PC order (or the license) here (Green 2026-10-16).
             import hardware_checkout
             return RedirectResponse(hardware_checkout.ORDERS_PATH, status_code=303)
+        # R7 (2026-10-21): a refunded own-PC order whose subscription has ended becomes a new pending order (the old
+        # one is kept in the audit log), instead of a checkout button for an order that can no longer be paid.
+        billing.supersede_refunded_order(customer_id)
         if query_selection.get("plan"):
             billing.save_build_selection(customer_id, query_selection)
         progress = billing.build_progress(customer_id) or {}

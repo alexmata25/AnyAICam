@@ -219,6 +219,8 @@ def create_checkout(identity: dict) -> dict:
     customer_id = identity["customer_id"]
     if billing.has_camera_plan(customer_id) or storage_plan(customer_id):
         raise HTTPException(status_code=409, detail="This account already has a camera plan or a paid order.")
+    # R7 (2026-10-21): an order page opened before the refunded order's subscription ended checks out a new order too.
+    billing.supersede_refunded_order(customer_id)
     progress = billing.build_progress(customer_id)
     if not progress or progress["state"] != billing.BUILD_PENDING or not progress.get("plan"):
         raise HTTPException(status_code=409, detail="There is no order to check out. Build your system first.")

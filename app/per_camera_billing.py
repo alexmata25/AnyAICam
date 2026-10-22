@@ -503,6 +503,7 @@ def save_build_selection(customer_id: str, selection: dict) -> None:
     alone."""
     if not customer_id or not selection.get("plan") or order_paid(customer_id):
         return
+    supersede_refunded_order(customer_id)  # R7: a refunded and ended own-PC order no longer blocks a new one
     existing = row("SELECT state FROM build_system_intents WHERE customer_id=?", (customer_id,))
     if existing and existing["state"] != BUILD_PENDING:
         return
@@ -550,6 +551,72 @@ def build_progress(customer_id: str) -> dict | None:
                  "appliance": intent["appliance_sku"] if intent["appliance_sku"] in _appliance_skus() else None,
                  "relays": intent["relay_modules"], "own_pc": intent["own_pc"]}
     return {"state": state, **{key: value for key, value in selection.items() if value}}
+
+
+BUILD_ORDER_SUPERSEDED = "build_order.superseded_after_refund"
+
+
+def previous_order_refunded_and_ended(customer_id: str) -> bool:
+    """R7 (owner-approved correction, 2026-10-21): the account's paid Build Your System order grants nothing any more,
+    so the customer may place a NEW order. All of:
+    * no camera plan that is active or suspended (per-camera or legacy) and no appliance storage plan (order_paid): the
+      order's subscription has ENDED -- a refunded plan whose subscription is still running is suspended, still on
+      Stripe, and stays blocked (no second subscription beside it);
+    * no paid AnyAiCam appliance (whose purchase includes the licence);
+    * the order's one-time VMS licence is suspended because its payment was REFUNDED. Refunds are terminal (only a won
+      dispute restores a licence, billing_status._restore_disputed_licences), so the old licence can never come back
+      beside a new one. A disputed licence (the dispute may still be won) and an active licence keep today's behaviour.
+    """
+    if not customer_id or order_paid(customer_id) or vms_license_owned(customer_id):
+        return False
+    import customer_entitlements
+    if customer_entitlements.appliance_includes_vms_license(customer_id):
+        return False
+    licence = row("SELECT status,suspended_reason FROM customer_entitlements WHERE customer_id=? AND product='vms_license'",
+                  (customer_id,))
+    return bool(licence and licence["status"] == "suspended" and licence["suspended_reason"] == "refunded")
+
+
+def supersede_refunded_order(customer_id: str) -> bool:
+    """R7: replace the account's paid-but-refunded-and-ended Build Your System order (previous_order_refunded_and_ended)
+    with a NEW pending own-PC order for the same plan and camera count, so the customer can check out again. The account
+    keeps one build_system_intents row (customer_id is its key), so the old order is first copied -- that row, its
+    licence row, its plan row and the payments of its subscription, with every Stripe reference -- into an append-only
+    audit_logs record (no schema change); the licence, plan, payment and reversal rows are not changed here.
+    Idempotent and race-safe: only the request whose conditional UPDATE moves the paid row writes the copy; any other
+    finds nothing to do. Fails closed (the order stays as it was). Returns True when this call superseded the order."""
+    if not customer_id:
+        return False
+    from partner_db import transaction
+    try:
+        current = row("SELECT state FROM build_system_intents WHERE customer_id=?", (customer_id,))
+        if not current or current["state"] not in (BUILD_PAID, BUILD_DONE) or not previous_order_refunded_and_ended(customer_id):
+            return False  # the usual case: read only, no write transaction for a page view
+        with transaction() as db:
+            intent = row("SELECT * FROM build_system_intents WHERE customer_id=?", (customer_id,))
+            if not intent or intent["state"] not in (BUILD_PAID, BUILD_DONE) or not previous_order_refunded_and_ended(customer_id):
+                return False
+            licence = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product='vms_license'", (customer_id,))
+            plan = entitlement_for_customer(customer_id)
+            payments = rows("SELECT * FROM subscription_payments WHERE stripe_subscription_id=? ORDER BY paid_at",
+                            (plan["stripe_subscription_id"],)) if plan and plan.get("stripe_subscription_id") else []
+            now = _now()
+            moved = db.execute("UPDATE build_system_intents SET state=?,own_pc=1,appliance_sku=NULL,relay_modules=NULL,"
+                               "created_at=?,updated_at=?,paid_at=NULL,completed_at=NULL "
+                               "WHERE customer_id=? AND state=? AND updated_at=?",
+                               (BUILD_PENDING, now, now, customer_id, intent["state"], intent["updated_at"])).rowcount
+            if moved != 1:
+                return False
+            details = {"reason": "the previous order's licence was refunded and its subscription has ended",
+                       "previous_order": intent, "licence": licence, "plan": plan, "payments": payments}
+            db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
+                       "VALUES(?,?,?,?,?,?,?)", ("", "system", BUILD_ORDER_SUPERSEDED, "build_system_order", customer_id,
+                                                 json.dumps(details, default=str, sort_keys=True), now))
+    except Exception:
+        logger.exception("build_order.supersede_failed customer_id=%s", customer_id)
+        return False
+    logger.info("build_order.superseded_after_refund customer_id=%s previous_state=%s", customer_id, intent["state"])
+    return True
 
 
 def purchase_progress_banner(customer_id: str, path: str = "") -> str:
