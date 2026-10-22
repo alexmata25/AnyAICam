@@ -291,7 +291,7 @@ INSTALLER_PENDING_NOTICE = ("Your AnyAiCam software installer is not yet availab
 # After payment (order-complete page and confirmation email): the same promise, nothing more.
 INSTALLER_PENDING_TEXT = ("Your AnyAiCam software installer is not yet available for download. Your license and plan are saved "
                           "to your AnyAiCam account, and the installer will become available there (My subscription) when it "
-                          "is ready. We will email you when it is.")
+                          "is ready. Check your AnyAiCam account (My subscription) for the installer.")
 
 
 def installer_available() -> bool:
