@@ -35944,6 +35944,9 @@ _motion_source_selector = motion_source.MotionSourceSelector()
 def motion_substream_url(camera_number: int) -> str | None:
     """Credentialed RTSP URL of this camera's substream for the motion
     reader, or None when it has no distinct one (or is not configured).
+    Windows (2026-10-21, defect D2): a camera without a distinct substream
+    gets its main stream URL instead -- the live HLS playlist is never read
+    there (motion_source.WINDOWS, motion_source.reader_url()).
     Synchronous (database + camera_url()); always called off the event
     loop. Never logs the URL."""
     try:
@@ -35965,7 +35968,7 @@ def motion_substream_url(camera_number: int) -> str | None:
         url_candidates = _publisher.substream_candidates
     except Exception:
         url_candidates = None
-    return motion_source.resolve_substream_url(main_url, record, url_candidates)
+    return motion_source.reader_url(main_url, record, url_candidates)
 
 
 
@@ -36256,6 +36259,10 @@ async def _motion_detector_loop(camera_number: int, hold_owner: str = "motion") 
         else:
             live_hls_demand.release(camera_number, hold_owner)
         if source_kind == "hls" and not manifest.exists():
+            await asyncio.sleep(5)
+            continue
+        if source_kind == "wait":
+            # Windows: no camera stream to read yet (never the live HLS playlist, motion_source.WINDOWS).
             await asyncio.sleep(5)
             continue
         process = None
@@ -42556,6 +42563,22 @@ if cloud_settings.deployed:
 
 
 
+def hls_folder_outside_static(hls_folder, static_folder) -> bool:
+    """True when the live HLS folder is not inside the static folder, so /static would never find it. Windows 1.3.2
+    (2026-10-21, Blue, functional Sandbox defect D1): service-launcher.ps1 puts static in {app}\\app\\static and HLS
+    in %ProgramData%\\AnyAiCam\\hls, so every /static/hls/... URL -- the VMS pages /, /camera/<n>, /playback, the rule
+    preview, and WireGuard remote live (live_view_wireguard.py) -- answered 404. On Linux the Docker volume puts HLS
+    inside static (/app/static/hls): False, nothing changes."""
+    try:
+        return not Path(hls_folder).resolve().is_relative_to(Path(static_folder).resolve())
+    except (OSError, ValueError):
+        return True
+
+
+# Registered BEFORE /static: Starlette tries mounts in order, so /static/hls/... is served from HLS_FOLDER itself.
+# The HLS cache headers and on-demand touch (middleware above) key on HLS_URL_PREFIX and apply unchanged.
+if hls_folder_outside_static(HLS_FOLDER, STATIC_FOLDER):
+    app.mount(HLS_URL_PREFIX, StaticFiles(directory=str(HLS_FOLDER), check_dir=False), name="static-hls")
 app.mount("/static", StaticFiles(directory=str(STATIC_FOLDER)), name="static")
 
 
