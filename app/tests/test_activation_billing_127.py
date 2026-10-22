@@ -388,3 +388,152 @@ def test_r7_old_order_replays_never_touch_the_new_order(shop, db_path, stripe_su
     _billing_event(db_path, _refund(first["data"]["object"]["payment_intent"], "evt_rede_refund_new"))
     assert _plan_row(db_path, customer_id) == new_plan and _licence(db_path, customer_id)["status"] == "active"
     assert _licence(db_path, customer_id)["stripe_checkout_session_id"] == "cs_test_rede_2"
+
+
+# ------------------------------------------------------------------ Red review of 0ba37427 (H1, H2, M1, M2, L1, L2)
+
+APPLIANCE_SELECTION = {"appliance": "AIC-APPLIANCE-RYZEN-STARTER", "plan": "hybrid", "cameras": 8}
+
+
+def _hardware_order(db_path, captured, customer_id, email, monkeypatch, *, intent="pi_hw_review", pre_change=False):
+    """A signed-in buyer's appliance checkout and its verified webhook (hardware_checkout.py)."""
+    import build_orders
+    import hardware_checkout
+    monkeypatch.setattr(build_orders, "_line_amounts", lambda session: {})
+    with override_target(sqlite_path=str(db_path)):
+        opened = hardware_checkout.create_checkout(APPLIANCE_SELECTION, email=email, identity={"customer_id": customer_id})
+    if pre_change:  # a checkout opened before 2026-10-22: no price lock, no saved card
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE hardware_checkouts SET intended_price_id=NULL,intended_monthly_cents=NULL "
+                         "WHERE stripe_checkout_session_id=?", (opened["session_id"],))
+    fields = dict(captured[-1])
+    metadata = {key[len("metadata["):-1]: value for key, value in fields.items() if key.startswith("metadata[")}
+    event = {"id": f"evt_{opened['session_id']}", "type": "checkout.session.completed", "livemode": False,
+             "data": {"object": {"id": opened["session_id"], "mode": "payment", "payment_status": "paid", "status": "complete",
+                                 "customer": "cus_hw_review", "payment_intent": intent, "customer_email": email,
+                                 "customer_details": {"email": email}, "metadata": metadata}}}
+    with override_target(sqlite_path=str(db_path)):
+        return hardware_checkout.sync_from_stripe_event(event)
+
+
+def _signed_in_customer(client, mail, db_path, email):
+    _new_customer(client, mail, email, OWN_PC)
+    return _customer_id(db_path, email)
+
+
+def test_h1_hardware_refunded_before_its_order_is_recorded_saves_no_plan(shop, db_path, stripe_subscriptions, monkeypatch):
+    import billing_status
+    import build_orders
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "h1a@example.test")
+    with override_target(sqlite_path=str(db_path)):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(billing_status.REVERSALS_DDL)
+        billing_status._record_reversal("ch_h1a", "pi_h1a", "", "refunded")  # the refund arrived first
+    _hardware_order(db_path, captured, customer_id, "h1a@example.test", monkeypatch, intent="pi_h1a")
+    assert _plan_row(db_path, customer_id) is None
+    assert _one(db_path, "SELECT status FROM hardware_orders WHERE stripe_payment_intent_id='pi_h1a' AND sku LIKE 'AIC-APPLIANCE-%'",
+                ())["status"] == "refunded"
+    _activate_appliance(db_path, customer_id)
+    _call(db_path, build_orders.on_appliance_activated, customer_id)
+    assert stripe_subscriptions["created"] == []
+
+
+def test_h1_a_reversal_recorded_beside_a_paid_hardware_order_blocks_the_start(shop, db_path, stripe_subscriptions, monkeypatch):
+    import billing_status
+    import build_orders
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "h1b@example.test")
+    _hardware_order(db_path, captured, customer_id, "h1b@example.test", monkeypatch, intent="pi_h1b")
+    assert _plan_row(db_path, customer_id)["state"] == "awaiting_activation"
+    with override_target(sqlite_path=str(db_path)):  # recorded without touching the order row (the race Red found)
+        billing_status._record_reversal("ch_h1b", "pi_h1b", "", "disputed")
+    _activate_appliance(db_path, customer_id)
+    assert _call(db_path, build_orders.on_appliance_activated, customer_id)["status"] == "ignored"
+    assert stripe_subscriptions["created"] == []
+
+
+def test_h1_control_a_paid_hardware_order_starts_its_saved_plan_at_activation(shop, db_path, stripe_subscriptions, monkeypatch):
+    import build_orders
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "h1c@example.test")
+    _hardware_order(db_path, captured, customer_id, "h1c@example.test", monkeypatch, intent="pi_h1c")
+    plan = _plan_row(db_path, customer_id)
+    assert (plan["plan_key"], plan["camera_quantity"], plan["stripe_price_id"], plan["order_kind"]) == ("hybrid", 8, PRICES["hybrid"], "appliance")
+    _activate_appliance(db_path, customer_id)
+    assert _call(db_path, build_orders.on_appliance_activated, customer_id)["status"] == "started"
+    assert stripe_subscriptions["created"][-1]["items[0][price]"] == PRICES["hybrid"]
+
+
+def test_h2_a_hardware_checkout_opened_before_the_change_never_gets_an_automatic_plan(shop, db_path, stripe_subscriptions,
+                                                                                     monkeypatch):
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "h2@example.test")
+    _hardware_order(db_path, captured, customer_id, "h2@example.test", monkeypatch, intent="pi_h2", pre_change=True)
+    assert _plan_row(db_path, customer_id) is None  # the customer starts the plan themselves, as they were told
+
+
+def test_m1_a_manual_retry_uses_the_card_the_customer_chose_since(shop, db_path, stripe_subscriptions, monkeypatch):
+    import build_orders
+    import main
+    client, captured, mail, _, _ = shop
+    customer_id, _, _ = _own_pc_order(client, mail, db_path, captured, "m1@example.test")
+    stripe_subscriptions["fail"].append(_Refused("card_declined"))
+    _activate_appliance(db_path, customer_id)
+    assert _call(db_path, build_orders.on_appliance_activated, customer_id)["status"] == "payment_failed"
+    get = main.stripe_api_get
+    monkeypatch.setattr(main, "stripe_api_get", lambda path: {"invoice_settings": {"default_payment_method": "pm_updated_card"}}
+                        if path.startswith("/v1/customers/") else get(path))
+    assert _call(db_path, build_orders.start_storage_plan, customer_id, manual=True)["status"] == "started"
+    assert stripe_subscriptions["created"][-1]["default_payment_method"] == "pm_updated_card"
+
+
+def test_m2_my_subscription_accepts_an_account_activated_before_the_claim_marker(shop, db_path, stripe_subscriptions, monkeypatch):
+    import appliance_readiness
+    import build_orders
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "m2@example.test")
+    monkeypatch.setattr(build_orders, "_appliance_activated", lambda cid: False)  # no 2026-10-11 activation marker
+    monkeypatch.setattr(appliance_readiness, "customer_has_activated_appliance", lambda cid: cid == customer_id)
+    import per_camera_billing as billing
+    monkeypatch.setattr(billing, "account_activated", lambda cid: True)
+    response = client.post("/api/v2/customer/subscription/checkout", json={"plan_key": "hybrid", "camera_quantity": 5})
+    assert response.status_code == 200, response.text
+
+
+def test_l2_a_saved_price_refused_by_the_catalog_check_is_held(shop, db_path, stripe_subscriptions, monkeypatch):
+    import build_orders
+    import main
+    from fastapi import HTTPException
+    client, captured, mail, _, _ = shop
+    customer_id, _, _ = _own_pc_order(client, mail, db_path, captured, "l2@example.test")
+
+    def archived(*args):
+        raise HTTPException(status_code=503, detail="PRICE_INACTIVE")
+    monkeypatch.setattr(main, "require_stripe_price_matches_catalog", archived)
+    _activate_appliance(db_path, customer_id)
+    assert _call(db_path, build_orders.on_appliance_activated, customer_id)["status"] == "owner_review"
+    assert _call(db_path, build_orders.retry_storage_starts) == 0 and stripe_subscriptions["created"] == []
+
+
+def test_l1_a_reversal_during_the_start_is_flagged_for_owner_review(shop, db_path, stripe_subscriptions, monkeypatch):
+    import billing_status
+    import build_orders
+    client, captured, mail, _, _ = shop
+    customer_id, event, _ = _own_pc_order(client, mail, db_path, captured, "l1@example.test")
+    intent = event["data"]["object"]["payment_intent"]
+    post = stripe_subscriptions  # noqa: F841
+    import main
+    original = main.stripe_api_post
+
+    def post_then_refund(path, fields, idempotency_key=None):
+        answer = original(path, fields, idempotency_key=idempotency_key)
+        if path == "/v1/subscriptions":  # the refund lands while Stripe answers
+            billing_status._record_reversal(f"ch_{intent}", intent, "", "refunded")
+        return answer
+    monkeypatch.setattr(main, "stripe_api_post", post_then_refund)
+    _activate_appliance(db_path, customer_id)
+    assert _call(db_path, build_orders.on_appliance_activated, customer_id)["status"] == "started"
+    assert "owner review" in (_plan_row(db_path, customer_id)["hold_reason"] or "")
+    assert _one(db_path, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='deferred_plan.started_after_reversal' AND entity_id=?",
+                (customer_id,))["n"] == 1

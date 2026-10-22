@@ -573,10 +573,12 @@ def _appliance_activated(customer_id: str) -> bool:
 
 
 def service_activated(customer_id: str) -> bool:
-    """Owner billing rule (2026-10-22): the account's AnyAiCam service is activated -- an appliance or own PC that went
-    through an activation event and is still in service (_appliance_activated). A monthly plan bought directly (My
-    subscription, a plan-only order) is charged only then."""
-    return _appliance_activated(customer_id)
+    """Owner billing rule (2026-10-22): the account's AnyAiCam service is activated -- an appliance or own PC of the
+    account that is activated and in service (appliance_readiness, which also counts appliances claimed before the
+    2026-10-11 activation marker; Red review M2). Gates purchases the customer makes themselves (My subscription, a
+    plan-only order). Automatic off-session starts keep the stricter _appliance_activated."""
+    from appliance_readiness import customer_has_activated_appliance
+    return customer_has_activated_appliance(customer_id)
 
 
 def _start_allowed(customer_id: str, plan: dict) -> bool:
@@ -594,9 +596,14 @@ def _start_allowed(customer_id: str, plan: dict) -> bool:
 
 
 def _hardware_still_paid(plan: dict) -> bool:
-    return bool(row("SELECT id FROM hardware_orders WHERE customer_id=? AND stripe_checkout_session_id=? "
-                    "AND sku LIKE 'AIC-APPLIANCE-%' AND status='paid' LIMIT 1",
-                    (plan["customer_id"], plan["checkout_session_id"])))
+    order = row("SELECT id,stripe_payment_intent_id FROM hardware_orders WHERE customer_id=? AND stripe_checkout_session_id=? "
+                "AND sku LIKE 'AIC-APPLIANCE-%' AND status='paid' LIMIT 1", (plan["customer_id"], plan["checkout_session_id"]))
+    if not order:
+        return False
+    # Owner billing rule 5 (Red review H1): a refund or dispute recorded before the order itself was recorded leaves the
+    # order 'paid' (nothing to suspend yet); its payment's reversal record still counts.
+    import billing_status
+    return billing_status.reversal_reason("", str(order.get("stripe_payment_intent_id") or ""), "") is None
 
 
 def _idempotency_key(plan: dict) -> str:
@@ -642,10 +649,21 @@ def _existing_subscription(plan: dict) -> dict | None:
     return None
 
 
-def _default_payment_method(plan: dict) -> str | None:
+def _default_payment_method(plan: dict, *, manual: bool = False) -> str | None:
+    import main
+    if manual:
+        # Red review M1: after a declined first payment the customer updates the card in Manage billing (the Stripe
+        # customer's default); the retry uses that card, not the one saved at purchase.
+        try:
+            customer = main.stripe_api_get(f"/v1/customers/{plan['stripe_customer_id']}")
+            chosen = (customer.get("invoice_settings") or {}).get("default_payment_method")
+            chosen = chosen.get("id") if isinstance(chosen, dict) else chosen
+            if chosen:
+                return str(chosen)
+        except Exception:
+            logger.info("build_order.default_card_unread customer=%s", plan.get("stripe_customer_id"))
     if plan.get("stripe_payment_method_id"):
         return plan["stripe_payment_method_id"]
-    import main
     listing = main.stripe_api_get(f"/v1/payment_methods?customer={plan['stripe_customer_id']}&type=card&limit=1")
     found = (listing.get("data") or [None])[0]
     return str(found["id"]) if found and found.get("id") else None
@@ -700,7 +718,12 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
                 _finish(customer_id, STORAGE_HELD, error=str(error)[:300])
                 logger.error("build_order.storage_start_held_price customer_id=%s reason=%s", customer_id, error)
                 return {"status": STORAGE_HELD, "reason": "the saved plan price is no longer configured"}
-            main.require_stripe_price_matches_catalog(price_id, cents, "month")
+            try:
+                main.require_stripe_price_matches_catalog(price_id, cents, "month")
+            except HTTPException as refused_price:  # Red review L2: e.g. the saved Price was archived
+                _finish(customer_id, STORAGE_HELD, error=f"saved price refused by the catalog check: {refused_price.detail}"[:300])
+                logger.error("build_order.storage_start_held_catalog customer_id=%s", customer_id)
+                return {"status": STORAGE_HELD, "reason": "the saved plan price failed the catalog check"}
             quantity = str(int(plan["camera_quantity"]))
             fields = [("customer", plan["stripe_customer_id"]), ("items[0][price]", price_id), ("items[0][quantity]", quantity),
                       ("off_session", "true"), ("payment_behavior", "error_if_incomplete"),
@@ -711,7 +734,7 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
             trial = storage_trial.subscription_trial_fields(customer_id, checkout=False, plan_key=plan["plan_key"])
             # A free-trial subscription gets no card attached: it ends at the
             # trial end unless the customer explicitly chooses paid storage.
-            method = None if trial else _default_payment_method(plan)
+            method = None if trial else _default_payment_method(plan, manual=manual)
             if method:
                 fields.append(("default_payment_method", method))
             fields += trial
@@ -728,8 +751,16 @@ def start_storage_plan(customer_id: str, *, manual: bool = False) -> dict:
         return {"status": STORAGE_PAYMENT_FAILED if refused else STORAGE_FAILED}
     subscription_id = str(subscription.get("id") or "")
     _finish(customer_id, STORAGE_STARTED, subscription_id=subscription_id)
-    if not _order_still_paid(plan):  # a refund/dispute recorded while Stripe created the subscription
+    if not _order_still_paid(plan):  # a refund/dispute recorded while Stripe created the subscription (Red review L1)
         logger.error("build_order.storage_started_after_reversal customer_id=%s subscription=%s", customer_id, subscription_id)
+        import json
+        now = datetime.now().isoformat()
+        with connection() as db:
+            db.execute("UPDATE deferred_storage_plans SET hold_reason=?,held_at=? WHERE customer_id=?",
+                       ("started while its purchase was refunded or disputed: owner review", now, customer_id))
+            db.execute("INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) "
+                       "VALUES(?,?,?,?,?,?,?)", ("", "system", "deferred_plan.started_after_reversal", "deferred_storage_plan",
+                                                 customer_id, json.dumps({"subscription_id": subscription_id}), now))
     trial_id = str((subscription.get("metadata") or {}).get("anyaicam_storage_trial") or "")
     if trial_id:
         import storage_trial

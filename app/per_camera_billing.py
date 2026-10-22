@@ -1626,8 +1626,12 @@ def register_routes(app: FastAPI) -> None:
         if existing and existing["kind"] == "legacy":
             raise HTTPException(status_code=409, detail=LEGACY_PLAN_REFUSAL if existing["verified"] else LEGACY_PLAN_UNVERIFIED)
         import build_orders
-        if build_orders.live_storage_plan(customer_id):
+        saved_plan = build_orders.live_storage_plan(customer_id)
+        if saved_plan:
             # Saved with the appliance or licence order; it starts at activation (build_orders.py).
+            if saved_plan.get("state") == build_orders.STORAGE_PAYMENT_FAILED:
+                raise HTTPException(status_code=409, detail="Your plan's first payment did not go through. Update your card in "
+                                                            "Manage billing, then retry the payment in My subscription.")
             raise HTTPException(status_code=409, detail="Your monthly plan was saved with your order and starts when your "
                                                         "AnyAiCam system is activated.")
         import main

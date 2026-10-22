@@ -207,6 +207,10 @@ def _save_intended_plan(customer_id: str | None, record: dict | None, payment_me
     import build_orders
     if not customer_id or not record or record.get("status") != "paid" or not record.get("intended_plan"):
         return "skipped"
+    if not record.get("intended_price_id"):
+        # Red review H2: a checkout opened before 2026-10-22 saved no card and promised the customer they would start
+        # the plan themselves; it is never turned into an automatic start.
+        return "skipped"
     if not any(part.startswith(APPLIANCE_PREFIX) for part in str(record.get("items") or "").split(",")):
         return "skipped"
     try:
@@ -405,7 +409,13 @@ def sync_from_stripe_event(event: dict) -> dict:
                    "paid_at=COALESCE(paid_at,?),updated_at=? WHERE id=?",
                    (session_id, email or record.get("email"), customer_id, session.get("amount_total"), intent_id, stripe_customer,
                     json.dumps(_shipping(session)), ",".join(order_ids), now, now, checkout_id))
-    if kind == HARDWARE_ONLY and customer_id:
+    import billing_status
+    reversed_as = billing_status.reversal_reason("", intent_id or "", "") if intent_id else None
+    if reversed_as:
+        # Red review H1: refunded or disputed before this order was recorded -> the order is recorded reversed (as a
+        # later refund would have left it) and no plan is saved for it.
+        billing_status.reverse_hardware_orders(intent_id, reversed_as)
+    elif kind == HARDWARE_ONLY and customer_id:
         _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id), build_orders._payment_method(session))
     try:  # the confirmation email never fails the step; retried from the outbox and on the order pages
         import stripe_mode

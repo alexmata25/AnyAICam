@@ -314,9 +314,9 @@ def test_a_revocation_during_the_start_stops_it_before_stripe(shop, db_path, str
     import build_orders
     real = build_orders._default_payment_method
 
-    def revoke_then_lookup(plan):  # the appliance is revoked while the start is being prepared
+    def revoke_then_lookup(plan, **kwargs):  # the appliance is revoked while the start is being prepared
         _revoke(db_path, "app-build")
-        return real(plan)
+        return real(plan, **kwargs)
     monkeypatch.setattr(build_orders, "_default_payment_method", revoke_then_lookup)
     assert _start(db_path, customer_id)["status"] == "ignored"
     assert stripe_subscriptions["keys"] == [] and stripe_subscriptions["created"] == []
