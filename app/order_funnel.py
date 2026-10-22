@@ -372,11 +372,8 @@ def _order_confirmation_key(customer_id: str) -> str:
     that was already confirmed is ever confirmed twice); every order that replaced a refunded-and-ended one (R7,
     per_camera_billing.supersede_refunded_order, recorded in audit_logs) gets its own key, ":order-2", ":order-3", ..."""
     from partner_db import row
-    try:
-        superseded = int((row("SELECT COUNT(*) AS n FROM audit_logs WHERE action=? AND entity_type='build_system_order' "
-                              "AND entity_id=?", (billing.BUILD_ORDER_SUPERSEDED, customer_id)) or {}).get("n") or 0)
-    except Exception:  # no audit table yet: the first order
-        superseded = 0
+    superseded = int((row("SELECT COUNT(*) AS n FROM audit_logs WHERE action=? AND entity_type='build_system_order' "
+                          "AND entity_id=?", (billing.BUILD_ORDER_SUPERSEDED, customer_id)) or {}).get("n") or 0)
     return ORDER_CONFIRMATION_KEY + customer_id + (f"{ORDER_NUMBER_SEPARATOR}{superseded + 1}" if superseded else "")
 
 
@@ -427,10 +424,11 @@ def send_order_confirmation(customer_id: str, *, test_mode: bool | None = None) 
         # A new order replaced a refunded one: an unsent confirmation of an earlier order is out of date (closed, not retried).
         from partner_db import connection
         with connection() as db:
+            # Exact prefix (Red's review): a LIKE pattern would treat '_' / '%' in an id as wildcards.
+            numbered = ORDER_CONFIRMATION_KEY + customer_id + ORDER_NUMBER_SEPARATOR
             db.execute("UPDATE provisioning_notifications SET status='superseded',updated_at=? WHERE stripe_event_id<>? "
-                       "AND (stripe_event_id=? OR stripe_event_id LIKE ?) AND status IN ('pending','failed')",
-                       (pn._now(), key, ORDER_CONFIRMATION_KEY + customer_id,
-                        ORDER_CONFIRMATION_KEY + customer_id + ORDER_NUMBER_SEPARATOR + "%"))
+                       "AND (stripe_event_id=? OR substr(stripe_event_id,1,?)=?) AND status IN ('pending','failed')",
+                       (pn._now(), key, ORDER_CONFIRMATION_KEY + customer_id, len(numbered), numbered))
     return pn._send_once(event_id=key, notification_type=kind, customer_id=customer_id,
                          recipient_email=str(customer.get("email") or ""), subject=subject, text=text, html=html,
                          metadata={"build_system_order": True}, test_mode=test_mode)
