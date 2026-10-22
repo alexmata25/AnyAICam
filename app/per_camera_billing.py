@@ -419,6 +419,59 @@ def payment_problem(entitlement: dict | None) -> dict | None:
     return None
 
 
+TRIAL_ACTIVE, PAID_ACTIVE = "Trial Active", "Paid Active"
+
+
+def _paid_for(customer_id: str, subscription_id: str) -> bool:
+    """A verified, non-refunded paid invoice of this subscription (subscription_payments: written by the invoice.paid
+    webhook for invoices that actually collected money; a $0 trial invoice writes none)."""
+    if not subscription_id:
+        return False
+    try:
+        return bool(row("SELECT id FROM subscription_payments WHERE customer_id=? AND stripe_subscription_id=? "
+                        "AND status='paid' AND refunded_at IS NULL LIMIT 1", (customer_id, subscription_id)))
+    except Exception:
+        return False
+
+
+def plan_status_label(customer_id: str, entitlement: dict | None) -> str:
+    """Owner 2026-10-22: a free storage trial is shown as "Trial Active", separate from "Paid Active".
+    * Trial Active: Stripe's subscription is trialing, the AnyAiCam storage trial bound to that subscription is valid
+      (running, this customer's) and the account's service is verified activated (build_orders.service_activated).
+    * Paid Active: the plan is active, not in a trial, and Stripe confirmed a successful payment for it (a verified,
+      non-refunded paid invoice) -- an active status alone is not enough.
+    Display only: a trial never charges because of this, and nothing here changes billing or entitlements."""
+    if not entitlement:
+        return ""
+    status = str(entitlement.get("status") or "")
+    if status == "suspended":
+        return "Suspended"
+    if status != "active":
+        return "Ended"
+    if payment_problem(entitlement):
+        return "Payment due"
+    subscription_id = str(entitlement.get("stripe_subscription_id") or "")
+    if str(entitlement.get("stripe_status") or "") == "trialing":
+        import build_orders
+        import storage_trial
+        try:
+            trial = storage_trial.by_subscription(subscription_id)
+        except Exception:
+            trial = None
+        if not trial or trial.get("customer_id") != customer_id:
+            return "Trial · under review by AnyAiCam"
+        if trial["effective_status"] == storage_trial.EXPIRED:
+            return "Trial ended"
+        if trial["effective_status"] != storage_trial.ACTIVE:
+            return "Trial · under review by AnyAiCam"
+        if not build_orders.service_activated(customer_id):
+            return "Trial · Pending Activation"
+        return TRIAL_ACTIVE
+    if _paid_for(customer_id, subscription_id):
+        return PAID_ACTIVE
+    return "Active · awaiting payment confirmation"
+
+
 def _grace_deadline_html(problem: dict) -> str:
     """The grace end as a readable date (viewer's time zone via
     <time data-local-date>), or a generic phrase when it is unknown."""
@@ -1310,7 +1363,9 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
         if payload["cloud_event_storage"]:
             # No day count (owner 2026-10-17): the cloud clip expiry is not enforced yet (S3 lifecycle check).
             retention += " · Cloud Video Backup (event clips stored online)"
-        current_html = f'<div class="health-row"><span>Licensed cameras</span><span>{payload["camera_quantity"]}</span></div><div class="health-row"><span>Retention</span><span>{retention}</span></div>'
+        current_html = (f'<div class="health-row" id="v2-plan-status"><span>Status</span>'
+                        f'<span>{escape(plan_status_label(customer_id, entitlement))}</span></div>'
+                        f'<div class="health-row"><span>Licensed cameras</span><span>{payload["camera_quantity"]}</span></div><div class="health-row"><span>Retention</span><span>{retention}</span></div>')
     # What the plan includes, from PLANS (subscription_offers, 2026-10-05):
     # features, retention, cloud EVENT retention, the VMS license. Without a
     # plan, the three plans side by side.

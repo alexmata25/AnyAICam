@@ -390,8 +390,6 @@ def _ordered_plan(customer_id: str) -> tuple[str | None, int]:
 HARDWARE_FULFILLMENT_LABELS = {"unfulfilled": "Awaiting preparation", "paid": "Awaiting preparation", "preparing": "Being prepared",
                                "configuring": "Being prepared", "testing": "Being prepared", "ready_to_ship": "Ready to ship",
                                "shipped": "Shipped", "delivered": "Delivered", "cancelled": "Cancelled"}
-PLAN_STATUS_LABELS = {"active": "Active", "trialing": "Trial", "suspended": "Suspended", "past_due": "Payment due",
-                      "canceled": "Ended", "cancelled": "Ended", "ended": "Ended"}
 
 
 def _money(cents: int) -> str:
@@ -406,6 +404,15 @@ def _date(epoch) -> str:
         return ""
 
 
+def _trial_paid_after(customer_id: str) -> bool:
+    import storage_trial
+    try:
+        trial = storage_trial.active_trial(customer_id)
+    except Exception:
+        return False
+    return bool(trial and trial.get("paid_authorized_at"))
+
+
 def purchases_panel(customer_id: str) -> str:
     """Owner 2026-10-22: what the customer bought, at what price, and its status -- read only from server records written
     after Stripe verification (camera plan entitlement and its billed Price, the VMS licence entitlement priced from the
@@ -414,7 +421,8 @@ def purchases_panel(customer_id: str) -> str:
     from partner_db import row, rows
     import pricing_catalog
     items = []
-    payload = billing.entitlement_payload(billing.entitlement_for_customer(customer_id))
+    entitlement = billing.entitlement_for_customer(customer_id)
+    payload = billing.entitlement_payload(entitlement)
     if payload:
         quantity = int(payload["camera_quantity"])
         if payload.get("monthly_per_camera_amount") is not None:
@@ -422,9 +430,13 @@ def purchases_panel(customer_id: str) -> str:
             price = f"{quantity} × {_money(per)} = {_money(per * quantity)}/month"
         else:
             price = "see My subscription for the amount"
-        status = PLAN_STATUS_LABELS.get(str(payload.get("status") or "").lower(), str(payload.get("status") or "").title())
+        # Owner 2026-10-22: Trial Active (verified activation + valid trial) is shown apart from Paid Active (payment confirmed).
+        status = billing.plan_status_label(customer_id, entitlement)
         when = _date(payload.get("billing_period_end"))
-        if when and status == "Active":
+        if when and status == billing.TRIAL_ACTIVE:
+            status += (f" · free trial until {when}" + (" · continues as a paid plan after the trial" if _trial_paid_after(customer_id)
+                                                        else " · not charged unless you choose to continue"))
+        elif when and status == billing.PAID_ACTIVE:
             status += f" · {'ends' if payload.get('cancel_at_period_end') else 'renews'} on {when}"
         items.append(("order-item-plan", f"AnyAiCam {payload['display_name']} plan · {_cameras(quantity)}", price, status))
     else:

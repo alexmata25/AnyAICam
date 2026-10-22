@@ -537,3 +537,118 @@ def test_l1_a_reversal_during_the_start_is_flagged_for_owner_review(shop, db_pat
     assert "owner review" in (_plan_row(db_path, customer_id)["hold_reason"] or "")
     assert _one(db_path, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='deferred_plan.started_after_reversal' AND entity_id=?",
                 (customer_id,))["n"] == 1
+
+
+# ------------------------------------------------------------------ owner 2026-10-22: Trial Active apart from Paid Active
+
+HYBRID_OWN_PC = "plan=hybrid&cameras=5&vms_licence=5"
+ADMIN = {"email": "admin@anyaicam.test", "role": "global_admin"}
+
+
+def _hybrid_order_with_trial(client, mail, db_path, captured, email):
+    import storage_trial
+    _new_customer(client, mail, email, HYBRID_OWN_PC)
+    customer_id = _customer_id(db_path, email)
+    _call(db_path, storage_trial.grant, customer_id, admin=ADMIN, reason="evaluating cloud storage")
+    assert _checkout(client).status_code == 200
+    _record_build_order(db_path, _paid_checkout_event(captured, customer_id, f"cs_test_{customer_id[:12]}"))
+    return customer_id
+
+
+def _label(db_path, customer_id):
+    import per_camera_billing as billing
+    with override_target(sqlite_path=str(db_path)):
+        return billing.plan_status_label(customer_id, billing.entitlement_for_customer(customer_id))
+
+
+def _paid_invoice(db_path, customer_id, subscription_id, refunded=False):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO subscription_payments(id,customer_id,stripe_customer_id,stripe_subscription_id,stripe_price_id,"
+                     "product_class,amount_paid_cents,currency,period_start,paid_at,status,refunded_at) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (f"in_{subscription_id}", customer_id, "cus_x", subscription_id, PRICES["hybrid"], "base_v2_commissionable",
+                      9995, "usd", "1790000000", "2026-10-22T00:00:00", "paid", "2026-10-23T00:00:00" if refunded else None))
+
+
+def test_a_trial_started_at_activation_is_trial_active_and_charges_nothing(shop, db_path, stripe_subscriptions):
+    import build_orders
+    from test_hybrid_build_system_flow import _pay
+    client, captured, mail, _, _ = shop
+    customer_id = _hybrid_order_with_trial(client, mail, db_path, captured, "trial-active@example.test")
+    _activate_appliance(db_path, customer_id)
+    assert _call(db_path, build_orders.on_appliance_activated, customer_id)["status"] == "started"
+    created = stripe_subscriptions["created"][-1]
+    # No recurring charge because the trial started: no card attached, ends at the trial end unless the owner continues.
+    assert "trial_end" in created and created["cancel_at_period_end"] == "true" and "default_payment_method" not in created
+    _pay(db_path, customer_id, "hybrid", 5, "sub_storage_1", status="trialing")
+    assert _label(db_path, customer_id) == "Trial Active"
+    portal_page = client.get("/subscription-portal").text
+    status_row = portal_page[portal_page.index('id="v2-plan-status"'):][:200]
+    assert "Trial Active" in status_row and "Paid Active" not in portal_page
+    panel = client.get("/order-complete").text
+    assert "Trial Active · free trial until" in panel and "not charged unless you choose to continue" in panel
+    assert "Paid Active" not in panel
+
+
+def test_trial_active_needs_verified_activation(shop, db_path, stripe_subscriptions):
+    import storage_trial
+    from test_hybrid_build_system_flow import _pay
+    client, captured, mail, _, _ = shop
+    customer_id = _hybrid_order_with_trial(client, mail, db_path, captured, "trial-unactivated@example.test")
+    trial = _call(db_path, storage_trial.latest, customer_id)
+    _call(db_path, storage_trial.link_subscription, trial["id"], customer_id, "sub_trial_early")
+    _pay(db_path, customer_id, "hybrid", 5, "sub_trial_early", status="trialing")
+    assert _label(db_path, customer_id) == "Trial · Pending Activation"  # no activated system on the account
+    _activate_appliance(db_path, customer_id)
+    assert _label(db_path, customer_id) == "Trial Active"
+
+
+def test_trial_active_needs_a_valid_trial_entitlement(shop, db_path, stripe_subscriptions, monkeypatch):
+    import storage_trial
+    from test_hybrid_build_system_flow import _pay
+    client, captured, mail, _, _ = shop
+    _new_customer(client, mail, "trial-none@example.test", HYBRID_OWN_PC)
+    customer_id = _customer_id(db_path, "trial-none@example.test")
+    _activate_appliance(db_path, customer_id)
+    _pay(db_path, customer_id, "hybrid", 5, "sub_untracked_trial", status="trialing")
+    assert _label(db_path, customer_id) == "Trial · under review by AnyAiCam"  # Stripe trialing, no AnyAiCam trial bound
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO storage_trials(id,customer_id,status,starts_at,expires_at,granted_by,granted_at,reason,"
+                     "stripe_subscription_id,updated_at) VALUES('t-old',?,?,?,?,?,?,?,?,?)",
+                     (customer_id, "active", "2026-08-01T00:00:00+00:00", "2026-08-31T00:00:00+00:00", "admin",
+                      "2026-08-01T00:00:00+00:00", "test", "sub_untracked_trial", "2026-08-01T00:00:00+00:00"))
+    assert _label(db_path, customer_id) == "Trial ended"  # its 30 days are over
+    assert _call(db_path, storage_trial.active_trial, customer_id) is None
+
+
+def test_paid_active_needs_a_confirmed_payment(shop, db_path, stripe_subscriptions):
+    from test_hybrid_build_system_flow import _pay
+    client, captured, mail, _, _ = shop
+    _new_customer(client, mail, "paid-active@example.test", HYBRID_OWN_PC)
+    customer_id = _customer_id(db_path, "paid-active@example.test")
+    _activate_appliance(db_path, customer_id)
+    _pay(db_path, customer_id, "hybrid", 5, "sub_paid", status="active")
+    assert _label(db_path, customer_id) == "Active · awaiting payment confirmation"  # Stripe 'active' alone is not enough
+    _paid_invoice(db_path, customer_id, "sub_paid")
+    assert _label(db_path, customer_id) == "Paid Active"
+    assert "Paid Active · renews on" in client.get("/order-complete").text
+    assert "Paid Active" in client.get("/subscription-portal").text
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE subscription_payments SET refunded_at='2026-10-23T00:00:00' WHERE stripe_subscription_id='sub_paid'")
+    assert _label(db_path, customer_id) != "Paid Active"
+
+
+def test_a_converted_trial_is_paid_active_only_after_its_first_payment(shop, db_path, stripe_subscriptions):
+    import storage_trial
+    from test_hybrid_build_system_flow import _pay
+    client, captured, mail, _, _ = shop
+    customer_id = _hybrid_order_with_trial(client, mail, db_path, captured, "trial-converted@example.test")
+    _activate_appliance(db_path, customer_id)
+    trial = _call(db_path, storage_trial.latest, customer_id)
+    _call(db_path, storage_trial.link_subscription, trial["id"], customer_id, "sub_converting")
+    _pay(db_path, customer_id, "hybrid", 5, "sub_converting", status="trialing")
+    assert _label(db_path, customer_id) == "Trial Active"
+    _pay(db_path, customer_id, "hybrid", 5, "sub_converting", status="active")  # Stripe ends the trial, invoice not yet paid
+    assert _label(db_path, customer_id) == "Active · awaiting payment confirmation"
+    _paid_invoice(db_path, customer_id, "sub_converting")
+    assert _label(db_path, customer_id) == "Paid Active"
