@@ -1524,6 +1524,25 @@ def _column_exists(db, table, column) -> bool:
     return any(row['name'] == column for row in db.execute(f'PRAGMA table_info("{table}")').fetchall())
 
 
+def _require_same_column_definition(db, version, statement, table, column):
+    """An existing column is only accepted if it is compatible with the column this ADD COLUMN would have created
+    (same declared type; NOT NULL when the migration requires it; SQLite). Anything else is a schema mismatch that must
+    not be recorded as migrated."""
+    if _db_backend() != 'sqlite':
+        return
+    m = re.search(r'ADD\s+COLUMN\s+["`]?\w+["`]?\s+([A-Za-z]+)', statement, re.I)
+    want_type = (m.group(1) if m else '').upper()
+    want_not_null = re.search(r'\bNOT\s+NULL\b', statement, re.I) is not None
+    row = next(r for r in db.execute(f'PRAGMA table_info("{table}")').fetchall() if r['name'] == column)
+    have_type = (row['type'] or '').split('(')[0].strip().upper()
+    # Same declared type required; an existing column may be STRICTER (NOT NULL from a newer base CREATE TABLE) than
+    # the ADD COLUMN, but never looser than a NOT NULL the migration asks for.
+    if have_type != want_type or (want_not_null and not row['notnull']):
+        raise RuntimeError(f'Schema mismatch in migration {version}: {table}.{column} exists as '
+                           f'{have_type or "<no type>"}{" NOT NULL" if row["notnull"] else ""}, expected '
+                           f'{want_type}{" NOT NULL" if want_not_null else ""}; not recording the migration')
+
+
 def apply_migrations():
     with connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY,applied_at TEXT NOT NULL)')
@@ -1537,11 +1556,20 @@ def apply_migrations():
             # with no schema_migrations row, and every later start failed with "duplicate column name". Now the
             # statements and the marker commit together or not at all (SQLite DDL is transactional; PostgreSQL's
             # connection is already transactional).
-            if sqlite and not db.in_transaction: db.execute('BEGIN IMMEDIATE')
+            if sqlite:
+                if not db.in_transaction: db.execute('BEGIN IMMEDIATE')
+            else:
+                db.execute('SELECT pg_advisory_xact_lock(727001)')  # serializes concurrent PostgreSQL migrators
+            # Re-check under the write lock (Codex MIG-127-01): another worker/process may have committed this migration
+            # between our first read of schema_migrations and this point.
+            if db.execute('SELECT 1 FROM schema_migrations WHERE version=?',(version,)).fetchone():
+                db.commit(); continue
             for statement in [item.strip() for item in script.split(';') if item.strip()]:
                 add=_ADD_COLUMN.match(statement)
                 if add and _column_exists(db, add.group(1), add.group(2)):
-                    # Safe to rerun: a column left by such an interrupted start (or already present) is not added twice.
+                    # Safe to rerun: a column left by such an interrupted start (or already present) is not added
+                    # twice -- but only if it is that column (Codex MIG-127-02), else a clear schema-mismatch error.
+                    _require_same_column_definition(db, version, statement, add.group(1), add.group(2))
                     logger.warning('Migration %s: column %s.%s already exists; statement skipped',version,add.group(1),add.group(2))
                     continue
                 db.execute(statement)
