@@ -45,6 +45,9 @@ foreach ($folder in @($env:ANYAICAM_RECORDINGS_FOLDER, $env:ANYAICAM_HLS_FOLDER,
 # private/domain networks.
 $bindHost = if ($settings['ANYAICAM_BIND_HOST']) { $settings['ANYAICAM_BIND_HOST'] } else { '0.0.0.0' }
 $port = if ($settings['ANYAICAM_HTTP_PORT'] -match '^\d{2,5}$') { $settings['ANYAICAM_HTTP_PORT'] } else { '8000' }
+# 1.3.3 D4: a VMS left over from an earlier service run (an orphan that survived a stop) holds port 8000 with the old
+# product mode, so every new VMS would fail to bind and the service would restart in a loop. Stop it first.
+try { & (Join-Path $PSScriptRoot 'stop-stale-vms.ps1') -InstallRoot $installRoot } catch { Write-Output "AnyAiCam VMS launcher: stale-process check failed: $($_.Exception.Message)" }
 Set-Location (Join-Path $installRoot 'app')
 & (Join-Path $installRoot 'runtime\python\python.exe') -m uvicorn main:app --host $bindHost --port $port --proxy-headers
 exit $LASTEXITCODE
