@@ -86,6 +86,8 @@ def advance_fulfillment_status(order_id: str, new_status: str) -> dict:
     if not order:
         raise ValueError(f"Unknown hardware order {order_id!r}")
     _refuse_test_order_on_live_server(order)
+    if new_status != "cancelled":
+        _refuse_reversed_payment(order)
     current = order["fulfillment_status"] or "paid"
 
     if new_status == "cancelled":
@@ -109,6 +111,19 @@ def advance_fulfillment_status(order_id: str, new_status: str) -> dict:
     return row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
 
 
+def _refuse_reversed_payment(order: dict) -> None:
+    """Codex HW-REFUND-RACE: a refunded / disputed payment is never advanced or shipped (a recorded reversal is applied)."""
+    if order.get("status") in ("refunded", "disputed"):
+        raise ValueError(f"Order {order.get('id')!r} is {order.get('status')}; it cannot be fulfilled.")
+    intent = str(order.get("stripe_payment_intent_id") or "")
+    if intent:
+        import billing_status
+        reason = billing_status.hardware_payment_reversed(intent)
+        if reason:
+            billing_status.reconcile_hardware_reversals(intent)
+            raise ValueError(f"Order {order.get('id')!r} is {reason}; it cannot be fulfilled.")
+
+
 def mark_shipped(order_id: str, *, carrier: str, tracking_number: str, tracking_link: Optional[str] = None) -> dict:
     """Advances to 'shipped', records carrier/tracking, and sends the
     shipping email (send-once per order, see purchase_notifications.
@@ -116,6 +131,7 @@ def mark_shipped(order_id: str, *, carrier: str, tracking_number: str, tracking_
     existing = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
     if existing:
         _refuse_test_order_on_live_server(existing)
+        _refuse_reversed_payment(existing)
     now = _now()
     with connection() as db:
         db.execute(

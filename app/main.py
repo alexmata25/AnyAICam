@@ -115426,6 +115426,9 @@ async def _billing_grace_worker() -> None:
             # happened yet or failed transiently (build_orders.py).
             from build_orders import retry_storage_starts
             await asyncio.to_thread(retry_storage_starts)
+            # Codex HW-REFUND-RACE: refunds / disputes on record whose hardware order is still 'paid'.
+            from billing_status import reconcile_hardware_reversals
+            await asyncio.to_thread(reconcile_hardware_reversals)
         except asyncio.CancelledError:
             raise
         except Exception as error:

@@ -48,7 +48,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from appliance_protocol import RateLimiter
-from partner_db import connection, row, rows
+from partner_db import connection, row, rows, transaction
 
 logger = logging.getLogger("anyaicam.hardware_checkout")
 
@@ -391,32 +391,39 @@ def sync_from_stripe_event(event: dict) -> dict:
     intent = session.get("payment_intent")
     intent_id = str((intent.get("id") if isinstance(intent, dict) else intent) or "") or None
     stripe_customer = str(session.get("customer") or "") or None
+    import billing_status
     order_ids = []
-    for sku, quantity in items:
-        entry = catalog[sku]
-        price_id = os.environ.get(entry["env"], "").strip()
-        charged = amounts.get(price_id)
-        order = hardware_orders.upsert_order(
-            customer_id=customer_id, sku=sku, product_name=entry["name"], stripe_price_id=price_id or "unconfigured",
-            quantity=quantity, amount_cents=charged if charged is not None else entry["cents"] * quantity,
-            stripe_checkout_session_id=session_id, stripe_payment_intent_id=intent_id, stripe_customer_id=stripe_customer,
-            status="paid")
-        order_ids.append(order["id"])
-    now = _now()
-    with connection() as db:
+    # Codex HW-REFUND-RACE (2026-10-23): the order rows, the checkout update, the reversal check and the saved plan are ONE
+    # transaction under this payment's lock -- the key a charge.refunded / charge.dispute.created for the same
+    # PaymentIntent takes (billing_status.lock_payment, global key order). Whichever commits first, the other sees it:
+    # a refund recorded first (even before any order row existed) is re-read under the lock and the orders are written
+    # refunded/disputed, never paid; a refund arriving after finds the paid rows and reverses them.
+    with transaction() as db:
+        if intent_id:
+            billing_status.lock_payment(db, billing_status.payment_keys(intent=intent_id))
+        reversed_as = billing_status.hardware_payment_reversed(intent_id or "")
+        for sku, quantity in items:
+            entry = catalog[sku]
+            price_id = os.environ.get(entry["env"], "").strip()
+            charged = amounts.get(price_id)
+            order = hardware_orders.upsert_order(
+                customer_id=customer_id, sku=sku, product_name=entry["name"], stripe_price_id=price_id or "unconfigured",
+                quantity=quantity, amount_cents=charged if charged is not None else entry["cents"] * quantity,
+                stripe_checkout_session_id=session_id, stripe_payment_intent_id=intent_id, stripe_customer_id=stripe_customer,
+                status=reversed_as or "paid")
+            order_ids.append(order["id"])
+        now = _now()
         db.execute("UPDATE hardware_checkouts SET status='paid',stripe_checkout_session_id=?,email=?,customer_id=COALESCE(customer_id,?),"
                    "amount_total_cents=?,stripe_payment_intent_id=?,stripe_customer_id=?,shipping_json=?,order_ids=?,"
                    "paid_at=COALESCE(paid_at,?),updated_at=? WHERE id=?",
                    (session_id, email or record.get("email"), customer_id, session.get("amount_total"), intent_id, stripe_customer,
                     json.dumps(_shipping(session)), ",".join(order_ids), now, now, checkout_id))
-    import billing_status
-    reversed_as = billing_status.reversal_reason("", intent_id or "", "") if intent_id else None
-    if reversed_as:
-        # Red review H1: refunded or disputed before this order was recorded -> the order is recorded reversed (as a
-        # later refund would have left it) and no plan is saved for it.
-        billing_status.reverse_hardware_orders(intent_id, reversed_as)
-    elif kind == HARDWARE_ONLY and customer_id:
-        _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id), build_orders._payment_method(session))
+        if reversed_as:
+            # Red review H1: refunded or disputed before this order was recorded -> recorded reversed (a replay of an
+            # earlier paid row is reversed too) and no plan is saved for it.
+            billing_status.reverse_hardware_orders(intent_id, reversed_as)
+        elif kind == HARDWARE_ONLY and customer_id:
+            _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id), build_orders._payment_method(session))
     try:  # the confirmation email never fails the step; retried from the outbox and on the order pages
         import stripe_mode
         send_confirmation(checkout_id, test_mode=stripe_mode.is_test_mode(event=event))

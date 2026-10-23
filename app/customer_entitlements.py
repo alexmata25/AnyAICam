@@ -318,11 +318,15 @@ def total_camera_slots(customer_id: str) -> int:
 def appliance_includes_vms_license(customer_id: str) -> bool:
     """An AnyAiCam appliance purchase includes the VMS software license, so
     such a customer is never charged for it separately."""
-    return row(
-        "SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' "
-        "AND status='paid' LIMIT 1",
-        (customer_id,),
-    ) is not None
+    import billing_status
+    # Codex HW-REFUND-RACE: a paid row whose payment has a recorded refund / dispute does not count (and is reconciled).
+    for order in rows("SELECT stripe_payment_intent_id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' "
+                      "AND status='paid'", (customer_id,)):
+        intent = str(order.get("stripe_payment_intent_id") or "")
+        if not intent or not billing_status.hardware_payment_reversed(intent):
+            return True
+        billing_status.reconcile_hardware_reversals(intent)
+    return False
 
 
 def vms_license_capacity(customer_id: str) -> int:

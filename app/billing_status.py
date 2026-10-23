@@ -508,6 +508,39 @@ def reverse_hardware_orders(intent: str, reason: str) -> int:
     return changed
 
 
+def reconcile_hardware_reversals(intent: str | None = None, limit: int = 200) -> int:
+    """Codex HW-REFUND-RACE (2026-10-23): a refund or dispute recorded in billing_reversals whose hardware order is still
+    'paid' -- e.g. the reversal was recorded before the order row existed -- is applied now. Each payment is handled under
+    its payment lock (the same key a refund / dispute and the hardware webhook take) and the reversal is re-read under
+    it, so a won dispute (reason 'dispute_won') is never applied. intent=None sweeps; returns the orders changed."""
+    with connection() as db:
+        db.execute(REVERSALS_DDL)
+    if intent:
+        intents = [intent]
+    else:
+        intents = [r["payment_intent"] for r in rows(
+            "SELECT DISTINCT h.stripe_payment_intent_id AS payment_intent FROM hardware_orders h "
+            "JOIN billing_reversals b ON b.payment_intent=h.stripe_payment_intent_id "
+            "WHERE h.status='paid' AND b.reason IN ('refunded','disputed') LIMIT ?", (int(limit),))]
+    changed = 0
+    for pi in filter(None, intents):
+        with transaction() as db:
+            lock_payment(db, payment_keys(intent=pi))
+            reason = reversal_reason("", pi, "")
+            if reason:
+                count = db.execute("UPDATE hardware_orders SET status=?,updated_at=? WHERE stripe_payment_intent_id=? "
+                                   "AND status='paid'", (reason, datetime.now().isoformat(), pi)).rowcount
+                if count:
+                    logger.warning("billing.hardware_reversal_reconciled intent=%s reason=%s orders=%s", pi, reason, count)
+                changed += count
+    return changed
+
+
+def hardware_payment_reversed(intent: str) -> str | None:
+    """'refunded' / 'disputed' when this hardware payment has an active reversal on record, else None."""
+    return reversal_reason("", intent, "") if intent else None
+
+
 def restore_hardware_orders(intent: str) -> int:
     """A won dispute: the payment stands, so the order is paid again."""
     if not intent:

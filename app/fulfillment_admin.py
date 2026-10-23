@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from partner_db import connection, row, rows
+from partner_db import connection, row, rows, transaction
 
 OPERATOR_STEPS = {
     # target: states it may be applied from ('unfulfilled' is the table's
@@ -91,6 +91,13 @@ def apply_step(order_id: str, payload: FulfillmentRequest, actor: dict) -> dict:
         if not _CARRIER.fullmatch(carrier) or not _TRACKING.fullmatch(tracking_number):
             raise HTTPException(status_code=400, detail="Enter the carrier and a tracking number (letters, numbers, spaces and dashes).")
         link = tracking_link(carrier, tracking_number)
+    # Codex HW-REFUND-RACE: a refund / dispute already recorded for this payment is applied first (under its payment
+    # lock), so a stale 'paid' row can never be prepared, shipped or delivered.
+    intent = str(order.get("stripe_payment_intent_id") or "")
+    if intent:
+        import billing_status
+        if billing_status.reconcile_hardware_reversals(intent):
+            order = _order(order_id)
     current = str(order.get("fulfillment_status") or "")
     # Checked before anything else, the repeat path included: a refunded,
     # disputed or cancelled order is never moved and never emailed.
@@ -112,9 +119,17 @@ def apply_step(order_id: str, payload: FulfillmentRequest, actor: dict) -> dict:
     now = datetime.now().isoformat()
     details = {"from": current or "paid", "to": target, **({"carrier": carrier} if carrier else {})}
     # The transition and its audit record are one transaction: both are
-    # written, or neither is.
-    with connection() as db:
-        if target == "shipped":
+    # written, or neither is -- under the payment lock, with the reversal
+    # re-read, so a refund committing at the same moment is never overtaken.
+    import billing_status
+    reversed_now = None
+    with transaction() as db:
+        if intent:
+            billing_status.lock_payment(db, billing_status.payment_keys(intent=intent))
+            reversed_now = billing_status.hardware_payment_reversed(intent)
+        if reversed_now:
+            changed = 0
+        elif target == "shipped":
             changed = db.execute(
                 f"UPDATE hardware_orders SET fulfillment_status='shipped',carrier=?,tracking_number=?,tracking_link=?,shipped_at=?,"
                 f"updated_at=? WHERE id=? AND status='paid' AND fulfillment_status IN ({placeholders})",
@@ -130,6 +145,9 @@ def apply_step(order_id: str, payload: FulfillmentRequest, actor: dict) -> dict:
                        "VALUES(?,?,?,?,?,?,?)",
                        (actor.get("email", ""), actor.get("role", ""), f"hardware_order.{target}", "hardware_order", order_id,
                         json.dumps(details), now))
+    if reversed_now:
+        billing_status.reconcile_hardware_reversals(intent)
+        raise HTTPException(status_code=409, detail=f"This order is {reversed_now}; it cannot be fulfilled.")
     if changed != 1:
         latest = _order(order_id)
         if latest.get("fulfillment_status") == target:  # a concurrent request applied it first
