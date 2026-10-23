@@ -61,7 +61,10 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 logger = logging.getLogger("anyaicam.product_mode")
@@ -191,14 +194,39 @@ _RESOLVED_AT_START: dict[str, tuple[bool, bool]] = {}
 # the VMS ends its own process once the mode it just persisted changes a
 # flag it is running with; the compose service's `restart: unless-stopped`
 # starts it again and the flags are re-read. Only done where that
-# supervisor exists: inside the appliance's Docker container, or when this
-# variable says so explicitly ("false" turns it off).
+# supervisor exists: inside the appliance's Docker container, the Windows
+# service (below), or when this variable says so explicitly ("false" turns
+# it off).
 SELF_RESTART_ENV = "ANYAICAM_PRODUCT_MODE_SELF_RESTART"
 # A graceful shutdown that is stuck (e.g. on a worker thread) must not leave
 # the appliance half-stopped forever: exit hard after this many seconds.
 SELF_RESTART_GRACE_SECONDS = 30.0
 _DOCKER_MARKER = Path("/.dockerenv")
 _UNSUPPORTED_LOGGED: list[str] | None = None
+# Windows 1.3.3 (Blue, D3, 2026-10-22): the supervisor is the AnyAiCamVMS
+# WinSW service. The cloud's restart_vms (`AnyAiCamVMS.exe restart`) can run
+# BEFORE this sync persists the new mode, so the restarted VMS kept the old
+# mode's flags and a Local->Hybrid switch never started MediaMTX/P2P. The VMS
+# now asks its own wrapper for `restart!` (WinSW restarts the service from a
+# detached process, as the agent already does for itself) -- the same stop and
+# start restart_vms performs, never TerminateProcess, which on Windows would
+# leave the FFmpeg/MediaMTX children running.
+_WINDOWS = os.name == "nt"
+WINDOWS_SERVICE_WRAPPER = "AnyAiCamVMS.exe"
+# A requested Windows restart takes seconds; asked again only if this process
+# is somehow still running (and stale) this long after.
+WINDOWS_RESTART_RETRY_SECONDS = 600.0
+_WINDOWS_RESTART_REQUESTED_AT: float | None = None
+
+
+def _windows_service_wrapper() -> Path | None:
+    """<install root>\\service\\AnyAiCamVMS.exe, from the bundled interpreter's
+    own location (<install root>\\runtime\\python\\python.exe) -- never from
+    the environment. None outside an installed Windows VMS."""
+    if not _WINDOWS:
+        return None
+    wrapper = Path(sys.executable).resolve().parent.parent.parent / "service" / WINDOWS_SERVICE_WRAPPER
+    return wrapper if wrapper.is_file() else None
 
 
 def stale_running_flags() -> list[str]:
@@ -217,10 +245,32 @@ def _self_restart_supported() -> bool:
         return False
     if setting in ("true", "1", "yes", "on"):
         return True
-    return _DOCKER_MARKER.exists()
+    return _DOCKER_MARKER.exists() or _windows_service_wrapper() is not None
+
+
+def _restart_windows_service(wrapper: Path, run=None) -> bool:
+    try:
+        result = (run or subprocess.run)([str(wrapper), "restart!"], capture_output=True, text=True, timeout=60, check=False,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as error:
+        logger.warning("product_mode.self_restart_failed wrapper=%s error=%s", wrapper.name, error)
+        return False
+    if result.returncode != 0:
+        logger.warning("product_mode.self_restart_failed wrapper=%s exit=%s", wrapper.name, result.returncode)
+        return False
+    return True
 
 
 def _terminate_process() -> None:
+    wrapper = _windows_service_wrapper()
+    if wrapper is not None:
+        # Windows: WinSW stops and starts the service; no hard exit here, so a
+        # failed request leaves the VMS running (and is retried next cycle).
+        global _WINDOWS_RESTART_REQUESTED_AT
+        if not _restart_windows_service(wrapper):
+            raise RuntimeError(f"{wrapper.name} restart! failed")
+        _WINDOWS_RESTART_REQUESTED_AT = time.monotonic()
+        return
     # Hard fallback first, as a daemon timer, so it cannot itself keep the
     # interpreter alive; then the same SIGTERM `docker stop` would send,
     # which uvicorn handles as a graceful shutdown.
@@ -239,6 +289,9 @@ def restart_if_running_flags_stale(*, terminate=None) -> list[str]:
     stale = stale_running_flags()
     if not stale:
         return []
+    if (_WINDOWS_RESTART_REQUESTED_AT is not None
+            and time.monotonic() - _WINDOWS_RESTART_REQUESTED_AT < WINDOWS_RESTART_RETRY_SECONDS):
+        return stale  # the Windows service restart is already under way
     if not _self_restart_supported():
         if _UNSUPPORTED_LOGGED != stale:
             logger.warning(
@@ -250,7 +303,8 @@ def restart_if_running_flags_stale(*, terminate=None) -> list[str]:
         return stale
     logger.warning(
         "product_mode.self_restart mode=%s stale_flags=%s "
-        "(ending the VMS process; Docker restarts it with the new mode)",
+        + ("(restarting the AnyAiCam VMS Windows service with the new mode)" if _windows_service_wrapper() is not None
+           else "(ending the VMS process; Docker restarts it with the new mode)"),
         current_mode() or "unset", ",".join(stale),
     )
     (terminate or _terminate_process)()

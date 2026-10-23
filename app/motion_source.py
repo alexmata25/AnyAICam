@@ -68,6 +68,13 @@ SUBSTREAM_RETRY_SECONDS = _int_env("ANYAICAM_MOTION_SUBSTREAM_RETRY_SECONDS", 18
 SUBSTREAM_STALL_SECONDS = _int_env("ANYAICAM_MOTION_SUBSTREAM_STALL_SECONDS", 30, 5)
 # A substream run that delivered at least this many frames was healthy.
 SUBSTREAM_HEALTHY_FRAMES = 30
+# Windows (2026-10-21, Blue, functional Sandbox F-L/F-H defect D2): an FFmpeg HLS reader holding camera<N>.m3u8 open
+# makes the live encoder's playlist rename fail -- silently -- so the playlist freezes at its first segment: the
+# motion reader then gets no frames (no motion events) and the customer live playlist goes empty 20 s later. On
+# Windows the motion reader therefore NEVER reads the live playlist: a camera without a distinct substream is read
+# over its main stream (RTSP, same 1 fps 160x90 frames), and failures keep retrying the camera stream instead of
+# falling back to HLS. Linux is unchanged (a rename over an open file is allowed there).
+WINDOWS = os.name == "nt"
 
 
 def hls_command(manifest: str) -> list[str]:
@@ -142,14 +149,29 @@ def resolve_substream_url(main_url: str, record: Optional[dict],
     return url
 
 
+def reader_url(main_url: str, record: Optional[dict],
+               url_candidates: Optional[Callable[[str], list[str]]], *, windows: bool = None) -> Optional[str]:
+    """The credentialed URL the motion reader opens, or None. The camera's distinct substream when it has one
+    (resolve_substream_url); on Windows only, otherwise the main stream itself -- never the live HLS playlist (see
+    WINDOWS). On Linux exactly resolve_substream_url(). Never logs."""
+    url = resolve_substream_url(main_url, record, url_candidates)
+    if url or not (WINDOWS if windows is None else windows):
+        return url
+    return main_url or None
+
+
 class MotionSourceSelector:
     """Per-camera choice between the substream and the HLS playlist, with
     failure counting. Pure bookkeeping: the caller supplies the substream
     URL resolver and the clock, so this is unit-testable without FFmpeg."""
 
     def __init__(self, mode: str = None, *, max_failures: int = None, retry_seconds: float = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, windows: bool = None):
         self.mode = configured_mode(mode) if mode is not None else MOTION_SOURCE
+        # Windows: the live HLS playlist is never read (see WINDOWS); ANYAICAM_MOTION_SOURCE=hls means "auto" there.
+        self.windows = WINDOWS if windows is None else bool(windows)
+        if self.windows and self.mode == "hls":
+            self.mode = "auto"
         self.max_failures = SUBSTREAM_MAX_FAILURES if max_failures is None else max(1, int(max_failures))
         self.retry_seconds = SUBSTREAM_RETRY_SECONDS if retry_seconds is None else float(retry_seconds)
         self._clock = clock
@@ -159,7 +181,14 @@ class MotionSourceSelector:
         self._generation: dict[int, int] = {}
 
     def choose(self, camera_number: int, resolve_substream: Callable[[int], Optional[str]]) -> tuple[str, Optional[str]]:
-        """("substream", credentialed URL) or ("hls", None)."""
+        """("substream", credentialed URL) or ("hls", None); on Windows ("substream", URL) or ("wait", None) --
+        "wait" = no camera stream to read yet, retry later (the live HLS playlist is never read on Windows)."""
+        if self.windows:
+            try:
+                url = resolve_substream(camera_number)
+            except Exception:
+                url = None
+            return ("substream", url) if url else ("wait", None)
         if self.mode == "hls":
             return "hls", None
         if self.mode == "auto" and self._clock() < self._hls_until.get(camera_number, 0.0):
@@ -180,6 +209,12 @@ class MotionSourceSelector:
             return None
         failures = self._failures.get(camera_number, 0) + 1
         self._failures[camera_number] = failures
+        if self.windows:
+            if failures < self.max_failures:
+                return None
+            self._failures[camera_number] = 0
+            return (f"Camera {camera_number} motion camera stream failed {failures} times; retrying it "
+                    f"(on Windows the live HLS playlist is never read).")
         if self.mode != "auto" or failures < self.max_failures:
             return None
         self._failures[camera_number] = 0
@@ -194,6 +229,10 @@ class MotionSourceSelector:
         self._last_kind[camera_number] = kind
         if self.mode == "hls":
             return None  # the previous behaviour, previous logs
+        if kind == "wait":
+            return f"Camera {camera_number} motion detector source: none yet (no camera stream to read); retrying."
+        if self.windows and kind == "substream":
+            return f"Camera {camera_number} motion detector source: camera stream (RTSP; the live HLS playlist is not read on Windows)."
         return f"Camera {camera_number} motion detector source: {'camera substream' if kind == 'substream' else 'live HLS stream'}."
 
     def forget(self, camera_number: int) -> None:

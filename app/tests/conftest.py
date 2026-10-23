@@ -330,6 +330,27 @@ def _platform_independent_analytics(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _platform_independent_live_readers(monkeypatch):
+    """Windows 1.3.2 (2026-10-21, defect D2): on Windows the motion and AI frame readers never read the live HLS
+    playlist (motion_source.WINDOWS, analytics_frames.WINDOWS). The existing source-selection tests describe the Linux
+    contract, so on a Windows test host the suite runs them as on Linux; the Windows behaviour has its own tests
+    (test_windows_live_readers_132.py), which pass windows=True explicitly. No effect on Linux."""
+    import sys
+    for name in ("motion_source", "analytics_frames"):
+        try:
+            module = __import__(name)
+        except ImportError:
+            continue
+        monkeypatch.setattr(module, "WINDOWS", False, raising=False)
+    main = sys.modules.get("main")
+    for attribute in ("_motion_source_selector", "ai_frames"):
+        holder = getattr(main, attribute, None) if main is not None else None
+        if holder is not None and hasattr(holder, "windows"):
+            monkeypatch.setattr(holder, "windows", False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _appliance_entitlements(request, monkeypatch, tmp_path):
     """An appliance (the default edge role) runs Talk Down / Voice Call only
     with a valid signed entitlement snapshot (appliance_entitlements.py).

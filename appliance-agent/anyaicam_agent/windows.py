@@ -46,6 +46,13 @@ UNSUPPORTED_ACTIONS = {
     'install_update': 'Software updates are not installed remotely on Windows; install the new AnyAiCam setup instead.',
 }
 UPDATES_UNSUPPORTED = UNSUPPORTED_ACTIONS['install_update']
+# Windows 1.3.3 D3b (Blue, Sandbox F-H on 8f7a24b0, 2026-10-22): the VMS restarts its own service (`restart!`) once a
+# new product mode is saved, and the cloud's restart_vms for the same switch can arrive while that stop is still
+# pending; WinSW then refuses ("Cannot stop 'AnyAiCamVMS' service") and the command was reported failed although the
+# VMS came back in the new mode. When the service is mid-stop/start, wait for it to settle and run the restart once more.
+SERVICE_IDS = {'AnyAiCamVMS.exe': 'AnyAiCamVMS'}
+RESTART_SETTLE_SECONDS = 120
+_BUSY_MARKERS = ('Cannot stop', 'Cannot start')
 
 
 def install_root() -> Path:
@@ -55,7 +62,22 @@ def install_root() -> Path:
     return Path(sys.executable).resolve().parent.parent.parent
 
 
-def run_privileged_action(action_type: str, *, root: Path | None = None, run=subprocess.run) -> tuple[str, dict, str]:
+def _service_busy(service_id: str, result, run) -> bool:
+    output = f'{getattr(result, "stdout", "") or ""}\n{getattr(result, "stderr", "") or ""}'
+    return service_state(service_id, run).endswith('_pending') or any(m in output for m in _BUSY_MARKERS)
+
+
+def _wait_until_settled(service_id: str, run, sleep, seconds: float) -> str:
+    deadline = time.monotonic() + seconds
+    state = service_state(service_id, run)
+    while state.endswith('_pending') and time.monotonic() < deadline:
+        sleep(2)
+        state = service_state(service_id, run)
+    return state
+
+
+def run_privileged_action(action_type: str, *, root: Path | None = None, run=subprocess.run,
+                          sleep=time.sleep) -> tuple[str, dict, str]:
     """The Windows counterpart of commands._queue_privileged_action()'s
     marker + root watcher: same (status, result, error) shape."""
     if action_type in UNSUPPORTED_ACTIONS:
@@ -71,9 +93,19 @@ def run_privileged_action(action_type: str, *, root: Path | None = None, run=sub
                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except (OSError, subprocess.SubprocessError) as error:
         return 'failed', {}, f'Could not run {wrapper} {verb}: {error}'
+    extra = {}
+    service_id = SERVICE_IDS.get(wrapper)
+    if result.returncode != 0 and service_id and _service_busy(service_id, result, run):
+        settled = _wait_until_settled(service_id, run, sleep, RESTART_SETTLE_SECONDS)
+        try:
+            result = run([str(executable), verb], capture_output=True, text=True, timeout=120, check=False,
+                         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except (OSError, subprocess.SubprocessError) as error:
+            return 'failed', {}, f'Could not run {wrapper} {verb} after a restart already in progress: {error}'
+        extra = {'retried_after_restart_in_progress': True, 'state_before_retry': settled}
     if result.returncode != 0:
         return 'failed', {}, f'{wrapper} {verb} exited with {result.returncode}.'
-    return 'completed', {'requested': True, 'action': action_type}, ''
+    return 'completed', {'requested': True, 'action': action_type, **extra}, ''
 
 
 # --------------------------------------------------------------- metrics

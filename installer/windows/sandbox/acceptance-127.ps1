@@ -83,8 +83,14 @@ Check '1.2.7 isolation: production names resolve only to this VM' {
 }
 Check '1.2.7 isolation: an outbound internet connection fails' {
     $c = New-Object Net.Sockets.TcpClient
-    try { $t = $c.ConnectAsync('1.1.1.1', 443); if ($t.Wait(5000) -and $c.Connected) { throw 'reached 1.1.1.1:443' } } catch [AggregateException] { } finally { $c.Close() }
-    'no route to the internet'
+    # 1.3.3 U131-L: without a route ConnectAsync can also throw at once ("unreachable network", a
+    # MethodInvocationException around a SocketException) instead of failing the task: both mean no connection.
+    $how = 'no route to the internet'
+    try { $t = $c.ConnectAsync('1.1.1.1', 443); if ($t.Wait(5000) -and $c.Connected) { throw 'reached 1.1.1.1:443' } }
+    catch [AggregateException] { }
+    catch [System.Management.Automation.MethodInvocationException] { $how = "no route to the internet ($($_.Exception.InnerException.Message))" }
+    finally { $c.Close() }
+    $how
 }
 
 # ---------------------------------------------------------------- exact public entitlement keyset

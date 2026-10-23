@@ -73,6 +73,7 @@ Type: files; Name: "{group}\Show AnyAiCam claim code.lnk"
 Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "stop-stale-vms.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; Stops processes still running from {app} after the services are removed (PrepareToInstall from {tmp}; the

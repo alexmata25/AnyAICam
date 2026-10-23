@@ -331,7 +331,7 @@ def _yaml_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def render_mediamtx_config() -> str:
+def render_mediamtx_config(windows: bool = None) -> str:
     """Builds the base MediaMTX config -- API and WebRTC HTTP signaling
     both loopback-only (see module docstring), no static paths (every
     camera path is added/removed at runtime via the config REST API by
@@ -355,6 +355,13 @@ def render_mediamtx_config() -> str:
         "hls: no",
         "srt: no",
     ]
+    # Windows 1.3.2 (2026-10-21, Blue, functional Sandbox observation O3): MediaMTX 1.21 also starts a MoQ server
+    # (:8892 TCP/UDP and :8893 QUIC on every interface, MediaMTX's default anonymous publish/read) unless told not to;
+    # live view never uses MoQ. On Windows mediamtx.exe is a native process, so it is switched off. Linux is unchanged:
+    # there MediaMTX stays inside the container network (only 8189/udp is published), and its config gains no key an
+    # older MediaMTX might reject.
+    if (os.name == "nt") if windows is None else windows:
+        lines.append("moq: no")
     hosts = advertised_hosts()
     if hosts:
         lines.append("webrtcAdditionalHosts: [" + ", ".join(_yaml_quote(h) for h in hosts) + "]")
