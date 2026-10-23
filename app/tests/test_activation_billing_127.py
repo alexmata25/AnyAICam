@@ -652,3 +652,55 @@ def test_a_converted_trial_is_paid_active_only_after_its_first_payment(shop, db_
     assert _label(db_path, customer_id) == "Active · awaiting payment confirmation"
     _paid_invoice(db_path, customer_id, "sub_converting")
     assert _label(db_path, customer_id) == "Paid Active"
+
+
+# ------------------------------------------------------------------ owner 2026-10-22 verification: what a purchase charges
+
+def test_a_hardware_purchase_charges_only_the_hardware(shop, db_path):
+    import os
+    import hardware_checkout
+    import per_camera_billing as billing
+    client, captured, mail, _, _ = shop
+    with override_target(sqlite_path=str(db_path)):
+        hardware_checkout.create_checkout({"appliance": "AIC-APPLIANCE-RYZEN-STARTER", "plan": "hybrid", "cameras": 8, "relays": 2},
+                                          email="hw-only@example.test", identity=None)
+    fields = dict(captured[-1])
+    hardware_prices = {os.environ.get(entry["env"], "") for entry in hardware_checkout._catalog().values()} - {""}
+    lines = [value for key, value in fields.items() if key.startswith("line_items[") and key.endswith("[price]")]
+    assert fields["mode"] == "payment" and lines and set(lines) <= hardware_prices
+    plan_prices = {billing.price_id_for(key) for key in billing.PLANS} - {None, ""}
+    assert not set(lines) & plan_prices  # the monthly plan is saved, never charged at purchase
+    assert not any(key.startswith("subscription_data[") for key in fields)
+
+
+def test_an_own_pc_purchase_charges_only_the_approved_licence_price(shop, db_path):
+    import os
+    client, captured, mail, _, _ = shop
+    _new_customer(client, mail, "licence-price@example.test", OWN_PC)
+    assert _checkout(client).status_code == 200
+    fields = _checkouts(captured)[-1]
+    lines = [value for key, value in fields.items() if key.startswith("line_items[") and key.endswith("[price]")]
+    assert lines == [os.environ["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8"]] and fields["line_items[0][quantity]"] == "1"
+
+
+def test_a_redelivered_hardware_order_records_one_order_one_plan_and_charges_nothing(shop, db_path, stripe_subscriptions,
+                                                                                    monkeypatch):
+    import hardware_checkout
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "hw-replay@example.test")
+    first = _hardware_order(db_path, captured, customer_id, "hw-replay@example.test", monkeypatch, intent="pi_hw_replay")
+    fields = dict(captured[-1])
+    metadata = {key[len("metadata["):-1]: value for key, value in fields.items() if key.startswith("metadata[")}
+    session_id = _one(db_path, "SELECT stripe_checkout_session_id AS s FROM hardware_checkouts WHERE customer_id=?", (customer_id,))["s"]
+    replay = {"id": f"evt_{session_id}", "type": "checkout.session.completed", "livemode": False,
+              "data": {"object": {"id": session_id, "mode": "payment", "payment_status": "paid", "status": "complete",
+                                  "customer": "cus_hw_review", "payment_intent": "pi_hw_replay",
+                                  "customer_email": "hw-replay@example.test", "customer_details": {"email": "hw-replay@example.test"},
+                                  "metadata": metadata}}}
+    with override_target(sqlite_path=str(db_path)):
+        again = hardware_checkout.sync_from_stripe_event(replay)
+    assert again["order_ids"] == first["order_ids"]
+    assert _one(db_path, "SELECT COUNT(*) AS n FROM hardware_orders WHERE stripe_payment_intent_id='pi_hw_replay'", ())["n"] == \
+        len(first["order_ids"])
+    assert _one(db_path, "SELECT COUNT(*) AS n FROM deferred_storage_plans WHERE customer_id=?", (customer_id,))["n"] == 1
+    assert stripe_subscriptions["created"] == []  # nothing monthly before activation, however often Stripe resends
