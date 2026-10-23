@@ -216,3 +216,89 @@ def test_a_paid_order_without_any_reversal_is_unchanged(shop, db_path, stripe_su
     for step, extra in (("preparing", {}), ("shipped", {"carrier": "UPS", "tracking_number": "1Z999AA10123456784"}),
                         ("delivered", {})):
         assert _step(db_path, order_id, step, **extra)["status"] == "applied"
+
+
+# ------------------------------------------------------------------ Codex HW-REFUND-RACE-FULFILLMENT (review of 35801bfa)
+
+@pytest.mark.parametrize("helper", ["mark_shipped", "advance_fulfillment_status"])
+def test_a_fulfilment_helper_waits_for_a_refund_holding_the_lock_and_then_refuses(shop, db_path, stripe_subscriptions,
+                                                                                one_time_payments, monkeypatch, helper):
+    """The refund of an already-recorded appliance payment is paused INSIDE its locked transaction (orders reversed, not
+    committed). The library fulfilment helper started meanwhile must not ship / advance the order: it waits for the
+    payment lock, re-reads the reversal in the same transaction as its update, and refuses."""
+    import billing_status
+    import hardware_fulfillment
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, f"race12{helper}@example.test")
+    intent = f"pi_race12_{helper}"
+    _hardware_order(db_path, captured, customer_id, f"race12{helper}@example.test", monkeypatch, intent=intent)
+    order_id = _orders(db_path, intent)[0]["id"]
+    holding, release = threading.Event(), threading.Event()
+    original = billing_status.reverse_hardware_orders
+
+    def paused(pi, reason):
+        changed = original(pi, reason)
+        if threading.current_thread().name == "refund":
+            holding.set()
+            release.wait(10)
+        return changed
+    monkeypatch.setattr(billing_status, "reverse_hardware_orders", paused)
+    outcome, errors = {}, []
+
+    def refund():
+        try:
+            with override_target(sqlite_path=str(db_path)):
+                billing_status.sync_from_stripe_event(_refund(intent, event_id=f"evt_refund_{intent}"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+
+    def fulfil():
+        try:
+            with override_target(sqlite_path=str(db_path)):
+                if helper == "mark_shipped":
+                    hardware_fulfillment.mark_shipped(order_id, carrier="UPS", tracking_number="1Z999AA10123456784")
+                else:
+                    hardware_fulfillment.advance_fulfillment_status(order_id, "preparing")
+            outcome["result"] = "applied"
+        except ValueError as refused:
+            outcome["result"] = f"refused: {refused}"
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+    refund_thread = threading.Thread(target=refund, name="refund")
+    refund_thread.start()
+    assert holding.wait(10)
+    fulfil_thread = threading.Thread(target=fulfil, name="fulfil")
+    fulfil_thread.start()
+    time.sleep(1.0)
+    release.set()
+    refund_thread.join(30)
+    fulfil_thread.join(30)
+    assert errors == []
+    assert outcome["result"].startswith("refused"), outcome
+    order = _orders(db_path, intent)[0]
+    assert order["status"] == "refunded" and order["fulfillment_status"] not in ("shipped", "preparing"), order
+
+
+def test_library_helpers_still_fulfil_and_cancel_normal_paid_orders(shop, db_path, stripe_subscriptions, monkeypatch):
+    """The locked helpers change nothing for a paid, unreversed order; cancellation stays possible (also when refunded)."""
+    import hardware_fulfillment
+    import purchase_notifications
+    monkeypatch.setattr(purchase_notifications, "notify_hardware_shipped", lambda order_id: None)
+    monkeypatch.setattr(purchase_notifications, "notify_hardware_cancellation", lambda order_id: None)
+    client, captured, mail, _, _ = shop
+    customer_id = _signed_in_customer(client, mail, db_path, "race13@example.test")
+    _hardware_order(db_path, captured, customer_id, "race13@example.test", monkeypatch, intent="pi_race13")
+    order_id = _orders(db_path, "pi_race13")[0]["id"]
+    assert _call(db_path, hardware_fulfillment.advance_fulfillment_status, order_id, "preparing")["fulfillment_status"] == "preparing"
+    shipped = _call(db_path, hardware_fulfillment.mark_shipped, order_id, carrier="UPS", tracking_number="1Z999AA10123456784")
+    assert shipped["fulfillment_status"] == "shipped" and shipped["tracking_number"] == "1Z999AA10123456784"
+    assert _call(db_path, hardware_fulfillment.advance_fulfillment_status, order_id, "delivered")["fulfillment_status"] == "delivered"
+    customer_id = _signed_in_customer(client, mail, db_path, "race14@example.test")
+    _hardware_order(db_path, captured, customer_id, "race14@example.test", monkeypatch, intent="pi_race14")
+    paid_order = _orders(db_path, "pi_race14")[0]["id"]
+    assert _call(db_path, hardware_fulfillment.mark_cancelled, paid_order)["fulfillment_status"] == "cancelled"
+    customer_id = _signed_in_customer(client, mail, db_path, "race15@example.test")
+    _hardware_order(db_path, captured, customer_id, "race15@example.test", monkeypatch, intent="pi_race15")
+    refunded_order = _orders(db_path, "pi_race15")[0]["id"]
+    _stale_reversal(db_path, "pi_race15")
+    assert _call(db_path, hardware_fulfillment.mark_cancelled, refunded_order)["fulfillment_status"] == "cancelled"

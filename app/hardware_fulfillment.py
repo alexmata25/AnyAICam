@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from partner_db import connection, row
+from partner_db import connection, row, transaction
 
 HARDWARE_PREPARATION_MAX_DAYS = int(os.environ.get("ANYAICAM_HARDWARE_PREPARATION_MAX_DAYS", "14") or "14")
 
@@ -102,12 +102,18 @@ def advance_fulfillment_status(order_id: str, new_status: str) -> dict:
         raise ValueError(f"Unknown fulfillment status {new_status!r}")
 
     now = _now()
-    with connection() as db:
-        db.execute("UPDATE hardware_orders SET fulfillment_status=?,updated_at=? WHERE id=?", (new_status, now, order_id))
-        if new_status == "cancelled":
-            db.execute("UPDATE hardware_orders SET cancelled_at=? WHERE id=?", (now, order_id))
-        if new_status == "delivered":
-            db.execute("UPDATE hardware_orders SET delivered_at=? WHERE id=?", (now, order_id))
+    reversed_now = None
+    with transaction() as db:
+        if new_status != "cancelled":  # forward steps: under the payment lock, reversal re-read (Codex review of 35801bfa)
+            reversed_now = _locked_reversal(db, order_id)
+        if not reversed_now:
+            db.execute("UPDATE hardware_orders SET fulfillment_status=?,updated_at=? WHERE id=?", (new_status, now, order_id))
+            if new_status == "cancelled":
+                db.execute("UPDATE hardware_orders SET cancelled_at=? WHERE id=?", (now, order_id))
+            if new_status == "delivered":
+                db.execute("UPDATE hardware_orders SET delivered_at=? WHERE id=?", (now, order_id))
+    if reversed_now:
+        _apply_and_refuse(order, reversed_now)
     return row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
 
 
@@ -124,6 +130,32 @@ def _refuse_reversed_payment(order: dict) -> None:
             raise ValueError(f"Order {order.get('id')!r} is {reason}; it cannot be fulfilled.")
 
 
+def _locked_reversal(db, order_id: str) -> str | None:
+    """Inside the caller's transaction: take the order's PaymentIntent lock (the key a charge.refunded /
+    charge.dispute.created takes) and re-read the order and its reversal, so a refund can never commit between this check
+    and the caller's update. Returns 'refunded' / 'disputed' when the order must not be fulfilled, else None."""
+    current = row("SELECT status,stripe_payment_intent_id FROM hardware_orders WHERE id=?", (order_id,)) or {}
+    intent = str(current.get("stripe_payment_intent_id") or "")
+    if intent:
+        import billing_status
+        billing_status.lock_payment(db, billing_status.payment_keys(intent=intent))
+        current = row("SELECT status,stripe_payment_intent_id FROM hardware_orders WHERE id=?", (order_id,)) or {}
+        reason = billing_status.hardware_payment_reversed(intent)
+        if reason:
+            return reason
+    status = str(current.get("status") or "")
+    return status if status in ("refunded", "disputed") else None
+
+
+def _apply_and_refuse(order: dict, reason: str) -> None:
+    """After the transaction: record a reversal found under the lock on the order row, then refuse."""
+    intent = str(order.get("stripe_payment_intent_id") or "")
+    if intent:
+        import billing_status
+        billing_status.reconcile_hardware_reversals(intent)
+    raise ValueError(f"Order {order.get('id')!r} is {reason}; it cannot be fulfilled.")
+
+
 def mark_shipped(order_id: str, *, carrier: str, tracking_number: str, tracking_link: Optional[str] = None) -> dict:
     """Advances to 'shipped', records carrier/tracking, and sends the
     shipping email (send-once per order, see purchase_notifications.
@@ -133,11 +165,16 @@ def mark_shipped(order_id: str, *, carrier: str, tracking_number: str, tracking_
         _refuse_test_order_on_live_server(existing)
         _refuse_reversed_payment(existing)
     now = _now()
-    with connection() as db:
-        db.execute(
-            "UPDATE hardware_orders SET fulfillment_status='shipped',carrier=?,tracking_number=?,tracking_link=?,shipped_at=?,updated_at=? WHERE id=?",
-            (carrier, tracking_number, tracking_link, now, now, order_id),
-        )
+    reversed_now = None
+    with transaction() as db:  # under the payment lock, reversal re-read (Codex review of 35801bfa)
+        reversed_now = _locked_reversal(db, order_id)
+        if not reversed_now:
+            db.execute(
+                "UPDATE hardware_orders SET fulfillment_status='shipped',carrier=?,tracking_number=?,tracking_link=?,shipped_at=?,updated_at=? WHERE id=?",
+                (carrier, tracking_number, tracking_link, now, now, order_id),
+            )
+    if reversed_now:
+        _apply_and_refuse(existing or {"id": order_id}, reversed_now)
     order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
     if not order:
         raise ValueError(f"Unknown hardware order {order_id!r}")

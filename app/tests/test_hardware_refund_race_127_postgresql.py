@@ -166,6 +166,53 @@ class PostgreSQLHardwareRefundRaceTests(unittest.TestCase):
             self.run_threads(*(pair if n % 2 == 0 else reversed(pair)))
             self.assertEqual(self.statuses(ids), {"refunded"}, n)
 
+    def test_a_fulfilment_helper_waits_for_an_uncommitted_refund_and_refuses(self):
+        """Codex review of 35801bfa: hardware_fulfillment.mark_shipped / advance_fulfillment_status take the payment lock
+        and re-read the reversal in the same transaction as their update."""
+        import billing_status
+        import hardware_fulfillment
+        for n, helper in ((40, "mark_shipped"), (41, "advance_fulfillment_status")):
+            ids = self.new_order(n)
+            self.webhook(ids)
+            with self.db() as db:
+                order_id = db.execute("SELECT id FROM hardware_orders WHERE stripe_payment_intent_id=%s",
+                                      (ids["intent"],)).fetchone()["id"]
+            holding, release, outcome = threading.Event(), threading.Event(), {}
+            original = billing_status.reverse_hardware_orders
+
+            def paused(intent, reason):
+                changed = original(intent, reason)  # the paid row is reversed, NOT committed yet
+                if threading.current_thread().name == "reversal":
+                    holding.set()
+                    release.wait(15)
+                return changed
+
+            def fulfil():
+                try:
+                    if helper == "mark_shipped":
+                        hardware_fulfillment.mark_shipped(order_id, carrier="UPS", tracking_number="1Z999AA10123456784")
+                    else:
+                        hardware_fulfillment.advance_fulfillment_status(order_id, "preparing")
+                    outcome["result"] = "applied"
+                except ValueError as refused:
+                    outcome["result"] = f"refused: {refused}"
+            with patch("billing_status.reverse_hardware_orders", side_effect=paused),                     patch("purchase_notifications.notify_hardware_shipped", return_value=None):
+                reversal = threading.Thread(target=lambda: self.reversal(ids, "refund"), name="reversal")
+                reversal.start()
+                self.assertTrue(holding.wait(15))
+                worker = threading.Thread(target=fulfil, name="fulfil")
+                worker.start()
+                time.sleep(1.5)
+                self.assertNotIn("result", outcome, "the helper must wait for the refund's payment lock")
+                release.set()
+                reversal.join(30)
+                worker.join(30)
+            self.assertTrue(outcome["result"].startswith("refused"), (helper, outcome))
+            with self.db() as db:
+                row = db.execute("SELECT status,fulfillment_status FROM hardware_orders WHERE id=%s", (order_id,)).fetchone()
+            self.assertEqual(row["status"], "refunded", helper)
+            self.assertNotIn(row["fulfillment_status"], ("shipped", "preparing"), helper)
+
     def test_reconciliation_applies_a_reversal_left_beside_a_paid_row(self):
         import billing_status
         ids = self.new_order(30)
