@@ -1,8 +1,12 @@
 import json
 import logging
+import re
 from datetime import datetime
 
 from database_backend import connect
+# Module-level alias: apply_migrations() itself also does `from database_backend import backend` further down, which
+# makes the plain name local to the whole function (UnboundLocalError if used earlier).
+from database_backend import backend as _db_backend
 
 logger=logging.getLogger('anyaicam.migrations')
 
@@ -1509,14 +1513,40 @@ CREATE TABLE IF NOT EXISTS test_account_closures(
 ]
 
 
+# "ALTER TABLE <table> ADD COLUMN <column> ..." -- the only MIGRATIONS statement form that cannot simply run twice.
+_ADD_COLUMN = re.compile(r'^\s*ALTER\s+TABLE\s+["`]?(\w+)["`]?\s+ADD\s+COLUMN\s+["`]?(\w+)["`]?', re.I)
+
+
+def _column_exists(db, table, column) -> bool:
+    if _db_backend() == 'postgresql':
+        return db.execute('SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? '
+                          'AND column_name=?', (table, column)).fetchone() is not None
+    return any(row['name'] == column for row in db.execute(f'PRAGMA table_info("{table}")').fetchall())
+
+
 def apply_migrations():
     with connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY,applied_at TEXT NOT NULL)')
         applied={item['version'] for item in db.execute('SELECT version FROM schema_migrations').fetchall()}
+        sqlite = _db_backend() == 'sqlite'
         for version,script in MIGRATIONS:
             if version in applied: continue
-            for statement in [item.strip() for item in script.split(';') if item.strip()]: db.execute(statement)
-            db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(version,datetime.now().isoformat())); logger.info('Applied database migration %s',version)
+            # One migration = one transaction (2026-10-23, EC2 step-05 failure): Python's sqlite3 only opens a
+            # transaction before INSERT/UPDATE/DELETE, so a migration's leading DDL used to commit on its own. A start
+            # killed after that DDL but before the commit left e.g. pending_analytics_links.licensed_quantity in place
+            # with no schema_migrations row, and every later start failed with "duplicate column name". Now the
+            # statements and the marker commit together or not at all (SQLite DDL is transactional; PostgreSQL's
+            # connection is already transactional).
+            if sqlite and not db.in_transaction: db.execute('BEGIN IMMEDIATE')
+            for statement in [item.strip() for item in script.split(';') if item.strip()]:
+                add=_ADD_COLUMN.match(statement)
+                if add and _column_exists(db, add.group(1), add.group(2)):
+                    # Safe to rerun: a column left by such an interrupted start (or already present) is not added twice.
+                    logger.warning('Migration %s: column %s.%s already exists; statement skipped',version,add.group(1),add.group(2))
+                    continue
+                db.execute(statement)
+            db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(version,datetime.now().isoformat()))
+            db.commit(); logger.info('Applied database migration %s',version)
 
         # VMS 1.2.6 Analytics Control Center. Operational switches are
         # deliberately separate from commercial subscription and per-camera
