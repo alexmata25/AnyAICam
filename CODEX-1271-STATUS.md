@@ -6,7 +6,7 @@ Date: 2026-10-24
 
 - Frozen baseline: `b8c7a7edba7083ee703bb7a4d71bc8f27ea7dc5c`.
 - Isolated Codex branch: `codex/linux-1271-integrated`.
-- Latest source commit: `d44db2c565e0c1a9ac3f40a204492bf1e712d74c` (`test: use verified admin session for live-view role check`).
+- Latest source commit: `dcace5778c56988d447bd8a182a8308e7fb21dc5` (`fix: repair customer fetch wrapper and P2P browser fixtures`). The report-only commit that follows does not change application or test code.
 - `git merge-base b8c7a7ed HEAD` resolves to the frozen baseline. The frozen source and the original Red worktrees were not modified.
 - Red's trust/G2 and authorization tracked work was snapshotted into local review commits `3b198918049b500a205ce4486c36625a10dc1b91` and `87e2ca3ba5f305acba6fc3f63caf46072903bed7`. The only untracked package/build copies inspected were byte-identical to tracked source (34/34 files); generated build and egg-info output was excluded. Original worktrees remain untouched.
 
@@ -28,6 +28,8 @@ Additional isolated fixes in this branch:
 - A Local-view regression fixture now uses a persisted MFA-verified administrator session, so the role-routing assertion tests a valid wrong-role user under D-AUTHZ-2b (`d44db2c5`). This did not relax authentication.
 - Same-origin CSRF wrapper strips quoted cookie values (`e2501657`).
 - Ultralytics opt-out is written to the actual `Ultralytics/settings.json` config location before import, and inference remains fail-closed if telemetry cannot be disabled (`4dbbc18d`).
+- Final browser validation found the wrapper's generated HTML had an unclosed function, and the previous Node test duplicated rather than executed the template. Commit `dcace577` fixes the wrapper to always delegate GET/cross-origin requests, normalize URL/Request origins, preserve Request headers, and add CSRF only to unsafe same-origin requests. The test now parses and executes the extracted f-string template.
+- The same commit corrects the Playwright fixture to model a valid `MediaStreamTrack` and HLS `playing` event; fallback assertions wait for relay success rather than only player creation. These corrections preserve the product acceptance assertions.
 
 ## Focused automated evidence
 
@@ -39,9 +41,11 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 - Installer trust-registry tests: **8 passed, 3 skipped, 2 subtests passed**. Log: `_evidence/installer-trust.log`.
 - Appliance-agent trust/update tests: **51 passed, 11 skipped, 39 subtests passed**. Log: `_evidence/agent-trust.log`.
 - Node/Python-wrapper browser tests: **41 passed, 0 failed**. Log: `_evidence/node-focused-pytest2.log`; direct same-origin CSRF wrapper check reports `same-origin-login-variants=passed` on `e2501657`.
+- Actual shell CSRF wrapper: `node tests/test_csrf_browser_wrapper.js` passed, and `py_compile app/main.py` passed. Log: `_evidence/csrf-wrapper-final.log`.
 - Local-view page authorization: **7 passed, 0 failed** after correcting an old test fixture to use a persisted MFA-verified administrator session. The initial unverified cookie was correctly refused by the new auth middleware. Log: `_evidence/local-view-auth-fixed.log`.
 - Local/P2P route authorization, WireGuard policy, local customer access/playback, and cloud-relay playlist paths: **55 passed, 0 failed, 7 skipped**. Log: `_evidence/local-view-p2p-final.log`.
 - P2P signaling and relay-session workflow: **24 passed, 0 failed**. Log: `_evidence/local-view-signaling-final.log`.
+- Cross-browser P2P UI transition matrix on `dcace577`: **36 passed, 0 failed** across Chromium, Edge, and WebKit, 6 warnings, 184.09 s. Log: `_evidence/p2p-browser-final.log`. This is a mocked-media browser test, not a physical camera or real-network acceptance run.
 - Ultralytics privacy tests: **4 passed**; local installed Ultralytics 8.4.115 opt-out smoke reported `sync=False`, `events.enabled=False`; runtime preflight passed. No model was loaded and no external telemetry request was made. Logs: `_evidence/ultralytics-privacy-final.log`, `_evidence/runtime-preflight-final.log`.
 - Python syntax compilation passed for `app/ultralytics_privacy.py`, `app/ppe.py`, `app/lpr.py`, `app/main.py`, and `installer/windows/runtime-preflight.py`.
 - The Local-view and authorization test summaries were captured as focused evidence notes under `_evidence/` and exercised the source content committed as `d44db2c5`.
@@ -49,9 +53,10 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 ## Environment and unverified acceptance
 
 - Python 3.12 is absent (`C:\Program Files\AnyAiCam\runtime\python\python.exe` does not exist); the `py` launcher cannot resolve it. Local route tests ran on Python 3.14.6. Two earlier combined attempts in the restricted session stalled at TestClient socket operations; the focused suites were rerun with approved loopback access and completed. Interrupted attempts are not counted.
+- The release builder was inspected with `installer/build_release_installer.py --help`. A proper 1.2.7.1 build still needs the approved trust-registry JSON and independent SHA-256; verified MediaMTX Linux binary and hash; update verification public key; exact release commit; release version; and the shared Docker lock for `--preload-vms-image`. The `--no-mediamtx`, `--no-update-signing-key`, or `--no-entitlement-signing-keys` options would omit required product behavior and were not used.
 - No Docker, WSL, Ubuntu VM, root-owned Linux check, installer build, image build, installer install/upgrade/repair/rollback, camera, or physical acceptance test was run. Shared Docker work is on HOLD and engine/VM access is unavailable from this session; do not bypass the shared lock or start a VM.
 - No release installer, image digest, or artifact hash was produced.
-- Basic Local HLS routing/auth code has not been established as end-to-end media delivery. `app/live_view_p2p.py` describes signaling, but the appliance-side media-answer publisher is not demonstrated. Real authenticated direct video/P2P remains unverified and may require product work.
+- Local/P2P implementation exists: `app/live_view_p2p.py` brokers authenticated offer/answer/ICE signaling, while `app/webrtc_publisher.py` bridges the appliance's camera RTSP stream to local MediaMTX WHEP/WebRTC. Focused mock-server and browser transition suites pass. The publisher module documents historical real MediaMTX v1.21/camera/Ryzen verification, but that historical transcript was not independently rerun for this 1.2.7.1 branch; current physical/network video acceptance remains pending. Do not state that the publisher is absent or that new product work is necessarily required.
 - Telemetry behavior was smoke-tested against installed Ultralytics 8.4.115, not the release-pinned 8.3.40 package. Run pinned-package verification in an approved isolated Linux build/test environment.
 - Do not use test trust keys for release builds. Builder needs the approved public entitlement keyset and hash, verified MediaMTX binary/hash, and authorized update-verification public key material. No private signing key was accessed.
 - AGPL/commercial licensing for the LPR model/runtime must be resolved by the owner/legal counsel before customer distribution; this branch does not assert legal clearance.
