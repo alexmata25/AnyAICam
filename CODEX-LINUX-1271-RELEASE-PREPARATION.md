@@ -68,7 +68,7 @@ acceptance.
 | Input | Authorized source | Independent validation before build | Current state |
 |---|---|---|---|
 | TRUST-1 production registry | Authorized cloud trust administrator, using `python -m entitlement_keyset --trust-registry` on the approved cloud host against production public signer records; preserve prior generation history | Review canonical production JSON, generation and signer lifecycle; verify retained signers cover existing accepted grants; compare canonical registry bytes to a separately obtained cloud-host SHA-256; builder must accept both registry and digest | Registry and digest missing. No individual custodian name/contact is present in the reviewed repository or handoff; identity must be confirmed by the owner/Red. No cloud access performed |
-| Software Update verification public key | Existing release-signing custodian's trusted offline signing environment; export only the public PEM corresponding to the already approved release-signing identity | Custodian supplies separately confirmed fingerprint and provenance; compare using the custodian's documented fingerprint procedure; builder canonicalizes PEM, rejects private key material, records canonical PEM SHA-256, and `installer/12-update-signing-key.sh` verifies it | Public PEM and fingerprint missing. No individual custodian name/contact is present in the reviewed repository or handoff; identity must be confirmed by the owner/Red. Do not generate replacement key material |
+| Software Update verification public key | Candidate public PEM found in Red's preserved RC7 build inputs at `anyaicam-red/rc7-validation-20261019/build-inputs/payload/keys/update-signing-public-key.pem`; SHA-256 `f2666abc40fb8507f78700203c7e3707df176485c2a0a7f1f130c9f5b9a6a1f1`. The same hash is recorded as the embedded signing public key in `docs/releases/v1.2.3-launch-handoff.md` | The RC7 input manifest records this exact hash, and the earlier release handoff names it. The release-signing custodian must attest that this remains the approved production update-verification key for 1.2.7.1 and confirm its fingerprint/provenance. If it was rotated, provide the replacement public PEM and independent fingerprint through the approved channel. Never obtain or use the private key | Public candidate is locally available and hash-matched to older release documentation; current approval/validity and custodian identity are **NOT VERIFIED**. Do not assume it is still current |
 | MediaMTX Linux binary | Official `bluenviron/mediamtx` GitHub v1.21.0 release asset `mediamtx_v1.21.0_linux_amd64.tar.gz` | Obtain official `checksums.sha256`; verify archive SHA; verify GitHub attestation with repository `bluenviron/mediamtx`; extract the Linux amd64 executable; record and independently verify its full SHA-256; reconcile against an approved full-hash release record before passing the binary/hash pair to builder | **Verified 2026-10-24**; evidence at `_evidence/mediamtx-v1.21.0-official-verification/`; release-use approval still requires Red/release engineering to accept the evidence |
 | Release identity | Owner-approved version `1.2.7.1` and frozen application/test source commit `dcace5778c56988d447bd8a182a8308e7fb21dc5` | Clean isolated worktree; verify commit ancestry and builder-reported source commit; never overwrite the accepted earlier installer | Identified; no artifact built |
 
@@ -288,13 +288,18 @@ non-secret materials and decisions:
 1. Production TRUST-1 canonical registry JSON plus its independently obtained
    SHA-256; supplied by the authorized cloud trust administrator via the
    approved release-materials channel.
-2. Software Update verification public-key PEM plus independently checked
-   fingerprint/provenance; supplied by the release-signing custodian. No
-   private signing key is needed for installer construction.
-3. MediaMTX version approval (historical candidate v1.21.0 Linux amd64 versus
-   any explicitly approved update), official archive/checksum/attestation and
-   exact extracted-binary SHA. Release engineering supplies the verified
-   artifact; this checkout does not contain the full Linux digest.
+2. Software Update verification public key: the RC7 build-input PEM is
+   available and hashes to the previously documented embedded-key hash
+   `f2666abc40fb8507f78700203c7e3707df176485c2a0a7f1f130c9f5b9a6a1f1`.
+   The release-signing custodian must confirm that exact key remains approved
+   for 1.2.7.1 and attest its fingerprint/provenance; otherwise supply only the
+   current public PEM and independently verified fingerprint. No private
+   signing key is needed for installer construction.
+3. MediaMTX approval and artifact: owner approved v1.21.0 Linux amd64; the
+   official archive/checksum/attestation and exact extracted-binary SHA have
+   been independently verified in `_evidence/mediamtx-v1.21.0-official-verification/`.
+   Red/release engineering must accept that preserved evidence as the build
+   input record; no replacement version should be used without approval.
 4. Owner approved product version `1.2.7.1`, historical MediaMTX target
    `v1.21.0` Linux amd64 subject to official artifact/full-hash verification,
    and preference for the appliance-side Docker build initially. Do not
@@ -582,11 +587,18 @@ Read-only inspection of `docs/entitlement-signing-keys.md`,
 - `docs/software-update.md` describes an offline-generated release-signing
   key pair, with the private half kept off servers and out of Git. Only the
   public key is installed on appliances and exposed to the cloud publisher.
-  The staging example path is `/etc/anyaicam-staging/update-signing/`; it is
-  explicitly staging, not evidence of the production key's current location.
-  The production public PEM, its independently confirmed fingerprint, the
-  named signing custodian, and the approved transfer channel are not identified
-  in reviewed materials. No private key was read or requested.
+  Read-only comparison found the RC7 public PEM's SHA-256
+  `f2666abc40fb8507f78700203c7e3707df176485c2a0a7f1f130c9f5b9a6a1f1`
+  matches both Red's recorded RC7 input manifest and the older release
+  handoff's embedded-key hash. This gives release engineering an existing
+  public-key candidate without asking anyone to export a new key. It does not
+  prove that this key is still the currently approved production verifier for
+  1.2.7.1. The staging example path
+  `/etc/anyaicam-staging/update-signing/` is explicitly staging, not evidence
+  of production key location. The release-signing custodian must confirm the
+  candidate hash/fingerprint remains current or provide a new public-only
+  file and independent fingerprint. The custodian's name and transfer channel
+  are not identified. No private key was read or requested.
 - The release builder requires the registry plus independent digest and the
   update public key unless a `--no-*` bypass is selected. Those bypasses are
   not acceptable for this release; the relevant production inputs remain
@@ -622,8 +634,38 @@ lightweight builder tests open.
 | Item | Status | Responsible party | Estimate / next action |
 |---|---|---|---|
 | Production TRUST-1 registry and independent digest | Pending | Authorized trust administrator; owner/Red must identify custodian and approved channel | Once identified, allow about one business day to transfer and independently verify |
-| Software Update public PEM and fingerprint | Pending | Existing release-signing custodian; owner/Red must identify custodian and approved channel | Once identified, allow about one business day to transfer and verify |
+| Software Update key | Candidate located and hash-matched to preserved RC7 inputs and older release documentation; current approval and fingerprint attestation pending | Release-signing custodian; owner/Red must identify custodian and channel | Attestation can close this gate if it confirms the recorded hash; otherwise allow about one business day for public-only transfer and verification |
 | Docker queue/holder and release authorization | Pending; no Docker ran | Owner plus current Docker lock custodian | Requires explicit owner test-window authorization and current queue/lock confirmation |
+| Existing Ubuntu VM and host preflight | Prior owner inventory confirms the VM identity/specs, but current `Get-VM`/WSL inspection is denied; available RAM 10.93 GiB is below the 12 GiB floor, C: 24.04 GiB and reported backup path absent | Owner/authorized Windows administrator | Refresh VM/backup inventory and recover RAM/disk before proposing a test window; no boot or configuration change |
 | Linux 1.2.7.1 installer build and Ubuntu lifecycle | Pending | Release engineering/Red; Green independent acceptance | About 1–2 days after verified inputs and authorized Docker window |
 | Existing untracked test/evidence files | Preserved, unstaged | Codex | No action; do not stage, remove, or bundle them |
 | Frozen corrective application source | Preserved at `dcace5778c56988d447bd8a182a8308e7fb21dc5` | Codex | No source changes; continue documentation/source review only |
+
+## 10. Existing Ubuntu test host preflight — 2026-10-24
+
+The owner previously identified `AnyAiCam-Linux-Test` on `ALEXDELLLAPTOP` as
+Ubuntu 24.04.5, with 8 GiB fixed RAM, 8 vCPUs, a 150 GiB dynamic VHDX, Docker
+29.9.0/Compose 5.6.0, and an existing VMS 1.2.6 workload. These are prior
+owner-confirmed details, not current observations. In this session,
+read-only `Get-VM` and WSL distribution listing were denied by the restricted
+execution session. `C:\AnyAiCam-VM-Backup` is not present at the reported path.
+The read-only Windows `GlobalMemoryStatusEx` call reports 10.93 GiB available
+of 31.46 GiB total, below the previously owner-established 12 GiB minimum
+(13 GiB preferred). `C:` has 25,808,961,536 bytes free (about 24.04 GiB).
+Current VM state, VHDX path/size and checkpoint state could not be reverified.
+
+Do not boot or install into this VM based on the stale inventory. Before
+acceptance, the owner or an authorized normal Windows administrator must
+refresh the VM state/configuration and available RAM, verify an export or
+independent backup exists and is restorable, and provide the current VHDX
+path/size plus free space on the volume holding both source and backup. The
+previously owner-established host gate was at least 12 GiB free RAM (prefer
+13 GiB); keep the VM's configured 8 GiB unchanged unless the owner separately
+approves a change. The old workload and Default Switch mean this is not yet a
+clean, isolated 1.2.7.1 acceptance target. Use a verified disposable clone and
+restricted/offline network only after backup and owner authorization. The
+current 10.93 GiB available RAM fails the start gate. The current 24.04 GiB
+C: free space is not enough evidence of room for a second copy of the
+previously reported 19.32 GiB VHDX while retaining the 8 GiB disk start
+headroom, plus install/build artifacts. Verify actual VHDX size and a separate
+backup target or recover more disk before any checkpoint/export or test.
