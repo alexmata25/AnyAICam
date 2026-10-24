@@ -251,6 +251,18 @@ def test_every_admin_route_refuses_an_administrator_without_a_global_grant_on_th
     _run_matrix(client, token)
 
 
+def test_mfa_setup_page_refuses_a_full_admin_session_without_a_live_grant(client, profile):
+    if profile != "cloud":
+        pytest.skip("cloud-profile rule")
+    # This page is intentionally exempted from middleware's admin-namespace
+    # grant gate for enrollment-only sessions. A normal MFA-verified session
+    # must still have a live admin grant before the page is served.
+    make_partner_user("ops@partner.test", "administrator", partner_id="partner-a")
+    token = partner_session_cookie("ops@partner.test", "administrator")
+    response = client.get("/admin/mfa-setup", cookies=cookies_for(token))
+    assert response.status_code == 403
+
+
 def test_matrix_covers_the_known_admin_surface():
     paths = {path for _method, path in admin_route_matrix()}
     for expected in ("/api/admin/customers/cust-a/camera-quota", "/admin-portal", "/api/operations/identity-grants"):

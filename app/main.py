@@ -108901,10 +108901,18 @@ def admin_mfa_setup_page(request: Request):
     administrator's enrollment-only session (and a break-glass re-enrollment
     session) lands. It only calls the MFA enroll/confirm routes; after
     confirming, the administrator signs in again -- now with a code."""
-    from partner_portal import partner_enrollment_identity, partner_identity
-    identity = partner_enrollment_identity(request) or partner_identity(request)
-    if not identity or identity.get("role") != "administrator":
-        return RedirectResponse("/partner.html", status_code=303)
+    # The middleware intentionally exempts this page from the normal admin
+    # namespace gate so an enrollment-only session can reach it. Re-check the
+    # live administrator grant here for BOTH enrollment-only and full sessions;
+    # otherwise a revoked or partner-scoped MFA-verified admin can still load
+    # an admin page (even though the mutation endpoints reject the session).
+    try:
+        from platform_owner import _mfa_actor
+        _mfa_actor(request, allow_enrollment=True)
+    except HTTPException as error:
+        if error.status_code == 403:
+            return HTMLResponse("Administrator access is required.", status_code=403)
+        raise
     response = HTMLResponse(ADMIN_MFA_SETUP_PAGE)
     response.headers["Cache-Control"] = "no-store"
     return response
