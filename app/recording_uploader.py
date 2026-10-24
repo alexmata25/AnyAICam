@@ -332,6 +332,13 @@ def _control_plane_get(path: str) -> dict | None:
         return None
 
 
+def _edge_cloud_recording_mode(value) -> str | None:
+    """R-REC-1 (1.2.7.1): the edge only knows 'motion' (event media) and
+    'disabled'. Anything else -- an older cloud's 'continuous' or NULL, or a
+    garbled value -- is None, which uploads nothing."""
+    return value if value in ("motion", "disabled") else None
+
+
 def _refresh_camera_map(*, prefer_local: bool = False) -> None:
     """Polls the existing, unchanged GET /api/appliance/configuration for
     this appliance's own camera_number -> camera_id/site_id/cloud_recording_
@@ -404,7 +411,7 @@ def _refresh_camera_map(*, prefer_local: bool = False) -> None:
         mapping[camera_number] = {
             "camera_id": camera_id,
             "site_id": site_id,
-            "cloud_recording_mode": cloud_recording_mode if isinstance(cloud_recording_mode, str) else None,
+            "cloud_recording_mode": _edge_cloud_recording_mode(cloud_recording_mode),
             "people_counting_enabled": bool(item.get("people_counting_enabled")),
             "smart_motion_enabled": bool(item.get("smart_motion_enabled")),
             "lpr_enabled": bool(item.get("lpr_enabled")),
@@ -1482,38 +1489,15 @@ async def recording_upload_worker() -> None:
             if now - last_config_refresh >= CONFIG_REFRESH_SECONDS:
                 await asyncio.to_thread(_refresh_camera_map)
                 last_config_refresh = now
-            for camera_number in _known_camera_numbers():
-                if RECORDING_UPLOAD_CAMERA_SCOPE is not None and camera_number not in RECORDING_UPLOAD_CAMERA_SCOPE:
-                    continue
-                if _camera_at_or_over_total_cap(camera_number):
-                    continue
-                identity = _camera_identity(camera_number)
-                if not identity:
-                    continue
-                # Product-architecture decision (2026-09-16): Hybrid
-                # ('motion') no longer uploads ANY continuous recording
-                # segments to cloud, at all -- only 'continuous'/None
-                # (the Cloud/Continuous premium tier) reaches _relay_
-                # camera_once() now. Hybrid's own cloud footage is
-                # exclusively real, intelligent event clips/thumbnails
-                # (event_media_uploader.py's separate pipeline, gated
-                # the opposite way: cloud_recording_mode=='motion'
-                # only) -- "no event, no cloud video upload" for
-                # Hybrid, full 24/7 continuous cloud for the Continuous
-                # tier a customer explicitly pays for. Local recording
-                # is completely unaffected either way -- this only ever
-                # decides which already-recorded local segments also
-                # get uploaded. 'disabled' (Local tier) was already
-                # excluded; 'motion' now gets the identical treatment.
-                # The motion-window segment-overlap filtering inside
-                # _pending_recording_files() (the ported c380f7e logic)
-                # is consequently unreachable under this gate today --
-                # deliberately preserved, not deleted, in case a future
-                # product tier ever wants a capped/filtered continuous
-                # upload again; see that function's own docstring.
-                if identity.get("cloud_recording_mode") in ("disabled", "motion"):
-                    continue
-                await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
+            # R-REC-1 (1.2.7.1): no recording segment is uploaded for any
+            # mode. Continuous cloud recording is not offered and every
+            # camera records event clips only, which reach the cloud through
+            # event_media_uploader.py's own pipeline (cloud_recording_mode
+            # =='motion'). The segment relay (_relay_camera_once and the
+            # motion-window filtering in _pending_recording_files()) is kept
+            # in this module but never called from here (Red decision 2);
+            # the server also refuses the continuous tier and catalog route.
+            # This worker now only keeps the camera map fresh.
             recording_upload_state["last_scan_at"] = datetime.now().isoformat()
             recording_upload_state["last_error"] = None
             await asyncio.sleep(SCAN_SECONDS)
