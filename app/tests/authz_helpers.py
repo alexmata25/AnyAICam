@@ -236,7 +236,7 @@ def session_row(token: str) -> dict | None:
     return dict(row) if row else None
 
 
-ADMIN_NAMESPACE_PREFIXES = ("/api/admin/", "/api/operations/", "/operations/", "/admin", "/api/platform-owner/",
+ADMIN_NAMESPACE_PREFIXES = ("/api/admin/", "/api/operations/", "/operations", "/admin", "/api/platform-owner/",
                             "/analytics-entitlements", "/billing-operations", "/license-management", "/subscription-admin")
 # Reached mid-login, before any session exists (their own checks are tested separately).
 PUBLIC_MID_LOGIN = {"/api/platform-owner/mfa/verify", "/api/platform-owner/break-glass-recover"}

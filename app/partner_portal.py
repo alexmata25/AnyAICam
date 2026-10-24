@@ -50,32 +50,159 @@ def is_auth_flow_path(path) -> bool:
     return any(bare == p or bare.startswith(p + '/') for p in AUTH_FLOW_PATHS)
 
 
-def _token(email: str, role: str, partner_id=None, customer_id=None, session_id=None, ttl_hours: int | None = None) -> str:
-    if ttl_hours is None:
-        from appliance_identity import get_ttl_config
-        ttl_hours = get_ttl_config()['session_ttl_hours']
-    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + ttl_hours * 3600}, separators=(',', ':')).encode()
+def _token(email: str, role: str, partner_id=None, customer_id=None, session_id=None, ttl_hours: int | None = None, *, ttl_seconds: int | None = None) -> str:
+    if ttl_seconds is None:
+        if ttl_hours is None:
+            from appliance_identity import get_ttl_config
+            ttl_hours = get_ttl_config()['session_ttl_hours']
+        ttl_seconds = int(ttl_hours) * 3600
+    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + int(ttl_seconds)}, separators=(',', ':')).encode()
     encoded = urlsafe_b64encode(payload).decode().rstrip('=')
     signature = hmac.new(SESSION_SECRETS[0].encode(), encoded.encode(), hashlib.sha256).hexdigest()
     return encoded + '.' + signature
 
 
-def _identity(request: Request) -> dict | None:
-    token = request.cookies.get(SESSION_COOKIE, '')
+# Linux 1.2.7.1 (D-AUTHZ-1 residual + D-AUTHZ-2b): _identity() is the single
+# choke point every Partner Portal identity goes through -- partner_identity(),
+# require_partner_access(), cloud_administrator_bridge() / current_user(), the
+# Admin Portal, website_partner, aws_cost_dashboard, tenant checks and the
+# platform-owner routes all inherit it. A session is honoured only while:
+#   - its user_sessions row exists, is not revoked or expired, and names the
+#     same email and role as the signed cookie;
+#   - the account (partner_users) still exists, is approved and active, still
+#     has that role, and its authorization_version equals the one recorded at
+#     sign-in (a grant revoke, role change, password or MFA reset ends it);
+#   - on the cloud profile, an administrator session carries the server-side
+#     MFA marker mfa_state='verified' (set only by MFA verification); one
+#     without any marker is revoked and audited on sight.
+# An MFA enrollment / re-enrollment session (mfa_state enrollment_only /
+# reenroll_required) is never a full session: only partner_enrollment_identity()
+# accepts it. Edge only: a session the cloud vouched for (auth_source
+# cloud_assertion / local_customer) has no authoritative LOCAL account version
+# -- the signed identity manifest governs it (appliance_identity.
+# reconcile_sessions_against_manifest, local_customer_access) -- so only a
+# local account's approval/status is checked there. Administrator tokens with
+# no session row are refused everywhere (phase 1; other roles unchanged).
+# env_account: an ANYAICAM_PARTNER_ACCOUNTS sign-in (no database user) -- edge only;
+# the cloud refuses it at sign-in and here (L-7).
+EDGE_DELEGATED_AUTH_SOURCES = frozenset({'cloud_assertion', 'local_customer', 'env_account'})
+ENROLLMENT_MFA_STATES = frozenset({'enrollment_only', 'reenroll_required'})
+_INACTIVE_ACCOUNT_STATUSES = frozenset({'suspended', 'revoked', 'pending', 'disabled'})
+
+
+def _decode(token: str) -> dict | None:
+    """Signature, expiry and role of a Partner Portal cookie -- nothing else."""
     try:
-        encoded, signature = token.rsplit('.', 1)
+        encoded, signature = str(token or '').rsplit('.', 1)
         if not any(hmac.compare_digest(signature,hmac.new(secret.encode(),encoded.encode(),hashlib.sha256).hexdigest()) for secret in SESSION_SECRETS): return None
         payload = json.loads(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
         if payload['expires'] < time.time() or payload['role'] not in AUTH_ROLES: return None
-        if payload.get('session_id'):
-            with connection() as db: session=db.execute('SELECT revoked_at,expires_at FROM user_sessions WHERE id=?',(payload['session_id'],)).fetchone()
-            if not session or session['revoked_at'] or session['expires_at']<datetime.now().isoformat(): return None
         return payload
-    except (ValueError, KeyError, json.JSONDecodeError):
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None
 
 
-def establish_partner_session(destination: str, *, request: Request, email: str, role: str, user: dict | None, authorization_version_at_login: int | None = None) -> RedirectResponse:
+def _raw_identity(request: Request) -> dict | None:
+    """The signed cookie's own claims WITHOUT the session/account checks --
+    only for signing out (a session that no longer authorizes anything must
+    still be revocable by its holder)."""
+    return _decode(request.cookies.get(SESSION_COOKIE, ''))
+
+
+def _account_for_session(db, session: dict):
+    if session.get('user_id'):
+        account = db.execute('SELECT id,email,role,approved,account_status,authorization_version FROM partner_users WHERE id=?', (session['user_id'],)).fetchone()
+        if account is not None: return account
+    return db.execute('SELECT id,email,role,approved,account_status,authorization_version FROM partner_users WHERE lower(email)=?',
+                      (str(session.get('email') or '').lower(),)).fetchone()
+
+
+def _account_active(account) -> bool:
+    return bool(account['approved']) and str(account['account_status'] or 'active').lower() not in _INACTIVE_ACCOUNT_STATUSES
+
+
+def _evaluate(payload: dict) -> tuple:
+    """(identity, kind) for a signature-valid cookie. kind 'full' = an ordinary
+    session, 'enrollment' = an administrator MFA (re-)enrollment session
+    (partner_enrollment_identity() only); anything else is a refusal reason."""
+    role = payload['role']; session_id = payload.get('session_id')
+    if not session_id:
+        if role == 'administrator': return None, 'no_session'
+        return dict(payload), 'full'
+    from admin_auth_policy import is_cloud_profile
+    cloud = is_cloud_profile()
+    with connection() as db:
+        session = db.execute('SELECT * FROM user_sessions WHERE id=?', (session_id,)).fetchone()
+        if not session: return None, 'unknown_session'
+        session = dict(session)
+        if session.get('revoked_at') or str(session.get('expires_at') or '') < datetime.now().isoformat(): return None, 'ended'
+        if session.get('role') != role or str(session.get('email') or '').lower() != str(payload.get('email') or '').lower(): return None, 'mismatch'
+        account = _account_for_session(db, session)
+    auth_source = session.get('auth_source')
+    if auth_source in EDGE_DELEGATED_AUTH_SOURCES and not cloud:
+        if account is not None and not _account_active(account): return None, 'inactive'
+    else:
+        if account is None: return None, 'no_account'
+        if not _account_active(account): return None, 'inactive'
+        if account['role'] != role: return None, 'role_changed'
+        version = session.get('authorization_version_at_login')
+        if version is None or int(version) != int(account['authorization_version'] or 0): return None, 'authorization_changed'
+    mfa_state = session.get('mfa_state')
+    kind = 'full'
+    if mfa_state in ENROLLMENT_MFA_STATES:
+        kind = 'enrollment'
+    elif role == 'administrator' and cloud and mfa_state != 'verified':
+        # An administrator session issued without the MFA marker (before
+        # 1.2.7.1, or by any path other than MFA verification) ends here.
+        with connection() as db:
+            db.execute('UPDATE user_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL', (datetime.now().isoformat(), session_id))
+        from admin_auth_policy import auth_audit
+        auth_audit('session.invalidated', actor_email=payload.get('email'), actor_role=role, reason='admin_without_mfa',
+                   entity_id=str(session.get('user_id') or ''))
+        return None, 'admin_without_mfa'
+    identity = dict(payload)
+    identity.update({'user_id': session.get('user_id') or (account['id'] if account is not None else None), 'mfa_state': mfa_state,
+                     'mfa_verified_at': session.get('mfa_verified_at'), 'auth_source': auth_source,
+                     'authorization_version': session.get('authorization_version_at_login')})
+    return identity, kind
+
+
+def _cached_evaluation(request: Request) -> tuple:
+    """Evaluated once per request (memoised on request.state, keyed by the
+    cookie) -- the middleware and the route share one decision."""
+    token = request.cookies.get(SESSION_COOKIE, '')
+    if not token: return None, 'no_cookie'
+    try:
+        cache = request.scope.setdefault('anyaicam_partner_identity_cache', {})
+    except Exception:
+        cache = {}
+    if token not in cache:
+        payload = _decode(token)
+        try:
+            cache[token] = _evaluate(payload) if payload else (None, 'invalid')
+        except Exception:
+            cache[token] = (None, 'error')  # fail closed
+    identity, kind = cache[token]
+    return (dict(identity) if identity else None), kind
+
+
+def _identity(request: Request) -> dict | None:
+    identity, kind = _cached_evaluation(request)
+    return identity if kind == 'full' else None
+
+
+def partner_enrollment_identity(request: Request) -> dict | None:
+    """An administrator session that may ONLY enroll (or re-enroll) MFA: the
+    restricted session an un-enrolled administrator gets at sign-in on the
+    cloud (L-2a) or a break-glass redemption (RC-2). Accepted solely by the MFA
+    status/enroll/confirm routes, /admin/mfa-setup and sign-out."""
+    identity, kind = _cached_evaluation(request)
+    return identity if kind == 'enrollment' and identity and identity.get('role') == 'administrator' else None
+
+
+def establish_partner_session(destination: str, *, request: Request, email: str, role: str, user: dict | None, authorization_version_at_login: int | None = None,
+                              auth_source: str | None = 'password', mfa_state: str | None = None, mfa_method: str | None = None,
+                              ttl_minutes: int | None = None) -> RedirectResponse:
     """Writes the user_sessions row and sets the signed partner cookie
     for a freshly-authenticated Partner Portal identity, then redirects
     to destination -- the exact same two steps partner_login_submit()
@@ -83,21 +210,33 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
     a second entry point (main.py's POST /api/portal-login, the blue
     Portal login page's Administrator/Partner/Technician selector) can
     establish an identical session without duplicating this
-    security-sensitive cookie-signing logic."""
+    security-sensitive cookie-signing logic.
+
+    1.2.7.1: the row always records the account's authorization_version (read
+    in the same connection as the INSERT when the caller has none), how the
+    sign-in was proven (auth_source: password, mfa, break_glass,
+    cloud_assertion, local_customer) and the MFA marker. Only MFA
+    verification passes mfa_state='verified'."""
     from appliance_identity import get_ttl_config
-    session_ttl_hours = get_ttl_config()['session_ttl_hours']
+    ttl_seconds = int(ttl_minutes) * 60 if ttl_minutes else int(get_ttl_config()['session_ttl_hours']) * 3600
     session_id = secrets.token_hex(16)
     now = datetime.now()
-    expiry = now + timedelta(hours=session_ttl_hours)
+    expiry = now + timedelta(seconds=ttl_seconds)
+    user_id = user.get('id') if user else None
     with connection() as db:
+        version = authorization_version_at_login
+        if version is None and user_id and auth_source not in EDGE_DELEGATED_AUTH_SOURCES:
+            current = db.execute('SELECT authorization_version FROM partner_users WHERE id=?', (user_id,)).fetchone()
+            version = int(current['authorization_version']) if current else None
         db.execute(
-            'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent,authorization_version_at_login) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent,'
+            'authorization_version_at_login,auth_source,mfa_state,mfa_verified_at,mfa_method) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (
-                session_id, user.get('id') if user else None, email, role, 'Web browser', 'cookie',
+                session_id, user_id, email, role, 'Web browser', 'cookie',
                 now.isoformat(), now.isoformat(), expiry.isoformat(),
                 request.client.host if request.client else None, request.headers.get('user-agent', '')[:500],
-                authorization_version_at_login,
+                version, auth_source, mfa_state, now.isoformat() if mfa_state == 'verified' else None, mfa_method,
             ),
         )
     response = RedirectResponse(destination, status_code=303)
@@ -107,8 +246,8 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
     # POST, and unsafe methods also need the double-submit CSRF token.
     response.set_cookie(
         SESSION_COOKIE,
-        _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id, session_ttl_hours),
-        httponly=True, samesite='lax', secure=settings.secure_cookies, max_age=session_ttl_hours * 3600, domain=settings.cookie_domain or None,
+        _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id, ttl_seconds=ttl_seconds),
+        httponly=True, samesite='lax', secure=settings.secure_cookies, max_age=ttl_seconds, domain=settings.cookie_domain or None,
     )
     return response
 
@@ -146,13 +285,28 @@ def _edge_customer_login(payload: dict, request: Request, email: str, password: 
     audit({'email':email,'role':result['role']},'login.succeeded','local_customer',result['user']['id'],{'mode':result['mode']})
     destination=_safe_next_path(payload.get('next')) or '/customer-live'  # the cloud setup flow is not on the appliance
     return establish_partner_session(destination,request=request,email=email,role=result['role'],user=result['user'],
-                                     authorization_version_at_login=result['authorization_version'])
+                                     authorization_version_at_login=result['authorization_version'],auth_source='local_customer')
 
 
 def _require(request: Request, roles=PARTNER_ROLES) -> dict:
     identity = _identity(request)
     if not identity or identity['role'] not in roles:
         raise HTTPException(status_code=403, detail='Partner authorization required.')
+    # Linux 1.2.7.1 (cloud): an administrator-only route also needs a LIVE
+    # global administrator grant -- partner_users.role stays 'administrator'
+    # after a grant is revoked, and a partner-scoped administrator carries the
+    # same role label (coordinator evidence 2026-10-24, Green Z8d'). Partner-
+    # scoped administrators keep the routes open to partner roles.
+    if identity['role'] == 'administrator' and set(roles) <= {'administrator'}:
+        from admin_auth_policy import auth_audit, is_cloud_profile
+        if is_cloud_profile():
+            from appliance_identity import has_global_administrator_grant
+            with connection() as db:
+                live = has_global_administrator_grant(db, email=identity.get('email', ''))
+            if not live:
+                auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='admin_without_global_grant',
+                           entity_id=str(identity.get('user_id') or ''))
+                raise HTTPException(status_code=403, detail='Global administrator grant required.')
     return identity
 
 
@@ -284,10 +438,25 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=429,detail='Account is temporarily locked after repeated sign-in failures. Try again later or reset your password.')
         if settings.runtime_role=='edge' and payload.get('customer_only') and _claimed_appliance():
             return _edge_customer_login(payload,request,email,password)
-        user,reason=authenticate_detailed(email,password); role=user['role'] if user else None
+        user,reason=authenticate_detailed(email,password); role=user['role'] if user else None; env_account = False
+        from admin_auth_policy import auth_audit, is_cloud_profile
+        cloud=is_cloud_profile()
         account = PORTAL_ACCOUNTS.get(email, {})
         if not role and account.get('approved') is True and account.get('role') in AUTH_ROLES and hmac.compare_digest(password, str(account.get('password',''))):
-            role = account['role']
+            if cloud:
+                # L-7 (1.2.7.1): an env-defined account has no database user --
+                # no MFA, no grant, no revocable version -- so the cloud never
+                # signs it in.
+                record_login_failure(email)
+                auth_audit('login.denied',actor_email=email,actor_role=str(account.get('role') or ''),reason='env_account_on_cloud')
+                raise HTTPException(status_code=403,detail='The email or password is incorrect.')
+            role = account['role']; env_account = True
+        if role=='administrator' and cloud:
+            # L-6 (1.2.7.1): administrator access on the cloud starts only at
+            # the Admin portal sign-in, which requires MFA (begin_admin_login).
+            auth_audit('login.denied',actor_email=email,actor_role='administrator',reason='admin_requires_mfa_sign_in',
+                       entity_id=str(user.get('id','') if user else ''))
+            raise HTTPException(status_code=403,detail='Administrators sign in through the Admin portal sign-in, with two-factor authentication.')
         if role and payload.get('partner_only') and role not in PARTNER_ROLES:
             audit(user or {'email':email,'role':role},'login.denied','partner_portal','',{'reason':'customer_account'})
             raise HTTPException(status_code=403,detail='Customer accounts cannot enter the Partner Portal. Use the customer sign-in page.')
@@ -331,7 +500,8 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
             destination=next_path
         else:
             destination=destination_for_role(role)
-        response=establish_partner_session(destination, request=request, email=email, role=role, user=user)
+        response=establish_partner_session(destination, request=request, email=email, role=role, user=user,
+                                           auth_source='env_account' if env_account else 'password')
         # Post-RC5 (Green 2026-10-17): after the session fully exists, attach this customer owner's pending guest
         # purchases if their own address was confirmed (signin_purchase_attachment: Red's conditions a-g). Never
         # raises and never touches the response, session, role or destination.
@@ -353,7 +523,7 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         main_module=sys.modules.get('main')
         if main_module is not None and hasattr(main_module,'perform_logout'):
             return main_module.perform_logout(request)
-        identity=_identity(request)
+        identity=_raw_identity(request)
         if identity and identity.get('session_id'):
             with connection() as db: db.execute('UPDATE user_sessions SET revoked_at=? WHERE id=?',(datetime.now().isoformat(),identity['session_id']))
         response=RedirectResponse('/partner.html',status_code=303); response.delete_cookie(SESSION_COOKIE,domain=settings.cookie_domain or None); return response
@@ -401,6 +571,11 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
             # A changed password also bumps the authorization version, so appliance
             # sessions and offline appliance passwords follow it (local_customer_access.py).
             db.execute('UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id=?',(user_id,))
+            # 1.2.7.1: this request's own session follows the new version (same
+            # transaction); every other session is revoked just below.
+            if identity.get('session_id'):
+                db.execute('UPDATE user_sessions SET authorization_version_at_login=(SELECT authorization_version FROM partner_users WHERE id=?) WHERE id=? AND user_id=?',
+                           (user_id,identity['session_id'],user_id))
             # A new password signs out every OTHER session of this user, as a
             # reset already does (cloud_security.consume_password_reset):
             # a session stolen with the old password must not outlive it.

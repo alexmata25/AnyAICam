@@ -474,8 +474,55 @@ def revoke_grant(db, *, grant_id: str, now: str | None = None) -> None:
         bump_authorization_version(db, row["user_id"])
 
 
-def bump_authorization_version(db, user_id: str) -> None:
+def bump_authorization_version(db, user_id: str, *, keep_session_id: str | None = None) -> None:
+    """Moves this user's authorization_version AND, in the same transaction,
+    revokes every open Partner Portal session they hold (Linux 1.2.7.1,
+    D-AUTHZ-1 residual): a grant revoke, role change, password or MFA reset
+    ends the old sessions at once instead of relying only on the per-request
+    version comparison in partner_portal._identity(). keep_session_id (a
+    password or MFA-factor change made from that session) keeps the caller's
+    own session and re-binds it to the new version."""
     db.execute("UPDATE partner_users SET authorization_version=authorization_version+1 WHERE id=?", (user_id,))
+    revoke_user_sessions(db, user_id, keep_session_id=keep_session_id)
+
+
+def _user_sessions_table_exists(db) -> bool:
+    try:
+        from database_backend import backend
+        if backend() == "sqlite":
+            return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_sessions'").fetchone() is not None
+        return db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='user_sessions'").fetchone() is not None
+    except Exception:
+        return False
+
+
+def revoke_user_sessions(db, user_id: str, *, keep_session_id: str | None = None) -> int:
+    """Revokes this user's open sessions (all but keep_session_id, which is
+    re-bound to the user's current authorization_version). Safe before the
+    user_sessions table exists (first initialization)."""
+    if not _user_sessions_table_exists(db):
+        return 0
+    now = datetime.now().isoformat()
+    if keep_session_id:
+        result = db.execute("UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL AND id!=?", (now, user_id, keep_session_id))
+        db.execute("UPDATE user_sessions SET authorization_version_at_login=(SELECT authorization_version FROM partner_users WHERE id=?) "
+                   "WHERE id=? AND user_id=? AND revoked_at IS NULL", (user_id, keep_session_id, user_id))
+    else:
+        result = db.execute("UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (now, user_id))
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def live_administrator_grant_scope(db, *, user_id: str) -> str | None:
+    """'global' or 'partner' when this user holds a live administrator grant of
+    that scope (global wins), else None."""
+    rows = db.execute("SELECT scope_type FROM identity_grants WHERE user_id=? AND role='administrator' AND revoked_at IS NULL",
+                      (user_id,)).fetchall()
+    scopes = {row["scope_type"] for row in rows}
+    if "global" in scopes:
+        return "global"
+    if "partner" in scopes:
+        return "partner"
+    return None
 
 
 def _appliance_scope(db, *, cloud_id: str) -> dict | None:
