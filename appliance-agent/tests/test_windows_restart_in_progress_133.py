@@ -66,12 +66,56 @@ class RestartInProgressTests(unittest.TestCase):
         self.assertEqual(self.action(run)[0], 'completed')
         self.assertEqual(run.wrapper_calls(), [self.vms, self.vms])
 
-    def test_a_retry_that_fails_again_is_reported_failed(self):
+    def test_a_retry_refused_as_busy_completes_once_the_service_is_running(self):
+        # D3c: a restart in progress after the command arrived that ends RUNNING is the restart the cloud asked for.
         run = Scripted([(1, 'Cannot stop'), (1, 'Cannot stop')], [STOP_PENDING, RUNNING])
+        status, result, error = self.action(run)
+        self.assertEqual((status, error), ('completed', ''))
+        self.assertTrue(result['completed_by_restart_in_progress'])
+        self.assertEqual(len(run.wrapper_calls()), 2)  # still one retry only
+
+    def test_a_retry_that_fails_with_another_error_is_reported_failed(self):
+        run = Scripted([(1, 'Cannot stop'), (5, 'Access is denied.')], [STOP_PENDING, RUNNING])
+        status, result, error = self.action(run)
+        self.assertEqual((status, result), ('failed', {}))
+        self.assertIn('exited with 5', error)
+        self.assertEqual(len(run.wrapper_calls()), 2)
+
+    # ------------------------------------------------------------ D3c (Sandbox U132-L on 080bfe15, 2026-10-23)
+    STOPPED = 'SERVICE_NAME: AnyAiCamVMS\n        STATE              : 1  STOPPED\n'
+
+    def test_d3c_the_stopped_moment_inside_the_self_restart_is_not_settled(self):
+        # restart! = stop, a brief STOPPED, then start: the retry must wait for the start, not run in between.
+        run = Scripted([(1, "FATAL - Cannot stop 'AnyAiCamVMS' service on computer '.'."), (0, '')],
+                       [STOP_PENDING, self.STOPPED, START_PENDING, RUNNING])
+        status, result, error = self.action(run)
+        self.assertEqual((status, error), ('completed', ''))
+        self.assertEqual(result['state_before_retry'], 'running')
+
+    def test_d3c_the_sandbox_sequence_cannot_stop_then_cannot_start_completes(self):
+        # The exact U132-L log: "Cannot stop" (19:36:35), STOPPED between stop and start (19:36:58.55), the retry gets
+        # "Cannot start" (19:36:59), and the VMS's own restart then finishes RUNNING. Old code: reported failed.
+        run = Scripted([(1, "FATAL - Cannot stop 'AnyAiCamVMS' service on computer '.'."),
+                        (1, "FATAL - Cannot start service 'AnyAiCamVMS' on computer '.'.")],
+                       [STOP_PENDING, self.STOPPED, START_PENDING, RUNNING])
+        status, result, error = self.action(run)
+        self.assertEqual((status, error), ('completed', ''))
+        self.assertEqual(result, {'requested': True, 'action': 'restart_vms', 'retried_after_restart_in_progress': True,
+                                  'state_before_retry': 'running', 'completed_by_restart_in_progress': True})
+        self.assertEqual(len(run.wrapper_calls()), 2)
+
+    def test_a_service_that_stays_stopped_is_settled_after_the_stable_polls(self):
+        run = Scripted([(1, 'Cannot stop'), (0, '')], [STOP_PENDING, self.STOPPED])
+        status, result, _ = self.action(run)
+        self.assertEqual(status, 'completed')
+        self.assertEqual(result['state_before_retry'], 'stopped')
+        self.assertEqual(len(self.slept), windows.STOPPED_STABLE_POLLS - 1)
+
+    def test_a_busy_retry_after_which_the_service_stays_stopped_is_reported_failed(self):
+        run = Scripted([(1, 'Cannot stop'), (1, 'Cannot start')], [STOP_PENDING, self.STOPPED])
         status, result, error = self.action(run)
         self.assertEqual((status, result), ('failed', {}))
         self.assertIn('exited with 1', error)
-        self.assertEqual(len(run.wrapper_calls()), 2)  # one retry only
 
     def test_a_retry_that_cannot_run_is_reported_failed(self):
         run = Scripted([(1, 'Cannot stop'), OSError('access denied')], [STOP_PENDING, RUNNING])
