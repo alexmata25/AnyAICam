@@ -40,7 +40,19 @@ def _prepare_settings_file(directory: Path) -> Path:
         if problem:
             raise TelemetryOptOutError("Ultralytics config directory ACL is unsafe")
 
-    settings_file = directory / "settings.json"
+    # Ultralytics treats YOLO_CONFIG_DIR as a parent and appends its own
+    # platform-independent "Ultralytics" subdirectory.
+    settings_dir = directory / "Ultralytics"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    if settings_dir.is_symlink():
+        raise TelemetryOptOutError("Ultralytics settings directory is a link")
+    if os.name == "nt":
+        from platform_paths import windows_write_problem
+
+        if windows_write_problem(settings_dir):
+            raise TelemetryOptOutError("Ultralytics settings directory ACL is unsafe")
+
+    settings_file = settings_dir / "settings.json"
     if settings_file.is_symlink():
         raise TelemetryOptOutError("Ultralytics settings file is a link")
     if os.name == "nt" and settings_file.exists():
@@ -61,7 +73,7 @@ def _prepare_settings_file(directory: Path) -> Path:
 
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=settings_dir,
                                          prefix=".settings-", suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
             json.dump(settings, handle, sort_keys=True)

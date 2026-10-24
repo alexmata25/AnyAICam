@@ -59,9 +59,11 @@ def main():
     # Keep ultralytics' first-import settings file out of the installing
     # user's profile and opt out before importing it. Its telemetry sender
     # snapshots this value during package import.
-    settings_dir = Path(tempfile.mkdtemp(prefix="anyaicam-preflight-"))
+    config_root = Path(tempfile.mkdtemp(prefix="anyaicam-preflight-"))
+    settings_dir = config_root / "Ultralytics"
+    settings_dir.mkdir()
     (settings_dir / "settings.json").write_text(json.dumps({"sync": False}), encoding="utf-8")
-    os.environ["YOLO_CONFIG_DIR"] = str(settings_dir)
+    os.environ["YOLO_CONFIG_DIR"] = str(config_root)
     failures = check()
     if failures:
         # stdout only: the setup log records it, and Windows PowerShell 5.1

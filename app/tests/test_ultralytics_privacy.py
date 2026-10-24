@@ -13,7 +13,7 @@ import ultralytics_privacy as privacy
 
 
 def _fake_ultralytics(monkeypatch, settings_dir, outbound):
-    settings = {"sync": json.loads((settings_dir / "settings.json").read_text(encoding="utf-8"))["sync"]}
+    settings = {"sync": json.loads((settings_dir / "Ultralytics" / "settings.json").read_text(encoding="utf-8"))["sync"]}
     events = types.SimpleNamespace(enabled=settings["sync"])
 
     class YOLO:
@@ -44,7 +44,9 @@ def _fake_ultralytics(monkeypatch, settings_dir, outbound):
 def test_opt_out_is_written_before_import_and_model_use_has_no_outbound_calls(tmp_path, monkeypatch):
     config_dir = tmp_path / "ultralytics"
     config_dir.mkdir()
-    settings_file = config_dir / "settings.json"
+    settings_dir = config_dir / "Ultralytics"
+    settings_dir.mkdir()
+    settings_file = settings_dir / "settings.json"
     settings_file.write_text(json.dumps({"sync": True, "custom_setting": "keep"}), encoding="utf-8")
     monkeypatch.setattr(privacy, "_settings_path", lambda: config_dir)
     # This test uses a user-owned temp directory; production Windows paths are
@@ -77,7 +79,9 @@ def test_opt_out_is_written_before_import_and_model_use_has_no_outbound_calls(tm
 def test_malformed_settings_fail_closed_before_ultralytics_import(tmp_path, monkeypatch):
     config_dir = tmp_path / "ultralytics"
     config_dir.mkdir()
-    (config_dir / "settings.json").write_text("not-json", encoding="utf-8")
+    settings_dir = config_dir / "Ultralytics"
+    settings_dir.mkdir()
+    (settings_dir / "settings.json").write_text("not-json", encoding="utf-8")
     monkeypatch.setattr(privacy, "_settings_path", lambda: config_dir)
     monkeypatch.setitem(sys.modules, "ultralytics", None)
 
@@ -88,7 +92,9 @@ def test_malformed_settings_fail_closed_before_ultralytics_import(tmp_path, monk
 def test_sender_that_ignores_the_opt_out_fails_closed(tmp_path, monkeypatch):
     config_dir = tmp_path / "ultralytics"
     config_dir.mkdir()
-    (config_dir / "settings.json").write_text(json.dumps({"sync": True}), encoding="utf-8")
+    settings_dir = config_dir / "Ultralytics"
+    settings_dir.mkdir()
+    (settings_dir / "settings.json").write_text(json.dumps({"sync": True}), encoding="utf-8")
     monkeypatch.setattr(privacy, "_settings_path", lambda: config_dir)
     import platform_paths
     monkeypatch.setattr(platform_paths, "windows_write_problem", lambda _path: "")
