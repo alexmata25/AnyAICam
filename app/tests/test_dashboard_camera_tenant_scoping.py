@@ -309,8 +309,9 @@ def test_license_count_fix_is_unaffected_by_this_change(db_path):
 
 def test_idle_event_mode_camera_is_armed_not_a_recording_problem(http_client, db_path):
     """2026-09-29: an online Event-mode camera with no recent file was shown
-    as "Recording problem: stopped". It is armed (waiting for activity);
-    Continuous mode without recording, and an offline camera, stay stopped."""
+    as "Recording problem: stopped". It is armed (waiting for activity); an
+    offline camera stays stopped. R-REC-1 (1.2.7.1): a NULL/legacy mode is
+    event too, so an online idle camera is armed whatever its column says."""
     conn = sqlite3.connect(db_path)
     _seed_two_customers_five_cameras_each(conn)
     ids = [r[0] for r in conn.execute(
@@ -324,7 +325,7 @@ def test_idle_event_mode_camera_is_armed_not_a_recording_problem(http_client, db
     data = http_client.get("/api/cameras/status", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")}).json()
     by_number = {c["camera"]: c for c in data["cameras"]}
     assert by_number[1]["recording"] == "armed" and by_number[1]["recording_mode"] == "event"      # idle Event mode
-    assert by_number[2]["recording"] == "stopped" and by_number[2]["recording_mode"] == "continuous"  # real problem
+    assert by_number[2]["recording"] == "armed" and by_number[2]["recording_mode"] == "event"      # NULL column = event
     assert by_number[3]["recording"] == "stopped"                                                  # offline stays a problem
 
 

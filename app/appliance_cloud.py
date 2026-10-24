@@ -834,6 +834,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         _modes: dict={}
         for item in camera_items:
             item['recording_mode']=_effective_camera_mode(appliance.get('customer_id'),item.get('recording_mode'),_modes)
+            # R-REC-1: event recording is the only local mode -- transmitted
+            # literally, whatever (NULL/legacy) the column holds.
+            item['local_recording_mode']='event'
         # 2026-10-10: a plan-included analytic (Smart Motion) is reported as
         # the plan allows it NOW -- cancelling Hybrid or moving to Basic Local
         # turns it off at the edge; the customer's stored choice is kept, so
@@ -1273,27 +1276,26 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             recording_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         except ValueError:
             raise HTTPException(status_code=403,detail='Camera identity cannot be used for cloud media.')
-        if RECORDING_UPLOAD_ENABLED or camera['id'] in RECORDING_UPLOAD_PILOT_CAMERAS:
-            policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
-        else:
-            # Event-media-only credentials go only to a camera whose plan
-            # includes cloud event protection: no S3 write for a Local (or
-            # cancelled) plan, so nothing is uploaded that the catalog would
-            # refuse and the retention sweep would never see.
-            if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
+        # R-REC-1 (1.2.7.1): continuous recording upload is not offered. The
+        # broad whole-camera ('continuous' tier) policy is never issued, even
+        # when RECORDING_UPLOAD_ENABLED or the pilot list authorized the
+        # request: every credential is the narrow event-media one, and only
+        # for a camera whose plan includes cloud event protection -- no S3
+        # write for a Local (or cancelled) plan, so nothing is uploaded that
+        # the catalog would refuse and the retention sweep would never see.
+        if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
+            raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
+        with connection() as db:
+            if not motion_event_policy(db,camera.get('customer_id')):
                 raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
-            with connection() as db:
-                if not motion_event_policy(db,camera.get('customer_id')):
-                    raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
-            policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         session_name=recording_session_name(appliance['id'],camera_id)
         assume_args={'RoleArn':RECORDING_UPLOAD_ROLE_ARN,'RoleSessionName':session_name,'Policy':json.dumps(policy),'DurationSeconds':RECORDING_SESSION_DURATION_SECONDS}
         if RECORDING_SESSION_TAGS_ENABLED:
             # Only once the role's trust policy allows sts:TagSession (an
             # AssumeRole with Tags is refused otherwise). See
             # docs/abac-media-authorization-20261010.md.
-            tier='continuous' if (RECORDING_UPLOAD_ENABLED or camera['id'] in RECORDING_UPLOAD_PILOT_CAMERAS) else 'events'
-            assume_args['Tags']=recording_session_tags(camera['customer_id'],camera['site_id'],appliance['id'],camera_id,tier)
+            assume_args['Tags']=recording_session_tags(camera['customer_id'],camera['site_id'],appliance['id'],camera_id,'events')
         try:
             sts=boto3.client('sts',region_name=RECORDING_AWS_REGION)
             assumed=sts.assume_role(**assume_args)
@@ -1337,6 +1339,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not (RECORDING_UPLOAD_ENABLED or camera_id in RECORDING_UPLOAD_PILOT_CAMERAS):
             raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
+        # R-REC-1 (1.2.7.1): continuous recording segments are never
+        # cataloged in the cloud; event media has its own routes.
+        raise HTTPException(status_code=403,detail='Continuous recording upload is not offered; only event media is accepted.')
         safe=sanitize_appliance_payload(payload)
         s3_key=str(safe.get('s3_key','')).strip()
         if not s3_key: raise HTTPException(status_code=400,detail='s3_key is required.')
@@ -2200,7 +2205,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     # a successful reprovision.
                     camera_id=existing['id']
                     db.execute(
-                        "UPDATE cameras SET name=?,appliance_id=?,site_id=?,status='configured' WHERE id=?",
+                        "UPDATE cameras SET name=?,appliance_id=?,site_id=?,status='configured',local_recording_mode='event' WHERE id=?",
                         (job['camera_name'],appliance['id'],job['site_id'],camera_id),
                     )
                 else:
@@ -2233,14 +2238,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     if placeholder:
                         camera_id=placeholder['id']
                         db.execute(
-                            "UPDATE cameras SET device_key=?,name=?,status='configured' WHERE id=?",
+                            "UPDATE cameras SET device_key=?,name=?,status='configured',local_recording_mode='event' WHERE id=?",
                             (job['device_key'],job['camera_name'],camera_id),
                         )
                     else:
                         camera_id=secrets.token_hex(5)
                         db.execute(
-                            'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
-                            (camera_id,job['customer_id'],job['site_id'],appliance['id'],job['device_key'],job['camera_name'],'configured',now),
+                            'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,local_recording_mode,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                            (camera_id,job['customer_id'],job['site_id'],appliance['id'],job['device_key'],job['camera_name'],'configured','event',now),
                         )
                 # A camera provisioned through this appliance-driven async
                 # path previously never received a camera_number at all --
@@ -2476,9 +2481,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # retention are completely unaffected either way, exactly like the
         # other two values.
         identity=require_partner_access(request,{'administrator'})
+        # R-REC-1 (1.2.7.1): 'continuous' (24/7 cloud upload) is not offered.
         mode=payload.get('cloud_recording_mode')
-        if mode is not None and mode not in ('motion','continuous','disabled'):
-            raise HTTPException(status_code=400,detail="cloud_recording_mode must be 'motion', 'continuous', 'disabled', or null.")
+        if mode is not None and mode not in ('motion','disabled'):
+            raise HTTPException(status_code=400,detail="cloud_recording_mode must be 'motion', 'disabled', or null; continuous upload is not offered.")
         with connection() as db:
             cursor=db.execute('UPDATE cameras SET cloud_recording_mode=? WHERE id=?',(mode,camera_id))
             if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
@@ -2497,9 +2503,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # camera to motion/activity-triggered recording (see
         # local_recording_policy.py and main.py's process_supervisor).
         identity=require_partner_access(request,{'administrator'})
+        # R-REC-1 (1.2.7.1): event recording is the only local mode. A
+        # missing/null value is stored as 'event'; 'continuous' or anything
+        # else is refused.
         mode=payload.get('local_recording_mode')
-        if mode is not None and mode not in ('continuous','event'):
-            raise HTTPException(status_code=400,detail="local_recording_mode must be 'continuous', 'event', or null.")
+        if mode is None:
+            mode='event'
+        if mode!='event':
+            raise HTTPException(status_code=400,detail="local_recording_mode must be 'event' (or null, stored as 'event'); continuous recording is not offered.")
         # Configurable pre-roll/post-roll/merge-gap/max-event-length --
         # all optional; a value left out of the payload is left
         # untouched in the database (omission means "don't change it",

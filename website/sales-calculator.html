@@ -535,7 +535,6 @@
               <label for="mode">Recording mode</label>
               <select id="mode">
                 <option value="motion" selected>Motion triggered</option>
-                <option value="continuous">24/7 continuous</option>
               </select>
             </div>
 
@@ -706,30 +705,24 @@
     const storageCostMonthly = {
       '2mp': {
         motion: { 2: 3.99, 7: 4.09, 14: 4.39, 30: 4.99 },
-        continuous: { 2: 4.99, 7: 5.79, 14: 6.89, 30: 7.99 }
       },
       '4mp': {
         motion: { 2: 4.19, 7: 4.59, 14: 5.19, 30: 6.09 },
-        continuous: { 2: 5.49, 7: 7.09, 14: 9.29, 30: 10.79 }
       },
       '8mp': {
         motion: { 2: 4.49, 7: 5.09, 14: 5.89, 30: 7.29 },
-        continuous: { 2: 5.99, 7: 8.39, 14: 11.69, 30: 13.59 }
       }
     };
 
     const storageCostAnnual = {
       '2mp': {
         motion: { 2: 43.09, 7: 44.17, 14: 47.41, 30: 53.89 },
-        continuous: { 2: 53.89, 7: 62.53, 14: 74.41, 30: 86.29 }
       },
       '4mp': {
         motion: { 2: 45.25, 7: 49.57, 14: 56.05, 30: 65.77 },
-        continuous: { 2: 59.29, 7: 76.57, 14: 100.33, 30: 116.53 }
       },
       '8mp': {
         motion: { 2: 48.49, 7: 54.97, 14: 63.61, 30: 78.73 },
-        continuous: { 2: 64.69, 7: 90.61, 14: 126.25, 30: 146.77 }
       }
     };
 
@@ -815,7 +808,6 @@
       const resolutions = ['2mp', '4mp', '8mp'];
       const modes = [
         { key: 'motion', label: 'Motion Recording' },
-        { key: 'continuous', label: '24/7 Continuous Recording' }
       ];
 
       const serviceName = 'universal pricing ($4 margin)';

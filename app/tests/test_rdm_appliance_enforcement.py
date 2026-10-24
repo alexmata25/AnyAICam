@@ -269,7 +269,7 @@ def test_refresh_camera_map_includes_all_four_entitlement_keys(monkeypatch, isol
     assert identity == {
         "camera_id": "cam-1",
         "site_id": "site-1",
-        "cloud_recording_mode": "continuous",
+        "cloud_recording_mode": None,  # R-REC-1: an older cloud's 'continuous' uploads nothing
         "people_counting_enabled": True,
         "smart_motion_enabled": False,
         "lpr_enabled": True,

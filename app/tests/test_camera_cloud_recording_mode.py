@@ -133,7 +133,8 @@ def test_admin_can_set_motion_mode(client, db_path):
     assert _camera_mode(db_path, "cam-1") == "motion"
 
 
-def test_admin_can_set_continuous_mode(client, db_path):
+def test_admin_cannot_set_continuous_mode(client, db_path):
+    """R-REC-1 (1.2.7.1): continuous cloud upload is not offered."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -144,8 +145,8 @@ def test_admin_can_set_continuous_mode(client, db_path):
         json={"cloud_recording_mode": "continuous"},
     )
 
-    assert response.status_code == 200
-    assert _camera_mode(db_path, "cam-1") == "continuous"
+    assert response.status_code == 400
+    assert _camera_mode(db_path, "cam-1") is None
 
 
 def test_admin_can_clear_mode_back_to_null(client, db_path):
@@ -236,9 +237,9 @@ def test_configuration_route_exposes_recording_mode_field(client, db_path):
     assert cameras[0]["recording_mode"] == "motion"
 
 
-def test_configuration_route_reports_null_when_unset_without_a_billing_v2_plan(client, db_path):
-    """Customers outside per-camera billing keep the stored value unchanged:
-    an unset camera stays null (older edges read it as continuous upload)."""
+def test_configuration_route_reports_disabled_when_unset_without_any_plan(client, db_path):
+    """R-REC-1 (1.2.7.1): never null (older edges read null as continuous
+    upload). A customer without cloud event protection gets 'disabled'."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -246,13 +247,15 @@ def test_configuration_route_reports_null_when_unset_without_a_billing_v2_plan(c
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
 
     assert response.status_code == 200
-    assert response.json()["cameras"][0]["recording_mode"] is None
+    assert response.json()["cameras"][0]["recording_mode"] == "disabled"
 
 
 @pytest.mark.parametrize("legacy_mode", ["continuous", "motion"])
-def test_a_legacy_plan_customer_keeps_the_stored_unset_mode(client, db_path, legacy_mode):
+def test_a_legacy_plan_customer_keeps_cloud_event_protection(client, db_path, legacy_mode):
     """Codex review (d9f1f11): a legacy continuous customer's unset camera
-    must not be switched to 'disabled' by the cloud."""
+    must not be switched to 'disabled' by the cloud. R-REC-1 decision 1: a
+    qualifying legacy plan (here 30 days) maps to 'motion' -- event media,
+    never continuous upload."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -260,9 +263,7 @@ def test_a_legacy_plan_customer_keeps_the_stored_unset_mode(client, db_path, leg
 
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
 
-    assert response.json()["cameras"][0]["recording_mode"] is None
-
-
+    assert response.json()["cameras"][0]["recording_mode"] == "motion"
 @pytest.mark.parametrize("plan_key,expected", [("hybrid", "motion"), ("ai_local", "disabled"), ("basic_local", "disabled")])
 def test_configuration_route_derives_an_unset_mode_from_the_paid_plan(client, db_path, plan_key, expected):
     """A new paying customer's camera works without an administrator: the
@@ -278,8 +279,10 @@ def test_configuration_route_derives_an_unset_mode_from_the_paid_plan(client, db
     assert response.json()["cameras"][0]["recording_mode"] == expected
 
 
-@pytest.mark.parametrize("explicit", ["disabled", "continuous", "motion"])
-def test_an_explicit_mode_is_kept_on_a_hybrid_plan(client, db_path, explicit):
+@pytest.mark.parametrize("explicit,expected", [("disabled", "disabled"), ("continuous", "motion"), ("motion", "motion")])
+def test_an_explicit_mode_is_kept_on_a_hybrid_plan(client, db_path, explicit, expected):
+    """R-REC-1: a legacy explicit 'continuous' is never transmitted; on a
+    Hybrid plan it follows the plan ('motion')."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")

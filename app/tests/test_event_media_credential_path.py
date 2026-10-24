@@ -200,11 +200,10 @@ def test_credentials_route_503_when_event_media_enabled_but_aws_not_configured(c
 # ---------------------------------------------- existing bulk-recording behavior preserved
 
 
-def test_bulk_recording_still_gets_the_original_broad_policy_unchanged(client, db_path, monkeypatch):
-    """Regression lock: when RECORDING_UPLOAD_ENABLED is the flag that
-    authorized the request, the credential's scope must be byte-for-
-    byte the same as before this change -- the whole camera prefix, not
-    the new narrower events-only one."""
+def test_bulk_recording_flag_now_gets_only_the_event_media_policy(client, db_path, monkeypatch):
+    """R-REC-1 (1.2.7.1): continuous upload is not offered. Even when
+    RECORDING_UPLOAD_ENABLED authorized the request, the credential is the
+    narrow events-only one, never the whole camera prefix."""
     _configure(monkeypatch, recording_enabled=True, event_media_enabled=False)
     _install_fake_boto3(monkeypatch)
     with override_target(sqlite_path=str(db_path)):
@@ -215,13 +214,9 @@ def test_bulk_recording_still_gets_the_original_broad_policy_unchanged(client, d
     response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
 
     assert response.status_code == 200
-    assert _FakeSTS.last_policy["Statement"][0]["Resource"] == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
-
-
-def test_both_flags_enabled_prefers_the_broad_bulk_policy(client, db_path, monkeypatch):
-    """A request authorized by both simply gets the broader, already-
-    established bulk policy -- there is nothing extra for the narrower
-    one to restrict in that case."""
+    assert _FakeSTS.last_policy["Statement"][0]["Resource"] == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*/events/*"
+def test_both_flags_enabled_still_gets_only_the_event_media_policy(client, db_path, monkeypatch):
+    """R-REC-1 (1.2.7.1): the broad bulk policy is never issued."""
     _configure(monkeypatch, recording_enabled=True, event_media_enabled=True)
     _install_fake_boto3(monkeypatch)
     with override_target(sqlite_path=str(db_path)):
@@ -230,7 +225,7 @@ def test_both_flags_enabled_prefers_the_broad_bulk_policy(client, db_path, monke
                   customer_id="cust-1", site_id="site-1")
 
     client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-1", "cred"))
-    assert "/events/" not in _FakeSTS.last_policy["Statement"][0]["Resource"]
+    assert "/events/" in _FakeSTS.last_policy["Statement"][0]["Resource"]
 
 
 # ------------------------------------------------------- the narrower scope itself
@@ -313,10 +308,9 @@ def test_pilot_camera_allowlist_unset_restricts_nothing():
     assert appliance_cloud.RECORDING_UPLOAD_PILOT_CAMERAS == frozenset()
 
 
-def test_pilot_listed_camera_gets_the_broad_bulk_policy_with_the_global_flag_off(client, db_path, monkeypatch):
-    """The real scenario this mechanism exists for: RECORDING_UPLOAD_ENABLED
-    stays globally false, but one explicitly-approved camera still gets
-    the real bulk-recording session scope."""
+def test_pilot_listed_camera_gets_only_the_event_media_policy(client, db_path, monkeypatch):
+    """R-REC-1 (1.2.7.1): a pilot-listed camera no longer gets the bulk
+    (continuous) session scope -- only the events-only one."""
     _configure(monkeypatch, recording_enabled=False, event_media_enabled=True, pilot_cameras={"cam-1"})
     _install_fake_boto3(monkeypatch)
     with override_target(sqlite_path=str(db_path)):
@@ -326,8 +320,7 @@ def test_pilot_listed_camera_gets_the_broad_bulk_policy_with_the_global_flag_off
 
     resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
 
-    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
-    assert "/events/" not in resource
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*/events/*"
     assert appliance_cloud.RECORDING_UPLOAD_ENABLED is False
 
 
@@ -350,10 +343,9 @@ def test_pilot_listed_camera_reaches_credentials_with_both_global_flags_off(clie
 
     resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
 
-    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
-    assert "/events/" not in resource
-
-
+    # R-REC-1 (1.2.7.1): the pilot list still opens the route, but only for
+    # the narrow event-media scope.
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*/events/*"
 def test_a_non_pilot_camera_still_404s_on_credentials_with_both_global_flags_off(client, db_path, monkeypatch):
     """Regression lock, mirroring test_a_non_pilot_camera_still_404s_on_
     available_with_the_global_flag_off below: being on the allowlist for
@@ -383,11 +375,9 @@ def test_a_non_pilot_camera_still_gets_the_narrow_event_media_policy(client, db_
     assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-2/*/events/*"
 
 
-def test_pilot_listed_camera_can_catalog_a_recording_with_the_global_flag_off(client, db_path, monkeypatch):
-    """recording_available() (R2) must also accept a pilot-listed
-    camera_id even while RECORDING_UPLOAD_ENABLED stays globally false --
-    without this, the credential above would be issued but every
-    catalog call would still 404."""
+def test_pilot_listed_camera_can_no_longer_catalog_a_continuous_recording(client, db_path, monkeypatch):
+    """R-REC-1 (1.2.7.1): recording_available() (continuous segments) is
+    refused for every camera, a pilot-listed one included."""
     _configure(monkeypatch, recording_enabled=False, event_media_enabled=False, pilot_cameras={"cam-1"})
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -399,8 +389,7 @@ def test_pilot_listed_camera_can_catalog_a_recording_with_the_global_flag_off(cl
         json={"s3_key": "recordings/cust-1/site-1/appl-1/cam-1/2026/09/13/x.mp4", "started_at": "2026-09-13T00:00:00", "ended_at": "2026-09-13T00:00:10"},
         headers=_auth_headers("appl-1", "cred"),
     )
-    assert response.status_code == 200
-    assert response.json()["status"] == "accepted"
+    assert response.status_code == 403
 
 
 def test_a_non_pilot_camera_still_404s_on_available_with_the_global_flag_off(client, db_path, monkeypatch):
@@ -462,7 +451,7 @@ def test_bulk_recording_globally_enabled_behavior_is_unchanged_regardless_of_pil
                   customer_id="cust-1", site_id="site-1")
 
     resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
-    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*/events/*"  # R-REC-1: never the broad bulk scope
 
 
 def _grant_v2_plan(db, customer_id="cust-1", plan_key="hybrid", status="active"):
@@ -552,7 +541,7 @@ def test_session_tags_are_not_sent_until_enabled(client, db_path, monkeypatch):
     assert _FakeSTS.last_tags is None
 
 
-@pytest.mark.parametrize("pilot,tier", [(False, "events"), (True, "continuous")])
+@pytest.mark.parametrize("pilot,tier", [(False, "events"), (True, "events")])  # R-REC-1: never 'continuous'
 def test_session_tags_carry_the_database_identity_and_tier(client, db_path, monkeypatch, pilot, tier):
     _configure(monkeypatch, recording_enabled=False, event_media_enabled=True,
                pilot_cameras=frozenset({"cam-1"}) if pilot else frozenset())

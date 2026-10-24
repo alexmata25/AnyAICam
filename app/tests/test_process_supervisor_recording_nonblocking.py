@@ -31,6 +31,9 @@ This file proves:
      dispatched via to_thread() while all 5 recorders are alive
      completes quickly, not queued behind permanently-busy workers.
 
+R-REC-1 (1.2.7.1): the recording supervisor only ever starts the event
+buffer (start_event_recording_buffer), so that is the starter faked here.
+
 Same import/isolation constraints as the other fix-verification test
 files this session: imports `main` (must run inside the deployed
 container's Python). Does not touch, test, or modify the motion-
@@ -141,7 +144,7 @@ def test_five_recorders_do_not_occupy_executor_and_capacity_is_retained(monkeypa
     # would be caught red-handed by _FakeRecordingProcess.wait()'s own
     # assertion above.
     processes = {cam: _FakeRecordingProcess(alive_polls=50) for cam in cameras}
-    monkeypatch.setattr(main, "start_recording", _make_starter({cam: [processes[cam]] for cam in cameras}))
+    monkeypatch.setattr(main, "start_event_recording_buffer", _make_starter({cam: [processes[cam]] for cam in cameras}))
     monkeypatch.setattr(main, "camera_process_state", {cam: {} for cam in cameras})
     monkeypatch.setattr(main, "camera_reconnect_counts", {cam: 0 for cam in cameras})
     monkeypatch.setattr(main, "ffmpeg_processes", [])
@@ -202,7 +205,7 @@ def test_recording_exit_is_detected(monkeypatch):
     camera_number = 9
     process = _FakeRecordingProcess(alive_polls=3, exit_code=1)
     monkeypatch.setattr(
-        main, "start_recording", _make_starter({camera_number: [process, _FakeRecordingProcess(alive_polls=1000)]})
+        main, "start_event_recording_buffer", _make_starter({camera_number: [process, _FakeRecordingProcess(alive_polls=1000)]})
     )
     state = {camera_number: _RecordingStateDict()}
     monkeypatch.setattr(main, "camera_process_state", state)
@@ -252,7 +255,7 @@ def test_recording_process_cleaned_up_and_restarted(monkeypatch):
         call_log.append(cam)
         return first_process if len(call_log) == 1 else second_process
 
-    monkeypatch.setattr(main, "start_recording", starter)
+    monkeypatch.setattr(main, "start_event_recording_buffer", starter)
     state = {camera_number: {}}
     monkeypatch.setattr(main, "camera_process_state", state)
     monkeypatch.setattr(main, "camera_reconnect_counts", {camera_number: 0})
@@ -271,7 +274,7 @@ def test_recording_process_cleaned_up_and_restarted(monkeypatch):
 
     asyncio.run(scenario())
 
-    # starter() (start_recording) called a second time -- restart-on-exit
+    # starter() (start_event_recording_buffer) called a second time -- restart-on-exit
     # behavior preserved.
     assert len(call_log) >= 2, "recording process should have been restarted after exiting"
 

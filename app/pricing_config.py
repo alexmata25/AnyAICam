@@ -15,17 +15,14 @@ DEFAULT_PRICING = {
         '2mp': {
             'label': '2MP / 1080p',
             'motion': {'2': 7.99, '7': 8.09, '14': 8.39, '30': None},
-            'continuous': {'2': None, '7': 9.79, '14': 10.89, '30': 11.99},
         },
         '4mp': {
             'label': '4MP',
             'motion': {'2': 8.19, '7': 8.59, '14': 9.19, '30': 10.09},
-            'continuous': {'2': 9.49, '7': 11.09, '14': 13.29, '30': 14.79},
         },
         '8mp': {
             'label': '8MP / 4K',
             'motion': {'2': 8.49, '7': 9.09, '14': 9.89, '30': 11.29},
-            'continuous': {'2': 9.99, '7': 12.39, '14': 15.69, '30': 17.59},
         },
     },
     'addons': {
@@ -39,12 +36,6 @@ DEFAULT_PRICING = {
             'label': '2MP / 1080p - Motion - 30 days',
             'options': [10.99, 8.99],
             'sources': ['Visible pricing table', 'JavaScript calculator'],
-            'confirmed': False,
-        },
-        '2mp.continuous.2': {
-            'label': '2MP / 1080p - Continuous - 2 days',
-            'options': [10.99, 8.99],
-            'sources': ['Visible pricing table', 'JavaScript pricing object'],
             'confirmed': False,
         },
     },
@@ -84,15 +75,31 @@ def load_pricing() -> dict:
             _merge(config, json.loads(CONFIG_FILE.read_text(encoding='utf-8')))
     except (OSError, json.JSONDecodeError):
         pass
+    _drop_continuous_plans(config)
     _ensure_partner_terms(config)
     return config
 
 
+# R-REC-1 (1.2.7.1): continuous recording is not offered. A pricing file
+# saved before 1.2.7.1 may still carry continuous rows; they are dropped on
+# every load, so no quote, page or partner term can offer one again.
+RECORDING_PLANS = ('motion',)
+
+
+def _drop_continuous_plans(config: dict) -> None:
+    for plan in (config.get('plans') or {}).values():
+        if isinstance(plan, dict):
+            plan.pop('continuous', None)
+    for key in [key for key in (config.get('conflicts') or {}) if '.continuous.' in key]:
+        config['conflicts'].pop(key, None)
+    terms = (config.get('partner') or {}).get('plan_terms') or {}
+    for key in [key for key in terms if '.continuous.' in key]:
+        terms.pop(key, None)
 def _ensure_partner_terms(config: dict) -> None:
     partner = config.setdefault('partner', deepcopy(DEFAULT_PRICING['partner']))
     plan_terms = partner.setdefault('plan_terms', {})
     for resolution, plan in config['plans'].items():
-        for recording in ('motion', 'continuous'):
+        for recording in RECORDING_PLANS:
             for retention, retail in plan[recording].items():
                 key = f'{resolution}.{recording}.{retention}'
                 record = plan_terms.setdefault(key, {})

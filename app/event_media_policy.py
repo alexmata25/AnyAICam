@@ -100,7 +100,9 @@ def motion_event_policy(db, customer_id: str) -> dict | None:
             return None
         return {"retention_days": override["retention_days"]}
     plan = _current_plan(db, customer_id)
-    if not plan or str(plan["recording_mode"] or "").strip().lower() != "motion":
+    # R-REC-1 decision 1: a legacy 'continuous' plan (no longer sold) keeps
+    # cloud event protection when its retention qualifies, like 'motion'.
+    if not plan or str(plan["recording_mode"] or "").strip().lower() not in ("motion", "continuous"):
         return None
     try:
         retention_days = int(plan["retention_days"])
@@ -146,9 +148,9 @@ def daily_seconds_used(db, camera_id: str, event_at: datetime) -> float:
 _MAX_SINGLE_CLIP_SECONDS = 3600
 
 
-CLOUD_RECORDING_MODES = ("motion", "continuous", "disabled")
-
-
+# R-REC-1 (1.2.7.1): continuous cloud upload is not offered; a camera's
+# cloud mode is only ever 'motion' (event clips + thumbnails) or 'disabled'.
+CLOUD_RECORDING_MODES = ("motion", "disabled")
 def _billing_v2_entitlement(customer_id: str) -> dict | None:
     try:
         from per_camera_billing import entitlement_for_customer
@@ -169,15 +171,22 @@ def effective_cloud_recording_mode(db, customer_id: str, explicit):
     (Local plans, suspended or cancelled Hybrid), so nothing is uploaded
     that the catalog would refuse.
 
-    Every other customer (legacy plans, partner-managed): the stored value,
-    unchanged -- an unset camera stays None, which older edges treat as
-    continuous upload for the legacy continuous plans that rely on it."""
-    if not customer_id or not _billing_v2_entitlement(customer_id):
-        return explicit if explicit in CLOUD_RECORDING_MODES else None
-    cloud_events = bool(motion_event_policy(db, customer_id))
-    if explicit in ("continuous", "disabled"):
-        return explicit
-    return "motion" if cloud_events else "disabled"
+    Every other customer (legacy plans, partner-managed): an explicit
+    'motion' or 'disabled' is kept; an unset, 'continuous' or unknown value
+    follows the plan the same way.
+
+    R-REC-1 (1.2.7.1): the result is ONLY ever 'motion' or 'disabled' --
+    never None (which older edges read as continuous upload) and never
+    'continuous'. A legacy continuous plan maps to 'motion' when it
+    qualifies for cloud event protection (motion_event_policy()), else to
+    'disabled' (Red decision 1)."""
+    if explicit == "disabled":
+        return "disabled"
+    if not customer_id:
+        return "motion" if explicit == "motion" else "disabled"
+    if explicit == "motion" and not _billing_v2_entitlement(customer_id):
+        return "motion"
+    return "motion" if motion_event_policy(db, customer_id) else "disabled"
 
 
 def allows_event_media(db, customer_id: str, camera_id: str, event_at: datetime, duration_seconds: float) -> tuple[bool, str]:

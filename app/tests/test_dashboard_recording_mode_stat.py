@@ -9,6 +9,8 @@ only-"event"-if-the-column-says-so interpretation this file's own
 canonical reader of that column (the local recording pipeline's
 _local_recording_settings_for_camera()) already establishes.
 
+R-REC-1 (1.2.7.1): event recording is the only local mode, so a camera
+with a NULL/legacy column reads as "Event" and "Mixed" no longer exists.
 Reuses test_dashboard_camera_tenant_scoping.py's own established harness
 (http_client against https://app.anyaicam.com, same seed helpers).
 """
@@ -83,10 +85,9 @@ def test_five_event_mode_cameras_shows_event_not_continuous(http_client, db_path
     assert _recording_stat(response.text) == "Event"
 
 
-def test_cameras_with_no_recording_mode_set_default_to_continuous(http_client, db_path):
-    """NULL local_recording_mode (the schema default) means Continuous
-    -- the same interpretation the real recording pipeline uses, not a
-    fix-specific invention."""
+def test_cameras_with_no_recording_mode_set_show_event(http_client, db_path):
+    """R-REC-1: NULL local_recording_mode means Event -- the same
+    interpretation the real recording pipeline uses."""
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     for n in range(1, 4):
@@ -94,10 +95,10 @@ def test_cameras_with_no_recording_mode_set_default_to_continuous(http_client, d
     conn.commit()
     conn.close()
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert _recording_stat(response.text) == "Continuous"
+    assert _recording_stat(response.text) == "Event"
 
 
-def test_a_mix_of_event_and_continuous_cameras_shows_mixed(http_client, db_path):
+def test_a_mix_of_event_and_legacy_null_cameras_shows_event(http_client, db_path):
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     _seed_camera(conn, "cam-1", customer_id="cust-1", camera_number=1, name="Camera 1", local_recording_mode="event")
@@ -105,7 +106,7 @@ def test_a_mix_of_event_and_continuous_cameras_shows_mixed(http_client, db_path)
     conn.commit()
     conn.close()
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert _recording_stat(response.text) == "Mixed"
+    assert _recording_stat(response.text) == "Event"
 
 
 def test_a_customer_with_zero_real_cameras_shows_a_dash_not_a_guess(http_client, db_path):
@@ -121,9 +122,10 @@ def test_a_second_customers_cameras_never_affect_the_first_customers_stat(http_c
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-a")
     _seed_tenant(conn, "cust-b")
-    _seed_camera(conn, "a-cam-1", customer_id="cust-a", camera_number=1, name="A Camera 1", local_recording_mode=None)
+    # R-REC-1: every camera reads as Event, so isolation is shown by a
+    # customer without cameras of its own next to one that has them.
     _seed_camera(conn, "b-cam-1", customer_id="cust-b", camera_number=1, name="B Camera 1", local_recording_mode="event")
     conn.commit()
     conn.close()
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
-    assert _recording_stat(response.text) == "Continuous"
+    assert _recording_stat(response.text) == "—"

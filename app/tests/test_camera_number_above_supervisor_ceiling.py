@@ -13,6 +13,18 @@ import pytest
 import main
 
 AFTER_REPLACEMENTS = [1, 2, 3, 9]  # cameras 4..8 were replaced over time
+JANITORS: list[int] = []
+
+
+@pytest.fixture(autouse=True)
+def _no_real_janitor(monkeypatch):
+    """R-REC-1 G: start_camera_supervisors() also starts each slot's
+    event_buffer_janitor (a forever loop); recorded here instead."""
+    JANITORS.clear()
+
+    async def fake_janitor(camera_number):
+        JANITORS.append(camera_number)
+    monkeypatch.setattr(main, "event_buffer_janitor", fake_janitor)
 
 
 @pytest.fixture()
@@ -98,6 +110,7 @@ def test_a_camera_provisioned_while_running_gets_its_supervisors_without_a_resta
         await asyncio.gather(*tasks)
     asyncio.run(run())
     assert sorted(started) == [(9, "live"), (9, "recording")]
+    assert JANITORS == [9]  # the post-boot camera gets its buffer janitor too
     assert main.camera_process_state[9]["live"] == "starting"
     assert sorted(staggers) == [0, 1]  # not camera 9's boot stagger (16 and 17 steps)
 

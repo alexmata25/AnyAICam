@@ -290,7 +290,6 @@
                                 <label style="display:grid; gap:0.35rem; font-weight:800; color:#0b1332;">Recording type
                                     <select id="indexRecordingSelect" style="min-height:3rem; border:1px solid #cfd9ea; border-radius:8px; padding:0 0.8rem; font-weight:700; color:#0b1332; background:#fff;">
                                         <option value="motion">Motion events</option>
-                                        <option value="continuous">Continuous recording</option>
                                     </select>
                                 </label>
                                 <label style="display:grid; gap:0.35rem; font-weight:800; color:#0b1332;">Cloud retention
@@ -478,7 +477,7 @@
                 </p>
                 <ul>
                     <li>Choose 2MP, 4MP, or 8MP cameras with individual quantities</li>
-                    <li>Select motion or 24/7 continuous recording</li>
+                    <li>Motion (event) recording</li>
                     <li>Pick 2, 7, 14, or 30-day storage duration</li>
                     <li>Add analytics: Smart Motion, LPR, People Counting, PPE</li>
                     <li>Choose hardware adapter or free software bridge</li>
@@ -578,17 +577,14 @@
             var cloudPrices = {
                 "2mp": {
                     motion: { "2": 7.99, "7": 8.09, "14": 8.39, "30": 8.99 },
-                    continuous: { "2": 8.99, "7": 9.79, "14": 10.89, "30": 11.99 },
                     label: "2MP / 1080p"
                 },
                 "4mp": {
                     motion: { "2": 8.19, "7": 8.59, "14": 9.19, "30": 10.09 },
-                    continuous: { "2": 9.49, "7": 11.09, "14": 13.29, "30": 14.79 },
                     label: "4MP"
                 },
                 "8mp": {
                     motion: { "2": 8.49, "7": 9.09, "14": 9.89, "30": 11.29 },
-                    continuous: { "2": 9.99, "7": 12.39, "14": 15.69, "30": 17.59 },
                     label: "8MP / 4K"
                 }
             };

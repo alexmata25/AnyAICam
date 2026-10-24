@@ -259,8 +259,9 @@ async def test_worker_still_never_calls_relay_for_cameras_2_to_5_with_the_camera
     except asyncio.CancelledError:
         pass
 
-    assert 1 in calls
-    assert all(camera not in calls for camera in (2, 3, 4, 5))
+    # R-REC-1 (1.2.7.1): the worker never relays a recording segment for any
+    # camera or mode (continuous upload is not offered).
+    assert calls == []
 
 
 @pytest.fixture

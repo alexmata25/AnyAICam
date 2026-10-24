@@ -85,9 +85,34 @@ RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 SYNC_INTERVAL_SECONDS = int(os.environ.get("ANYAICAM_CAMERA_CONFIG_SYNC_INTERVAL_SECONDS", "60"))
 
-sync_state: dict = {"last_run_at": None, "last_error": None, "last_synced_count": 0}
+sync_state: dict = {"last_run_at": None, "last_error": None, "last_synced_count": 0, "recording_mode_changed": []}
+
+# R-REC-1 (1.2.7.1): event recording is the only local recording mode. The
+# cloud's local_recording_mode is never copied as-is: every synced camera is
+# stored as 'event' (a None/'continuous'/unknown value from an older cloud is
+# coerced and logged). The cloud recording mode is kept only when it is
+# 'motion' or 'disabled' -- anything else (an older cloud's 'continuous') is
+# stored as NULL, which uploads nothing.
+LOCAL_RECORDING_MODE = "event"
+EDGE_CLOUD_RECORDING_MODES = ("motion", "disabled")
+# Called with the camera_numbers whose local recording mode this sync changed
+# (main.request_recording_strategy_check: the running recorder switches now).
+_recording_mode_listeners: list = []
 
 
+def register_recording_mode_listener(listener) -> None:
+    if listener not in _recording_mode_listeners:
+        _recording_mode_listeners.append(listener)
+
+
+def _notify_recording_mode_changed(camera_numbers) -> None:
+    if not camera_numbers:
+        return
+    for listener in list(_recording_mode_listeners):
+        try:
+            listener(list(camera_numbers))
+        except Exception as error:
+            logger.warning("edge_camera_sync.recording_mode_notify_failed error_type=%s", type(error).__name__)
 def _control_plane_headers(appliance_id: str, credential: str) -> dict:
     # Deliberately duplicated (not imported) from recording_uploader.py's
     # identical helper -- the same explicit per-module scope decision
@@ -406,6 +431,7 @@ def sync_provisioned_cameras() -> dict:
     now = datetime.now().isoformat()
     synced = 0
     credentials_moved = 0
+    recording_mode_changed: list[int] = []
     with connection() as db:
         # cameras.customer_id/site_id carry a FOREIGN KEY (see partner_db.
         # py's schema), and so does the recordings table's own customer_
@@ -490,6 +516,18 @@ def sync_provisioned_cameras() -> dict:
                 previous = db.execute("SELECT status, device_key FROM cameras WHERE id=?", (camera_id,)).fetchone()
                 if previous is not None and str(previous["status"] or "").strip().lower() != "removed":
                     removed_now, former_device_key = True, previous["device_key"]
+            sent_local_mode = item.get("local_recording_mode")
+            if sent_local_mode != LOCAL_RECORDING_MODE:
+                logger.info("edge_camera_sync.local_recording_mode_coerced camera_id=%s received=%r stored=event",
+                            camera_id, str(sent_local_mode)[:32] if sent_local_mode is not None else None)
+            sent_cloud_mode = item.get("recording_mode")
+            cloud_mode = sent_cloud_mode if sent_cloud_mode in EDGE_CLOUD_RECORDING_MODES else None
+            if sent_cloud_mode is not None and cloud_mode is None:
+                logger.info("edge_camera_sync.cloud_recording_mode_cleared camera_id=%s received=%r",
+                            camera_id, str(sent_cloud_mode)[:32])
+            stored_mode_row = db.execute("SELECT local_recording_mode FROM cameras WHERE id=?", (camera_id,)).fetchone()
+            if (stored_mode_row is None or stored_mode_row["local_recording_mode"] != LOCAL_RECORDING_MODE)                     and isinstance(camera_number, int) and not isinstance(camera_number, bool):
+                recording_mode_changed.append(camera_number)
             talk_down = item.get("talk_down")
             talk_down_supported = None
             talk_down_metadata = None
@@ -524,11 +562,11 @@ def sync_provisioned_cameras() -> dict:
                 (
                     camera_id, identity["customer_id"], identity["site_id"], identity["appliance_id"],
                     item.get("name") or "Camera", camera_number, item.get("status"), device_key,
-                    item.get("onvif_endpoint"), item.get("resolution"), item.get("recording_mode"),
+                    item.get("onvif_endpoint"), item.get("resolution"), cloud_mode,
                     item.get("people_counting_enabled"), item.get("smart_motion_enabled"),
                     item.get("lpr_enabled"), item.get("ppe_enabled"), item.get("facial_recognition_enabled"),
                     json.dumps(item.get("analytics_lab_leases") or {}, sort_keys=True),
-                    item.get("local_recording_mode"), item.get("local_recording_pre_roll_seconds"),
+                    LOCAL_RECORDING_MODE, item.get("local_recording_pre_roll_seconds"),
                     item.get("local_recording_post_roll_seconds"), item.get("local_recording_merge_gap_seconds"),
                     item.get("local_recording_max_event_seconds"),
                     talk_down_supported, talk_down_metadata, talk_down_verified_at, now,
@@ -606,6 +644,7 @@ def sync_provisioned_cameras() -> dict:
     sync_state["last_run_at"] = now
     sync_state["last_error"] = None
     sync_state["last_synced_count"] = synced
+    sync_state["recording_mode_changed"] = recording_mode_changed
     return result
 
 
@@ -634,6 +673,9 @@ async def camera_configuration_sync_worker() -> None:
                 logger.debug("edge_camera_sync.cycle_result result=%s", result)
             if result.get("status") == "ok":
                 await asyncio.to_thread(refresh_analytics_camera_map)
+                # R-REC-1b: the running recorders of cameras whose mode this
+                # cycle changed switch now, not at their next reconnect.
+                _notify_recording_mode_changed(sync_state.get("recording_mode_changed") or [])
         except asyncio.CancelledError:
             raise
         except Exception as error:

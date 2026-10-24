@@ -3087,13 +3087,19 @@ def start_camera_supervisors(numbers, tasks: list) -> list[int]:
     `numbers` that have none; returns the numbers started. The startup
     stagger follows each camera's position in this start, not its number
     (the same as before for cameras 1..N; a camera numbered 9 found later
-    does not wait 16-17 stagger steps)."""
+    does not wait 16-17 stagger steps).
+
+    R-REC-1 G (1.2.7.1): every slot also gets its event_buffer_janitor here,
+    whatever MOTION_DETECTION_ENABLED says -- every camera records into
+    _event_buffer, and a camera added after boot (camera_supervisor_watcher)
+    must never fill it without limit (the 33 GB incident class)."""
     started = _claim_camera_supervisor_slots(_valid_camera_numbers(numbers))
     for position, camera_number in enumerate(started):
         camera_process_state[camera_number]  # noqa: B018 -- creates its entry
         camera_reconnect_counts[camera_number]  # noqa: B018
         tasks.append(asyncio.create_task(process_supervisor(camera_number, "live", stagger_index=position * 2)))
         tasks.append(asyncio.create_task(process_supervisor(camera_number, "recording", stagger_index=position * 2 + 1)))
+        tasks.append(asyncio.create_task(event_buffer_janitor(camera_number)))
     return started
 
 
@@ -16531,22 +16537,34 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 # docs/local-event-mode-recording-design.md for the full audit/design
 # this implements.
 #
-# Continuous mode (the default, and every camera's behavior before
-# this pass) is completely untouched above -- start_recording() itself
-# has zero changes. Everything below is new and purely additive: a
-# camera only ever reaches this code if its own local_recording_mode
-# column (synced from the cloud admin route via edge_camera_sync.py)
-# reads back as the literal string 'event'.
+# R-REC-1 (1.2.7.1): event recording is the ONLY local recording mode.
+# start_recording() above (24/7 continuous 300 s segments) is kept in the
+# code but nothing calls it: every camera -- a NULL, missing, legacy
+# 'continuous', unknown or unreadable local_recording_mode included --
+# records through the event buffer below (Codex NO-GO b8c7a7ed, R-REC-1).
 EVENT_BUFFER_SEGMENT_SECONDS = 30
 EVENT_BUFFER_SUBFOLDER_NAME = "_event_buffer"
+LOCAL_RECORDING_MODE = "event"
+# (camera_number, stored value) pairs already logged as coerced to event,
+# so a legacy row is reported once, not on every read.
+_local_recording_mode_coerced: set = set()
+
+
+def _note_local_recording_mode_coerced(camera_number: int, stored) -> None:
+    key = (camera_number, repr(stored)[:64])
+    if key in _local_recording_mode_coerced:
+        return
+    _local_recording_mode_coerced.add(key)
+    structured_log("recording.local_mode_coerced_to_event", level="warning",
+                   camera_number=camera_number, stored=repr(stored)[:64])
 
 
 def _local_recording_settings(camera_number: int) -> dict:
     """Reads this camera's Event-mode configuration fresh from the
-    local database on every call (never cached) so a mode/setting
-    change made via the cloud admin route takes effect the next time
-    process_supervisor()'s own reconnect loop checks, without requiring
-    a full appliance restart. Returns defaults (event_clips.py's own
+    local database on every call (never cached). The mode is ALWAYS
+    'event' (R-REC-1, 1.2.7.1): a NULL, missing, legacy 'continuous',
+    unknown or unreadable stored value is logged once and recorded as
+    event -- never as continuous. Returns defaults (event_clips.py's own
     DEFAULT_* constants) for any field the customer/admin has not
     explicitly configured -- the exact same no-hidden-default
     philosophy as local_recording_mode itself, just for its numeric
@@ -16554,7 +16572,7 @@ def _local_recording_settings(camera_number: int) -> dict:
     from event_clips import DEFAULT_MERGE_GAP_SECONDS, DEFAULT_POST_ROLL_SECONDS, DEFAULT_PRE_ROLL_SECONDS
     from local_recording_policy import DEFAULT_MAX_EVENT_RECORDING_SECONDS
 
-    mode = "continuous"
+    mode = LOCAL_RECORDING_MODE  # always: see R-REC-1 above
     pre_roll = DEFAULT_PRE_ROLL_SECONDS
     post_roll = DEFAULT_POST_ROLL_SECONDS
     merge_gap = DEFAULT_MERGE_GAP_SECONDS
@@ -16568,11 +16586,18 @@ def _local_recording_settings(camera_number: int) -> dict:
                 "local_recording_max_event_seconds FROM cameras WHERE camera_number=?",
                 (camera_number,),
             ).fetchone()
-    except Exception:
+    except Exception as error:
+        # Fail safe: an unreadable database keeps event recording, never
+        # falls back to continuous (R-REC-1).
+        if (camera_number, "read_failed") not in _local_recording_mode_coerced:
+            _local_recording_mode_coerced.add((camera_number, "read_failed"))
+            structured_log("recording.local_mode_read_failed", level="warning",
+                           camera_number=camera_number, error=type(error).__name__)
         row = None
     if row:
-        if row["local_recording_mode"] == "event":
-            mode = "event"
+        stored = row["local_recording_mode"]
+        if stored != LOCAL_RECORDING_MODE:
+            _note_local_recording_mode_coerced(camera_number, stored)
         if row["local_recording_pre_roll_seconds"] is not None:
             pre_roll = row["local_recording_pre_roll_seconds"]
         if row["local_recording_post_roll_seconds"] is not None:
@@ -16636,21 +16661,39 @@ def _buffer_segment_start(clip: Path, camera_number: int) -> datetime | None:
         return None
 
 
+def event_buffer_age_cap_seconds(settings: dict) -> int:
+    """How long after it ENDS an idle buffer segment may stay on disk: the
+    pre-roll, the fixed safety margin, the detection lookback and the
+    post-roll (defaults 5 + 10 + 60 + 5 = 80 s). With 30 s segments and a
+    30 s janitor pass an idle camera keeps at most ~140 s of footage."""
+    from local_recording_policy import DEFAULT_BUFFER_SAFETY_MARGIN_SECONDS, DETECTION_LOOKBACK_SECONDS
+    return int(settings["pre_roll_seconds"] + DEFAULT_BUFFER_SAFETY_MARGIN_SECONDS
+               + DETECTION_LOOKBACK_SECONDS + settings["post_roll_seconds"])
+
+
+def event_buffer_hard_max_age_seconds(settings: dict) -> int:
+    """The ceiling no segment outlives (R-REC-1 G), even while an in-flight
+    event window still overlaps it: the age cap plus the longest event
+    recording plus two segments (defaults 80 + 300 + 60 = 440 s). A stale
+    or never-closed window can therefore never pin the buffer -- the 33 GB
+    incident class. There is no byte cap: bytes = bitrate x this age."""
+    return event_buffer_age_cap_seconds(settings) + int(settings["max_event_seconds"]) + 2 * EVENT_BUFFER_SEGMENT_SECONDS
+
+
 async def event_buffer_janitor(camera_number: int) -> None:
     """Deletes this camera's short buffer segments once they age past
     the configured pre-roll lookback -- the actual mechanism that stops
-    an idle Event-mode camera from accumulating disk usage. A no-op
-    (cheap, polls every EVENT_BUFFER_SEGMENT_SECONDS) for any camera
-    whose local_recording_mode is not 'event', so this can safely run
-    for every camera slot unconditionally rather than needing to be
-    started/stopped as a mode changes."""
+    an idle camera from accumulating disk usage. One runs for EVERY
+    supervisor slot, started with its supervisors by
+    start_camera_supervisors() (boot slots and cameras added later alike)
+    whatever MOTION_DETECTION_ENABLED says: every camera records into
+    _event_buffer (R-REC-1), so every buffer needs its janitor."""
     from local_recording_policy import DETECTION_LOOKBACK_SECONDS, BufferSegment, is_buffer_segment_still_needed
 
     while True:
         await asyncio.sleep(EVENT_BUFFER_SEGMENT_SECONDS)
         settings = _local_recording_settings(camera_number)
-        if settings["mode"] != "event":
-            continue
+        hard_max_age = event_buffer_hard_max_age_seconds(settings)
         buffer_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
         if not buffer_folder.is_dir():
             continue
@@ -16669,7 +16712,7 @@ async def event_buffer_janitor(camera_number: int) -> None:
                 continue
             segment_end = segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS)
             segment = BufferSegment(start=segment_start, end=segment_end)
-            if not is_buffer_segment_still_needed(
+            if (now - segment_end).total_seconds() > hard_max_age or not is_buffer_segment_still_needed(
                 segment, now=now, pre_roll_seconds=settings["pre_roll_seconds"],
                 in_flight_event_windows=in_flight,
                 lookback_seconds=DETECTION_LOOKBACK_SECONDS + settings["post_roll_seconds"],
@@ -17285,6 +17328,46 @@ async def _wait_for_live_hls_demand(camera_number: int) -> None:
         await asyncio.sleep(live_hls_demand.IDLE_POLL_SECONDS)
 
 
+# R-REC-1b (1.2.7.1): a recording-mode change reaches the RUNNING recorder
+# without waiting for it to exit. The recording supervisor polls its ffmpeg
+# every RECORDING_POLL_SECONDS; it re-reads the desired strategy at once when
+# request_recording_strategy_check() names its camera (edge_camera_sync does,
+# for every camera whose mode it changed) and otherwise every
+# RECORDING_STRATEGY_CHECK_SECONDS. On a mismatch it stops ffmpeg gracefully
+# (SIGTERM on Linux, so the segment is closed; killed after
+# RECORDING_GRACEFUL_STOP_SECONDS) and restarts at once -- not a failure: no
+# reconnect count, no 10 s backoff. Bound N from the edge DB change:
+# 4 + 1 + 5 = 10 s (usually < 2 s when notified). The cloud->edge sync
+# interval (<= 60 s) comes on top of N for a change made in the cloud.
+RECORDING_POLL_SECONDS = 1.0
+RECORDING_STRATEGY_CHECK_SECONDS = 4.0
+RECORDING_GRACEFUL_STOP_SECONDS = 5.0
+RECORDING_SWITCH_BOUND_SECONDS = 10
+_recording_strategy_wake: set[int] = set()
+
+
+def request_recording_strategy_check(camera_numbers) -> None:
+    """Wakes the recording supervisors of these cameras to re-read their
+    mode now. Safe from a worker thread (a set add under the GIL)."""
+    for number in camera_numbers or ():
+        try:
+            _recording_strategy_wake.add(int(number))
+        except (TypeError, ValueError):
+            continue
+
+
+def _desired_recording_strategy(camera_number: int) -> str:
+    """The strategy the recorder should run now: the reader's mode, which
+    is always 'event' (R-REC-1)."""
+    return _local_recording_settings(camera_number)["mode"]
+
+
+def _recording_starter_for(strategy):
+    """Event-only (R-REC-1): every strategy records through the event
+    buffer. The continuous segmenter is deliberately not reachable here."""
+    return start_event_recording_buffer
+
+
 async def process_supervisor(camera_number: int, mode: str, *, stagger_index: int | None = None) -> None:
     """Keep one camera worker alive and retry when a camera is unavailable.
     stagger_index: the startup-stagger slot (start_camera_supervisors()
@@ -17308,31 +17391,16 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
 
 
 
-    # 2026-09-20: for mode=="recording", the starter is no longer fixed
-    # for this task's whole lifetime -- it is re-selected on every
-    # reconnect-loop iteration below, based on this camera's CURRENT
-    # local_recording_mode (read fresh, never cached, by
-    # _local_recording_settings()). This is what lets an admin's mode
-    # change take effect without restarting the appliance: the next
-    # time this camera's recorder reconnects (which happens routinely
-    # anyway -- RTSP hiccups, camera reboots, etc.), it picks up
-    # whichever strategy is currently configured. mode=="live" is
-    # completely unaffected -- always start_live_stream, exactly as
-    # before this change.
+    # mode=="recording": the strategy is read fresh on every start and kept
+    # as active_strategy; the poll loop below compares it with the desired
+    # one and switches the RUNNING recorder (R-REC-1b). Every strategy is
+    # the event buffer (R-REC-1). mode=="live" is unaffected.
+    active_strategy = None
+
     def _select_recording_starter():
         if mode != "recording":
             return start_live_stream
-        return (
-            start_event_recording_buffer
-            if _local_recording_settings(camera_number)["mode"] == "event"
-            else start_recording
-        )
-
-
-
-
-
-
+        return _recording_starter_for(active_strategy)
     unhealthy_runs = 0  # live: runs in a row that never wrote video (recovery detection)
     while True:
         if mode == "live" and live_hls_demand.on_demand() and not live_hls_demand.wanted(camera_number):
@@ -17345,13 +17413,9 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
             live_copy_used = live_copy_allowed(camera_number)
             camera_process_state[camera_number]["live_video"] = "copy" if live_copy_used else "encode"
         worker_started = time.monotonic()
-
-
-
-
-
-
-
+        if mode == "recording":
+            active_strategy = _desired_recording_strategy(camera_number)
+            _recording_strategy_wake.discard(camera_number)
 
         try:
             process = _select_recording_starter()(camera_number)
@@ -17433,6 +17497,7 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
         idle_stop = False
         run_healthy = False  # this worker has written its own playlist
         copy_upgrade = False
+        strategy_switch = False  # recording: mode changed under the running recorder
         try:
             if mode == "live":
                 playlist_path = HLS_FOLDER / f"camera{camera_number}.m3u8"
@@ -17549,8 +17614,29 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                 # block returns immediately -- it's still needed to reap
                 # the process and obtain its real exit code, just no
                 # longer blocks for any meaningful duration.
+                last_strategy_check = time.monotonic()
                 while process.poll() is None:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(RECORDING_POLL_SECONDS)
+                    woken = camera_number in _recording_strategy_wake
+                    if not woken and time.monotonic() - last_strategy_check < RECORDING_STRATEGY_CHECK_SECONDS:
+                        continue
+                    _recording_strategy_wake.discard(camera_number)
+                    last_strategy_check = time.monotonic()
+                    desired = _desired_recording_strategy(camera_number)
+                    if desired == active_strategy:
+                        continue
+                    # Live switch (R-REC-1b): SIGTERM lets ffmpeg close the
+                    # segment it is writing (Windows: TerminateProcess); the
+                    # partial file is kept, retention handles it.
+                    strategy_switch = True
+                    structured_log("recording.strategy_switched", camera_number=camera_number,
+                                   from_strategy=str(active_strategy), to_strategy=str(desired))
+                    process.terminate()
+                    try:
+                        await asyncio.to_thread(process.wait, timeout=RECORDING_GRACEFUL_STOP_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    break
 
             return_code = await asyncio.to_thread(process.wait)
             completed = True
@@ -17572,7 +17658,7 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                     datetime.now().isoformat()
                 )
 
-            if copy_upgrade:
+            if copy_upgrade or strategy_switch:
                 camera_process_state[camera_number][mode] = "connecting"
             elif not idle_stop:
                 camera_reconnect_counts[camera_number] += 1
@@ -17595,8 +17681,8 @@ async def process_supervisor(camera_number: int, mode: str, *, stagger_index: in
                         pass
         if mode == "live" and not idle_stop and not copy_upgrade:
             unhealthy_runs = 0 if run_healthy else unhealthy_runs + 1
-        if idle_stop or copy_upgrade:
-            continue  # straight back to waiting for demand / into stream copy
+        if idle_stop or copy_upgrade or strategy_switch:
+            continue  # straight back to waiting for demand / into stream copy / the new strategy
         await asyncio.sleep(10)
 
 
@@ -40774,6 +40860,9 @@ import recording_retention_sweep
 import analytics_sync
 import event_media_uploader
 import edge_camera_sync
+# R-REC-1b: a camera whose local recording mode the sync changed wakes its
+# recording supervisor at once (process_supervisor()'s live switch).
+edge_camera_sync.register_recording_mode_listener(request_recording_strategy_check)
 import analytics_platform
 import lpr
 import ppe
@@ -40930,39 +41019,9 @@ async def lifespan(app: FastAPI):
 
             reconcile_camera_workers(camera_numbers)  # registry: see reconcile_camera_workers()
             motion_tasks = list(_camera_worker_tasks["motion"].values())
-            # 2026-09-20: one janitor per camera slot, started
-            # unconditionally alongside motion detection -- each one is
-            # a cheap no-op for any camera not currently in Event mode
-            # (see event_buffer_janitor()'s own docstring), so this
-            # never needs its own separate enable flag or lifecycle.
-            event_buffer_janitor_tasks = [
-                asyncio.create_task(event_buffer_janitor(camera_number))
-
-
-
-
-
-
-
-
-                for camera_number in camera_numbers
-
-
-
-
-
-
-
-
-            ]
-
-
-
-
-
-
-
-
+            # R-REC-1 G: the event-buffer janitors are started per supervisor
+            # slot by start_camera_supervisors(), not here (they used to be
+            # boot-only and only with motion detection on).
         if AI_PERSON_DETECTION_ENABLED:
 
 
@@ -53399,16 +53458,16 @@ def _customer_camera_status(customer_cameras: list[dict]) -> dict:
             # while a recent file exists, so an idle, healthy Event-mode
             # camera read as "Recording problem: stopped". Online + Event
             # mode is "armed" (waiting for activity), not a problem.
-            mode_row = db.execute("SELECT local_recording_mode FROM cameras WHERE id=?", (camera["id"],)).fetchone()
-            event_mode = bool(mode_row) and mode_row["local_recording_mode"] == "event"
-            recording_state = "running" if recording_running else ("armed" if online and event_mode else "stopped")
+            # R-REC-1: every camera records event clips only (the stored
+            # column is not consulted -- NULL/legacy values are event too).
+            recording_state = "running" if recording_running else ("armed" if online else "stopped")
             cameras.append(
                 {
                     "camera": camera_number,
                     "online": online,
                     "stream": "online" if online else "offline",
                     "recording": recording_state,
-                    "recording_mode": "event" if event_mode else "continuous",
+                    "recording_mode": LOCAL_RECORDING_MODE,
                     "last_stream_update_seconds": None,
                     "reconnects": 0,
                     "last_exit_code": None,
@@ -75985,7 +76044,7 @@ def _dashboard_camera_health_facts(customer_cameras, camera_ids_by_number) -> di
                 f" FROM cameras WHERE id IN ({placeholders})", tuple(ids),
             ).fetchall():
                 facts[ids[row["id"]]] = {
-                    "recording_mode": "Event" if row["local_recording_mode"] == "event" else "Continuous",
+                    "recording_mode": "Event",  # R-REC-1: the only recording mode
                     "analytics": [label for column, label in _DASHBOARD_ANALYTICS_LABELS if row[column]],
                 }
             for row in db.execute(
@@ -76230,27 +76289,16 @@ def dashboard(request: Request) -> str:
     # per-customer camera_id to scope a query by) keeps the pre-existing
     # "Continuous" literal -- out of scope for this fix, which is about
     # a real customer's Dashboard reflecting a real appliance's config.
+    # R-REC-1 (1.2.7.1): event recording is the only local recording mode
+    # (see _local_recording_settings()), so the stat is "Event" whenever
+    # there are cameras -- a NULL/legacy column value never reads as
+    # continuous, and there is no "Mixed" any more.
     if _dashboard_camera_ids_by_number:
-        from partner_db import connection
-        with connection() as db:
-            _dashboard_recording_mode_rows = db.execute(
-                f"SELECT local_recording_mode FROM cameras WHERE id IN ({','.join('?' for _ in _dashboard_camera_ids_by_number)})",
-                tuple(_dashboard_camera_ids_by_number.values()),
-            ).fetchall()
-        _dashboard_recording_modes = {
-            "event" if row["local_recording_mode"] == "event" else "continuous"
-            for row in _dashboard_recording_mode_rows
-        }
-        if _dashboard_recording_modes == {"event"}:
-            _dashboard_recording_stat = "Event"
-        elif _dashboard_recording_modes == {"continuous"}:
-            _dashboard_recording_stat = "Continuous"
-        else:
-            _dashboard_recording_stat = "Mixed"
+        _dashboard_recording_stat = "Event"
     elif _customer_dashboard_cameras is not None:
         _dashboard_recording_stat = "—"
     else:
-        _dashboard_recording_stat = "Continuous"
+        _dashboard_recording_stat = "Event"
     # Plan indicator (2026-09-21): status only, deliberately no pricing
     # here -- the dashboard's own job is "what plan am I on", never "how
     # much does it cost" or a Local-vs-Hybrid comparison (that detail
@@ -133986,15 +134034,16 @@ def save_partner_quotes(quotes: list[dict]) -> None:
 
 
 
+def _quote_recording_mode(value) -> str:
+    """R-REC-1: a quote records motion events only. Missing means 'motion';
+    'continuous' (or anything else) is refused with a 400."""
+    mode = str(value or "motion").strip().lower()
+    if mode != "motion":
+        raise HTTPException(status_code=400, detail="Only motion (event) recording is offered; continuous recording is not available.")
+    return mode
+
+
 def partner_quote_price(quote: dict) -> dict:
-
-
-
-
-
-
-
-
     pricing = {
 
 
@@ -134014,15 +134063,6 @@ def partner_quote_price(quote: dict) -> dict:
 
 
             "motion": {2: 7.99, 7: 8.09, 14: 8.39, 30: 8.99},
-
-
-
-
-
-
-
-
-            "continuous": {2: 8.99, 7: 9.79, 14: 10.89, 30: 11.99},
 
 
 
@@ -134058,15 +134098,6 @@ def partner_quote_price(quote: dict) -> dict:
 
 
 
-            "continuous": {2: 9.49, 7: 11.09, 14: 13.29, 30: 14.79},
-
-
-
-
-
-
-
-
         },
 
 
@@ -134086,15 +134117,6 @@ def partner_quote_price(quote: dict) -> dict:
 
 
             "motion": {2: 8.49, 7: 9.09, 14: 9.89, 30: 11.29},
-
-
-
-
-
-
-
-
-            "continuous": {2: 9.99, 7: 12.39, 14: 15.69, 30: 17.59},
 
 
 
@@ -134184,7 +134206,7 @@ def partner_quote_price(quote: dict) -> dict:
 
 
 
-    mode = str(quote.get("recording_mode") or "motion").lower()
+    mode = "motion"  # R-REC-1: a legacy 'continuous' quote is priced as motion (no continuous plan)
 
 
 
@@ -137287,7 +137309,7 @@ def partner_quote_builder_page(request: Request) -> Response:
 
 
 
-          <label>Recording mode<select id="quote-recording"><option value="motion">Motion events</option><option value="continuous">24/7 continuous</option></select></label>
+          <label>Recording mode<select id="quote-recording"><option value="motion">Motion events</option></select></label>
 
 
 
@@ -137503,7 +137525,7 @@ def partner_quote_builder_page(request: Request) -> Response:
 
 
 
-      '2mp':{motion:{2:7.99,7:8.09,14:8.39,30:8.99},continuous:{2:8.99,7:9.79,14:10.89,30:11.99}},
+      '2mp':{motion:{2:7.99,7:8.09,14:8.39,30:8.99}},
 
 
 
@@ -137512,7 +137534,7 @@ def partner_quote_builder_page(request: Request) -> Response:
 
 
 
-      '4mp':{motion:{2:8.19,7:8.59,14:9.19,30:10.09},continuous:{2:9.49,7:11.09,14:13.29,30:14.79}},
+      '4mp':{motion:{2:8.19,7:8.59,14:9.19,30:10.09}},
 
 
 
@@ -137521,7 +137543,7 @@ def partner_quote_builder_page(request: Request) -> Response:
 
 
 
-      '8mp':{motion:{2:8.49,7:9.09,14:9.89,30:11.29},continuous:{2:9.99,7:12.39,14:15.69,30:17.59}}
+      '8mp':{motion:{2:8.49,7:9.09,14:9.89,30:11.29}}
 
 
 
@@ -137908,7 +137930,7 @@ def partner_quote_builder_page(request: Request) -> Response:
 
 
 
-      quoteField('quote-recording').value=quote.recording_mode||'motion';
+      quoteField('quote-recording').value='motion';  // R-REC-1: event (motion) recording only
 
 
 
@@ -138680,6 +138702,7 @@ def create_partner_quote(request: Request, payload: PartnerQuoteCreateModel) -> 
     from partner_db import allowed as _quote_allowed
     if not _quote_allowed(identity, "quote.create"):
         raise HTTPException(status_code=403, detail="Quote permission required.")
+    payload.recording_mode = _quote_recording_mode(payload.recording_mode)
     with connection() as db:
         if not authorize_customer_tenant(db, identity, payload.customer_id):
             return {"status": "error", "message": "Partner customer not found."}
@@ -138846,23 +138869,9 @@ def update_partner_quote(quote_id: str, request: Request, payload: PartnerQuoteU
     from partner_db import allowed as _quote_allowed
     if not _quote_allowed(identity, "quote.create"):
         raise HTTPException(status_code=403, detail="Quote permission required.")
-
-
-
-
-
-
-
-
+    if payload.recording_mode is not None:
+        payload.recording_mode = _quote_recording_mode(payload.recording_mode)
     quotes = load_partner_quotes()
-
-
-
-
-
-
-
-
     visible = partner_record_scope(request)
     quote_item = next((item for item in quotes if item.get("id") == quote_id and visible(item.get("partner_id"))), None)
 
