@@ -102,7 +102,7 @@ def test_the_first_registry_holds_every_active_cloud_key_and_verifies_in_the_bui
     assert document["environment"] == "production"
     assert all(entry["state"] == "active" for entry in document["keys"].values())
     path = tmp_path / "registry.json"
-    path.write_text(printed.rpartition("sha256 ")[0], encoding="ascii")
+    path.write_bytes(printed.rpartition("sha256 ")[0].encode("ascii"))
     registry_bytes, keyset_bytes = builder.read_entitlement_trust_registry(str(path), digest)
     assert hashlib.sha256(registry_bytes).hexdigest() == digest
     assert set(json.loads(keyset_bytes)["keys"]) == set(document["keys"])
@@ -112,7 +112,7 @@ def test_rotation_retires_the_old_key_adds_the_next_and_never_drops_a_binding(cl
     _cloud_private_keys(cloud_db)
     _code, first = _run_tool(cloud_db, "--trust-registry")
     previous = tmp_path / "gen1.json"
-    previous.write_text(first.rpartition("sha256 ")[0], encoding="ascii")
+    previous.write_bytes(first.rpartition("sha256 ")[0].encode("ascii"))
     old_id = next(iter(_registry(first)[0]["keys"]))
     code, second = _run_tool(cloud_db, "--trust-registry", "--previous", str(previous),
                              "--add", f"anyaicam-identity-next={NEXT_KEY}", "--retire", old_id)
@@ -122,7 +122,7 @@ def test_rotation_retires_the_old_key_adds_the_next_and_never_drops_a_binding(cl
     assert document["keys"][old_id]["state"] == "retired" and document["keys"][old_id]["changed_generation"] == 2
     assert document["keys"]["anyaicam-identity-next"]["state"] == "active"
     gen2 = tmp_path / "gen2.json"
-    gen2.write_text(second.rpartition("sha256 ")[0], encoding="ascii")
+    gen2.write_bytes(second.rpartition("sha256 ")[0].encode("ascii"))
     code, third = _run_tool(cloud_db, "--trust-registry", "--previous", str(gen2), "--revoke", old_id)
     assert code == 0 and _registry(third)[0]["keys"][old_id]["state"] == "revoked"
     gen3 = tmp_path / "gen3.json"
