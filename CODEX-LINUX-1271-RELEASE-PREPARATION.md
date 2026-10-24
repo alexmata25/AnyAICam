@@ -5,8 +5,10 @@ Application/test source: `dcace5778c56988d447bd8a182a8308e7fb21dc5`
 Review branch: `codex/linux-1271-integrated`
 Frozen baseline: `b8c7a7edba7083ee703bb7a4d71bc8f27ea7dc5c`
 
-This is an offline preparation record. No installer, image, registry, key, or
-MediaMTX artifact was built or downloaded. Docker HOLD is still in force.
+This is an offline preparation record. No installer, Docker image, registry,
+or signing key was built, acquired, or used. The official MediaMTX artifact
+was downloaded and independently verified as documented below. Docker HOLD
+remains in force.
 
 ## 1. TRUST-1 and update-verification release materials
 
@@ -67,7 +69,7 @@ acceptance.
 |---|---|---|---|
 | TRUST-1 production registry | Authorized cloud trust administrator, using `python -m entitlement_keyset --trust-registry` on the approved cloud host against production public signer records; preserve prior generation history | Review canonical production JSON, generation and signer lifecycle; verify retained signers cover existing accepted grants; compare canonical registry bytes to a separately obtained cloud-host SHA-256; builder must accept both registry and digest | Registry and digest missing. No individual custodian name/contact is present in the reviewed repository or handoff; identity must be confirmed by the owner/Red. No cloud access performed |
 | Software Update verification public key | Existing release-signing custodian's trusted offline signing environment; export only the public PEM corresponding to the already approved release-signing identity | Custodian supplies separately confirmed fingerprint and provenance; compare using the custodian's documented fingerprint procedure; builder canonicalizes PEM, rejects private key material, records canonical PEM SHA-256, and `installer/12-update-signing-key.sh` verifies it | Public PEM and fingerprint missing. No individual custodian name/contact is present in the reviewed repository or handoff; identity must be confirmed by the owner/Red. Do not generate replacement key material |
-| MediaMTX Linux binary | Official `bluenviron/mediamtx` GitHub v1.21.0 release asset `mediamtx_v1.21.0_linux_amd64.tar.gz` | Obtain official `checksums.sha256`; verify archive SHA; verify GitHub attestation with repository `bluenviron/mediamtx`; extract the Linux amd64 executable; record and independently verify its full SHA-256; reconcile against an approved full-hash release record before passing the binary/hash pair to builder | Version/platform chosen by owner; artifact and complete hash missing |
+| MediaMTX Linux binary | Official `bluenviron/mediamtx` GitHub v1.21.0 release asset `mediamtx_v1.21.0_linux_amd64.tar.gz` | Obtain official `checksums.sha256`; verify archive SHA; verify GitHub attestation with repository `bluenviron/mediamtx`; extract the Linux amd64 executable; record and independently verify its full SHA-256; reconcile against an approved full-hash release record before passing the binary/hash pair to builder | **Verified 2026-10-24**; evidence at `_evidence/mediamtx-v1.21.0-official-verification/`; release-use approval still requires Red/release engineering to accept the evidence |
 | Release identity | Owner-approved version `1.2.7.1` and frozen application/test source commit `dcace5778c56988d447bd8a182a8308e7fb21dc5` | Clean isolated worktree; verify commit ancestry and builder-reported source commit; never overwrite the accepted earlier installer | Identified; no artifact built |
 
 Transfer only these public release inputs via the owner-approved, access-
@@ -89,21 +91,27 @@ artifact is named `mediamtx_v1.21.0_linux_amd64.tar.gz` from the official
 The project's Windows dependency lock independently pins v1.21.0 for Windows
 amd64, but its Windows ZIP hash is not valid for Linux.
 
-**Important evidence gap:** the tracked Linux release notes preserve only an
-abbreviated binary hash (`9fac297a…01ad`) and archive hash (`e02e34c3…`), not
-the exact full 64-hex SHA-256 values. No Linux MediaMTX binary is present in
-this tracked checkout. Therefore the historical pin is identifiable, but its
-exact expected hash is not independently recoverable from this source tree.
-Do not pass a guessed or Windows checksum to the builder.
+**Official artifact independently verified 2026-10-24:** downloaded the
+v1.21.0 Linux amd64 archive and upstream `checksums.sha256` from the official
+release; the archive SHA-256 is
+`e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b`
+(27,192,682 bytes), matching the upstream checksum file. `gh attestation
+verify` passed with repository `bluenviron/mediamtx`, signer workflow
+`bluenviron/mediamtx/.github/workflows/release.yml`, and source ref
+`refs/tags/v1.21.0`; the verified attestation subject includes the exact
+archive hash. The archive listing was checked before extraction and contained
+only `mediamtx`, `mediamtx.yml`, and `LICENSE`. The extracted executable is
+ELF64 little-endian x86_64, 55,239,741 bytes, with SHA-256
+`9fac297a1b57762980fc1f7d91499211091366b3abecd0a7a0d8146387d901ad`,
+matching the full hash behind the previously documented abbreviated binary
+pin. The executable was not run on Windows. Full verification output,
+attestation JSON and a SHA256SUMS manifest are preserved under
+`_evidence/mediamtx-v1.21.0-official-verification/`.
 
-Required before build: obtain the exact v1.21.0 Linux amd64 archive and its
-official release checksum/attestation from the upstream release, verify the
-asset using the published checksum and GitHub attestation procedure, extract
-`mediamtx`, compute its SHA-256, and have release engineering compare it with
-the independently preserved historical binary hash or an approved release
-record. Preserve the archive hash and extracted-binary hash in the build
-evidence. The builder accepts the extracted binary plus its exact SHA-256 and
-refuses mismatch.
+This closes the MediaMTX provenance/hash gap for the builder input; it does not
+authorize a build, installer test, Docker use, or release. Upstream's official
+release page documents its checksum and attestation verification procedures:
+[`bluenviron/mediamtx` v1.21.0 release](https://github.com/bluenviron/mediamtx/releases/tag/v1.21.0).
 
 Upstream now lists v1.21.2 as a later release. That does not make it an
 approved AnyAiCam pin. Keep v1.21.0 as the historical compatibility candidate
@@ -415,8 +423,9 @@ release record, then preserve the archive hash, attestation result, binary
 hash, version output, and operator identity in the release evidence. The
 archive checksum and GitHub attestation establish upstream artifact
 provenance; the builder's `--mediamtx-sha256` must be the full hash of the
-extracted executable. Do not proceed if the independent approved binary-hash
-record is unavailable or disagrees.
+extracted executable. The Ubuntu-side `mediamtx --version` and execution check
+remain pending because the Linux binary was not run on Windows. Do not proceed
+if the independent approved binary-hash record is unavailable or disagrees.
 
 Once the public TRUST-1 registry/digest and public update key/fingerprint are
 delivered and verified, build into a new, versioned output directory using
@@ -446,3 +455,55 @@ builder output manifest, source commit, exact command with local paths
 redacted from any shared report, installer SHA-256 and size. Keep public
 material hashes and provenance in evidence; never include credentials or
 private signing material.
+
+## 8. Current verification checkpoint — 2026-10-24
+
+### Completed
+
+- Source under test remains pinned to application commit
+  `dcace5778c56988d447bd8a182a8308e7fb21dc5`. This checkpoint is documentation
+  and verification only; no application source files were changed.
+- Official MediaMTX v1.21.0 Linux amd64 archive checksum and GitHub attestation
+  independently verified; extracted executable hash is recorded in §2 and
+  evidence is preserved in `_evidence/mediamtx-v1.21.0-official-verification/`.
+- Focused installer-builder regression file passed on Windows/Python
+  `3.14.6`: **23 passed, 1 skipped, 17 subtests passed** in 8.34 seconds.
+  Command: `pytest installer/tests/test_build_release_installer.py -q`.
+  Pytest initially failed during fixture setup because its temporary shim was
+  directed to a sandbox-protected system temp path. The identical test command
+  passed after setting `TEMP` and `TMP` to `_pytest-scratch/` inside this
+  isolated worktree. The test file exercises release manifest/payload checks,
+  `git archive` line endings, tar executable modes and builder fail-fast
+  behavior; inspection confirmed it does not invoke Docker. The one skipped
+  test requires POSIX executable-bit behavior and is not counted as a pass.
+- Green's existing acceptance package was preserved unchanged at the shared
+  handoff path recorded in the coordination note; its copied-file SHA-256 is
+  `E6DF8D5CE290713DAA3B2F815B72E95F85CE118160F7D76C4AD89436D7FDFB0E`.
+  Its referenced `_evidence/CODEX-SHA256SUMS.txt` manifest independently
+  verified **45/45 entries**, with no missing or mismatched file (manifest
+  SHA-256 `7c833b0add60a745f326ec416e6bd32337351ac45a70d3072634fa81c6ea565f`).
+
+### Pending checklist and blockers
+
+| Work item | State / evidence | Responsible party | Estimate / next action |
+|---|---|---|---|
+| TRUST-1 production public registry and independent digest | Missing; no production access performed | Authorized cloud trust administrator, identity to be confirmed by Red/owner | Obtain through approved release-materials channel; estimate one business day after custodian and transfer channel are identified |
+| Software Update public key and separately verified fingerprint | Missing; private key is not requested | Existing release-signing custodian, identity to be confirmed by Red/owner | Obtain public PEM + provenance/fingerprint via approved channel; estimate one business day after custodian is identified |
+| Current Docker queue/lock holder | NOT VERIFIED; October 23 lock-order note and an absent historical marker do not establish current status | Red/current lock custodian; owner authorizes a test window | Red to report queue, holder, authoritative lock path and preserved logs; no Docker until explicit owner authorization |
+| Ubuntu 24.04 / Python 3.12 build and lifecycle acceptance | Pending; current focused test ran on Windows Python 3.14.6 only | Red / release engineering, with Green independent validation | Prepare after release inputs and owner-approved Docker window; estimate 1–2 days after access and lock are available |
+| LPR commercial licensing | Distribution blocker; no legal clearance in this review | Owner/legal and release owner | Obtain documented commercial-use clearance before customer distribution; date not estimable until decision owner is assigned |
+| Historical `aws.env` credential assessment and secure archival approval | Risk remains flagged; values are not shown/copied; no history-bearing bundle/push created | Credential owner/security and repository owner | Credential owner to assess validity and handle any required rotation under separate approval; owner to approve encrypted archival destination before any history-bearing backup |
+| Green acceptance-package independent review | Package copied and hash recorded; review result not yet received | Green | Green to return exact findings against `dcace5778c56988d447bd8a182a8308e7fb21dc5`; estimate 1 business day after review begins |
+
+### Release state
+
+The MediaMTX artifact provenance sub-gate is **PASS**. The focused Windows
+installer-builder tests are **PASS with one platform-specific skip**. Linux
+installer construction and Linux acceptance remain **BLOCKED** on the missing
+approved TRUST-1 registry/digest and update public key/fingerprint, plus a
+separately authorized Ubuntu/Docker test window. No installer was built, no
+Docker command was run, no credential or private key was accessed, and no
+appliance or production system was changed. The next independent action is to
+review Green's acceptance package and reconcile its claims against the frozen
+source commit while Red supplies the requested custodian and lock-status
+information.
