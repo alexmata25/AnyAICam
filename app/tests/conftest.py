@@ -365,6 +365,11 @@ def _appliance_entitlements(request, monkeypatch, tmp_path):
         return
     monkeypatch.setattr(appliance_entitlements, "STATE_FILE", tmp_path / "feature_entitlements.json")
     monkeypatch.setattr(appliance_entitlements, "TRUST_ANCHOR_FILE", tmp_path / "trust-anchor" / "entitlement_signing_keys.json")
+    # TRUST-1 (1.2.7.1): the protected trust registry and its monotonic state live beside it (absent = legacy mode).
+    monkeypatch.setattr(appliance_entitlements, "TRUST_REGISTRY_FILE",
+                        tmp_path / "trust-anchor" / "entitlement_trust_registry.json", raising=False)
+    monkeypatch.setattr(appliance_entitlements, "TRUST_STATE_FILE",
+                        tmp_path / "trust-anchor" / "entitlement_trust_state.json", raising=False)
     # Licensed camera capacity (vms_capacity.py, signed 2026-10-09): its files
     # live in the test's directory too, the root-owned fallback included.
     import vms_capacity

@@ -119,11 +119,34 @@ def test_only_verified_accepted_state_grants_capacity_and_remains_offline_after_
                                             "vms_license_capacity": 6, "source": "signed"}
 
 
+def _trust_registry_with(capacity_state, state):
+    public_b64 = base64.b64encode(capacity_state["public"]).decode("ascii")
+    return capacity_accept.TrustContext({
+        "type": "anyaicam.entitlement_trust_registry", "version": 1, "environment": "production", "generation": 2,
+        "issued_at": capacity_state["now"].isoformat(),
+        "keys": {"cloud-key": {"public_key": public_b64, "state": state,
+                               "purposes": ["analytics", "capacity", "features", "local_access"],
+                               "environment": "production", "changed_generation": 2}}}, None)
+
+
 def test_accepted_capacity_remains_valid_after_its_signing_key_is_retired(capacity_state, monkeypatch):
+    """TRUST-1: RETIRED (verify-only) keeps the accepted capacity."""
     accept_in_test(capacity_state, signed_snapshot(capacity_state, 6))
-    monkeypatch.setattr(appliance_entitlements, "_trusted_keys", lambda: {})
+    monkeypatch.setattr(appliance_entitlements, "_trust_registry", lambda: _trust_registry_with(capacity_state, "retired"))
     assert vms_capacity.load_capacity() == {"camera_slot_quantity": 6, "plan_camera_slots": 6,
                                             "vms_license_capacity": 6, "source": "signed"}
+
+
+def test_accepted_capacity_is_refused_once_its_signing_key_is_revoked_or_removed(capacity_state, monkeypatch):
+    """TRUST-1 (b8 kept the capacity through accepted_key): REVOKED or no longer trusted -> nothing."""
+    accept_in_test(capacity_state, signed_snapshot(capacity_state, 6))
+    monkeypatch.setattr(appliance_entitlements, "_trust_registry", lambda: _trust_registry_with(capacity_state, "revoked"))
+    assert vms_capacity.load_capacity() is None
+    assert vms_capacity.capacity_status()["reason"] == "revoked"
+    monkeypatch.setattr(appliance_entitlements, "_trust_registry", lambda: capacity_accept.TrustContext(
+        capacity_accept.legacy_trust_registry({"other-key": base64.b64encode(bytes(32)).decode()}), None))
+    assert vms_capacity.load_capacity() is None
+    assert vms_capacity.capacity_status()["reason"] == "unknown_key"
 
 
 def test_new_untrusted_staging_cannot_revoke_or_raise_last_accepted_limit(capacity_state):
