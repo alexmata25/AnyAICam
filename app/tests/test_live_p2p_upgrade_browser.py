@@ -32,20 +32,24 @@ ORIGIN = "http://anyaicam.test"
 
 FAKES_JS = r"""
 window.__log = {hlsLoads: [], hlsDestroyed: 0, pcs: []};
-// Playwright's WebKit build for Windows ships without WebRTC, MediaStream
-// and MediaSource (real Safari has all three), and its video.srcObject
-// rejects anything but a real MediaProvider. A Blob IS a MediaProvider
-// there, so the fake connection hands the page a Blob as its "stream" --
-// enough for the page's own upgrade/fallback logic to run in the Safari
-// engine. Real WebRTC playback on Safari still needs Apple hardware.
-window.__makeFakeStream = () => {
-  if (typeof window.MediaStream === 'undefined') return new Blob([]);
-  try {
-    const canvas = document.createElement('canvas'); canvas.width = 64; canvas.height = 48;
-    canvas.getContext('2d').fillRect(0, 0, 64, 48);
-    return canvas.captureStream ? canvas.captureStream(5) : new MediaStream();
-  } catch (e) { return new MediaStream(); }
-};
+// The test replaces WebRTC and media transport, so use a deterministic
+// MediaStream subset in every browser instead of relying on engine-specific
+// WebRTC implementations. The production code assembles incoming event.track
+// values into a stream; supplying a real-shaped track avoids the invalid
+// addTrack(undefined) fixture that previously prevented all transitions.
+class FakeTrack { constructor(kind) { this.kind = kind; this.id = kind + '-fixture'; } stop() {} }
+class FakeMediaStream {
+  constructor(tracks = []) { this.tracks = [...tracks]; }
+  getTracks() { return [...this.tracks]; }
+  addTrack(track) { if (!this.tracks.includes(track)) this.tracks.push(track); }
+}
+window.MediaStream = FakeMediaStream;
+Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+  configurable: true,
+  get() { return this.__fixtureSrcObject || null; },
+  set(value) { this.__fixtureSrcObject = value; },
+});
+window.__makeFakeStream = () => new FakeMediaStream([new FakeTrack('video')]);
 window.__p2pDelayMs = 1500;
 class FakeHls {
   static isSupported() { return true; }
@@ -53,7 +57,13 @@ class FakeHls {
   static get ErrorTypes() { return {NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError'}; }
   constructor() { this.handlers = {}; }
   loadSource(url) { window.__log.hlsLoads.push(url); }
-  attachMedia(video) { this.video = video; setTimeout(() => (this.handlers.manifestParsed || []).forEach(f => f()), 10); }
+  attachMedia(video) {
+    this.video = video;
+    setTimeout(() => {
+      (this.handlers.manifestParsed || []).forEach(f => f());
+      video.dispatchEvent(new Event('playing'));
+    }, 10);
+  }
   on(event, fn) { (this.handlers[event] = this.handlers[event] || []).push(fn); }
   destroy() { window.__log.hlsDestroyed++; }
   startLoad() {}
@@ -92,7 +102,10 @@ class FakePC extends EventTarget {
           this.packetsReceived += 10; this.framesDecoded += 1;
         }
       }, 100);
-      if (this.ontrack) this.ontrack({streams: [window.__makeFakeStream()]});
+      if (this.ontrack) {
+        const stream = window.__makeFakeStream();
+        this.ontrack({streams: [stream], track: stream.getTracks()[0]});
+      }
     }, window.__p2pDelayMs);
   }
   async addIceCandidate() {}
@@ -253,8 +266,9 @@ def test_relay_first_then_p2p_upgrade_then_relay_fallback(playwright_instance, p
         # 3. P2P fails -> back to relay
         loads_before = harness.log()["hlsLoads"]
         page.evaluate("() => window.__log.pcs[window.__log.pcs.length - 1]._set('failed')")
-        assert harness.wait_for(lambda: harness.log()["hlsLoads"] > loads_before), "relay not re-attached after P2P failure"
-        assert harness.outcomes.count("relay") >= 2
+        assert harness.wait_for(
+            lambda: harness.log()["hlsLoads"] > loads_before and harness.outcomes.count("relay") >= 2
+        ), "relay was not re-attached and reported after P2P failure"
         assert harness.playlist_requests > requests_after_upgrade
     finally:
         browser.close()
@@ -311,8 +325,9 @@ def test_p2p_that_freezes_mid_session_falls_back_to_the_relay(playwright_instanc
         assert harness.wait_for(lambda: "p2p" in harness.outcomes), f"p2p never won: {harness.outcomes}"
         loads_before = harness.log()["hlsLoads"]
         page.evaluate("() => { window.__p2pFreeze = true; }")  # still 'connected', frames stop
-        assert harness.wait_for(lambda: harness.log()["hlsLoads"] > loads_before), "frozen P2P must fall back to the relay"
-        assert harness.outcomes[-1] == "relay"
+        assert harness.wait_for(
+            lambda: harness.log()["hlsLoads"] > loads_before and harness.outcomes[-1:] == ["relay"]
+        ), "frozen P2P must fall back and report the resumed relay"
     finally:
         browser.close()
 
@@ -331,8 +346,10 @@ def test_poor_quality_p2p_falls_back_to_the_relay(playwright_instance, pages, en
         assert harness.wait_for(lambda: "p2p" in harness.outcomes), f"p2p never won: {harness.outcomes}"
         loads_before = harness.log()["hlsLoads"]
         page.evaluate("() => { window.__p2pPoor = true; }")
-        assert harness.wait_for(lambda: harness.log()["hlsLoads"] > loads_before, timeout=12.0), "poor P2P must fall back to the relay"
-        assert harness.outcomes[-1] == "relay"
+        assert harness.wait_for(
+            lambda: harness.log()["hlsLoads"] > loads_before and harness.outcomes[-1:] == ["relay"],
+            timeout=12.0,
+        ), "poor P2P must fall back and report the resumed relay"
     finally:
         browser.close()
 
