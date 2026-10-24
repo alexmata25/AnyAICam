@@ -67,3 +67,11 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 ## Recommendation
 
 The corrective source work has substantial focused offline coverage, but Linux 1.2.7.1 is **NOT READY for physical installation or customer distribution**. Remaining gates: supported Ubuntu/Python 3.12 Docker and installer lifecycle validation; approved trusted release materials and immutable image digest; pinned Ultralytics opt-out check; full backup/restore and appliance acceptance after separate owner approval; Red/Green independent review; and LPR licensing clearance. The local route/signaling tests do not demonstrate actual camera media delivery over a physical P2P link.
+
+## Release-preparation checkpoint — 2026-10-24
+
+- Exact application/test source remains `dcace5778c56988d447bd8a182a8308e7fb21dc5`; the current local review branch includes report-only descendants. The tracked source/index are clean; untracked local evidence and temporary SQLite/test artifacts remain preserved and excluded from commits.
+- The Green reviewer handoff is committed at `7d5d212672c786f34d46e8fdef9f96831b1aa021`: `CODEX-GREEN-ACCEPTANCE-PACKAGE-1271.md`. It records exact test commands, hashes, release-input inventory, lifecycle and physical-camera procedures, license/runtime gates, and unresolved acceptance work.
+- No approved production trust registry/digest, update public key/fingerprint, or MediaMTX binary/hash is present in the tracked source. Release build must wait for the authorized suppliers and an explicit Docker lock window if preloading is chosen.
+- Ultralytics `8.3.40` is pinned, but the telemetry runtime smoke used local `8.4.115`; pinned-image behavior remains unverified. The LPR weights are fetched from a pinned model repository revision and hash, but model/runtime commercial distribution rights remain a legal/owner gate.
+- No installer, Docker image, PostgreSQL 16 test, Linux lifecycle test, root-owned Linux check, physical camera run, or appliance installation was performed. Frozen b8, Red worktrees, production, Ryzen, and Samsung remain unchanged.
