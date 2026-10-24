@@ -1,8 +1,8 @@
 # Linux 1.2.7.1 release-input and preservation plan
 
-Date: 2026-10-24  
-Application/test source: `dcace5778c56988d447bd8a182a8308e7fb21dc5`  
-Review branch: `codex/linux-1271-integrated`  
+Date: 2026-10-24
+Application/test source: `dcace5778c56988d447bd8a182a8308e7fb21dc5`
+Review branch: `codex/linux-1271-integrated`
 Frozen baseline: `b8c7a7edba7083ee703bb7a4d71bc8f27ea7dc5c`
 
 This is an offline preparation record. No installer, image, registry, key, or
