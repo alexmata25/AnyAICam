@@ -492,6 +492,12 @@ def _seed_appliance(db_path):
 def licensed(monkeypatch):
     import customer_entitlements
     monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 64)
+    # Provisioning now uses usable_camera_capacity(), which also requires a
+    # software entitlement. This fixture isolates the recording-mode policy
+    # under test; without an explicit licensed-capacity stub the endpoint
+    # correctly returns its capacity-refusal JSONResponse before creating a
+    # job, and the test would inspect the wrong response shape.
+    monkeypatch.setattr(customer_entitlements, "usable_camera_capacity", lambda customer_id: 64)
 
 
 @pytest.mark.parametrize("mode,expected", [(None, "motion"), ("motion", "motion"), ("disabled", "disabled"),
