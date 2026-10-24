@@ -16,7 +16,7 @@
     <meta property="og:image:alt" content="Cloud storage pricing table showing 2MP, 4MP, 8MP camera costs per recording type">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="Cloud Storage Pricing | ANY AI CAM - Per Camera Monthly Plans">
-    <meta name="twitter:description" content="Per-camera cloud pricing for 2MP, 4MP, and 8MP security cameras with motion-triggered and continuous recording options. Save up to 10% annually.">
+    <meta name="twitter:description" content="Per-camera cloud pricing for 2MP, 4MP, and 8MP security cameras with motion-triggered (event) recording. Save up to 10% annually.">
     <script type="application/ld+json">
         {
           "@context": "https://schema.org",
@@ -657,7 +657,6 @@
 <label style="display:grid; gap:0.35rem; font-weight:800; color:#0b1332;">Recording type
                                     <select id="indexRecordingSelect" style="min-height:3rem; border:1px solid #cfd9ea; border-radius:8px; padding:0 0.8rem; font-weight:700; color:#0b1332; background:#fff;">
 <option value="motion">Motion events</option>
-<option value="continuous">Continuous recording</option>
 </select>
 </label>
 <label style="display:grid; gap:0.35rem; font-weight:800; color:#0b1332;">Cloud retention
@@ -761,13 +760,6 @@
                                         <td class="price" data-monthly="8.39">$8.39</td>
                                         <td class="price" data-monthly="10.99">$10.99</td>
                                     </tr>
-                                    <tr>
-                                        <td class="recording-type">24/7 continuous</td>
-                                        <td class="price" data-monthly="10.99">$10.99</td>
-                                        <td class="price" data-monthly="9.79">$9.79</td>
-                                        <td class="price" data-monthly="10.89">$10.89</td>
-                                        <td class="price" data-monthly="11.99">$11.99</td>
-                                    </tr>
                                 </tbody>
                             </table>
                         </div>
@@ -796,13 +788,6 @@
                                         <td class="price" data-monthly="9.19">$9.19</td>
                                         <td class="price" data-monthly="10.09">$10.09</td>
                                     </tr>
-                                    <tr>
-                                        <td class="recording-type">24/7 continuous</td>
-                                        <td class="price" data-monthly="9.49">$9.49</td>
-                                        <td class="price" data-monthly="11.09">$11.09</td>
-                                        <td class="price" data-monthly="13.29">$13.29</td>
-                                        <td class="price" data-monthly="14.79">$14.79</td>
-                                    </tr>
                                 </tbody>
                             </table>
                         </div>
@@ -830,13 +815,6 @@
                                         <td class="price" data-monthly="9.09">$9.09</td>
                                         <td class="price" data-monthly="9.89">$9.89</td>
                                         <td class="price" data-monthly="11.29">$11.29</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="recording-type">24/7 continuous</td>
-                                        <td class="price" data-monthly="9.99">$9.99</td>
-                                        <td class="price" data-monthly="12.39">$12.39</td>
-                                        <td class="price" data-monthly="15.69">$15.69</td>
-                                        <td class="price" data-monthly="17.59">$17.59</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -1042,17 +1020,14 @@
             var cloudPrices = {
                 "2mp": {
                     motion: { "2": 7.99, "7": 8.09, "14": 8.39, "30": 8.99 },
-                    continuous: { "2": 8.99, "7": 9.79, "14": 10.89, "30": 11.99 },
                     label: "2MP / 1080p"
                 },
                 "4mp": {
                     motion: { "2": 8.19, "7": 8.59, "14": 9.19, "30": 10.09 },
-                    continuous: { "2": 9.49, "7": 11.09, "14": 13.29, "30": 14.79 },
                     label: "4MP"
                 },
                 "8mp": {
                     motion: { "2": 8.49, "7": 9.09, "14": 9.89, "30": 11.29 },
-                    continuous: { "2": 9.99, "7": 12.39, "14": 15.69, "30": 17.59 },
                     label: "8MP / 4K"
                 }
             };

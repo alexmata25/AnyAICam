@@ -972,7 +972,6 @@ main{padding:36px 14px 72px!important}
 <h3 class="subheading">Recording Type</h3>
 <div class="recording-row">
 <div class="camera-option recording-choice" data-type="motion"><h3>Motion Triggered</h3><p>Records when activity is detected</p></div>
-<div class="camera-option recording-choice" data-type="continuous"><h3>24/7 Continuous</h3><p>Records continuously</p></div>
 </div>
 <h3 class="subheading">Storage Duration</h3>
 <div class="duration-grid">
@@ -1260,30 +1259,18 @@ main{padding:36px 14px 72px!important}
             "2mp-14days-motion": 8.39,
             "2mp-30days-motion": 8.99,
 
-            "2mp-2days-continuous": 8.99,
-            "2mp-7days-continuous": 9.79,
-            "2mp-14days-continuous": 10.89,
-            "2mp-30days-continuous": 11.99,
 
             "4mp-2days-motion": 8.19,
             "4mp-7days-motion": 8.59,
             "4mp-14days-motion": 9.19,
             "4mp-30days-motion": 10.09,
 
-            "4mp-2days-continuous": 9.49,
-            "4mp-7days-continuous": 11.09,
-            "4mp-14days-continuous": 13.29,
-            "4mp-30days-continuous": 14.79,
 
             "8mp-2days-motion": 8.49,
             "8mp-7days-motion": 9.09,
             "8mp-14days-motion": 9.89,
             "8mp-30days-motion": 11.29,
 
-            "8mp-2days-continuous": 9.99,
-            "8mp-7days-continuous": 12.39,
-            "8mp-14days-continuous": 15.69,
-            "8mp-30days-continuous": 17.59,
 
             "smart-motion": 1.79,
             "people-counting": 10.99,
@@ -1476,7 +1463,7 @@ main{padding:36px 14px 72px!important}
                 }
 
                 lines.push(`Camera Resolution / Quantity: ${resParts.length ? resParts.join(', ') : 'Not selected'}`);
-                lines.push(`Recording Type: ${selectedValues.recordingType === 'motion' ? 'Motion Only' : selectedValues.recordingType === 'continuous' ? '24/7 Continuous' : 'Not selected'}`);
+                lines.push(`Recording Type: ${selectedValues.recordingType === 'motion' ? 'Motion Only' : 'Not selected'}`);
                 lines.push(`Storage Duration: ${selectedValues.duration ? selectedValues.duration + ' days' : 'Not selected'}`);
                 lines.push(`Billing Preference: ${selectedValues.billingCycle === 'annual' ? 'Annual Billing (10% Off)' : 'Monthly Billing'}`);
                 lines.push(`Estimated Cloud Monthly Total After Trial: ${formatMoney(pricing.futureCloudMonthlyTotal)}`);
@@ -1933,7 +1920,7 @@ main{padding:36px 14px 72px!important}
                 }
                 html += resParts.join(', ');
                 html += `</p>
-                            <p><strong>Recording Type:</strong> ${selectedValues.recordingType === 'motion' ? 'Motion Only' : '24/7 Continuous'}</p>
+                            <p><strong>Recording Type:</strong> Motion Only</p>
                             <p><strong>Storage Duration:</strong> ${selectedValues.duration} days</p>
                             <p><strong>Billing Preference:</strong> ${selectedValues.billingCycle === 'annual' ? 'Annual Billing (10% Off)' : 'Monthly Billing'}</p>
                             <p>Cloud Base Estimate: ${formatMoney(pricing.cloudBaseMonthlySubtotal)} / month</p>
