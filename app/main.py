@@ -503,7 +503,14 @@ try:
 
 
 
-    from ultralytics import YOLO
+    try:
+        from ultralytics_privacy import load_yolo_class
+
+        YOLO = load_yolo_class()
+    except Exception:
+        # A telemetry opt-out or model-runtime problem disables optional AI,
+        # never the independent video, recording, or playback pipeline.
+        YOLO = None
 
     import torch
 

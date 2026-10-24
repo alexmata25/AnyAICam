@@ -23,7 +23,13 @@ import os
 
 import analytics_platform
 
-from ultralytics import YOLO
+from ultralytics_privacy import load_yolo_class
+
+try:
+    YOLO = load_yolo_class()
+except Exception:
+    # Optional AI is fail-closed; camera recording and the rest of VMS stay up.
+    YOLO = None
 
 # 1.3.2: unset means on only when the PPE model is installed (always on the Linux image; never on Windows,
 # which ships no PPE model) -- analytics_platform.ppe_switch_default().

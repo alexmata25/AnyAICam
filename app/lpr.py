@@ -294,7 +294,8 @@ def _get_plate_model():
         try:
             if not os.path.isfile(LPR_PLATE_MODEL_PATH):
                 raise FileNotFoundError(LPR_PLATE_MODEL_PATH)
-            from ultralytics import YOLO
+            from ultralytics_privacy import load_yolo_class
+            YOLO = load_yolo_class()
             _plate_model = YOLO(LPR_PLATE_MODEL_PATH)
         except Exception:
             _plate_model_failed = True

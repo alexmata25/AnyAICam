@@ -9,9 +9,11 @@ naming every module that failed, so setup stops visibly instead of installing a
 service that crashes on every start.
 """
 import importlib
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 REQUIRED_MODULES = (
     "fastapi",
@@ -44,6 +46,10 @@ def check(modules=None):
     if "ultralytics" in loaded:
         try:
             from ultralytics import YOLO  # noqa: F401  (the name app/main.py imports)
+            from ultralytics import settings
+            from ultralytics.utils.events import events
+            if settings.get("sync") is not False or getattr(events, "enabled", None) is not False:
+                failures.append("ultralytics: outbound telemetry is not disabled")
         except Exception as exc:
             failures.append(f"ultralytics.YOLO: {type(exc).__name__}: {exc}")
     return failures
@@ -51,8 +57,11 @@ def check(modules=None):
 
 def main():
     # Keep ultralytics' first-import settings file out of the installing
-    # user's profile.
-    os.environ.setdefault("YOLO_CONFIG_DIR", tempfile.mkdtemp(prefix="anyaicam-preflight-"))
+    # user's profile and opt out before importing it. Its telemetry sender
+    # snapshots this value during package import.
+    settings_dir = Path(tempfile.mkdtemp(prefix="anyaicam-preflight-"))
+    (settings_dir / "settings.json").write_text(json.dumps({"sync": False}), encoding="utf-8")
+    os.environ["YOLO_CONFIG_DIR"] = str(settings_dir)
     failures = check()
     if failures:
         # stdout only: the setup log records it, and Windows PowerShell 5.1
