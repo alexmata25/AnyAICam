@@ -2294,6 +2294,24 @@ def apply_migrations():
         # older edge sync, cloud or restored backup is corrected the next time
         # the VMS (edge) or portal (cloud) starts. Idempotent.
         enforce_event_only_recording(db)
+        # Linux 1.2.7.1 (D-AUTHZ-1 residual / D-AUTHZ-2b): how each Partner Portal
+        # session was proven (auth_source) and its server-side MFA marker
+        # (mfa_state verified / enrollment_only / reenroll_required, set only
+        # by MFA verification or break-glass), plus the cloud role lock
+        # (admin_auth_policy). Additive columns; the data step runs once.
+        session_columns_now=_columns('user_sessions')
+        for name in ('auth_source','mfa_verified_at','mfa_method','mfa_state'):
+            if session_columns_now and name not in session_columns_now:
+                db.execute(f'ALTER TABLE user_sessions ADD COLUMN {name} TEXT')
+        import admin_auth_policy
+        db.execute(admin_auth_policy.ROLE_LOCK_DDL)
+        admin_auth_policy.record_role_lock(db)
+        if SESSION_AUTHZ_MFA not in applied and session_columns_now:
+            counts=session_authz_mfa_migration(db, cloud=_role_locked_cloud(db))
+            db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(SESSION_AUTHZ_MFA,datetime.now().isoformat()))
+            logger.info('Applied database migration %s (%s)',SESSION_AUTHZ_MFA,
+                        ' '.join(f'{key}={value}' for key,value in sorted(counts.items())))
+
 def enforce_event_only_recording(db) -> dict:
     """R-REC-1 (1.2.7.1): event recording is the only recording mode.
 
@@ -2341,25 +2359,6 @@ def enforce_event_only_recording(db) -> dict:
                 ('system', 'system', 'recording.event_only_migration', 'cameras', '', json.dumps(counts, sort_keys=True),
                  datetime.now().isoformat()))
     return counts
-
-        # Linux 1.2.7.1 (D-AUTHZ-1 residual / D-AUTHZ-2b): how each Partner Portal
-        # session was proven (auth_source) and its server-side MFA marker
-        # (mfa_state verified / enrollment_only / reenroll_required, set only
-        # by MFA verification or break-glass), plus the cloud role lock
-        # (admin_auth_policy). Additive columns; the data step runs once.
-        session_columns_now=_columns('user_sessions')
-        for name in ('auth_source','mfa_verified_at','mfa_method','mfa_state'):
-            if session_columns_now and name not in session_columns_now:
-                db.execute(f'ALTER TABLE user_sessions ADD COLUMN {name} TEXT')
-        import admin_auth_policy
-        db.execute(admin_auth_policy.ROLE_LOCK_DDL)
-        admin_auth_policy.record_role_lock(db)
-        if SESSION_AUTHZ_MFA not in applied and session_columns_now:
-            counts=session_authz_mfa_migration(db, cloud=_role_locked_cloud(db))
-            db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(SESSION_AUTHZ_MFA,datetime.now().isoformat()))
-            logger.info('Applied database migration %s (%s)',SESSION_AUTHZ_MFA,
-                        ' '.join(f'{key}={value}' for key,value in sorted(counts.items())))
-
 
 # One-time, at the deploy of claim-flow activation (2026-10-11). Before it, an
 # appliance linked through a claim code never started its account's deferred
