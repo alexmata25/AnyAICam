@@ -158,6 +158,7 @@ caller
             agent_scripts.mkdir(parents=True)
             (agent_scripts / "lib-capacity-accept.sh").write_text("""\
 install_capacity_accept() { [[ -d "$VMS_DATA_CONFIG_DIR" ]] && [[ ! -L "$VMS_DATA_CONFIG_DIR" ]]; }
+migrate_capacity_trust_state() { :; }
 """, encoding="utf-8")
             step = ROOT / "installer/16-capacity-accept.sh"
             script = f'''\

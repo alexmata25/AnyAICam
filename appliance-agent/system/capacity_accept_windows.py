@@ -7,16 +7,23 @@ Ported from Codex 07e934a onto Red's Windows trust layout (claude/red-127-window
   identity  %ProgramData%\\AnyAiCam\\recordings\\appliance_identity.json
   keyset    %ProgramData%\\AnyAiCam\\update\\entitlement_signing_keys.json (installed by install-runtime.ps1)
   accepted  %ProgramData%\\AnyAiCam\\update\\vms_capacity_accepted.json
+  registry  %ProgramData%\\AnyAiCam\\update\\entitlement_trust_registry.json (TRUST-1; installed by the Windows
+            runtime installer once Blue's packaging ships it -- until then LEGACY mode: the flat keyset at generation 0)
+  state     %ProgramData%\\AnyAiCam\\update\\entitlement_trust_state.json   (monotonic; ratcheted here under the lock)
 - the ACL rule is platform_paths.windows_write_problem() -- the same check appliance_entitlements and
   vms_capacity already use -- applied to each input/store file and every directory up to %ProgramData%\\AnyAiCam;
 - the signed-format, identity-transition, expiry, replay and high-water policy is the Linux helper's own
-  (capacity_accept._validate_keyset / _validate_state / _advance); filesystem work is never delegated to it.
+  (capacity_accept._validate_keyset / _state_floor / _advance and the shared trust resolver, TrustContext); filesystem
+  work is never delegated to it. TRUST-1 + G2 parity (1.2.7.1): the signer is resolved against the current registry
+  (active / retired / revoked, registry rollback refused), the current accepted state is checked structurally only
+  (a clock rollback never blocks it), new grants stay strict.
 
 No command-line or environment path overrides. The injectable seams are for isolated policy tests only.
 """
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +33,7 @@ import sys
 MAX_INPUT_BYTES = 256 * 1024
 MAX_TRUST_BYTES = 64 * 1024
 MAX_STATE_BYTES = 512 * 1024
+MAX_REGISTRY_BYTES = 256 * 1024
 
 
 class Reject(ValueError):
@@ -56,6 +64,8 @@ def _paths() -> dict:
         "identity": root / "recordings" / "appliance_identity.json",
         "trust": platform_paths.UPDATE_DIR / "entitlement_signing_keys.json",
         "accepted": platform_paths.UPDATE_DIR / "vms_capacity_accepted.json",
+        "registry": platform_paths.UPDATE_DIR / "entitlement_trust_registry.json",
+        "trust_state": platform_paths.UPDATE_DIR / "entitlement_trust_state.json",
     }
 
 
@@ -156,14 +166,24 @@ def accept_pending() -> str:
     return _accept_from_paths(_paths())
 
 
-def _accept_from_paths(paths, *, keyset=None, verifier=None, acl_problem=None, now=None) -> str:
-    """Injectable policy seam for tests; never exposed through a command line or the environment."""
+def _accept_from_paths(paths, *, keyset=None, registry=None, trust_state=None, verifier=None, acl_problem=None,
+                       now=None) -> str:
+    """Injectable policy seam for tests; never exposed through a command line or the environment. keyset= (flat,
+    LEGACY), registry= and trust_state= (documents) replace the corresponding files when given."""
     if not paths["staging"].exists():
         return "no_pending_snapshot"
     acl_problem = acl_problem or _windows_acl_problem
     root = paths["root"]
-    for name in ("staging", "identity", "trust"):
+    registry_path, state_path = paths.get("registry"), paths.get("trust_state")
+    registry_installed = registry is not None or (registry_path is not None and registry_path.exists())
+    inputs = ["staging", "identity"]
+    if not registry_installed and keyset is None:
+        inputs.append("trust")
+    for name in inputs:
         if acl_problem(paths[name], root):
+            raise Reject("unsafe_input_acl")
+    for path in (registry_path, state_path):
+        if path is not None and path.exists() and acl_problem(path, root):
             raise Reject("unsafe_input_acl")
     if acl_problem(paths["accepted"].parent, root):
         raise Reject("unsafe_store_acl")
@@ -172,32 +192,34 @@ def _accept_from_paths(paths, *, keyset=None, verifier=None, acl_problem=None, n
 
     snapshot = _json_file(paths["staging"], MAX_INPUT_BYTES)
     identity = _json_file(paths["identity"], MAX_INPUT_BYTES)
-    key_doc = keyset if keyset is not None else _json_file(paths["trust"], MAX_TRUST_BYTES)
 
     system_dir = str(Path(__file__).resolve().parent)
     if system_dir not in sys.path:
         sys.path.insert(0, system_dir)
     import capacity_accept as policy
 
-    try:
-        public_keys = policy._validate_keyset(key_doc)
-    except policy.Reject as error:
-        raise Reject(str(error)) from error
     verify = verifier or _verify_ed25519
-
-    def validate_state(state):
+    with _windows_lock(paths["accepted"].parent / ".vms_capacity_accepted.lock"):
         try:
-            return policy._validate_state(state, public_keys, now=now, verifier=verify)
+            trust = _trust_context(policy, paths, keyset=keyset, registry=registry, trust_state=trust_state)
+            if trust.mode == "registry":  # ratchet the protected state under the lock (never backwards)
+                next_state = policy.next_trust_state(trust.registry, trust.registry_sha256, trust.state)
+                if next_state != trust.state:
+                    _atomic_replace(state_path, policy.canonical_trust_state(next_state))
+                    trust.state = policy.parse_trust_state(next_state)
+        except policy.TrustError as error:
+            raise Reject(str(error)) from error
         except policy.Reject as error:
             raise Reject(str(error)) from error
-
-    with _windows_lock(paths["accepted"].parent / ".vms_capacity_accepted.lock"):
         current = None
         if paths["accepted"].exists():  # read under the lock: monotonic updates are serialised
             current = _json_file(paths["accepted"], MAX_STATE_BYTES)
-            validate_state(current)
+            try:
+                policy._state_floor(current)  # structural only: a clock rollback or revoked signer never blocks
+            except policy.Reject as error:
+                raise Reject(str(error)) from error
         try:
-            next_state, outcome = policy._advance(snapshot, public_keys, identity, current, now=now, verifier=verify)
+            next_state, outcome = policy._advance(snapshot, trust, identity, current, now=now, verifier=verify)
         except policy.Reject as error:
             raise Reject(str(error)) from error
         if outcome == "unchanged":
@@ -207,6 +229,33 @@ def _accept_from_paths(paths, *, keyset=None, verifier=None, acl_problem=None, n
             raise Reject("accepted_state_too_large")
         _atomic_replace(paths["accepted"], encoded)
         return outcome
+
+
+def _trust_context(policy, paths, *, keyset=None, registry=None, trust_state=None):
+    """The installed trust (TRUST-1): registry + protected state when a registry is installed, else LEGACY (the flat
+    keyset at generation 0; refused by the resolver once the state or the accepted grant records generation >= 1)."""
+    state_path, registry_path = paths.get("trust_state"), paths.get("registry")
+    if trust_state is None and state_path is not None and state_path.exists():
+        trust_state = _json_file(state_path, MAX_TRUST_BYTES)
+    if registry is None and registry_path is not None and registry_path.exists():
+        with registry_path.open("rb") as stream:
+            data = stream.read(MAX_REGISTRY_BYTES + 1)
+        if len(data) > MAX_REGISTRY_BYTES:
+            raise Reject("file_too_large")
+        try:
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise Reject("invalid_registry") from error
+        return policy.TrustContext(document, trust_state, registry_sha256=hashlib.sha256(data).hexdigest())
+    if registry is not None:
+        return policy.TrustContext(registry, trust_state,
+                                   registry_sha256=hashlib.sha256(policy.canonical_trust_registry(registry)).hexdigest())
+    key_doc = keyset
+    if key_doc is None and paths["trust"].exists():
+        key_doc = _json_file(paths["trust"], MAX_TRUST_BYTES)
+    if key_doc is None:
+        return policy.TrustContext(None, trust_state)
+    return policy.TrustContext(policy.legacy_trust_registry(policy._validate_keyset(key_doc)), trust_state)
 
 
 def main() -> int:

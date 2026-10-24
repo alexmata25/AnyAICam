@@ -14,6 +14,24 @@ migration preserves the existing offline policy and its documented
 pre-migration provenance limitation. Unsigned cloud capacity is never used.
 The old STATE_FILE is maintained by the root helper only as a compatibility
 mirror for an intentional rollback to 1.2.4; this release never reads it.
+
+TRUST-1 + G2 (Linux 1.2.7.1, wt-1271-design/TRUST1-G2-DESIGN.md):
+  * The accepted grant's signer (snapshot signature key_id) is resolved on
+    EVERY read against the CURRENT protected trust registry for purpose
+    "capacity" (appliance_entitlements._trust_registry): active or retired
+    verify; revoked, absent-after-binding, unknown, other-environment, rebound
+    or a rolled-back registry give no capacity. The stored accepted_key and
+    signer fields are cross-checks only and never confer trust.
+  * Accepted mode: the accepted grant is verified without any clock check
+    (appliance_entitlements.verify(accepted=True)), so a clock rollback or a
+    cloud outage never removes the last-known-good capacity. A clock behind
+    the trusted floor (max(high-water issue time, accepted_at)) is reported by
+    capacity_status() as clock_behind_trusted_time, informational only; the
+    root acceptor keeps refusing new grants that look future-dated until the
+    clock is corrected (NTP), then accepts newer grants normally.
+  * Every fail-closed outcome has an explicit reason (capacity_status()) and is
+    logged once per change. Recordings, event media and credentials are never
+    touched; the accepted file is kept as the anti-replay floor.
 """
 from __future__ import annotations
 
@@ -69,42 +87,39 @@ def _record(capacity: dict, source: str) -> dict | None:
             "vms_license_capacity": capacity.get("vms_license_capacity"), "source": source}
 
 
-def _verified_capacity(snapshot, *, check_expiry: bool, public_keys=None) -> tuple[str | None, dict | None]:
-    """(reason, capacity record): reason is None when signature and identity verify."""
-    import appliance_entitlements
-    reason = appliance_entitlements.verify(snapshot, public_keys if public_keys is not None else appliance_entitlements._trusted_keys(),
-                                           identity=appliance_entitlements._local_identity(),
-                                           check_expiry=check_expiry)
-    if reason:
-        return reason, None
-    capacity = snapshot.get("camera_capacity") if isinstance(snapshot, dict) else None
-    return None, (_record(capacity, "signed") if isinstance(capacity, dict) else None)
+_TRUST_CRITICAL = frozenset(("binding_mismatch", "environment_mismatch", "invalid_registry", "invalid_trust_state",
+                             "registry_rollback", "registry_unsafe", "revoked", "scope_denied", "trust_state_unsafe",
+                             "unknown_key", "purpose_denied", "retired_cannot_sign"))
 
 
-def _accepted_signed() -> tuple[bool, dict | None]:
-    """Return (accepted-store-present, usable record); unsafe presence fails closed."""
+def _accepted_signed_detail(now: datetime | None = None) -> tuple[bool, dict | None, str | None, dict]:
+    """(accepted-store-present, usable record, refusal reason, info). Unsafe presence fails closed with a reason.
+    info: signer_key_id, trust_generation, trust_mode, trusted_floor (datetime) when known."""
     import appliance_entitlements
 
+    info: dict = {}
     try:
         if os.name == "nt" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE:
             import platform_paths
             if platform_paths.windows_write_problem(ACCEPTED_FILE.parent):
-                return os.path.lexists(ACCEPTED_FILE), None
+                present = os.path.lexists(ACCEPTED_FILE)
+                return present, None, ("accepted_store_unsafe" if present else None), info
             if os.path.lexists(ACCEPTED_FILE) and platform_paths.windows_write_problem(ACCEPTED_FILE):
-                return True, None
+                return True, None, "accepted_store_unsafe", info
         parent = os.lstat(ACCEPTED_FILE.parent)
         if (stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode) or
                 (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
                  (parent.st_uid != 0 or parent.st_mode & 0o022))):
-            return os.path.lexists(ACCEPTED_FILE), None
+            present = os.path.lexists(ACCEPTED_FILE)
+            return present, None, ("accepted_store_unsafe" if present else None), info
         try:
             before = os.lstat(ACCEPTED_FILE)
         except FileNotFoundError:
-            return False, None
+            return False, None, None, info
         if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
                 (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
                  (before.st_uid != 0 or before.st_mode & 0o022))):
-            return True, None
+            return True, None, "accepted_store_unsafe", info
         fd = os.open(ACCEPTED_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
                      getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
         with os.fdopen(fd, "rb") as handle:
@@ -112,32 +127,51 @@ def _accepted_signed() -> tuple[bool, dict | None]:
             if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
                     (os.name == "posix" and ACCEPTED_FILE == _DEFAULT_ACCEPTED_FILE and
                      (opened.st_uid != 0 or opened.st_mode & 0o022))):
-                return True, None
+                return True, None, "accepted_store_unsafe", info
             raw = handle.read(_MAX_FILE_BYTES + 1)
         if len(raw) > _MAX_FILE_BYTES:
-            return True, None
+            return True, None, "accepted_state_malformed", info
         state = json.loads(raw.decode("utf-8"))
         if not isinstance(state, dict) or state.get("schema") not in {1, 2}:
-            return True, None
+            return True, None, "accepted_state_malformed", info
         accepted_identity = appliance_entitlements._bound_identity(state.get("identity"))
         local_identity = appliance_entitlements._local_identity()
         if accepted_identity is None or accepted_identity != local_identity:
-            return True, None
+            return True, None, "identity_mismatch", info
         snapshot = state.get("snapshot")
-        accepted_keys = None
+        signature = snapshot.get("signature") if isinstance(snapshot, dict) else None
+        key_id = signature.get("key_id") if isinstance(signature, dict) else None
+        trust_generation = state.get("trust_generation", 0)
+        if not isinstance(key_id, str) or type(trust_generation) is not int or trust_generation < 0:
+            return True, None, "accepted_state_malformed", info
+        info.update(signer_key_id=key_id, trust_generation=trust_generation)
+        signer = state.get("signer")
+        if signer is not None and (not isinstance(signer, dict) or signer.get("key_id") != key_id):
+            return True, None, "binding_mismatch", info
+        trust = appliance_entitlements._trust_registry()
+        info["trust_mode"] = trust.mode
+        try:
+            key = trust.resolve(key_id, purpose="capacity", for_new_grant=False,
+                                appliance_id=local_identity["appliance_id"], accepted_generation=trust_generation)
+        except ValueError as error:  # TrustError (fail closed with the resolver's reason)
+            return True, None, str(error), info
         if state.get("schema") == 2:
-            signature = snapshot.get("signature") if isinstance(snapshot, dict) else None
-            key_id = signature.get("key_id") if isinstance(signature, dict) else None
             try:
                 accepted_key = base64.b64decode(state.get("accepted_key"), validate=True)
             except (TypeError, ValueError, base64.binascii.Error):
-                return True, None
-            if not isinstance(key_id, str) or len(accepted_key) != 32:
-                return True, None
-            accepted_keys = {key_id: base64.b64encode(accepted_key).decode("ascii")}
-        reason, record = _verified_capacity(snapshot, check_expiry=False, public_keys=accepted_keys)
-        if reason or record is None:
-            return True, None
+                return True, None, "accepted_state_malformed", info
+            if accepted_key != key:
+                return True, None, "binding_mismatch", info
+        if signer is not None and signer.get("public_key_sha256") != hashlib.sha256(key).hexdigest():
+            return True, None, "binding_mismatch", info
+        reason = appliance_entitlements.verify(snapshot, {key_id: base64.b64encode(key).decode("ascii")},
+                                               identity=local_identity, accepted=True)
+        if reason:
+            return True, None, reason, info
+        capacity = snapshot.get("camera_capacity")
+        record = _record(capacity, "signed") if isinstance(capacity, dict) else None
+        if record is None:
+            return True, None, "malformed_capacity", info
         body = {key: value for key, value in snapshot.items() if key != "signature"}
         high_water = state.get("high_water")
         issued = appliance_entitlements._parse_time(body.get("issued_at"))
@@ -145,14 +179,26 @@ def _accepted_signed() -> tuple[bool, dict | None]:
         if (not isinstance(high_water, dict) or normalized_issued is None or
                 high_water.get("issued_at") != normalized_issued or
                 high_water.get("digest") != hashlib.sha256(_canonical_json(body)).hexdigest()):
-            return True, None
+            return True, None, "invalid_high_water", info
         transition = body.get("identity_transition")
         if transition is not None and (not isinstance(transition, dict) or
                                        state.get("transition_id") != transition.get("transition_id")):
-            return True, None
-        return True, record
+            return True, None, "invalid_identity_transition", info
+        floor = issued
+        accepted_at = appliance_entitlements._parse_time(state.get("accepted_at"))
+        if accepted_at is not None and accepted_at > floor:
+            floor = accepted_at
+        info["trusted_floor"] = floor
+        return True, record, None, info
     except (OSError, ValueError, TypeError):
-        return os.path.lexists(ACCEPTED_FILE), None
+        present = os.path.lexists(ACCEPTED_FILE)
+        return present, None, ("accepted_state_malformed" if present else None), info
+
+
+def _accepted_signed(now: datetime | None = None) -> tuple[bool, dict | None]:
+    """Return (accepted-store-present, usable record); unsafe presence fails closed."""
+    present, record, _reason, _info = _accepted_signed_detail(now)
+    return present, record
 
 
 def _canonical_json(body: dict) -> bytes:
@@ -263,15 +309,77 @@ def _accept_on_windows() -> str:
         return "accept_rejected"
 
 
-def load_capacity() -> dict | None:
-    """The authorized capacity, or None (fail closed). Never raises."""
+_last_status: dict = {"key": None}
+
+
+def _reset_status_for_tests() -> None:
+    _last_status["key"] = None
+
+
+def _evaluate(now: datetime | None = None) -> dict:
+    present, record, reason, info = _accepted_signed_detail(now)
+    source = "signed"
+    if record is None and not present:
+        record, source = _fallback_capacity(), "migrated"
+        if record is None:
+            reason = "no_accepted_capacity"
+    current = (now or datetime.now(timezone.utc))
+    floor = info.get("trusted_floor")
+    import appliance_entitlements
+    status = {
+        "state": "licensed" if record is not None else "fail_closed",
+        "reason": None if record is not None else (reason or "unknown"),
+        "source": source if record is not None else None,
+        "camera_slot_quantity": record["camera_slot_quantity"] if record is not None else None,
+        "signer_key_id": info.get("signer_key_id"),
+        "trust_generation": info.get("trust_generation"),
+        "trust_mode": info.get("trust_mode"),
+        "clock_behind_trusted_time": bool(floor is not None and current < floor - appliance_entitlements.CLOCK_SKEW),
+    }
+    _note_status(status)
+    return {"status": status, "record": record}
+
+
+def _note_status(status: dict) -> None:
+    """Log once per change (never per read/frame): a fail-closed reason at CRITICAL for trust failures, WARNING
+    otherwise; recovery at WARNING."""
+    key = (status["state"], status["reason"], status["source"])
+    if _last_status["key"] == key:
+        return
+    previous, _last_status["key"] = _last_status["key"], key
+    if status["state"] == "fail_closed":
+        level = logging.CRITICAL if status["reason"] in _TRUST_CRITICAL else logging.WARNING
+        logger.log(level, "vms_capacity.fail_closed reason=%s signer=%s trust_generation=%s trust_mode=%s -- no "
+                   "camera is licensed until this is resolved; recordings are kept", status["reason"],
+                   status["signer_key_id"], status["trust_generation"], status["trust_mode"])
+    elif previous is not None and previous[0] == "fail_closed":
+        logger.warning("vms_capacity.recovered source=%s cameras=%s", status["source"], status["camera_slot_quantity"])
+    else:
+        logger.info("vms_capacity.licensed source=%s cameras=%s", status["source"], status["camera_slot_quantity"])
+
+
+def capacity_status(now: datetime | None = None) -> dict:
+    """The authorized capacity and, when none, WHY (TRUST-1/G2 diagnostics): state 'licensed' | 'fail_closed' |
+    'cloud_runtime', reason (registry_rollback, revoked, unknown_key, binding_mismatch, scope_denied,
+    environment_mismatch, no_trust_anchor, identity_mismatch, no_accepted_capacity, ...), signer, trust generation and
+    clock_behind_trusted_time (informational). Never raises."""
+    if _cloud_runtime():
+        return {"state": "cloud_runtime", "reason": None, "source": None, "camera_slot_quantity": None,
+                "signer_key_id": None, "trust_generation": None, "trust_mode": None,
+                "clock_behind_trusted_time": False}
     try:
-        store_exists, record = _accepted_signed()
-        if record is not None:
-            return record
-        if store_exists:
-            return None
-        return _fallback_capacity()
+        return _evaluate(now)["status"]
+    except Exception:
+        logger.exception("vms_capacity.status_failed")
+        return {"state": "fail_closed", "reason": "status_failed", "source": None, "camera_slot_quantity": None,
+                "signer_key_id": None, "trust_generation": None, "trust_mode": None,
+                "clock_behind_trusted_time": False}
+
+
+def load_capacity(now: datetime | None = None) -> dict | None:
+    """The authorized capacity, or None (fail closed, with its reason in capacity_status()). Never raises."""
+    try:
+        return _evaluate(now)["record"]
     except Exception:
         logger.exception("vms_capacity.load_failed")
         return None
@@ -289,16 +397,16 @@ def _activated() -> bool:
         return False
 
 
-def licensed_camera_numbers(provisioned: list[int]) -> list[int] | None:
+def licensed_camera_numbers(provisioned: list[int], now: datetime | None = None) -> list[int] | None:
     """Allowed provisioned numbers, or None for cloud runtime (no cameras)."""
     if _cloud_runtime():
         return None
-    capacity = load_capacity()
+    capacity = load_capacity(now)
     if capacity is None:
         return []
     return sorted(provisioned)[:int(capacity["camera_slot_quantity"])]
 
 
-def camera_licensed(camera_number: int, provisioned: list[int]) -> bool:
-    allowed = licensed_camera_numbers(provisioned)
+def camera_licensed(camera_number: int, provisioned: list[int], now: datetime | None = None) -> bool:
+    allowed = licensed_camera_numbers(provisioned, now)
     return allowed is None or camera_number in allowed

@@ -67,6 +67,354 @@ _ENTITLEMENT_KEY_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+# ===== BEGIN SHARED ENTITLEMENT TRUST RESOLVER (TRUST-1, Linux 1.2.7.1) =====
+# Byte-identical in app/appliance_entitlements.py, appliance-agent/system/capacity_accept.py and
+# appliance-agent/anyaicam_agent/updater/release_checks.py (appliance-agent/tests/test_trust_registry_1271.py compares
+# the three copies). Standard library only; no I/O. Design: wt-1271-design/TRUST1-G2-DESIGN.md.
+#
+# Registry (/etc/anyaicam-update/entitlement_trust_registry.json, root 0644, delivered ONLY by the installer / the
+# signed Software Update release chain, never by cloud configuration sync and never signed by an entitlement key):
+#   {"type": "anyaicam.entitlement_trust_registry", "version": 1, "environment": "production", "generation": N,
+#    "issued_at": ISO-8601, "keys": {key_id: {"public_key": base64, "state": "active|retired|revoked",
+#    "purposes": [capacity|features|analytics|local_access], "environment": ..., "changed_generation": n,
+#    "appliance_ids": [optional allow-list]}}}
+# Protected state (entitlement_trust_state.json, root 0644): {"schema": 1, "environment", "generation",
+#   "registry_sha256", "key_bindings": {key_id: sha256(public key)}, "revoked": {key_id: sha256(public key)}}.
+#   The generation never decreases, revoked only grows, a key_id is never rebound, the environment is pinned.
+# Lifecycle: active = signs and validates; retired = validates already-accepted/cached grants only; revoked (or a
+#   bound key_id absent from a later registry) = nothing. A key from another environment never authorizes capacity
+#   and authorizes other purposes only for the appliances it lists.
+# LEGACY mode (no registry installed): the flat keyset is active for every purpose at generation 0 -- only while the
+#   protected state is absent or at generation 0 and no accepted grant records a registry generation >= 1. Otherwise
+#   a missing registry is registry_rollback. No key embedded in an accepted grant ever confers trust.
+import base64 as _trust_base64
+import datetime as _trust_datetime
+import hashlib as _trust_hashlib
+import json as _trust_json
+import re as _trust_re
+
+TRUST_REGISTRY_TYPE = "anyaicam.entitlement_trust_registry"
+TRUST_REGISTRY_VERSION = 1
+TRUST_STATE_SCHEMA = 1
+TRUST_PURPOSES = ("analytics", "capacity", "features", "local_access")
+TRUST_KEY_STATES = ("active", "retired", "revoked")
+TRUST_LEGACY_ENVIRONMENT = "production"
+TRUST_MAX_KEYS = 256
+# Every reason a trust resolution can fail with (diagnostics; vms_capacity.capacity_status reports them).
+TRUST_FAILURE_REASONS = frozenset((
+    "binding_mismatch", "environment_mismatch", "invalid_registry", "invalid_trust_anchor", "invalid_trust_state",
+    "no_trust_anchor", "purpose_denied", "registry_rollback", "registry_unsafe", "retired_cannot_sign", "revoked",
+    "scope_denied", "trust_state_unsafe", "trust_unavailable", "unknown_key"))
+_TRUST_NAME = _trust_re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_TRUST_HEX = _trust_re.compile(r"^[0-9a-f]{64}$")
+_TRUST_REGISTRY_FIELDS = frozenset(("type", "version", "environment", "generation", "issued_at", "keys"))
+_TRUST_KEY_REQUIRED = frozenset(("public_key", "state", "purposes", "environment", "changed_generation"))
+_TRUST_KEY_OPTIONAL = frozenset(("appliance_ids",))
+_TRUST_STATE_FIELDS = frozenset(("schema", "environment", "generation", "registry_sha256", "key_bindings", "revoked"))
+_TRUST_LIFECYCLE_RANK = {"active": 0, "retired": 1, "revoked": 2}
+
+
+class TrustError(ValueError):
+    """A fail-closed trust refusal; str(error) is the stable reason shown in diagnostics."""
+
+
+def _trust_int(value, minimum):
+    return type(value) is int and value >= minimum
+
+
+def _trust_public_key_bytes(value, reason):
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    elif isinstance(value, str):
+        try:
+            raw = _trust_base64.b64decode(value, validate=True)
+        except (ValueError, TypeError):
+            raise TrustError(reason)
+    else:
+        raise TrustError(reason)
+    if len(raw) != 32:
+        raise TrustError(reason)
+    return raw
+
+
+def trust_key_fingerprint(public_key):
+    """SHA-256 hex of a raw 32-byte Ed25519 public key (given as bytes or base64 text)."""
+    return _trust_hashlib.sha256(_trust_public_key_bytes(public_key, "invalid_registry")).hexdigest()
+
+
+def canonical_trust_registry(document):
+    """The one canonical byte form of a registry (sorted keys, indent 2, LF-terminated ASCII). Its SHA-256 is what
+    release.env, the release builder, the installer and the protected trust state record."""
+    return (_trust_json.dumps(document, sort_keys=True, indent=2) + "\n").encode("ascii")
+
+
+def canonical_trust_state(state):
+    return (_trust_json.dumps(state, sort_keys=True, indent=2) + "\n").encode("ascii")
+
+
+def parse_trust_registry(document):
+    """The normalized registry, or TrustError('invalid_registry'). Strict: unknown fields, duplicate key material,
+    a changed_generation above the generation, or anything malformed rejects the whole registry."""
+    bad = "invalid_registry"
+    if not isinstance(document, dict) or set(document) != _TRUST_REGISTRY_FIELDS:
+        raise TrustError(bad)
+    if document["type"] != TRUST_REGISTRY_TYPE or type(document["version"]) is not int or \
+            document["version"] != TRUST_REGISTRY_VERSION:
+        raise TrustError(bad)
+    environment, generation, issued_at = document["environment"], document["generation"], document["issued_at"]
+    if not isinstance(environment, str) or not _TRUST_NAME.match(environment) or not _trust_int(generation, 1):
+        raise TrustError(bad)
+    try:
+        issued = _trust_datetime.datetime.fromisoformat(issued_at) if isinstance(issued_at, str) else None
+    except ValueError:
+        issued = None
+    if issued is None or issued.tzinfo is None:
+        raise TrustError(bad)
+    keys = document["keys"]
+    if not isinstance(keys, dict) or not keys or len(keys) > TRUST_MAX_KEYS:
+        raise TrustError(bad)
+    entries, seen = {}, set()
+    for key_id, entry in keys.items():
+        if not isinstance(key_id, str) or not _TRUST_NAME.match(key_id) or not isinstance(entry, dict):
+            raise TrustError(bad)
+        fields = set(entry)
+        if not _TRUST_KEY_REQUIRED <= fields or not fields <= (_TRUST_KEY_REQUIRED | _TRUST_KEY_OPTIONAL):
+            raise TrustError(bad)
+        raw = _trust_public_key_bytes(entry["public_key"], bad)
+        fingerprint = _trust_hashlib.sha256(raw).hexdigest()
+        if fingerprint in seen:
+            raise TrustError(bad)
+        seen.add(fingerprint)
+        purposes = entry["purposes"]
+        if entry["state"] not in TRUST_KEY_STATES or not isinstance(purposes, list) or not purposes or \
+                len(set(purposes)) != len(purposes) or any(purpose not in TRUST_PURPOSES for purpose in purposes):
+            raise TrustError(bad)
+        key_environment, changed = entry["environment"], entry["changed_generation"]
+        if not isinstance(key_environment, str) or not _TRUST_NAME.match(key_environment) or \
+                not _trust_int(changed, 1) or changed > generation:
+            raise TrustError(bad)
+        appliance_ids = None
+        if "appliance_ids" in entry:
+            listed = entry["appliance_ids"]
+            if not isinstance(listed, list) or not listed or len(listed) > 1024 or any(
+                    not isinstance(value, str) or not value.strip() or len(value) > 256 for value in listed):
+                raise TrustError(bad)
+            appliance_ids = frozenset(listed)
+        entries[key_id] = {"public_key": raw, "fingerprint": fingerprint, "state": entry["state"],
+                           "purposes": frozenset(purposes), "environment": key_environment,
+                           "appliance_ids": appliance_ids, "changed_generation": changed}
+    return {"normalized": True, "legacy": False, "environment": environment, "generation": generation,
+            "issued_at": issued_at, "keys": entries}
+
+
+def legacy_trust_registry(flat_keys):
+    """LEGACY mode: the flat keyset {key_id: public key (base64 or raw bytes)} as active keys for every purpose,
+    environment production, generation 0."""
+    entries = {}
+    for key_id, value in (flat_keys or {}).items():
+        if not isinstance(key_id, str) or not _TRUST_NAME.match(key_id):
+            raise TrustError("invalid_trust_anchor")
+        raw = _trust_public_key_bytes(value, "invalid_trust_anchor")
+        entries[key_id] = {"public_key": raw, "fingerprint": _trust_hashlib.sha256(raw).hexdigest(),
+                           "state": "active", "purposes": frozenset(TRUST_PURPOSES),
+                           "environment": TRUST_LEGACY_ENVIRONMENT, "appliance_ids": None, "changed_generation": 0}
+    return {"normalized": True, "legacy": True, "environment": TRUST_LEGACY_ENVIRONMENT, "generation": 0,
+            "issued_at": None, "keys": entries}
+
+
+def _trust_normalized(registry):
+    if registry is None or (isinstance(registry, dict) and registry.get("normalized") is True):
+        return registry
+    return parse_trust_registry(registry)
+
+
+def parse_trust_state(document):
+    """The protected trust state, or TrustError('invalid_trust_state')."""
+    bad = "invalid_trust_state"
+    if not isinstance(document, dict) or set(document) != _TRUST_STATE_FIELDS:
+        raise TrustError(bad)
+    if type(document["schema"]) is not int or document["schema"] != TRUST_STATE_SCHEMA:
+        raise TrustError(bad)
+    environment, generation, digest = document["environment"], document["generation"], document["registry_sha256"]
+    if not isinstance(environment, str) or not _TRUST_NAME.match(environment) or not _trust_int(generation, 0):
+        raise TrustError(bad)
+    if not isinstance(digest, str) or not (_TRUST_HEX.match(digest) or (digest == "" and generation == 0)):
+        raise TrustError(bad)
+    maps = {}
+    for field in ("key_bindings", "revoked"):
+        value = document[field]
+        if not isinstance(value, dict) or len(value) > 4 * TRUST_MAX_KEYS or any(
+                not isinstance(key_id, str) or not _TRUST_NAME.match(key_id) or
+                not isinstance(fingerprint, str) or not _TRUST_HEX.match(fingerprint)
+                for key_id, fingerprint in value.items()):
+            raise TrustError(bad)
+        maps[field] = dict(sorted(value.items()))
+    return {"schema": TRUST_STATE_SCHEMA, "environment": environment, "generation": generation,
+            "registry_sha256": digest, "key_bindings": maps["key_bindings"], "revoked": maps["revoked"]}
+
+
+def next_trust_state(registry, registry_sha256, state):
+    """The protected state after installing `registry` (whose canonical bytes hash to registry_sha256) over `state`
+    (None on first install). Monotonic: a lower generation, or a different document at the same generation, is
+    registry_rollback; a key_id bound to other key material is binding_mismatch; a revoked key never returns; every
+    bound key_id absent from the registry becomes revoked. An identical replay returns the same state."""
+    registry = _trust_normalized(registry)
+    if registry is None or registry["legacy"]:
+        raise TrustError("invalid_registry")
+    if not isinstance(registry_sha256, str) or not _TRUST_HEX.match(registry_sha256):
+        raise TrustError("invalid_registry")
+    bindings, revoked = {}, {}
+    if state is not None:
+        prior = parse_trust_state(state)
+        if prior["environment"] != registry["environment"]:
+            raise TrustError("environment_mismatch")
+        if registry["generation"] < prior["generation"]:
+            raise TrustError("registry_rollback")
+        if registry["generation"] == prior["generation"] and prior["registry_sha256"] != registry_sha256:
+            raise TrustError("registry_rollback")
+        bindings, revoked = dict(prior["key_bindings"]), dict(prior["revoked"])
+    revoked_material = set(revoked.values())
+    for key_id, entry in registry["keys"].items():
+        bound = bindings.get(key_id)
+        if bound is not None and bound != entry["fingerprint"]:
+            raise TrustError("binding_mismatch")
+        if entry["state"] != "revoked" and (key_id in revoked or entry["fingerprint"] in revoked_material):
+            raise TrustError("registry_rollback")
+        bindings[key_id] = entry["fingerprint"]
+    for key_id, fingerprint in bindings.items():
+        entry = registry["keys"].get(key_id)
+        if entry is None or entry["state"] == "revoked":
+            revoked[key_id] = fingerprint
+    return {"schema": TRUST_STATE_SCHEMA, "environment": registry["environment"], "generation": registry["generation"],
+            "registry_sha256": registry_sha256, "key_bindings": dict(sorted(bindings.items())),
+            "revoked": dict(sorted(revoked.items()))}
+
+
+def check_trust_registry_transition(old_registry, new_registry):
+    """Tooling / installer / applier guard from the installed registry to a new one: never a lower generation (an
+    identical replay is a no-op), never another environment, never a dropped key_id (explicit tombstones only),
+    never a key_id rebound to other key material, never a backwards lifecycle move (revoked->*, retired->active)."""
+    new = _trust_normalized(new_registry)
+    if new is None or new["legacy"]:
+        raise TrustError("invalid_registry")
+    old = _trust_normalized(old_registry)
+    if old is None or old["legacy"]:
+        return
+    if new["environment"] != old["environment"]:
+        raise TrustError("environment_mismatch")
+    if new["generation"] < old["generation"]:
+        raise TrustError("registry_rollback")
+    if new["generation"] == old["generation"]:
+        if new != old:
+            raise TrustError("registry_rollback")
+        return
+    old_material = {entry["fingerprint"]: key_id for key_id, entry in old["keys"].items()}
+    for key_id in sorted(old["keys"]):
+        before, after = old["keys"][key_id], new["keys"].get(key_id)
+        if after is None:
+            raise TrustError("dropped_binding")
+        if after["fingerprint"] != before["fingerprint"]:
+            raise TrustError("binding_mismatch")
+        if _TRUST_LIFECYCLE_RANK[after["state"]] < _TRUST_LIFECYCLE_RANK[before["state"]]:
+            raise TrustError("lifecycle_backwards")
+    for key_id, entry in new["keys"].items():
+        if key_id not in old["keys"] and entry["fingerprint"] in old_material:
+            raise TrustError("binding_mismatch")
+
+
+class TrustContext:
+    """One view of the installed trust: a normalized (or raw) registry -- None when none is installed -- plus the
+    protected state. resolve() is the only way to obtain a verification key."""
+
+    def __init__(self, registry, state=None, *, failure=None, registry_sha256=None, floor=0):
+        self.failure = failure
+        self.registry = _trust_normalized(registry)
+        self.state = parse_trust_state(state) if state is not None else None
+        self.registry_sha256 = registry_sha256
+        self.floor = floor if type(floor) is int and floor > 0 else 0
+
+    @property
+    def mode(self):
+        if self.failure:
+            return "failed"
+        return "registry" if self.registry is not None and not self.registry["legacy"] else "legacy"
+
+    @property
+    def generation(self):
+        return self.registry["generation"] if self.registry is not None else 0
+
+    def check(self, accepted_generation=0):
+        """The registry if it may be used at all, else TrustError."""
+        if self.failure:
+            raise TrustError(self.failure)
+        registry, state = self.registry, self.state
+        floor = max(self.floor, state["generation"] if state is not None else 0,
+                    accepted_generation if type(accepted_generation) is int else 0)
+        if registry is None or registry["legacy"]:
+            if floor > 0:
+                raise TrustError("registry_rollback")
+            if registry is None or not registry["keys"]:
+                raise TrustError("no_trust_anchor")
+        if registry["generation"] < floor:
+            raise TrustError("registry_rollback")
+        if state is not None:
+            if state["environment"] != registry["environment"]:
+                raise TrustError("environment_mismatch")
+            if (not registry["legacy"] and registry["generation"] == state["generation"] and
+                    self.registry_sha256 is not None and self.registry_sha256 != state["registry_sha256"]):
+                raise TrustError("registry_rollback")
+        return registry
+
+    def resolve(self, key_id, *, purpose, for_new_grant, appliance_id=None, accepted_generation=0):
+        """The raw public key that may verify a document signed by key_id for `purpose`, else TrustError.
+        for_new_grant=True: a new grant (active keys only); False: an already accepted/cached grant (retired too)."""
+        registry = self.check(accepted_generation)
+        if purpose not in TRUST_PURPOSES:
+            raise TrustError("purpose_denied")
+        state = self.state
+        entry = registry["keys"].get(key_id) if isinstance(key_id, str) else None
+        if entry is None:
+            if state is not None and isinstance(key_id, str) and (
+                    key_id in state["revoked"] or key_id in state["key_bindings"]):
+                raise TrustError("revoked")
+            raise TrustError("unknown_key")
+        if state is not None:
+            bound = state["key_bindings"].get(key_id)
+            if bound is not None and bound != entry["fingerprint"]:
+                raise TrustError("binding_mismatch")
+            if key_id in state["revoked"] or entry["fingerprint"] in state["revoked"].values():
+                raise TrustError("revoked")
+        if entry["state"] == "revoked":
+            raise TrustError("revoked")
+        if for_new_grant and entry["state"] != "active":
+            raise TrustError("retired_cannot_sign")
+        if purpose not in entry["purposes"]:
+            raise TrustError("purpose_denied")
+        if entry["environment"] != registry["environment"]:
+            if purpose == "capacity" or entry["appliance_ids"] is None or appliance_id not in entry["appliance_ids"]:
+                raise TrustError("scope_denied")
+        elif entry["appliance_ids"] is not None and appliance_id not in entry["appliance_ids"]:
+            raise TrustError("scope_denied")
+        return entry["public_key"]
+
+    def active_keys(self, purpose, appliance_id=None):
+        """{key_id: base64 public key} that may verify NEW documents for `purpose`; {} on any trust failure."""
+        try:
+            registry = self.check()
+        except TrustError:
+            return {}
+        keys = {}
+        for key_id in sorted(registry["keys"]):
+            try:
+                raw = self.resolve(key_id, purpose=purpose, for_new_grant=True, appliance_id=appliance_id)
+            except TrustError:
+                continue
+            keys[key_id] = _trust_base64.b64encode(raw).decode("ascii")
+        return keys
+# ===== END SHARED ENTITLEMENT TRUST RESOLVER =====
+
+
+
 class ReleaseCheckError(Exception):
     """A release failed a check. `code` is a short stable reason the UI and
     the update ledger can show; the message is for logs."""
@@ -459,4 +807,73 @@ def release_entitlement_keyset(release_root: PathLike, env: dict) -> Optional[by
     if hashlib.sha256(data).hexdigest() != expected:
         raise ReleaseCheckError("bad_keyset", "the entitlement keyset does not match release.env")
     validate_entitlement_keyset(data)
+    return data
+
+
+# ------------------------------------------------------------------ entitlement trust registry (TRUST-1, 1.2.7.1)
+# The protected registry a release may carry (payload/keys/entitlement-trust-registry.json), named by SHA-256 in
+# release.env -- so the release-signing key vouches for it through the signed manifest and the package hash. An
+# entitlement key never signs it. The flat keyset the same release carries must be its projection (active +
+# retired keys; revoked excluded) for 1.2.7 readers and rollback.
+ENTITLEMENT_REGISTRY_PATH = "payload/keys/entitlement-trust-registry.json"
+ENTITLEMENT_REGISTRY_ENV = "ENTITLEMENT_TRUST_REGISTRY_SHA256"
+# Phase 1 (owner decision 9): no lab/test signer in any shipped registry before independent TRUST-1 verification.
+_LAB_KEY_ID = re.compile(r"^(lab|test)[._-]", re.IGNORECASE)
+
+
+def validate_entitlement_trust_registry(data: bytes) -> dict:
+    """The normalized registry, or ReleaseCheckError('bad_trust_registry'): canonical form, public keys only, the
+    shared resolver's structural rules, every key in the registry's own environment, no lab/test key id in a
+    production registry, and at least one ACTIVE capacity key."""
+    upper = data.upper()
+    if b"PRIVATE" in upper or b"BEGIN" in upper or b"OPENSSH" in upper:
+        raise ReleaseCheckError("bad_trust_registry", "the entitlement trust registry contains key-container or private-key material")
+    try:
+        document = json.loads(data.decode("ascii"))
+        registry = parse_trust_registry(document)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ReleaseCheckError("bad_trust_registry", f"the entitlement trust registry is malformed: {error}") from error
+    if canonical_trust_registry(document) != data:
+        raise ReleaseCheckError("bad_trust_registry", "the entitlement trust registry is not in canonical form")
+    for key_id, entry in registry["keys"].items():
+        if entry["environment"] != registry["environment"]:
+            raise ReleaseCheckError("bad_trust_registry", f"key {key_id!r} belongs to environment "
+                                    f"{entry['environment']!r}, not {registry['environment']!r} (no lab keys ship)")
+        if registry["environment"] == "production" and _LAB_KEY_ID.match(key_id):
+            raise ReleaseCheckError("bad_trust_registry", f"key id {key_id!r} is a lab/test key id in a production registry")
+    if not any(entry["state"] == "active" and "capacity" in entry["purposes"] for entry in registry["keys"].values()):
+        raise ReleaseCheckError("bad_trust_registry", "the entitlement trust registry has no active capacity key")
+    return registry
+
+
+def entitlement_keyset_projection(data: bytes) -> bytes:
+    """The canonical flat keyset 1.2.7 readers use: every active and retired registry key (revoked excluded)."""
+    import base64
+    registry = validate_entitlement_trust_registry(data)
+    keys = {key_id: base64.b64encode(entry["public_key"]).decode("ascii")
+            for key_id, entry in registry["keys"].items() if entry["state"] != "revoked"}
+    return canonical_entitlement_keyset(keys)
+
+
+def release_entitlement_trust_registry(release_root: PathLike, env: dict) -> Optional[bytes]:
+    """The verified registry bytes a release carries, None when it carries none. release.env must name its SHA-256
+    exactly when it is present, and the release must also carry its flat keyset projection."""
+    path = Path(release_root) / ENTITLEMENT_REGISTRY_PATH
+    expected = str(env.get(ENTITLEMENT_REGISTRY_ENV) or "")
+    if not expected:
+        if path.exists() or path.is_symlink():
+            raise ReleaseCheckError("bad_trust_registry", "the release carries an entitlement trust registry that release.env does not name")
+        return None
+    if not _SHA256.match(expected):
+        raise ReleaseCheckError("bad_trust_registry", f"release.env {ENTITLEMENT_REGISTRY_ENV} is not a lowercase SHA-256")
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseCheckError("bad_trust_registry", "release.env names an entitlement trust registry the release does not contain")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ReleaseCheckError("bad_trust_registry", "the entitlement trust registry does not match release.env")
+    projection = entitlement_keyset_projection(data)
+    keyset = release_entitlement_keyset(release_root, env)
+    if keyset != projection:
+        raise ReleaseCheckError("bad_trust_registry", "the release's flat entitlement keyset is not the registry's "
+                                "projection (active + retired keys)")
     return data

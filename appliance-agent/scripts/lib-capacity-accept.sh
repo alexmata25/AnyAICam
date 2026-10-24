@@ -101,6 +101,22 @@ bootstrap_capacity_identity() {
     return 0
 }
 
+migrate_capacity_trust_state() {
+    # TRUST-1 (1.2.7.1): under the acceptor's lock, ratchet the protected
+    # trust state to the installed registry and record signer/trust_generation
+    # in an existing accepted state. An untrusted accepted state is kept as is
+    # (the VMS refuses it with a diagnostic). A registry rollback or an unsafe
+    # trust file fails the step before the VMS is touched.
+    local privileged_dir="/opt/anyaicam-agent/privileged"
+    local migrate_result
+    if ! migrate_result="$(/usr/bin/python3 -I "$privileged_dir/capacity_accept.py" --migrate-trust-state 2>&1)"; then
+        echo "[ERROR] Protected capacity trust-state migration failed: ${migrate_result:-helper returned failure}." >&2
+        return 1
+    fi
+    echo "[INFO] Protected capacity trust state: ${migrate_result//$'\n'/ }" >&2
+    return 0
+}
+
 uninstall_capacity_accept() {
     local privileged_dir="/opt/anyaicam-agent/privileged"
     local systemd_dir="/etc/systemd/system"

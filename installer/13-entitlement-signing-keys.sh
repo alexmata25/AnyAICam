@@ -22,14 +22,80 @@
 # replaces it root:root 0644 by temp file + atomic rename, never through a
 # symlink. Any refusal or error stops the install with the previous keyset
 # (or none) in place -- paid features fail closed.
+#
+# TRUST-1 (Linux 1.2.7.1): a release also carries the protected entitlement
+# trust REGISTRY (payload/keys/entitlement-trust-registry.json, its SHA-256 in
+# release.env as ENTITLEMENT_TRUST_REGISTRY_SHA256, so the release chain
+# vouches for it; no entitlement key ever signs it). It is installed FIRST,
+# through the applier's install_trust_registry(): registry, then the monotonic
+# protected trust state (entitlement_trust_state.json), both root:root 0644.
+# A lower generation, a different document at the same generation (replay /
+# tamper), a dropped key binding, a rebound key id or a backwards lifecycle
+# move stops the install with every trust file unchanged. Re-installing the
+# same release (--repair) is a no-op, and restores a deleted registry when the
+# protected state names exactly that generation. The flat keyset installed
+# after it must be the registry's projection (active + retired keys), kept for
+# 1.2.7 readers and rollback. A 1.2.7.1+ release always carries a registry
+# (installer/build_release_installer.py), so a Linux 1.2.7.1 appliance never
+# runs in legacy (flat keyset) trust mode after install.
 
 # Fixed: the exact path the VMS (app/appliance_entitlements.py) and the
 # Software Update applier use. Deliberately not taken from the environment.
 ENTITLEMENT_KEYS_DIR="/etc/anyaicam-update"
 ENTITLEMENT_KEYS_FILE="$ENTITLEMENT_KEYS_DIR/entitlement_signing_keys.json"
+ENTITLEMENT_REGISTRY_FILE="$ENTITLEMENT_KEYS_DIR/entitlement_trust_registry.json"
+ENTITLEMENT_TRUST_STATE_FILE="$ENTITLEMENT_KEYS_DIR/entitlement_trust_state.json"
+
+provision_entitlement_trust_registry() {
+    local registry_src="$PAYLOAD_DIR/keys/entitlement-trust-registry.json"
+    local keys_src="$PAYLOAD_DIR/keys/entitlement-signing-public-keys.json"
+    local outcome
+    if [[ -z "${ENTITLEMENT_TRUST_REGISTRY_SHA256:-}" ]]; then
+        if [[ -f "$ENTITLEMENT_REGISTRY_FILE" ]]; then
+            log "This release carries no entitlement trust registry; the installed one (and its protected state) is left unchanged."
+        fi
+        return 0
+    fi
+    if [[ ! -f "$registry_src" || -L "$registry_src" ]]; then
+        echo "[ERROR] release.env names an entitlement trust registry but the package does not contain it." >&2
+        return 1
+    fi
+    if [[ "$(sha256sum "$registry_src" | awk '{print $1}')" != "$ENTITLEMENT_TRUST_REGISTRY_SHA256" ]]; then
+        echo "[ERROR] The packaged entitlement trust registry does not match release.env; refusing to trust it." >&2
+        return 1
+    fi
+    if grep -qiE 'PRIVATE|BEGIN|OPENSSH' "$registry_src"; then
+        echo "[ERROR] The packaged entitlement trust registry contains key-container or private key material; refusing it." >&2
+        return 1
+    fi
+    outcome="$(python3 - "$registry_src" "$ENTITLEMENT_REGISTRY_FILE" "$ENTITLEMENT_TRUST_STATE_FILE" "$PAYLOAD_DIR/agent/system" "$keys_src" <<'PYEOF'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[4])
+import apply_release
+data = Path(sys.argv[1]).read_bytes()
+try:
+    apply_release.release_checks.validate_entitlement_trust_registry(data)
+    keyset = Path(sys.argv[5])
+    if not keyset.is_file() or keyset.read_bytes() != apply_release.release_checks.entitlement_keyset_projection(data):
+        raise apply_release.release_checks.ReleaseCheckError(
+            "bad_trust_registry", "the packaged flat keyset is not the registry's projection (active + retired keys)")
+    print(apply_release.install_trust_registry(Path(sys.argv[2]), Path(sys.argv[3]), data))
+except (apply_release.release_checks.ReleaseCheckError, apply_release.TrustAnchorError) as error:
+    print(f"[ERROR] {error}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+)" || {
+        echo "[ERROR] The entitlement trust registry was not installed; the previous registry and protected state are unchanged." >&2
+        return 1
+    }
+    log "Entitlement trust registry at $ENTITLEMENT_REGISTRY_FILE: $outcome (sha256 ${ENTITLEMENT_TRUST_REGISTRY_SHA256:0:12}...)."
+}
 
 provision_entitlement_signing_keys() {
     local keys_src="$PAYLOAD_DIR/keys/entitlement-signing-public-keys.json"
+    # TRUST-1: registry (then its protected state) first; a refusal leaves the flat keyset untouched too.
+    provision_entitlement_trust_registry || return 1
     if [[ -z "${ENTITLEMENT_SIGNING_KEYS_SHA256:-}" ]]; then
         if [[ -f "$ENTITLEMENT_KEYS_FILE" ]]; then
             log "This release provisions no entitlement-signing keyset; the existing one is left unchanged."

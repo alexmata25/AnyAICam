@@ -34,13 +34,18 @@ Sequence (each failure is reported; nothing claims success early):
           artifact-files.json hashes, safe archive members, free disk,
           additive-only migrations, nothing unexpected in the live tree
           and the entitlement PUBLIC keyset the release may carry (named in
-          release.env, canonical, public-only)
+          release.env, canonical, public-only), and (TRUST-1, 1.2.7.1) the
+          entitlement trust registry it may carry (named in release.env, its
+          flat keyset projection shipped beside it)
   stage the new application as /opt/anyaicam.next (live tree untouched)
   build the new image, back up the database, tag the current image --
           all while the current release keeps running
-  install that keyset root:root 0644 at the fixed trust-anchor path the
-          VMS reads (atomic, never through a symlink); a failure stops the
-          update here with nothing changed
+  install the trust registry and then the monotonic protected trust state
+          (install_trust_registry: never a lower generation, a different
+          document at the same generation, a dropped key binding or a
+          backwards lifecycle move), then the flat keyset, root:root 0644 at
+          the fixed trust-anchor paths the VMS reads (atomic, never through a
+          symlink); a failure stops the update here with nothing changed
   ---- downtime ----
   stop the VMS; rename /opt/anyaicam -> /opt/anyaicam.previous and
   /opt/anyaicam.next -> /opt/anyaicam (directory renames, never a copy into
@@ -129,6 +134,10 @@ class Paths:
     # Paid-feature trust anchor (2026-10-05): fixed, the path the VMS reads
     # (app/appliance_entitlements.py TRUST_ANCHOR_FILE).
     entitlement_keys: Path = Path("/etc/anyaicam-update/entitlement_signing_keys.json")
+    # TRUST-1 (1.2.7.1): the protected entitlement trust registry and its monotonic state (the paths
+    # app/appliance_entitlements.py TRUST_REGISTRY_FILE / TRUST_STATE_FILE and capacity_accept.py read).
+    entitlement_registry: Path = Path("/etc/anyaicam-update/entitlement_trust_registry.json")
+    entitlement_trust_state: Path = Path("/etc/anyaicam-update/entitlement_trust_state.json")
     # Signed camera capacity (2026-10-09): the root-owned fallback migrated
     # once from the unsigned file, and the files it is migrated from (in
     # agent-owned directories: read as untrusted).
@@ -324,6 +333,108 @@ def install_trust_anchor(target: Path, data: bytes, *, posix: Optional[bool] = N
         (write or safe_replace)(directory, target.name, data, mode=0o644, owner=(0, 0) if posix else None)
     except OSError as error:
         raise TrustAnchorError("trust_anchor_write_failed", f"writing {target} failed: {error}") from error
+
+
+# ---------------------------------------------------------------- entitlement trust registry (TRUST-1, 1.2.7.1)
+_TRUST_LOCK_NAME = ".vms_capacity_accepted.lock"   # the root capacity acceptor's lock (capacity_accept.LOCK_FILE)
+
+
+def _read_root_trust_file(path: Path, *, posix: bool, lstat) -> Optional[bytes]:
+    """The bytes of an existing root trust file, None when absent; TrustAnchorError when it is not a safe regular
+    root-owned file (never followed through a symlink)."""
+    try:
+        info = lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise TrustAnchorError("trust_anchor_unsafe", f"{path} cannot be inspected: {error}") from error
+    if statmod.S_ISLNK(info.st_mode) or not statmod.S_ISREG(info.st_mode):
+        raise TrustAnchorError("trust_anchor_unsafe", f"{path} is not a regular file")
+    problem = ownership_problem(info, expected_uid=0 if posix else None, posix=posix)
+    if problem:
+        raise TrustAnchorError("trust_anchor_unsafe", f"{path} {problem}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
+        return handle.read(1024 * 1024)
+
+
+def _trust_lock(directory: Path, posix: bool):
+    """The capacity acceptor's flock (so a ratchet and an install never interleave); None off POSIX or when the
+    directory does not exist yet (no acceptor can be using it)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    if not posix or not directory.is_dir() or directory.is_symlink():
+        return None
+    descriptor = os.open(directory / _TRUST_LOCK_NAME,
+                         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+    info = os.fstat(descriptor)
+    if not statmod.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_mode & 0o077:
+        os.close(descriptor)
+        raise TrustAnchorError("trust_anchor_unsafe", f"{directory / _TRUST_LOCK_NAME} is not a safe root lock")
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def install_trust_registry(registry_target: Path, state_target: Path, data: bytes, *, posix: Optional[bool] = None,
+                           lstat=os.lstat, write=None, make_dir=None) -> str:
+    """Installs a release's entitlement trust registry and then the monotonic protected trust state -- the one
+    routine for the Software Update applier and installer step 13. Returns 'installed', 'unchanged' (an identical
+    replay, e.g. installer --repair) or 'restored' (the registry file was missing but the protected state names
+    exactly this generation and digest). Refused with nothing written (TrustAnchorError 'trust_registry_refused',
+    the message starting with the reason): a malformed/lab/private registry, a lower generation, a different
+    document at the same generation, a dropped key binding, a rebound key id or a backwards lifecycle move
+    (registry_rollback, dropped_binding, binding_mismatch, lifecycle_backwards, environment_mismatch). Unsafe
+    destinations: TrustAnchorError 'trust_anchor_unsafe' (install_trust_anchor's rules)."""
+    import hashlib
+
+    def refused(reason: str, detail: str = "") -> TrustAnchorError:
+        return TrustAnchorError("trust_registry_refused",
+                                f"{reason}: the entitlement trust registry was not installed{': ' + detail if detail else ''}")
+
+    posix = _posix() if posix is None else posix
+    try:
+        new_registry = release_checks.validate_entitlement_trust_registry(data)
+    except release_checks.ReleaseCheckError as error:
+        raise refused("invalid_registry", str(error)) from error
+    digest = hashlib.sha256(data).hexdigest()
+    lock = _trust_lock(registry_target.parent, posix)
+    try:
+        state_raw = _read_root_trust_file(state_target, posix=posix, lstat=lstat)
+        registry_raw = _read_root_trust_file(registry_target, posix=posix, lstat=lstat)
+        old_state = None
+        if state_raw is not None:
+            try:
+                old_state = release_checks.parse_trust_state(json.loads(state_raw.decode("ascii")))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise refused("invalid_trust_state", "the protected trust state is unreadable; restore it from the "
+                              "backup taken with the registry") from error
+        old_registry = None
+        if registry_raw is not None:
+            try:
+                old_registry = release_checks.parse_trust_registry(json.loads(registry_raw.decode("ascii")))
+            except (UnicodeDecodeError, ValueError):
+                old_registry = None  # an unreadable registry is replaced; the protected state still guards it
+        if (old_state is not None and old_state["generation"] == new_registry["generation"]
+                and old_state["registry_sha256"] == digest):
+            if registry_raw == data:
+                return "unchanged"
+            install_trust_anchor(registry_target, data, posix=posix, lstat=lstat, write=write, make_dir=make_dir)
+            return "restored"
+        try:
+            release_checks.check_trust_registry_transition(old_registry, new_registry)
+            new_state = release_checks.next_trust_state(new_registry, digest, old_state)
+        except ValueError as error:  # TrustError
+            raise refused(str(error)) from error
+        install_trust_anchor(registry_target, data, posix=posix, lstat=lstat, write=write, make_dir=make_dir)
+        install_trust_anchor(state_target, release_checks.canonical_trust_state(new_state), posix=posix, lstat=lstat,
+                             write=write, make_dir=make_dir)
+        return "installed"
+    finally:
+        if lock is not None:
+            os.close(lock)
 
 
 # ---------------------------------------------------------------- capacity fallback (Linux 1.2.5)
@@ -1283,6 +1394,7 @@ class Applier:
         started = self.now()
         self.rollback_image, self.database_backup, self.previous_env, self.previous_marker = "", "", None, None
         self.entitlement_keyset = None
+        self.entitlement_registry = None
         previous = self._installed_release()
         record = {"update_id": update_id, "from_version": previous.get("version", ""),
                   "from_build_id": previous.get("build_id", ""), "to_version": "", "to_build_id": "",
@@ -1312,6 +1424,7 @@ class Applier:
             progress("preflight")
             self._stage_next(release_root)
             self._prepare_before_downtime(manifest, previous)
+            record["entitlement_trust_registry"] = self._install_entitlement_trust_registry()
             record["entitlement_keyset"] = self._install_entitlement_keyset()
             record["capacity_fallback"] = self._migrate_capacity_fallback(previous.get("version", ""))
             record["capacity_accept"] = self._install_capacity_accept(release_root)
@@ -1452,6 +1565,9 @@ class Applier:
             # to this signature through the package hash, release.env and
             # artifact-files.json, and validated here before anything changes.
             self.entitlement_keyset = release_checks.release_entitlement_keyset(release_root, env)
+            # TRUST-1 (1.2.7.1): the protected trust registry, bound the same way; its flat projection must be the
+            # keyset above.
+            self.entitlement_registry = release_checks.release_entitlement_trust_registry(release_root, env)
             payload = release_root / "payload" / "vms"
             identity = json.loads((payload / "app" / RELEASE_IDENTITY_STATIC).read_text(encoding="utf-8"))
             if identity.get("build_id") != manifest.build_id or identity.get("version") != manifest.version:
@@ -1508,6 +1624,19 @@ class Applier:
         self.rollback_image = rollback_tag
         self.previous_env = self._read_identity_env()
         self.previous_marker = self._read_marker_for_rollback()
+
+    def _install_entitlement_trust_registry(self) -> str:
+        """Before any downtime and before the flat keyset: installs the registry, then the monotonic protected trust
+        state (install_trust_registry). A lower generation, a different document at the same generation, a dropped
+        binding or a backwards lifecycle move stops the update with the running release and every trust file
+        untouched. 'unchanged' when the release carries none (the installed registry, if any, stays)."""
+        if self.entitlement_registry is None:
+            return "unchanged"
+        try:
+            return install_trust_registry(self.paths.entitlement_registry, self.paths.entitlement_trust_state,
+                                          self.entitlement_registry)
+        except TrustAnchorError as error:
+            raise Failure("install_failed", error.code, str(error)) from error
 
     def _install_entitlement_keyset(self) -> str:
         """Installs the verified keyset root:root 0644 at the fixed trust-anchor
@@ -1617,6 +1746,14 @@ class Applier:
         # place (or the eligible legacy fallback).
         self.run(["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper),
                   "--accept-migrated-snapshot"], 15)
+        # TRUST-1 (1.2.7.1): under the acceptor's lock, ratchet the protected trust state and record the signer /
+        # trust generation in an existing accepted state (option A). An untrusted accepted state is left as is (the
+        # VMS refuses it with a diagnostic); a registry rollback or an unsafe file stops the update before downtime.
+        code, output = self.run(["/usr/bin/python3", "-I", str(self.paths.capacity_accept_helper),
+                                 "--migrate-trust-state"], 15)
+        if code != 0:
+            raise Failure("install_failed", "capacity_trust_migration_failed",
+                          f"migrating the protected capacity trust state failed before downtime: {output[-300:]}")
         return "installed_before_downtime"
 
     # ------------------------------------------------------------------ activate (downtime)

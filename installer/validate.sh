@@ -230,6 +230,24 @@ entitlement_signing_keys_ok() {
     [[ "$(sha256sum "$keys" | awk '{print $1}')" == "$ENTITLEMENT_SIGNING_KEYS_SHA256" ]]
 }
 
+# TRUST-1 (1.2.7.1): the registry this release names is installed root-owned,
+# and the protected trust state is root-owned, at generation >= 1 and records
+# exactly this registry (so the VMS is not in legacy or rollback mode).
+entitlement_trust_registry_ok() {
+    local registry="$ENTITLEMENT_REGISTRY_FILE" state="$ENTITLEMENT_TRUST_STATE_FILE"
+    trust_anchor_entry_ok "$(dirname "$registry")" dir || return 1
+    trust_anchor_entry_ok "$registry" file || return 1
+    trust_anchor_entry_ok "$state" file || return 1
+    [[ "$(sha256sum "$registry" | awk '{print $1}')" == "$ENTITLEMENT_TRUST_REGISTRY_SHA256" ]] || return 1
+    python3 -I - "$state" "$ENTITLEMENT_TRUST_REGISTRY_SHA256" <<'PYEOF'
+import json, sys
+state = json.load(open(sys.argv[1], encoding="ascii"))
+ok = (isinstance(state, dict) and state.get("schema") == 1 and type(state.get("generation")) is int
+      and state["generation"] >= 1 and state.get("registry_sha256") == sys.argv[2])
+sys.exit(0 if ok else 1)
+PYEOF
+}
+
 run_validate() {
     load_release_metadata
     detect_install_state
@@ -250,6 +268,9 @@ run_validate() {
     fi
     if [[ -n "${ENTITLEMENT_SIGNING_KEYS_SHA256:-}" ]]; then
         check "Entitlement-signing keyset is provisioned root-owned" entitlement_signing_keys_ok
+    fi
+    if [[ -n "${ENTITLEMENT_TRUST_REGISTRY_SHA256:-}" ]]; then
+        check "Entitlement trust registry and protected trust state are provisioned root-owned" entitlement_trust_registry_ok
     fi
     # Existence/non-emptiness only -- the actual value is never read, printed,
     # or compared here. Without this key, camera provisioning with ONVIF/RTSP

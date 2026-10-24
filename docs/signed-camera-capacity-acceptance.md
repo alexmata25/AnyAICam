@@ -19,3 +19,46 @@ An already accepted camera capacity does not expire while the appliance is offli
 The first rollout to an existing Linux 1.2.5 installation must use the updated 1.2.5 installer/repair path. It provisions the trusted keyset, root helper and path/service units before stopping or recreating the VMS; where a valid signed/migrated capacity is available, it accepts that state and pins the cloud identity before downtime. A clean install stages only a provisional claim correlation until the first cloud-signed capacity is accepted. Later signed Software Update packages carry and install the same helper and units, then validate/accept available state before downtime. Do not use an older installer or treat a Software Update-only rollout as the first trust-state bootstrap.
 
 The root helper is fixed-path and argument-restricted, uses isolated Python (`-I`), imports only the standard library, performs no network access, and is installed root-owned. It rejects unsafe trust/state files, symlinks, hard links, nonregular files, writable trust directories, oversized inputs, invalid identities, replay, and signature failures. Normal uninstall removes the watcher/helper but preserves accepted capacity and trust state for offline continuity; purge-all remains destructive by design.
+
+## TRUST-1 + G2 (Linux 1.2.7.1)
+
+The paragraph above about schema 2 embedding the verified public key describes 1.2.7 and is superseded:
+
+* **Trust is resolved on every read.** The accepted file's `accepted_key` is
+  no longer a trust source (1.2.7 let it keep a removed key trusted). The VMS
+  and the root helper resolve the snapshot's signer `key_id` against the
+  current protected trust registry (`docs/entitlement-signing-keys.md`) for
+  purpose `capacity`: active or retired verify; revoked, absent after binding,
+  unknown, another environment, a rebound id or a rolled-back registry give
+  no capacity, with the reason in `vms_capacity.capacity_status()` (logged
+  once per change). `accepted_key` and the new `signer {key_id,
+  public_key_sha256}` must equal the resolved key (`binding_mismatch`
+  otherwise). Schema stays 2 (additive fields `signer`, `trust_generation`),
+  so an intentional rollback to 1.2.7 still reads it.
+* **Accepted mode (G2).** Already accepted capacity is re-verified (signature,
+  identity, trust, high-water, transition) without any clock check: a clock
+  rollback of any size or a cloud outage, including across reboots, keeps the
+  last-known-good capacity. New grants stay strict: `issued_at` at most five
+  minutes after the appliance clock, unexpired, newer than the high-water
+  mark, same identity; a refused grant never replaces the accepted file. A
+  clock behind the trusted floor (max(high-water issue time, accepted_at)) is
+  reported as `clock_behind_trusted_time` (informational). When NTP corrects
+  the clock, the next sync's grant is accepted normally; if it never does, the
+  appliance keeps running on its last-known-good capacity.
+* **Floor vs trust.** When a new grant arrives the current accepted state is
+  checked structurally only (`_state_floor`), so a newer grant from an active
+  key replaces a revoked-signer state, while an older or equal one is still
+  refused as a replay. The helper never pins an identity from an untrusted
+  state. A revoked signer's accepted file is kept as the anti-replay floor.
+* **Migration.** Step 16 (and the 1.2.7.1 applier) run
+  `capacity_accept.py --migrate-trust-state` under the acceptance lock after
+  the registry is installed: it ratchets the protected trust state and adds
+  `signer`/`trust_generation` to an existing 1.2.7 accepted state that the
+  registry trusts (idempotent; an untrusted state is left unchanged).
+* **Known limitation (N1b, owner decision 6).** TRUST-1 does not repair an
+  identity transition accepted from a since-revoked lab signer; recovery is a
+  full verified restore. No lab key ships in any registry.
+* **Windows.** `capacity_accept_windows.py` uses the same policy and resolver
+  (registry/state seams, ratchet under its lock). Windows packaging of the
+  registry (install-runtime.ps1, build.ps1, prepare-keyset.py) is a follow-up
+  for the next Windows candidate; until then Windows runs in legacy mode.

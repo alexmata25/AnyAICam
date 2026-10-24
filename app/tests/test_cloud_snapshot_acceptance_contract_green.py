@@ -89,7 +89,8 @@ def test_only_the_trusted_cloud_keys_verify(cloud, edge_db):
     snapshot = _issue(cloud, edge_db)
     other = base64.b64encode(Ed25519PrivateKey.generate().public_key().public_bytes_raw()).decode()
     untrusted = helper._validate_keyset({"keys": {"someone-else": other}})
-    with pytest.raises(helper.Reject, match="bad_signature"):
+    # TRUST-1 (1.2.7.1): an unknown signer is refused by the trust resolver with its explicit reason.
+    with pytest.raises(helper.Reject, match="bad_signature|unknown_key"):
         helper._validate_snapshot(snapshot, untrusted, _identity(), verifier=_verify)
     tampered = json.loads(json.dumps(snapshot))
     tampered["camera_capacity"]["camera_slot_quantity"] = 64
@@ -191,7 +192,7 @@ def test_a_rotated_key_not_yet_in_the_trust_anchor_keeps_the_previous_authorizat
     after = _issue(cloud, edge_db, slots=5, plan=5)
     now = datetime.fromisoformat(after["issued_at"])
     state, _ = helper._advance(before, old_only, _identity(), None, now=now, verifier=_verify)
-    with pytest.raises(helper.Reject, match="bad_signature"):
+    with pytest.raises(helper.Reject, match="bad_signature|unknown_key"):
         helper._advance(after, old_only, _identity(), state, now=now, verifier=_verify)
     assert helper._validate_state(state, old_only, now=now, verifier=_verify)  # previous authorization intact
 
