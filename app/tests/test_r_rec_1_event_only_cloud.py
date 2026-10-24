@@ -68,7 +68,8 @@ def _headers():
 
 
 def _admin_cookie():
-    return {partner_portal.SESSION_COOKIE: partner_portal._token("admin@example.test", "administrator")}
+    from authz_helpers import partner_session_cookie
+    return {partner_portal.SESSION_COOKIE: partner_session_cookie("admin@example.test", "administrator")}
 
 
 @pytest.fixture()
@@ -80,6 +81,11 @@ def db_path(tmp_path):
 def client(db_path):
     with override_target(sqlite_path=str(db_path)):
         initialize_database()
+        # 1.2.7.1 requires a real server-side session, a live administrator
+        # grant, and an MFA verification marker for cloud administrator APIs.
+        # Keep these route tests authorized without bypassing that policy.
+        from authz_helpers import make_partner_user
+        make_partner_user("admin@example.test", "administrator", global_admin=True)
         app = FastAPI()
         appliance_cloud.register_appliance_cloud_routes(app, shell=lambda *a, **k: "")
         with TestClient(app) as test_client:
