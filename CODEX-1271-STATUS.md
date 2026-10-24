@@ -50,7 +50,7 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 - Ultralytics privacy tests: **4 passed**; local installed Ultralytics 8.4.115 opt-out smoke reported `sync=False`, `events.enabled=False`; runtime preflight passed. No model was loaded and no external telemetry request was made. Logs: `_evidence/ultralytics-privacy-final.log`, `_evidence/runtime-preflight-final.log`.
 - Python syntax compilation passed for `app/ultralytics_privacy.py`, `app/ppe.py`, `app/lpr.py`, `app/main.py`, and `installer/windows/runtime-preflight.py`.
 - The Local-view and authorization test summaries were captured as focused evidence notes under `_evidence/` and exercised the source content committed as `d44db2c5`.
-- `_evidence/CODEX-SHA256SUMS.txt` contains 45 evidence-file entries. All paths and SHA-256 values are independently verified; the final authorized auth suite and the two restricted-session retry logs are included. SQLite databases and temporary fixtures are preserved locally but excluded from the hash list and Git commits.
+- `_evidence/CODEX-SHA256SUMS.txt` contains 45 evidence-file entries. All paths and SHA-256 values are independently verified; the final authorized auth suite and the two restricted-session retry logs are included. Manifest SHA-256: `7c833b0add60a745f326ec416e6bd32337351ac45a70d3072634fa81c6ea565f`. Final focused product log SHA-256: `d16567e189b968e6e2a18d622b13c355a2190aeba7a140c7a51fee10e606e242`. Final auth log SHA-256: `c274495dbf5839cff8ecafab5179a97e4e2a0ded3c4faf35579fa9e2ac040f15`. SQLite databases and temporary fixtures are preserved locally but excluded from the hash list and Git commits.
 
 ## Environment and unverified acceptance
 
