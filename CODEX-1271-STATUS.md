@@ -35,7 +35,7 @@ Additional isolated fixes in this branch:
 
 All results below are local offline tests on Python 3.14.6 with isolated SQLite databases unless explicitly stated otherwise. They are not Linux/Ubuntu or installer acceptance.
 
-- Corrected product/security suite on source `4dbbc18d` (before the later page-shell fetch-wrapper-only correction): **254 passed, 0 failed, 2 skipped**, 38 warnings, 287.15 s. Includes R-REC cloud/edge, trust/G2, keyset tooling, guest checkout plan, LPR stale-frame/camera cleanup/cadence, PPE and telemetry privacy tests. Log: `_evidence/full-focused-final2.log`. The later shell change is covered by the current 36-case browser matrix and exact-template Node test.
+- Final product/security suite on application/test source `dcace5778c56988d447bd8a182a8308e7fb21dc5` (run from report descendant `a890fc0bf50f9bae33907da316710e0843c9c254`): **254 passed, 0 failed, 2 skipped, 33 warnings, 179.33 s**. Includes R-REC cloud/edge, trust/G2, keyset tooling, guest checkout plan, LPR stale-frame/camera cleanup/cadence, PPE and telemetry privacy tests. Log: `_evidence/full-focused-final-current.log`.
 - Administrator authorization suite on integrated auth code: **139 passed, 0 failed, 4 skipped**, 665 warnings, 386.26 s. Log: `_evidence/authz-full-integrated.log`.
 - Final authorization/MFA rerun on `d44db2c5`: **139 passed, 0 failed, 4 skipped**, 665 warnings, 290.49 s. Log: `_evidence/authz-final2.log`. An earlier exact-tip attempt was interrupted and is excluded.
 - Installer trust-registry tests: **8 passed, 3 skipped, 2 subtests passed**. Log: `_evidence/installer-trust.log`.
@@ -49,7 +49,7 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 - Ultralytics privacy tests: **4 passed**; local installed Ultralytics 8.4.115 opt-out smoke reported `sync=False`, `events.enabled=False`; runtime preflight passed. No model was loaded and no external telemetry request was made. Logs: `_evidence/ultralytics-privacy-final.log`, `_evidence/runtime-preflight-final.log`.
 - Python syntax compilation passed for `app/ultralytics_privacy.py`, `app/ppe.py`, `app/lpr.py`, `app/main.py`, and `installer/windows/runtime-preflight.py`.
 - The Local-view and authorization test summaries were captured as focused evidence notes under `_evidence/` and exercised the source content committed as `d44db2c5`.
-- `_evidence/CODEX-SHA256SUMS.txt` covers 41 local test log/evidence files and verifies with 0 hash mismatches. SQLite databases and temporary fixtures are preserved locally but excluded from the hash list and Git commits.
+- `_evidence/CODEX-SHA256SUMS.txt` contains 42 evidence-file entries. All 42 paths exist and all SHA-256 values independently reverified with zero mismatches, including `_evidence/full-focused-final-current.log`. SQLite databases and temporary fixtures are preserved locally but excluded from the hash list and Git commits.
 
 ## Environment and unverified acceptance
 
