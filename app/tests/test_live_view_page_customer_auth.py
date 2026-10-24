@@ -81,7 +81,15 @@ def _owner_cookie(customer_id, email):
 
 
 def _admin_cookie():
-    return partner_portal._token("admin@example.test", "administrator", None, None, None)
+    # A signed administrator cookie without a persisted session is now
+    # intentionally invalid (D-AUTHZ-2b). Build a real MFA-verified session
+    # so this route-level role test reaches the route and continues to assert
+    # that a valid administrator is redirected to the partner portal.
+    from authz_helpers import make_partner_user, partner_session_cookie
+
+    email = "admin@example.test"
+    make_partner_user(email, "administrator", user_id="live-view-test-admin", global_admin=True)
+    return partner_session_cookie(email, "administrator", user_id="live-view-test-admin")
 
 
 @pytest.fixture()
