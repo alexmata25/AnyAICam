@@ -50,8 +50,14 @@ UPDATES_UNSUPPORTED = UNSUPPORTED_ACTIONS['install_update']
 # new product mode is saved, and the cloud's restart_vms for the same switch can arrive while that stop is still
 # pending; WinSW then refuses ("Cannot stop 'AnyAiCamVMS' service") and the command was reported failed although the
 # VMS came back in the new mode. When the service is mid-stop/start, wait for it to settle and run the restart once more.
+# D3c (Blue, Sandbox U132-L on 080bfe15, 2026-10-23): the VMS's own `restart!` is a stop and then a start, and between
+# the two the service is briefly STOPPED. Treating that moment as settled sent the retry into the other restart's start
+# ("Cannot start") and the command was reported failed although the VMS came back in the new mode. STOPPED now counts as
+# settled only when it lasts STOPPED_STABLE_POLLS polls; and a retry refused as busy again completes once the service is
+# RUNNING, because the restart the cloud asked for then happened after the command arrived.
 SERVICE_IDS = {'AnyAiCamVMS.exe': 'AnyAiCamVMS'}
 RESTART_SETTLE_SECONDS = 120
+STOPPED_STABLE_POLLS = 5
 _BUSY_MARKERS = ('Cannot stop', 'Cannot start')
 
 
@@ -67,10 +73,17 @@ def _service_busy(service_id: str, result, run) -> bool:
     return service_state(service_id, run).endswith('_pending') or any(m in output for m in _BUSY_MARKERS)
 
 
-def _wait_until_settled(service_id: str, run, sleep, seconds: float) -> str:
-    deadline = time.monotonic() + seconds
-    state = service_state(service_id, run)
-    while state.endswith('_pending') and time.monotonic() < deadline:
+def _wait_until_settled(service_id: str, run, sleep, deadline: float) -> str:
+    state, stopped_polls = service_state(service_id, run), 0
+    while time.monotonic() < deadline:
+        if state.endswith('_pending'):
+            stopped_polls = 0
+        elif state == 'stopped':
+            stopped_polls += 1
+            if stopped_polls >= STOPPED_STABLE_POLLS:
+                break
+        else:
+            break
         sleep(2)
         state = service_state(service_id, run)
     return state
@@ -96,13 +109,18 @@ def run_privileged_action(action_type: str, *, root: Path | None = None, run=sub
     extra = {}
     service_id = SERVICE_IDS.get(wrapper)
     if result.returncode != 0 and service_id and _service_busy(service_id, result, run):
-        settled = _wait_until_settled(service_id, run, sleep, RESTART_SETTLE_SECONDS)
+        deadline = time.monotonic() + RESTART_SETTLE_SECONDS   # one bound for every wait below
+        settled = _wait_until_settled(service_id, run, sleep, deadline)
         try:
             result = run([str(executable), verb], capture_output=True, text=True, timeout=120, check=False,
                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except (OSError, subprocess.SubprocessError) as error:
             return 'failed', {}, f'Could not run {wrapper} {verb} after a restart already in progress: {error}'
         extra = {'retried_after_restart_in_progress': True, 'state_before_retry': settled}
+        if result.returncode != 0 and _service_busy(service_id, result, run):
+            if _wait_until_settled(service_id, run, sleep, deadline) == 'running':
+                return 'completed', {'requested': True, 'action': action_type, **extra,
+                                     'completed_by_restart_in_progress': True}, ''
     if result.returncode != 0:
         return 'failed', {}, f'{wrapper} {verb} exited with {result.returncode}.'
     return 'completed', {'requested': True, 'action': action_type, **extra}, ''
