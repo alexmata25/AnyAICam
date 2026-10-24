@@ -65,8 +65,8 @@ acceptance.
 
 | Input | Authorized source | Independent validation before build | Current state |
 |---|---|---|---|
-| TRUST-1 production registry | Authorized cloud trust administrator, using `app/entitlement_keyset.py` against the production public signer records; preserve prior generation history | Review canonical production JSON, generation and signer lifecycle; verify retained signers cover existing accepted grants; compare canonical registry bytes to a separately obtained cloud-host SHA-256; builder must accept both registry and digest | Missing; no cloud access performed |
-| Software Update verification public key | Existing release-signing custodian's trusted offline signing environment; provide only the public PEM derived from the already approved private key | Custodian supplies the separately confirmed fingerprint and provenance; compare using that custodian's documented fingerprint procedure; builder canonicalizes PEM, rejects private key material, records canonical PEM SHA-256, and `installer/12-update-signing-key.sh` verifies it | Missing; do not generate replacement key material |
+| TRUST-1 production registry | Authorized cloud trust administrator, using `python -m entitlement_keyset --trust-registry` on the approved cloud host against production public signer records; preserve prior generation history | Review canonical production JSON, generation and signer lifecycle; verify retained signers cover existing accepted grants; compare canonical registry bytes to a separately obtained cloud-host SHA-256; builder must accept both registry and digest | Registry and digest missing. No individual custodian name/contact is present in the reviewed repository or handoff; identity must be confirmed by the owner/Red. No cloud access performed |
+| Software Update verification public key | Existing release-signing custodian's trusted offline signing environment; export only the public PEM corresponding to the already approved release-signing identity | Custodian supplies separately confirmed fingerprint and provenance; compare using the custodian's documented fingerprint procedure; builder canonicalizes PEM, rejects private key material, records canonical PEM SHA-256, and `installer/12-update-signing-key.sh` verifies it | Public PEM and fingerprint missing. No individual custodian name/contact is present in the reviewed repository or handoff; identity must be confirmed by the owner/Red. Do not generate replacement key material |
 | MediaMTX Linux binary | Official `bluenviron/mediamtx` GitHub v1.21.0 release asset `mediamtx_v1.21.0_linux_amd64.tar.gz` | Obtain official `checksums.sha256`; verify archive SHA; verify GitHub attestation with repository `bluenviron/mediamtx`; extract the Linux amd64 executable; record and independently verify its full SHA-256; reconcile against an approved full-hash release record before passing the binary/hash pair to builder | Version/platform chosen by owner; artifact and complete hash missing |
 | Release identity | Owner-approved version `1.2.7.1` and frozen application/test source commit `dcace5778c56988d447bd8a182a8308e7fb21dc5` | Clean isolated worktree; verify commit ancestry and builder-reported source commit; never overwrite the accepted earlier installer | Identified; no artifact built |
 
@@ -159,9 +159,13 @@ the authorized build measures the exact candidate.
 ### Shared Docker HOLD owner and release condition
 
 The available handoff identifies **Red** as the agent expected to release the
-shared lock. It does not identify the individual currently holding the lock,
-the lock-file path/token, or a current owner acknowledgment; those details are
-therefore **NOT VERIFIED**. Before a Docker job, Red/current lock custodian must
+shared lock. The latest visible lock-order note (`BLUE-TO-GREEN-LOCK-ORDER-20261023.md`)
+says the Blue sequence released the lock at 22:46 CDT on October 23 and Green
+could begin. A read-only check on October 24 found no marker at the historically
+documented `C:\Users\Alejandro Mata\anyaicam-red\.docker-test.lock` path.
+Neither item proves the current job queue is idle or identifies the individual
+currently responsible for the HOLD. The current holder/custodian and status
+remain **NOT VERIFIED**. Before a Docker job, Red/current lock custodian must
 post an explicit release/status handoff that confirms: (a) the existing job
 queue is idle and logs are preserved, (b) the shared lock is free and names
 the next authorized job/agent, and (c) the lock is returned after that job.
@@ -298,9 +302,14 @@ non-secret materials and decisions:
    Ultralytics and LPR model distribution terms remains outstanding; it is not
    resolved by an installer build.
 
-No production credentials were requested or accessed. No Docker command,
-installer build, download, GitHub push, appliance access, or production action
-was performed for this preparation note.
+Green's existing acceptance package was copied unchanged to the shared handoff
+as `CODEX-GREEN-ACCEPTANCE-PACKAGE-1271.md`; the source and copy both hash to
+`E6DF8D5CE290713DAA3B2F815B72E95F85CE118160F7D76C4AD89436D7FDFB0E`. A
+coordination request for Red's lock/custodian confirmation and Green's
+read-only review is at `CODEX-RELEASE-PREP-REQUEST-20261024.md` in that same
+handoff. No production credentials were requested or accessed. No Docker
+command, installer build, download, GitHub push, appliance access, or
+production action was performed for this preparation note.
 
 ## 6. Safe Ubuntu 24.04 / Python 3.12 installer acceptance sequence
 
@@ -373,3 +382,67 @@ limits. Use synthetic accounts, cameras, events, and recordings only.
     logs and screenshots without secrets or customer media. Any application,
     installer, or dependency change changes the candidate identity and
     requires affected tests plus a new exact-commit artifact.
+
+## 7. Retrieval and exact build commands (prepared; not executed)
+
+The official v1.21.0 release documents both the checksum-file check and GitHub
+artifact-attestation verification. From a clean Ubuntu 24.04 amd64 staging
+directory, after the release-materials owner authorizes the downloads:
+
+```bash
+set -euo pipefail
+umask 077
+mkdir -p "$HOME/release-inputs/mediamtx-v1.21.0"
+cd "$HOME/release-inputs/mediamtx-v1.21.0"
+version=v1.21.0
+archive="mediamtx_${version}_linux_amd64.tar.gz"
+base="https://github.com/bluenviron/mediamtx/releases/download/${version}"
+curl --fail --location --proto '=https' --tlsv1.2 -o "$archive" "$base/$archive"
+curl --fail --location --proto '=https' --tlsv1.2 -o checksums.sha256 "$base/checksums.sha256"
+awk -v f="$archive" '$2 == f { print }' checksums.sha256 > selected.sha256
+test "$(wc -l < selected.sha256)" -eq 1
+sha256sum --check selected.sha256
+gh attestation verify "$archive" --repo bluenviron/mediamtx
+tar -tzf "$archive" > archive-files.txt
+```
+
+Before extraction, inspect `archive-files.txt`; reject absolute paths, parent
+traversal, symlinks, unexpected executable paths, or a non-amd64 payload.
+Extract into a new mode-0700 staging directory only after that check. Verify
+the extracted `mediamtx` with `file`, `mediamtx --version`, and
+`sha256sum`; compare the complete binary hash to the separately approved
+release record, then preserve the archive hash, attestation result, binary
+hash, version output, and operator identity in the release evidence. The
+archive checksum and GitHub attestation establish upstream artifact
+provenance; the builder's `--mediamtx-sha256` must be the full hash of the
+extracted executable. Do not proceed if the independent approved binary-hash
+record is unavailable or disagrees.
+
+Once the public TRUST-1 registry/digest and public update key/fingerprint are
+delivered and verified, build into a new, versioned output directory using
+the frozen application commit. This is a command template, not an executed
+build; replace only the bracketed file paths and digest values with the
+verified release inputs:
+
+```bash
+python installer/build_release_installer.py \
+  --vms-commit dcace5778c56988d447bd8a182a8308e7fb21dc5 \
+  --vms-repo /path/to/clean/AnyAiCam-VMS \
+  --release-version 1.2.7.1 \
+  --entitlement-trust-registry /path/to/approved/production-trust-registry.json \
+  --entitlement-trust-registry-sha256 <independently-obtained-registry-sha256> \
+  --update-signing-public-key /path/to/approved/update-verification-public.pem \
+  --mediamtx-binary /path/to/staged/mediamtx \
+  --mediamtx-sha256 <independently-verified-executable-sha256> \
+  --output-dir /path/to/new-output/linux-1.2.7.1-test
+```
+
+Do not add `--preload-vms-image`: the owner selected appliance-side image
+build for the initial path. This installer build does not itself run Docker;
+the later disposable Ubuntu installation/lifecycle test does. The builder
+must fail if any approved trust/key/media input is missing or mismatched. Do
+not use the `--no-*` options to bypass required release inputs. Record the
+builder output manifest, source commit, exact command with local paths
+redacted from any shared report, installer SHA-256 and size. Keep public
+material hashes and provenance in evidence; never include credentials or
+private signing material.
