@@ -151,13 +151,43 @@ part of a Git commit and must remain out of any review backup/push:
 stage, or copy them into a source archive.
 
 `aws.env` is ignored now, but Git history contains a prior `aws.env` path.
-The corresponding historical blob is a credential-exposure risk; a Git bundle
-or a branch push carries reachable history and can carry that blob even though
-the working-tree file is ignored. This review did not read or print its
-contents. Keep the remote review-branch backup **blocked** until the owner
-establishes the approved encrypted archive method and credential validity has
-been assessed by the credential owner. Do not rewrite history or push it to a
-public repository.
+The corresponding historical blobs contain nonempty, non-placeholder values
+assigned to secret/password-named application fields. The file also contains a
+nonempty secret-manager identifier. This confirms historical credential-like
+material was committed; it does **not** establish whether those values are
+production credentials or whether any remain valid. No conventional
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `AWS_SESSION_TOKEN` assignment
+was found by field-name inspection. No value, value hash, or raw blob was
+printed or copied into this report.
+
+The path-history commits are:
+
+| Commit | Path action / exposure |
+|---|---|
+| `4a521409a23cf6c5cea330004ebf3e38c57aa8ac` | Added `aws.env`; credential-like fields present |
+| `1c5d053b89628d4d87d6e14fb9d20de99a0a91d0` | Modified file; credential-like fields present |
+| `d89d681d37c4ad45e308059ab41f67194054a187` | File present in commit tree; credential-like fields present |
+| `08441d1a51726fb4698df53e0efa0d26e0194da0` | Modified file; credential-like fields present |
+| `b5ebc430c95b6c5ff328fea16e18c6469344c7bb` | File present in commit tree; credential-like fields present |
+| `ee69f97c7e1f89f61e2fa9998bea7b0f0545081e` | Deleted `aws.env` from that tree; prior blobs remain in ancestry |
+| `2e2524d07cbeec9823fadb084b718039c4579bad` | Later path-history commit; file absent from this tree |
+
+In this clone, each of the five file-containing commits is an ancestor of all
+four cached remote-tracking refs: `origin/claude/red-1271-rrec`,
+`red/claude/red-1271-authz`, `red/claude/red-1271-hwplan`, and
+`red/claude/red-1271-trust`. The file-containing history is also reachable
+from cached tags `blue-win-1.3.3-test-53e8b41`,
+`blue-win-1.3.3-test-906f781`, `checkpoint-before-camera-ui-unification-20260827`,
+`green-activation-21372fd0-hold`, `release-candidate-5c459c4-20260827`,
+`v0.1.3`, `v0.9.0`, and `v0.9.1`. This is a read-only local-ref assessment;
+refs were not fetched, so it does not assert the current live server state.
+
+A Git bundle or branch push carries reachable history and can carry those
+blobs even though the current file is ignored. Keep the remote review-branch
+backup **blocked** until the credential owner determines whether the exposed
+values are still valid, handles any necessary revocation/rotation under
+separate approval, and the owner approves a secure backup destination. Do not
+rewrite history or push to a public repository.
 
 When the owner authorizes backup preparation, use this gated procedure:
 
@@ -185,6 +215,22 @@ When the owner authorizes backup preparation, use this gated procedure:
 6. A GitHub push remains a separate action requiring explicit approval of the
    exact repository, branch, visibility and commit range.
 
+### Credential-owner remediation requirements
+
+1. The credential custodian must assess the exposed portal, administrator and
+   SMTP values by credential identity in the protected secret systems, without
+   copying the historical values into a report. This checkout cannot verify
+   whether they are live.
+2. If any value is current or validity is uncertain, the owner must approve
+   revocation/rotation and the custodian must rotate it through the normal
+   secret-management process, then verify dependent services using sanitized
+   status only. This review did not rotate or test credentials.
+3. Record the custodian's sanitized determination and remediation completion
+   date. Retain the historical exposure classification even after rotation.
+4. Until the owner approves backup handling for a repository whose reachable
+   history includes these blobs, do not generate or transfer a history-bearing
+   bundle and do not push a review branch.
+
 ## 5. Exact remaining inputs and owner/release actions
 
 No password, token, cloud credential, or private key should be sent to Codex.
@@ -201,13 +247,17 @@ non-secret materials and decisions:
    any explicitly approved update), official archive/checksum/attestation and
    exact extracted-binary SHA. Release engineering supplies the verified
    artifact; this checkout does not contain the full Linux digest.
-4. Release owner confirms the product version string (expected `1.2.7.1`) and
-   installer approach: on-appliance Docker build or preloaded image. The latter
-   requires Red to release Docker HOLD and a scheduled resource-safe build.
-5. For preloading only: shared Docker lock release, target platform, and
-   resource preflight. No GHCR publication is necessary for either current
-   path; if GHCR is later proposed, repository visibility, immutable tag/digest
-   and publication approval are separate gates.
+4. Owner approved product version `1.2.7.1`, historical MediaMTX target
+   `v1.21.0` Linux amd64 subject to official artifact/full-hash verification,
+   and preference for the appliance-side Docker build initially. Do not
+   substitute v1.21.2.
+5. Appliance-side image build is the selected initial path, but Docker HOLD
+   remains active: no Docker execution until Red releases the hold and the
+   owner separately authorizes a test/build window. Preloading remains a
+   documented alternate for review; it requires the same lock/resource gates.
+   No GHCR publication is needed for either current path; if GHCR is later
+   proposed, repository visibility, immutable tag/digest and publication
+   approval are separate gates.
 6. Before customer distribution, owner/legal determination of the pinned
    Ultralytics and LPR model distribution terms remains outstanding; it is not
    resolved by an installer build.
