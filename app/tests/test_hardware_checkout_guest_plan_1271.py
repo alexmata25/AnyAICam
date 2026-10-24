@@ -39,6 +39,12 @@ ADMIN = {"email": "ops@example.test", "role": "global_admin"}
 def guest_shop(shop, stripe_subscriptions, monkeypatch):
     """The shop plus: Stripe answers which card paid a PaymentIntent (pm_<intent>), and line items are not read."""
     import build_orders
+    import partner_portal
+    # These journeys exercise cloud-account sign-in and deferred purchase
+    # attachment. The Dell test host may have a persisted activation identity;
+    # it must not make the website's login route take the appliance-only
+    # delegated/offline-auth branch.
+    monkeypatch.setattr(partner_portal, "_claimed_appliance", lambda: False)
     import main
     monkeypatch.setattr(build_orders, "_line_amounts", lambda session: {})
     inner_get = main.stripe_api_get
