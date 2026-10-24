@@ -1,0 +1,57 @@
+# AnyAiCam Linux 1.2.7.1 isolated corrective status
+
+Date: 2026-10-24
+
+## Source identity and preservation
+
+- Frozen baseline: `b8c7a7edba7083ee703bb7a4d71bc8f27ea7dc5c`.
+- Isolated Codex branch: `codex/linux-1271-integrated`.
+- Current source commit when this report was prepared: `4dbbc18d7a25e72c642f1da6f2435fc0854213b0`.
+- `git merge-base b8c7a7ed HEAD` resolves to the frozen baseline. The frozen source and the original Red worktrees were not modified.
+- Red's trust/G2 and authorization tracked work was snapshotted into local review commits `3b198918049b500a205ce4486c36625a10dc1b91` and `87e2ca3ba5f305acba6fc3f63caf46072903bed7`. The only untracked package/build copies inspected were byte-identical to tracked source (34/34 files); generated build and egg-info output was excluded. Original worktrees remain untouched.
+
+## Corrective areas assembled
+
+1. R-REC-1 event-only recording policy and route/migration/provisioning checks.
+2. G2 accepted authorization continuity during clock rollback/offline conditions.
+3. TRUST-1 key lifecycle, revocation and trust-state rollback protections.
+4. D-HW-PLAN-1 guest purchase-plan persistence and test isolation.
+5. D-AUTHZ-3 customer/tenant subscription and support-ticket isolation.
+6. D-AUTHZ-1 revoked administrator/session-version enforcement.
+7. D-AUTHZ-2b MFA enforcement on administrator authentication, setup, bootstrap and protected routes.
+
+Additional isolated fixes in this branch:
+
+- R-REC tests now obtain an MFA-authorized admin session rather than relying on a legacy bare-token bypass (`557a4240`).
+- The AUTHZ session-version migration is in the migration transaction (`0ae25115`).
+- The MFA setup page refuses unauthorized active-grant requests (`8973023c`); the guest plan test isolates host identity (`62b3527b`).
+- Same-origin CSRF wrapper strips quoted cookie values (`e2501657`).
+- Ultralytics opt-out is written to the actual `Ultralytics/settings.json` config location before import, and inference remains fail-closed if telemetry cannot be disabled (`4dbbc18d`).
+
+## Focused automated evidence
+
+All results below are local offline tests on Python 3.14.6 with isolated SQLite databases unless explicitly stated otherwise. They are not Linux/Ubuntu or installer acceptance.
+
+- Corrected product/security suite: **254 passed, 0 failed, 2 skipped**, 38 warnings, 287.15 s. Includes R-REC cloud/edge, trust/G2, keyset tooling, guest checkout plan, LPR stale-frame/camera cleanup/cadence, PPE and telemetry privacy tests. Log: `_evidence/full-focused-final2.log`.
+- Administrator authorization suite on integrated auth code: **139 passed, 0 failed, 4 skipped**, 665 warnings, 386.26 s. Log: `_evidence/authz-full-integrated.log`.
+- A second authorization rerun against commit `4dbbc18d` was interrupted at 50% after the session produced no further visible progress; it is not counted as a result. The complete prior run covers the unchanged authorization files, but exact-tip rerun evidence is still desirable.
+- Installer trust-registry tests: **8 passed, 3 skipped, 2 subtests passed**. Log: `_evidence/installer-trust.log`.
+- Appliance-agent trust/update tests: **51 passed, 11 skipped, 39 subtests passed**. Log: `_evidence/agent-trust.log`.
+- Node/Python-wrapper browser tests: **41 passed, 0 failed**. Log: `_evidence/node-focused-pytest2.log`; direct same-origin CSRF wrapper check reports `same-origin-login-variants=passed` on `e2501657`.
+- Ultralytics privacy tests: **4 passed**; local installed Ultralytics 8.4.115 opt-out smoke reported `sync=False`, `events.enabled=False`; runtime preflight passed. No model was loaded and no external telemetry request was made. Logs: `_evidence/ultralytics-privacy-final.log`, `_evidence/runtime-preflight-final.log`.
+- Python syntax compilation passed for `app/ultralytics_privacy.py`, `app/ppe.py`, `app/lpr.py`, `app/main.py`, and `installer/windows/runtime-preflight.py`.
+
+## Environment and unverified acceptance
+
+- A focused Local/P2P/auth/playback test command was started but emitted no output and was stopped after repeated checks found no observable test process or updated output. It is **interrupted, not passed**. Its attempted pytest log notes the launcher could not resolve a requested runtime; Python 3.12 is absent (`C:\Program Files\AnyAiCam\runtime\python\python.exe` does not exist). Python 3.14.6 is available.
+- No Docker, WSL, Ubuntu VM, root-owned Linux check, installer build, image build, installer install/upgrade/repair/rollback, camera, or physical acceptance test was run. Shared Docker work is on HOLD and engine/VM access is unavailable from this session; do not bypass the shared lock or start a VM.
+- No release installer, image digest, or artifact hash was produced.
+- Basic Local HLS routing/auth code has not been established as end-to-end media delivery. `app/live_view_p2p.py` describes signaling, but the appliance-side media-answer publisher is not demonstrated. Real authenticated direct video/P2P remains unverified and may require product work.
+- Telemetry behavior was smoke-tested against installed Ultralytics 8.4.115, not the release-pinned 8.3.40 package. Run pinned-package verification in an approved isolated Linux build/test environment.
+- Do not use test trust keys for release builds. Builder needs the approved public entitlement keyset and hash, verified MediaMTX binary/hash, and authorized update-verification public key material. No private signing key was accessed.
+- AGPL/commercial licensing for the LPR model/runtime must be resolved by the owner/legal counsel before customer distribution; this branch does not assert legal clearance.
+- Red/Green independent validation is still required on this exact candidate before integration or release acceptance.
+
+## Recommendation
+
+The corrective source work has substantial focused offline coverage, but Linux 1.2.7.1 is **NOT READY for physical installation or customer distribution**. Remaining gates: final exact-tip authorization rerun if resources permit; Local/P2P test resolution; supported Ubuntu/Python 3.12 Docker and installer lifecycle validation; exact trusted release materials and image digest; pinned Ultralytics opt-out check; full backup/restore and appliance acceptance after separate owner approval; Red/Green independent review; and licensing clearance.
