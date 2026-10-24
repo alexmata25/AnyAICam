@@ -347,6 +347,42 @@ limits. Use synthetic accounts, cameras, events, and recordings only.
    history, entitlements, subscription, and sessions. Exercise backup, restore,
    rollback and compare row counts/content to the synthetic baseline. Never
    use a production/customer URL or credential.
+
+   The exact existing dashboard migration/backup integration test is
+   `app/tests/test_aws_cost_dashboard_postgresql.py`. It reads
+   `ANYAICAM_TEST_POSTGRES_URL` and
+   `ANYAICAM_TEST_POSTGRES_RESTORE_URL`, restricts both hosts to loopback or
+   the isolated `postgres` test-network name, and requires distinct database
+   names. It performs `pg_dump --format=custom`, applies the migration twice,
+   then invokes `pg_restore --clean --if-exists` against the restore URL. Both
+   databases therefore must be newly created, empty, dedicated throwaways;
+   never point either variable at production, customer, staging, or reusable
+   developer databases. The test does not itself assert server major version,
+   so the operator must verify PostgreSQL 16 before running it. Use a
+   test-only `PGPASSFILE` with mode 0600 rather than putting passwords in URLs
+   or shell history:
+
+   ```bash
+   set -euo pipefail
+   umask 077
+   export PGPASSFILE="$HOME/.pgpass-aac-1271-test"
+   export ANYAICAM_TEST_POSTGRES_URL='postgresql://aac1271_test@127.0.0.1:5432/aac1271_source_<run-id>'
+   export ANYAICAM_TEST_POSTGRES_RESTORE_URL='postgresql://aac1271_test@127.0.0.1:5432/aac1271_restore_<run-id>'
+   for url in "$ANYAICAM_TEST_POSTGRES_URL" "$ANYAICAM_TEST_POSTGRES_RESTORE_URL"; do
+     psql "$url" -XAtc "SELECT current_database() || '|' || current_setting('server_version_num')"
+     psql "$url" -XAtc "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND c.relkind IN ('r','p','v','m','S','f')"
+   done
+   test "$(python3.12 -c 'import urllib.parse,os; print(urllib.parse.urlsplit(os.environ["ANYAICAM_TEST_POSTGRES_URL"]).path)')" != "$(python3.12 -c 'import urllib.parse,os; print(urllib.parse.urlsplit(os.environ["ANYAICAM_TEST_POSTGRES_RESTORE_URL"]).path)')"
+   cd app
+   python3.12 -m pytest -q --basetemp "$HOME/aac-1271-pg-test-tmp" tests/test_aws_cost_dashboard_postgresql.py
+   ```
+
+   Before pytest, confirm each `psql` output reports major version 16 and zero
+   user relations, and confirm the PGPASSFILE is test-only and mode 0600.
+   Preserve the logs. The integration test mutates the source DB and cleans
+   objects in the restore DB; after results are captured, discard only these
+   uniquely named disposable databases under the approved test-environment
+   cleanup procedure.
 4. **Build immutable test artifact:** build version `1.2.7.1` from the exact
    source commit and verified release inputs. Initially omit
    `--preload-vms-image` per owner decision. Record installer SHA-256, size,
