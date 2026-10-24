@@ -476,6 +476,14 @@ private signing material.
   `git archive` line endings, tar executable modes and builder fail-fast
   behavior; inspection confirmed it does not invoke Docker. The one skipped
   test requires POSIX executable-bit behavior and is not counted as a pass.
+- TRUST-1 installer input/manifest regression file passed on the same
+  Windows/Python `3.14.6` checkout: **8 passed, 3 skipped, 2 subtests passed**
+  in 1.63 seconds; command: `pytest installer/tests/test_entitlement_trust_registry_installer.py -q`.
+  The
+  skips are the root-owned/POSIX provisioning cases unavailable on Windows;
+  they remain pending Linux acceptance and are not counted as passes. This
+  suite used synthetic keys/registry fixtures only and did not load release
+  keys or invoke Docker.
 - Green's existing acceptance package was preserved unchanged at the shared
   handoff path recorded in the coordination note; its copied-file SHA-256 is
   `E6DF8D5CE290713DAA3B2F815B72E95F85CE118160F7D76C4AD89436D7FDFB0E`.
