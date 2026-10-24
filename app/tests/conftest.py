@@ -402,3 +402,14 @@ def legacy_own_pc_checkout(monkeypatch):
     import build_orders
     from legacy_own_pc_checkout import legacy_checkout_fields
     monkeypatch.setattr(build_orders, "_checkout_fields", legacy_checkout_fields)
+
+
+@pytest.fixture
+def partner_session():
+    """Mints a REAL Partner Portal session (user_sessions row bound to the
+    account's current authorization_version, MFA-verified for an
+    administrator) and returns its signed cookie value -- see
+    authz_helpers.partner_session_cookie(). Linux 1.2.7.1 refuses session-less
+    administrator tokens, so tests sign in this way instead."""
+    from authz_helpers import partner_session_cookie
+    return partner_session_cookie
