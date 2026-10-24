@@ -61,6 +61,20 @@ installer, `--no-entitlement-signing-keys`, or `--no-update-signing-key` to
 make the build proceed. These options would not satisfy TRUST-1/update
 acceptance.
 
+### Sanitized release-input checklist
+
+| Input | Authorized source | Independent validation before build | Current state |
+|---|---|---|---|
+| TRUST-1 production registry | Authorized cloud trust administrator, using `app/entitlement_keyset.py` against the production public signer records; preserve prior generation history | Review canonical production JSON, generation and signer lifecycle; verify retained signers cover existing accepted grants; compare canonical registry bytes to a separately obtained cloud-host SHA-256; builder must accept both registry and digest | Missing; no cloud access performed |
+| Software Update verification public key | Existing release-signing custodian's trusted offline signing environment; provide only the public PEM derived from the already approved private key | Custodian supplies the separately confirmed fingerprint and provenance; compare using that custodian's documented fingerprint procedure; builder canonicalizes PEM, rejects private key material, records canonical PEM SHA-256, and `installer/12-update-signing-key.sh` verifies it | Missing; do not generate replacement key material |
+| MediaMTX Linux binary | Official `bluenviron/mediamtx` GitHub v1.21.0 release asset `mediamtx_v1.21.0_linux_amd64.tar.gz` | Obtain official `checksums.sha256`; verify archive SHA; verify GitHub attestation with repository `bluenviron/mediamtx`; extract the Linux amd64 executable; record and independently verify its full SHA-256; reconcile against an approved full-hash release record before passing the binary/hash pair to builder | Version/platform chosen by owner; artifact and complete hash missing |
+| Release identity | Owner-approved version `1.2.7.1` and frozen application/test source commit `dcace5778c56988d447bd8a182a8308e7fb21dc5` | Clean isolated worktree; verify commit ancestry and builder-reported source commit; never overwrite the accepted earlier installer | Identified; no artifact built |
+
+Transfer only these public release inputs via the owner-approved, access-
+controlled release-materials location. Store private cloud or signing
+credentials nowhere in the build workspace. The release builder's checks are
+necessary but do not replace independent source/fingerprint/hash verification.
+
 ## 2. MediaMTX pin and provenance
 
 Repository history documents the Linux appliance integration with official
@@ -141,6 +155,28 @@ The source documents a prior 1.2.5 example of roughly 827 MiB compressed and
 3.4 GB extracted; these are historical measurements, **not** measurements of
 the 1.2.7.1 image. Do not publish current package-size or storage claims until
 the authorized build measures the exact candidate.
+
+### Shared Docker HOLD owner and release condition
+
+The available handoff identifies **Red** as the agent expected to release the
+shared lock. It does not identify the individual currently holding the lock,
+the lock-file path/token, or a current owner acknowledgment; those details are
+therefore **NOT VERIFIED**. Before a Docker job, Red/current lock custodian must
+post an explicit release/status handoff that confirms: (a) the existing job
+queue is idle and logs are preserved, (b) the shared lock is free and names
+the next authorized job/agent, and (c) the lock is returned after that job.
+The runner must also check the established resource gate immediately before
+start (at least 4 GiB RAM and 8 GiB disk) and stop below 3 GiB RAM or 6 GiB
+disk. No Docker command is authorized by this preparation note. The owner must
+separately authorize the first Docker build/test window; no one should infer
+HOLD release from available machine capacity alone.
+
+For the owner's selected initial appliance-side build route, producing the
+installer archive does not require `--preload-vms-image` or a Docker build on
+the release workstation. The later disposable Ubuntu install/lifecycle
+acceptance does require Docker on that test guest and therefore still waits for
+the explicit lock/owner authorization above. Do not switch silently to image
+preloading.
 
 ## 4. GitHub review-branch backup and secret-scan plan
 
@@ -265,3 +301,75 @@ non-secret materials and decisions:
 No production credentials were requested or accessed. No Docker command,
 installer build, download, GitHub push, appliance access, or production action
 was performed for this preparation note.
+
+## 6. Safe Ubuntu 24.04 / Python 3.12 installer acceptance sequence
+
+This is a prepared procedure, not authorization to install. Use a fresh,
+disposable Ubuntu 24.04 test VM with a verified snapshot/export and a separate
+scratch data disk. It must not be Ryzen, Samsung, production EC2, or a VM with
+customer data. Keep Docker HOLD in place until its custodian and the owner
+separately release the test window. Apply the existing RAM/disk start and stop
+limits. Use synthetic accounts, cameras, events, and recordings only.
+
+1. **Identity and input gate:** verify OS release, Python 3.12, amd64
+   architecture, Docker/Compose versions and host resources. Confirm exact
+   source commit/version and clean build checkout. Verify and record hashes of
+   registry, independently sourced registry digest, update public key and
+   fingerprint, MediaMTX archive and executable. Refuse to proceed if any
+   source, signer, environment, or digest is missing or inconsistent.
+2. **Offline source suites:** run `bash installer/tests/run_tests.sh`,
+   `python3 -m unittest discover -s installer/tests -v`, and the Green
+   acceptance package's exact Python product/security, MFA/admin/tenant,
+   P2P/signaling and Node wrapper test groups. Preserve raw logs and status;
+   do not count skips as passes. Run installer trust-registry tests and
+   appliance-agent trust/update tests in the same Linux environment.
+3. **PostgreSQL 16:** create two separately named, disposable PostgreSQL 16
+   databases and prove their endpoint/database names before tests. Run all
+   migration tests against both; first startup must apply expected migrations,
+   second startup must apply zero. Seed only synthetic customers, purchase
+   history, entitlements, subscription, and sessions. Exercise backup, restore,
+   rollback and compare row counts/content to the synthetic baseline. Never
+   use a production/customer URL or credential.
+4. **Build immutable test artifact:** build version `1.2.7.1` from the exact
+   source commit and verified release inputs. Initially omit
+   `--preload-vms-image` per owner decision. Record installer SHA-256, size,
+   manifest, package file hashes, Linux target and input provenance in a new
+   versioned output directory; preserve existing artifacts.
+5. **Fresh Local install:** snapshot/export the test VM first. Install the
+   candidate with test-only mode/config. Verify the exact `/version` commit,
+   basic motion/event recording, playback, and Local offline login. Verify
+   premium analytics start OFF, cannot run without entitlement, and remain
+   OFF after entitlement grant until an authorized user explicitly enables
+   them. Verify MFA for admin login/setup/recovery and protected APIs.
+6. **Fresh Hybrid install:** use a separately reset disposable snapshot or
+   second disposable VM. Verify event-only recording, allowed cloud sync and
+   customer isolation; ensure a service restart or cloud configuration sync
+   does not change a disabled analytics setting or enable continuous
+   recording. Never connect to live cloud services.
+7. **Motion/event-only enforcement:** exercise new-camera provisioning with
+   missing, malformed, legacy-continuous and event-only settings; upgrades,
+   restarts and Local↔Hybrid transitions; then switch a synthetic active camera
+   to event-only. Confirm immediately that continuous segments stop while
+   motion/event clips continue, and that no continuous upload path or UI option
+   is present.
+8. **G2/TRUST-1:** install the supplied production-format registry only in
+   this disposable test appliance. Verify root ownership/modes and registry
+   hash; test active, retired, revoked and rotated keys; reject tampered,
+   replayed, lower-generation, same-generation-different, rebound-key and
+   revoked-key restoration. Test accepted local event recording during clock
+   rollback/cloud outage while rejecting new invalid grants. Backup/restore
+   registry, protected trust state and accepted capacity together; test
+   mismatched restore fails closed and recovery with the exact approved
+   registry succeeds.
+9. **Upgrade/repair/rollback:** exercise supported 1.2.7-to-1.2.7.1 upgrade
+   using the installer/repair path (the older 1.2.7 update applier does not
+   understand TRUST-1 registry). Verify same-version repair, interrupted
+   dependency/image download and retry, install failure rollback, manual
+   rollback and restored `/version`. Confirm database, synthetic recordings,
+   settings, identity, authorization/trust files and mode are preserved as
+   specified. Do not test against appliances.
+10. **Independent closeout:** Green repeats targeted acceptance on the exact
+    artifact; Red confirms integration/source provenance. Store checksummed
+    logs and screenshots without secrets or customer media. Any application,
+    installer, or dependency change changes the candidate identity and
+    requires affected tests plus a new exact-commit artifact.
