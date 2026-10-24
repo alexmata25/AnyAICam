@@ -305,14 +305,22 @@ def live_storage_plan(customer_id: str) -> dict | None:
 
 def record_deferred_plan(customer_id: str, *, order_kind: str, plan_key: str, cameras: int, stripe_customer_id: str | None,
                          payment_method_id: str | None, checkout_session_id: str, price_id: str | None = None,
-                         monthly_cents: int | None = None) -> str:
+                         monthly_cents: int | None = None, db=None) -> str:
     """Owner billing rule 2 (2026-10-22): save the plan, camera count and approved monthly Price chosen with a purchase.
     It starts only at service activation (start_storage_plan). One row per account: a redelivered event for the same
     Checkout changes nothing; a new order replaces a saved plan only when that plan is no longer alive (its purchase was
     refunded or disputed and it never started -- the old row is kept in audit_logs). Never for an account that already
-    has a running plan. Returns 'recorded', 'replaced', 'unchanged' or 'skipped'."""
+    has a running plan. Returns 'recorded', 'replaced', 'unchanged' or 'skipped'.
+
+    db (D-HW-PLAN-1, 1.2.7.1): the connection of the caller's enclosing partner_db.transaction() -- the guest order
+    attachment (signin_purchase_attachment.finalize), which holds the payment lock -- so the plan is saved in the SAME
+    transaction as the order link and both commit or roll back together. Any other connection is refused."""
     import json
+    from contextlib import nullcontext
+    import partner_db
     from partner_db import transaction
+    if db is not None and partner_db._shared_connection.get() is not db:
+        raise ValueError("record_deferred_plan(db=...) must be the enclosing transaction's connection")
     if not customer_id or plan_key not in billing.PLANS or not checkout_session_id:
         return "skipped"
     if not billing.MIN_CAMERA_QUANTITY <= int(cameras or 0) <= billing.MAX_CAMERA_QUANTITY:
@@ -324,7 +332,7 @@ def record_deferred_plan(customer_id: str, *, order_kind: str, plan_key: str, ca
         monthly_cents = int(billing.PLANS[plan_key]["monthly_cents_per_camera"]) if price_id else None
     now = datetime.now().isoformat()
     values = (plan_key, int(cameras), stripe_customer_id, payment_method_id, checkout_session_id, price_id, monthly_cents, order_kind)
-    with transaction() as db:
+    with (nullcontext(db) if db is not None else transaction()) as db:
         existing = db.execute("SELECT * FROM deferred_storage_plans WHERE customer_id=?", (customer_id,)).fetchone()
         existing = dict(existing) if existing else None
         if existing and existing.get("checkout_session_id") == checkout_session_id:

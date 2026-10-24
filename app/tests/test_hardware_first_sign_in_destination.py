@@ -12,7 +12,8 @@ import pytest
 
 from database_backend import override_target
 from test_direct_onboarding import _login, _signed_in, site  # noqa: F401 -- fixtures
-from test_hardware_first_checkout import _buy, _customer_id, _paid_event, _record, _signup_and_verify, hw  # noqa: F401
+from test_hardware_first_checkout import (_before_price_lock, _buy, _customer_id, _paid_event, _record,  # noqa: F401
+                                          _signup_and_verify, hw)
 from test_pricing_ff_commission import db_path, license_portal, portal  # noqa: F401 -- fixtures
 
 pytestmark = pytest.mark.usefixtures("stripe_follows_events")
@@ -23,6 +24,7 @@ EMAIL = "buyer@example.test"
 
 def _paid_and_signed_in(hw, db_path):
     _buy(hw)
+    _before_price_lock(db_path)  # no saved plan (D-HW-PLAN-1): the plan is chosen after delivery, as these tests expect
     _record(db_path, _paid_event(hw, SESSION))
     _signup_and_verify(hw, EMAIL, next_path="/customer/orders")
     assert _signed_in(_login(hw["client"], EMAIL, customer_only=True))

@@ -30,6 +30,10 @@ Fenced protocol per purchase row (Codex blocker 2; condition d):
      upserts, joined into this transaction); then a unique purchase_attachments row; then the audit record. Any failure
      rolls the whole step back -- the row returns to 'attaching' under the same token and is retried after the lease.
   No claim is ever deleted, so one worker can never remove another's claim.
+  A guest hardware checkout's FINALIZE also saves the plan chosen with that appliance order (plan, camera count, the
+  Price locked at checkout, the card kept by the webhook) through hardware_checkout._save_intended_plan, joined into the
+  same transaction under the same payment lock (D-HW-PLAN-1, 1.2.7.1): the order and its plan attach together or not at
+  all; a refunded/disputed payment attaches neither; record_deferred_plan keeps a live plan (replays never replace it).
   3. EMAIL (after commit): notify_purchase_attached, keyed by the attachment id; purchase_attachments.email_sent_at
      records delivery; retry_purchase_attached_emails() (billing worker) re-sends what is still unsent.
 """
@@ -230,6 +234,9 @@ def finalize(kind: str, table: str, row_id: str, token: str, *, customer_id: str
                 raise FenceLost(f"{table}:{row_id}")
             link = dict(link_row)
             if _recorded_reversal(db, kind, table, link):
+                # Nothing attached; the claim is released so a won dispute can attach it at the next sign-in.
+                db.execute("UPDATE hardware_checkouts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?",
+                           (row_id, token))
                 return None
             moved = db.execute(
                 "UPDATE hardware_checkouts SET customer_id=?,linked_at=?,updated_at=?,claim_token=NULL WHERE id=? "
@@ -262,10 +269,15 @@ def finalize(kind: str, table: str, row_id: str, token: str, *, customer_id: str
         if moved != 1:
             raise FenceLost(f"{table}:{row_id}")
         _grant(kind, link, customer_id)
+        details = {"kind": label, "source_table": table, "source_id": row_id, "attachment_id": attachment_id}
+        if table == GUEST_CHECKOUTS:
+            # D-HW-PLAN-1: the plan chosen with this appliance order, in THIS transaction (payment lock held); a failure
+            # raises and rolls the order link back with it.
+            import hardware_checkout
+            details["deferred_plan"] = hardware_checkout._save_intended_plan(customer_id, link, db=db, strict=True)
         db.execute("INSERT INTO purchase_attachments(id,source_table,source_id,customer_id,normalized_email,kind,"
                    "attached_at) VALUES(?,?,?,?,?,?,?)", (attachment_id, table, row_id, customer_id, email, label, now))
-        audit({"email": email, "role": "customer_owner"}, "signin.purchase_attached", "customer", customer_id,
-              {"kind": label, "source_table": table, "source_id": row_id, "attachment_id": attachment_id})
+        audit({"email": email, "role": "customer_owner"}, "signin.purchase_attached", "customer", customer_id, details)
     return attachment_id
 
 

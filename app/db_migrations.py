@@ -2278,7 +2278,9 @@ def apply_migrations():
         for name,kind in (('stripe_price_id','TEXT'),('monthly_cents_per_camera','INTEGER'),('order_kind','TEXT')):
             if storage_columns and name not in storage_columns: db.execute(f'ALTER TABLE deferred_storage_plans ADD COLUMN {name} {kind}')
         checkout_columns=_columns('hardware_checkouts')
-        for name,kind in (('intended_price_id','TEXT'),('intended_monthly_cents','INTEGER')):
+        # D-HW-PLAN-1 (1.2.7.1): the card that paid a hardware checkout (Stripe id only), kept by the webhook so a guest's
+        # plan, saved when the order is attached, starts with it at activation. Additive, NULL on existing rows.
+        for name,kind in (('intended_price_id','TEXT'),('intended_monthly_cents','INTEGER'),('stripe_payment_method_id','TEXT')):
             if checkout_columns and name not in checkout_columns: db.execute(f'ALTER TABLE hardware_checkouts ADD COLUMN {name} {kind}')
         if HOLD_CLAIMED_STORAGE_STARTS not in applied:
             hold_pre_cutover_claimed_storage_starts(db)

@@ -135,6 +135,15 @@ def _customer_id(db_path, email):
     return _one(db_path, "SELECT id FROM customers WHERE email=?", (email,))["id"]
 
 
+def _before_price_lock(db_path):
+    """D-HW-PLAN-1 (1.2.7.1): a guest's chosen plan is now saved when the order is attached. The tests of the journey
+    where the customer still picks the plan on My subscription use a checkout opened before the 2026-10-22 price lock
+    (Red review H2: never an automatic plan; the choice is only a pre-fill). The saved-plan journey is covered by
+    test_hardware_checkout_guest_plan_1271.py."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE hardware_checkouts SET intended_price_id=NULL,intended_monthly_cents=NULL")
+
+
 # ------------------------------------------------------------ the checkout page and session
 
 def test_the_hardware_page_prices_from_the_server_and_says_the_subscription_comes_later(hw):
@@ -305,11 +314,14 @@ def test_a_guest_creates_the_account_with_the_order_email_and_sees_the_order(hw,
     assert ("Your AnyAiCam system has been ordered. Your equipment is being prepared for shipment. You do not need to "
             "activate or pay for your camera subscription yet. Return here when your equipment arrives.") in orders
     assert orders.count('class="hw-status">Paid<') == 2
-    # No camera plan was started, and the account can buy one later in its own checkout.
+    # No camera plan was started. D-HW-PLAN-1 (1.2.7.1): the plan chosen with the appliance (Hybrid x 8) was attached
+    # with the order and waits for activation, at the Price locked at checkout.
     import per_camera_billing as billing
     with override_target(sqlite_path=str(db_path)):
         assert not billing.has_camera_plan(customer_id)
-    assert _one(db_path, "SELECT COUNT(*) AS n FROM deferred_storage_plans")["n"] == 0
+    plan = _one(db_path, "SELECT * FROM deferred_storage_plans WHERE customer_id=?", (customer_id,))
+    assert (plan["plan_key"], plan["camera_quantity"], plan["stripe_price_id"], plan["state"]) == \
+        ("hybrid", 8, PLAN_PRICES["hybrid"], "awaiting_activation")
 
 
 def test_an_order_is_never_linked_to_an_existing_account_by_email_alone(hw, db_path):
@@ -359,6 +371,7 @@ def test_a_signed_in_owner_buys_into_the_account(hw, db_path):
 
 def test_order_status_follows_fulfillment_and_the_plan_is_offered_after_delivery(hw, db_path):
     _buy(hw)
+    _before_price_lock(db_path)
     _record(db_path, _paid_event(hw, "cs_test_hw000001"))
     _signup_and_verify(hw, "buyer@example.test", next_path="/customer/orders")
     assert _signed_in(_login(hw["client"], "buyer@example.test", customer_only=True))
@@ -430,6 +443,7 @@ def test_a_guest_without_an_account_still_gets_the_shipping_email(hw, db_path):
 
 def _hardware_owner_with_paid_order(hw, db_path, email="pending@example.test"):
     _buy(hw, email=email)
+    _before_price_lock(db_path)
     _record(db_path, _paid_event(hw, "cs_test_hw000001", email=email))
     _signup_and_verify(hw, email, next_path="/customer/orders")
     assert _signed_in(_login(hw["client"], email, customer_only=True))

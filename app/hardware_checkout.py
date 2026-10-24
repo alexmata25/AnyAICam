@@ -16,9 +16,13 @@ Rules this module keeps:
   and each Stripe Price is checked against it before a session is created
   (main.require_stripe_price_matches_catalog): a $0.50-$0.89 test Price or a
   missing Price ID refuses checkout. The browser sends only choices.
-* Nothing recurring is set up here: no subscription line, no saved card for
-  off-session use, no deferred storage plan. The camera subscription starts
-  only when the customer buys it on My subscription.
+* Nothing recurring is charged here: no subscription line. Owner billing rule
+  (2026-10-22): the card is saved for off-session use and the plan chosen with
+  an appliance (plan, camera count, Price locked when the checkout opened) is
+  saved as a deferred plan once the paid order belongs to an account -- by the
+  webhook for a signed-in buyer, and for a guest in the same transaction that
+  attaches the order (signin_purchase_attachment.finalize, under the payment
+  lock; D-HW-PLAN-1, 1.2.7.1). It starts only at appliance activation.
 * Only the signed Stripe webhook marks an order paid (payment_status=paid,
   including delayed methods via async_payment_succeeded). The success page
   reads state; it never grants anything.
@@ -174,36 +178,21 @@ def _account_email(customer_id: str) -> str:
     return str(customer.get("email") or "").strip().lower()
 
 
-def link_paid_orders(customer_id: str, email: str, *, session_id: str | None = None) -> int:
-    """Attach paid guest hardware orders to the account. Call only on proof
-    that the account owner controls this email: right after a verified
-    signup (all of the email's guest orders), or a sign-in from one order's
-    confirmation page (session_id: that order only). Returns how many
-    checkouts were linked."""
-    email = (email or "").strip().lower()
-    if not customer_id or not email:
-        return 0
-    linked, saved = 0, []
-    now = _now()
-    query = ("SELECT id,stripe_checkout_session_id FROM hardware_checkouts WHERE lower(email)=? AND customer_id IS NULL "
-             "AND status='paid'" + (" AND stripe_checkout_session_id=?" if session_id else ""))
-    with connection() as db:
-        for checkout in db.execute(query, (email, session_id) if session_id else (email,)).fetchall():
-            db.execute("UPDATE hardware_orders SET customer_id=?,updated_at=? WHERE stripe_checkout_session_id=? AND customer_id IS NULL",
-                       (customer_id, now, checkout["stripe_checkout_session_id"]))
-            db.execute("UPDATE hardware_checkouts SET customer_id=?,linked_at=?,updated_at=? WHERE id=? AND customer_id IS NULL",
-                       (customer_id, now, now, checkout["id"]))
-            linked += 1
-            saved.append(checkout["id"])
-    for checkout_id in saved:
-        _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id))
-    return linked
+# A guest's paid order is attached to an account ONLY by signin_purchase_attachment (fenced, audited, under the payment
+# lock), which also saves the order's plan in the same transaction (D-HW-PLAN-1). The former link_paid_orders() helper
+# (no caller; no lock, fence or reversal check) was removed in 1.2.7.1.
 
 
-def _save_intended_plan(customer_id: str | None, record: dict | None, payment_method_id: str | None = None) -> str:
+def _save_intended_plan(customer_id: str | None, record: dict | None, payment_method_id: str | None = None, *,
+                        db=None, strict: bool = False) -> str:
     """Owner billing rule (2026-10-22): the monthly plan chosen with an appliance order is saved with its approved Price
     (locked when the checkout opened) once the paid order belongs to an account; it starts only when the appliance is
-    activated (build_orders.start_storage_plan). Relay-only orders and orders without a chosen plan save nothing."""
+    activated (build_orders.start_storage_plan). Relay-only orders and orders without a chosen plan save nothing.
+
+    Two callers: the webhook of a signed-in purchase, and the guest order attachment (signin_purchase_attachment.
+    finalize), which passes its transaction's connection (db) and strict=True so a failure rolls the whole attachment
+    back (retried at a later sign-in after the claim lease) instead of attaching the order without its plan. The card
+    defaults to the one the webhook kept on the checkout row (stripe_payment_method_id)."""
     import build_orders
     if not customer_id or not record or record.get("status") != "paid" or not record.get("intended_plan"):
         return "skipped"
@@ -217,10 +206,13 @@ def _save_intended_plan(customer_id: str | None, record: dict | None, payment_me
         return build_orders.record_deferred_plan(
             customer_id, order_kind=build_orders.APPLIANCE_ORDER, plan_key=str(record["intended_plan"]),
             cameras=int(record.get("intended_cameras") or 0), stripe_customer_id=record.get("stripe_customer_id"),
-            payment_method_id=payment_method_id, checkout_session_id=str(record.get("stripe_checkout_session_id") or ""),
-            price_id=record.get("intended_price_id"), monthly_cents=record.get("intended_monthly_cents"))
+            payment_method_id=payment_method_id or record.get("stripe_payment_method_id") or None,
+            checkout_session_id=str(record.get("stripe_checkout_session_id") or ""),
+            price_id=record.get("intended_price_id"), monthly_cents=record.get("intended_monthly_cents"), db=db)
     except Exception:
         logger.exception("hardware_checkout.intended_plan_not_saved checkout=%s", record.get("id"))
+        if strict:
+            raise
         return "error"
 
 
@@ -384,13 +376,19 @@ def sync_from_stripe_event(event: dict) -> dict:
     except build_orders.RetryableBuildOrderError:
         raise
     email = str((session.get("customer_details") or {}).get("email") or session.get("customer_email") or record.get("email") or "").strip().lower()
-    # Signed-in purchases only; a guest's order waits for proof (link_paid_orders).
+    # Signed-in purchases only; a guest's order waits for proof (signin_purchase_attachment).
     customer_id = str(metadata.get("anyaicam_customer_id") or "") or None
     if customer_id and not row("SELECT id FROM customers WHERE id=?", (customer_id,)):
         customer_id = None
     intent = session.get("payment_intent")
     intent_id = str((intent.get("id") if isinstance(intent, dict) else intent) or "") or None
     stripe_customer = str(session.get("customer") or "") or None
+    payment_method = None
+    if kind == HARDWARE_ONLY and record.get("intended_plan") and record.get("intended_price_id"):
+        # D-HW-PLAN-1: the card that paid, kept on the checkout row so the plan -- saved now for a signed-in buyer, or
+        # when a guest's order is attached -- starts with it at activation. Read before the payment lock (a network
+        # call); None -> resolved from the Stripe customer's saved cards at activation.
+        payment_method = build_orders._payment_method(session)
     import billing_status
     order_ids = []
     # Codex HW-REFUND-RACE (2026-10-23): the order rows, the checkout update, the reversal check and the saved plan are ONE
@@ -415,15 +413,15 @@ def sync_from_stripe_event(event: dict) -> dict:
         now = _now()
         db.execute("UPDATE hardware_checkouts SET status='paid',stripe_checkout_session_id=?,email=?,customer_id=COALESCE(customer_id,?),"
                    "amount_total_cents=?,stripe_payment_intent_id=?,stripe_customer_id=?,shipping_json=?,order_ids=?,"
-                   "paid_at=COALESCE(paid_at,?),updated_at=? WHERE id=?",
+                   "stripe_payment_method_id=COALESCE(?,stripe_payment_method_id),paid_at=COALESCE(paid_at,?),updated_at=? WHERE id=?",
                    (session_id, email or record.get("email"), customer_id, session.get("amount_total"), intent_id, stripe_customer,
-                    json.dumps(_shipping(session)), ",".join(order_ids), now, now, checkout_id))
+                    json.dumps(_shipping(session)), ",".join(order_ids), payment_method, now, now, checkout_id))
         if reversed_as:
             # Red review H1: refunded or disputed before this order was recorded -> recorded reversed (a replay of an
             # earlier paid row is reversed too) and no plan is saved for it.
             billing_status.reverse_hardware_orders(intent_id, reversed_as)
         elif kind == HARDWARE_ONLY and customer_id:
-            _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id), build_orders._payment_method(session))
+            _save_intended_plan(customer_id, checkout_row(checkout_id=checkout_id), payment_method)
     try:  # the confirmation email never fails the step; retried from the outbox and on the order pages
         import stripe_mode
         send_confirmation(checkout_id, test_mode=stripe_mode.is_test_mode(event=event))
@@ -645,9 +643,25 @@ def _orders_page(customer_id: str) -> str:
         cards += (f'<div class="order-line hw-order" data-status="{escape(label, quote=True)}"><span>{escape(order["product_name"])}{quantity}'
                   f'<br><small class="note">Order {escape(generate_order_number(order["id"]))} · {escape(str(order["created_at"])[:10])}</small></span>'
                   f'<span class="hw-status">{escape(label)}</span></div>{tracking}')
+    import build_orders
+    import per_camera_billing as billing
+    saved = None if _has_camera_plan(customer_id) else build_orders.live_storage_plan(customer_id)
+    if saved and (saved.get("plan_key") not in billing.PLANS or saved.get("state") in (build_orders.STORAGE_STARTED,
+                                                                                          build_orders.STORAGE_SUPERSEDED)):
+        saved = None
     if waiting and not delivered:
         guide = (f'<p class="notice ok" id="orders-waiting" role="status">{escape(WAITING_FOR_DELIVERY)}</p>'
                  '<p class="note">Order statuses: Paid → Preparing → Shipped → Delivered. We email you when your equipment ships.</p>')
+    elif delivered and saved:
+        # D-HW-PLAN-1 (1.2.7.1): the plan chosen with the appliance is already saved (and a second plan checkout is
+        # refused): no "Choose my camera plan"; it starts when the appliance is activated.
+        quantity = int(saved.get("camera_quantity") or 0)
+        guide = ('<p class="notice ok" id="orders-delivered" role="status">Your equipment has arrived.</p>'
+                 f'<p id="orders-saved-plan">Your camera plan ({escape(billing.PLANS[saved["plan_key"]]["display_name"])} · '
+                 f'{quantity} camera{"s" if quantity != 1 else ""}) was saved with your order. It starts, with its first '
+                 'monthly charge, when you activate your appliance. Set up your appliance and add your cameras.</p>'
+                 '<a class="submit" id="orders-setup" href="/customer/setup">Set up my system</a>'
+                 '<a class="ghost" id="orders-manage-plan" href="/subscription-portal">Open My subscription</a>')
     elif delivered and _has_camera_plan(customer_id):
         # The plan already exists (a second one is refused anyway): no "Choose my camera plan" (Green 2026-10-16).
         guide = ('<p class="notice ok" id="orders-delivered" role="status">Your equipment has arrived.</p>'
