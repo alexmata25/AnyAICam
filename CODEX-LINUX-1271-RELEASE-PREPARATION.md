@@ -490,6 +490,15 @@ private signing material.
   Its referenced `_evidence/CODEX-SHA256SUMS.txt` manifest independently
   verified **45/45 entries**, with no missing or mismatched file (manifest
   SHA-256 `7c833b0add60a745f326ec416e6bd32337351ac45a70d3072634fa81c6ea565f`).
+  I also checked the summary lines in selected hashed logs against the package:
+  product/security **254 passed, 0 failed, 2 skipped**; MFA/admin/tenant
+  **139 passed, 0 failed, 4 skipped**; trust-registry installer **8 passed,
+  3 skipped**; agent trust/update **51 passed, 11 skipped**; local P2P auth
+  **55 passed, 0 failed, 7 skipped**; signaling **24 passed, 0 failed**; and
+  the browser-wrapper log reports its exact shell-fetch wrapper check passed.
+  These are Green's logged results whose files and summaries were checked,
+  not suites rerun in this session. Green's independent review verdict is
+  still pending.
 
 ### Pending checklist and blockers
 
