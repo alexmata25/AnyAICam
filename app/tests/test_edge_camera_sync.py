@@ -148,7 +148,9 @@ def test_local_recording_mode_and_configurable_fields_are_synced(db_path, monkey
     assert cameras["cam-1"]["local_recording_max_event_seconds"] == 600
 
 
-def test_local_recording_mode_defaults_to_null_when_not_reported(db_path, monkeypatch):
+def test_local_recording_mode_is_event_when_not_reported(db_path, monkeypatch):
+    """R-REC-1 (1.2.7.1): an older cloud that sends no local mode still
+    leaves the camera in event recording, never NULL/continuous."""
     _mock_identity(monkeypatch)
     _mock_cloud_config(monkeypatch, [
         {"id": "cam-1", "name": "Camera 1", "camera_number": 1, "status": "configured",
@@ -157,7 +159,7 @@ def test_local_recording_mode_defaults_to_null_when_not_reported(db_path, monkey
     ])
     edge_camera_sync.sync_provisioned_cameras()
     cameras = _local_cameras(db_path)
-    assert cameras["cam-1"]["local_recording_mode"] is None
+    assert cameras["cam-1"]["local_recording_mode"] == "event"
 
 
 def test_re_sync_updates_in_place_never_duplicates(db_path, monkeypatch):

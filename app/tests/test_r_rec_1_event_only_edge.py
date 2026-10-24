@@ -125,8 +125,12 @@ def test_the_supervisor_cannot_reach_start_recording():
     supervisor = source.split("async def process_supervisor", 1)[1].split("\nasync def ", 1)[0]
     assert re.search(r"\bstart_recording\b", supervisor) is None
     assert re.search(r"\bstart_recording\b", inspect.getsource(main._recording_starter_for)) is None
-    calls = [m.start() for m in re.finditer(r"(?<![\w.])start_recording\(", source)]
-    assert len(calls) == 1 and source[calls[0] - 4:calls[0]] == "def ", "start_recording() must have no caller"
+    import ast
+    callers = [node.lineno for node in ast.walk(ast.parse(source))
+               if isinstance(node, (ast.Call,)) and getattr(node.func, "id", None) == "start_recording"]
+    referenced = [node.lineno for node in ast.walk(ast.parse(source))
+                  if isinstance(node, ast.Name) and node.id == "start_recording"]
+    assert callers == [] and referenced == [], "start_recording() must have no caller or reference"
 
 
 class _FakeProcess:

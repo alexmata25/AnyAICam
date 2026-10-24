@@ -94,20 +94,20 @@ def test_migration_adds_local_recording_columns(db_path):
     assert "local_recording_max_event_seconds" in columns
 
 
-def test_new_camera_defaults_to_null_not_event(db_path):
-    """No hidden default: a camera nobody has ever explicitly switched
-    must read back as null, never as 'event' -- every existing/new
-    camera keeps today's unconditional continuous-recording behavior
-    until an administrator explicitly opts it into Event mode."""
+def test_a_raw_null_camera_is_set_to_event_at_the_next_start(db_path):
+    """R-REC-1 (1.2.7.1) replaces the old "no hidden default" rule: event
+    recording is the only mode. A row inserted outside the application
+    paths (which all write 'event') stays NULL only until the next start,
+    whose migration sets it to 'event'; every reader treats NULL as event."""
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
         initialize_database()
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+        assert _camera_row(db_path, "cam-1")["local_recording_mode"] is None
+        initialize_database()  # the next start
 
-    assert _camera_row(db_path, "cam-1")["local_recording_mode"] is None
-
-
+    assert _camera_row(db_path, "cam-1")["local_recording_mode"] == "event"
 def test_admin_can_set_event_mode(client, db_path):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -176,7 +176,8 @@ def test_omitted_configurable_fields_are_left_unchanged_not_cleared(client, db_p
     assert row["local_recording_post_roll_seconds"] == 20
 
 
-def test_admin_can_set_continuous_mode(client, db_path):
+def test_admin_cannot_set_continuous_mode(client, db_path):
+    """R-REC-1 (1.2.7.1): continuous local recording is refused."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -187,11 +188,12 @@ def test_admin_can_set_continuous_mode(client, db_path):
         json={"local_recording_mode": "continuous"},
     )
 
-    assert response.status_code == 200
-    assert _camera_row(db_path, "cam-1")["local_recording_mode"] == "continuous"
+    assert response.status_code == 400
+    assert _camera_row(db_path, "cam-1")["local_recording_mode"] is None  # unchanged
 
 
-def test_admin_can_clear_mode_back_to_null(client, db_path):
+def test_admin_clearing_the_mode_stores_event(client, db_path):
+    """R-REC-1 decision 3: null is stored as 'event', never NULL/continuous."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -204,9 +206,7 @@ def test_admin_can_clear_mode_back_to_null(client, db_path):
     )
 
     assert response.status_code == 200
-    assert _camera_row(db_path, "cam-1")["local_recording_mode"] is None
-
-
+    assert _camera_row(db_path, "cam-1")["local_recording_mode"] == "event"
 def test_invalid_mode_value_is_rejected(client, db_path):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -307,7 +307,8 @@ def test_configuration_route_exposes_local_recording_fields(client, db_path):
     assert camera["local_recording_post_roll_seconds"] == 15
 
 
-def test_configuration_route_reports_null_when_unset(client, db_path):
+def test_configuration_route_reports_event_when_unset(client, db_path):
+    """R-REC-1: the cloud transmits 'event' literally, even for a NULL row."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
@@ -316,5 +317,5 @@ def test_configuration_route_reports_null_when_unset(client, db_path):
 
     assert response.status_code == 200
     camera = response.json()["cameras"][0]
-    assert camera["local_recording_mode"] is None
+    assert camera["local_recording_mode"] == "event"
     assert camera["local_recording_pre_roll_seconds"] is None

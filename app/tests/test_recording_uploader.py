@@ -187,8 +187,9 @@ async def test_worker_never_calls_relay_for_a_camera_outside_scope(monkeypatch):
     except asyncio.CancelledError:
         pass
 
-    assert 1 in calls
-    assert 2 not in calls
+    # R-REC-1 (1.2.7.1): the worker never relays a recording segment for any
+    # camera or mode (continuous upload is not offered).
+    assert calls == []
 
 
 @pytest.mark.anyio
@@ -223,9 +224,9 @@ async def test_worker_never_calls_relay_for_a_hybrid_or_disabled_camera(monkeypa
     except asyncio.CancelledError:
         pass
 
-    assert 1 not in calls
-    assert 2 not in calls
-    assert 3 in calls
+    # R-REC-1 (1.2.7.1): the worker never relays a recording segment for any
+    # camera or mode (continuous upload is not offered).
+    assert calls == []  # not even the formerly 'continuous' camera 3
 
 
 @pytest.mark.anyio
@@ -261,7 +262,9 @@ async def test_worker_never_calls_relay_again_once_a_camera_hits_its_hard_total_
     except asyncio.CancelledError:
         pass
 
-    assert ru._uploaded_files.get(1) == ["camera1_2026-08-21_00-00-00.mkv"]
+    # R-REC-1 (1.2.7.1): the worker never relays a recording segment for any
+    # camera or mode (continuous upload is not offered).
+    assert ru._uploaded_files.get(1) is None
 
 
 @pytest.mark.anyio
@@ -298,8 +301,9 @@ async def test_worker_starts_for_a_pilot_camera_even_when_globally_disabled(monk
         pass
 
     assert ru.recording_upload_state["worker_status"] != "disabled"
-    assert 1 in calls
-    assert 2 not in calls
+    # R-REC-1 (1.2.7.1): the worker never relays a recording segment for any
+    # camera or mode (continuous upload is not offered).
+    assert calls == []
 
 
 @pytest.mark.anyio
@@ -328,7 +332,7 @@ async def test_worker_stays_disabled_with_no_scope_and_globally_off(monkeypatch)
 
 
 @pytest.mark.anyio
-async def test_worker_relays_normally_when_scope_and_cap_are_both_unset(monkeypatch):
+async def test_worker_relays_nothing_even_when_scope_and_cap_are_both_unset(monkeypatch):
     """Regression lock: neither new mechanism changes existing behavior
     for a deployment that doesn't opt into either."""
     monkeypatch.setattr(ru, "RUNTIME_ROLE", "edge")
@@ -350,4 +354,6 @@ async def test_worker_relays_normally_when_scope_and_cap_are_both_unset(monkeypa
     except asyncio.CancelledError:
         pass
 
-    assert set(calls) == {1, 2, 3, 4, 5}
+    # R-REC-1 (1.2.7.1): the worker never relays a recording segment for any
+    # camera or mode (continuous upload is not offered).
+    assert calls == []

@@ -76,8 +76,18 @@ def test_disabled_value_actually_persists(client, db_path):
     assert row[0] == "disabled"
 
 
-def test_motion_and_continuous_and_null_still_accepted(client):
-    for value in ("motion", "continuous", None):
+def test_continuous_is_rejected(client):
+    """R-REC-1 (1.2.7.1): continuous cloud upload is not offered."""
+    response = client.post(
+        "/api/admin/cameras/cam-1/cloud-recording-mode",
+        json={"cloud_recording_mode": "continuous"},
+        cookies={partner_portal.SESSION_COOKIE: _admin_cookie()},
+    )
+    assert response.status_code == 400
+
+
+def test_motion_and_null_still_accepted(client):
+    for value in ("motion", None):
         response = client.post(
             "/api/admin/cameras/cam-1/cloud-recording-mode",
             json={"cloud_recording_mode": value},
