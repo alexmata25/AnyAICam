@@ -7535,6 +7535,7 @@ class BillingInvoiceUpdateModel(BaseModel):
 
 
 class SubscriptionRequestCreateModel(BaseModel):
+    customer_id: str = ""  # 1.2.7.1: administrators name the target customer; ignored for customers
 
 
 
@@ -7643,6 +7644,7 @@ class SubscriptionRequestUpdateModel(BaseModel):
 
 
 class BillingSupportTicketCreateModel(BaseModel):
+    customer_id: str = ""  # 1.2.7.1: administrators name the target customer; ignored for customers
 
 
 
@@ -23607,6 +23609,201 @@ def process_stripe_webhook_event(event: dict) -> None:
 
 
 
+def _quarantine_unattributed(records: dict, kind: str) -> int:
+
+
+
+
+
+
+
+
+    """Linux 1.2.7.1 (D-AUTHZ-3): a subscription request / billing ticket with
+    no customer_id (written before tenant scoping: the shared 'anonymous'
+    identity, a legacy local admin, a cloud-administrator bridge id, or none)
+    cannot be attributed to a tenant. It is marked quarantined (with why and
+    when), hidden from every customer, still listed for administrators with
+    that flag, and never deleted. Idempotent; count-only audit."""
+    now = datetime.now().isoformat()
+
+
+
+
+
+
+
+
+    count = 0
+
+
+
+
+
+
+
+
+    for record in records.values():
+
+
+
+
+
+
+
+
+        if not isinstance(record, dict) or record.get("customer_id") or record.get("quarantined"):
+
+
+
+
+
+
+
+
+            continue
+
+
+
+
+
+
+
+
+        owner = str(record.get("user_id") or "")
+
+
+
+
+
+
+
+
+        reason = ("anonymous" if owner == "anonymous" else "cloud_administrator" if owner.startswith("cloud-administrator:")
+
+
+
+
+
+
+
+
+                  else "missing_owner" if not owner else "local_account")
+
+
+
+
+
+
+
+
+        record["quarantined"] = True
+
+
+
+
+
+
+
+
+        record["quarantine_reason"] = f"no_customer_id:{reason}"
+
+
+
+
+
+
+
+
+        record["quarantined_at"] = now
+
+
+
+
+
+
+
+
+        count += 1
+
+
+
+
+
+
+
+
+    if count:
+
+
+
+
+
+
+
+
+        structured_log("d_authz_3.quarantine", count=count, kind=kind)
+
+
+
+
+
+
+
+
+        try:
+
+
+
+
+
+
+
+
+            from admin_auth_policy import auth_audit
+
+
+
+
+
+
+
+
+            auth_audit("billing_rows.quarantined", actor_role="system", reason="d_authz_3", entity_type=kind, details={"count": count})
+
+
+
+
+
+
+
+
+        except Exception:
+
+
+
+
+
+
+
+
+            pass
+
+
+
+
+
+
+
+
+    return count
+
+
+
+
+
+
+
+
 def load_subscription_requests() -> dict:
 
 
@@ -23625,7 +23822,34 @@ def load_subscription_requests() -> dict:
 
 
 
-    return requests if isinstance(requests, dict) else {}
+    requests = requests if isinstance(requests, dict) else {}
+
+
+
+
+
+
+
+
+    if _quarantine_unattributed(requests, "subscription_requests"):
+
+
+
+
+
+
+
+
+        save_subscription_requests(requests)
+
+
+
+
+
+
+
+
+    return requests
 
 
 
@@ -23706,7 +23930,34 @@ def load_billing_support_tickets() -> dict:
 
 
 
-    return tickets if isinstance(tickets, dict) else {}
+    tickets = tickets if isinstance(tickets, dict) else {}
+
+
+
+
+
+
+
+
+    if _quarantine_unattributed(tickets, "billing_support_tickets"):
+
+
+
+
+
+
+
+
+        save_billing_support_tickets(tickets)
+
+
+
+
+
+
+
+
+    return tickets
 
 
 
@@ -23778,6 +24029,11 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+    """The legacy (users.json-era) billing account lookup, used by the legacy
+    administrator billing tools. 1.2.7.1 (D-AUTHZ-3): the shared 'primary'
+    account is never the fallback for anyone without manage_settings (it used
+    to answer an anonymous or customer caller), and an empty email matches
+    nothing. Customers use billing_account_for_principal()."""
     accounts = load_billing_accounts()
 
 
@@ -23796,6 +24052,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+    if user_email:
 
 
 
@@ -23804,17 +24061,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-
-    for account in accounts.values():
-
-
-
-
-
-
-
-
-        if str(account.get("billing_email") or "").strip().lower() == user_email:
+        for account in accounts.values():
 
 
 
@@ -23823,7 +24070,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-            return account
+            if str(account.get("billing_email") or "").strip().lower() == user_email:
 
 
 
@@ -23832,6 +24079,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+                return account
 
 
 
@@ -23840,8 +24088,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-
-    if "primary" in accounts:
+    if "primary" in accounts and user.get("enabled", True) and has_permission(user, "manage_settings"):
 
 
 
@@ -23859,7 +24106,16 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+    return _unassigned_billing_account(user.get("display_name") or user.get("email") or "Customer", user.get("email") or "")
 
+
+
+
+
+
+
+
+def _unassigned_billing_account(name: str, email: str, customer_id: str = "") -> dict:
 
 
 
@@ -23886,7 +24142,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-        "customer_name": user.get("display_name") or user.get("email") or "Customer",
+        "customer_id": customer_id,
 
 
 
@@ -23895,7 +24151,16 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-        "billing_email": user.get("email") or "",
+        "customer_name": name,
+
+
+
+
+
+
+
+
+        "billing_email": email,
 
 
 
@@ -23959,6 +24224,90 @@ def billing_account_for_user(user: dict) -> dict:
 
 
     }
+
+
+
+
+
+
+
+
+def billing_account_for_principal(principal: dict) -> dict:
+
+
+
+
+
+
+
+
+    """A customer's billing account: the account whose customer_id is this
+    tenant -- never matched by email and never 'primary'. An administrator
+    keeps the legacy lookup."""
+    if principal.get("kind") == "admin":
+
+
+
+
+
+
+
+
+        return billing_account_for_user(principal["user"])
+
+
+
+
+
+
+
+
+    customer_id = str(principal.get("customer_id") or "")
+
+
+
+
+
+
+
+
+    if customer_id:
+
+
+
+
+
+
+
+
+        for account in load_billing_accounts().values():
+
+
+
+
+
+
+
+
+            if isinstance(account, dict) and str(account.get("customer_id") or "") == customer_id:
+
+
+
+
+
+
+
+
+                return account
+
+
+
+
+
+
+
+
+    return _unassigned_billing_account(principal.get("display_name") or "Customer", principal.get("email") or "", customer_id)
 
 
 
@@ -24102,7 +24451,7 @@ def invoices_for_billing_account(account_id: str) -> list[dict]:
 
 
 
-def subscription_request_owner_matches(record: dict, user: dict) -> bool:
+CUSTOMER_BILLING_ROLES = frozenset({"customer_owner", "customer_viewer"})
 
 
 
@@ -24111,7 +24460,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-    return (
+def billing_principal(request: Request) -> dict:
 
 
 
@@ -24120,7 +24469,16 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-        record.get("user_id") == user.get("id")
+    """Linux 1.2.7.1 (D-AUTHZ-3): who is asking, for My subscription,
+    subscription requests, billing tickets and invoice downloads -- never the
+    legacy current_user() anonymous fallback and never manage_settings alone.
+      - customer: a Partner Portal customer_owner/customer_viewer session with
+        a customer_id (its tenant);
+      - admin: cloud_administrator_bridge() (a live global administrator grant;
+        MFA-verified on the cloud, via partner_portal._identity()); on an edge
+        appliance only, also a local legacy administrator (manage_settings).
+    Anyone else: 401 when signed out, 403 when signed in."""
+    from partner_portal import partner_identity
 
 
 
@@ -24129,7 +24487,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-        or has_permission(user, "manage_settings")
+    identity = partner_identity(request)
 
 
 
@@ -24138,7 +24496,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-    )
+    if identity and identity.get("role") in CUSTOMER_BILLING_ROLES:
 
 
 
@@ -24147,6 +24505,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
+        if not identity.get("customer_id"):
 
 
 
@@ -24155,6 +24514,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
+            raise HTTPException(status_code=403, detail="A customer account is required.")
 
 
 
@@ -24163,45 +24523,528 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
+        email = str(identity.get("email") or "")
 
 
-def billing_ticket_owner_matches(record: dict, user: dict) -> bool:
 
 
 
 
 
 
+        return {"kind": "customer", "customer_id": str(identity["customer_id"]), "role": identity["role"],
 
 
-    return (
 
 
 
 
 
 
+                "user_id": str(identity.get("user_id") or email), "email": email, "display_name": email}
 
 
-        record.get("user_id") == user.get("id")
 
 
 
 
 
 
+    admin = cloud_administrator_bridge(request)
 
 
-        or has_permission(user, "manage_settings")
 
 
 
 
 
 
+    if admin:
 
 
-    )
+
+
+
+
+
+
+        return {"kind": "admin", "role": "administrator", "user_id": admin["id"], "email": admin["email"],
+
+
+
+
+
+
+
+
+                "display_name": admin["display_name"], "user": admin}
+
+
+
+
+
+
+
+
+    legacy = authenticated_user(request)
+
+
+
+
+
+
+
+
+    if legacy and not _legacy_cloud_profile() and legacy.get("enabled", True) and has_permission(legacy, "manage_settings"):
+
+
+
+
+
+
+
+
+        return {"kind": "admin", "role": str(legacy.get("role") or "administrator"), "user_id": str(legacy.get("id") or ""),
+
+
+
+
+
+
+
+
+                "email": str(legacy.get("email") or ""), "display_name": legacy.get("display_name") or legacy.get("email") or "", "user": legacy}
+
+
+
+
+
+
+
+
+    if identity or legacy:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=403, detail="A customer account is required.")
+
+
+
+
+
+
+
+
+    raise HTTPException(status_code=401, detail="Authentication required.")
+
+
+
+
+
+
+
+
+def _billing_row_in_tenant(record: dict, principal: dict) -> bool:
+
+
+
+
+
+
+
+
+    if principal.get("kind") == "admin":
+
+
+
+
+
+
+
+
+        return True
+
+
+
+
+
+
+
+
+    return (principal.get("kind") == "customer" and not record.get("quarantined")
+
+
+
+
+
+
+
+
+            and str(record.get("customer_id") or "") == str(principal.get("customer_id") or ""))
+
+
+
+
+
+
+
+
+def subscription_request_owner_matches(record: dict, principal: dict) -> bool:
+
+
+
+
+
+
+
+
+    return _billing_row_in_tenant(record, principal)
+
+
+
+
+
+
+
+
+def billing_ticket_owner_matches(record: dict, principal: dict) -> bool:
+
+
+
+
+
+
+
+
+    return _billing_row_in_tenant(record, principal)
+
+
+
+
+
+
+
+
+def _billing_write_customer(principal: dict, requested_customer_id: str) -> str:
+
+
+
+
+
+
+
+
+    """The tenant a new request/ticket belongs to: a customer owner's own
+    (viewers read only); an administrator must name an existing customer."""
+    if principal.get("kind") == "customer":
+
+
+
+
+
+
+
+
+        if principal.get("role") != "customer_owner":
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=403, detail="Only the account owner can submit billing requests.")
+
+
+
+
+
+
+
+
+        return str(principal["customer_id"])
+
+
+
+
+
+
+
+
+    customer_id = str(requested_customer_id or "").strip()
+
+
+
+
+
+
+
+
+    if not customer_id:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=400, detail="customer_id is required.")
+
+
+
+
+
+
+
+
+    from partner_db import connection as partner_connection
+
+
+
+
+
+
+
+
+    with partner_connection() as db:
+
+
+
+
+
+
+
+
+        if not db.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=404, detail="Customer not found.")
+
+
+
+
+
+
+
+
+    return customer_id
+
+
+
+
+
+
+
+
+def customer_usage_snapshot(customer_id: str) -> dict:
+
+
+
+
+
+
+
+
+    """D-AUTHZ-3 / U-A3-3: the customer's OWN usage only -- its cameras and its
+    registered mobile devices. No host-wide recording counts or bytes, storage
+    bucket/prefix, CDN, runtime role, environment or AI/upload worker state
+    (customer_cloud_usage_snapshot(), the administrator view, keeps those)."""
+    devices = 0
+
+
+
+
+
+
+
+
+    try:
+
+
+
+
+
+
+
+
+        from partner_db import connection as partner_connection
+
+
+
+
+
+
+
+
+        with partner_connection() as db:
+
+
+
+
+
+
+
+
+            devices = int(db.execute("SELECT COUNT(*) AS n FROM mobile_devices WHERE customer_id=? AND revoked_at IS NULL",
+
+
+
+
+
+
+
+
+                                     (customer_id,)).fetchone()["n"])
+
+
+
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+
+
+
+        devices = 0
+
+
+
+
+
+
+
+
+    return {"scope": "customer", "customer_id": customer_id, "configured_cameras": get_camera_count(customer_id=customer_id),
+
+
+
+
+
+
+
+
+            "registered_mobile_devices": devices}
+
+
+
+
+
+
+
+
+def customer_license_summary(customer_id: str) -> dict:
+
+
+
+
+
+
+
+
+    """The customer's own entitlement summary (never the host-wide legacy
+    license_enforcement_snapshot())."""
+    try:
+
+
+
+
+
+
+
+
+        import customer_entitlements
+
+
+
+
+
+
+
+
+        limit = int(customer_entitlements.usable_camera_capacity(customer_id))
+
+
+
+
+
+
+
+
+        in_service = int(customer_entitlements.cameras_in_service(customer_id))
+
+
+
+
+
+
+
+
+        plan = customer_entitlements.product_mode_for_customer(customer_id) or ""
+
+
+
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+
+
+
+        limit, in_service, plan = 0, 0, ""
+
+
+
+
+
+
+
+
+    return {"scope": "customer", "customer_id": customer_id, "plan": plan or "none", "status": "active" if limit > 0 else "inactive",
+
+
+
+
+
+
+
+
+            "camera_limit": limit, "current_camera_count": in_service, "operational": limit > 0 and in_service <= limit,
+
+
+
+
+
+
+
+
+            "in_grace_period": False}
 
 
 
@@ -104382,7 +105225,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
 
 
 
@@ -104391,7 +105234,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    account = billing_account_for_user(user)
+    account = billing_account_for_principal(principal)
 
 
 
@@ -104400,7 +105243,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    license_data = license_enforcement_snapshot()
+    if principal["kind"] == "customer":
 
 
 
@@ -104409,7 +105252,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    invoices = invoices_for_billing_account(str(account.get("id") or ""))
+        license_data = customer_license_summary(principal["customer_id"])
 
 
 
@@ -104418,7 +105261,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    requests = [
+        usage = customer_usage_snapshot(principal["customer_id"])
 
 
 
@@ -104427,7 +105270,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        item
+    else:
 
 
 
@@ -104436,7 +105279,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        for item in load_subscription_requests().values()
+        license_data = license_enforcement_snapshot()
 
 
 
@@ -104445,7 +105288,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        if subscription_request_owner_matches(item, user)
+        usage = customer_cloud_usage_snapshot(principal["user"])
 
 
 
@@ -104454,7 +105297,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    ]
+    account_id = str(account.get("id") or "")
 
 
 
@@ -104463,7 +105306,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    tickets = [
+    invoices = invoices_for_billing_account(account_id) if account_id and account_id != "unassigned" else []
 
 
 
@@ -104472,7 +105315,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        item
+    requests = [item for item in load_subscription_requests().values() if isinstance(item, dict) and subscription_request_owner_matches(item, principal)]
 
 
 
@@ -104481,25 +105324,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        for item in load_billing_support_tickets().values()
-
-
-
-
-
-
-
-
-        if billing_ticket_owner_matches(item, user)
-
-
-
-
-
-
-
-
-    ]
+    tickets = [item for item in load_billing_support_tickets().values() if isinstance(item, dict) and billing_ticket_owner_matches(item, principal)]
 
 
 
@@ -104580,7 +105405,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        "usage": customer_cloud_usage_snapshot(user),
+        "usage": usage,
 
 
 
@@ -104661,7 +105486,16 @@ def create_subscription_request(
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
+
+
+
+
+
+
+
+
+    customer_id = _billing_write_customer(principal, payload.customer_id)
 
 
 
@@ -104769,15 +105603,6 @@ def create_subscription_request(
 
 
 
-
-
-
-
-
-
-
-
-
     request_id = uuid.uuid4().hex
 
 
@@ -104814,7 +105639,7 @@ def create_subscription_request(
 
 
 
-        "user_id": user.get("id"),
+        "customer_id": customer_id,
 
 
 
@@ -104823,7 +105648,7 @@ def create_subscription_request(
 
 
 
-        "user_name": user.get("display_name") or user.get("email"),
+        "created_by_user_id": principal["user_id"],
 
 
 
@@ -104832,7 +105657,34 @@ def create_subscription_request(
 
 
 
-        "user_email": user.get("email"),
+        "created_by_role": principal["role"],
+
+
+
+
+
+
+
+
+        "user_id": principal["user_id"],
+
+
+
+
+
+
+
+
+        "user_name": principal["display_name"] or principal["email"],
+
+
+
+
+
+
+
+
+        "user_email": principal["email"],
 
 
 
@@ -104985,7 +105837,16 @@ def create_subscription_request(
 
 
 
-        user_id=user.get("id"),
+        customer_id=customer_id,
+
+
+
+
+
+
+
+
+        created_by_role=principal["role"],
 
 
 
@@ -105120,52 +105981,7 @@ def update_subscription_request(
 
 
 
-    user = current_user(request)
-
-
-
-
-
-
-
-
-    if not has_permission(user, "manage_settings"):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="Settings permission is required.")
-
-
-
-
-
-
-
-
-    if payload.status not in {"pending", "approved", "declined", "completed"}:
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=400, detail="Invalid request status.")
-
-
-
-
-
-
-
-
-
+    principal = billing_principal(request)
 
 
 
@@ -105184,6 +106000,69 @@ def update_subscription_request(
 
 
     record = records.get(request_id)
+
+
+
+
+
+
+
+
+    if principal["kind"] != "admin":
+
+
+
+
+
+
+
+
+        # D-AUTHZ-3 (Z4i): customers never update; outside the tenant it does not exist.
+
+
+
+
+
+
+
+
+        if isinstance(record, dict) and subscription_request_owner_matches(record, principal):
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=403, detail="Only AnyAiCam administrators can update a subscription request.")
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=404, detail="Subscription request not found.")
+
+
+
+
+
+
+
+
+    if payload.status not in {"pending", "approved", "declined", "completed"}:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=400, detail="Invalid request status.")
 
 
 
@@ -105237,7 +106116,7 @@ def update_subscription_request(
 
 
 
-    record["updated_by"] = user.get("id")
+    record["updated_by"] = principal["user_id"]
 
 
 
@@ -105372,7 +106251,16 @@ def create_billing_support_ticket(
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
+
+
+
+
+
+
+
+
+    customer_id = _billing_write_customer(principal, payload.customer_id)
 
 
 
@@ -105417,15 +106305,6 @@ def create_billing_support_ticket(
 
 
 
-
-
-
-
-
-
-
-
-
     ticket_id = uuid.uuid4().hex
 
 
@@ -105462,7 +106341,7 @@ def create_billing_support_ticket(
 
 
 
-        "user_id": user.get("id"),
+        "customer_id": customer_id,
 
 
 
@@ -105471,7 +106350,7 @@ def create_billing_support_ticket(
 
 
 
-        "user_name": user.get("display_name") or user.get("email"),
+        "created_by_user_id": principal["user_id"],
 
 
 
@@ -105480,7 +106359,34 @@ def create_billing_support_ticket(
 
 
 
-        "user_email": user.get("email"),
+        "created_by_role": principal["role"],
+
+
+
+
+
+
+
+
+        "user_id": principal["user_id"],
+
+
+
+
+
+
+
+
+        "user_name": principal["display_name"] or principal["email"],
+
+
+
+
+
+
+
+
+        "user_email": principal["email"],
 
 
 
@@ -105705,52 +106611,7 @@ def update_billing_support_ticket(
 
 
 
-    user = current_user(request)
-
-
-
-
-
-
-
-
-    if not has_permission(user, "manage_settings"):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="Settings permission is required.")
-
-
-
-
-
-
-
-
-    if payload.status not in {"open", "in_progress", "resolved", "closed"}:
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=400, detail="Invalid ticket status.")
-
-
-
-
-
-
-
-
-
+    principal = billing_principal(request)
 
 
 
@@ -105769,6 +106630,60 @@ def update_billing_support_ticket(
 
 
     ticket = tickets.get(ticket_id)
+
+
+
+
+
+
+
+
+    if principal["kind"] != "admin":
+
+
+
+
+
+
+
+
+        if isinstance(ticket, dict) and billing_ticket_owner_matches(ticket, principal):
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=403, detail="Only AnyAiCam administrators can update a billing ticket.")
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=404, detail="Billing support ticket not found.")
+
+
+
+
+
+
+
+
+    if payload.status not in {"open", "in_progress", "resolved", "closed"}:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=400, detail="Invalid ticket status.")
 
 
 
@@ -105822,7 +106737,7 @@ def update_billing_support_ticket(
 
 
 
-    ticket["updated_by"] = user.get("id")
+    ticket["updated_by"] = principal["user_id"]
 
 
 
@@ -105930,7 +106845,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
 
 
 
@@ -105966,7 +106881,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    account = billing_account_for_user(user)
+    if principal["kind"] != "admin":
 
 
 
@@ -105975,7 +106890,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    if (
+        # D-AUTHZ-3: only an invoice of this tenant's own billing account.
 
 
 
@@ -105984,7 +106899,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-        invoice.get("account_id") != account.get("id")
+        account_id = str(billing_account_for_principal(principal).get("id") or "")
 
 
 
@@ -105993,7 +106908,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-        and not has_permission(user, "manage_settings")
+        if account_id in ("", "unassigned") or invoice.get("account_id") != account_id:
 
 
 
@@ -106002,16 +106917,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    ):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="You cannot access this invoice.")
+            raise HTTPException(status_code=404, detail="Invoice not found.")
 
 
 
