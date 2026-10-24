@@ -560,3 +560,70 @@ appliance or production system was changed. The next independent action is to
 review Green's acceptance package and reconcile its claims against the frozen
 source commit while Red supplies the requested custodian and lock-status
 information.
+
+## 9. Follow-up verification — 2026-10-24 22:45 UTC
+
+### Release-material provenance recheck
+
+Read-only inspection of `docs/entitlement-signing-keys.md`,
+`app/entitlement_keyset.py`, `docs/software-update.md`,
+`installer/build_release_installer.py`, and
+`installer/12-update-signing-key.sh` confirms the following:
+
+- The production TRUST-1 registry is generated from public signer records on
+  the authorized cloud host with `python -m entitlement_keyset
+  --trust-registry`; the registry digest is printed there and must be
+  independently transferred. The cloud's read-only public key endpoint is
+  documented as `GET https://<cloud>/api/appliance/signing-keys`, but a
+  downloaded keyset alone is not sufficient provenance for TRUST-1.
+- No reviewed source, configuration, or handoff identifies a named trust
+  administrator or approved transfer-channel location. That person and
+  channel remain owner/Red decisions.
+- `docs/software-update.md` describes an offline-generated release-signing
+  key pair, with the private half kept off servers and out of Git. Only the
+  public key is installed on appliances and exposed to the cloud publisher.
+  The staging example path is `/etc/anyaicam-staging/update-signing/`; it is
+  explicitly staging, not evidence of the production key's current location.
+  The production public PEM, its independently confirmed fingerprint, the
+  named signing custodian, and the approved transfer channel are not identified
+  in reviewed materials. No private key was read or requested.
+- The release builder requires the registry plus independent digest and the
+  update public key unless a `--no-*` bypass is selected. Those bypasses are
+  not acceptable for this release; the relevant production inputs remain
+  mandatory and absent.
+
+### Docker queue/lock recheck
+
+The historically documented marker
+`C:\Users\Alejandro Mata\anyaicam-red\.docker-test.lock` is absent in this
+read-only check. The latest visible lock-order note remains the October 23
+Blue-to-Green handoff; the shared `RED.md`/`GREEN.md` do not contain a current
+1.2.7.1 lock-owner/queue report. Therefore current queue activity, holder,
+authoritative lock path, and log-preservation state are **NOT VERIFIED**.
+Absence of the marker is not a lock release. Docker remains prohibited until
+the owner explicitly authorizes a test window and the current lock custodian
+confirms the queue is idle and lock is available.
+
+### Additional offline test attempt
+
+Attempted `app/tests/test_entitlement_keyset_tool.py` on the frozen source
+with Windows Python 3.14.6 and a worktree-local temporary directory. The first
+invocation did not collect because this standalone test needs `app/` on
+`PYTHONPATH`; the corrected invocation was interrupted by the reviewer after
+about 80 seconds with no captured output. It is **not a pass or a product
+failure** and is not included in test counts. Existing installer-builder and
+trust-registry test results above remain the last completed focused test
+evidence. Re-run this app/DB-backed test only in a supported environment with
+a bounded timeout; it is not necessary to hold the already completed
+lightweight builder tests open.
+
+### Current decision checklist
+
+| Item | Status | Responsible party | Estimate / next action |
+|---|---|---|---|
+| Production TRUST-1 registry and independent digest | Pending | Authorized trust administrator; owner/Red must identify custodian and approved channel | Once identified, allow about one business day to transfer and independently verify |
+| Software Update public PEM and fingerprint | Pending | Existing release-signing custodian; owner/Red must identify custodian and approved channel | Once identified, allow about one business day to transfer and verify |
+| Docker queue/holder and release authorization | Pending; no Docker ran | Owner plus current Docker lock custodian | Requires explicit owner test-window authorization and current queue/lock confirmation |
+| Linux 1.2.7.1 installer build and Ubuntu lifecycle | Pending | Release engineering/Red; Green independent acceptance | About 1–2 days after verified inputs and authorized Docker window |
+| Existing untracked test/evidence files | Preserved, unstaged | Codex | No action; do not stage, remove, or bundle them |
+| Frozen corrective application source | Preserved at `dcace5778c56988d447bd8a182a8308e7fb21dc5` | Codex | No source changes; continue documentation/source review only |
