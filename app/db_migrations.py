@@ -1667,6 +1667,10 @@ def apply_migrations():
                                if backend()=='sqlite' else
                                {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='facial_events'").fetchall()})
         if 'access_outcomes_json' not in facial_events_columns: db.execute('ALTER TABLE facial_events ADD COLUMN access_outcomes_json TEXT')
+        # R-REC-1 (1.2.7.1) supersedes the NULL-means-continuous rule below:
+        # NULL now follows the plan ('motion' or 'disabled', never continuous)
+        # and 'continuous' is cleared on every start -- see
+        # enforce_event_only_recording().
         # cloud_recording_mode has NO hidden default by design: NULL means
         # "not explicitly set for this camera" and every consumer (the
         # GET /api/appliance/configuration route, and the appliance's own
@@ -1750,6 +1754,10 @@ def apply_migrations():
         # consumer stays off; analytics_entitlements promotes it when Face
         # Access is granted. NULL/0 on every existing row.
         if 'door_access_requested' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_access_requested INTEGER')
+        # R-REC-1 (1.2.7.1) supersedes the NULL/'continuous' rule below: every
+        # camera records event clips only, every start sets this column to
+        # 'event' (enforce_event_only_recording()) and every reader treats any
+        # other value as 'event'.
         # Local Event-mode recording (2026-09-20): same no-hidden-default
         # convention as cloud_recording_mode above, deliberately kept as a
         # completely separate column/concept -- cloud_recording_mode gates
@@ -2280,6 +2288,57 @@ def apply_migrations():
             seeded=seed_explicit_analytics_operations(db)
             db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(SEED_EXPLICIT_ANALYTICS_OPERATIONS,datetime.now().isoformat()))
             logger.info('Applied database migration %s (explicit ON rows preserved: %s)',SEED_EXPLICIT_ANALYTICS_OPERATIONS,seeded)
+        # R-REC-1 (1.2.7.1): on EVERY start, not once -- a row written by an
+        # older edge sync, cloud or restored backup is corrected the next time
+        # the VMS (edge) or portal (cloud) starts. Idempotent.
+        enforce_event_only_recording(db)
+def enforce_event_only_recording(db) -> dict:
+    """R-REC-1 (1.2.7.1): event recording is the only recording mode.
+
+    - cameras.local_recording_mode -> 'event' where NULL or anything else;
+    - cameras.cloud_recording_mode -> NULL where not 'motion'/'disabled'
+      (e.g. 'continuous'; NULL now follows the plan and is never uploaded
+      as continuous, see event_media_policy.effective_cloud_recording_mode);
+    - camera_provisioning_requests.recording_mode -> 'motion' where NULL or
+      not 'motion'/'disabled'.
+
+    Runs on every start; changes nothing (and audits nothing) once clean.
+    The counts are logged and, when anything changed, written to audit_logs
+    as 'recording.event_only_migration'."""
+    def _table_columns(table):
+        try:
+            if _db_backend() == 'sqlite':
+                return {row['name'] for row in db.execute(f'PRAGMA table_info({table})').fetchall()}
+            return {row['column_name'] for row in db.execute(
+                f"SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='{table}'"
+            ).fetchall()}
+        except Exception:
+            return set()
+
+    counts = {'local_recording_mode_to_event': 0, 'cloud_recording_mode_cleared': 0, 'provisioning_requests_to_motion': 0}
+    camera_columns = _table_columns('cameras')
+    if 'local_recording_mode' in camera_columns:
+        counts['local_recording_mode_to_event'] = db.execute(
+            "UPDATE cameras SET local_recording_mode='event' WHERE local_recording_mode IS NULL OR local_recording_mode<>'event'"
+        ).rowcount or 0
+    if 'cloud_recording_mode' in camera_columns:
+        counts['cloud_recording_mode_cleared'] = db.execute(
+            "UPDATE cameras SET cloud_recording_mode=NULL WHERE cloud_recording_mode IS NOT NULL "
+            "AND cloud_recording_mode NOT IN ('motion','disabled')"
+        ).rowcount or 0
+    if 'recording_mode' in _table_columns('camera_provisioning_requests'):
+        counts['provisioning_requests_to_motion'] = db.execute(
+            "UPDATE camera_provisioning_requests SET recording_mode='motion' WHERE recording_mode IS NULL "
+            "OR recording_mode NOT IN ('motion','disabled')"
+        ).rowcount or 0
+    if any(counts.values()):
+        logger.warning('R-REC-1 event-only recording enforced: %s', counts)
+        if 'action' in _table_columns('audit_logs'):
+            db.execute(
+                'INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',
+                ('system', 'system', 'recording.event_only_migration', 'cameras', '', json.dumps(counts, sort_keys=True),
+                 datetime.now().isoformat()))
+    return counts
 
 
 # One-time, at the deploy of claim-flow activation (2026-10-11). Before it, an
