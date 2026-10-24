@@ -215,9 +215,10 @@ def test_customer_usage_and_licence_are_the_customers_own(env):
         db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES('site-a','cust-a','A','2026-01-01')")
         db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES('site-b','cust-b','B','2026-01-01')")
         for index in range(3):
-            db.execute("INSERT INTO cameras(id,customer_id,site_id,name,status,created_at) VALUES(?,?,?,?,?,?)",
-                       (f"cam-a-{index}", "cust-a", "site-a", f"A{index}", "active", "2026-01-01"))
-        db.execute("INSERT INTO cameras(id,customer_id,site_id,name,status,created_at) VALUES('cam-b-0','cust-b','site-b','B0','active','2026-01-01')")
+            db.execute("INSERT INTO cameras(id,customer_id,site_id,name,status,created_at,camera_number) VALUES(?,?,?,?,?,?,?)",
+                       (f"cam-a-{index}", "cust-a", "site-a", f"A{index}", "active", "2026-01-01", index + 1))
+        db.execute("INSERT INTO cameras(id,customer_id,site_id,name,status,created_at,camera_number) "
+                   "VALUES('cam-b-0','cust-b','site-b','B0','active','2026-01-01',1)")
     body = _portal(client, tokens["b"]).json()
     usage, licence = body["usage"], body["license"]
     for leaked in ("s3_bucket", "s3_prefix", "cloudfront_url", "edge_runtime_role", "deployment_environment",

@@ -591,7 +591,7 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         code = str(payload.get("code", ""))
         from admin_auth_policy import auth_audit, is_cloud_profile, record_mfa_failure
         from appliance_identity import has_global_administrator_grant, live_administrator_grant_scope
-        from cloud_security import login_blocked, record_login_failure
+        from cloud_security import clear_login_failures, login_blocked, record_login_failure
         from partner_db import audit as partner_audit
         from partner_db import connection
 
@@ -653,6 +653,7 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
                 else:
                     auth_audit("login.denied", actor_email=pending["email"], actor_role="administrator", reason=failure_kind, entity_id=pending["user_id"])
             raise failure
+        clear_login_failures(pending["email"])
         partner_audit({"email": pending["email"], "role": "administrator"}, "mfa_login_verify", "session", pending["user_id"])
         if method == "recovery_code":
             auth_audit("recovery_code_used", actor_email=pending["email"], actor_role="administrator", entity_id=pending["user_id"])

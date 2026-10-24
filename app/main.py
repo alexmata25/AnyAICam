@@ -44875,6 +44875,53 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
+        # Linux 1.2.7.1 (D-AUTHZ-2b, S-4): on the cloud no legacy users.json session
+        # reaches the administrator namespace (admin-capable legacy accounts are
+        # already refused by authenticated_user(); this covers every other role).
+
+
+
+
+
+
+
+
+        if is_admin_namespace_path(path) and not is_mfa_enrollment_path(path) and _legacy_cloud_profile():
+
+
+
+
+
+
+
+
+            if path.startswith("/api/"):
+
+
+
+
+
+
+
+
+                return JSONResponse({"status": "error", "message": "Administrator access is required."}, status_code=403)
+
+
+
+
+
+
+
+
+            return HTMLResponse("Administrator access is required.", status_code=403)
+
+
+
+
+
+
+
+
         return await call_next(request)
 
     # The customer/partner portal uses its own signed session cookie.
@@ -48653,7 +48700,11 @@ def portal_login_submit(request: Request, payload: dict):
             detail = f"This email has more than one portal available ({options}). Choose one from the Portal selector."
         raise HTTPException(status_code=403, detail=detail)
 
-    clear_login_failures(email)
+    # L-10 (1.2.7.1): on the cloud an administrator's failed sign-ins are only
+    # cleared once the MFA step succeeds (platform_owner mfa/verify), so wrong
+    # codes count toward the same lockout as wrong passwords.
+    if not (cloud and decision["role"] == "administrator"):
+        clear_login_failures(email)
 
     if decision["system"] == "legacy":
         legacy_user["failed_login_attempts"] = 0

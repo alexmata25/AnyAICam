@@ -194,8 +194,10 @@ def test_fresh_sign_in_after_the_revoke_gets_no_administrator_access(client, pro
             quota = client.post("/api/admin/customers/cust-a/camera-quota", json={"camera_quota": 1}, cookies=cookies_for(cookie))
             if profile == "cloud":
                 assert refused(quota), (path, quota.status_code)
-    assert _entitlements() == before_rows
     if profile == "cloud":
+        # The cloud-profile rule (coordinator 2026-10-24); an edge appliance keeps
+        # its local administrator behaviour (E-1/E-2).
+        assert _entitlements() == before_rows
         assert _quota_audits() == before_audits
         denials = [a for a in audit_actions() if a[1] == "login.denied"]
         assert denials and all("ops@partner.test" not in (a[3] or "") for a in denials)

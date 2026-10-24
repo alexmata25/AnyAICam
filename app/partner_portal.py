@@ -380,6 +380,10 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
     def setup_available():
         if settings.runtime_role not in {'edge', 'combined'}:
             raise HTTPException(status_code=404)
+        # L-8 (1.2.7.1): combined is a cloud profile too -- never a web first-admin setup there.
+        from admin_auth_policy import is_cloud_profile
+        if is_cloud_profile():
+            raise HTTPException(status_code=404)
         with connection() as db:
             if db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None:
                 raise HTTPException(status_code=404)
