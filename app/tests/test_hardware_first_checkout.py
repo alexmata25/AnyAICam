@@ -305,11 +305,14 @@ def test_a_guest_creates_the_account_with_the_order_email_and_sees_the_order(hw,
     assert ("Your AnyAiCam system has been ordered. Your equipment is being prepared for shipment. You do not need to "
             "activate or pay for your camera subscription yet. Return here when your equipment arrives.") in orders
     assert orders.count('class="hw-status">Paid<') == 2
-    # No camera plan was started, and the account can buy one later in its own checkout.
+    # No camera plan was started. D-HW-PLAN-1 (1.2.7.1): the plan chosen with the appliance (Hybrid x 8) was attached
+    # with the order and waits for activation, at the Price locked at checkout.
     import per_camera_billing as billing
     with override_target(sqlite_path=str(db_path)):
         assert not billing.has_camera_plan(customer_id)
-    assert _one(db_path, "SELECT COUNT(*) AS n FROM deferred_storage_plans")["n"] == 0
+    plan = _one(db_path, "SELECT * FROM deferred_storage_plans WHERE customer_id=?", (customer_id,))
+    assert (plan["plan_key"], plan["camera_quantity"], plan["stripe_price_id"], plan["state"]) == \
+        ("hybrid", 8, PLAN_PRICES["hybrid"], "awaiting_activation")
 
 
 def test_an_order_is_never_linked_to_an_existing_account_by_email_alone(hw, db_path):
