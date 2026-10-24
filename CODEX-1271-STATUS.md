@@ -38,6 +38,7 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 - Final product/security suite on application/test source `dcace5778c56988d447bd8a182a8308e7fb21dc5` (run from report descendant `a890fc0bf50f9bae33907da316710e0843c9c254`): **254 passed, 0 failed, 2 skipped, 33 warnings, 179.33 s**. Includes R-REC cloud/edge, trust/G2, keyset tooling, guest checkout plan, LPR stale-frame/camera cleanup/cadence, PPE and telemetry privacy tests. Log: `_evidence/full-focused-final-current.log`.
 - Administrator authorization suite on integrated auth code: **139 passed, 0 failed, 4 skipped**, 665 warnings, 386.26 s. Log: `_evidence/authz-full-integrated.log`.
 - Final authorization/MFA rerun on `d44db2c5`: **139 passed, 0 failed, 4 skipped**, 665 warnings, 290.49 s. Log: `_evidence/authz-final2.log`. An earlier exact-tip attempt was interrupted and is excluded.
+- Final authorization/MFA/tenant-isolation suite on application/test source `dcace5778c56988d447bd8a182a8308e7fb21dc5` (final report commit `81f0231422c942c58c38925c92538faecc625c14`): **139 passed, 0 failed, 4 skipped, 665 warnings, 238.48 s**. It used an isolated SQLite file and worktree-local pytest temp directory. Log: `_evidence/authz-exact-app-tip-authorized.log`. Restricted-session attempts that failed during collection/setup or stalled on loopback are retained but excluded from the result.
 - Installer trust-registry tests: **8 passed, 3 skipped, 2 subtests passed**. Log: `_evidence/installer-trust.log`.
 - Appliance-agent trust/update tests: **51 passed, 11 skipped, 39 subtests passed**. Log: `_evidence/agent-trust.log`.
 - Node/Python-wrapper browser tests: **41 passed, 0 failed**. Log: `_evidence/node-focused-pytest2.log`; direct same-origin CSRF wrapper check reports `same-origin-login-variants=passed` on `e2501657`.
@@ -49,7 +50,7 @@ All results below are local offline tests on Python 3.14.6 with isolated SQLite 
 - Ultralytics privacy tests: **4 passed**; local installed Ultralytics 8.4.115 opt-out smoke reported `sync=False`, `events.enabled=False`; runtime preflight passed. No model was loaded and no external telemetry request was made. Logs: `_evidence/ultralytics-privacy-final.log`, `_evidence/runtime-preflight-final.log`.
 - Python syntax compilation passed for `app/ultralytics_privacy.py`, `app/ppe.py`, `app/lpr.py`, `app/main.py`, and `installer/windows/runtime-preflight.py`.
 - The Local-view and authorization test summaries were captured as focused evidence notes under `_evidence/` and exercised the source content committed as `d44db2c5`.
-- `_evidence/CODEX-SHA256SUMS.txt` contains 42 evidence-file entries. All 42 paths exist and all SHA-256 values independently reverified with zero mismatches, including `_evidence/full-focused-final-current.log`. SQLite databases and temporary fixtures are preserved locally but excluded from the hash list and Git commits.
+- `_evidence/CODEX-SHA256SUMS.txt` contains 45 evidence-file entries. All paths and SHA-256 values are independently verified; the final authorized auth suite and the two restricted-session retry logs are included. SQLite databases and temporary fixtures are preserved locally but excluded from the hash list and Git commits.
 
 ## Environment and unverified acceptance
 
