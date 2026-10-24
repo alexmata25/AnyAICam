@@ -2342,6 +2342,24 @@ def enforce_event_only_recording(db) -> dict:
                  datetime.now().isoformat()))
     return counts
 
+        # Linux 1.2.7.1 (D-AUTHZ-1 residual / D-AUTHZ-2b): how each Partner Portal
+        # session was proven (auth_source) and its server-side MFA marker
+        # (mfa_state verified / enrollment_only / reenroll_required, set only
+        # by MFA verification or break-glass), plus the cloud role lock
+        # (admin_auth_policy). Additive columns; the data step runs once.
+        session_columns_now=_columns('user_sessions')
+        for name in ('auth_source','mfa_verified_at','mfa_method','mfa_state'):
+            if session_columns_now and name not in session_columns_now:
+                db.execute(f'ALTER TABLE user_sessions ADD COLUMN {name} TEXT')
+        import admin_auth_policy
+        db.execute(admin_auth_policy.ROLE_LOCK_DDL)
+        admin_auth_policy.record_role_lock(db)
+        if SESSION_AUTHZ_MFA not in applied and session_columns_now:
+            counts=session_authz_mfa_migration(db, cloud=_role_locked_cloud(db))
+            db.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',(SESSION_AUTHZ_MFA,datetime.now().isoformat()))
+            logger.info('Applied database migration %s (%s)',SESSION_AUTHZ_MFA,
+                        ' '.join(f'{key}={value}' for key,value in sorted(counts.items())))
+
 
 # One-time, at the deploy of claim-flow activation (2026-10-11). Before it, an
 # appliance linked through a claim code never started its account's deferred
@@ -2355,6 +2373,57 @@ def enforce_event_only_recording(db) -> dict:
 # old rules). Runs once, guarded by its schema_migrations marker, so a later
 # restart never holds a NEW claim's plan.
 HOLD_CLAIMED_STORAGE_STARTS='20261011_hold_pre_cutover_claimed_storage_starts'
+
+
+# Linux 1.2.7.1 (D-AUTHZ-1 residual / D-AUTHZ-2b), once per database:
+#   - edge: open sessions the cloud vouched for get their auth_source
+#     (local_customer for an owner with an appliance password, cloud_assertion
+#     for a delegated session with no local account), so partner_portal.
+#     _identity() keeps honouring them (E-1/E-2);
+#   - cloud/combined: every open administrator session is revoked (none can
+#     carry the new MFA marker; administrators sign in again with MFA);
+#   - every open session with no recorded authorization_version is bound to its
+#     active account's current version, or revoked when the account is
+#     inactive or missing (e.g. an ANYAICAM_PARTNER_ACCOUNTS session).
+# Count-only audit row; no identities are logged.
+SESSION_AUTHZ_MFA='20261025_session_authz_mfa'
+_INACTIVE_ACCOUNT_SQL="approved=1 AND COALESCE(account_status,'active') NOT IN ('suspended','revoked','pending','disabled')"
+
+
+def _role_locked_cloud(db) -> bool:
+    try:
+        row=db.execute("SELECT value FROM platform_security_state WHERE key='role_lock'").fetchone()
+    except Exception:
+        return False
+    return bool(row and row['value']=='cloud')
+
+
+def _table_exists(db, table) -> bool:
+    if _db_backend()=='sqlite':
+        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone() is not None
+    return db.execute('SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?',(table,)).fetchone() is not None
+
+
+def session_authz_mfa_migration(db, *, cloud: bool) -> dict:
+    now=datetime.now().isoformat(); counts={}
+
+    def run(key, sql, params=()):
+        result=db.execute(sql,params); counts[key]=int(getattr(result,'rowcount',0) or 0)
+
+    if not cloud:
+        if _table_exists(db,'local_customer_credentials'):
+            run('edge_local_customer_marked',"UPDATE user_sessions SET auth_source='local_customer' WHERE auth_source IS NULL AND revoked_at IS NULL "
+                "AND user_id IN (SELECT user_id FROM local_customer_credentials)")
+        run('edge_cloud_assertion_marked',"UPDATE user_sessions SET auth_source='cloud_assertion' WHERE auth_source IS NULL AND revoked_at IS NULL "
+            "AND authorization_version_at_login IS NOT NULL AND user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM partner_users)")
+    else:
+        run('admin_sessions_revoked',"UPDATE user_sessions SET revoked_at=? WHERE revoked_at IS NULL AND role='administrator'",(now,))
+    run('versions_backfilled',"UPDATE user_sessions SET authorization_version_at_login=(SELECT u.authorization_version FROM partner_users u WHERE u.id=user_sessions.user_id) "
+        f"WHERE revoked_at IS NULL AND authorization_version_at_login IS NULL AND auth_source IS NULL AND user_id IN (SELECT id FROM partner_users WHERE {_INACTIVE_ACCOUNT_SQL})")
+    run('unversioned_sessions_revoked',"UPDATE user_sessions SET revoked_at=? WHERE revoked_at IS NULL AND authorization_version_at_login IS NULL AND auth_source IS NULL",(now,))
+    db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',
+               ('system','system','migration.session_authz_mfa','user_sessions','',json.dumps({**counts,'cloud':cloud}),now))
+    return counts
 
 
 def hold_pre_cutover_claimed_storage_starts(db) -> int:

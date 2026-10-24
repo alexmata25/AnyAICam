@@ -407,3 +407,34 @@ def legacy_own_pc_checkout(monkeypatch):
     import build_orders
     from legacy_own_pc_checkout import legacy_checkout_fields
     monkeypatch.setattr(build_orders, "_checkout_fields", legacy_checkout_fields)
+
+
+@pytest.fixture
+def partner_session():
+    """Mints a REAL Partner Portal session (user_sessions row bound to the
+    account's current authorization_version, MFA-verified for an
+    administrator) and returns its signed cookie value -- see
+    authz_helpers.partner_session_cookie(). Linux 1.2.7.1 refuses session-less
+    administrator tokens, so tests sign in this way instead."""
+    from authz_helpers import partner_session_cookie
+    return partner_session_cookie
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_role_lock_leak():
+    """admin_auth_policy writes a database role lock on a cloud run (a cloud
+    database keeps the cloud profile even if a later start is misconfigured as
+    edge). A test that runs as cloud against the shared default database must
+    not leave that lock behind for the edge tests that follow it."""
+    yield
+    import sys
+    policy = sys.modules.get("admin_auth_policy")
+    if policy is None or not getattr(policy, "_locked_targets", None):
+        return
+    try:
+        from database_backend import connect
+        with connect() as db:
+            db.execute("DELETE FROM platform_security_state WHERE key='role_lock'")
+    except Exception:
+        pass
+    policy.reset_cache_for_tests()

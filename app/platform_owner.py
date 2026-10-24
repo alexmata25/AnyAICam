@@ -129,6 +129,7 @@ import hashlib
 import hmac
 import secrets
 import struct
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Callable
@@ -257,31 +258,45 @@ def mfa_is_confirmed(db, *, user_id: str) -> bool:
     return bool(row and row["confirmed_at"])
 
 
-def _require_global_grant_session(request: Request) -> dict:
-    """Every route below that manages MFA/recovery-code enrollment
-    itself (not the login-time verify/break-glass endpoints, which are
-    reached mid-login or without a session by design) requires an
-    ALREADY-ESTABLISHED session that is, right now, a live global
-    grant -- re-checked the same way current_user()/
-    cloud_administrator_bridge() already does for every other Admin
-    Portal route, not trusted from the session cookie's own role claim
-    alone."""
-    from partner_portal import partner_identity
+def _mfa_actor(request: Request, *, allow_enrollment: bool = True) -> dict:
+    """The administrator managing their OWN MFA factor: a full Partner Portal
+    session (MFA-verified on the cloud), or -- when allow_enrollment -- the
+    restricted enrollment / re-enrollment session (L-2a, RC-2). Requires a
+    partner_users administrator with a live administrator grant (1.2.7.1: any
+    administrator scope may enroll, since every administrator session on the
+    cloud needs MFA; a break-glass re-enrollment needs the global grant).
+    Re-checked live on every call, never trusted from the cookie alone."""
+    from partner_portal import partner_enrollment_identity, partner_identity
 
     identity = partner_identity(request)
+    enrollment = False
+    if identity is None and allow_enrollment:
+        identity = partner_enrollment_identity(request)
+        enrollment = identity is not None
     if not identity or identity.get("role") != "administrator":
         raise HTTPException(status_code=403, detail="Platform owner access is required.")
     email = str(identity.get("email") or "").strip()
-    from appliance_identity import has_global_administrator_grant
+    from appliance_identity import live_administrator_grant_scope
     from partner_db import connection
 
     with connection() as db:
-        if not email or not has_global_administrator_grant(db, email=email):
-            raise HTTPException(status_code=403, detail="Platform owner access is required.")
-        user = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()
-    if not user:
+        user = db.execute("SELECT id,role FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone() if email else None
+        scope = live_administrator_grant_scope(db, user_id=user["id"]) if user and user["role"] == "administrator" else None
+    if not user or scope is None or (identity.get("mfa_state") == "reenroll_required" and scope != "global"):
         raise HTTPException(status_code=403, detail="Platform owner access is required.")
-    return {"email": email, "user_id": user["id"]}
+    return {"email": email, "user_id": user["id"], "session_id": identity.get("session_id"), "mfa_state": identity.get("mfa_state"),
+            "enrollment": enrollment, "scope": scope}
+
+
+def _require_global_grant_session(request: Request) -> dict:
+    """A full (on the cloud: MFA-verified) session of a live GLOBAL
+    administrator grant -- re-checked the same way current_user()/
+    cloud_administrator_bridge() already does for every other Admin Portal
+    route, not trusted from the session cookie's own role claim alone."""
+    actor = _mfa_actor(request, allow_enrollment=False)
+    if actor["scope"] != "global":
+        raise HTTPException(status_code=403, detail="Platform owner access is required.")
+    return actor
 
 
 # ---------------------------------------------------------------- break-glass
@@ -372,6 +387,11 @@ def _redeem_break_glass_token(db, *, email: str, token: str) -> dict | None:
 def create_pending_mfa_login(db, *, user_id: str, destination: str, email: str, role: str, authorization_version_at_login: int | None, ttl_minutes: int = 5) -> str:
     token = secrets.token_urlsafe(24)
     now = datetime.now()
+    if authorization_version_at_login is None:
+        # 1.2.7.1: always bound to the version the password step saw, so a
+        # grant revoke / reset between the two steps is caught at verify.
+        current = db.execute("SELECT authorization_version FROM partner_users WHERE id=?", (user_id,)).fetchone()
+        authorization_version_at_login = int(current["authorization_version"]) if current else None
     db.execute(
         "INSERT INTO pending_mfa_logins(id,user_id,destination,email,role,authorization_version_at_login,created_at,expires_at,used_at) VALUES(?,?,?,?,?,?,?,?,NULL)",
         (token, user_id, destination, email, role, authorization_version_at_login, now.isoformat(), (now + timedelta(minutes=ttl_minutes)).isoformat()),
@@ -401,6 +421,39 @@ def _consume_pending_mfa_login(db, *, token: str) -> dict | None:
     return dict(row) if row else None
 
 
+# ------------------------------------------------------------ admin sign-in
+
+
+def begin_admin_login(request: Request, *, user: dict, email: str, role: str, destination: str):
+    """The ONLY way a password sign-in continues for an administrator on the
+    cloud (Linux 1.2.7.1, D-AUTHZ-2b): an enrolled administrator gets
+    {"status":"mfa_required"} and a 5-minute single-use pending login bound to
+    the current authorization_version (L-1); an un-enrolled one gets a
+    15-minute enrollment-only session that reaches nothing but the MFA
+    enrollment surface and sign-out (L-2a, T-2). Never a full administrator
+    session without MFA."""
+    from admin_auth_policy import ENROLLMENT_SESSION_MINUTES, auth_audit
+    from partner_db import connection
+
+    with connection() as db:
+        current = db.execute("SELECT authorization_version FROM partner_users WHERE id=?", (user["id"],)).fetchone()
+        version = int(current["authorization_version"]) if current else None
+        pending_token = None
+        if mfa_is_confirmed(db, user_id=user["id"]):
+            pending_token = create_pending_mfa_login(db, user_id=user["id"], destination=destination, email=email, role=role,
+                                                     authorization_version_at_login=version)
+    if pending_token:
+        auth_audit("login.mfa_required", actor_email=email, actor_role=role, entity_id=user["id"])
+        return {"status": "mfa_required", "mfa_pending_token": pending_token}
+    auth_audit("login.mfa_enrollment_required", actor_email=email, actor_role=role, entity_id=user["id"])
+    from partner_portal import establish_partner_session
+
+    return establish_partner_session(
+        "/admin/mfa-setup", request=request, email=email, role=role, user=user, authorization_version_at_login=version,
+        auth_source="password", mfa_state="enrollment_only", ttl_minutes=ENROLLMENT_SESSION_MINUTES,
+    )
+
+
 # ------------------------------------------------------------------- routes
 
 
@@ -410,7 +463,7 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         """What the Admin Portal's sign-in security card shows: never the
         secret or any code, only whether MFA is on and how many unused
         recovery codes remain."""
-        actor = _require_global_grant_session(request)
+        actor = _mfa_actor(request)
         from partner_db import connection
 
         with connection() as db:
@@ -419,7 +472,8 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
                 "SELECT COUNT(*) AS n FROM platform_owner_recovery_codes WHERE user_id=? AND used_at IS NULL",
                 (actor["user_id"],),
             ).fetchone()["n"]
-        return {"mfa_enabled": confirmed, "recovery_codes_remaining": int(remaining) if confirmed else 0}
+        return {"mfa_enabled": confirmed, "recovery_codes_remaining": int(remaining) if confirmed else 0,
+                "session": actor["mfa_state"] if actor["enrollment"] else "full"}
 
     @app.post("/api/platform-owner/mfa/enroll")
     def platform_owner_mfa_enroll(request: Request, payload: dict | None = None) -> dict:
@@ -428,9 +482,13 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         confirmed_at, so a session holder could switch MFA off by starting
         an enrollment and abandoning it. Now a replacement needs a current
         code from the confirmed factor, is stored as pending, and the
-        confirmed factor stays in force until the replacement is confirmed."""
-        actor = _require_global_grant_session(request)
+        confirmed factor stays in force until the replacement is confirmed.
+        1.2.7.1: a break-glass re-enrollment session (the factor is lost --
+        the host-minted token is the proof) replaces without a current code,
+        still as a pending factor."""
+        actor = _mfa_actor(request)
         secret = generate_totp_secret()
+        from admin_auth_policy import auth_audit
         from partner_db import audit as partner_audit
         from partner_db import connection
 
@@ -439,7 +497,7 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
             current = db.execute("SELECT secret_base32,confirmed_at FROM platform_owner_mfa WHERE user_id=?", (actor["user_id"],)).fetchone()
             replacing = bool(current and current["confirmed_at"])
             if replacing:
-                if not verify_totp_code(current["secret_base32"], str((payload or {}).get("current_code", ""))):
+                if actor["mfa_state"] != "reenroll_required" and not verify_totp_code(current["secret_base32"], str((payload or {}).get("current_code", ""))):
                     reauth_failed = True
                 else:
                     reauth_failed = False
@@ -458,6 +516,8 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=403, detail="Enter a current code from your existing authenticator to replace it.")
         if replacing:
             partner_audit({"email": actor["email"], "role": "administrator"}, "mfa_replace_started", "platform_owner_mfa", actor["user_id"])
+        auth_audit("mfa_enroll_started", actor_email=actor["email"], actor_role="administrator", entity_type="platform_owner_mfa",
+                   entity_id=actor["user_id"], details={"replacing": replacing, "session": actor["mfa_state"] or "full"})
         return {
             "status": "enrolled_pending_confirmation",
             "secret_base32": secret,
@@ -467,8 +527,16 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.post("/api/platform-owner/mfa/confirm")
     def platform_owner_mfa_confirm(request: Request, payload: dict) -> dict:
-        actor = _require_global_grant_session(request)
+        """Confirms the pending factor. 1.2.7.1: the account's
+        authorization_version moves in the same transaction. From an
+        enrollment-only / re-enrollment session every session (that one
+        included) ends and the administrator signs in again -- now through
+        MFA (EN-4). From a full session (a factor replacement) that session is
+        kept on the new version and every other one ends."""
+        actor = _mfa_actor(request)
         code = str(payload.get("code", ""))
+        from admin_auth_policy import auth_audit
+        from appliance_identity import bump_authorization_version
         from partner_db import audit as partner_audit
         from partner_db import connection
 
@@ -484,19 +552,36 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
             db.execute("UPDATE platform_owner_mfa SET secret_base32=?,confirmed_at=?,pending_secret_base32=NULL,pending_created_at=NULL WHERE user_id=?",
                        (candidate, datetime.now().isoformat(), actor["user_id"]))
             codes = generate_recovery_codes(db, user_id=actor["user_id"])
+            bump_authorization_version(db, actor["user_id"], keep_session_id=None if actor["enrollment"] else actor["session_id"])
         partner_audit({"email": actor["email"], "role": "administrator"}, "mfa_confirm", "platform_owner_mfa", actor["user_id"])
-        return {"status": "confirmed", "recovery_codes": codes, "message": "MFA is now required for this account's Admin Portal logins. Save these recovery codes -- they are shown only once."}
+        auth_audit("mfa_enroll_confirmed", actor_email=actor["email"], actor_role="administrator", entity_type="platform_owner_mfa",
+                   entity_id=actor["user_id"], details={"session": actor["mfa_state"] or "full"})
+        if actor["enrollment"]:
+            return {"status": "confirmed", "recovery_codes": codes, "sign_in_required": True, "destination": "/partner.html",
+                    "message": "Two-factor authentication is on. Save these recovery codes -- they are shown only once -- then sign in again with a code."}
+        return {"status": "confirmed", "recovery_codes": codes, "sign_in_required": False,
+                "message": "MFA is now required for this account's Admin Portal logins. Save these recovery codes -- they are shown only once."}
 
     @app.post("/api/platform-owner/recovery-codes/regenerate")
-    def platform_owner_recovery_codes_regenerate(request: Request) -> dict:
-        actor = _require_global_grant_session(request)
+    def platform_owner_recovery_codes_regenerate(request: Request, payload: dict | None = None) -> dict:
+        """RC-1 (1.2.7.1): needs a full (MFA-verified on the cloud) session AND
+        a current code from the confirmed authenticator."""
+        actor = _mfa_actor(request, allow_enrollment=False)
         from partner_db import audit as partner_audit
         from partner_db import connection
 
+        denied = False
         with connection() as db:
-            if not mfa_is_confirmed(db, user_id=actor["user_id"]):
+            row = db.execute("SELECT secret_base32,confirmed_at FROM platform_owner_mfa WHERE user_id=?", (actor["user_id"],)).fetchone()
+            if not row or not row["confirmed_at"]:
                 raise HTTPException(status_code=400, detail="Confirm MFA enrollment before generating recovery codes.")
-            codes = generate_recovery_codes(db, user_id=actor["user_id"])
+            if not verify_totp_code(row["secret_base32"], str((payload or {}).get("current_code", ""))):
+                denied = True
+            else:
+                codes = generate_recovery_codes(db, user_id=actor["user_id"])
+        if denied:
+            partner_audit({"email": actor["email"], "role": "administrator"}, "recovery_codes_regenerate_denied", "platform_owner_recovery_codes", actor["user_id"])
+            raise HTTPException(status_code=403, detail="Enter a current code from your authenticator to create new recovery codes.")
         partner_audit({"email": actor["email"], "role": "administrator"}, "recovery_codes_regenerate", "platform_owner_recovery_codes", actor["user_id"])
         return {"status": "regenerated", "recovery_codes": codes}
 
@@ -504,9 +589,21 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
     def platform_owner_mfa_verify(request: Request, payload: dict):
         mfa_pending_token = str(payload.get("mfa_pending_token", ""))
         code = str(payload.get("code", ""))
-        from appliance_identity import has_global_administrator_grant
+        from admin_auth_policy import auth_audit, is_cloud_profile, record_mfa_failure
+        from appliance_identity import has_global_administrator_grant, live_administrator_grant_scope
+        from cloud_security import clear_login_failures, login_blocked, record_login_failure
         from partner_db import audit as partner_audit
         from partner_db import connection
+
+        # L-10 (1.2.7.1): a locked account cannot complete a pending sign-in;
+        # the pending token is spent either way.
+        with connection() as db:
+            peek = db.execute("SELECT email FROM pending_mfa_logins WHERE id=?", (mfa_pending_token,)).fetchone()
+        if peek and login_blocked(str(peek["email"] or "")):
+            with connection() as db:
+                _consume_pending_mfa_login(db, token=mfa_pending_token)
+            auth_audit("login.blocked", actor_email=peek["email"], actor_role="administrator", reason="rate_limit")
+            raise HTTPException(status_code=429, detail="Account is temporarily locked after repeated sign-in failures. Try again later.")
 
         # Every failure below is raised only AFTER this block commits: raising
         # inside it rolled back _consume_pending_mfa_login()'s claim, so a
@@ -514,61 +611,155 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         # allowed unlimited code guesses for its whole 5-minute life (admin
         # portal pass 2026-09-26). A wrong code now spends the attempt.
         failure: HTTPException | None = None
+        failure_kind = ""
+        method = ""
+        user_row = None
         with connection() as db:
             pending = _consume_pending_mfa_login(db, token=mfa_pending_token)
             if not pending:
                 failure = HTTPException(status_code=400, detail="This sign-in attempt has expired. Sign in again.")
-            # Re-verify the grant is STILL live right now -- the pending
-            # row is only a "password already checked, MFA still owed"
-            # marker, never itself a source of authorization.
-            elif not has_global_administrator_grant(db, email=pending["email"]):
-                failure = HTTPException(status_code=403, detail="This account no longer has platform owner access.")
             else:
-                mfa_row = db.execute("SELECT secret_base32, confirmed_at FROM platform_owner_mfa WHERE user_id=?", (pending["user_id"],)).fetchone()
-                ok = bool(mfa_row and mfa_row["confirmed_at"] and verify_totp_code(mfa_row["secret_base32"], code))
-                if not ok:
-                    ok = consume_recovery_code(db, user_id=pending["user_id"], code=code)
-                if not ok:
-                    failure = HTTPException(status_code=400, detail="Incorrect code. Sign in again to get a new attempt.")
+                account = db.execute("SELECT id,partner_id,customer_id,role,approved,account_status,authorization_version FROM partner_users WHERE id=?",
+                                     (pending["user_id"],)).fetchone()
+                version = pending["authorization_version_at_login"]
+                active = bool(account and account["approved"] and str(account["account_status"] or "active").lower() not in {"suspended", "revoked", "pending", "disabled"}
+                              and account["role"] == pending["role"])
+                # Re-verify the account is STILL entitled right now -- the
+                # pending row is only a "password already checked, MFA still
+                # owed" marker, never itself a source of authorization.
+                if pending["destination"] == "/admin-portal":
+                    entitled = has_global_administrator_grant(db, email=pending["email"])
                 else:
-                    user_row = db.execute("SELECT id,partner_id,customer_id FROM partner_users WHERE id=?", (pending["user_id"],)).fetchone()
+                    entitled = (not is_cloud_profile()) or live_administrator_grant_scope(db, user_id=pending["user_id"]) is not None
+                if not active or not entitled:
+                    failure, failure_kind = HTTPException(status_code=403, detail="This account no longer has platform owner access."), "no_access"
+                elif version is not None and int(version) != int(account["authorization_version"]):
+                    failure, failure_kind = HTTPException(status_code=403, detail="This sign-in attempt is no longer valid. Sign in again."), "authorization_changed"
+                else:
+                    mfa_row = db.execute("SELECT secret_base32, confirmed_at FROM platform_owner_mfa WHERE user_id=?", (pending["user_id"],)).fetchone()
+                    if mfa_row and mfa_row["confirmed_at"] and verify_totp_code(mfa_row["secret_base32"], code):
+                        method = "totp"
+                    elif consume_recovery_code(db, user_id=pending["user_id"], code=code):
+                        method = "recovery_code"
+                    if not method:
+                        failure, failure_kind = HTTPException(status_code=400, detail="Incorrect code. Sign in again to get a new attempt."), "incorrect_code"
+                    else:
+                        user_row = dict(account)
         if failure is not None:
-            if failure.status_code == 400 and pending:
-                partner_audit({"email": pending["email"], "role": "administrator"}, "mfa_login_failed", "session", pending["user_id"])
+            if pending:
+                record_login_failure(pending["email"])
+                if failure_kind == "incorrect_code":
+                    record_mfa_failure(user_id=pending["user_id"], email=pending["email"])
+                else:
+                    auth_audit("login.denied", actor_email=pending["email"], actor_role="administrator", reason=failure_kind, entity_id=pending["user_id"])
             raise failure
+        clear_login_failures(pending["email"])
         partner_audit({"email": pending["email"], "role": "administrator"}, "mfa_login_verify", "session", pending["user_id"])
+        if method == "recovery_code":
+            auth_audit("recovery_code_used", actor_email=pending["email"], actor_role="administrator", entity_id=pending["user_id"])
 
         from partner_portal import establish_partner_session
 
         return establish_partner_session(
             pending["destination"], request=request, email=pending["email"], role=pending["role"],
-            user=dict(user_row) if user_row else None,
-            authorization_version_at_login=pending["authorization_version_at_login"],
+            user={"id": user_row["id"], "partner_id": user_row["partner_id"], "customer_id": user_row["customer_id"]},
+            authorization_version_at_login=int(user_row["authorization_version"]),
+            auth_source="mfa", mfa_state="verified", mfa_method=method,
         )
 
     @app.post("/api/platform-owner/break-glass-recover")
     def platform_owner_break_glass_recover(request: Request, payload: dict):
-        email = str(payload.get("email", ""))
+        """RC-2 (1.2.7.1): throttled per account; a redemption moves the
+        account's authorization_version (every older session ends) and yields
+        ONE short re-enrollment session -- it reaches the MFA enrollment
+        surface only, until a new factor is confirmed and the owner signs in
+        again with it."""
+        email = str(payload.get("email", "")).strip().lower()
         token = str(payload.get("token", ""))
-        from appliance_identity import has_global_administrator_grant
+        from admin_auth_policy import ENROLLMENT_SESSION_MINUTES, auth_audit
+        from appliance_identity import bump_authorization_version, has_global_administrator_grant
+        from cloud_security import clear_login_failures, login_blocked, record_login_failure
         from partner_db import audit as partner_audit
         from partner_db import connection
 
-        with connection() as db:
-            redeemed = _redeem_break_glass_token(db, email=email, token=token)
-            if not redeemed:
-                raise HTTPException(status_code=400, detail="Invalid or expired recovery token.")
-            # Same live re-verification as every other path here -- a
-            # token redeemed after the grant itself was independently
-            # revoked must not still succeed.
-            if not has_global_administrator_grant(db, email=email.strip().lower()):
-                raise HTTPException(status_code=403, detail="This account no longer has platform owner access.")
-            user_row = db.execute("SELECT id,partner_id,customer_id FROM partner_users WHERE id=?", (redeemed["user_id"],)).fetchone()
-        partner_audit({"email": email.strip().lower(), "role": "administrator"}, "break_glass_redeem", "session", redeemed["user_id"])
+        throttle_key = "break-glass:" + email
+        if login_blocked(throttle_key):
+            auth_audit("login.blocked", actor_email=email, actor_role="administrator", reason="break_glass_rate_limit")
+            raise HTTPException(status_code=429, detail="Too many recovery attempts. Try again later.")
+        forbidden = False
+        user_row = None
+
+        class _NoLongerEntitled(Exception):
+            pass
+
+        try:
+            with connection() as db:
+                redeemed = _redeem_break_glass_token(db, email=email, token=token)
+                if redeemed:
+                    # Same live re-verification as every other path here -- a
+                    # token redeemed after the grant itself was independently
+                    # revoked must not still succeed (raising rolls the claim back).
+                    if not has_global_administrator_grant(db, email=email):
+                        raise _NoLongerEntitled()
+                    bump_authorization_version(db, redeemed["user_id"])
+                    user_row = db.execute("SELECT id,partner_id,customer_id,authorization_version FROM partner_users WHERE id=?", (redeemed["user_id"],)).fetchone()
+                    user_row = dict(user_row) if user_row else None
+        except _NoLongerEntitled:
+            forbidden = True
+        if not redeemed:
+            record_login_failure(throttle_key)
+            auth_audit("login.failed", actor_email=email, actor_role="administrator", reason="break_glass_invalid")
+            raise HTTPException(status_code=400, detail="Invalid or expired recovery token.")
+        if forbidden or not user_row:
+            raise HTTPException(status_code=403, detail="This account no longer has platform owner access.")
+        clear_login_failures(throttle_key)
+        partner_audit({"email": email, "role": "administrator"}, "break_glass_redeem", "session", redeemed["user_id"])
+        auth_audit("break_glass_redeemed", actor_email=email, actor_role="administrator", entity_id=redeemed["user_id"])
 
         from partner_portal import establish_partner_session
 
         return establish_partner_session(
-            "/admin-portal", request=request, email=email.strip().lower(), role="administrator",
-            user=dict(user_row) if user_row else None, authorization_version_at_login=None,
+            "/admin/mfa-setup", request=request, email=email, role="administrator",
+            user={"id": user_row["id"], "partner_id": user_row["partner_id"], "customer_id": user_row["customer_id"]},
+            authorization_version_at_login=int(user_row["authorization_version"]),
+            auth_source="break_glass", mfa_state="reenroll_required", ttl_minutes=ENROLLMENT_SESSION_MINUTES,
         )
+
+
+# ------------------------------------------------------------------- host CLI
+
+
+def cli_main(argv=None) -> int:
+    """Host-only operator commands (never an HTTP route):
+
+        python -m platform_owner mint-break-glass --email OWNER --reason WHY --operator WHO
+
+    prints a single-use, 30-minute break-glass token for an account that holds
+    a live global administrator grant (audited as break_glass_create). Run it
+    inside the cloud container (docker exec) only when the password + MFA +
+    recovery-code path is unavailable."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m platform_owner")
+    commands = parser.add_subparsers(dest="command", required=True)
+    mint = commands.add_parser("mint-break-glass", help="mint a single-use break-glass token for a platform owner")
+    mint.add_argument("--email", required=True)
+    mint.add_argument("--reason", required=True)
+    mint.add_argument("--operator", required=True, help="who is minting it (recorded in the audit log)")
+    mint.add_argument("--ttl-minutes", type=int, default=30)
+    args = parser.parse_args(argv)
+    from partner_db import connection
+
+    with connection() as db:
+        raw = create_break_glass_token(db, email=args.email, reason=args.reason, created_by=args.operator,
+                                       ttl_minutes=max(1, min(30, int(args.ttl_minutes))))
+    if not raw:
+        print("No live global administrator grant for that account; nothing was minted.", file=sys.stderr)
+        return 1
+    print("Break-glass token (shown once; single use; expires in at most 30 minutes):", file=sys.stderr)
+    print(raw)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli_main())

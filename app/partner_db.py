@@ -292,11 +292,18 @@ def bootstrap_admin() -> None:
     email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower()
     if not email: return
     now=datetime.now().isoformat(); partner_id='anyaicam-primary'
+    # Linux 1.2.7.1 (D-AUTHZ-2b, design b/g): on the cloud profile this never
+    # creates a password account from ANYAICAM_ADMIN_PASSWORD, and never
+    # re-creates a global grant that was revoked -- a restart or recreate must
+    # not undo an owner's revocation or re-seed a password-only administrator.
+    from admin_auth_policy import is_cloud_profile
+    cloud=is_cloud_profile()
     with database_connect() as db:
         existing=db.execute('SELECT id FROM partner_users WHERE email=?',(email,)).fetchone()
         if existing:
             user_id=existing['id']
         else:
+            if cloud: return
             password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
             if not password: return
             db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
@@ -304,6 +311,8 @@ def bootstrap_admin() -> None:
             db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
         has_grant=db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global' AND revoked_at IS NULL",(user_id,)).fetchone()
         if not has_grant:
+            if cloud and db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global'",(user_id,)).fetchone():
+                return  # revoked on purpose: never re-created on the cloud
             from appliance_identity import create_grant
             create_grant(db,user_id=user_id,role='administrator',scope_type='global',scope_id=None,granted_by='system:bootstrap_admin',now=now)
 

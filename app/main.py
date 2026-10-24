@@ -7541,6 +7541,7 @@ class BillingInvoiceUpdateModel(BaseModel):
 
 
 class SubscriptionRequestCreateModel(BaseModel):
+    customer_id: str = ""  # 1.2.7.1: administrators name the target customer; ignored for customers
 
 
 
@@ -7649,6 +7650,7 @@ class SubscriptionRequestUpdateModel(BaseModel):
 
 
 class BillingSupportTicketCreateModel(BaseModel):
+    customer_id: str = ""  # 1.2.7.1: administrators name the target customer; ignored for customers
 
 
 
@@ -9215,7 +9217,286 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 
+# Linux 1.2.7.1 (D-AUTHZ-2b, T-3/T-3a/T-4): on the cloud profile the legacy
+
+
+
+
+
+
+
+
+# users.json store is never a source of administrator access. A missing or
+
+
+
+
+
+
+
+
+# empty users.json becomes this TOMBSTONE (a disabled local-admin whose hash can
+
+
+
+
+
+
+
+
+# never verify), never default_users() hashed from ANYAICAM_ADMIN_PASSWORD -- so
+
+
+
+
+
+
+
+
+# neither a restart nor a rollback to a pre-1.2.7.1 image (whose load_users()
+
+
+
+
+
+
+
+
+# re-seeds a password admin only for a missing/empty file or an EMPTY hash) can
+
+
+
+
+
+
+
+
+# bring a password-only administrator back.
+
+
+
+
+
+
+
+
+RETIRED_PASSWORD_HASH = "!retired-1.2.7.1"
+
+
+
+
+
+
+
+
+LEGACY_RETIRE_BACKUP_SUFFIX = ".pre-1271"
+
+
+
+
+
+
+
+
+def _legacy_cloud_profile() -> bool:
+
+
+
+
+
+
+
+
+    try:
+
+
+
+
+
+
+
+
+        from admin_auth_policy import is_cloud_profile
+
+
+
+
+
+
+
+
+        return is_cloud_profile()
+
+
+
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+
+
+
+        return RUNTIME_ROLE in {"cloud", "combined"}
+
+
+
+
+
+
+
+
+def legacy_tombstone_users() -> list[dict]:
+
+
+
+
+
+
+
+
+    tombstone = UserModel(
+
+
+
+
+
+
+
+
+        id="local-admin",
+
+
+
+
+
+
+
+
+        display_name="Local Administrator (retired)",
+
+
+
+
+
+
+
+
+        email=os.environ.get("ANYAICAM_ADMIN_EMAIL", "admin@local").strip().lower() or "admin@local",
+
+
+
+
+
+
+
+
+        role="administrator",
+
+
+
+
+
+
+
+
+        enabled=False,
+
+
+
+
+
+
+
+
+        super_admin=False,
+
+
+
+
+
+
+
+
+        site_ids=["home"],
+
+
+
+
+
+
+
+
+        camera_ids=[],
+
+
+
+
+
+
+
+
+        password_hash=RETIRED_PASSWORD_HASH,
+
+
+
+
+
+
+
+
+    ).model_dump(mode="json")
+
+
+
+
+
+
+
+
+    tombstone["retired_reason"] = "d_authz_2b_cloud"
+
+
+
+
+
+
+
+
+    return [tombstone]
+
+
+
+
+
+
+
+
 def default_users() -> list[dict]:
+
+
+
+
+
+
+
+
+    if _legacy_cloud_profile():
+
+
+
+
+
+
+
+
+        return legacy_tombstone_users()
 
 
 
@@ -9395,6 +9676,15 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
 
 
 
+    cloud = _legacy_cloud_profile()
+
+
+
+
+
+
+
+
     admin_email = os.environ.get("ANYAICAM_ADMIN_EMAIL", "admin@local").strip().lower()
 
 
@@ -9521,7 +9811,7 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
 
 
 
-            if not user.get("password_hash") and admin_password:
+            if not user.get("password_hash"):
 
 
 
@@ -9530,7 +9820,7 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
 
 
 
-                user["password_hash"] = hash_password(admin_password)
+                if cloud:
 
 
 
@@ -9539,7 +9829,70 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
 
 
 
-                changed = True
+                    # 1.2.7.1: never hash ANYAICAM_ADMIN_PASSWORD on the cloud, and
+
+
+
+
+
+
+
+
+                    # never leave an EMPTY hash a pre-1.2.7.1 image would fill from it.
+
+
+
+
+
+
+
+
+                    user["password_hash"] = RETIRED_PASSWORD_HASH
+
+
+
+
+
+
+
+
+                    user["enabled"] = False
+
+
+
+
+
+
+
+
+                    changed = True
+
+
+
+
+
+
+
+
+                elif admin_password:
+
+
+
+
+
+
+
+
+                    user["password_hash"] = hash_password(admin_password)
+
+
+
+
+
+
+
+
+                    changed = True
 
 
 
@@ -9584,6 +9937,15 @@ def load_users() -> list[dict]:
 
 
 
+    cloud = _legacy_cloud_profile()
+
+
+
+
+
+
+
+
     try:
 
 
@@ -9602,7 +9964,16 @@ def load_users() -> list[dict]:
 
 
 
-            data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+            raw = USERS_FILE.read_text(encoding="utf-8")
+
+
+
+
+
+
+
+
+            data = json.loads(raw) if raw.strip() else []
 
 
 
@@ -9656,6 +10027,24 @@ def load_users() -> list[dict]:
 
 
 
+            if cloud and data != []:
+
+
+
+
+
+
+
+
+                raise json.JSONDecodeError("users.json is not a list of accounts", raw[:64], 0)
+
+
+
+
+
+
+
+
     except (OSError, json.JSONDecodeError):
 
 
@@ -9665,7 +10054,7 @@ def load_users() -> list[dict]:
 
 
 
-        pass
+        if cloud:
 
 
 
@@ -9674,7 +10063,43 @@ def load_users() -> list[dict]:
 
 
 
-    users = default_users()
+            # Never overwritten on the cloud: an unreadable store is left for the
+
+
+
+
+
+
+
+
+            # operator, and nobody signs in from it meanwhile (T-4 / Z6l).
+
+
+
+
+
+
+
+
+            structured_log("security.users_file_unreadable", level="critical", path=str(USERS_FILE))
+
+
+
+
+
+
+
+
+            return []
+
+
+
+
+
+
+
+
+    users = legacy_tombstone_users() if cloud else default_users()
 
 
 
@@ -9720,6 +10145,457 @@ def load_users() -> list[dict]:
 
 
     return users
+
+
+
+
+
+
+
+
+def retire_cloud_legacy_admins() -> dict:
+
+
+
+
+
+
+
+
+    """Linux 1.2.7.1 startup step (cloud/combined only; D-AUTHZ-2b, S-1/T-3):
+    every enabled ADMIN-CAPABLE legacy users.json account (administrator /
+    admin / support_admin / installer / super_admin) is disabled IN THE DATA, so
+    an image rollback cannot re-open the legacy password-only Admin Portal
+    sign-in. Before the first change users.json is copied byte-for-byte to
+    users.json.pre-1271 (mode 0600, never overwritten); the retired accounts'
+    legacy sessions are purged from sessions.json; one count-only audit row.
+    Idempotent. Non-administrator legacy accounts are left as they are and only
+    counted (configuration_issues reports them for owner review). Never deletes
+    an account."""
+    result = {"retired": 0, "sessions_purged": 0, "non_admin_enabled": 0, "backup": False}
+
+
+
+
+
+
+
+
+    if not _legacy_cloud_profile():
+
+
+
+
+
+
+
+
+        return result
+
+
+
+
+
+
+
+
+    from admin_auth_policy import auth_audit, legacy_user_is_admin_capable
+
+
+
+
+
+
+
+
+    try:
+
+
+
+
+
+
+
+
+        if not USERS_FILE.exists():
+
+
+
+
+
+
+
+
+            return result
+
+
+
+
+
+
+
+
+        raw = USERS_FILE.read_bytes()
+
+
+
+
+
+
+
+
+        data = json.loads(raw.decode("utf-8")) if raw.strip() else []
+
+
+
+
+
+
+
+
+    except (OSError, ValueError):
+
+
+
+
+
+
+
+
+        structured_log("security.users_file_unreadable", level="critical", path=str(USERS_FILE))
+
+
+
+
+
+
+
+
+        return result
+
+
+
+
+
+
+
+
+    if not isinstance(data, list):
+
+
+
+
+
+
+
+
+        return result
+
+
+
+
+
+
+
+
+    accounts = [item for item in data if isinstance(item, dict)]
+
+
+
+
+
+
+
+
+    targets = [item for item in accounts if item.get("enabled", True) and legacy_user_is_admin_capable(item)]
+
+
+
+
+
+
+
+
+    result["non_admin_enabled"] = sum(1 for item in accounts if item.get("enabled", True) and not legacy_user_is_admin_capable(item))
+
+
+
+
+
+
+
+
+    if targets:
+
+
+
+
+
+
+
+
+        backup = USERS_FILE.with_name(USERS_FILE.name + LEGACY_RETIRE_BACKUP_SUFFIX)
+
+
+
+
+
+
+
+
+        if not backup.exists():
+
+
+
+
+
+
+
+
+            descriptor = os.open(str(backup), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+
+
+
+
+
+
+
+            with os.fdopen(descriptor, "wb") as handle:
+
+
+
+
+
+
+
+
+                handle.write(raw)
+
+
+
+
+
+
+
+
+            try:
+
+
+
+
+
+
+
+
+                os.chmod(backup, 0o600)
+
+
+
+
+
+
+
+
+            except OSError:
+
+
+
+
+
+
+
+
+                pass
+
+
+
+
+
+
+
+
+            result["backup"] = True
+
+
+
+
+
+
+
+
+        now = datetime.now().isoformat()
+
+
+
+
+
+
+
+
+        retired_ids = set()
+
+
+
+
+
+
+
+
+        for item in targets:
+
+
+
+
+
+
+
+
+            item["enabled"] = False
+
+
+
+
+
+
+
+
+            item["retired_reason"] = "d_authz_2b_cloud"
+
+
+
+
+
+
+
+
+            item["retired_at"] = now
+
+
+
+
+
+
+
+
+            retired_ids.add(item.get("id"))
+
+
+
+
+
+
+
+
+        save_users(data)
+
+
+
+
+
+
+
+
+        sessions = load_sessions()
+
+
+
+
+
+
+
+
+        purge = [key for key, value in sessions.items() if isinstance(value, dict) and value.get("user_id") in retired_ids]
+
+
+
+
+
+
+
+
+        for key in purge:
+
+
+
+
+
+
+
+
+            sessions.pop(key, None)
+
+
+
+
+
+
+
+
+        if purge:
+
+
+
+
+
+
+
+
+            save_sessions(sessions)
+
+
+
+
+
+
+
+
+        result.update(retired=len(targets), sessions_purged=len(purge))
+
+
+
+
+
+
+
+
+        auth_audit("legacy_admins.retired", actor_role="system", reason="d_authz_2b_cloud", entity_type="users_json",
+
+
+
+
+
+
+
+
+                   details={"count": len(targets), "sessions_purged": len(purge), "non_admin_enabled": result["non_admin_enabled"]})
+
+
+
+
+
+
+
+
+    structured_log("security.legacy_admins_retired", retired=result["retired"], sessions_purged=result["sessions_purged"],
+
+
+
+
+
+
+
+
+                   non_admin_enabled=result["non_admin_enabled"], backup=result["backup"])
+
+
+
+
+
+
+
+
+    return result
 
 
 
@@ -10664,6 +11540,69 @@ def authenticated_user(request: Request) -> dict | None:
 
 
     )
+
+
+
+
+
+
+
+
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-1/S-4): on the cloud a legacy users.json
+
+
+
+
+
+
+
+
+    # session never carries administrator access -- even before the startup
+
+
+
+
+
+
+
+
+    # retirement step has disabled the account in the data.
+
+
+
+
+
+
+
+
+    if user and _legacy_cloud_profile():
+
+
+
+
+
+
+
+
+        from admin_auth_policy import legacy_user_is_admin_capable
+
+
+
+
+
+
+
+
+        if legacy_user_is_admin_capable(user):
+
+
+
+
+
+
+
+
+            return None
 
 
 
@@ -11781,6 +12720,25 @@ def configuration_issues() -> list[dict]:
     # valid=False / /ready 503 for a state that was never actually
     # broken).
     recommended_global = ["ANYAICAM_ADMIN_EMAIL", "ANYAICAM_ADMIN_PASSWORD", "ANYAICAM_PORTAL_SECRET"]
+    # Linux 1.2.7.1 (D-AUTHZ-2b, T-3a): on the cloud ANYAICAM_ADMIN_PASSWORD is
+    # never used (no legacy or bootstrap password administrator), but a
+    # pre-1.2.7.1 image would re-seed a password admin from it after a rollback
+    # with users.json missing -- so its PRESENCE is the warning there.
+    if _legacy_cloud_profile():
+        recommended_global = [key for key in recommended_global if key != "ANYAICAM_ADMIN_PASSWORD"]
+        if os.environ.get("ANYAICAM_ADMIN_PASSWORD", "").strip():
+            issues.append({"key": "ANYAICAM_ADMIN_PASSWORD", "severity": "warning",
+                           "message": "ANYAICAM_ADMIN_PASSWORD is set on the cloud. Remove it from the cloud environment: 1.2.7.1 never uses it, "
+                                      "and an older image would re-create a password-only administrator from it after a rollback."})
+        try:
+            _legacy_accounts = json.loads(USERS_FILE.read_text(encoding="utf-8")) if USERS_FILE.exists() else []
+            from admin_auth_policy import legacy_user_is_admin_capable as _admin_capable
+            _non_admin = sum(1 for item in _legacy_accounts if isinstance(item, dict) and item.get("enabled", True) and not _admin_capable(item))
+        except (OSError, ValueError, TypeError):
+            _non_admin = 0
+        if _non_admin:
+            issues.append({"key": "LEGACY_USERS", "severity": "warning",
+                           "message": f"{_non_admin} enabled legacy (users.json) non-administrator account(s) remain on the cloud; review them."})
     # ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD: bootstrap_admin()
     # (partner_db.py) already no-ops safely without them -- the app
     # doesn't crash, it simply skips auto-creating a Partner Portal
@@ -22737,6 +23695,201 @@ def process_stripe_webhook_event(event: dict) -> None:
 
 
 
+def _quarantine_unattributed(records: dict, kind: str) -> int:
+
+
+
+
+
+
+
+
+    """Linux 1.2.7.1 (D-AUTHZ-3): a subscription request / billing ticket with
+    no customer_id (written before tenant scoping: the shared 'anonymous'
+    identity, a legacy local admin, a cloud-administrator bridge id, or none)
+    cannot be attributed to a tenant. It is marked quarantined (with why and
+    when), hidden from every customer, still listed for administrators with
+    that flag, and never deleted. Idempotent; count-only audit."""
+    now = datetime.now().isoformat()
+
+
+
+
+
+
+
+
+    count = 0
+
+
+
+
+
+
+
+
+    for record in records.values():
+
+
+
+
+
+
+
+
+        if not isinstance(record, dict) or record.get("customer_id") or record.get("quarantined"):
+
+
+
+
+
+
+
+
+            continue
+
+
+
+
+
+
+
+
+        owner = str(record.get("user_id") or "")
+
+
+
+
+
+
+
+
+        reason = ("anonymous" if owner == "anonymous" else "cloud_administrator" if owner.startswith("cloud-administrator:")
+
+
+
+
+
+
+
+
+                  else "missing_owner" if not owner else "local_account")
+
+
+
+
+
+
+
+
+        record["quarantined"] = True
+
+
+
+
+
+
+
+
+        record["quarantine_reason"] = f"no_customer_id:{reason}"
+
+
+
+
+
+
+
+
+        record["quarantined_at"] = now
+
+
+
+
+
+
+
+
+        count += 1
+
+
+
+
+
+
+
+
+    if count:
+
+
+
+
+
+
+
+
+        structured_log("d_authz_3.quarantine", count=count, kind=kind)
+
+
+
+
+
+
+
+
+        try:
+
+
+
+
+
+
+
+
+            from admin_auth_policy import auth_audit
+
+
+
+
+
+
+
+
+            auth_audit("billing_rows.quarantined", actor_role="system", reason="d_authz_3", entity_type=kind, details={"count": count})
+
+
+
+
+
+
+
+
+        except Exception:
+
+
+
+
+
+
+
+
+            pass
+
+
+
+
+
+
+
+
+    return count
+
+
+
+
+
+
+
+
 def load_subscription_requests() -> dict:
 
 
@@ -22755,7 +23908,34 @@ def load_subscription_requests() -> dict:
 
 
 
-    return requests if isinstance(requests, dict) else {}
+    requests = requests if isinstance(requests, dict) else {}
+
+
+
+
+
+
+
+
+    if _quarantine_unattributed(requests, "subscription_requests"):
+
+
+
+
+
+
+
+
+        save_subscription_requests(requests)
+
+
+
+
+
+
+
+
+    return requests
 
 
 
@@ -22836,7 +24016,34 @@ def load_billing_support_tickets() -> dict:
 
 
 
-    return tickets if isinstance(tickets, dict) else {}
+    tickets = tickets if isinstance(tickets, dict) else {}
+
+
+
+
+
+
+
+
+    if _quarantine_unattributed(tickets, "billing_support_tickets"):
+
+
+
+
+
+
+
+
+        save_billing_support_tickets(tickets)
+
+
+
+
+
+
+
+
+    return tickets
 
 
 
@@ -22908,6 +24115,11 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+    """The legacy (users.json-era) billing account lookup, used by the legacy
+    administrator billing tools. 1.2.7.1 (D-AUTHZ-3): the shared 'primary'
+    account is never the fallback for anyone without manage_settings (it used
+    to answer an anonymous or customer caller), and an empty email matches
+    nothing. Customers use billing_account_for_principal()."""
     accounts = load_billing_accounts()
 
 
@@ -22926,6 +24138,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+    if user_email:
 
 
 
@@ -22934,17 +24147,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-
-    for account in accounts.values():
-
-
-
-
-
-
-
-
-        if str(account.get("billing_email") or "").strip().lower() == user_email:
+        for account in accounts.values():
 
 
 
@@ -22953,7 +24156,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-            return account
+            if str(account.get("billing_email") or "").strip().lower() == user_email:
 
 
 
@@ -22962,6 +24165,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+                return account
 
 
 
@@ -22970,8 +24174,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-
-    if "primary" in accounts:
+    if "primary" in accounts and user.get("enabled", True) and has_permission(user, "manage_settings"):
 
 
 
@@ -22989,7 +24192,16 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
+    return _unassigned_billing_account(user.get("display_name") or user.get("email") or "Customer", user.get("email") or "")
 
+
+
+
+
+
+
+
+def _unassigned_billing_account(name: str, email: str, customer_id: str = "") -> dict:
 
 
 
@@ -23016,7 +24228,7 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-        "customer_name": user.get("display_name") or user.get("email") or "Customer",
+        "customer_id": customer_id,
 
 
 
@@ -23025,7 +24237,16 @@ def billing_account_for_user(user: dict) -> dict:
 
 
 
-        "billing_email": user.get("email") or "",
+        "customer_name": name,
+
+
+
+
+
+
+
+
+        "billing_email": email,
 
 
 
@@ -23089,6 +24310,90 @@ def billing_account_for_user(user: dict) -> dict:
 
 
     }
+
+
+
+
+
+
+
+
+def billing_account_for_principal(principal: dict) -> dict:
+
+
+
+
+
+
+
+
+    """A customer's billing account: the account whose customer_id is this
+    tenant -- never matched by email and never 'primary'. An administrator
+    keeps the legacy lookup."""
+    if principal.get("kind") == "admin":
+
+
+
+
+
+
+
+
+        return billing_account_for_user(principal["user"])
+
+
+
+
+
+
+
+
+    customer_id = str(principal.get("customer_id") or "")
+
+
+
+
+
+
+
+
+    if customer_id:
+
+
+
+
+
+
+
+
+        for account in load_billing_accounts().values():
+
+
+
+
+
+
+
+
+            if isinstance(account, dict) and str(account.get("customer_id") or "") == customer_id:
+
+
+
+
+
+
+
+
+                return account
+
+
+
+
+
+
+
+
+    return _unassigned_billing_account(principal.get("display_name") or "Customer", principal.get("email") or "", customer_id)
 
 
 
@@ -23232,7 +24537,7 @@ def invoices_for_billing_account(account_id: str) -> list[dict]:
 
 
 
-def subscription_request_owner_matches(record: dict, user: dict) -> bool:
+CUSTOMER_BILLING_ROLES = frozenset({"customer_owner", "customer_viewer"})
 
 
 
@@ -23241,7 +24546,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-    return (
+def billing_principal(request: Request) -> dict:
 
 
 
@@ -23250,7 +24555,16 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-        record.get("user_id") == user.get("id")
+    """Linux 1.2.7.1 (D-AUTHZ-3): who is asking, for My subscription,
+    subscription requests, billing tickets and invoice downloads -- never the
+    legacy current_user() anonymous fallback and never manage_settings alone.
+      - customer: a Partner Portal customer_owner/customer_viewer session with
+        a customer_id (its tenant);
+      - admin: cloud_administrator_bridge() (a live global administrator grant;
+        MFA-verified on the cloud, via partner_portal._identity()); on an edge
+        appliance only, also a local legacy administrator (manage_settings).
+    Anyone else: 401 when signed out, 403 when signed in."""
+    from partner_portal import partner_identity
 
 
 
@@ -23259,7 +24573,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-        or has_permission(user, "manage_settings")
+    identity = partner_identity(request)
 
 
 
@@ -23268,7 +24582,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
-    )
+    if identity and identity.get("role") in CUSTOMER_BILLING_ROLES:
 
 
 
@@ -23277,6 +24591,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
+        if not identity.get("customer_id"):
 
 
 
@@ -23285,6 +24600,7 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
+            raise HTTPException(status_code=403, detail="A customer account is required.")
 
 
 
@@ -23293,45 +24609,528 @@ def subscription_request_owner_matches(record: dict, user: dict) -> bool:
 
 
 
+        email = str(identity.get("email") or "")
 
 
-def billing_ticket_owner_matches(record: dict, user: dict) -> bool:
 
 
 
 
 
 
+        return {"kind": "customer", "customer_id": str(identity["customer_id"]), "role": identity["role"],
 
 
-    return (
 
 
 
 
 
 
+                "user_id": str(identity.get("user_id") or email), "email": email, "display_name": email}
 
 
-        record.get("user_id") == user.get("id")
 
 
 
 
 
 
+    admin = cloud_administrator_bridge(request)
 
 
-        or has_permission(user, "manage_settings")
 
 
 
 
 
 
+    if admin:
 
 
-    )
+
+
+
+
+
+
+        return {"kind": "admin", "role": "administrator", "user_id": admin["id"], "email": admin["email"],
+
+
+
+
+
+
+
+
+                "display_name": admin["display_name"], "user": admin}
+
+
+
+
+
+
+
+
+    legacy = authenticated_user(request)
+
+
+
+
+
+
+
+
+    if legacy and not _legacy_cloud_profile() and legacy.get("enabled", True) and has_permission(legacy, "manage_settings"):
+
+
+
+
+
+
+
+
+        return {"kind": "admin", "role": str(legacy.get("role") or "administrator"), "user_id": str(legacy.get("id") or ""),
+
+
+
+
+
+
+
+
+                "email": str(legacy.get("email") or ""), "display_name": legacy.get("display_name") or legacy.get("email") or "", "user": legacy}
+
+
+
+
+
+
+
+
+    if identity or legacy:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=403, detail="A customer account is required.")
+
+
+
+
+
+
+
+
+    raise HTTPException(status_code=401, detail="Authentication required.")
+
+
+
+
+
+
+
+
+def _billing_row_in_tenant(record: dict, principal: dict) -> bool:
+
+
+
+
+
+
+
+
+    if principal.get("kind") == "admin":
+
+
+
+
+
+
+
+
+        return True
+
+
+
+
+
+
+
+
+    return (principal.get("kind") == "customer" and not record.get("quarantined")
+
+
+
+
+
+
+
+
+            and str(record.get("customer_id") or "") == str(principal.get("customer_id") or ""))
+
+
+
+
+
+
+
+
+def subscription_request_owner_matches(record: dict, principal: dict) -> bool:
+
+
+
+
+
+
+
+
+    return _billing_row_in_tenant(record, principal)
+
+
+
+
+
+
+
+
+def billing_ticket_owner_matches(record: dict, principal: dict) -> bool:
+
+
+
+
+
+
+
+
+    return _billing_row_in_tenant(record, principal)
+
+
+
+
+
+
+
+
+def _billing_write_customer(principal: dict, requested_customer_id: str) -> str:
+
+
+
+
+
+
+
+
+    """The tenant a new request/ticket belongs to: a customer owner's own
+    (viewers read only); an administrator must name an existing customer."""
+    if principal.get("kind") == "customer":
+
+
+
+
+
+
+
+
+        if principal.get("role") != "customer_owner":
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=403, detail="Only the account owner can submit billing requests.")
+
+
+
+
+
+
+
+
+        return str(principal["customer_id"])
+
+
+
+
+
+
+
+
+    customer_id = str(requested_customer_id or "").strip()
+
+
+
+
+
+
+
+
+    if not customer_id:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=400, detail="customer_id is required.")
+
+
+
+
+
+
+
+
+    from partner_db import connection as partner_connection
+
+
+
+
+
+
+
+
+    with partner_connection() as db:
+
+
+
+
+
+
+
+
+        if not db.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=404, detail="Customer not found.")
+
+
+
+
+
+
+
+
+    return customer_id
+
+
+
+
+
+
+
+
+def customer_usage_snapshot(customer_id: str) -> dict:
+
+
+
+
+
+
+
+
+    """D-AUTHZ-3 / U-A3-3: the customer's OWN usage only -- its cameras and its
+    registered mobile devices. No host-wide recording counts or bytes, storage
+    bucket/prefix, CDN, runtime role, environment or AI/upload worker state
+    (customer_cloud_usage_snapshot(), the administrator view, keeps those)."""
+    devices = 0
+
+
+
+
+
+
+
+
+    try:
+
+
+
+
+
+
+
+
+        from partner_db import connection as partner_connection
+
+
+
+
+
+
+
+
+        with partner_connection() as db:
+
+
+
+
+
+
+
+
+            devices = int(db.execute("SELECT COUNT(*) AS n FROM mobile_devices WHERE customer_id=? AND revoked_at IS NULL",
+
+
+
+
+
+
+
+
+                                     (customer_id,)).fetchone()["n"])
+
+
+
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+
+
+
+        devices = 0
+
+
+
+
+
+
+
+
+    return {"scope": "customer", "customer_id": customer_id, "configured_cameras": get_camera_count(customer_id=customer_id),
+
+
+
+
+
+
+
+
+            "registered_mobile_devices": devices}
+
+
+
+
+
+
+
+
+def customer_license_summary(customer_id: str) -> dict:
+
+
+
+
+
+
+
+
+    """The customer's own entitlement summary (never the host-wide legacy
+    license_enforcement_snapshot())."""
+    try:
+
+
+
+
+
+
+
+
+        import customer_entitlements
+
+
+
+
+
+
+
+
+        limit = int(customer_entitlements.usable_camera_capacity(customer_id))
+
+
+
+
+
+
+
+
+        in_service = int(customer_entitlements.cameras_in_service(customer_id))
+
+
+
+
+
+
+
+
+        plan = customer_entitlements.product_mode_for_customer(customer_id) or ""
+
+
+
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+
+
+
+        limit, in_service, plan = 0, 0, ""
+
+
+
+
+
+
+
+
+    return {"scope": "customer", "customer_id": customer_id, "plan": plan or "none", "status": "active" if limit > 0 else "inactive",
+
+
+
+
+
+
+
+
+            "camera_limit": limit, "current_camera_count": in_service, "operational": limit > 0 and in_service <= limit,
+
+
+
+
+
+
+
+
+            "in_grace_period": False}
 
 
 
@@ -40906,6 +42705,11 @@ async def lifespan(app: FastAPI):
 
 
     structured_log("startup.begin", web_concurrency=WEB_CONCURRENCY)
+    # Linux 1.2.7.1 (D-AUTHZ-2b): cloud/combined only, idempotent.
+    try:
+        retire_cloud_legacy_admins()
+    except Exception as error:
+        structured_log("security.retire_cloud_legacy_admins_failed", level="error", error=type(error).__name__)
 
 
 
@@ -43015,6 +44819,22 @@ PUBLIC_PATH_PREFIXES = (
 
 
 
+# Linux 1.2.7.1: the administrator namespace (GREEN-MFA-ACCEPTANCE-SPEC.md §1)
+# and the MFA enrollment surface inside it.
+ADMIN_NAMESPACE_PREFIXES = ("/api/admin/", "/api/operations/", "/operations", "/admin", "/api/platform-owner/",
+                            "/analytics-entitlements", "/billing-operations", "/license-management", "/subscription-admin")
+MFA_ENROLLMENT_PATHS = frozenset({"/api/platform-owner/mfa/status", "/api/platform-owner/mfa/enroll", "/api/platform-owner/mfa/confirm",
+                                  "/admin/mfa-setup"})
+
+
+def is_admin_namespace_path(path: str) -> bool:
+    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in ADMIN_NAMESPACE_PREFIXES)
+
+
+def is_mfa_enrollment_path(path: str) -> bool:
+    return path in MFA_ENROLLMENT_PATHS
+
+
 def _partner_must_change_password(identity: dict) -> bool:
     try:
         from partner_db import connection as _pw_connection
@@ -43114,6 +44934,53 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
+        # Linux 1.2.7.1 (D-AUTHZ-2b, S-4): on the cloud no legacy users.json session
+        # reaches the administrator namespace (admin-capable legacy accounts are
+        # already refused by authenticated_user(); this covers every other role).
+
+
+
+
+
+
+
+
+        if is_admin_namespace_path(path) and not is_mfa_enrollment_path(path) and _legacy_cloud_profile():
+
+
+
+
+
+
+
+
+            if path.startswith("/api/"):
+
+
+
+
+
+
+
+
+                return JSONResponse({"status": "error", "message": "Administrator access is required."}, status_code=403)
+
+
+
+
+
+
+
+
+            return HTMLResponse("Administrator access is required.", status_code=403)
+
+
+
+
+
+
+
+
         return await call_next(request)
 
     # The customer/partner portal uses its own signed session cookie.
@@ -43139,10 +45006,38 @@ async def authentication_middleware(request: Request, call_next):
         # the portal and could keep using the emailed/relayed password
         # indefinitely. Until it sets its own, page navigations go to
         # /change-password (APIs it needs to do that, and logout, stay open).
+        # Linux 1.2.7.1 (cloud; coordinator 2026-10-24, Green Z8d'/Z8f): the
+        # administrator namespace needs a LIVE global administrator grant on
+        # every request, checked here before any route or body validation --
+        # a revoked or partner-scoped administrator keeps only the routes open
+        # to partner roles. (MFA and the session version are enforced in
+        # partner_portal._identity() itself.)
+        if portal_identity.get("role") == "administrator" and is_admin_namespace_path(path) and not is_mfa_enrollment_path(path):
+            from admin_auth_policy import auth_audit, is_cloud_profile
+            if is_cloud_profile():
+                from appliance_identity import has_global_administrator_grant
+                from partner_db import connection as _grant_connection
+                with _grant_connection() as _grant_db:
+                    _live_global = has_global_administrator_grant(_grant_db, email=str(portal_identity.get("email") or ""))
+                if not _live_global:
+                    auth_audit("access.denied", actor_email=portal_identity.get("email"), actor_role="administrator",
+                               reason="admin_without_global_grant", entity_id=str(portal_identity.get("user_id") or ""))
+                    return JSONResponse({"status": "error", "message": "Global administrator grant required."}, status_code=403)
         if request.method == "GET" and not path.startswith(("/api/", "/static/")) and path not in {"/change-password", "/partner-logout", "/logout"}:
             if _partner_must_change_password(portal_identity):
                 return RedirectResponse("/change-password", status_code=303)
         return await call_next(request)
+
+    # Linux 1.2.7.1 (D-AUTHZ-2b, L-2a / RC-2): an MFA enrollment-only or
+    # break-glass re-enrollment session reaches the MFA enrollment surface
+    # (and sign-out, which is public) -- nothing else.
+    if is_mfa_enrollment_path(path):
+        try:
+            from partner_portal import partner_enrollment_identity
+            if partner_enrollment_identity(request):
+                return await call_next(request)
+        except Exception:
+            pass
 
 
 
@@ -43680,7 +45575,7 @@ def portal_destination_for_user(user: dict | None) -> str:
 PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
 
 
-def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None, partner_administrator_scope: str | None = None) -> dict:
+def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None, partner_administrator_scope: str | None = None, cloud_profile: bool = False) -> dict:
     """Pure decision for POST /api/portal-login -- the blue Portal login
     page's own selector (Administrator/Partner/Technician), added
     because this app's two independent identity systems (the legacy
@@ -43721,6 +45616,11 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
     the caller its real options without this function ever guessing on
     their behalf."""
     available: list[str] = []
+    # Linux 1.2.7.1 (D-AUTHZ-2b, L-3): the partner identity wins whenever both
+    # validate (its MFA rules apply), and on the cloud the legacy users.json
+    # administrator is never selectable at all.
+    if cloud_profile:
+        legacy_role = None
     if legacy_role in ADMIN_PORTAL_ROLES:
         available.append("administrator")
     if partner_role == "administrator" and "administrator" not in available:
@@ -43731,11 +45631,11 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
         available.append("technician")
 
     def _for_administrator() -> dict:
-        if legacy_role in ADMIN_PORTAL_ROLES:
-            return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
         if partner_role == "administrator":
             destination = "/admin-portal" if partner_administrator_scope == "global" else "/partner?tab=customers"
             return {"system": "partner", "role": "administrator", "destination": destination}
+        if legacy_role in ADMIN_PORTAL_ROLES:
+            return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
         return {"system": None, "role": None, "destination": None}
 
     from customer_policy import role_destination  # partner_db's own role vocabulary/destinations -- portal_destination_for_user() above answers the *legacy* system's, a different mapping
@@ -43764,8 +45664,8 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
     # once collapse into the *same* "administrator" bucket entry (they're
     # still two different sessions/destinations), so len(available)==1
     # alone isn't enough to prove there's only one real identity here.
-    administrator_ambiguous = bool(legacy_role in ADMIN_PORTAL_ROLES) and partner_role == "administrator"
-    if len(available) == 1 and not administrator_ambiguous:
+    # 1.2.7.1: no longer ambiguous -- the partner administrator wins (L-3).
+    if len(available) == 1:
         result = resolvers[available[0]]()
         result["available"] = available
         return result
@@ -45784,6 +47684,15 @@ def login_submit(
 
 
     user = next((item for item in users if item.get("email", "").strip().lower() == normalized_email), None)
+    # Linux 1.2.7.1 (D-AUTHZ-2b, L-5): on the cloud this local emergency sign-in
+    # never signs in an administrator-capable legacy account -- refused before
+    # any password check, with the ordinary generic answer (audited).
+    if user and _legacy_cloud_profile():
+        from admin_auth_policy import auth_audit, legacy_user_is_admin_capable
+        if legacy_user_is_admin_capable(user):
+            auth_audit("login.denied", actor_email=normalized_email, actor_role=str(user.get("role") or ""), reason="legacy_admin_on_cloud",
+                       entity_type="legacy_user", entity_id=str(user.get("id") or ""))
+            return HTMLResponse(login_page_html("Invalid email or password.", next_url), status_code=401)
 
 
 
@@ -46703,10 +48612,18 @@ def portal_login_submit(request: Request, payload: dict):
     if login_blocked(email):
         raise HTTPException(status_code=429, detail="Account is temporarily locked after repeated sign-in failures. Try again later or reset your password.")
 
+    # Linux 1.2.7.1 (D-AUTHZ-2b): on the cloud profile the legacy users.json
+    # administrator is never checked here (L-3/L-4) -- only noted, so a
+    # legacy-only administrator gets the generic refusal and an audit row.
+    cloud = _legacy_cloud_profile()
     users = load_users()
     legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
     legacy_role: str | None = None
-    if legacy_user and legacy_user.get("enabled", True) and verify_password(password, legacy_user.get("password_hash", "")):
+    legacy_admin_on_cloud = False
+    if cloud:
+        from admin_auth_policy import legacy_user_is_admin_capable
+        legacy_admin_on_cloud = bool(legacy_user and legacy_user_is_admin_capable(legacy_user))
+    elif legacy_user and legacy_user.get("enabled", True) and verify_password(password, legacy_user.get("password_hash", "")):
         candidate_role = str(legacy_user.get("role") or "").strip().lower()
         if candidate_role in ADMIN_PORTAL_ROLES:
             legacy_role = candidate_role
@@ -46806,11 +48723,33 @@ def portal_login_submit(request: Request, payload: dict):
     # login() below still correctly reports this as "no selection made"
     # rather than silently guessing.
 
-    decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role, partner_administrator_scope=partner_administrator_scope)
+    # Linux 1.2.7.1 (coordinator 2026-10-24, Green Z8d'): on the cloud an
+    # administrator sign-in needs a LIVE administrator grant (global, or
+    # partner-scoped for the Partner Portal) -- partner_users.role stays
+    # 'administrator' after a revoke. Generic refusal, sanitized audit.
+    if cloud and partner_role == "administrator":
+        from admin_auth_policy import auth_audit
+        from appliance_identity import live_administrator_grant_scope
+        from partner_db import connection as _scope_db_connection
+        with _scope_db_connection() as _scope_db:
+            _live_scope = live_administrator_grant_scope(_scope_db, user_id=str((partner_user or {}).get("id") or ""))
+        if _live_scope is None:
+            record_login_failure(email)
+            auth_audit("login.denied", actor_email=email, actor_role="administrator", reason="admin_without_grant",
+                       entity_id=str((partner_user or {}).get("id") or ""))
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        partner_administrator_scope = _live_scope
+
+    decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role, partner_administrator_scope=partner_administrator_scope,
+                                    cloud_profile=cloud)
 
     if not decision["system"]:
         if not legacy_role and not partner_role:
             record_login_failure(email)
+            if legacy_admin_on_cloud:
+                from admin_auth_policy import auth_audit
+                auth_audit("login.denied", actor_email=email, actor_role=str(legacy_user.get("role") or ""), reason="legacy_admin_on_cloud",
+                           entity_type="legacy_user", entity_id=str(legacy_user.get("id") or ""))
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         labels = {"administrator": "Administrator", "partner": "Partner", "technician": "Technician"}
         options = ", ".join(labels[key] for key in decision["available"])
@@ -46820,7 +48759,11 @@ def portal_login_submit(request: Request, payload: dict):
             detail = f"This email has more than one portal available ({options}). Choose one from the Portal selector."
         raise HTTPException(status_code=403, detail=detail)
 
-    clear_login_failures(email)
+    # L-10 (1.2.7.1): on the cloud an administrator's failed sign-ins are only
+    # cleared once the MFA step succeeds (platform_owner mfa/verify), so wrong
+    # codes count toward the same lockout as wrong passwords.
+    if not (cloud and decision["role"] == "administrator"):
+        clear_login_failures(email)
 
     if decision["system"] == "legacy":
         legacy_user["failed_login_attempts"] = 0
@@ -46843,12 +48786,19 @@ def portal_login_submit(request: Request, payload: dict):
     # PLATFORM_OWNER_MFA_HOOK (2026-09-23): password (and, if delegated,
     # cloud-assertion) verification above already fully decided this is
     # a real, live scope_type='global' administrator login destined for
-    # /admin-portal -- see platform_owner.py's own module docstring for
-    # why this is the ONLY branch this hook can ever apply to. Every
-    # other login (every partner/technician/customer role, and every
-    # administrator login that ISN'T a global grant) is completely
-    # unaffected -- this whole block is skipped for them, exactly as
-    # before this hook existed.
+    # /admin-portal -- see platform_owner.py's own module docstring.
+    # Linux 1.2.7.1 (D-AUTHZ-2b): on the cloud profile EVERY administrator
+    # sign-in (any scope) continues only through begin_admin_login() -- an
+    # MFA challenge when enrolled, an enrollment-only session when not --
+    # never a full administrator session without MFA. On an edge appliance the
+    # original hook (an enrolled global administrator verifies a code) stays.
+    destination = "/change-password" if partner_user and partner_user.get("must_change_password") else decision["destination"]
+    if cloud and decision["role"] == "administrator":
+        if not partner_user or not partner_user.get("id"):
+            record_login_failure(email)
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        from platform_owner import begin_admin_login
+        return begin_admin_login(request, user=partner_user, email=email, role="administrator", destination=destination)
     if decision["system"] == "partner" and decision["destination"] == "/admin-portal" and partner_user and partner_user.get("id"):
         from partner_db import connection as _pdb_connection
         with _pdb_connection() as _mfa_db:
@@ -46865,10 +48815,10 @@ def portal_login_submit(request: Request, payload: dict):
 
     # Same rule as POST /api/partner-login: an account still on its temporary
     # (invited / partner-issued) password must choose its own first.
-    destination = "/change-password" if partner_user and partner_user.get("must_change_password") else decision["destination"]
     return establish_partner_session(
         destination, request=request, email=email, role=decision["role"], user=partner_user,
         authorization_version_at_login=partner_authorization_version,
+        auth_source="cloud_assertion" if own_appliance else "password",
     )
 
 
@@ -46977,9 +48927,12 @@ def perform_logout(request: Request):
 
 
 
-    from partner_portal import partner_identity, SESSION_COOKIE as PARTNER_SESSION_COOKIE
+    from partner_portal import _raw_identity, SESSION_COOKIE as PARTNER_SESSION_COOKIE
+    # 1.2.7.1: the signed cookie's own claims -- a session that no longer
+    # authorizes anything (an MFA enrollment session, a stale version) is
+    # still revoked by its holder's sign-out.
     try:
-        portal_identity = partner_identity(request)
+        portal_identity = _raw_identity(request)
     except Exception:
         portal_identity = None
     if portal_identity and portal_identity.get("session_id"):
@@ -103371,7 +105324,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
 
 
 
@@ -103380,7 +105333,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    account = billing_account_for_user(user)
+    account = billing_account_for_principal(principal)
 
 
 
@@ -103389,7 +105342,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    license_data = license_enforcement_snapshot()
+    if principal["kind"] == "customer":
 
 
 
@@ -103398,7 +105351,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    invoices = invoices_for_billing_account(str(account.get("id") or ""))
+        license_data = customer_license_summary(principal["customer_id"])
 
 
 
@@ -103407,7 +105360,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    requests = [
+        usage = customer_usage_snapshot(principal["customer_id"])
 
 
 
@@ -103416,7 +105369,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        item
+    else:
 
 
 
@@ -103425,7 +105378,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        for item in load_subscription_requests().values()
+        license_data = license_enforcement_snapshot()
 
 
 
@@ -103434,7 +105387,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        if subscription_request_owner_matches(item, user)
+        usage = customer_cloud_usage_snapshot(principal["user"])
 
 
 
@@ -103443,7 +105396,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    ]
+    account_id = str(account.get("id") or "")
 
 
 
@@ -103452,7 +105405,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-    tickets = [
+    invoices = invoices_for_billing_account(account_id) if account_id and account_id != "unassigned" else []
 
 
 
@@ -103461,7 +105414,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        item
+    requests = [item for item in load_subscription_requests().values() if isinstance(item, dict) and subscription_request_owner_matches(item, principal)]
 
 
 
@@ -103470,25 +105423,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        for item in load_billing_support_tickets().values()
-
-
-
-
-
-
-
-
-        if billing_ticket_owner_matches(item, user)
-
-
-
-
-
-
-
-
-    ]
+    tickets = [item for item in load_billing_support_tickets().values() if isinstance(item, dict) and billing_ticket_owner_matches(item, principal)]
 
 
 
@@ -103569,7 +105504,7 @@ def subscription_portal_api(request: Request) -> dict:
 
 
 
-        "usage": customer_cloud_usage_snapshot(user),
+        "usage": usage,
 
 
 
@@ -103650,7 +105585,16 @@ def create_subscription_request(
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
+
+
+
+
+
+
+
+
+    customer_id = _billing_write_customer(principal, payload.customer_id)
 
 
 
@@ -103758,15 +105702,6 @@ def create_subscription_request(
 
 
 
-
-
-
-
-
-
-
-
-
     request_id = uuid.uuid4().hex
 
 
@@ -103803,7 +105738,7 @@ def create_subscription_request(
 
 
 
-        "user_id": user.get("id"),
+        "customer_id": customer_id,
 
 
 
@@ -103812,7 +105747,7 @@ def create_subscription_request(
 
 
 
-        "user_name": user.get("display_name") or user.get("email"),
+        "created_by_user_id": principal["user_id"],
 
 
 
@@ -103821,7 +105756,34 @@ def create_subscription_request(
 
 
 
-        "user_email": user.get("email"),
+        "created_by_role": principal["role"],
+
+
+
+
+
+
+
+
+        "user_id": principal["user_id"],
+
+
+
+
+
+
+
+
+        "user_name": principal["display_name"] or principal["email"],
+
+
+
+
+
+
+
+
+        "user_email": principal["email"],
 
 
 
@@ -103974,7 +105936,16 @@ def create_subscription_request(
 
 
 
-        user_id=user.get("id"),
+        customer_id=customer_id,
+
+
+
+
+
+
+
+
+        created_by_role=principal["role"],
 
 
 
@@ -104109,52 +106080,7 @@ def update_subscription_request(
 
 
 
-    user = current_user(request)
-
-
-
-
-
-
-
-
-    if not has_permission(user, "manage_settings"):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="Settings permission is required.")
-
-
-
-
-
-
-
-
-    if payload.status not in {"pending", "approved", "declined", "completed"}:
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=400, detail="Invalid request status.")
-
-
-
-
-
-
-
-
-
+    principal = billing_principal(request)
 
 
 
@@ -104173,6 +106099,69 @@ def update_subscription_request(
 
 
     record = records.get(request_id)
+
+
+
+
+
+
+
+
+    if principal["kind"] != "admin":
+
+
+
+
+
+
+
+
+        # D-AUTHZ-3 (Z4i): customers never update; outside the tenant it does not exist.
+
+
+
+
+
+
+
+
+        if isinstance(record, dict) and subscription_request_owner_matches(record, principal):
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=403, detail="Only AnyAiCam administrators can update a subscription request.")
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=404, detail="Subscription request not found.")
+
+
+
+
+
+
+
+
+    if payload.status not in {"pending", "approved", "declined", "completed"}:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=400, detail="Invalid request status.")
 
 
 
@@ -104226,7 +106215,7 @@ def update_subscription_request(
 
 
 
-    record["updated_by"] = user.get("id")
+    record["updated_by"] = principal["user_id"]
 
 
 
@@ -104361,7 +106350,16 @@ def create_billing_support_ticket(
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
+
+
+
+
+
+
+
+
+    customer_id = _billing_write_customer(principal, payload.customer_id)
 
 
 
@@ -104406,15 +106404,6 @@ def create_billing_support_ticket(
 
 
 
-
-
-
-
-
-
-
-
-
     ticket_id = uuid.uuid4().hex
 
 
@@ -104451,7 +106440,7 @@ def create_billing_support_ticket(
 
 
 
-        "user_id": user.get("id"),
+        "customer_id": customer_id,
 
 
 
@@ -104460,7 +106449,7 @@ def create_billing_support_ticket(
 
 
 
-        "user_name": user.get("display_name") or user.get("email"),
+        "created_by_user_id": principal["user_id"],
 
 
 
@@ -104469,7 +106458,34 @@ def create_billing_support_ticket(
 
 
 
-        "user_email": user.get("email"),
+        "created_by_role": principal["role"],
+
+
+
+
+
+
+
+
+        "user_id": principal["user_id"],
+
+
+
+
+
+
+
+
+        "user_name": principal["display_name"] or principal["email"],
+
+
+
+
+
+
+
+
+        "user_email": principal["email"],
 
 
 
@@ -104694,52 +106710,7 @@ def update_billing_support_ticket(
 
 
 
-    user = current_user(request)
-
-
-
-
-
-
-
-
-    if not has_permission(user, "manage_settings"):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="Settings permission is required.")
-
-
-
-
-
-
-
-
-    if payload.status not in {"open", "in_progress", "resolved", "closed"}:
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=400, detail="Invalid ticket status.")
-
-
-
-
-
-
-
-
-
+    principal = billing_principal(request)
 
 
 
@@ -104758,6 +106729,60 @@ def update_billing_support_ticket(
 
 
     ticket = tickets.get(ticket_id)
+
+
+
+
+
+
+
+
+    if principal["kind"] != "admin":
+
+
+
+
+
+
+
+
+        if isinstance(ticket, dict) and billing_ticket_owner_matches(ticket, principal):
+
+
+
+
+
+
+
+
+            raise HTTPException(status_code=403, detail="Only AnyAiCam administrators can update a billing ticket.")
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=404, detail="Billing support ticket not found.")
+
+
+
+
+
+
+
+
+    if payload.status not in {"open", "in_progress", "resolved", "closed"}:
+
+
+
+
+
+
+
+
+        raise HTTPException(status_code=400, detail="Invalid ticket status.")
 
 
 
@@ -104811,7 +106836,7 @@ def update_billing_support_ticket(
 
 
 
-    ticket["updated_by"] = user.get("id")
+    ticket["updated_by"] = principal["user_id"]
 
 
 
@@ -104919,7 +106944,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    user = current_user(request)
+    principal = billing_principal(request)
 
 
 
@@ -104955,7 +106980,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    account = billing_account_for_user(user)
+    if principal["kind"] != "admin":
 
 
 
@@ -104964,7 +106989,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    if (
+        # D-AUTHZ-3: only an invoice of this tenant's own billing account.
 
 
 
@@ -104973,7 +106998,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-        invoice.get("account_id") != account.get("id")
+        account_id = str(billing_account_for_principal(principal).get("id") or "")
 
 
 
@@ -104982,7 +107007,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-        and not has_permission(user, "manage_settings")
+        if account_id in ("", "unassigned") or invoice.get("account_id") != account_id:
 
 
 
@@ -104991,16 +107016,7 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
-    ):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="You cannot access this invoice.")
+            raise HTTPException(status_code=404, detail="Invoice not found.")
 
 
 
@@ -106855,8 +108871,43 @@ else{status.textContent='Two-factor authentication is off. Turn it on to require
 catch(error){status.textContent=error.status===403?'Two-factor authentication applies to platform administrator accounts signed in through the Administrator portal.':'Two-factor status is unavailable right now.';$('admin-mfa-enable').hidden=true;$('admin-mfa-regenerate').hidden=true}};
 $('admin-mfa-enable').onclick=async()=>{feedback.textContent='';try{const data=await call('/api/platform-owner/mfa/enroll','POST');$('admin-mfa-secret').textContent=data.secret_base32;$('admin-mfa-uri').href=data.provisioning_uri;$('admin-mfa-setup').hidden=false;$('admin-mfa-enable').hidden=true;$('admin-mfa-code').focus()}catch(error){feedback.textContent=error.message}};
 $('admin-mfa-confirm-form').onsubmit=async event=>{event.preventDefault();feedback.textContent='';try{const data=await call('/api/platform-owner/mfa/confirm','POST',{code:$('admin-mfa-code').value.trim()});$('admin-mfa-secret').textContent='';showCodes(data.recovery_codes);feedback.textContent=data.message;await refresh()}catch(error){feedback.textContent=error.message}};
-$('admin-mfa-regenerate').onclick=async()=>{if(!confirm('Replace your recovery codes? The old ones stop working.'))return;feedback.textContent='';try{const data=await call('/api/platform-owner/recovery-codes/regenerate','POST');showCodes(data.recovery_codes);feedback.textContent='New recovery codes created. The old ones no longer work.';await refresh()}catch(error){feedback.textContent=error.message}};
+$('admin-mfa-regenerate').onclick=async()=>{if(!confirm('Replace your recovery codes? The old ones stop working.'))return;const current=prompt('Enter a current 6-digit code from your authenticator app.');if(!current)return;feedback.textContent='';try{const data=await call('/api/platform-owner/recovery-codes/regenerate','POST',{current_code:current.trim()});showCodes(data.recovery_codes);feedback.textContent='New recovery codes created. The old ones no longer work.';await refresh()}catch(error){feedback.textContent=error.message}};
 refresh()})();</script>"""
+
+
+ADMIN_MFA_SETUP_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set up two-factor authentication</title><style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#10203a}
+code,pre{background:#f1f4f9;padding:6px;border-radius:6px;word-break:break-all;user-select:all}button{padding:8px 14px}label{display:block;margin:12px 0}</style></head>
+<body><h1>Set up two-factor authentication</h1>
+<p>Administrator access to AnyAiCam requires a code from an authenticator app (Google Authenticator, 1Password, Authy...). This page only sets that up; sign in again afterwards.</p>
+<div id="mfa-start"><button type="button" id="mfa-enroll">Create my authenticator key</button></div>
+<div id="mfa-setup" hidden><p>Add this key to your authenticator app, then enter the 6-digit code it shows.</p><p><code id="mfa-secret"></code></p>
+<p><a id="mfa-uri" href="#">Open in authenticator app</a></p><form id="mfa-confirm"><label>Code <input id="mfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></label><button>Confirm</button></form></div>
+<div id="mfa-done" hidden><p><strong>Recovery codes (shown once).</strong> Each works once if you lose your authenticator. Store them somewhere safe.</p><pre id="mfa-codes"></pre>
+<p><a href="/partner.html">Sign in again with your code</a></p></div>
+<p role="status" id="mfa-feedback"></p>
+<form method="post" action="/logout"><button type="submit">Sign out</button></form>
+<script>(()=>{const $=id=>document.getElementById(id),feedback=$('mfa-feedback');
+const csrf=()=>{const c=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));return c?decodeURIComponent(c.substring(14)):''};
+const call=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify(body||{})});let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.detail||'Request failed.');return d};
+$('mfa-enroll').onclick=async()=>{feedback.textContent='';try{const d=await call('/api/platform-owner/mfa/enroll');$('mfa-secret').textContent=d.secret_base32;$('mfa-uri').href=d.provisioning_uri;$('mfa-start').hidden=true;$('mfa-setup').hidden=false;$('mfa-code').focus()}catch(e){feedback.textContent=e.message}};
+$('mfa-confirm').onsubmit=async e=>{e.preventDefault();feedback.textContent='';try{const d=await call('/api/platform-owner/mfa/confirm',{code:$('mfa-code').value.trim()});$('mfa-secret').textContent='';$('mfa-setup').hidden=true;$('mfa-codes').textContent=(d.recovery_codes||[]).join('\\n');$('mfa-done').hidden=false;feedback.textContent=d.message||''}catch(err){feedback.textContent=err.message}};
+})();</script></body></html>"""
+
+
+@app.get("/admin/mfa-setup", response_class=HTMLResponse)
+def admin_mfa_setup_page(request: Request):
+    """Linux 1.2.7.1 (D-AUTHZ-2b, L-2a / RC-2): where an un-enrolled
+    administrator's enrollment-only session (and a break-glass re-enrollment
+    session) lands. It only calls the MFA enroll/confirm routes; after
+    confirming, the administrator signs in again -- now with a code."""
+    from partner_portal import partner_enrollment_identity, partner_identity
+    identity = partner_enrollment_identity(request) or partner_identity(request)
+    if not identity or identity.get("role") != "administrator":
+        return RedirectResponse("/partner.html", status_code=303)
+    response = HTMLResponse(ADMIN_MFA_SETUP_PAGE)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/admin-portal", response_class=HTMLResponse)
