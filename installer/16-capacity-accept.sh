@@ -59,6 +59,9 @@ install_capacity_accept_step() {
     # shellcheck source=../appliance-agent/scripts/lib-capacity-accept.sh
     source "$AGENT_PAYLOAD_DIR/scripts/lib-capacity-accept.sh"
     install_capacity_accept "$AGENT_PAYLOAD_DIR/system"
+    # TRUST-1 (1.2.7.1): step 13 installed the registry and its protected
+    # state; record the signer and trust generation in the accepted state.
+    migrate_capacity_trust_state || return 1
     # Existing activations are pinned before downtime. A fresh installation
     # creates its appliance ID later, then calls this again after identity setup.
     if [[ -e "$IDENTITY_FILE" ]]; then

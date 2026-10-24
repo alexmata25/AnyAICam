@@ -61,7 +61,8 @@ _UNSET = object()
 
 
 def release_files(version: str, build_id: str, *, app_files: dict | None = None, migrations: str = MIGRATIONS_V1,
-                  entitlement_keyset: bytes | None = None, entitlement_keyset_sha256=_UNSET) -> dict:
+                  entitlement_keyset: bytes | None = None, entitlement_keyset_sha256=_UNSET,
+                  entitlement_registry: bytes | None = None, entitlement_registry_sha256=_UNSET) -> dict:
     """{relative path: bytes} for an installer release package. With
     entitlement_keyset, the package carries the entitlement PUBLIC keyset and
     release.env names its SHA-256 (or entitlement_keyset_sha256, to test a
@@ -94,6 +95,13 @@ def release_files(version: str, build_id: str, *, app_files: dict | None = None,
         named = (hashlib.sha256(entitlement_keyset).hexdigest() if entitlement_keyset_sha256 is _UNSET
                  else entitlement_keyset_sha256)
         files["release.env"] += f"ENTITLEMENT_SIGNING_KEYS_SHA256={named}\n".encode()
+    # TRUST-1 (1.2.7.1): the protected entitlement trust registry, named in release.env like the keyset.
+    if entitlement_registry is not None or entitlement_registry_sha256 is not _UNSET:
+        if entitlement_registry is not None:
+            files["payload/keys/entitlement-trust-registry.json"] = entitlement_registry
+        named = (hashlib.sha256(entitlement_registry).hexdigest() if entitlement_registry_sha256 is _UNSET
+                 else entitlement_registry_sha256)
+        files["release.env"] += f"ENTITLEMENT_TRUST_REGISTRY_SHA256={named}\n".encode()
     for relative, data in (app_files or {}).items():
         files[f"payload/vms/app/{relative}"] = data if isinstance(data, bytes) else data.encode()
     listing = [{"path": path, "sha256": hashlib.sha256(data).hexdigest(), "mode": "0o644", "size": len(data)}

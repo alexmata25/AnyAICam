@@ -50,14 +50,18 @@ def signed_snapshot(state, *, quantity=5, issued=None, expires=None, changes=Non
                                    "value": base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")}}
 
 
-def accept(state, snapshot, *, keyset=None):
+def accept(state, snapshot, *, keyset=None, registry=None, trust_state=None, now=None):
+    """registry=/trust_state= are the TRUST-1 seams (None = read the files under the test root, absent = legacy)."""
     paths = state["paths"]
     paths["staging.json"].write_text(json.dumps(snapshot), encoding="utf-8")
     return windows_accept._accept_from_paths(
         {"root": paths["root"], "staging": paths["staging.json"], "identity": paths["identity.json"],
-         "trust": paths["keys.json"], "accepted": paths["accepted.json"]},
-        keyset=keyset or state["keyset"], acl_problem=lambda *_args, **_kwargs: "",
-        verifier=windows_accept._verify_ed25519, now=state["now"])
+         "trust": paths["keys.json"], "accepted": paths["accepted.json"],
+         "registry": paths["root"] / "entitlement_trust_registry.json",
+         "trust_state": paths["root"] / "entitlement_trust_state.json"},
+        keyset=keyset or (None if registry is not None else state["keyset"]), registry=registry,
+        trust_state=trust_state, acl_problem=lambda *_args, **_kwargs: "",
+        verifier=windows_accept._verify_ed25519, now=now or state["now"])
 
 
 def test_accepts_valid_cloud_signed_camera_capacity_and_enforces_bound_identity(acceptance):
@@ -190,3 +194,95 @@ def test_the_installer_ships_the_acceptance_helper_and_its_policy_core():
     for name in ("capacity_accept.py", "capacity_accept_windows.py"):
         source = bs.join(["..", "..", "appliance-agent", "system", name])
         assert f'Source: "{source}"; DestDir: "{{app}}{bs}agent{bs}system"' in iss
+
+
+# ------------------------------------------------------------------------------ TRUST-1 + G2 parity (1.2.7.1)
+import capacity_accept as policy  # noqa: E402  (the shared Linux policy core the Windows helper delegates to)
+
+
+def windows_registry(state, entries, generation):
+    keys = {}
+    for key_id, (public_b64, lifecycle) in entries.items():
+        keys[key_id] = {"public_key": public_b64, "state": lifecycle,
+                        "purposes": ["analytics", "capacity", "features", "local_access"],
+                        "environment": "production", "changed_generation": 1}
+    return {"type": "anyaicam.entitlement_trust_registry", "version": 1, "environment": "production",
+            "generation": generation, "issued_at": state["now"].isoformat(), "keys": keys}
+
+
+def second_key():
+    private = Ed25519PrivateKey.generate()
+    return private, base64.b64encode(private.public_key().public_bytes(serialization.Encoding.Raw,
+                                                                     serialization.PublicFormat.Raw)).decode("ascii")
+
+
+def resign(private, snapshot, key_id):
+    body = {k: v for k, v in snapshot.items() if k != "signature"}
+    signature = private.sign(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return {**body, "signature": {"alg": "Ed25519", "key_id": key_id,
+                                   "value": base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")}}
+
+
+def test_windows_acceptor_records_signer_and_ratchets_the_trust_state(acceptance):
+    current = acceptance["keyset"]["keys"]["test-key"]
+    registry = windows_registry(acceptance, {"test-key": (current, "active")}, 1)
+    assert accept(acceptance, signed_snapshot(acceptance, quantity=3), registry=registry) == "accepted"
+    saved = json.loads(acceptance["paths"]["accepted.json"].read_text(encoding="utf-8"))
+    assert saved["signer"]["key_id"] == "test-key" and saved["trust_generation"] == 1
+    trust_state = json.loads((acceptance["paths"]["root"] / "entitlement_trust_state.json").read_text())
+    assert trust_state["generation"] == 1 and "test-key" in trust_state["key_bindings"]
+
+
+def test_windows_rotation_retired_keeps_state_refuses_new_old_key_grants_accepts_new_key(acceptance):
+    current = acceptance["keyset"]["keys"]["test-key"]
+    assert accept(acceptance, signed_snapshot(acceptance, quantity=3),
+                  registry=windows_registry(acceptance, {"test-key": (current, "active")}, 1)) == "accepted"
+    private2, public2 = second_key()
+    rotated = windows_registry(acceptance, {"test-key": (current, "retired"), "next-key": (public2, "active")}, 2)
+    later = acceptance["now"] + timedelta(minutes=1)
+    with pytest.raises(windows_accept.Reject, match="retired_cannot_sign"):
+        accept(acceptance, signed_snapshot(acceptance, quantity=9, issued=later), registry=rotated, now=later)
+    newer = resign(private2, signed_snapshot(acceptance, quantity=5, issued=later), "next-key")
+    assert accept(acceptance, newer, registry=rotated, now=later) == "accepted"
+    saved = json.loads(acceptance["paths"]["accepted.json"].read_text(encoding="utf-8"))
+    assert (saved["signer"]["key_id"], saved["snapshot"]["camera_capacity"]["camera_slot_quantity"]) == ("next-key", 5)
+
+
+def test_windows_revoked_or_rolled_back_registry_never_trusts_new_grants(acceptance):
+    current = acceptance["keyset"]["keys"]["test-key"]
+    private2, public2 = second_key()
+    gen1 = windows_registry(acceptance, {"test-key": (current, "active")}, 1)
+    assert accept(acceptance, signed_snapshot(acceptance, quantity=3), registry=gen1) == "accepted"
+    gen2 = windows_registry(acceptance, {"test-key": (current, "revoked"), "next-key": (public2, "active")}, 2)
+    later = acceptance["now"] + timedelta(minutes=1)
+    with pytest.raises(windows_accept.Reject, match="revoked"):
+        accept(acceptance, signed_snapshot(acceptance, quantity=9, issued=later), registry=gen2, now=later)
+    with pytest.raises(windows_accept.Reject, match="registry_rollback"):  # state is now generation 2
+        accept(acceptance, signed_snapshot(acceptance, quantity=9, issued=later), registry=gen1, now=later)
+    with pytest.raises(windows_accept.Reject, match="registry_rollback"):  # registry deleted after generation 1
+        accept(acceptance, signed_snapshot(acceptance, quantity=9, issued=later), now=later)
+    saved = json.loads(acceptance["paths"]["accepted.json"].read_text(encoding="utf-8"))
+    assert saved["snapshot"]["camera_capacity"]["camera_slot_quantity"] == 3
+
+
+def test_windows_clock_rollback_does_not_block_and_a_future_new_grant_never_overwrites(acceptance):
+    """G2 parity: a clock behind the accepted grant is not a reason to refuse the accepted state; the new grant that
+    looks 'future' is refused and the last-known-good stays."""
+    assert accept(acceptance, signed_snapshot(acceptance, quantity=3)) == "accepted"
+    behind = acceptance["now"] - timedelta(days=30)
+    with pytest.raises(windows_accept.Reject, match="issued_in_future"):
+        accept(acceptance, signed_snapshot(acceptance, quantity=9, issued=acceptance["now"] + timedelta(minutes=1)),
+               now=behind)
+    saved = json.loads(acceptance["paths"]["accepted.json"].read_text(encoding="utf-8"))
+    assert saved["snapshot"]["camera_capacity"]["camera_slot_quantity"] == 3
+    policy._validate_state(saved, policy.TrustContext(policy.legacy_trust_registry(acceptance["keyset"]["keys"]), None),
+                           now=behind, verifier=windows_accept._verify_ed25519)
+
+
+def test_windows_paths_include_the_registry_and_trust_state(monkeypatch):
+    real_os = __import__("os")
+    monkeypatch.setattr(windows_accept, "os", types.SimpleNamespace(name="nt", path=real_os.path))
+    paths = windows_accept._paths()
+    assert paths["registry"].name == "entitlement_trust_registry.json"
+    assert paths["trust_state"].name == "entitlement_trust_state.json"
+    assert paths["registry"].parent == paths["trust"].parent == paths["accepted"].parent

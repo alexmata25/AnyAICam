@@ -103,19 +103,39 @@ class CapacityAcceptancePolicyTests(unittest.TestCase):
         same, outcome = _advance(snapshot, self.keys, IDENTITY, accepted, now=NOW, verifier=self.verify)
         self.assertEqual((same, outcome), (accepted, "unchanged"))
 
-    def test_accepted_key_survives_cloud_key_retirement(self):
+    def _registry(self, entries, generation):
+        keys = {key_id: {"public_key": base64.b64encode(raw).decode(), "state": state,
+                         "purposes": ["analytics", "capacity", "features", "local_access"],
+                         "environment": "production", "changed_generation": 1}
+                for key_id, (raw, state) in entries.items()}
+        return {"type": "anyaicam.entitlement_trust_registry", "version": 1, "environment": "production",
+                "generation": generation, "issued_at": NOW.isoformat(), "keys": keys}
+
+    def test_accepted_state_survives_retirement_but_not_removal_or_revocation(self):
+        """TRUST-1 (inverts b8's test_accepted_key_survives_cloud_key_retirement): RETIRED is verify-only and keeps
+        the accepted grant; a key that is absent or REVOKED gives nothing, whatever accepted_key holds."""
         snapshot = make_snapshot(self.private)
         accepted, _ = _advance(snapshot, self.keys, IDENTITY, None, now=NOW, verifier=self.verify)
         self.assertEqual(accepted["schema"], 2)
-        _validate_state(accepted, {}, now=NOW + dt.timedelta(days=30), verifier=self.verify)
+        other = Ed25519PrivateKey.generate().public_key().public_bytes(serialization.Encoding.Raw,
+                                                                       serialization.PublicFormat.Raw)
+        retired = capacity_accept.TrustContext(self._registry({"cloud-key": (self.public, "retired"),
+                                                               "next-key": (other, "active")}, 2), None)
+        _validate_state(accepted, retired, now=NOW + dt.timedelta(days=30), verifier=self.verify)
+        revoked = capacity_accept.TrustContext(self._registry({"cloud-key": (self.public, "revoked"),
+                                                               "next-key": (other, "active")}, 2), None)
+        for keys in ({}, {"next-key": other}, revoked):
+            with self.subTest(keys=type(keys).__name__), \
+                    self.assertRaisesRegex(Reject, "revoked|unknown_key|no_trust_anchor"):
+                _validate_state(accepted, keys, now=NOW + dt.timedelta(days=30), verifier=self.verify)
 
     def test_new_key_snapshot_advances_after_the_previous_signing_key_is_retired(self):
+        """Rotation uses a NEW key id; the old id stays bound to its old key material (no rebinding)."""
         old = make_snapshot(self.private)
         accepted, _ = _advance(old, self.keys, IDENTITY, None, now=NOW, verifier=self.verify)
         next_private = Ed25519PrivateKey.generate()
         next_public = next_private.public_key().public_bytes(serialization.Encoding.Raw,
                                                              serialization.PublicFormat.Raw)
-        next_keys = {"cloud-key": next_public}
 
         def verify_any_trusted_key(key, message, signature):
             try:
@@ -124,12 +144,26 @@ class CapacityAcceptancePolicyTests(unittest.TestCase):
             except InvalidSignature:
                 return False
 
-        next_snapshot = make_snapshot(next_private, issued=NOW + dt.timedelta(minutes=1), quantity=6)
-        advanced, outcome = _advance(next_snapshot, next_keys, IDENTITY, accepted,
+        rotated = capacity_accept.TrustContext(self._registry({"cloud-key": (self.public, "retired"),
+                                                               "next-key": (next_public, "active")}, 2), None)
+        body = {k: v for k, v in make_snapshot(next_private, issued=NOW + dt.timedelta(minutes=1),
+                                                quantity=6).items() if k != "signature"}
+        value = base64.urlsafe_b64encode(next_private.sign(_canonical(body))).decode("ascii").rstrip("=")
+        next_snapshot = {**body, "signature": {"alg": "Ed25519", "key_id": "next-key", "value": value}}
+        advanced, outcome = _advance(next_snapshot, rotated, IDENTITY, accepted,
                                      now=NOW + dt.timedelta(minutes=1), verifier=verify_any_trusted_key)
         self.assertEqual(outcome, "accepted")
         self.assertEqual(advanced["snapshot"], next_snapshot)
+        self.assertEqual(advanced["signer"]["key_id"], "next-key")
         self.assertEqual(base64.b64decode(advanced["accepted_key"]), next_public)
+        # Re-using the old key id for new key material is a rebinding and is refused.
+        first = capacity_accept.parse_trust_registry(self._registry({"cloud-key": (self.public, "active")}, 1))
+        rebound = capacity_accept.parse_trust_registry(self._registry({"cloud-key": (next_public, "active")}, 2))
+        with self.assertRaisesRegex(capacity_accept.TrustError, "binding_mismatch"):
+            capacity_accept.check_trust_registry_transition(first, rebound)
+        state = capacity_accept.next_trust_state(first, "a" * 64, None)
+        with self.assertRaisesRegex(capacity_accept.TrustError, "binding_mismatch"):
+            capacity_accept.next_trust_state(rebound, "b" * 64, state)
 
     def test_initial_claim_accepts_only_a_signed_provisional_to_cloud_identity_transition(self):
         target = dict(IDENTITY, appliance_id="cloud-assigned-appliance")
@@ -268,7 +302,7 @@ class CapacityAcceptancePolicyTests(unittest.TestCase):
         tampered = dict(good, camera_capacity={"camera_slot_quantity": 64})
         with self.assertRaisesRegex(Reject, "bad_signature"):
             _advance(tampered, self.keys, IDENTITY, None, now=NOW, verifier=self.verify)
-        with self.assertRaisesRegex(Reject, "bad_signature"):
+        with self.assertRaisesRegex(Reject, "unknown_key"):
             _advance(good, {"other": self.public}, IDENTITY, None, now=NOW, verifier=self.verify)
         for field in ("appliance_id", "cloud_id", "customer_id"):
             other = dict(IDENTITY, **{field: "wrong"})
@@ -425,13 +459,14 @@ class AcceptanceFilesystemTests(unittest.TestCase):
             result = capacity_accept.main()
         return result, stdout.getvalue().strip(), stderr.getvalue().strip()
 
-    def test_bootstrap_rejects_accepted_snapshot_when_appliance_clock_is_over_five_minutes_behind(self):
-        # Simulate a valid accepted authorization made while the appliance
-        # clock was correct, then stepped back by more than the validator's
-        # five-minute future tolerance before an offline repair.
-        # The CLI path uses the real appliance clock, so keep this timestamp
-        # in the future relative to the test run instead of the fixed NOW
-        # fixture (which eventually becomes historical).
+    def test_bootstrap_accepts_accepted_snapshot_when_appliance_clock_is_over_five_minutes_behind(self):
+        # G2 (1.2.7.1): a valid accepted authorization made while the
+        # appliance clock was correct stays valid after the clock steps back
+        # by more than the five-minute tolerance: accepted state is validated
+        # in accepted mode (signature, identity, trust, high-water; no
+        # future/expiry check). b8 rejected it with issued_in_future.
+        # The CLI path uses the real appliance clock, so the accepted
+        # snapshot is issued in the future relative to this test run.
         future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
         snapshot = make_snapshot(self.private, issued=future, expires=future + dt.timedelta(days=1),
                                  **CLOUD_IDENTITY)
@@ -441,7 +476,6 @@ class AcceptanceFilesystemTests(unittest.TestCase):
         accepted_before = json.dumps(accepted_state, sort_keys=True).encode()
         self.accepted.write_bytes(accepted_before)
         self.accepted.chmod(0o600)
-        pending_before = (self.trust / PENDING_CLAIM_FILE).read_bytes()
         constants = {
             "TRUST_DIR": str(self.trust),
             "IDENTITY_FILE": str(self.identity_dir / "appliance_identity.json"),
@@ -454,12 +488,12 @@ class AcceptanceFilesystemTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             result = capacity_accept.main()
 
-        self.assertEqual(result, 1)
-        self.assertIn("issued_in_future", stderr.getvalue())
+        self.assertEqual(result, 0, stderr.getvalue())
+        self.assertEqual(stdout.getvalue().strip(), "reconciled_accepted_identity")
         self.assertEqual(self.accepted.read_bytes(), accepted_before)
-        self.assertEqual((self.trust / PENDING_CLAIM_FILE).read_bytes(), pending_before)
-        self.assertFalse((self.trust / IDENTITY_ANCHOR_FILE).exists())
-        self.assertEqual(stdout.getvalue(), "")
+        self.assertFalse((self.trust / PENDING_CLAIM_FILE).exists())
+        self.assertEqual(json.loads((self.trust / IDENTITY_ANCHOR_FILE).read_text())["appliance_id"],
+                         CLOUD_IDENTITY["appliance_id"])
 
     def stage_snapshot(self, snapshot):
         self.stage.write_text(json.dumps(snapshot), encoding="utf-8")

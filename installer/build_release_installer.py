@@ -210,6 +210,43 @@ def read_entitlement_signing_keys(path: str, expected_sha256: str) -> bytes:
     return canonical
 
 
+# TRUST-1 (Linux 1.2.7.1): from this release on, a build that provisions entitlement trust must carry the
+# protected trust registry (so a 1.2.7.1 appliance never runs in legacy flat-keyset mode after install).
+TRUST_REGISTRY_REQUIRED_SINCE = (1, 2, 7, 1)
+
+
+def _release_checks_module():
+    """The appliance's own stdlib-only release checks (shared trust resolver included), loaded from this checkout."""
+    import importlib.util
+    source = Path(__file__).resolve().parents[1] / "appliance-agent" / "anyaicam_agent" / "updater" / "release_checks.py"
+    spec = importlib.util.spec_from_file_location("anyaicam_builder_release_checks", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def read_entitlement_trust_registry(path: str, expected_sha256: str) -> tuple[bytes, bytes]:
+    """(registry bytes, flat keyset projection bytes) for the protected entitlement trust registry -- packaged only
+    when its SHA-256 equals expected_sha256, a digest the operator obtained independently on the cloud host
+    (python -m entitlement_keyset --trust-registry, docs/entitlement-signing-keys.md). The appliance's own release
+    checks validate it: canonical form, public keys only, every key in the registry's environment, no lab/test key
+    id in a production registry, at least one active capacity key. The flat keyset shipped beside it is derived
+    here (active + retired keys) for 1.2.7 readers and rollback."""
+    expected = validate_sha256(str(expected_sha256 or ""), "--entitlement-trust-registry-sha256")
+    data = Path(path).read_bytes()
+    actual = sha256_bytes(data)
+    if actual != expected:
+        raise SystemExit(f"--entitlement-trust-registry does not match --entitlement-trust-registry-sha256 "
+                         f"(registry digest {actual}); refusing to package an unverified trust registry.")
+    checks = _release_checks_module()
+    try:
+        checks.validate_entitlement_trust_registry(data)
+        keyset = checks.entitlement_keyset_projection(data)
+    except checks.ReleaseCheckError as error:
+        raise SystemExit(f"--entitlement-trust-registry is refused (environment / lab key / format): {error}") from error
+    return data, keyset
+
+
 def validate_sha256(value: str, label: str) -> str:
     if not SHA256_RE.fullmatch(value):
         raise SystemExit(f"{label} must be a 64-character lowercase SHA-256")
@@ -636,6 +673,13 @@ def main() -> int:
                         help="Required with --entitlement-signing-public-keys: the SHA-256 of the canonical keyset, "
                              "obtained independently on the cloud host (python -m entitlement_keyset). The build "
                              "fails unless the keyset matches it.")
+    parser.add_argument("--entitlement-trust-registry",
+                        help="TRUST-1 (required from 1.2.7.1): the canonical entitlement trust registry JSON "
+                             "(python -m entitlement_keyset --trust-registry on the cloud host). Packaged with its flat "
+                             "keyset projection; replaces --entitlement-signing-public-keys.")
+    parser.add_argument("--entitlement-trust-registry-sha256",
+                        help="Required with --entitlement-trust-registry: its SHA-256, obtained independently on the "
+                             "cloud host. The build fails unless the registry matches it.")
     parser.add_argument("--no-entitlement-signing-keys", action="store_true",
                         help="Explicitly build an installer that provisions no entitlement keyset: a fresh install "
                              "denies every paid feature until a release that carries one is installed.")
@@ -676,6 +720,12 @@ def main() -> int:
             "accept a Software Update."
         )
     update_key_bytes = read_update_signing_public_key(args.update_signing_public_key) if args.update_signing_public_key else b""
+    if args.entitlement_trust_registry and (args.entitlement_signing_public_keys or args.no_entitlement_signing_keys):
+        raise SystemExit("--entitlement-trust-registry, --entitlement-signing-public-keys and "
+                         "--no-entitlement-signing-keys are mutually exclusive (the registry carries its own keyset).")
+    if bool(args.entitlement_trust_registry) != bool(args.entitlement_trust_registry_sha256):
+        raise SystemExit("--entitlement-trust-registry and --entitlement-trust-registry-sha256 go together: the "
+                         "registry digest is obtained independently on the cloud host.")
     if args.entitlement_signing_public_keys and args.no_entitlement_signing_keys:
         raise SystemExit("--entitlement-signing-public-keys and --no-entitlement-signing-keys are mutually exclusive.")
     if args.entitlement_signing_public_keys and not args.entitlement_signing_keys_sha256:
@@ -683,7 +733,8 @@ def main() -> int:
                          "obtained independently on the cloud host (docs/entitlement-signing-keys.md).")
     if args.entitlement_signing_keys_sha256 and not args.entitlement_signing_public_keys:
         raise SystemExit("--entitlement-signing-keys-sha256 is only used with --entitlement-signing-public-keys.")
-    if not args.entitlement_signing_public_keys and not args.no_entitlement_signing_keys:
+    if not args.entitlement_signing_public_keys and not args.no_entitlement_signing_keys and \
+            not args.entitlement_trust_registry:
         raise SystemExit(
             "Paid features need a trust anchor: pass --entitlement-signing-public-keys with the cloud's entitlement-"
             "signing PUBLIC keyset, or --no-entitlement-signing-keys to explicitly build an installer whose fresh "
@@ -692,11 +743,23 @@ def main() -> int:
     entitlement_keys_bytes = (read_entitlement_signing_keys(args.entitlement_signing_public_keys,
                                                             args.entitlement_signing_keys_sha256)
                               if args.entitlement_signing_public_keys else b"")
+    entitlement_registry_bytes = b""
+    if args.entitlement_trust_registry:
+        entitlement_registry_bytes, entitlement_keys_bytes = read_entitlement_trust_registry(
+            args.entitlement_trust_registry, args.entitlement_trust_registry_sha256)
 
     if not args.release_version:
         raise SystemExit("--release-version is required (e.g. --release-version 1.2.5): the installer, its manifest "
                          "and the installed appliance all report it, and Software Update compares it.")
     release_version = validate_release_version(args.release_version)
+    version_tuple = tuple(int(part) for part in release_version.split("."))
+    width = max(len(version_tuple), len(TRUST_REGISTRY_REQUIRED_SINCE))
+    if (version_tuple + (0,) * (width - len(version_tuple)) >= TRUST_REGISTRY_REQUIRED_SINCE +
+            (0,) * (width - len(TRUST_REGISTRY_REQUIRED_SINCE)) and not entitlement_registry_bytes):
+        raise SystemExit("A 1.2.7.1+ release must carry the entitlement trust registry: pass "
+                         "--entitlement-trust-registry with --entitlement-trust-registry-sha256 (TRUST-1; "
+                         "docs/entitlement-signing-keys.md). A flat keyset alone, or none, would leave appliances in "
+                         "legacy trust mode.")
 
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
@@ -775,6 +838,12 @@ def main() -> int:
             key_dest.parent.mkdir(parents=True, exist_ok=True)
             key_dest.write_bytes(update_key_bytes)
             update_key_sha256 = sha256_file(key_dest)
+        entitlement_registry_sha256 = ""
+        if entitlement_registry_bytes:
+            registry_dest = package / "payload/keys/entitlement-trust-registry.json"
+            registry_dest.parent.mkdir(parents=True, exist_ok=True)
+            registry_dest.write_bytes(entitlement_registry_bytes)
+            entitlement_registry_sha256 = sha256_file(registry_dest)
         entitlement_keys_sha256 = ""
         if entitlement_keys_bytes:
             keys_dest = package / "payload/keys/entitlement-signing-public-keys.json"
@@ -832,6 +901,7 @@ def main() -> int:
             f"RELEASE_VERSION={release_version}\n"
             f"UPDATE_SIGNING_KEY_SHA256={update_key_sha256}\n"
             f"ENTITLEMENT_SIGNING_KEYS_SHA256={entitlement_keys_sha256}\n"
+            f"ENTITLEMENT_TRUST_REGISTRY_SHA256={entitlement_registry_sha256}\n"
         )
         release_env += "".join(f"{key}={value}\n" for key, value in preload.items())
         (package / "release.env").write_text(release_env, encoding="utf-8", newline="\n")
@@ -847,6 +917,7 @@ def main() -> int:
             "release_version": release_version,
             "update_signing_key_sha256": update_key_sha256,
             "entitlement_signing_keys_sha256": entitlement_keys_sha256,
+            "entitlement_trust_registry_sha256": entitlement_registry_sha256,
             "installer_source_commit": installer_commit,
             "vms_release_commit": vms_commit,
             "vms_release_source": release_source,

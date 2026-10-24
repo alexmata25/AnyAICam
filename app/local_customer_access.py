@@ -98,8 +98,10 @@ def _cloud_url() -> str:
 
 
 def _trusted_keys() -> dict[str, str]:
+    """TRUST-1 (1.2.7.1): only keys ACTIVE for the local_access purpose in the current protected trust registry
+    (LEGACY mode: the flat keyset) verify a NEW cloud assertion or identity manifest."""
     import appliance_entitlements
-    return appliance_entitlements._trusted_keys()
+    return appliance_entitlements.trusted_keys_for("local_access")
 
 
 def _request(method: str, path: str, identity: dict, payload: dict | None = None) -> dict:
