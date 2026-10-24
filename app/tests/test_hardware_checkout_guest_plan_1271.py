@@ -51,6 +51,15 @@ def guest_shop(shop, stripe_subscriptions, monkeypatch):
             return {"id": intent, "object": "payment_intent", "payment_method": f"pm_{intent}"}
         return inner_get(path)
     monkeypatch.setattr(main, "stripe_api_get", get)
+    inner_post, made = main.stripe_api_post, []
+
+    def post(path, fields, idempotency_key=None):
+        answer = inner_post(path, fields, idempotency_key=idempotency_key)
+        if path == "/v1/checkout/sessions":  # Stripe-shaped ids: the order confirmation page only accepts cs_test_...
+            made.append(1)
+            answer = {**answer, "id": f"cs_test_guest{len(made):06d}"}
+        return answer
+    monkeypatch.setattr(main, "stripe_api_post", post)
     client, captured, mail, _, _ = shop
     return {"client": client, "captured": captured, "mail": mail, "subs": stripe_subscriptions, "intent_reads": reads}
 
@@ -226,6 +235,24 @@ def test_u_h1_a_granted_storage_trial_starts_at_activation_on_the_saved_plan(sho
     assert (created[0]["items[0][price]"], created[0]["items[0][quantity]"]) == (PRICES["hybrid"], "4")
     assert "trial_end" in created[0] and created[0]["cancel_at_period_end"] == "true"
     assert "default_payment_method" not in created[0]                             # a free trial charges nothing
+
+
+def test_u_h1_the_attached_plan_is_shown_as_saved_and_never_sold_twice(shop, guest_shop, db_path):
+    """After attachment the guest is in the same state as a signed-in appliance buyer: My subscription shows the saved
+    plan as Pending Activation, a second plan checkout is refused, and My orders offers setup, not a plan picker."""
+    g = guest_shop
+    _guest_order(db_path, g, "guest-ui@example.test", "pi_guest_ui")
+    customer_id = _create_account(db_path, g, "guest-ui@example.test")
+    _sign_in(g, "guest-ui@example.test")
+    portal = g["client"].get("/subscription-portal").text
+    assert "Pending Activation" in portal and "$19.99 per camera/month ($79.96/month)" in portal
+    refused = g["client"].post("/api/v2/customer/subscription/checkout", json={"plan_key": "hybrid", "camera_quantity": 4})
+    assert refused.status_code == 409
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE hardware_orders SET fulfillment_status='delivered' WHERE customer_id=?", (customer_id,))
+    orders = g["client"].get("/customer/orders").text
+    assert 'id="orders-saved-plan"' in orders and "Hybrid · 4 cameras" in orders and 'id="orders-choose-plan"' not in orders
+    assert g["subs"]["created"] == []
 
 
 def test_u_h1_the_order_page_sign_in_attaches_the_plan_too(shop, guest_shop, db_path):

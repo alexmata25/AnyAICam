@@ -643,9 +643,25 @@ def _orders_page(customer_id: str) -> str:
         cards += (f'<div class="order-line hw-order" data-status="{escape(label, quote=True)}"><span>{escape(order["product_name"])}{quantity}'
                   f'<br><small class="note">Order {escape(generate_order_number(order["id"]))} · {escape(str(order["created_at"])[:10])}</small></span>'
                   f'<span class="hw-status">{escape(label)}</span></div>{tracking}')
+    import build_orders
+    import per_camera_billing as billing
+    saved = None if _has_camera_plan(customer_id) else build_orders.live_storage_plan(customer_id)
+    if saved and (saved.get("plan_key") not in billing.PLANS or saved.get("state") in (build_orders.STORAGE_STARTED,
+                                                                                          build_orders.STORAGE_SUPERSEDED)):
+        saved = None
     if waiting and not delivered:
         guide = (f'<p class="notice ok" id="orders-waiting" role="status">{escape(WAITING_FOR_DELIVERY)}</p>'
                  '<p class="note">Order statuses: Paid → Preparing → Shipped → Delivered. We email you when your equipment ships.</p>')
+    elif delivered and saved:
+        # D-HW-PLAN-1 (1.2.7.1): the plan chosen with the appliance is already saved (and a second plan checkout is
+        # refused): no "Choose my camera plan"; it starts when the appliance is activated.
+        quantity = int(saved.get("camera_quantity") or 0)
+        guide = ('<p class="notice ok" id="orders-delivered" role="status">Your equipment has arrived.</p>'
+                 f'<p id="orders-saved-plan">Your camera plan ({escape(billing.PLANS[saved["plan_key"]]["display_name"])} · '
+                 f'{quantity} camera{"s" if quantity != 1 else ""}) was saved with your order. It starts, with its first '
+                 'monthly charge, when you activate your appliance. Set up your appliance and add your cameras.</p>'
+                 '<a class="submit" id="orders-setup" href="/customer/setup">Set up my system</a>'
+                 '<a class="ghost" id="orders-manage-plan" href="/subscription-portal">Open My subscription</a>')
     elif delivered and _has_camera_plan(customer_id):
         # The plan already exists (a second one is refused anyway): no "Choose my camera plan" (Green 2026-10-16).
         guide = ('<p class="notice ok" id="orders-delivered" role="status">Your equipment has arrived.</p>'
