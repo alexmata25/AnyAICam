@@ -7,6 +7,9 @@ param(
     # (docs/entitlement-signing-keys.md). Without it a Windows install trusts no signed capacity: 0 cameras.
     [Parameter(Mandatory=$true)][string]$EntitlementKeyset,
     [Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256,
+    # Optional explicit build interpreter. This avoids relying on a machine-wide
+    # Python Launcher registration when the approved interpreter is per-user.
+    [string]$PythonExe = '',
     [switch]$Sign,
     [switch]$AzureSign
 )
@@ -125,7 +128,14 @@ if ($Sign -or $AzureSign) {
 # public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
 if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
 $keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
-& py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+if ($PythonExe) {
+    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
+    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
+    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+} else {
+    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+}
 if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset was refused; nothing was built.' }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"

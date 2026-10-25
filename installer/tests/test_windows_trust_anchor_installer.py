@@ -65,6 +65,9 @@ def test_build_requires_the_keyset_and_its_pin_and_hands_both_to_setup():
     assert "[Parameter(Mandatory=$true)][string]$EntitlementKeyset," in build
     assert "[Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256," in build
     assert "prepare-keyset.py" in build and '/DKeysetSha256=$EntitlementKeysetSha256' in build
+    assert "[string]$PythonExe = ''" in build
+    assert "& $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py')" in build
+    assert "Python 3.12.10" in build
     assert build.index("prepare-keyset.py") < build.index("& $iscc")
     iss = _text("AnyAiCam-VMS.iss")
     assert "#error KeysetSha256 is required" in iss
