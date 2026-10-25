@@ -33,6 +33,14 @@ def _run_tool(cloud_db, *args):
     return code, out.getvalue()
 
 
+def _run_with_public_keys(monkeypatch, public_keys, *args):
+    out = io.StringIO()
+    monkeypatch.setattr(entitlement_keyset, "cloud_public_keys", lambda: dict(public_keys))
+    with redirect_stdout(out):
+        code = entitlement_keyset.main(list(args))
+    return code, out.getvalue()
+
+
 def _cloud_private_keys(cloud_db):
     import appliance_identity
     with override_target(sqlite_path=str(cloud_db)):
@@ -78,6 +86,25 @@ def test_rotation_digest_includes_the_pre_generated_next_key(cloud_db):
     keys = json.loads(rotated.rsplit("sha256 ", 1)[0])["keys"]
     assert keys["next-key"] == NEXT_KEY and len(keys) == len(json.loads(current.rsplit("sha256 ", 1)[0])["keys"]) + 1
     assert rotated.strip().splitlines()[-1] == f"sha256 {entitlement_keyset.digest(keys)}"
+
+
+def test_legacy_flat_keyset_refuses_rebinding_an_existing_id(monkeypatch):
+    replacement = base64.b64encode(bytes(reversed(range(32)))).decode()
+    with pytest.raises(SystemExit, match="no rebinding"):
+        _run_with_public_keys(monkeypatch, {"existing-key": NEXT_KEY}, "--add", f"existing-key={replacement}")
+
+
+def test_legacy_flat_keyset_allows_same_binding_and_new_ids(monkeypatch):
+    replacement = base64.b64encode(bytes(reversed(range(32)))).decode()
+    code, printed = _run_with_public_keys(
+        monkeypatch,
+        {"existing-key": NEXT_KEY},
+        "--add", f"existing-key={NEXT_KEY}",
+        "--add", f"next-key={replacement}",
+    )
+    assert code == 0
+    keys = json.loads(printed.rsplit("sha256 ", 1)[0])["keys"]
+    assert keys == {"existing-key": NEXT_KEY, "next-key": replacement}
 
 
 @pytest.mark.parametrize("bad", ["no-equals", "bad id=" + NEXT_KEY, "k=AAAA", "k=" + base64.b64encode(bytes(64)).decode()])

@@ -155,6 +155,8 @@ def main(argv=None) -> int:
     for item in args.add:
         key_id, _, value = item.partition("=")
         key_id, value = _public_key(key_id.strip(), value.strip())
+        if key_id in keys and keys[key_id] != value:
+            raise SystemExit(f"key id {key_id!r} is already bound to other key material (no rebinding)")
         keys[key_id] = value
     if not keys:
         print("This cloud has no active entitlement-signing key.", file=sys.stderr)
