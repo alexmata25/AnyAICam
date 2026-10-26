@@ -75843,7 +75843,7 @@ def customer_dashboard_intelligence_api(request: Request, start_ms: int, end_ms:
 
 
 
-def dashboard_intelligence_api() -> dict:
+def dashboard_intelligence_api(request: Request) -> dict:
 
 
 
@@ -76176,7 +76176,7 @@ def dashboard_intelligence_api() -> dict:
 
 
 
-    alerts = in_app_alerts(limit=100).get("alerts", [])
+    alerts = in_app_alerts(request, limit=100).get("alerts", [])
 
 
 

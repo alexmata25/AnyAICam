@@ -123,6 +123,61 @@ def test_host_level_apis_unchanged_on_the_edge_appliance(http_client, db_path, m
     assert http_client.get(path, cookies=cookie).status_code == 200
 
 
+def test_local_dashboard_intelligence_passes_request_to_alert_handler(
+    cloud, monkeypatch, tmp_path
+):
+    """The local Dashboard route shares the alert handler's request-scoped
+    customer guard. Supplying the request keeps the endpoint usable while
+    preserving that guard for customer sessions.
+    """
+    monkeypatch.setattr(main, "load_motion_events", lambda: [])
+    monkeypatch.setattr(main, "analytics_events", lambda: [])
+    monkeypatch.setattr(main, "get_camera_numbers", lambda: [])
+    monkeypatch.setattr(main, "health_issues", {})
+    monkeypatch.setattr(main, "IN_APP_ALERTS_FILE", tmp_path / "in_app_alerts.jsonl")
+
+    from starlette.requests import Request
+
+    admin_cookie = partner_portal._token(
+        "admin@example.test", "administrator", None, None, None
+    )
+    route = next(
+        route for route in main.app.routes
+        if getattr(route, "path", None) == "/api/dashboard/intelligence"
+    )
+    assert route.endpoint is main.dashboard_intelligence_api
+    assert route.dependant.request_param_name == "request"
+    assert route.status_code in (None, 200)
+
+    def request_for(cookie):
+        return Request({
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "https",
+            "path": "/api/dashboard/intelligence",
+            "raw_path": b"/api/dashboard/intelligence",
+            "query_string": b"",
+            "headers": [
+                (b"cookie", f"{partner_portal.SESSION_COOKIE}={cookie}".encode())
+            ],
+            "client": ("testclient", 123),
+            "server": ("testserver", 443),
+            "app": main.app,
+        })
+    payload = main.dashboard_intelligence_api(request_for(admin_cookie))
+    assert payload["alerts"] == []
+    assert payload["events_today"] == 0
+
+    customer_cookie = partner_portal._token(
+        "customer@example.test", "customer_owner", None, "cust-1", None
+    )
+    with pytest.raises(main.HTTPException) as denied:
+        main.dashboard_intelligence_api(request_for(customer_cookie))
+    assert denied.value.status_code == 403
+
+
 @pytest.mark.parametrize("path", sorted(main.CLOUD_HOST_LOCAL_API_PATHS))
 def test_every_host_local_api_refuses_a_cloud_customer(http_client, db_path, cloud, path):
     """Probed live on staging with a test customer: each of these answered
