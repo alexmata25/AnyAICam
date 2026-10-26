@@ -47,8 +47,24 @@ os.environ['ANYAICAM_STATE_DIR'] = r'$data\agent'
 os.chdir(r'$app\app')
 "@
     Set-Content -LiteralPath $file -Value ($prelude + "`n" + $Code) -Encoding UTF8
-    try { $out = & $py $file 2>&1; $rc = $LASTEXITCODE } finally { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
-    if ($rc -ne 0) { throw "python exit $rc`: $(($out | Out-String).Trim())" }
+    $stdout = Join-Path $env:TEMP ('acc-' + [guid]::NewGuid().ToString('N') + '.stdout')
+    $stderr = Join-Path $env:TEMP ('acc-' + [guid]::NewGuid().ToString('N') + '.stderr')
+    try {
+        # Redirect native streams to files. PowerShell 7 can promote stderr from a
+        # native process to NativeCommandError when ErrorActionPreference=Stop,
+        # even when the helper intentionally exits 0 after a fail-closed result.
+        $process = Start-Process -FilePath $py -ArgumentList ('"' + $file + '"') -NoNewWindow -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw 'python timed out after 30 seconds'
+        }
+        $out = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw } else { '' }
+        $err = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw } else { '' }
+    } finally {
+        Remove-Item -LiteralPath $file, $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    }
+    if ($process.ExitCode -ne 0) { throw "python exit $($process.ExitCode)`: stdout=$(($out | Out-String).Trim()); stderr=$(($err | Out-String).Trim())" }
     ($out | Out-String).Trim()
 }
 function Capacity { AppPython 'import vms_capacity, json; c = vms_capacity.load_capacity(); print(json.dumps(None if c is None else int(c["camera_slot_quantity"])))' }
@@ -122,8 +138,8 @@ Check '1.2.7 capacity: before any entitlement, 0 cameras are licensed' {
 if ($acceptance.keyset_kind -eq 'production') {
     # The production build trusts ONLY the production key: a snapshot signed by any other key is refused.
     Stop-Service AnyAiCamVMS -Force
-    Check '1.2.7 capacity (production keyset): a snapshot signed by a non-production key is refused (bad_signature)' {
-        Sign 'valid' 2; $r = AcceptStaged; if ($r -ne 'REJECT bad_signature') { throw $r }; $r
+    Check '1.2.7 capacity (production keyset): a snapshot signed by an untrusted key is refused (unknown_key)' {
+        Sign 'valid' 2; $r = AcceptStaged; if ($r -ne 'REJECT unknown_key') { throw $r }; $r
     }
     Check '1.2.7 capacity (production keyset): still 0 cameras' { $l = Licensed; if ($l -ne '[]') { throw "licensed $l" }; 'licensed []' }
     Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue
@@ -144,7 +160,7 @@ if ($acceptance.keyset_kind -eq 'production') {
     Stop-Service AnyAiCamVMS -Force     # no cloud sync while snapshots are planted
     $cases = @(
         @{ name = 'tampered (capacity edited after signing)'; case = 'tampered'; code = 'bad_signature' },
-        @{ name = 'signed by an unknown key';                 case = 'unknown-key'; code = 'bad_signature' },
+        @{ name = 'signed by an unknown key';                 case = 'unknown-key'; code = 'unknown_key' },
         @{ name = 'bound to another appliance';               case = 'wrong-binding'; code = 'identity_mismatch' },
         @{ name = 'expired';                                  case = 'expired'; code = 'expired' },
         @{ name = 'issued in the future';                     case = 'future'; code = 'issued_in_future' },

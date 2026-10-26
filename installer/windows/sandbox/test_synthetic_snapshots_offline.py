@@ -53,7 +53,7 @@ r = subprocess.run([sys.executable, str(SIGNER), "--app", str(ROOT / "app"), "--
 check("synthetic key pair self-check (sign + verify)", r.returncode == 0 and "signs and verifies" in r.stdout, r.stdout + r.stderr)
 code, state = outcome(make("valid", 2), None)
 check("valid synthetic snapshot (capacity 2) is accepted first", code == "accepted" and state is not None, code)
-for case, expected in [("tampered", "bad_signature"), ("unknown-key", "bad_signature"), ("wrong-binding", "identity_mismatch"),
+for case, expected in [("tampered", "bad_signature"), ("unknown-key", "unknown_key"), ("wrong-binding", "identity_mismatch"),
                        ("expired", "expired"), ("future", "issued_in_future"), ("replay", "replay")]:
     code, after = outcome(make(case), state)
     check(f"{case}: refused with {expected}, accepted state unchanged", code == expected and after is state, code)
