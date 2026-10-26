@@ -60,7 +60,12 @@ def prepare_ultralytics_config(config_root):
     the full settings schema before initializing telemetry. The installer
     preflight must prepare that exact file before importing the package.
     """
-    app_root = Path(__file__).resolve().parents[1]
+    # This file is installed at ``{app}\installer\runtime-preflight.py``;
+    # the application helper it imports is in the sibling ``app`` directory.
+    # Add that packaged application directory explicitly so the clean embedded
+    # interpreter does not depend on its current working directory or a
+    # developer/test PYTHONPATH.
+    app_root = Path(__file__).resolve().parents[1] / "app"
     if str(app_root) not in sys.path:
         sys.path.insert(0, str(app_root))
     from ultralytics_privacy import _prepare_settings_file

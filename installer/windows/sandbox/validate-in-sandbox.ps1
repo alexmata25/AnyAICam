@@ -15,6 +15,34 @@ function Check([string]$Name, [scriptblock]$Test) {
     $checks.Add([pscustomobject]@{ name = $Name; ok = [bool]$ok; detail = "$detail" })
     Add-Content -Path (Join-Path $results 'report.txt') -Value ("{0}  {1}  {2}" -f ($(if ($ok) { 'PASS' } else { 'FAIL' })), $Name, $detail)
 }
+trap {
+    $message = ($_ | Out-String).Trim()
+    try {
+        Add-Content -Path (Join-Path $results 'report.txt') -Value ("FAIL  harness terminated  {0}" -f $message)
+        $failed = @($checks | Where-Object { -not $_.ok }).Count + 1
+        $checks.Add([pscustomobject]@{ name = 'harness terminated'; ok = $false; detail = $message })
+        $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
+        Add-Content -Path (Join-Path $results 'report.txt') -Value ("RESULT: {0} checks, {1} failed" -f $checks.Count, $failed)
+        Set-Content -Path (Join-Path $results 'DONE') -Value ("{0} failed; harness terminated" -f $failed)
+    } catch { }
+    exit 1
+}
+function Start-BoundedProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [int]$TimeoutSeconds = 900
+    )
+    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -ErrorAction Stop
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        [void]$process.WaitForExit(10000)
+        throw "process exceeded ${TimeoutSeconds}s bound: $FilePath (pid $($process.Id))"
+    }
+    $process.Refresh()
+    return $process
+}
 function Http([string]$Path) {
     $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Uri ("http://127.0.0.1:8000" + $Path)
     return $response
@@ -132,7 +160,7 @@ if ($previous) {
 # file) is reported with its reason instead of a blank exit code.
 $installError = ''
 try {
-    $install = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$($acceptanceSettings.product_mode)", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop
+    $install = Start-BoundedProcess -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$($acceptanceSettings.product_mode)", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -ErrorAction Stop
 } catch { $install = $null; $installError = $_.Exception.Message }
 Check 'silent install exit code 0' { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
 Check 'code integrity / Smart App Control state (diagnostic)' {
@@ -466,7 +494,7 @@ Check 'installed uninstaller carries the same valid signature as the setup' {
     if ($signature.SignerCertificate.Subject -ne $setupSignature.SignerCertificate.Subject) { throw "signer $($signature.SignerCertificate.Subject)" }
     "$($uninstaller.Name): Valid, $($signature.SignerCertificate.Subject)"
 }
-$uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-uninstall.log') + '"') -Wait -PassThru
+$uninstall = Start-BoundedProcess -FilePath $uninstaller.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-uninstall.log') + '"')
 Check 'uninstall exit code 0' { $uninstall.ExitCode -eq 0 }
 Check 'uninstall removes the service' { -not (Get-Service AnyAiCamVMS -ErrorAction SilentlyContinue) }
 Check 'uninstall removes the cloud agent service' { -not (Get-Service AnyAiCamAgent -ErrorAction SilentlyContinue) }
