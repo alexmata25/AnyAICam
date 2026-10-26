@@ -12,18 +12,27 @@ $checks = New-Object System.Collections.Generic.List[object]
 function Check([string]$Name, [scriptblock]$Test) {
     try { $detail = & $Test; $ok = $true } catch { $detail = $_.Exception.Message; $ok = $false }
     if ($detail -is [bool]) { $ok = $detail; $detail = '' }
-    $checks.Add([pscustomobject]@{ name = $Name; ok = [bool]$ok; detail = "$detail" })
+    $status = if ($ok) { 'PASS' } else { 'FAIL' }
+    $checks.Add([pscustomobject]@{ name = $Name; status = $status; ok = [bool]$ok; detail = "$detail" })
     Add-Content -Path (Join-Path $results 'report.txt') -Value ("{0}  {1}  {2}" -f ($(if ($ok) { 'PASS' } else { 'FAIL' })), $Name, $detail)
+}
+function NotTested([string]$Name, [string]$Reason) {
+    $checks.Add([pscustomobject]@{ name = $Name; status = 'NOT TESTED'; ok = $null; detail = $Reason })
+    Add-Content -Path (Join-Path $results 'report.txt') -Value ("NOT TESTED  {0}  {1}" -f $Name, $Reason)
+}
+function WriteAcceptanceSummary {
+    $failed = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
+    $notTested = @($checks | Where-Object { $_.status -eq 'NOT TESTED' }).Count
+    $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
+    Add-Content (Join-Path $results 'report.txt') ("RESULT: {0} checks, {1} failed, {2} not tested" -f $checks.Count, $failed, $notTested)
+    Set-Content -Path (Join-Path $results 'DONE') -Value ("{0} failed; {1} not tested" -f $failed, $notTested)
 }
 trap {
     $message = ($_ | Out-String).Trim()
     try {
         Add-Content -Path (Join-Path $results 'report.txt') -Value ("FAIL  harness terminated  {0}" -f $message)
-        $failed = @($checks | Where-Object { -not $_.ok }).Count + 1
-        $checks.Add([pscustomobject]@{ name = 'harness terminated'; ok = $false; detail = $message })
-        $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
-        Add-Content -Path (Join-Path $results 'report.txt') -Value ("RESULT: {0} checks, {1} failed" -f $checks.Count, $failed)
-        Set-Content -Path (Join-Path $results 'DONE') -Value ("{0} failed; harness terminated" -f $failed)
+        $checks.Add([pscustomobject]@{ name = 'harness terminated'; status = 'FAIL'; ok = $false; detail = $message })
+        WriteAcceptanceSummary
     } catch { }
     exit 1
 }
@@ -131,7 +140,7 @@ if (Test-Path 'C:\Validation\previous\SIMULATE-1.3.0') {
 }
 if ($previous) {
     $previousError = ''
-    try { $old = Start-Process -FilePath $previous.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-previous.log') + '"') -Wait -PassThru -ErrorAction Stop }
+    try { $old = Start-BoundedProcess -FilePath $previous.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", ('/LOG="' + (Join-Path $results 'setup-previous.log') + '"') -TimeoutSeconds 900 -ErrorAction Stop }
     catch { $old = $null; $previousError = $_.Exception.Message }
     Check "previous release $($previous.Name) installed (exit 0)" { if (-not $old) { throw "did not start: $previousError" }; if ($old.ExitCode -ne 0) { throw "exit $($old.ExitCode)" }; 'exit 0' }
     $oldLabel = Join-Path $env:ProgramData 'AnyAiCam\label\claim-label.txt'
@@ -174,6 +183,19 @@ $installLog = Get-Content (Join-Path $results 'setup-install.log') -ErrorAction 
 Check 'Visual C++ runtime installer succeeded (setup log)' { $line = $installLog | Where-Object { $_ -match 'Visual C\+\+ runtime installer exit code: (\d+)' } | Select-Object -Last 1; if (-not $line) { throw 'no exit code in setup log' }; $code = [int]([regex]::Match($line, 'exit code: (\d+)').Groups[1].Value); if ($code -notin 0, 1638, 3010) { throw "exit $code" }; "exit $code" }
 Check 'Visual C++ x64 runtime registered' { $r = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction Stop; if ($r.Installed -ne 1) { throw 'Installed is not 1' }; "version $($r.Version)" }
 Check 'setup ran the runtime preflight and it passed (setup log)' { $line = $installLog | Where-Object { $_ -match 'AnyAiCam runtime preflight passed' } | Select-Object -First 1; if (-not $line) { throw 'no preflight pass line in setup log' }; $line.Substring($line.IndexOf('AnyAiCam runtime')) }
+if (-not $install -or $install.ExitCode -ne 0) {
+    $reason = if ($install) { "installer exited with code $($install.ExitCode); dependent application checks require a successful installation" } else { "installer did not complete successfully ($installError); dependent application checks require a successful installation" }
+    foreach ($name in @(
+        'installed runtime and service startup',
+        'VMS health, version, login, Dashboard, and API',
+        'local licensing and ACL checks',
+        'cloud-link agent and claim lifecycle',
+        'event recording and playback',
+        'upgrade, repair, and installed uninstaller signature'
+    )) { NotTested $name $reason }
+    WriteAcceptanceSummary
+    exit 1
+}
 Check 'bundled Python loads torch, cv2, ultralytics (preflight)' {
     $python = Join-Path $env:ProgramFiles 'AnyAiCam\runtime\python\python.exe'
     $out = & $python (Join-Path $env:ProgramFiles 'AnyAiCam\installer\runtime-preflight.py') 2>&1 | Out-String
@@ -324,6 +346,16 @@ foreach ($part in 'python', 'app') {
 }
 $python = Join-Path $cloudRuntime 'python\python.exe'
 $cloudApp = Join-Path $cloudRuntime 'app'
+$cryptoOutput = (& $python -c 'import cryptography; print(cryptography.__version__)' 2>&1 | Out-String).Trim()
+$cryptoExitCode = $LASTEXITCODE
+Check 'test cloud runtime has pinned cryptography==44.0.0' {
+    if ($cryptoExitCode -ne 0) { throw "Python import failed (exit $cryptoExitCode): $cryptoOutput" }
+    if ($cryptoOutput -ne '44.0.0') { throw "expected 44.0.0, found '$cryptoOutput'" }
+    $cryptoOutput
+}
+if ($cryptoExitCode -ne 0 -or $cryptoOutput -ne '44.0.0') {
+    throw "test cloud requires the approved pinned cryptography==44.0.0 dependency; import reported '$cryptoOutput' (exit $cryptoExitCode)"
+}
 & $python 'C:\Validation\scripts\test-cloud.py' --app $cloudApp --data $cloudData --host $TestCloudHost --certificates-only
 Import-Certificate -FilePath (Join-Path $cloudData 'tls\ca.cer') -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
 # 2026-10-20: built as a list -- in a production-keyset run the old inline "$(if ...)" added a $null element, and
@@ -457,7 +489,7 @@ function StillLinked {
     'agent running, same credential, no claim code file, heartbeat'
 }
 function Reinstall([string]$Log) {
-    Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results $Log) + '"') -Wait -PassThru
+    Start-BoundedProcess -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results $Log) + '"') -TimeoutSeconds 900
 }
 function SecretsKept {
     if (-not (WaitHealthy 180)) { throw 'not healthy after reinstall' }
@@ -539,7 +571,4 @@ Check 'no claim code or credential in any log' {
     "$(@(Get-ChildItem $results -Recurse -File).Count) files checked"
 }
 
-$failed = @($checks | Where-Object { -not $_.ok }).Count
-$checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
-Add-Content (Join-Path $results 'report.txt') ("RESULT: {0} checks, {1} failed" -f $checks.Count, $failed)
-Set-Content (Join-Path $results 'DONE') ("{0} failed" -f $failed)
+WriteAcceptanceSummary

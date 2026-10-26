@@ -20,6 +20,30 @@ T 'production run: networking DISABLED in the .wsb' { if (-not (Select-String -P
 T 'production run: acceptance.json has the mode, kind and pin' { $a = Get-Content -Raw (Join-Path $Work 'p\scripts\acceptance.json') | ConvertFrom-Json; if ($a.product_mode -ne 'local' -or $a.keyset_kind -ne 'production' -or $a.expected_keyset_sha256 -ne $prod) { throw ($a | ConvertTo-Json -Compress) } }
 T 'production run: NO signing key is copied' { if (Test-Path (Join-Path $Work 'p\scripts\signing-key.json')) { throw 'signing key present' } }
 T 'production run: acceptance-127.ps1 and synthetic-snapshots.py copied' { foreach ($f in 'acceptance-127.ps1', 'synthetic-snapshots.py', 'validate-in-sandbox.ps1', 'test-cloud.py') { if (-not (Test-Path (Join-Path $Work "p\scripts\$f"))) { throw "missing $f" } } }
+T 'production runner: installer waits are bounded and return process handles' {
+    $runner = Get-Content -Raw (Join-Path $Work 'p\scripts\validate-in-sandbox.ps1')
+    if ($runner -notmatch '(?s)Start-Process\s+-FilePath\s+\$FilePath.*?-PassThru.*?WaitForExit\(\$TimeoutSeconds\s*\*\s*1000\)') { throw 'bounded process capture is missing' }
+    if ($runner -notmatch 'Start-BoundedProcess\s+-FilePath\s+\$setup\.FullName') { throw 'primary installer does not use bounded process capture' }
+}
+T 'production runner: terminal errors write report JSON and DONE' {
+    $runner = Get-Content -Raw (Join-Path $Work 'p\scripts\validate-in-sandbox.ps1')
+    if ($runner -notmatch '(?s)function WriteAcceptanceSummary\s*\{.*?report\.json.*?\bDONE\b' -or $runner -notmatch '(?s)trap\s*\{.*?WriteAcceptanceSummary') { throw 'fatal-error completion call chain is missing' }
+}
+T 'production runner: failed installation marks dependent acceptance NOT TESTED' {
+    $runner = Get-Content -Raw (Join-Path $Work 'p\scripts\validate-in-sandbox.ps1')
+    if ($runner -notmatch '(?s)if\s*\(-not\s*\$install\s*-or\s*\$install\.ExitCode\s*-ne\s*0\).*?NotTested\s+\$name\s+\$reason.*?WriteAcceptanceSummary') { throw 'failed install does not stop dependent checks with NOT TESTED status' }
+    if ($runner -notmatch "status\s*=\s*'NOT TESTED'") { throw 'NOT TESTED report status is missing' }
+}
+T 'production runner: test cloud checks the pinned cryptography dependency' {
+    $runner = Get-Content -Raw (Join-Path $Work 'p\scripts\validate-in-sandbox.ps1')
+    if ($runner -notmatch 'cryptography==44\.0\.0') { throw 'cryptography pin preflight is missing' }
+}
+T 'Windows runtime dependency: cryptography 44.0.0 is hash-pinned' {
+    $requirements = Get-Content (Join-Path $PSScriptRoot '..\requirements-windows.txt')
+    $lock = Get-Content (Join-Path $PSScriptRoot '..\wheels.lock.sha256')
+    if ($requirements -notcontains 'cryptography==44.0.0') { throw 'requirements-windows.txt pin missing' }
+    if (-not ($lock | Where-Object { $_ -match '^708ee5f1bafe76d041b53a4f95eb28cdeb8d18da17e597d46d7833ee59b97ede\s+cryptography-44\.0\.0-cp39-abi3-win_amd64\.whl$' })) { throw 'approved cryptography wheel hash missing' }
+}
 T 'synthetic-test run: folder prepared with the synthetic key' { & $make -Setup $setup -Folder (Join-Path $Work 's') -ProductMode hybrid -KeysetKind synthetic-test -ExpectedKeysetSha256 ('0' * 64) -SyntheticSigningKey $SyntheticKey; if (-not (Test-Path (Join-Path $Work 's\scripts\signing-key.json'))) { throw 'key not copied' } }
 T 'production run with a signing key is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x1') -ProductMode local -KeysetKind production -ExpectedKeysetSha256 $prod -SyntheticSigningKey $SyntheticKey } 'never receives a signing key'
 T 'synthetic-test run without a key is refused' { & $make -Setup $setup -Folder (Join-Path $Work 'x2') -ProductMode local -KeysetKind synthetic-test -ExpectedKeysetSha256 $prod } 'needs -SyntheticSigningKey'
