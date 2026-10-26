@@ -9,7 +9,6 @@ naming every module that failed, so setup stops visibly instead of installing a
 service that crashes on every start.
 """
 import importlib
-import json
 import os
 import sys
 import tempfile
@@ -47,23 +46,34 @@ def check(modules=None):
         try:
             from ultralytics import YOLO  # noqa: F401  (the name app/main.py imports)
             from ultralytics import settings
-            from ultralytics.utils.events import events
-            if settings.get("sync") is not False or getattr(events, "enabled", None) is not False:
+            if settings.get("sync") is not False:
                 failures.append("ultralytics: outbound telemetry is not disabled")
         except Exception as exc:
             failures.append(f"ultralytics.YOLO: {type(exc).__name__}: {exc}")
     return failures
 
 
+def prepare_ultralytics_config(config_root):
+    """Use the same fail-closed settings preparation as the application.
+
+    Ultralytics 8.3.40 reads ``<YOLO_CONFIG_DIR>/settings.json`` and validates
+    the full settings schema before initializing telemetry. The installer
+    preflight must prepare that exact file before importing the package.
+    """
+    app_root = Path(__file__).resolve().parents[1]
+    if str(app_root) not in sys.path:
+        sys.path.insert(0, str(app_root))
+    from ultralytics_privacy import _prepare_settings_file
+
+    _prepare_settings_file(Path(config_root), verify_acl=False)
+    os.environ["YOLO_CONFIG_DIR"] = str(config_root)
+
+
 def main():
     # Keep ultralytics' first-import settings file out of the installing
-    # user's profile and opt out before importing it. Its telemetry sender
-    # snapshots this value during package import.
+    # user's profile and write a complete, valid opt-out before importing it.
     config_root = Path(tempfile.mkdtemp(prefix="anyaicam-preflight-"))
-    settings_dir = config_root / "Ultralytics"
-    settings_dir.mkdir()
-    (settings_dir / "settings.json").write_text(json.dumps({"sync": False}), encoding="utf-8")
-    os.environ["YOLO_CONFIG_DIR"] = str(config_root)
+    prepare_ultralytics_config(config_root)
     failures = check()
     if failures:
         # stdout only: the setup log records it, and Windows PowerShell 5.1

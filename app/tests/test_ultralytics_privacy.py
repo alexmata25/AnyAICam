@@ -2,6 +2,7 @@
 import ast
 import builtins
 import json
+import os
 import socket
 import sys
 import types
@@ -13,14 +14,20 @@ import ultralytics_privacy as privacy
 
 
 def _fake_ultralytics(monkeypatch, settings_dir, outbound):
-    settings = {"sync": json.loads((settings_dir / "Ultralytics" / "settings.json").read_text(encoding="utf-8"))["sync"]}
-    events = types.SimpleNamespace(enabled=settings["sync"])
+    settings_file = settings_dir / "settings.json"
+
+    def read_settings():
+        return json.loads(settings_file.read_text(encoding="utf-8"))
+
+    def update_settings(values):
+        settings = read_settings()
+        settings.update(values)
+        settings_file.write_text(json.dumps(settings), encoding="utf-8")
 
     class YOLO:
         def __init__(self, *_args, **_kwargs):
-            # Model initialization is the first point at which a library event
-            # could be emitted. The fake mirrors Events' settings gate.
-            if events.enabled:
+            # Model initialization follows the library's sync setting gate.
+            if read_settings()["sync"]:
                 outbound.append(True)
                 urllib.request.urlopen("https://telemetry.invalid")
 
@@ -28,25 +35,17 @@ def _fake_ultralytics(monkeypatch, settings_dir, outbound):
     ultralytics.__path__ = []
     ultralytics.YOLO = YOLO
     ultralytics.settings = types.SimpleNamespace(
-        get=settings.get,
-        update=lambda values: (settings.update(values), setattr(events, "enabled", settings["sync"])),
+        get=lambda key: read_settings().get(key),
+        update=update_settings,
     )
-    utils = types.ModuleType("ultralytics.utils")
-    utils.__path__ = []
-    events_module = types.ModuleType("ultralytics.utils.events")
-    events_module.events = events
     monkeypatch.setitem(sys.modules, "ultralytics", ultralytics)
-    monkeypatch.setitem(sys.modules, "ultralytics.utils", utils)
-    monkeypatch.setitem(sys.modules, "ultralytics.utils.events", events_module)
-    return events
+    return ultralytics.settings
 
 
 def test_opt_out_is_written_before_import_and_model_use_has_no_outbound_calls(tmp_path, monkeypatch):
     config_dir = tmp_path / "ultralytics"
     config_dir.mkdir()
-    settings_dir = config_dir / "Ultralytics"
-    settings_dir.mkdir()
-    settings_file = settings_dir / "settings.json"
+    settings_file = config_dir / "settings.json"
     settings_file.write_text(json.dumps({"sync": True, "custom_setting": "keep"}), encoding="utf-8")
     monkeypatch.setattr(privacy, "_settings_path", lambda: config_dir)
     # This test uses a user-owned temp directory; production Windows paths are
@@ -54,13 +53,14 @@ def test_opt_out_is_written_before_import_and_model_use_has_no_outbound_calls(tm
     import platform_paths
     monkeypatch.setattr(platform_paths, "windows_write_problem", lambda _path: "")
     outbound = []
-    events = _fake_ultralytics(monkeypatch, config_dir, outbound)
+    settings = _fake_ultralytics(monkeypatch, config_dir, outbound)
     real_import = builtins.__import__
 
     def checked_import(name, *args, **kwargs):
         if name == "ultralytics":
-            # The opt-out file must exist before the package initializes its
-            # Events singleton.
+            # The complete file must exist at the path the pinned package
+            # reads before its telemetry setup runs.
+            assert os.environ["YOLO_CONFIG_DIR"] == str(config_dir)
             assert json.loads(settings_file.read_text(encoding="utf-8"))["sync"] is False
         return real_import(name, *args, **kwargs)
 
@@ -71,17 +71,20 @@ def test_opt_out_is_written_before_import_and_model_use_has_no_outbound_calls(tm
     model = privacy.load_yolo_class()("fixture.pt")
 
     assert isinstance(model, object)
-    assert json.loads(settings_file.read_text(encoding="utf-8")) == {"sync": False, "custom_setting": "keep"}
-    assert events.enabled is False
+    persisted = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert persisted["sync"] is False
+    assert persisted["settings_version"] == "0.0.6"
+    assert len(persisted) == 18
+    assert "custom_setting" not in persisted
+    assert not (config_dir / "Ultralytics" / "settings.json").exists()
+    assert settings.get("sync") is False
     assert outbound == []
 
 
 def test_malformed_settings_fail_closed_before_ultralytics_import(tmp_path, monkeypatch):
     config_dir = tmp_path / "ultralytics"
     config_dir.mkdir()
-    settings_dir = config_dir / "Ultralytics"
-    settings_dir.mkdir()
-    (settings_dir / "settings.json").write_text("not-json", encoding="utf-8")
+    (config_dir / "settings.json").write_text("not-json", encoding="utf-8")
     monkeypatch.setattr(privacy, "_settings_path", lambda: config_dir)
     monkeypatch.setitem(sys.modules, "ultralytics", None)
 
@@ -92,20 +95,16 @@ def test_malformed_settings_fail_closed_before_ultralytics_import(tmp_path, monk
 def test_sender_that_ignores_the_opt_out_fails_closed(tmp_path, monkeypatch):
     config_dir = tmp_path / "ultralytics"
     config_dir.mkdir()
-    settings_dir = config_dir / "Ultralytics"
-    settings_dir.mkdir()
-    (settings_dir / "settings.json").write_text(json.dumps({"sync": True}), encoding="utf-8")
+    (config_dir / "settings.json").write_text(json.dumps({"sync": True}), encoding="utf-8")
     monkeypatch.setattr(privacy, "_settings_path", lambda: config_dir)
     import platform_paths
     monkeypatch.setattr(platform_paths, "windows_write_problem", lambda _path: "")
     _fake_ultralytics(monkeypatch, config_dir, [])
     settings = sys.modules["ultralytics"].settings
-    monkeypatch.setattr(settings, "get", lambda _key: False)
+    monkeypatch.setattr(settings, "get", lambda _key: True)
     monkeypatch.setattr(settings, "update", lambda _values: None)
-    events_module = sys.modules["ultralytics.utils.events"]
-    events_module.events.enabled = True
 
-    with pytest.raises(privacy.TelemetryOptOutError, match="sender is not disabled"):
+    with pytest.raises(privacy.TelemetryOptOutError, match="did not remain disabled"):
         privacy.load_yolo_class()
 
 
