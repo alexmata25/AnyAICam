@@ -41,7 +41,9 @@ def test_capture_cuts_the_listening_window_out_of_the_right_buffer_segments(tmp_
             calls.append((cmd, listing_file.read()))
         return type("R", (), {"stdout": b"\x01\x00" * 16000 * 8})()
 
-    start = datetime(2026, 9, 28, 3, 13, 25, tzinfo=timezone.utc)
+    # Segment names are local time (FFmpeg -strftime); W-2 made this test
+    # zone-independent -- on the Linux container local time is UTC anyway.
+    start = datetime(2026, 9, 28, 3, 13, 25).astimezone()
     pcm = listen.capture_window(tmp_path, start, 8.0, runner=runner)
     assert pcm and len(pcm) == 16000 * 8 * 2
     cmd, listing = calls[0]

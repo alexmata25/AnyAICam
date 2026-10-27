@@ -60,10 +60,14 @@ class Transcriber(Protocol):
 # ---------------------------------------------------------------- audio capture
 
 def _segment_start(path: Path) -> datetime | None:
-    """buf<N>_YYYY-mm-dd_HH-MM-SS.mkv -> its start time (UTC, like the name)."""
+    """buf<N>_YYYY-mm-dd_HH-MM-SS.mkv -> its start time, as an aware datetime.
+
+    The name is LOCAL time: FFmpeg's -strftime uses localtime(), and main.py's
+    janitor reads the same names as local (W-2, 2026-10-27). UTC only on a
+    host whose zone is UTC (the Linux container); a Windows PC usually isn't."""
     try:
         stamp = path.stem.split("_", 1)[1]
-        return datetime.strptime(stamp, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(stamp, "%Y-%m-%d_%H-%M-%S").astimezone()
     except (IndexError, ValueError):
         return None
 
