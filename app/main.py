@@ -38861,8 +38861,8 @@ def get_yolo_model():
             # inference pass can't claim every core on an appliance
             # also running 5 live ffmpeg streams, 5 recorders, and
             # motion detection.
-            if torch is not None:
-                torch.set_num_threads(2)
+            from inference_threads import limit_torch_threads
+            limit_torch_threads()  # shared with PPE/LPR loaders (W-4)
             yolo_model = YOLO(YOLO_MODEL_NAME)
 
 

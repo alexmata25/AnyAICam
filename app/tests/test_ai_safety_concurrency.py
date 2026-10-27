@@ -63,6 +63,11 @@ def _reset_ai_globals(monkeypatch):
     _FakeYOLO.construct_count = 0
     fake_torch = _FakeTorch()
     monkeypatch.setattr(main, "torch", fake_torch)
+    # W-4: the cap is shared (inference_threads), which imports torch itself.
+    import sys
+    import inference_threads
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(inference_threads, "_applied", False)
     monkeypatch.setattr(main, "YOLO", _FakeYOLO)
     # Detector-loop tests exercise an entitled/operational camera. The
     # Control Center now intentionally pauses inference for all-OFF cameras.

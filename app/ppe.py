@@ -68,6 +68,8 @@ def _get_model():
     if _model is not None or _model_load_failed:
         return _model
     try:
+        from inference_threads import limit_torch_threads
+        limit_torch_threads()
         _model = YOLO(PPE_MODEL_NAME)
     except Exception:
         _model_load_failed = True

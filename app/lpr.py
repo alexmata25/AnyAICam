@@ -296,6 +296,8 @@ def _get_plate_model():
                 raise FileNotFoundError(LPR_PLATE_MODEL_PATH)
             from ultralytics_privacy import load_yolo_class
             YOLO = load_yolo_class()
+            from inference_threads import limit_torch_threads
+            limit_torch_threads()
             _plate_model = YOLO(LPR_PLATE_MODEL_PATH)
         except Exception:
             _plate_model_failed = True
