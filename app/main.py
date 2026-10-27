@@ -55671,6 +55671,43 @@ def _legacy_camera_status() -> dict:
 
 
 
+_PSUTIL_CPU_PRIMED = False
+_PSUTIL_CPU_MIN_INTERVAL_SECONDS = 1.0
+_psutil_cpu_last: tuple[float, float] | None = None  # (monotonic, percent)
+
+
+def _psutil_cpu_memory(need_cpu: bool, need_memory: bool) -> tuple[float | None, float | None]:
+    """CPU and memory where os.getloadavg and /proc/meminfo don't exist (Windows,
+    W-3 2026-10-27). psutil's first cpu_percent() has no baseline and returns 0.0,
+    so the first call measures a short 0.2 s interval; later calls never block.
+    cpu_percent(None) measures since the previous call, so a call within
+    _PSUTIL_CPU_MIN_INTERVAL_SECONDS of the last reading reuses it (no 0 % noise)."""
+    global _PSUTIL_CPU_PRIMED, _psutil_cpu_last
+    try:
+        import psutil
+    except ImportError:
+        return None, None
+    cpu = memory = None
+    try:
+        if need_cpu:
+            now = time.monotonic()
+            if not _PSUTIL_CPU_PRIMED:
+                psutil.cpu_percent(interval=None)
+                cpu = psutil.cpu_percent(interval=0.2)
+                _PSUTIL_CPU_PRIMED = True
+            elif _psutil_cpu_last is not None and now - _psutil_cpu_last[0] < _PSUTIL_CPU_MIN_INTERVAL_SECONDS:
+                cpu = _psutil_cpu_last[1]
+            else:
+                cpu = psutil.cpu_percent(interval=None)
+            cpu = min(100.0, round(float(cpu), 1))
+            _psutil_cpu_last = (now, cpu)
+        if need_memory:
+            memory = round(float(psutil.virtual_memory().percent), 1)
+    except Exception:
+        pass
+    return cpu, memory
+
+
 def system_metrics() -> dict:
 
 
@@ -55725,7 +55762,7 @@ def system_metrics() -> dict:
 
 
 
-        cpu_percent = 0
+        cpu_percent = None
 
 
 
@@ -55833,7 +55870,9 @@ def system_metrics() -> dict:
 
 
 
-    except (OSError, ValueError, IndexError):
+    except OSError:
+        memory_percent = None
+    except (ValueError, IndexError):
 
 
 
@@ -55843,6 +55882,12 @@ def system_metrics() -> dict:
 
 
         pass
+    if cpu_percent is None or memory_percent is None:
+        psutil_cpu, psutil_memory = _psutil_cpu_memory(cpu_percent is None, memory_percent is None)
+        if cpu_percent is None:
+            cpu_percent = psutil_cpu if psutil_cpu is not None else 0
+        if memory_percent is None:
+            memory_percent = psutil_memory if psutil_memory is not None else 0.0
 
 
 
