@@ -599,7 +599,10 @@ def latest_full_resolution_frame(camera_number, buffer_dir, *, now: float | None
         for entry in os.scandir(buffer_dir):
             if entry.name.endswith(".mkv"):
                 try:
-                    mtime = entry.stat().st_mtime
+                    # os.stat, not entry.stat() (W-1, 2026-10-27): on NTFS the
+                    # directory entry of a segment FFmpeg still has open keeps
+                    # its creation-time mtime, so the live segment looked stale.
+                    mtime = os.stat(entry.path).st_mtime
                 except OSError:
                     continue
                 if abs(wall_now - mtime) <= LPR_FULL_RES_MAX_AGE_SECONDS:
