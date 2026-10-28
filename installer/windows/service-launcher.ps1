@@ -34,6 +34,9 @@ $env:ANYAICAM_MEDIAMTX_CONFIG = Join-Path $dataRoot 'mediamtx\anyaicam-mediamtx.
 $env:ANYAICAM_STATE_DIR = Join-Path $dataRoot 'agent'
 $env:PYTHONUNBUFFERED = '1'
 $env:PATH = (Join-Path $installRoot 'runtime\tools\ffmpeg') + ';' + $env:PATH
+# 1.3.4: the bundled Tesseract OCR engine for licence plate reading (install-runtime.ps1), and its model folder.
+$env:PATH = (Join-Path $installRoot 'runtime\tools\tesseract') + ';' + $env:PATH
+$env:TESSDATA_PREFIX = Join-Path $installRoot 'runtime\tools\tesseract\tessdata'
 foreach ($folder in @($env:ANYAICAM_RECORDINGS_FOLDER, $env:ANYAICAM_HLS_FOLDER,
                       (Split-Path -Parent $env:ANYAICAM_PARTNER_DB), (Split-Path -Parent $env:ANYAICAM_MEDIAMTX_CONFIG))) {
     New-Item -ItemType Directory -Force -Path $folder | Out-Null

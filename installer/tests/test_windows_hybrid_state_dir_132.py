@@ -30,9 +30,10 @@ class StaticTests(unittest.TestCase):
         self.assertIn(line, agent)                       # the very same folder the agent writes
         self.assertLess(vms.index("foreach ($line in Get-Content -LiteralPath $environmentFile)"), vms.index(line))
 
-    def test_installer_defaults_the_linux_analytics_switches_and_never_lpr(self):
+    def test_installer_defaults_the_linux_analytics_switches(self):
+        # 1.3.4: LPR is defaulted as on Linux (06-deploy-vms.sh) now that Tesseract is bundled; never facial or PPE.
         runtime = read("install-runtime.ps1")
-        self.assertIn("foreach ($analyticsFlag in @('PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED'))", runtime)
+        self.assertIn("foreach ($analyticsFlag in @('ANYAICAM_LPR_ENABLED', 'PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED'))", runtime)
         self.assertIn("if (-not $values.Contains($analyticsFlag)) { $values[$analyticsFlag] = 'true' }", runtime)
         for never in ("ANYAICAM_LPR_ENABLED", "ANYAICAM_FACIAL_RECOGNITION_ENABLED", "ANYAICAM_PPE_ENABLED"):
             self.assertNotIn(f"$values['{never}']", runtime)

@@ -5,6 +5,8 @@ claude/red-127-analytics-default-off). The installer must not undercut it:
   * it never turns a premium analytic on (no per-feature ON switch, no camera or database state);
   * the only analytics keys it writes are the appliance CAPABILITY switches the Linux installer also defaults
     (06-deploy-vms.sh): People Counting and the rule analytics, add-if-missing, so an explicit false survives upgrade;
+    1.3.4 (LPR parity): ANYAICAM_LPR_ENABLED joins them, as on Linux, now that the Tesseract engine is bundled. It is an
+    appliance capability switch there too; the per-camera entitlement and enable still decide whether LPR runs;
   * it never turns basic (pixel-change) motion detection off.
 """
 import os
@@ -17,9 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WIN = ROOT / "installer" / "windows"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
-PREMIUM_SWITCHES = ("ANYAICAM_SMART_MOTION_ENABLED", "ANYAICAM_LPR_ENABLED", "ANYAICAM_PPE_ENABLED",
-                    "ANYAICAM_FACIAL_RECOGNITION_ENABLED")
-CAPABILITY_SWITCHES = ("PEOPLE_COUNTING_ENABLED", "CUSTOMER_ANALYTICS_RULES_ENABLED")
+PREMIUM_SWITCHES = ("ANYAICAM_SMART_MOTION_ENABLED", "ANYAICAM_PPE_ENABLED", "ANYAICAM_FACIAL_RECOGNITION_ENABLED")
+CAPABILITY_SWITCHES = ("ANYAICAM_LPR_ENABLED", "PEOPLE_COUNTING_ENABLED", "CUSTOMER_ANALYTICS_RULES_ENABLED")
 
 
 def read(name):
@@ -48,7 +49,7 @@ class StaticTests(unittest.TestCase):
         runtime = read("install-runtime.ps1")
         written = set(re.findall(r"\$values\['([A-Z_]*ENABLED)'\]", runtime))
         self.assertEqual(written, set())                                    # nothing written by literal key
-        self.assertIn("@('PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED')", runtime)
+        self.assertIn("@('ANYAICAM_LPR_ENABLED', 'PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED')", runtime)
 
 
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "needs Windows PowerShell")
@@ -71,10 +72,10 @@ class UpgradeMergeTests(unittest.TestCase):
         self.assertEqual(self.merge({}), {key: "true" for key in CAPABILITY_SWITCHES})
 
     def test_an_explicit_false_survives_an_upgrade(self):
-        merged = self.merge({"PEOPLE_COUNTING_ENABLED": "false", "CUSTOMER_ANALYTICS_RULES_ENABLED": "false",
-                             "ANYAICAM_PPE_ENABLED": "false"})
-        self.assertEqual(merged, {"PEOPLE_COUNTING_ENABLED": "false", "CUSTOMER_ANALYTICS_RULES_ENABLED": "false",
-                                  "ANYAICAM_PPE_ENABLED": "false"})
+        merged = self.merge({"ANYAICAM_LPR_ENABLED": "false", "PEOPLE_COUNTING_ENABLED": "false",
+                             "CUSTOMER_ANALYTICS_RULES_ENABLED": "false", "ANYAICAM_PPE_ENABLED": "false"})
+        self.assertEqual(merged, {"ANYAICAM_LPR_ENABLED": "false", "PEOPLE_COUNTING_ENABLED": "false",
+                                  "CUSTOMER_ANALYTICS_RULES_ENABLED": "false", "ANYAICAM_PPE_ENABLED": "false"})
 
 
 if __name__ == "__main__":

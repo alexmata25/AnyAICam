@@ -1,0 +1,328 @@
+{
+ "bundle": "tesseract-5.5.2-win64-anyaicam",
+ "purpose": "Windows LPR OCR engine (1.3.4 parity). Linux uses Debian tesseract-ocr + tesseract-ocr-eng (tessdata_fast).",
+ "source": "conda-forge win-64 packages (https://conda.anaconda.org/conda-forge); SHA-256 values are the ones conda-forge publishes (api.anaconda.org), checked again on download.",
+ "why_5_5_2": "5.5.3 adds a declared libcurl dependency tree; 5.5.2 is the newest build otherwise identical in engine. Both builds import archive.dll and libcurl.dll.",
+ "license_review": {
+  "copyleft": [
+   {
+    "package": "libiconv",
+    "license": "LGPL-2.1-only",
+    "dlls": [
+     "iconv.dll",
+     "charset.dll"
+    ],
+    "why_needed": "archive.dll and libxml2.dll import it; tesseract55.dll imports archive.dll",
+    "status": "LEGAL GATE before customer distribution (same class as psycopg-binary LGPL): notice + source offer for libiconv 1.18 + replaceability. Remedy without LGPL: a Tesseract build with -DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON (needs a compiler toolchain; not available on the Dell)."
+   }
+  ],
+  "not_bundled": {
+   "lzo": "GPL-2.0-or-later: declared by libarchive but archive.dll does not import lzo2.dll",
+   "krb5": "declared by libcurl, not imported",
+   "ca-certificates": "data only, not needed"
+  }
+ },
+ "model": {
+  "package": "tesseract",
+  "member": "share/tessdata/eng.traineddata",
+  "sha256": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+  "note": "byte-identical to tessdata_fast 4.1.0 eng.traineddata (Apache-2.0), as on Linux"
+ },
+ "packages": [
+  {
+   "name": "bzip2",
+   "version": "1.0.8",
+   "file": "bzip2-1.0.8-h0ad9c76_10.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/bzip2-1.0.8-h0ad9c76_10.conda",
+   "sha256": "04767466ee9227c9c57ab2c6503e0149177d34111c7418d2f420297acb1eb229",
+   "license": "bzip2-1.0.6"
+  },
+  {
+   "name": "giflib",
+   "version": "5.2.2",
+   "file": "giflib-5.2.2-hb0bd012_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/giflib-5.2.2-hb0bd012_1.conda",
+   "sha256": "573af9bb6294d125a0be6dc4963e589188da92426c3887feb60dd22a07530e4f",
+   "license": "MIT"
+  },
+  {
+   "name": "icu",
+   "version": "78.3",
+   "file": "icu-78.3-h5112557_2.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/icu-78.3-h5112557_2.conda",
+   "sha256": "75c549b55b673e15de8785a8e5dd85bca7eb612eee0ff4dc8d7bdaa15eacbdbb",
+   "license": "MIT"
+  },
+  {
+   "name": "leptonica",
+   "version": "1.87.0",
+   "file": "leptonica-1.87.0-hb83fb89_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/leptonica-1.87.0-hb83fb89_1.conda",
+   "sha256": "6a0e2e099c4b530300fdcc092ddd0ffcc5383dbd04cdf03b232996857b3017d8",
+   "license": "BSD-2-Clause"
+  },
+  {
+   "name": "lerc",
+   "version": "4.2.0",
+   "file": "lerc-4.2.0-hd936e49_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/lerc-4.2.0-hd936e49_0.conda",
+   "sha256": "93d666f63f284ef77b87b0b1f77b70f7d36d315a132f9afa64bc0012d937ba39",
+   "license": "Apache-2.0"
+  },
+  {
+   "name": "libarchive",
+   "version": "3.8.9",
+   "file": "libarchive-3.8.9-gpl_h8fdc8af_101.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libarchive-3.8.9-gpl_h8fdc8af_101.conda",
+   "sha256": "71cb6e49282d2aee1eb0249a290dc2333b0063ac2ecec69116ad569d822a0aaf",
+   "license": "BSD-2-Clause"
+  },
+  {
+   "name": "libcurl",
+   "version": "8.23.0",
+   "file": "libcurl-8.23.0-hdb0ef4a_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libcurl-8.23.0-hdb0ef4a_0.conda",
+   "sha256": "d3088e1fd049fe0c1905ba6174e77279ddb4817739a204aaf4bd31d59d38ea6a",
+   "license": "curl"
+  },
+  {
+   "name": "libdeflate",
+   "version": "1.26",
+   "file": "libdeflate-1.26-h1a1d4e4_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libdeflate-1.26-h1a1d4e4_0.conda",
+   "sha256": "f51f28e894579387a531c53d97e058642ecfb232c4cb156c43c9121a9044f3d8",
+   "license": "MIT"
+  },
+  {
+   "name": "libiconv",
+   "version": "1.18",
+   "file": "libiconv-1.18-hc1393d2_3.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libiconv-1.18-hc1393d2_3.conda",
+   "sha256": "35e04e3ddac7720fc7c550a1c9f998604299d6a7bd1f3ec9b2825d825061daa2",
+   "license": "LGPL-2.1-only"
+  },
+  {
+   "name": "libjpeg-turbo",
+   "version": "3.2.0",
+   "file": "libjpeg-turbo-3.2.0-hfd05255_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libjpeg-turbo-3.2.0-hfd05255_1.conda",
+   "sha256": "df78ab4c0eecb3dd9331898f96baeed8e5ca1c363346332517abeb0b614b9a53",
+   "license": "IJG AND BSD-3-Clause AND Zlib"
+  },
+  {
+   "name": "liblzma",
+   "version": "5.8.3",
+   "file": "liblzma-5.8.3-hfd05255_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/liblzma-5.8.3-hfd05255_1.conda",
+   "sha256": "d36c4a1e1f80fd08e18a407e03622ff2f34dfdd022da6488ad19603dea19e6d5",
+   "license": "0BSD"
+  },
+  {
+   "name": "libpng",
+   "version": "1.6.59",
+   "file": "libpng-1.6.59-hdc8cecf_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libpng-1.6.59-hdc8cecf_0.conda",
+   "sha256": "36050852deae6edc98d7b71489b8d07254e2753c69bd524bf5784927cd1f0b2c",
+   "license": "zlib-acknowledgement"
+  },
+  {
+   "name": "libpsl",
+   "version": "0.23.1",
+   "file": "libpsl-0.23.1-h9b16d47_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libpsl-0.23.1-h9b16d47_1.conda",
+   "sha256": "e53fe3b09f82b59b644264133d6d148ac31bb5451b7583cff55690bf038f2f62",
+   "license": "MIT"
+  },
+  {
+   "name": "libssh2",
+   "version": "1.11.1",
+   "file": "libssh2-1.11.1-h734d217_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libssh2-1.11.1-h734d217_1.conda",
+   "sha256": "1097b08429b4f53f5751a32c6d99a083d227ca7f7812c0b239eea124cec073a0",
+   "license": "BSD-3-Clause"
+  },
+  {
+   "name": "libtiff",
+   "version": "4.7.2",
+   "file": "libtiff-4.7.2-h8f73337_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libtiff-4.7.2-h8f73337_1.conda",
+   "sha256": "3575a092e3e52625a1767804a4ebd321becaadf61b63dcd6735ebb88c0b3c359",
+   "license": "HPND"
+  },
+  {
+   "name": "libwebp-base",
+   "version": "1.6.0",
+   "file": "libwebp-base-1.6.0-h4d5522a_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libwebp-base-1.6.0-h4d5522a_1.conda",
+   "sha256": "4470d98d3178b0d45492eed4808afe421d2e7808352b8d06c2dc29166b75d94d",
+   "license": "BSD-3-Clause"
+  },
+  {
+   "name": "libxml2-16",
+   "version": "2.15.4",
+   "file": "libxml2-16-2.15.4-h3cfd58e_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libxml2-16-2.15.4-h3cfd58e_1.conda",
+   "sha256": "819c4edd7b7bcfa9461aeccb56c0a7e9fa7c251163333e64222c142499822958",
+   "license": "MIT"
+  },
+  {
+   "name": "libzlib",
+   "version": "1.3.2",
+   "file": "libzlib-1.3.2-hfd05255_3.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libzlib-1.3.2-hfd05255_3.conda",
+   "sha256": "0629c2cc0404d3bb29d6baa7b4ba62da80797015e86de050db81ea5a07050527",
+   "license": "Zlib"
+  },
+  {
+   "name": "lz4-c",
+   "version": "1.10.0",
+   "file": "lz4-c-1.10.0-h6a83c73_2.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/lz4-c-1.10.0-h6a83c73_2.conda",
+   "sha256": "6824e36be0f95ae516dc36dddd18f69cbad0e4e07906fcb10a5f26a8dc471903",
+   "license": "BSD-2-Clause"
+  },
+  {
+   "name": "openjpeg",
+   "version": "2.5.4",
+   "file": "openjpeg-2.5.4-h90fa87c_2.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/openjpeg-2.5.4-h90fa87c_2.conda",
+   "sha256": "d1c630ccd9ae0898b48d84e986f4c330f66a25e535f99efe8cbf03f042b33da5",
+   "license": "BSD-2-Clause"
+  },
+  {
+   "name": "openssl",
+   "version": "3.6.5",
+   "file": "openssl-3.6.5-hf411b9b_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.5-hf411b9b_0.conda",
+   "sha256": "bc44625e0c6d83f3e02b5f6adc01e0e3ca7001d3d94e24959591a57f5a011b9a",
+   "license": "Apache-2.0"
+  },
+  {
+   "name": "tesseract",
+   "version": "5.5.2",
+   "file": "tesseract-5.5.2-hfa586c3_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/tesseract-5.5.2-hfa586c3_0.conda",
+   "sha256": "eca334e9aeb0b4206f3b6ecd1a25d93514960a7518522545e7814987c979359f",
+   "license": "Apache-2.0"
+  },
+  {
+   "name": "zstd",
+   "version": "1.5.7",
+   "file": "zstd-1.5.7-h534d264_7.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_7.conda",
+   "sha256": "ca7daae4f218a11fab82cc2857f0ea518ec3f46acec60490485347a4c22c6b3e",
+   "license": "BSD-3-Clause"
+  }
+ ],
+ "dlls": [
+  {
+   "dll": "archive.dll",
+   "package": "libarchive"
+  },
+  {
+   "dll": "charset.dll",
+   "package": "libiconv"
+  },
+  {
+   "dll": "deflate.dll",
+   "package": "libdeflate"
+  },
+  {
+   "dll": "gif-7.dll",
+   "package": "giflib"
+  },
+  {
+   "dll": "iconv.dll",
+   "package": "libiconv"
+  },
+  {
+   "dll": "icudt78.dll",
+   "package": "icu"
+  },
+  {
+   "dll": "icuuc78.dll",
+   "package": "icu"
+  },
+  {
+   "dll": "jpeg8.dll",
+   "package": "libjpeg-turbo"
+  },
+  {
+   "dll": "leptonica-1.87.0.dll",
+   "package": "leptonica"
+  },
+  {
+   "dll": "lerc.dll",
+   "package": "lerc"
+  },
+  {
+   "dll": "libbz2.dll",
+   "package": "bzip2"
+  },
+  {
+   "dll": "libcrypto-3-x64.dll",
+   "package": "openssl"
+  },
+  {
+   "dll": "libcurl.dll",
+   "package": "libcurl"
+  },
+  {
+   "dll": "liblzma.dll",
+   "package": "liblzma"
+  },
+  {
+   "dll": "libpng16.dll",
+   "package": "libpng"
+  },
+  {
+   "dll": "libsharpyuv.dll",
+   "package": "libwebp-base"
+  },
+  {
+   "dll": "libssh2.dll",
+   "package": "libssh2"
+  },
+  {
+   "dll": "libwebp.dll",
+   "package": "libwebp-base"
+  },
+  {
+   "dll": "libwebpmux.dll",
+   "package": "libwebp-base"
+  },
+  {
+   "dll": "libxml2.dll",
+   "package": "libxml2-16"
+  },
+  {
+   "dll": "lz4.dll",
+   "package": "lz4-c"
+  },
+  {
+   "dll": "openjp2.dll",
+   "package": "openjpeg"
+  },
+  {
+   "dll": "psl-5.dll",
+   "package": "libpsl"
+  },
+  {
+   "dll": "tesseract55.dll",
+   "package": "tesseract"
+  },
+  {
+   "dll": "tiff.dll",
+   "package": "libtiff"
+  },
+  {
+   "dll": "zlib.dll",
+   "package": "libzlib"
+  },
+  {
+   "dll": "zstd.dll",
+   "package": "zstd"
+  }
+ ],
+ "bundle_sha256": "0bdeb0f30d96241554a83b29fa1072d1fd19048725d417ada9b8aa4ecaa083d6"
+}

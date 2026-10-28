@@ -42,6 +42,9 @@ $pinned = [ordered]@{
     'vc_redist.x64-14.44.35211.exe'         = 'cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b'
     # 1.3.2 Voice Call listening: the Linux Dockerfiles' pin (alphacephei.com/vosk/models, Apache-2.0).
     'vosk-model-small-en-us-0.15.zip'       = '30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498'
+    # 1.3.4 LPR parity: Tesseract 5.5.2 + its DLL closure + tessdata_fast eng, assembled deterministically from pinned
+    # conda-forge packages by prepare-tesseract-bundle.py (tesseract-bundle.lock.json; licences inside the zip).
+    'tesseract-5.5.2-win64-anyaicam.zip'    = '0bdeb0f30d96241554a83b29fa1072d1fd19048725d417ada9b8aa4ecaa083d6'
 }
 foreach ($file in $pinned.Keys) {
     $path = Join-Path $vendor $file
@@ -90,14 +93,14 @@ if ($AzureSign) {
     $compilerArguments += '/SAnyAiCamSign=' + $signCommand
 }
 # Runtime catalog (2026-10-08, runtime-catalog.ps1): Smart App Control blocks
-# the runtime's unsigned native files (wheels, WinSW, FFmpeg, MediaMTX). One
+# the runtime's unsigned native files (wheels, WinSW, FFmpeg, MediaMTX, Tesseract). One
 # catalog of their hashes, signed with the same certificate, is registered by
 # the setup. Built from exactly the pinned inputs verified above.
 . (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
 $outputDir = Join-Path $PSScriptRoot 'output'
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 $catalog = Join-Path $outputDir 'AnyAiCamRuntime.cat'
-$nativeArchives = @($lockedWheels | ForEach-Object { Join-Path $wheelRoot $_ }) + @('python-3.12.10-embed-amd64.zip', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip' | ForEach-Object { Join-Path $vendor $_ })
+$nativeArchives = @($lockedWheels | ForEach-Object { Join-Path $wheelRoot $_ }) + @('python-3.12.10-embed-amd64.zip', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip', 'tesseract-5.5.2-win64-anyaicam.zip' | ForEach-Object { Join-Path $vendor $_ })
 $catalogStage = Join-Path $outputDir 'runtime-catalog'
 [void](Export-NativeFiles $catalogStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
 $makeCat = if ($env:ANYAICAM_MAKECAT_PATH) { $env:ANYAICAM_MAKECAT_PATH } else { 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makecat.exe' }

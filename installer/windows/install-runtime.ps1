@@ -7,6 +7,8 @@ param(
     [Parameter(Mandatory=$true)][string]$WheelRoot,
     [Parameter(Mandatory=$true)][string]$FFmpegArchive,
     [Parameter(Mandatory=$true)][string]$MediaMtxArchive,
+    # 1.3.4: the Tesseract OCR engine bundle for licence plate reading (prepare-tesseract-bundle.py).
+    [Parameter(Mandatory=$true)][string]$TesseractArchive,
     # 1.3.2: the pinned Vosk speech model for Voice Call listening (install-stt-model.ps1).
     [Parameter(Mandatory=$true)][string]$SttModelArchive,
     [Parameter(Mandatory=$true)][string]$AppVersion,
@@ -78,6 +80,38 @@ try {
     New-Item -ItemType Directory -Force -Path $mediamtxRoot | Out-Null
     Copy-Item -Path (Join-Path $mediamtxTemp 'mediamtx.exe'), (Join-Path $mediamtxTemp 'LICENSE') -Destination $mediamtxRoot -Force
 } finally { if (Test-Path $mediamtxTemp) { Remove-Item $mediamtxTemp -Recurse -Force } }
+
+# Tesseract OCR (1.3.4, LPR parity): tesseract.exe, its DLLs and the English model, the same OCR Linux gets from
+# Debian's tesseract-ocr. Every file is checked against the bundle's own manifest (and nothing unlisted may be in it)
+# before it replaces the old copy; the folder is replaced as a whole on every install, so an upgrade never mixes
+# versions. service-launcher.ps1 puts it on PATH (analytics_platform finds it there) and sets TESSDATA_PREFIX.
+$tesseractRoot = Join-Path $InstallRoot 'runtime\tools\tesseract'
+$tesseractTemp = Join-Path $env:TEMP ('anyaicam-tesseract-' + [guid]::NewGuid().ToString('N'))
+try {
+    Expand-Archive -LiteralPath $TesseractArchive -DestinationPath $tesseractTemp -Force
+    $bundleManifest = Get-Content -LiteralPath (Join-Path $tesseractTemp 'BUNDLE-MANIFEST.json') -Raw | ConvertFrom-Json
+    $listed = @($bundleManifest.files.PSObject.Properties)
+    if ($listed.Count -lt 3) { throw 'The Tesseract bundle manifest lists no files.' }
+    foreach ($file in $listed) {
+        $path = Join-Path $tesseractTemp ($file.Name -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Tesseract bundle file missing: $($file.Name)" }
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() -ne $file.Value.sha256) { throw "Tesseract bundle file failed its checksum: $($file.Name)" }
+    }
+    # Cut relative names from the folder's own full spelling: TEMP may be an 8.3 short path (source-integrity.ps1).
+    $tesseractTempFull = (Get-Item -LiteralPath $tesseractTemp).FullName.TrimEnd('\')
+    $extra = @(Get-ChildItem -LiteralPath $tesseractTempFull -Recurse -File | ForEach-Object { $_.FullName.Substring($tesseractTempFull.Length + 1) -replace '\\', '/' } |
+        Where-Object { $_ -ne 'BUNDLE-MANIFEST.json' -and -not $bundleManifest.files.PSObject.Properties[$_] })
+    if ($extra.Count) { throw "The Tesseract bundle holds unlisted files: $($extra -join ', ')" }
+    if (-not (Test-Path -LiteralPath (Join-Path $tesseractTemp 'tesseract\tesseract.exe'))) { throw 'The Tesseract bundle does not contain tesseract.exe.' }
+    if (Test-Path -LiteralPath $tesseractRoot) { Remove-Item -LiteralPath $tesseractRoot -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $tesseractRoot) | Out-Null
+    Move-Item -LiteralPath (Join-Path $tesseractTemp 'tesseract') -Destination $tesseractRoot
+    Copy-Item -LiteralPath (Join-Path $tesseractTemp 'BUNDLE-MANIFEST.json') -Destination $tesseractRoot -Force
+    $tesseractLicenses = Join-Path $InstallRoot 'licenses\tesseract'
+    if (Test-Path -LiteralPath $tesseractLicenses) { Remove-Item -LiteralPath $tesseractLicenses -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $tesseractLicenses) | Out-Null
+    Move-Item -LiteralPath (Join-Path $tesseractTemp 'licenses') -Destination $tesseractLicenses
+} finally { if (Test-Path $tesseractTemp) { Remove-Item $tesseractTemp -Recurse -Force } }
 
 # The data folder holds the app secrets (config\vms.env), the account database
 # and recordings: only the service (LocalSystem) and administrators may read it.
@@ -205,10 +239,11 @@ if (-not $values.Contains('ANYAICAM_CAMERA_CREDENTIAL_KEY')) {
 }
 # On-device analytics whose code default is off (the Linux installer's 06-deploy-vms.sh defaults, 1.3.2): People
 # Counting and the customer rule analytics (line crossing, intrusion, loitering) still run only for a camera the cloud
-# licensed and a customer configured. Add-if-missing: an explicit true or false is never changed. LPR is not
-# defaulted on Windows (no Tesseract OCR engine is bundled; app/analytics_platform.py reports it unavailable), and
-# facial recognition stays an explicit opt-in, as on Linux.
-foreach ($analyticsFlag in @('PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED')) {
+# licensed and a customer configured. Add-if-missing: an explicit true or false is never changed. 1.3.4: LPR joins
+# them as on Linux, now that the Tesseract engine is bundled; it still runs only for a licensed, enabled camera, and
+# app/analytics_platform.py reports it unavailable while the plate model is not installed. Facial recognition stays
+# an explicit opt-in, as on Linux.
+foreach ($analyticsFlag in @('ANYAICAM_LPR_ENABLED', 'PEOPLE_COUNTING_ENABLED', 'CUSTOMER_ANALYTICS_RULES_ENABLED')) {
     if (-not $values.Contains($analyticsFlag)) { $values[$analyticsFlag] = 'true' }
 }
 $values['ANYAICAM_RUNTIME_ROLE'] = 'edge'
