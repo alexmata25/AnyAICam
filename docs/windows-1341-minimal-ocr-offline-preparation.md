@@ -33,10 +33,10 @@ stages only the resulting DLL closure. Windows and VC runtime imports are
 reported as external prerequisites, not as bundled or cleared libraries.
 The runner also saves dumpbin output for every staged executable and DLL.
 
-Six policy tests use actual synthetic PE normal/delay tables: recursive and
+Seven policy tests cover actual synthetic PE normal/delay tables: recursive and
 case-insensitive closure, delay import inclusion, transitive forbidden imports,
-unresolved imports, x86 providers, and malformed binaries. All six passed on the
-host and on the guest's Python 3.12.10. Read-only validation of sealed binaries
+unresolved imports, x86 providers, malformed binaries, and preservation of prior
+audit evidence. Read-only validation of sealed binaries
 also passes the Leptonica x64 closure and rejects the legacy Tesseract closure
 at `archive.dll`. None of these checks substitutes for auditing the unbuilt
 minimal Tesseract executable.

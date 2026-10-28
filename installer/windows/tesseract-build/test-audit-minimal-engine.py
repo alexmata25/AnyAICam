@@ -1,8 +1,10 @@
 """Policy regression tests using real synthetic normal/delay PE import tables."""
 import importlib.util
 import struct
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("audit", Path(__file__).with_name("audit-minimal-engine.py"))
 audit = importlib.util.module_from_spec(spec)
@@ -56,6 +58,18 @@ class ClosureTests(unittest.TestCase):
     def test_malformed_binary_fails(self):
         with self.assertRaises(ValueError):
             audit.closure(b"not an executable", {})
+
+    def test_existing_audit_evidence_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "dependency-audit.json"
+            report.write_text("retained evidence")
+            with patch("sys.argv", ["audit", "--exe", "unused", "--inputs", "unused",
+                                    "--output", str(root / "engine")]):
+                with self.assertRaisesRegex(ValueError, "preserve prior evidence"):
+                    audit.main()
+            self.assertEqual(report.read_text(), "retained evidence")
+            self.assertFalse((root / "engine").exists())
 
 
 if __name__ == "__main__":

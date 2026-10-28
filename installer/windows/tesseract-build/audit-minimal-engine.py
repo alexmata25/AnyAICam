@@ -59,7 +59,8 @@ def main() -> None:
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.output.exists():
+    report_path = args.output.parent / "dependency-audit.json"
+    if args.output.exists() or report_path.exists():
         raise ValueError("Output already exists; preserve prior evidence")
     manifest = json.loads((args.inputs / "inputs-manifest.json").read_text(encoding="utf-8-sig"))
     providers, paths = {}, {}
@@ -86,6 +87,8 @@ def main() -> None:
     shutil.copy2(model, args.output / "tessdata/eng.traineddata")
     report = {
         "executable_sha256": sha(executable),
+        "input_manifest_sha256": sha((args.inputs / "inputs-manifest.json").read_bytes()),
+        "lock_sha256": sha((args.inputs / "tesseract-minimal.lock.json").read_bytes()),
         "bundled_dlls": [{"name": name, "sha256": sha(providers[name]),
                           "source": paths[name].relative_to(args.inputs).as_posix()} for name in sorted(needed)],
         "external_system_or_vc_runtime_imports": sorted(system),
@@ -93,7 +96,7 @@ def main() -> None:
         "licensing_cleared": False,
         "release_archive_created": False,
     }
-    (args.output.parent / "dependency-audit.json").write_text(json.dumps(report, indent=2) + "\n")
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":

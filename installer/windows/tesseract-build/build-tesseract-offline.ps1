@@ -38,8 +38,10 @@ try {
         }
     }
     $lock = Get-Content -Raw (Join-Path $Inputs 'tesseract-minimal.lock.json') | ConvertFrom-Json
-    $vs = Get-Content -Raw 'C:\AAC-Test\Evidence\Toolchain-20261028\vswhere.json' | ConvertFrom-Json |
-        Where-Object installationPath -eq 'C:\AAC-Test\BuildTools2022' | Select-Object -First 1
+    $vsInstances = Get-Content -Raw 'C:\AAC-Test\Evidence\Toolchain-20261028\vswhere.json' | ConvertFrom-Json
+    $vs = $vsInstances | Where-Object {
+        [IO.Path]::GetFullPath($_.installationPath) -eq 'C:\AAC-Test\BuildTools2022'
+    } | Select-Object -First 1
     if (-not $vs -or $vs.installationVersion -notmatch '^17\.') { throw 'Expected VS 2022 instance missing' }
     $cmake = Join-Path $vs.installationPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $work = Join-Path $Output 'work'
@@ -77,6 +79,10 @@ try {
             Where-Object Extension -in '.exe', '.dll') {
             Invoke-Logged $dumpbin.FullName @('/nologo', '/dependents', $binary.FullName) ("dumpbin-" + $binary.Name)
         }
+        Invoke-Logged (Join-Path $Output 'engine\tesseract.exe') @('--version') 'engine-version'
+        $engineVersion = (Get-Content -Raw (Join-Path $Output 'engine-version.stdout.log')) +
+            (Get-Content -Raw (Join-Path $Output 'engine-version.stderr.log'))
+        if ($engineVersion -notmatch '(?m)^tesseract 5\.5\.2(?:\s|$)') { throw 'Unexpected OCR engine version' }
         $plan.Compiled = $true
         $plan | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Output 'build-plan.json') -Encoding UTF8
         # Dependency success is not OCR acceptance or licensing clearance.
