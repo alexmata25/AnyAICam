@@ -299,6 +299,17 @@ def _require(request: Request, roles=PARTNER_ROLES) -> dict:
     # scoped administrators keep the routes open to partner roles.
     if identity['role'] == 'administrator' and set(roles) <= {'administrator'}:
         from admin_auth_policy import auth_audit, is_cloud_profile
+        # Windows 1.3.4.1 (D-AUTHZ-2b port): an administrator-only route needs
+        # the server-side MFA marker on EVERY profile. _evaluate() already ends
+        # an unmarked administrator session on the cloud; on an edge install
+        # these routes (appliance_cloud /api/admin/*, cloud_features,
+        # website_partner) are registered too, so refuse an administrator
+        # session that did not pass MFA verification here (the session itself
+        # stays valid for the surfaces that do not require MFA on the edge).
+        if identity.get('mfa_state') != 'verified':
+            auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='admin_without_mfa',
+                       entity_id=str(identity.get('user_id') or ''))
+            raise HTTPException(status_code=403, detail='Administrator MFA verification required.')
         if is_cloud_profile():
             from appliance_identity import has_global_administrator_grant
             with connection() as db:

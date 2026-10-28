@@ -334,6 +334,13 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
         who = partner_identity(request)
         if not who or who.get("role") != "administrator":
             raise HTTPException(status_code=403, detail="Administrator access is required.")
+        # Windows 1.3.4.1 (D-AUTHZ-2b port): same rule as partner_portal._require
+        # for administrator-only routes -- the session must have passed MFA.
+        if who.get("mfa_state") != "verified":
+            from admin_auth_policy import auth_audit
+            auth_audit("access.denied", actor_email=who.get("email"), actor_role="administrator", reason="admin_without_mfa",
+                       entity_id=str(who.get("user_id") or ""))
+            raise HTTPException(status_code=403, detail="Administrator MFA verification required.")
         return who
 
     def camera_access(db, camera_id: str, who: dict, *, edit: bool) -> dict:
