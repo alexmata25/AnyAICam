@@ -1,0 +1,157 @@
+{
+ "bundle": "tesseract-5.5.2-win64-minimal",
+ "purpose": "Windows LPR OCR engine (1.3.4 parity) WITHOUT libarchive/libcurl and therefore without libiconv (LGPL), libxml2, ICU, OpenSSL, libssh2. Owner request 2026-10-27.",
+ "source": {
+  "name": "tesseract",
+  "version": "5.5.2",
+  "url": "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.5.2.tar.gz",
+  "sha256": "6235ea0dae45ea137f59c09320406f5888383741924d98855bd2ce0d16b54f21",
+  "license": "Apache-2.0"
+ },
+ "cmake_options": [
+  "-DSW_BUILD=OFF",
+  "-DBUILD_SHARED_LIBS=OFF",
+  "-DDISABLE_ARCHIVE=ON",
+  "-DDISABLE_CURL=ON",
+  "-DDISABLE_TIFF=ON",
+  "-DBUILD_TRAINING_TOOLS=OFF",
+  "-DGRAPHICS_DISABLED=ON",
+  "-DBUILD_TESTS=OFF",
+  "-DOPENMP_BUILD=OFF",
+  "-DENABLE_NATIVE=OFF",
+  "-DENABLE_LTO=OFF",
+  "-DENABLE_CCACHE=OFF",
+  "-DENABLE_PRECOMPILED_HEADERS=OFF",
+  "-DINSTALL_CONFIGS=ON",
+  "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL"
+ ],
+ "deterministic_flags": {
+  "CMAKE_C_FLAGS": "/Brepro",
+  "CMAKE_CXX_FLAGS": "/Brepro /EHsc",
+  "CMAKE_EXE_LINKER_FLAGS": "/Brepro"
+ },
+ "toolchain": "Visual Studio 2022 Build Tools (VCTools workload + Windows 11 SDK + CMake), installed INSIDE Windows Sandbox only; the exact MSVC and CMake versions used are recorded in the build output (build-info.json).",
+ "packages": [
+  {
+   "name": "leptonica",
+   "version": "1.87.0",
+   "file": "leptonica-1.87.0-hb83fb89_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/leptonica-1.87.0-hb83fb89_1.conda",
+   "sha256": "6a0e2e099c4b530300fdcc092ddd0ffcc5383dbd04cdf03b232996857b3017d8",
+   "license": "BSD-2-Clause"
+  },
+  {
+   "name": "giflib",
+   "version": "5.2.2",
+   "file": "giflib-5.2.2-hb0bd012_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/giflib-5.2.2-hb0bd012_1.conda",
+   "sha256": "573af9bb6294d125a0be6dc4963e589188da92426c3887feb60dd22a07530e4f",
+   "license": "MIT"
+  },
+  {
+   "name": "libjpeg-turbo",
+   "version": "3.2.0",
+   "file": "libjpeg-turbo-3.2.0-hfd05255_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libjpeg-turbo-3.2.0-hfd05255_1.conda",
+   "sha256": "df78ab4c0eecb3dd9331898f96baeed8e5ca1c363346332517abeb0b614b9a53",
+   "license": "IJG AND BSD-3-Clause AND Zlib"
+  },
+  {
+   "name": "openjpeg",
+   "version": "2.5.4",
+   "file": "openjpeg-2.5.4-h90fa87c_2.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/openjpeg-2.5.4-h90fa87c_2.conda",
+   "sha256": "d1c630ccd9ae0898b48d84e986f4c330f66a25e535f99efe8cbf03f042b33da5",
+   "license": "BSD-2-Clause"
+  },
+  {
+   "name": "libpng",
+   "version": "1.6.59",
+   "file": "libpng-1.6.59-hdc8cecf_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libpng-1.6.59-hdc8cecf_0.conda",
+   "sha256": "36050852deae6edc98d7b71489b8d07254e2753c69bd524bf5784927cd1f0b2c",
+   "license": "zlib-acknowledgement"
+  },
+  {
+   "name": "libzlib",
+   "version": "1.3.2",
+   "file": "libzlib-1.3.2-hfd05255_3.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libzlib-1.3.2-hfd05255_3.conda",
+   "sha256": "0629c2cc0404d3bb29d6baa7b4ba62da80797015e86de050db81ea5a07050527",
+   "license": "Zlib"
+  },
+  {
+   "name": "libtiff",
+   "version": "4.7.2",
+   "file": "libtiff-4.7.2-h8f73337_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libtiff-4.7.2-h8f73337_1.conda",
+   "sha256": "3575a092e3e52625a1767804a4ebd321becaadf61b63dcd6735ebb88c0b3c359",
+   "license": "HPND"
+  },
+  {
+   "name": "lerc",
+   "version": "4.2.0",
+   "file": "lerc-4.2.0-hd936e49_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/lerc-4.2.0-hd936e49_0.conda",
+   "sha256": "93d666f63f284ef77b87b0b1f77b70f7d36d315a132f9afa64bc0012d937ba39",
+   "license": "Apache-2.0"
+  },
+  {
+   "name": "libdeflate",
+   "version": "1.26",
+   "file": "libdeflate-1.26-h1a1d4e4_0.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libdeflate-1.26-h1a1d4e4_0.conda",
+   "sha256": "f51f28e894579387a531c53d97e058642ecfb232c4cb156c43c9121a9044f3d8",
+   "license": "MIT"
+  },
+  {
+   "name": "liblzma",
+   "version": "5.8.3",
+   "file": "liblzma-5.8.3-hfd05255_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/liblzma-5.8.3-hfd05255_1.conda",
+   "sha256": "d36c4a1e1f80fd08e18a407e03622ff2f34dfdd022da6488ad19603dea19e6d5",
+   "license": "0BSD"
+  },
+  {
+   "name": "zstd",
+   "version": "1.5.7",
+   "file": "zstd-1.5.7-h534d264_7.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_7.conda",
+   "sha256": "ca7daae4f218a11fab82cc2857f0ea518ec3f46acec60490485347a4c22c6b3e",
+   "license": "BSD-3-Clause"
+  },
+  {
+   "name": "libwebp-base",
+   "version": "1.6.0",
+   "file": "libwebp-base-1.6.0-h4d5522a_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libwebp-base-1.6.0-h4d5522a_1.conda",
+   "sha256": "4470d98d3178b0d45492eed4808afe421d2e7808352b8d06c2dc29166b75d94d",
+   "license": "BSD-3-Clause"
+  }
+ ],
+ "model": {
+  "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/eng.traineddata",
+  "sha256": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+  "license": "Apache-2.0",
+  "note": "tessdata_fast 4.1.0 English, the same model Linux uses"
+ },
+ "forbidden_dlls": [
+  "archive.dll",
+  "iconv.dll",
+  "charset.dll",
+  "libxml2.dll",
+  "libcurl.dll",
+  "icuuc78.dll",
+  "icudt78.dll",
+  "libcrypto-3-x64.dll",
+  "libssl-3-x64.dll",
+  "libssh2.dll",
+  "psl-5.dll",
+  "lzo2.dll"
+ ],
+ "engine": {
+  "tesseract_exe_sha256": "",
+  "build_info": "filled from the Sandbox build output after review"
+ },
+ "bundle_sha256": ""
+}
