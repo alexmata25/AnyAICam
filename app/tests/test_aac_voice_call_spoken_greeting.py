@@ -120,6 +120,7 @@ def test_default_provider_selection(monkeypatch):
     monkeypatch.setenv("ANYAICAM_GREETING_AUDIO_PROVIDER", "isapi_tts")
     assert isinstance(greeting._default_provider(), greeting.IsapiTtsGreetingProvider)
     monkeypatch.setenv("ANYAICAM_GREETING_AUDIO_PROVIDER", "auto")
+    monkeypatch.setattr(greeting, "WINDOWS", False)  # Linux rules; Windows SAPI: test_windows_greeting_sapi_134
     monkeypatch.setattr(greeting.shutil, "which", lambda name: None)
     assert isinstance(greeting._default_provider(), greeting.MockGreetingAudioProvider)
     monkeypatch.setattr(greeting.shutil, "which", lambda name: "/usr/bin/espeak-ng")

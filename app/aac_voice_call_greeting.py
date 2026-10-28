@@ -166,6 +166,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import wave
 
 logger = logging.getLogger("anyaicam.aac_voice_call_greeting")
@@ -227,6 +228,75 @@ def synthesize_speech(text: str, *, voice: str = GREETING_VOICE, words_per_minut
         return reader.readframes(reader.getnframes()), reader.getframerate()
 
 
+# Windows (1.3.4 voice parity): no espeak-ng, so the greeting is spoken with Windows' own speech engine
+# (System.Speech / SAPI; nothing bundled) through the in-box Windows PowerShell. Raw 22,050 Hz 16-bit mono PCM,
+# the format eSpeak gives, so level_greeting_pcm() and the ISAPI relay are unchanged. The text is read from
+# stdin, never placed on the command line. ANYAICAM_GREETING_SAPI_VOICE picks a voice by name; otherwise an
+# en-US voice is preferred and the default voice used when there is none.
+WINDOWS = sys.platform == "win32"
+SAPI_SAMPLE_RATE = 22050
+GREETING_SAPI_VOICE = os.environ.get("ANYAICAM_GREETING_SAPI_VOICE", "").strip()
+_SAPI_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Speech
+$text = [Console]::In.ReadToEnd()
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+    if ($env:AAC_SAPI_VOICE) { $synth.SelectVoice($env:AAC_SAPI_VOICE) }
+    else { try { $synth.SelectVoiceByHints('NotSet', 'NotSet', 0, [Globalization.CultureInfo]::new('en-US')) } catch { } }
+    $synth.Rate = [int]$env:AAC_SAPI_RATE
+    $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(22050, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+    $buffer = New-Object System.IO.MemoryStream
+    $synth.SetOutputToAudioStream($buffer, $format)
+    $synth.Speak($text)
+    $synth.SetOutputToNull()
+    $bytes = $buffer.ToArray()
+    $out = [Console]::OpenStandardOutput()
+    $out.Write($bytes, 0, $bytes.Length)
+    $out.Flush()
+} finally { $synth.Dispose() }
+"""
+
+
+def _sapi_rate(words_per_minute: int) -> int:
+    """eSpeak words per minute -> SAPI's -10..10 rate (0 is about 180 wpm, each step about 18 wpm)."""
+    return max(-10, min(10, round((int(words_per_minute) - 180) / 18)))
+
+
+def _powershell() -> str:
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+
+def synthesize_speech_sapi(text: str, *, words_per_minute: int = GREETING_WORDS_PER_MINUTE,
+                           runner=subprocess.run) -> tuple[bytes, int]:
+    """Text -> (PCM16 mono bytes, 22050) with Windows SAPI. Raises RuntimeError when nothing was spoken."""
+    environment = dict(os.environ, AAC_SAPI_RATE=str(_sapi_rate(words_per_minute)), AAC_SAPI_VOICE=GREETING_SAPI_VOICE)
+    try:
+        pcm = runner(
+            [_powershell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _SAPI_SCRIPT],
+            input=text[:500].encode("utf-8"), capture_output=True, timeout=30, check=True, env=environment,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"Windows speech synthesis failed: {type(error).__name__}") from error
+    if len(pcm) < 2:
+        raise RuntimeError("Windows speech synthesis produced no audio")
+    return pcm[: len(pcm) - (len(pcm) % 2)], SAPI_SAMPLE_RATE
+
+
+def _tts_engine() -> str | None:
+    """The greeting's speech engine on this computer: espeak-ng where installed (Linux), else SAPI on Windows."""
+    if shutil.which("espeak-ng"):
+        return "espeak-ng"
+    return "windows-sapi" if WINDOWS else None
+
+
+def synthesize_greeting(text: str) -> tuple[bytes, int]:
+    if _tts_engine() == "windows-sapi":
+        return synthesize_speech_sapi(text)
+    return synthesize_speech(text)
+
+
 def _talk_camera(camera_id: str) -> dict | None:
     from database_backend import connect
 
@@ -254,7 +324,7 @@ def _auth_cooldown(camera_id: str) -> int:
 
 
 class IsapiTtsGreetingProvider:
-    def __init__(self, *, synthesize=synthesize_speech, camera_lookup=_talk_camera,
+    def __init__(self, *, synthesize=synthesize_greeting, camera_lookup=_talk_camera,
                  talk_active=_camera_in_customer_talk, auth_cooldown=_auth_cooldown,
                  relay_factory=_open_relay, background=True, sleep=time.sleep) -> None:
         self._synthesize = synthesize
@@ -271,7 +341,7 @@ class IsapiTtsGreetingProvider:
         return {
             "provider": "isapi_tts",
             "hardware_connected": True,
-            "tts_engine": "espeak-ng",
+            "tts_engine": _tts_engine() or "espeak-ng",
             "note": "Offline edge text-to-speech played through the camera's own two-way audio speaker.",
         }
 
@@ -342,9 +412,9 @@ class IsapiTtsGreetingProvider:
 
 def _default_provider() -> GreetingAudioProvider:
     """ANYAICAM_GREETING_AUDIO_PROVIDER: "auto" (default) speaks for real
-    when espeak-ng is installed (the release image), else the mock;
-    "mock" and "isapi_tts" force one."""
+    when a speech engine exists -- espeak-ng (the release image) or, on
+    Windows, SAPI (1.3.4) -- else the mock; "mock" and "isapi_tts" force one."""
     choice = os.environ.get("ANYAICAM_GREETING_AUDIO_PROVIDER", "auto").strip().lower()
-    if choice == "isapi_tts" or (choice == "auto" and shutil.which("espeak-ng")):
+    if choice == "isapi_tts" or (choice == "auto" and _tts_engine()):
         return IsapiTtsGreetingProvider()
     return MockGreetingAudioProvider()
