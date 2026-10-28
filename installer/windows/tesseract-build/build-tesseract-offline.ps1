@@ -24,10 +24,20 @@ function Invoke-Logged([string]$File, [string[]]$Arguments, [string]$Name) {
         if ($_ -match '"') { throw 'Embedded quotes are not supported in build arguments' }
         '"' + $_ + '"'
     })
-    $p = Start-Process -FilePath $File -ArgumentList $quoted -Wait -PassThru -WindowStyle Hidden `
+    # Wait for the native command, not persistent compiler telemetry descendants.
+    $p = Start-Process -FilePath $File -ArgumentList $quoted -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $Output "$Name.stdout.log") `
         -RedirectStandardError (Join-Path $Output "$Name.stderr.log")
-    if ($p.ExitCode -ne 0) { throw "$Name failed with exit code $($p.ExitCode); logs retained" }
+    # Retain the process handle before exit: Windows PowerShell 5 otherwise may
+    # expose a null ExitCode even after WaitForExit reports completion.
+    $nativeHandle = $p.Handle
+    $p.WaitForExit()
+    $p.Refresh()
+    $exitCode = $p.ExitCode
+    [ordered]@{ File = $File; Arguments = $Arguments; ProcessId = $p.Id;
+        RootProcessWait = $true; ExitCode = $exitCode } | ConvertTo-Json -Depth 4 |
+        Set-Content (Join-Path $Output "$Name.process.json") -Encoding UTF8
+    if ($null -eq $exitCode -or $exitCode -ne 0) { throw "$Name failed with exit code $exitCode; logs retained" }
 }
 try {
     $manifest = Get-Content -Raw (Join-Path $Inputs 'inputs-manifest.json') | ConvertFrom-Json
@@ -49,6 +59,14 @@ try {
     Copy-Item -LiteralPath (Join-Path $Inputs 'src') -Destination (Join-Path $work 'src') -Recurse
     Copy-Item -LiteralPath (Join-Path $Inputs 'licenses') -Destination (Join-Path $Output 'input-licenses') -Recurse
     Copy-Item -LiteralPath $Supplement -Destination (Join-Path $Output 'licensing-supplement') -Recurse
+    $extraNotices = Join-Path $PSScriptRoot 'notices'
+    $noticePins = Get-Content -Raw (Join-Path $extraNotices 'provenance-pinned.json') | ConvertFrom-Json
+    foreach ($notice in $noticePins) {
+        if ((Get-FileHash -LiteralPath (Join-Path $extraNotices $notice.File) -Algorithm SHA256).Hash -ne $notice.SHA256) {
+            throw "Supplemental notice mismatch: $($notice.File)"
+        }
+    }
+    Copy-Item -LiteralPath $extraNotices -Destination (Join-Path $Output 'additional-notices') -Recurse
     $prefix = Join-Path $Inputs 'prefix\Library'
     $buildDir = Join-Path $work 'build'
     $configure = @('-S', (Join-Path $work 'src'), '-B', $buildDir,
@@ -60,6 +78,9 @@ try {
         "-DCMAKE_EXE_LINKER_FLAGS=$($lock.deterministic_flags.CMAKE_EXE_LINKER_FLAGS)")
     $plan = [ordered]@{
         PreparedUTC = [DateTime]::UtcNow.ToString('o'); InputsVerified = @($manifest.PSObject.Properties).Count
+        RunnerSHA256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        InputManifestSHA256 = (Get-FileHash -LiteralPath (Join-Path $Inputs 'inputs-manifest.json') -Algorithm SHA256).Hash
+        LockSHA256 = (Get-FileHash -LiteralPath (Join-Path $Inputs 'tesseract-minimal.lock.json') -Algorithm SHA256).Hash
         Toolchain = $toolchain; CMake = $cmake; ConfigureArguments = $configure
         BuildArguments = @('--build', $buildDir, '--config', 'Release', '--target', 'tesseract', '--parallel', '1')
         Compiled = $false; LicensingCleared = $false; ReleaseArchiveCreated = $false
@@ -72,6 +93,10 @@ try {
         if ($engines.Count -ne 1) { throw 'Expected exactly one compiled tesseract.exe' }
         Invoke-Logged $Python @((Join-Path $PSScriptRoot 'audit-minimal-engine.py'),
             '--exe', $engines[0].FullName, '--inputs', $Inputs, '--output', (Join-Path $Output 'engine')) 'dependency-audit'
+        Invoke-Logged $Python @((Join-Path $PSScriptRoot 'prepare-ocr-notices.py'),
+            '--inputs', $Inputs, '--supplement', $Supplement, '--extra-notices', $extraNotices,
+            '--audit', (Join-Path $Output 'dependency-audit.json'),
+            '--output', (Join-Path $Output 'distribution-notices')) 'notice-audit'
         $dumpbin = Get-ChildItem -Path (Join-Path $vs.installationPath 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') |
             Sort-Object FullName -Descending | Select-Object -First 1
         if (-not $dumpbin) { throw 'dumpbin missing' }
@@ -85,8 +110,8 @@ try {
         if ($engineVersion -notmatch '(?m)^tesseract 5\.5\.2(?:\s|$)') { throw 'Unexpected OCR engine version' }
         $plan.Compiled = $true
         $plan | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Output 'build-plan.json') -Encoding UTF8
-        # Dependency success is not OCR acceptance or licensing clearance.
-        Set-Content (Join-Path $Output 'DEPENDENCY-AUDIT-COMPLETE-OCR-AND-NOTICES-PENDING') 'Not a release artifact'
+        # Component audits do not imply OCR acceptance or release authorization.
+        Set-Content (Join-Path $Output 'DEPENDENCY-AND-NOTICE-AUDITS-COMPLETE-OCR-PENDING') 'Not a release artifact'
     } else {
         Set-Content (Join-Path $Output 'PREPARED-ONLY') 'No compilation performed; use a new output directory for -Build'
     }

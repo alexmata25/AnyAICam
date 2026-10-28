@@ -55,6 +55,10 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "AMD64"):
             audit.closure(binary(["one.dll"]), {"one.dll": binary(machine=0x14C)})
 
+    def test_debug_runtime_is_not_a_release_system_dependency(self):
+        with self.assertRaisesRegex(ValueError, "Unresolved dependency: vcruntime140d.dll"):
+            audit.closure(binary(["vcruntime140d.dll"]), {})
+
     def test_malformed_binary_fails(self):
         with self.assertRaises(ValueError):
             audit.closure(b"not an executable", {})

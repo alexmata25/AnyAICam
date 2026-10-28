@@ -1,0 +1,20 @@
+[
+  {
+    "File": "lerc-4.2.0-NOTICE",
+    "URL": "https://raw.githubusercontent.com/Esri/lerc/v4.2.0/NOTICE",
+    "Bytes": 679,
+    "SHA256": "F222A70D24E261B9B4B238DF4FE9132E669D7776F137753C6CBBC5BE4701124D",
+    "Commit": "e534980e11992cc5f11864b0dcff1af6a27cee0d",
+    "CommitURL": "https://raw.githubusercontent.com/Esri/lerc/e534980e11992cc5f11864b0dcff1af6a27cee0d/NOTICE",
+    "CommitContentVerified": true
+  },
+  {
+    "File": "libwebp-1.6.0-PATENTS",
+    "URL": "https://raw.githubusercontent.com/webmproject/libwebp/v1.6.0/PATENTS",
+    "Bytes": 1436,
+    "SHA256": "CC3273E0694EA5896145E0677699B53471B03EA43021DDC50E7923FBB9F5023C",
+    "Commit": "4fa21912338357f89e4fd51cf2368325b59e9bd9",
+    "CommitURL": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/PATENTS",
+    "CommitContentVerified": true
+  }
+]

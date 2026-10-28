@@ -1,0 +1,3 @@
+# Preserve exact integrity-pinned upstream notice bytes, including CRLF.
+lerc-4.2.0-NOTICE -text
+libwebp-1.6.0-PATENTS -text

@@ -33,9 +33,10 @@ stages only the resulting DLL closure. Windows and VC runtime imports are
 reported as external prerequisites, not as bundled or cleared libraries.
 The runner also saves dumpbin output for every staged executable and DLL.
 
-Seven policy tests cover actual synthetic PE normal/delay tables: recursive and
+Eight policy tests cover actual synthetic PE normal/delay tables: recursive and
 case-insensitive closure, delay import inclusion, transitive forbidden imports,
-unresolved imports, x86 providers, malformed binaries, and preservation of prior
+unresolved imports, rejection of debug CRT from release dependencies, x86
+providers, malformed binaries, and preservation of prior
 audit evidence. Read-only validation of sealed binaries
 also passes the Leptonica x64 closure and rejects the legacy Tesseract closure
 at `archive.dll`. None of these checks substitutes for auditing the unbuilt
@@ -49,10 +50,10 @@ The staged Leptonica DLL imports 13 non-system DLLs. Their package/notice map:
 | deflate.dll | libdeflate 1.26 | COPYING |
 | gif-7.dll | giflib 5.2.2 | COPYING; preserve accompanying getopt notice |
 | jpeg8.dll | libjpeg-turbo 3.2.0 | LICENSE.md, README.ijg, IJG product acknowledgment |
-| lerc.dll | lerc 4.2.0 | LICENSE |
+| lerc.dll | lerc 4.2.0 | LICENSE and exact-release NOTICE |
 | liblzma.dll | liblzma 5.8.3 | COPYING and COPYING.0BSD |
 | libpng16.dll | libpng 1.6.59 | LICENSE, PNG Reference Library License v2 |
-| libsharpyuv.dll, libwebp.dll, libwebpmux.dll | libwebp-base 1.6.0 | COPYING |
+| libsharpyuv.dll, libwebp.dll, libwebpmux.dll | libwebp-base 1.6.0 | COPYING and PATENTS |
 | openjp2.dll | openjpeg 2.5.4 | LICENSE |
 | tiff.dll | libtiff 4.7.2 | LICENSE.md |
 | zlib.dll | libzlib 1.3.2 | LICENSE |
@@ -62,6 +63,15 @@ Disabling Tesseract's own TIFF integration does not remove Leptonica's transitiv
 TIFF dependency. This map must be reconciled with the actual final executable
 closure. Tesseract source LICENSE/AUTHORS and tessdata_fast model LICENSE/README
 are also retained in the acquired supplement.
+
+`prepare-ocr-notices.py` verifies the notice/package map against the actual
+audited DLL set, verifies sealed notice hashes and immutable supplement commits,
+and assembles full notices, the IJG acknowledgment and model provenance.
+`audit-build-products.py` additionally checks CMake compiler-ID and LTO probe executables.
+Those non-distributed auxiliaries may use the installed nonredistributable
+debug CRT; debug CRT is never permitted or staged for the release engine.
+Native launcher waits retain the process handle and wait for the command itself,
+avoiding persistent telemetry-child waits and blank PowerShell 5 exit codes.
 
 ## Gates after compilation
 
