@@ -1,4 +1,4 @@
-# FUNCTIONAL Windows Sandbox scenario F-L / F-H for AnyAiCam VMS 1.2.7 (Windows setup 1.3.2). Blue, 2026-10-21.
+# FUNCTIONAL Windows Sandbox scenario for AnyAiCam Windows 1.3.4.1 acceptance (application API compatibility version 1.2.7).
 #
 # SYNTHETIC-KEYSET / SIMULATED CAMERA. This is NOT production-keyset acceptance and NOT physical-camera acceptance:
 #   * the setup under test is the TEST-ONLY synthetic-keyset build (make-wsb.ps1 -Functional refuses anything else),
@@ -41,13 +41,15 @@ $settings = Get-Content -Raw 'C:\Validation\scripts\acceptance.json' | ConvertFr
 $mode = $settings.product_mode
 $other = if ($mode -eq 'local') { 'hybrid' } else { 'local' }
 $run = if ($mode -eq 'local') { 'F-L' } else { 'F-H' }
-# 1.3.3 acceptance (2026-10-21): with the accepted 1.3.2 setup in C:\Validation\previous this is the functional UPGRADE
-# scenario U132-L / U132-H: 1.3.2 is installed, linked and records the simulated camera first, then the setup under
-# test runs as an upgrade over it and the rest of the scenario runs on the new version; U132-L ends with a rollback
-# to 1.3.2 (uninstall, then the 1.3.2 setup again).
+# With the accepted signed 1.3.4 setup in C:\Validation\previous, this scenario verifies the 1.3.4 -> 1.3.4.1
+# in-place upgrade and preserves a real event recording across the install.
 $previousSetup = Get-ChildItem 'C:\Validation\previous' -Filter 'AnyAiCam-VMS-Setup-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
 $upgrade = [bool]$previousSetup
-if ($upgrade) { $run = if ($mode -eq 'local') { 'U132-L' } else { 'U132-H' } }
+if ($upgrade) {
+    $previousVersion = if ($previousSetup.Name -match 'Setup-(\d+\.\d+\.\d+(?:\.\d+)?)-') { $Matches[1] } else { '?' }
+    $upgradeTag = if ($previousVersion -match '^1\.3\.4(?:\.0)?$') { 'U134' } else { 'UOLD' }
+    $run = if ($mode -eq 'local') { "$upgradeTag-L" } else { "$upgradeTag-H" }
+}
 Set-Content -Path (Join-Path $results 'report.txt') -Value @(
     "AnyAiCam Windows FUNCTIONAL scenario $run " + (Get-Date -Format o) + " on " + [Environment]::OSVersion.VersionString,
     "LABEL: SYNTHETIC-KEYSET / SIMULATED CAMERA -- not production-keyset acceptance, not physical-camera acceptance.")
@@ -62,7 +64,7 @@ Check 'run settings: synthetic-test keyset (functional runs never use the produc
     "keyset synthetic-test; mode $mode"
 }
 if ($upgrade) {
-    Check 'previous setup present (the accepted 1.3.2, SYNTHETIC-KEYSET): installed first, then upgraded' {
+    Check 'previous setup present: installed first, then upgraded' {
         "$($previousSetup.Name) $($previousSetup.Length) bytes sha256=$((Get-FileHash $previousSetup.FullName -Algorithm SHA256).Hash.ToLower())"
     }
 }
@@ -82,12 +84,107 @@ $installError = ''
 $firstSetup = if ($upgrade) { $previousSetup } else { $setup }
 try { $install = Start-Process -FilePath $firstSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode", ('/LOG="' + (Join-Path $results 'setup-install.log') + '"') -Wait -PassThru -ErrorAction Stop }
 catch { $install = $null; $installError = $_.Exception.Message }
-Check "install$(if ($upgrade) { ' (previous 1.3.2)' }): silent setup exit code 0" { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
+Check "install$(if ($upgrade) { ' (previous baseline)' }): silent setup exit code 0" { if (-not $install) { throw "setup did not start: $installError" }; if ($install.ExitCode -ne 0) { throw "exit $($install.ExitCode)" }; 'exit 0' }
 Check 'install: VMS answers /health within 3 minutes' { WaitHealthy 180 }
 Check 'install: /version is 1.2.7 with the full build commit' { $v = (Http '/version').Content | ConvertFrom-Json; if ($v.version -ne '1.2.7' -or "$($v.build_id)" -notmatch '^[0-9a-f]{40}$') { throw "version $($v.version) build $($v.build_id)" }; "version $($v.version) build $($v.build_id)" }
 $app = Join-Path $env:ProgramFiles 'AnyAiCam'
 $data = Join-Path $env:ProgramData 'AnyAiCam'
 $agentState = Join-Path $data 'agent'
+
+Check 'service identity and LocalSystem Tesseract/SAPI execution' {
+    $service = Get-CimInstance Win32_Service -Filter "Name='AnyAiCamVMS'"
+    if (-not $service -or $service.StartName -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM')) {
+        throw "AnyAiCamVMS service identity is '$($service.StartName)', expected LocalSystem"
+    }
+    $python = @(VmsProcess | Select-Object -First 1)
+    if (-not $python) { throw 'VMS Python process not found for LocalSystem identity check' }
+    $owner = Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter "ProcessId=$($python[0].ProcessId)") -MethodName GetOwner
+    if ($owner.ReturnValue -ne 0 -or $owner.User -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM')) {
+        throw "VMS process owner is '$($owner.Domain)\$($owner.User)', expected SYSTEM"
+    }
+
+    $probeDir = Join-Path $results 'localsystem-probe'
+    New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    $probeScript = Join-Path $probeDir 'probe.ps1'
+    $resultPath = Join-Path $probeDir 'result.json'
+    $wavePath = Join-Path $probeDir 'sapi.wav'
+    $taskName = 'AnyAiCam-1341-LocalSystem-Acceptance-' + [guid]::NewGuid().ToString('N')
+    $tesseract = Join-Path $app 'runtime\tools\tesseract\tesseract.exe'
+    if (-not (Test-Path -LiteralPath $tesseract)) { throw "bundled Tesseract missing: $tesseract" }
+    $probeBody = @'
+param([string]$ResultPath, [string]$WavePath, [string]$TesseractPath, [string]$Tessdata)
+$ErrorActionPreference = 'Stop'
+try {
+    $env:TESSDATA_PREFIX = $Tessdata
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $version = (& $TesseractPath --version 2>&1 | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or $version -notmatch '^tesseract\s') { throw "Tesseract failed: $version" }
+    $languages = (& $TesseractPath --list-langs 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $languages -notmatch '(?m)^eng\s*$') { throw 'Tesseract English model unavailable' }
+    $voice = New-Object -ComObject SAPI.SpVoice
+    $stream = New-Object -ComObject SAPI.SpFileStream
+    $stream.Open($WavePath, 3, $false)
+    $voice.AudioOutputStream = $stream
+    [void]$voice.Speak('AnyAiCam local service acceptance check.')
+    $stream.Close()
+    $bytes = [IO.File]::ReadAllBytes($WavePath)
+    if ($bytes.Length -le 44 -or -not ($bytes[44..($bytes.Length - 1)] | Where-Object { $_ -ne 0 })) { throw 'SAPI produced no non-silent PCM samples' }
+    [pscustomobject]@{ ok = $true; identity = $identity; tesseract = $version; english_model = $true; sapi_wave_bytes = $bytes.Length; sapi_non_silent = $true } |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding UTF8
+} catch {
+    [pscustomobject]@{ ok = $false; identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name; error = $_.Exception.Message } |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultPath -Encoding UTF8
+    exit 1
+}
+'@
+    Set-Content -LiteralPath $probeScript -Value $probeBody -Encoding UTF8
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ResultPath "{1}" -WavePath "{2}" -TesseractPath "{3}" -Tessdata "{4}"' -f $probeScript, $resultPath, $wavePath, $tesseract, (Join-Path $app 'runtime\tools\tesseract\tessdata')
+    try {
+        $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $arguments
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        $probe = WaitFor 90 { if (Test-Path -LiteralPath $resultPath) { Get-Content -Raw -LiteralPath $resultPath | ConvertFrom-Json } }
+        if (-not $probe) { throw 'LocalSystem probe did not produce a result within 90 seconds' }
+        if (-not $probe.ok -or $probe.identity -notin @('NT AUTHORITY\SYSTEM', 'SYSTEM')) { throw "LocalSystem probe failed: $($probe | ConvertTo-Json -Compress)" }
+        "WinSW identity=$($owner.Domain)\$($owner.User); scheduled SYSTEM Tesseract=$($probe.tesseract), English model=$($probe.english_model); SAPI non-silent WAV=$($probe.sapi_wave_bytes) bytes"
+    } finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $probeScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Check 'WinSW VMS Python process is in the CPU-limited Job Object' {
+    if (-not ('AnyAiCam.AcceptanceJobQuery' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace AnyAiCam {
+  public static class AcceptanceJobQuery {
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static bool IsInAnyJob(int pid) {
+      IntPtr process = OpenProcess(0x1000, false, pid);
+      if (process == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "OpenProcess");
+      try { bool result; if (!IsProcessInJob(process, IntPtr.Zero, out result)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "IsProcessInJob"); return result; }
+      finally { CloseHandle(process); }
+    }
+  }
+}
+'@
+    }
+    $python = @(VmsProcess | Select-Object -First 1)
+    if (-not $python) { throw 'VMS Python process not found' }
+    if (-not [AnyAiCam.AcceptanceJobQuery]::IsInAnyJob([int]$python[0].ProcessId)) { throw "VMS PID $($python[0].ProcessId) is not in a Windows Job Object" }
+    $logs = @(Get-ChildItem -LiteralPath (Join-Path $data 'logs') -Filter 'AnyAiCamVMS*.out.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $applied = $false
+    foreach ($log in $logs | Select-Object -First 5) {
+        if ((Get-Content -Raw -LiteralPath $log.FullName) -match 'resource limits applied \(cpu=(?!0;)\d+') { $applied = $true; break }
+    }
+    if (-not $applied) { throw 'WinSW launcher output does not confirm a nonzero CPU limit was applied' }
+    "VMS PID $($python[0].ProcessId) belongs to a Job Object; WinSW launcher logged a nonzero CPU cap"
+}
 
 # ---------------------------------------------------------------- harness runtime OUTSIDE the install folder
 # (as validate-in-sandbox.ps1 since 2026-10-21: Setup/agent restarts must never touch harness processes)
@@ -353,8 +450,13 @@ function ClipIds {
     $r = WaitFor 120 { $x = Edge GET "/api/customer/recordings/$camId"; if ($x.status -eq 200) { $x } }
     @($r.body.clips | ForEach-Object { [string]$_.id })
 }
+function CurrentClips {
+    $r = Edge GET "/api/customer/recordings/$camId"
+    if ($r.status -ne 200) { throw "recording list returned HTTP $($r.status)" }
+    @($r.body.clips)
+}
 $uninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}_is1'
-function SetupVersionOf($file) { if ($file.Name -match 'Setup-(\d+\.\d+\.\d+)-') { $Matches[1] } else { '?' } }
+function SetupVersionOf($file) { if ($file.Name -match 'Setup-(\d+\.\d+\.\d+(?:\.\d+)?)-') { $Matches[1] } else { '?' } }
 
 # ---------------------------------------------------------------- test cloud (functional routes; synthetic key; Sandbox only)
 & $hp 'C:\Validation\scripts\test-cloud.py' --app $cloudApp --data $cloudData --host $TestCloudHost --certificates-only
@@ -463,10 +565,12 @@ $rtsp = "rtsp://${camHost}:8554/cam1"
 $camServer = Start-Process -FilePath (Join-Path $sim 'mediamtx\mediamtx.exe') -ArgumentList ('"' + (Join-Path $sim 'camera-mediamtx.yml') + '"') -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $results 'camera-mediamtx.out.log') -RedirectStandardError (Join-Path $results 'camera-mediamtx.err.log')
 Start-Sleep -Seconds 3
-# A black frame with a white box that moves for 6 s, then holds still for 6 s (basic motion needs motion that stops).
+# Event-only acceptance: a black frame with a white box that moves for 6 s,
+# then holds still for 84 s. The quiet window lets the harness prove that
+# completed event clips stop growing instead of behaving like continuous recording.
 $encoder = if ((& $ffmpeg -hide_banner -encoders 2>&1 | Out-String) -match 'libx264') { @('-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency') } else { @('-c:v', 'mpeg4') }
 $ffArgs = @('-hide_banner', '-loglevel', 'warning', '-re', '-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=10', '-f', 'lavfi', '-i', 'color=c=white:s=160x120:r=10',
-            '-filter_complex', "[0][1]overlay=x='if(lt(mod(t,12),6),40+60*mod(t,12),400)':y=120:shortest=0", '-pix_fmt', 'yuv420p', '-g', '20') + $encoder +
+            '-filter_complex', "[0][1]overlay=x='if(lt(mod(t,90),6),40+60*mod(t,90),400)':y=120:shortest=0", '-pix_fmt', 'yuv420p', '-g', '20') + $encoder +
           @('-f', 'rtsp', '-rtsp_transport', 'tcp', $rtsp)
 $camPublisher = Start-Process -FilePath $ffmpeg -ArgumentList $ffArgs -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $results 'camera-ffmpeg.out.log') -RedirectStandardError (Join-Path $results 'camera-ffmpeg.err.log')
@@ -510,7 +614,10 @@ Check 'discovery: a cloud scan job finds the simulated camera (agent scan, real 
 }
 $cloudCamera = $null
 Check 'provisioning: the owner adds the discovered camera; the agent verifies it (RTSP DESCRIBE) and the cloud provisions it' {
-    $p = Cloud POST '/api/customer/cameras/provision' @{ appliance_id = $cloudAppliance.id; device_key = $script:deviceKey; name = 'Simulated camera'; recording_mode = 'event' } -Owner
+    # R-REC-1: leave the retired recording_mode field out. The appliance
+    # enforces local event-only recording; this harness verifies that mode
+    # after sync and then verifies an actual event clip below.
+    $p = Cloud POST '/api/customer/cameras/provision' @{ appliance_id = $cloudAppliance.id; device_key = $script:deviceKey; name = 'Simulated camera' } -Owner
     $done = WaitFor 420 { $j = Cloud GET "/api/customer/camera-provisioning/$($p.job_id)" -Owner; if ($j.status -in 'provisioned', 'failed', 'timed_out') { $j } }
     $done | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $results 'provision-job.json')
     if (-not $done -or $done.status -ne 'provisioned') { throw "status $($done.status) $($done.failure_code) $($done.message)" }
@@ -543,22 +650,26 @@ Check 'event-only: edge configuration is event mode and the segment recorder use
     'stored event mode; segment writers use _event_buffer; idle retention/event playback still require their separate checks'
 }
 
-# ---------------------------------------------------------------- UPGRADE 1.3.2 -> setup under test (U132-L / U132-H)
+# ---------------------------------------------------------------- upgrade from the accepted setup -> setup under test
 if ($upgrade) {
-    # A finished, listed recording made by 1.3.2: a VMS restart ends the open segment; listed once older than 90 s.
-    $preGrowing = WaitFor 300 { Growing $camNo }
+    # Event-only baseline: require a completed, listed event clip before
+    # restart/upgrade; do not use a growing continuous segment as evidence.
+    $script:preClips = WaitFor 420 { $ids = @(ClipIds); if ($ids.Count) { $ids } }
+    if (-not $script:preClips) { throw 'the previous setup did not produce a playable event recording before upgrade' }
     Restart-Service AnyAiCamVMS -Force; [void](WaitHealthy 180)
-    $script:preClips = @()
-    Check 'upgrade (before): 1.3.2 recorded the simulated camera and lists a finished clip' {
+    Check 'upgrade (before): the previous setup recorded an event clip and lists it' {
         $clips = WaitFor 420 { $r = Edge GET "/api/customer/recordings/$camId"; if ($r.status -eq 200 -and @($r.body.clips).Count) { @($r.body.clips) } }
-        if (-not $clips) { throw "no clip listed under 1.3.2 (recording was growing: $([bool]$preGrowing))" }
-        $script:preClips = @($clips | ForEach-Object { [string]$_.id }); "$($script:preClips.Count) clip(s) before the upgrade"
+        if (-not $clips) { throw 'no event clip listed before the upgrade' }
+        $listed = @($clips | ForEach-Object { [string]$_.id })
+        $missing = @($script:preClips | Where-Object { $listed -notcontains $_ })
+        if ($missing) { throw "$($missing.Count) event clip(s) disappeared before the upgrade" }
+        "$($listed.Count) event clip(s) before the upgrade"
     }
     $beforeState = UpgradeState
     $beforeBuild = ((Http '/version').Content | ConvertFrom-Json).build_id
     $beforeState | ConvertTo-Json | Set-Content (Join-Path $results 'upgrade-before.json')
     $up = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-upgrade.log') + '"') -Wait -PassThru
-    Check 'upgrade: the setup under test runs over 1.3.2 (exit 0) and the VMS is healthy' {
+    Check 'upgrade: the setup under test runs over the accepted previous baseline (exit 0) and the VMS is healthy' {
         if ($up.ExitCode -ne 0) { throw "exit $($up.ExitCode)" }; if (-not (WaitHealthy 240)) { throw 'not healthy' }; 'exit 0; healthy'
     }
     Check 'upgrade: the uninstall entry and /version report the new setup' {
@@ -574,7 +685,7 @@ if ($upgrade) {
         $changed = @(foreach ($k in $beforeState.Keys) { if ("$($after[$k])" -ne "$($beforeState[$k])") { $k } })
         if ($changed) { throw "changed: $($changed -join ', ') (see upgrade-before.json / upgrade-after.json)" }; "all $($beforeState.Keys.Count) kept"
     }
-    Check 'upgrade: the clips recorded by 1.3.2 are still listed and play (MP4, H.264) on the new version' {
+    Check 'upgrade: event clips recorded by the previous setup remain listed and playable on the new version' {
         $ids = ClipIds
         $missing = @($script:preClips | Where-Object { $ids -notcontains $_ }); if ($missing) { throw "$($missing.Count) clip(s) missing after the upgrade" }
         $file = Join-Path $results 'upgrade-old-clip.mp4'
@@ -584,10 +695,10 @@ if ($upgrade) {
         $p = Probe $file; if (-not ($p.streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'no video in the old clip' }
         "$($script:preClips.Count) clip(s) kept; the oldest plays"
     }
-    Check 'upgrade: running the 1.3.2 setup over the new version is refused (downgrade) and changes nothing' {
+    Check 'upgrade: running the previous setup over the new version is refused (downgrade) and changes nothing' {
         $envBefore = (Get-FileHash (Join-Path $data 'config\vms.env')).Hash
-        $d = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-downgrade-133-refused.log') + '"') -Wait -PassThru
-        if ($d.ExitCode -eq 0) { throw '1.3.2 setup ran over the newer version' }
+        $d = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-previous-downgrade-refused.log') + '"') -Wait -PassThru
+        if ($d.ExitCode -eq 0) { throw 'previous setup ran over the newer version' }
         if ((Get-FileHash (Join-Path $data 'config\vms.env')).Hash -ne $envBefore) { throw 'vms.env changed' }
         if ((Get-ItemProperty $uninstallKey).DisplayVersion -ne (SetupVersionOf $setup)) { throw 'version changed' }
         if (-not (WaitHealthy 120)) { throw 'not healthy after the refused setup' }
@@ -623,12 +734,12 @@ if ($mode -eq 'hybrid') { MoqCheck $mode; WebRtcCheck $mode }
 else { Info 'live view: WebRTC' { 'Local mode runs no WebRTC publisher (P2P is a Hybrid feature): checked in the Hybrid runs and after each switch to Hybrid' } }
 Info 'live view: WebRTC through the cloud' { 'not tested: cloud signalling / P2P / TURN run through the cloud (live_view_p2p), which the test cloud does not serve' }
 
-# ---------------------------------------------------------------- recording, motion, analytics
-Check 'recording: the VMS records the simulated camera to MKV under ProgramData (true size growing)' {
-    $g = WaitFor 300 { Growing $camNo }
-    Diag 'recording'
-    if (-not $g) { throw "no growing MKV in $data\recordings\camera$camNo ($((Mkv $camNo).Count) file(s)); see diag-recording.txt" }
-    "$($g.name) $($g.from) -> $($g.to) bytes ($($g.note))"
+# ---------------------------------------------------------------- event-only recording, motion, analytics
+Check 'recording: provisioned camera is local event-only' {
+    $config = @(EdgeSql "SELECT local_recording_mode, cloud_recording_mode FROM cameras WHERE id='$camId'")[0]
+    if (-not $config) { throw 'provisioned camera settings are missing from the edge database' }
+    if ($config.local_recording_mode -ne 'event') { throw "local mode is '$($config.local_recording_mode)', expected event" }
+    "local_recording_mode=$($config.local_recording_mode); cloud upload mode=$($config.cloud_recording_mode)"
 }
 PlaylistFresh 'recording'
 Check 'motion (basic, default ON): the moving box produces motion events' {
@@ -637,6 +748,60 @@ Check 'motion (basic, default ON): the moving box produces motion events' {
     Diag 'motion'
     if (-not $events) { throw "no motion event for camera $camNo (motion_events.jsonl exists: $(Test-Path $file)); see diag-motion.txt" }
     "$(@($events).Count) motion event line(s)"
+}
+Check 'recording: a motion event produces a finished playable event clip' {
+    $clips = WaitFor 420 { $items = @(CurrentClips); if ($items.Count) { $items } }
+    if (-not $clips) { Diag 'event-recording'; throw 'motion was detected but no finished event clip appeared' }
+    $script:eventClip = $clips[0]
+    $file = Join-Path $results 'event-recording-online.mp4'
+    $media = Edge GET "/api/customer/recordings/$camId/$($script:eventClip.id)/media" -Out $file
+    if ($media.status -eq 302 -and $media.location) { $media = Edge GET $media.location -Out $file }
+    if ($media.status -ne 200) { throw "event clip media returned HTTP $($media.status)" }
+    $probe = Probe $file
+    if (-not ($probe.streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'event clip has no playable video stream' }
+    $beforeIdle = @(Mkv $camNo | ForEach-Object { [pscustomobject]@{ name = $_.Name; length = [long](TrueLength $_.FullName) } })
+    Start-Sleep -Seconds 15
+    $afterIdle = @(Mkv $camNo | ForEach-Object { [pscustomobject]@{ name = $_.Name; length = [long](TrueLength $_.FullName) } })
+    $changedDuringIdle = @()
+    foreach ($item in $afterIdle) {
+        $prior = @($beforeIdle | Where-Object { $_.name -eq $item.name })[0]
+        if (-not $prior -or $item.length -ne $prior.length) { $changedDuringIdle += $item }
+    }
+    if ($afterIdle.Count -ne $beforeIdle.Count -or $changedDuringIdle.Count) {
+        throw 'recording files changed during the simulated no-motion interval; event-only idle behavior is not proven'
+    }
+    "$(@($clips).Count) event clip(s); first clip plays as $($media.content_type)"
+}
+Check 'shutdown: WinSW stop during delayed event finalization is bounded and preserves a playable clip' {
+    $motionFile = Join-Path $data 'recordings\motion_events.jsonl'
+    $baselineEvents = if (Test-Path -LiteralPath $motionFile) { @(Get-Content -LiteralPath $motionFile).Count } else { 0 }
+    $beforeIds = @(CurrentClips | ForEach-Object { [string]$_.id })
+    $newEvent = WaitFor 110 {
+        if (Test-Path -LiteralPath $motionFile) {
+            $rows = @(Get-Content -LiteralPath $motionFile)
+            if ($rows.Count -gt $baselineEvents) { $rows[-1] }
+        }
+    }
+    if (-not $newEvent) { throw 'no new simulated motion event arrived to exercise delayed finalization' }
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $stopJob = Start-Job -ScriptBlock { Stop-Service -Name AnyAiCamVMS -Force -ErrorAction Stop }
+    if (-not (Wait-Job -Job $stopJob -Timeout 35)) { Stop-Job -Job $stopJob -ErrorAction SilentlyContinue; throw 'WinSW service stop exceeded the 35-second acceptance bound' }
+    Receive-Job -Job $stopJob -ErrorAction Stop | Out-Null
+    Remove-Job -Job $stopJob -Force -ErrorAction SilentlyContinue
+    $stopwatch.Stop()
+    if ((Get-Service AnyAiCamVMS).Status -ne 'Stopped') { throw 'AnyAiCamVMS did not reach Stopped after the stop request' }
+    if ($stopwatch.Elapsed.TotalSeconds -gt 35) { throw "service stop took $([math]::Round($stopwatch.Elapsed.TotalSeconds,1)) seconds" }
+    Start-Service AnyAiCamVMS
+    if (-not (WaitHealthy 180)) { throw 'VMS did not become healthy after the bounded-stop test' }
+    $after = WaitFor 180 { $items = @(CurrentClips); $ids = @($items | ForEach-Object { [string]$_.id }); $added = @($ids | Where-Object { $beforeIds -notcontains $_ }); if ($added.Count) { @($items | Where-Object { $added -contains [string]$_.id }) } }
+    if (-not $after) { throw 'the event arriving immediately before WinSW stop did not survive as a new event clip' }
+    $clip = $after[0]
+    $file = Join-Path $results 'event-recording-after-winsw-stop.mp4'
+    $media = Edge GET "/api/customer/recordings/$camId/$($clip.id)/media" -Out $file
+    if ($media.status -eq 302 -and $media.location) { $media = Edge GET $media.location -Out $file }
+    if ($media.status -ne 200) { throw "post-stop event clip returned HTTP $($media.status)" }
+    if (-not ((Probe $file).streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'post-stop event clip is not playable' }
+    "stop completed in $([math]::Round($stopwatch.Elapsed.TotalSeconds,1)) seconds; finalized event clip is playable"
 }
 PlaylistFresh 'motion'
 MotionReaderRtsp 'motion'
@@ -681,11 +846,11 @@ function SwitchMode([string]$Target, [scriptblock]$Change) {
     }
     Info "MediaMTX listeners after the switch to $Target" { Start-Sleep -Seconds 20; MediaMtxListeners }
     if ($Target -eq 'hybrid') { MoqCheck "after the switch to hybrid"; WebRtcCheck "after-switch-hybrid" }
-    Check "mode: after the switch to $Target the camera is still licensed and recording resumes" {
+    Check "mode: after the switch to $Target the camera remains licensed and event-only" {
         $l = Licensed $camNo; if ($l -ne "[$camNo]") { throw "licensed $l" }
-        $g = WaitFor 300 { Growing $camNo }
-        Diag "after-switch-$Target"
-        if (-not $g) { throw "no growing recording after the switch; see diag-after-switch-$Target.txt" }; "licensed; $($g.name) $($g.note) ($($g.from) -> $($g.to) bytes)"
+        $config = @(EdgeSql "SELECT local_recording_mode, cloud_recording_mode FROM cameras WHERE id='$camId'")[0]
+        if ($config.local_recording_mode -ne 'event') { throw "local recording mode changed to '$($config.local_recording_mode)'" }
+        "licensed; local event-only mode preserved; cloud upload mode=$($config.cloud_recording_mode)"
     }
     PlaylistFresh "after-switch-$Target"
     MotionReaderRtsp "after-switch-$Target"
@@ -726,27 +891,27 @@ Check 'offline: live view still works without the cloud' {
     'playlist with segments'
 }
 PlaylistFresh 'offline'
-Check 'offline: recording continues without the cloud' {
-    # 906f7819 U132-L/U132-H: the simulated camera's ~1 KB/s stream is written in 256 KiB MKV steps, so within 180 s a
-    # 15 s sample often saw neither growth nor a rollover although new segments kept appearing offline. Compare against
-    # the newest segment when the check starts and allow longer than one 300 s segment: a stopped recorder still fails.
-    $base = @(Mkv $camNo)
-    $baseName = if ($base.Count) { $base[-1].Name } else { '' }
-    $baseLen = if ($base.Count) { TrueLength $base[-1].FullName } else { -1 }
-    $g = WaitFor 330 {
-        $now = @(Mkv $camNo)
-        if ($now.Count -and $now[-1].Name -ne $baseName) { [pscustomobject]@{ name = $now[-1].Name; from = 0; to = (TrueLength $now[-1].FullName); note = "new segment since the check began (after $baseName)" } }
-        elseif ($now.Count -and (TrueLength $now[-1].FullName) -gt $baseLen) { [pscustomobject]@{ name = $now[-1].Name; from = $baseLen; to = (TrueLength $now[-1].FullName); note = 'growing' } }
+Check 'offline: the completed local event clip remains playable without the cloud' {
+    $clips = @(CurrentClips)
+    if (-not $script:eventClip -or -not (@($clips | ForEach-Object { [string]$_.id }) -contains [string]$script:eventClip.id)) {
+        throw 'the previously completed event clip is not listed offline'
     }
-    Diag 'offline-recording'
-    if (-not $g) { throw 'no growing recording offline; see diag-offline-recording.txt' }; "$($g.name) $($g.note) ($($g.from) -> $($g.to) bytes)"
+    $file = Join-Path $results 'event-recording-offline.mp4'
+    $media = Edge GET "/api/customer/recordings/$camId/$($script:eventClip.id)/media" -Out $file
+    if ($media.status -eq 302 -and $media.location) { $media = Edge GET $media.location -Out $file }
+    if ($media.status -ne 200) { throw "offline event clip media returned HTTP $($media.status)" }
+    $probe = Probe $file
+    if (-not ($probe.streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'offline event clip has no playable video stream' }
+    'the same completed event clip is listed and playable offline'
 }
 
-# ---------------------------------------------------------------- playback (offline): a finished 5-minute segment
-Check 'playback (offline): the recording list shows a finished segment of the simulated camera' {
-    $clips = WaitFor 720 { $r = Edge GET "/api/customer/recordings/$camId"; if ($r.status -eq 200 -and @($r.body.clips).Count) { @($r.body.clips) } }
-    if (-not $clips) { throw 'no clip listed (segments are 5 minutes; listed once older than 90 s)' }
-    $script:clip = $clips[0]; "$(@($clips).Count) clip(s)"
+# ---------------------------------------------------------------- playback (offline): event clip retained from event-only recording
+Check 'playback (offline): the event clip remains in the recording list' {
+    $clips = @(CurrentClips)
+    if (-not $clips -or -not $script:eventClip) { throw 'no event clip is available for offline playback' }
+    $script:clip = $clips | Where-Object { [string]$_.id -eq [string]$script:eventClip.id } | Select-Object -First 1
+    if (-not $script:clip) { throw 'the event clip recorded before offline mode is missing' }
+    "$(@($clips).Count) event clip(s); target event clip retained"
 }
 Check 'playback (offline): the clip plays as MP4 (H.264) from this PC' {
     $file = Join-Path $results 'playback-clip.mp4'
@@ -769,9 +934,9 @@ Check 'online again: the cloud returns and the owner signs in online again' {
     $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\again.cookies'; if ($x.status -eq 303) { $x } }
     if (-not $r) { throw 'online sign-in did not recover' }; '303'
 }
-# ---------------------------------------------------------------- FIX-FORWARD (U132-L): uninstall, 1.3.2 refused, new setup again
-# Owner policy 2026-10-22: fix-forward is the default; version metadata is never reset or downgraded. 1.3.3 on 126863e3
-# showed the 1.3.2 setup refuses over the newer data folder (install-version-guard exit 10). Checked here: that refusal
+# ---------------------------------------------------------------- FIX-FORWARD: uninstall, previous setup refused, new setup again
+# Owner policy 2026-10-22: fix-forward is the default; version metadata is never reset or downgraded. Prior validation
+# showed an older setup refuses over the newer data folder (install-version-guard exit 10). Checked here: that refusal
 # changes nothing, and the setup under test installs again over the kept data with identity, link and recordings.
 if ($upgrade -and $mode -eq 'local') {
     $rbState = UpgradeState; $rbMkv = (Mkv $camNo).Count; $rbClips = ClipIds
@@ -785,8 +950,8 @@ if ($upgrade -and $mode -eq 'local') {
     }
     $rbI = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
         ('/LOG="' + (Join-Path $results 'setup-rollback-install.log') + '"') -Wait -PassThru
-    Check 'fix-forward: the 1.3.2 setup is refused over the newer data folder and changes nothing' {
-        if ($rbI.ExitCode -eq 0) { throw '1.3.2 installed over the newer data folder' }
+    Check 'fix-forward: the previous setup is refused over the newer data folder and changes nothing' {
+        if ($rbI.ExitCode -eq 0) { throw 'previous setup installed over the newer data folder' }
         $text = [IO.File]::ReadAllText((Join-Path $results 'setup-rollback-install.log'))
         if ($text -notmatch 'Downgrade refused') { throw "exit $($rbI.ExitCode) without the downgrade refusal" }
         if (Test-Path $uninstallKey) { throw 'an uninstall entry appeared' }
@@ -808,7 +973,7 @@ if ($upgrade -and $mode -eq 'local') {
 }
 [void](Cloud POST '/test/revoke-appliance' -Owner)
 Check 'revoked appliance: the cloud refuses it and online customer sign-in on this PC is refused' {
-    # U132-L on 126863e3: the VMS was not running (failed rollback), Edge returned status 0, reported as 'accepted'.
+    # Prior U132-L run: VMS was not running (failed rollback), Edge returned status 0, reported as 'accepted'.
     if (-not (WaitHealthy 180)) { throw 'inconclusive: the VMS is not healthy, so sign-in could not be tried' }
     $script:lastLogin = $null
     $r = WaitFor 120 { $x = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\revoked.cookies'; $script:lastLogin = $x; if ($x.status -ge 400) { $x } }

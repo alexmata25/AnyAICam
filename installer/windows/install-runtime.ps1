@@ -48,6 +48,13 @@ $pathContent = $pathContent | ForEach-Object { if ($_ -eq '#import site') { 'imp
 if ($LASTEXITCODE -ne 0) { throw 'Private pip bootstrap failed.' }
 & $python -m pip install --no-index --find-links $WheelRoot --disable-pip-version-check --no-warn-script-location -r (Join-Path $InstallRoot 'installer\requirements-windows.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
+# pip's 33 distlib console-script EXEs are generated after catalog staging.
+# They are not used by the VMS (which imports modules / invokes python -m) and
+# are not part of the product runtime. Remove only top-level Scripts\*.exe;
+# keep package modules, scripts and all other runtime files unchanged.
+. (Join-Path $PSScriptRoot 'python-launchers.ps1')
+$removedPythonLaunchers = Remove-AnyAiCamGeneratedPythonLaunchers $pythonRoot
+Write-Output "Removed $removedPythonLaunchers pip-generated Python Scripts EXE launchers; package modules and runtime files are retained."
 # The VMS imports cv2/ultralytics/torch at startup; their DLLs need the Visual
 # C++ runtime the setup installs first. Stop here, before any service exists,
 # if anything fails to load (the setup log has the preflight's output).

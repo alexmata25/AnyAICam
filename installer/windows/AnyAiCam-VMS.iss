@@ -77,6 +77,7 @@ Source: "stop-stale-vms.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 ; 1.3.4: the VMS Job Object (CPU cap, optional memory limit) the launcher applies before starting Python.
 Source: "vms-job-limits.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "python-launchers.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; Stops processes still running from {app} after the services are removed (PrepareToInstall from {tmp}; the
 ; uninstaller from {app}\installer).

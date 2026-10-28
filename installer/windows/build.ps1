@@ -152,7 +152,7 @@ $setupPath = Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + 
 $setupBytes = Assert-InstallerSize $setupPath
 Write-Output "Installer size accepted: $setupBytes bytes (limit 750000000)."
 if ($Sign -or $AzureSign) {
-    $setup = Get-Item (Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe'))
+    $setup = Get-Item -LiteralPath $setupPath
     # (Inno Setup 7 keeps no signed-uninstaller cache; the installed
     # unins000.exe is verified by the Windows Sandbox validation.)
     $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)

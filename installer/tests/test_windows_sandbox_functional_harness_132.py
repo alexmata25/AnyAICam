@@ -57,7 +57,10 @@ def test_simulated_camera_is_loopback_only():
 
 def test_event_only_provisioning_and_private_recorder_are_explicit_acceptance_checks():
     script = _text(FUNCTIONAL)
-    assert "recording_mode = 'event'" in script
+    # 1.3.4.1 reconciliation: provisioning omits the retired recording_mode field, so the stored 'event' mode below
+    # proves the appliance's own event-only default rather than an explicitly requested mode.
+    provision = next(line for line in script.splitlines() if "/api/customer/cameras/provision" in line)
+    assert "recording_mode" not in provision
     assert "recording_mode = 'continuous'" not in script
     assert 'SELECT local_recording_mode FROM cameras' in script
     assert 'continuous customer-facing segment writer detected' in script
