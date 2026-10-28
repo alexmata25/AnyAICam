@@ -151,15 +151,13 @@ $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+. (Join-Path $PSScriptRoot 'installer-size-policy.ps1')
 $setupPath = Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe')
-$setupArtifact = Get-Item -LiteralPath $setupPath -ErrorAction Stop
-$maxInstallerBytes = [long]750000000  # 750 MB decimal, strictly below a 750 MiB interpretation.
-if ($setupArtifact.Length -gt $maxInstallerBytes) {
-    throw "Installer size gate failed: $($setupArtifact.Length) bytes exceeds $maxInstallerBytes bytes (750 MB)."
-}
-Write-Output "Installer size gate passed: $($setupArtifact.Length) / $maxInstallerBytes bytes (750 MB)."
+$sizeProblem = Get-AnyAiCamSetupSizeProblem $setupPath
+if ($sizeProblem) { throw "Installer size policy: $sizeProblem" }
+Write-Output "Installer size gate passed: $((Get-Item -LiteralPath $setupPath).Length) / $AnyAiCamSetupMaxBytes bytes (750 MB)."
 if ($Sign -or $AzureSign) {
-    $setup = $setupArtifact
+    $setup = Get-Item -LiteralPath $setupPath
     # (Inno Setup 7 keeps no signed-uninstaller cache; the installed
     # unins000.exe is verified by the Windows Sandbox validation.)
     $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)

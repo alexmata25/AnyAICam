@@ -42,7 +42,10 @@ class Windows1341AcceptanceSourceTests(unittest.TestCase):
         self.assertIn("resource limits applied \\(cpu=", self.functional)
 
     def test_installer_has_750_mb_and_full_catalog_member_gates(self):
-        self.assertIn("[long]750000000", self.builder)
+        size_policy = (ROOT / "installer/windows/installer-size-policy.ps1").read_text(encoding="utf-8")
+        self.assertIn("installer-size-policy.ps1", self.builder)
+        self.assertIn("[long]750000000", size_policy)
+        self.assertIn("Get-AnyAiCamSetupSizeProblem", self.builder)
         self.assertIn("foreach ($member in $catalogMembers)", self.builder)
         self.assertIn("verify /pa /c", self.builder.lower())
 
