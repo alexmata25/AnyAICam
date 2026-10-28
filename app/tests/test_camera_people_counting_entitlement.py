@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from database_backend import override_target
+from authz_helpers import make_partner_user, partner_session_cookie, enroll_confirmed_mfa
 
 with override_target(sqlite_path="/tmp/test_camera_people_counting_entitlement.db"):
     import appliance_cloud
@@ -50,7 +51,7 @@ def _appliance_auth_headers(appliance_id: str, credential: str) -> dict:
 
 
 def _admin_cookie() -> str:
-    return partner_portal._token("admin@example.test", "administrator")
+    return partner_session_cookie("admin@example.test", "administrator")
 
 
 @pytest.fixture()
@@ -63,6 +64,8 @@ def client(db_path):
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
         initialize_database()
+        uid = make_partner_user("admin@example.test", "administrator", global_admin=True)
+        enroll_confirmed_mfa(uid)
         app = FastAPI()
         appliance_cloud.register_appliance_cloud_routes(app, shell=lambda *a, **k: "")
         with TestClient(app) as test_client:
@@ -165,6 +168,18 @@ def test_non_administrator_role_is_rejected(client, seeded_db_path):
         json={"people_counting_enabled": True},
     )
 
+    assert response.status_code == 403
+    assert not _camera_entitlement(seeded_db_path, "cam-1")
+
+
+@pytest.mark.parametrize("mfa_state", [None, "enrollment_only"])
+def test_administrator_without_verified_mfa_is_rejected(client, seeded_db_path, mfa_state):
+    token = partner_session_cookie("admin@example.test", "administrator", mfa_state=mfa_state)
+    response = client.post(
+        "/api/admin/cameras/cam-1/people-counting",
+        cookies={partner_portal.SESSION_COOKIE: token},
+        json={"people_counting_enabled": True},
+    )
     assert response.status_code == 403
     assert not _camera_entitlement(seeded_db_path, "cam-1")
 

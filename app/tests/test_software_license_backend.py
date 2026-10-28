@@ -23,8 +23,8 @@ import pytest
 
 from test_pricing_ff_commission import (  # noqa: F401 -- fixtures
     OWNER,
-    _cookie,
-    _make_global_admin,
+    _cookie as _legacy_cookie,
+    _make_global_admin as _legacy_make_global_admin,
     _paid_appliance_order,
     _seed,
     db_path,
@@ -43,6 +43,29 @@ DOWNLOAD_KEYS = {"platform", "version", "commit", "filename", "size_bytes", "sha
                  "install_flow", "url"}
 ADMIN_EMAIL = "admin@example.test"
 CREDENTIAL = "appliance-credential-1"
+
+
+def _cookie(email, role, customer_id=None):
+    if role != "administrator":
+        return _legacy_cookie(email, role, customer_id)
+    from authz_helpers import make_partner_user, partner_session_cookie, enroll_confirmed_mfa, cookies_for
+    from partner_db import connection
+    with connection() as db:
+        account = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()
+    if account is None:
+        uid = make_partner_user(email, role, partner_admin_grant=True)
+        enroll_confirmed_mfa(uid)
+    return cookies_for(partner_session_cookie(email, role, customer_id=customer_id))
+
+
+def _make_global_admin(db_path, email="admin@example.test"):
+    from authz_helpers import enroll_confirmed_mfa
+    from partner_db import connection
+    _legacy_make_global_admin(db_path, email)
+    with connection() as db:
+        uid = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()["id"]
+    enroll_confirmed_mfa(uid)
+    return _cookie(email, "administrator")
 
 
 # ------------------------------------------------------------------ fixtures / helpers

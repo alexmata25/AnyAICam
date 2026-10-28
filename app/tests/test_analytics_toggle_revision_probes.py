@@ -67,12 +67,19 @@ def _headers():
 def cloud(tmp_path):
     db_path = tmp_path / "cloud.db"
     with override_target(sqlite_path=str(db_path)):
-        from partner_db import initialize_database
-        initialize_database()
+        from partner_db import ensure_database_initialized
+        # Register this target before _seed holds a write transaction and
+        # assignment helpers open their own read connections. Calling the
+        # uncached initializer here lets those helpers rerun write migrations
+        # against the caller's still-open transaction.
+        ensure_database_initialized()
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        _seed(conn)
-        yield db_path, conn
+        try:
+            _seed(conn)
+            yield db_path, conn
+        finally:
+            conn.close()
 
 
 def _config(db_path):
