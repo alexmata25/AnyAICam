@@ -112,6 +112,7 @@ def windows_host(monkeypatch, tmp_path):
     monkeypatch.setenv("CUSTOMER_ANALYTICS_RULES_ENABLED", "true")
     monkeypatch.setattr(analytics_platform.shutil, "which", lambda name: None)
     monkeypatch.setattr(analytics_platform, "PPE_MODEL_PATH", str(tmp_path / "models" / "ppe" / "yolov8n-ppe.pt"))
+    monkeypatch.setattr(analytics_platform, "LPR_PLATE_MODEL_PATH", str(tmp_path / "models" / "lpr" / "plate.pt"))
     return tmp_path
 
 
@@ -139,6 +140,10 @@ def test_windows_switches_and_installed_engines_are_honoured(windows_host, monke
     # An administrator installs Tesseract and turns LPR on; installs the PPE model (PPE then defaults on); opts in to
     # facial recognition.
     monkeypatch.setattr(analytics_platform.shutil, "which", lambda name: r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+    assert "license plate model is not installed" in analytics_platform.unavailable_reason("lpr", windows=True)
+    plate = Path(analytics_platform.LPR_PLATE_MODEL_PATH)  # 1.3.4: LPR also needs its plate model
+    plate.parent.mkdir(parents=True)
+    plate.write_bytes(b"model")
     assert "turned off" in analytics_platform.unavailable_reason("lpr", windows=True)
     monkeypatch.setenv("ANYAICAM_LPR_ENABLED", "true")
     model = Path(analytics_platform.PPE_MODEL_PATH)

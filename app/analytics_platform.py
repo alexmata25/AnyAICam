@@ -3,8 +3,8 @@
 The Linux appliance is unchanged: unavailable_reason() is None for every analytic there, and each analytic's own
 appliance-wide switch and engine checks apply exactly as before.
 
-A native Windows install bundles the YOLO detector (app/yolov8n.pt), OpenCV and torch, but not the Tesseract OCR
-engine or the PPE model, and its appliance-wide switches come from vms.env (install-runtime.ps1). On Windows an
+A native Windows install bundles the YOLO detector (app/yolov8n.pt), OpenCV and torch, and since 1.3.4 the Tesseract
+OCR engine, but not the licence-plate or PPE model, and its appliance-wide switches come from vms.env (install-runtime.ps1). On Windows an
 analytic whose engine or switch is missing is reported unavailable with the reason: the Analytics Control Center
 shows it as not available on this computer and refuses to turn it on, and main._analytic_globally_enabled never
 runs it -- instead of a switch that shows "On" while nothing is processed.
@@ -23,6 +23,8 @@ import platform_paths
 PPE_MODEL_PATH = os.environ.get(
     "ANYAICAM_PPE_MODEL",
     platform_paths.native_path("/opt/anyaicam-ppe-model/yolov8n-ppe.pt", "models", "ppe", "yolov8n-ppe.pt"))
+# The same file lpr._get_plate_model() loads (1.3.4): Windows bundles the Tesseract engine but not this model (LIC-1).
+LPR_PLATE_MODEL_PATH = os.environ.get("ANYAICAM_LPR_PLATE_MODEL", platform_paths.native_path("/opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt", "models", "lpr", "license-plate-finetune-v1n.pt"))
 
 RULE_ANALYTICS = ("line_crossing", "intrusion", "loitering")
 # Whether this process applies the Windows availability rules (True only on Windows). The test suite turns it off for
@@ -60,6 +62,9 @@ def unavailable_reason(analytic_key: str, *, windows: bool | None = None) -> str
     if analytic_key == "lpr":
         if not _tesseract_installed():
             return "License plate reading is not available on Windows: the Tesseract OCR engine is not installed."
+        # 1.3.4: without its plate model LPR would fall back to a cascade that finds almost nothing (no silent On).
+        if not os.path.isfile(LPR_PLATE_MODEL_PATH):
+            return "License plate reading is not available on Windows: the license plate model is not installed."
         if not _switch("ANYAICAM_LPR_ENABLED", "false"):
             return "License plate reading is turned off on this computer."
     if analytic_key == "ppe":
