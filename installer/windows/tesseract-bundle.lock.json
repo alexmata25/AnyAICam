@@ -17,7 +17,7 @@
    }
   ],
   "not_bundled": {
-   "lzo": "GPL-2.0-or-later: declared by libarchive but archive.dll does not import lzo2.dll",
+   "lzo": "GPL-2.0-or-later: only the conda-forge gpl_* libarchive builds use it; the lock pins the lgpl_* build (no lzo). The earlier gpl_ pin was replaced 2026-10-27 because static lzo in it could not be ruled out.",
    "krb5": "declared by libcurl, not imported",
    "ca-certificates": "data only, not needed"
   }
@@ -72,9 +72,9 @@
   {
    "name": "libarchive",
    "version": "3.8.9",
-   "file": "libarchive-3.8.9-gpl_h8fdc8af_101.conda",
-   "url": "https://conda.anaconda.org/conda-forge/win-64/libarchive-3.8.9-gpl_h8fdc8af_101.conda",
-   "sha256": "71cb6e49282d2aee1eb0249a290dc2333b0063ac2ecec69116ad569d822a0aaf",
+   "file": "libarchive-3.8.9-lgpl_hb42df8c_1.conda",
+   "url": "https://conda.anaconda.org/conda-forge/win-64/libarchive-3.8.9-lgpl_hb42df8c_1.conda",
+   "sha256": "b99265b28739c9d10bad5c2396c07d6796297d774d31e58854447e952f780bcc",
    "license": "BSD-2-Clause"
   },
   {
@@ -324,5 +324,5 @@
    "package": "zstd"
   }
  ],
- "bundle_sha256": "0bdeb0f30d96241554a83b29fa1072d1fd19048725d417ada9b8aa4ecaa083d6"
+ "bundle_sha256": "221b4599a9310737d8f3a2d8a93477eb3c495d41b5eca8af6ed7b79e0781fbf7"
 }

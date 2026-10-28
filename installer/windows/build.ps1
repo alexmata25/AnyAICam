@@ -44,7 +44,7 @@ $pinned = [ordered]@{
     'vosk-model-small-en-us-0.15.zip'       = '30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498'
     # 1.3.4 LPR parity: Tesseract 5.5.2 + its DLL closure + tessdata_fast eng, assembled deterministically from pinned
     # conda-forge packages by prepare-tesseract-bundle.py (tesseract-bundle.lock.json; licences inside the zip).
-    'tesseract-5.5.2-win64-anyaicam.zip'    = '0bdeb0f30d96241554a83b29fa1072d1fd19048725d417ada9b8aa4ecaa083d6'
+    'tesseract-5.5.2-win64-anyaicam.zip'    = '221b4599a9310737d8f3a2d8a93477eb3c495d41b5eca8af6ed7b79e0781fbf7'
 }
 foreach ($file in $pinned.Keys) {
     $path = Join-Path $vendor $file
