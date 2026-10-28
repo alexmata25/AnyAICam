@@ -348,6 +348,10 @@ def test_edge_local_emergency_login_still_works(edge):
     assert response.status_code == 303
     token = legacy_cookie_from(response)
     assert token and main.authenticated_user(_request_legacy(token))["role"] == "administrator"
+    # Preserve the documented edge emergency sign-in while keeping it outside
+    # the Partner Portal's global-only protected API surface.
+    protected = edge.post("/api/admin/customers/cust-a/camera-quota", cookies={main.SESSION_COOKIE_NAME: token}, json={"camera_quota": 4})
+    assert protected.status_code in (401, 403)
 
 
 def test_edge_admin_partner_session_needs_no_cloud_mfa(edge):

@@ -1,8 +1,7 @@
 """Regression coverage for the Administrator Portal authorization
-boundary: a cloud-delegated Partner Portal session with a live,
-GLOBAL-scoped 'administrator' grant may use the real /admin-portal
-(main.py's cloud_administrator_bridge(), consulted by current_user())
--- without ever creating a legacy users.json row for that identity.
+boundary. This application has no authoritative delegated MFA signal,
+so a cloud-delegated administrator assertion must fail closed for
+protected administrator operations. Local emergency access is separate.
 
 Boundary this file exists to prove, per the task's own explicit list:
   - cloud global Administrator = global admin access
@@ -92,12 +91,9 @@ def test_global_administrator_grant_reaches_admin_portal(http_client):
     _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="administrator", scope_type="global")
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
-    assert login.status_code == 303
-    assert login.headers["location"] == "/admin-portal"
-    session_cookie = login.cookies[partner_portal.SESSION_COOKIE]
-
-    page = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie})
-    assert page.status_code == 200
+    assert login.status_code == 403
+    assert "verifiable mfa" in login.json()["detail"].lower()
+    assert partner_portal.SESSION_COOKIE not in login.cookies
 
 
 def test_bridged_identity_can_use_a_real_admin_only_action_not_just_load_the_page(http_client):
@@ -110,10 +106,8 @@ def test_bridged_identity_can_use_a_real_admin_only_action_not_just_load_the_pag
     _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="administrator", scope_type="global")
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
-    session_cookie = login.cookies[partner_portal.SESSION_COOKIE]
-
-    grants_list = client.get("/api/operations/identity-grants", cookies={partner_portal.SESSION_COOKIE: session_cookie})
-    assert grants_list.status_code == 200
+    assert login.status_code == 403
+    assert client.get("/api/operations/identity-grants", cookies=login.cookies).status_code in (401, 403)
 
 
 # =============================================================== same email, Administrator + Partner grants
@@ -127,7 +121,8 @@ def test_same_email_with_both_grants_can_select_either_portal(http_client):
     _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="partner_owner", scope_type="partner", scope_id="partner-1")
 
     as_admin = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
-    assert as_admin.headers["location"] == "/admin-portal"
+    assert as_admin.status_code == 403
+    assert partner_portal.SESSION_COOKIE not in as_admin.cookies
 
     as_partner = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "partner"}, follow_redirects=False)
     assert as_partner.headers["location"] == "/partner?tab=customers"
@@ -157,14 +152,14 @@ def test_removing_administrator_grant_immediately_denies_admin_portal_even_with_
     admin_grant_id = _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="administrator", scope_type="global")
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
-    session_cookie = login.cookies[partner_portal.SESSION_COOKIE]
-    assert client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie}).status_code == 200
+    assert login.status_code == 403
+    assert partner_portal.SESSION_COOKIE not in login.cookies
 
     client.post(f"/api/operations/identity-grants/{admin_grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: admin_token})
 
-    denied = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie})
-    assert denied.status_code == 200  # permission_denied_page() renders 200, same convention as every other Admin Portal page
-    assert "manage_settings" in denied.text or "permission" in denied.text.lower()
+    denied = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
+    assert denied.status_code in (401, 403)
+    assert partner_portal.SESSION_COOKIE not in denied.cookies
 
 
 # =============================================================== partner-scoped admin must never gain global reach
@@ -177,13 +172,8 @@ def test_partner_scoped_administrator_cannot_reach_admin_portal(http_client):
     _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="administrator", scope_type="partner", scope_id="partner-1")
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
-    assert login.status_code == 303
-    assert login.headers["location"] == "/partner?tab=customers"  # never /admin-portal
-    session_cookie = login.cookies[partner_portal.SESSION_COOKIE]
-
-    denied = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie})
-    assert denied.status_code == 200
-    assert "manage_settings" in denied.text or "permission" in denied.text.lower()
+    assert login.status_code == 403
+    assert partner_portal.SESSION_COOKIE not in login.cookies
 
 
 def test_has_global_administrator_grant_is_false_for_a_partner_scoped_grant():

@@ -232,3 +232,97 @@ def test_no_email_or_skip_path_bypasses_mfa(cloud):
         assert response.status_code == 200 and response.json()["status"] == "mfa_required"
     mfa_paths = sorted({route.path for route in main.app.routes if "mfa" in getattr(route, "path", "")})
     assert all("email" not in path and "skip" not in path for path in mfa_paths), mfa_paths
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_global_admin_can_audit_reset_partner_admin_factor_without_granting_privilege(tmp_path, monkeypatch, profile):
+    import json
+
+    from authz_helpers import audit_actions, table_snapshot
+
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        with connection() as db:
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-a','A','approved','real','2026-01-01')")
+            db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-a','partner-a','Customer A','a@customers.test','active','real','2026-01-01')")
+
+        target_email = "company-admin@partner.test"
+        target_id = make_partner_user(target_email, "administrator", partner_id="partner-a", partner_admin_grant=True, password=PASSWORD)
+        target_secret = enroll_confirmed_mfa(target_id)
+        target_existing_session = partner_session_cookie(target_email, "administrator", mfa_state="verified")
+        pending = _login_target(client, target_email).json()["mfa_pending_token"]
+        with connection() as db:
+            recovery_codes = platform_owner.generate_recovery_codes(db, user_id=target_id)
+
+        global_email = "global-owner@anyaicam.test"
+        global_id = make_partner_user(global_email, "administrator", partner_id="partner-a", global_admin=True, password=PASSWORD)
+        global_secret = enroll_confirmed_mfa(global_id)
+        global_unverified = partner_session_cookie(global_email, "administrator", mfa_state=None)
+
+        scoped_email = "other-company-admin@partner.test"
+        make_partner_user(scoped_email, "administrator", partner_id="partner-a", partner_admin_grant=True, password=PASSWORD)
+        scoped_verified = partner_session_cookie(scoped_email, "administrator", mfa_state="verified")
+
+        route = f"/api/platform-owner/partner-administrators/{target_id}/mfa-reset"
+        body = {"partner_id": "partner-a"}
+        protected_before = table_snapshot()
+        assert client.post(route, cookies=cookies_for(global_unverified), json=body).status_code in (401, 403)
+        assert client.post(route, cookies=cookies_for(scoped_verified), json=body).status_code == 403
+        assert table_snapshot() == protected_before
+
+        global_login = client.post("/api/portal-login", json={"email": global_email, "password": PASSWORD, "portal": "administrator"})
+        assert global_login.status_code == 200 and global_login.json()["status"] == "mfa_required"
+        global_verify = client.post("/api/platform-owner/mfa/verify", json={"mfa_pending_token": global_login.json()["mfa_pending_token"], "code": totp_now(global_secret)})
+        assert global_verify.status_code == 303, global_verify.text
+        global_token = partner_cookie_from(global_verify)
+
+        reset = client.post(route, cookies=cookies_for(global_token), json=body)
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["status"] == "reset"
+        assert session_row(target_existing_session)["revoked_at"] is not None
+        with connection() as db:
+            assert db.execute("SELECT 1 FROM platform_owner_mfa WHERE user_id=?", (target_id,)).fetchone() is None
+            assert db.execute("SELECT COUNT(*) AS n FROM platform_owner_recovery_codes WHERE user_id=?", (target_id,)).fetchone()["n"] == 0
+            pending_row = db.execute("SELECT used_at FROM pending_mfa_logins WHERE id=?", (pending,)).fetchone()
+            assert pending_row and pending_row["used_at"]
+            grants_after = [tuple(row) for row in db.execute("SELECT role,scope_type,scope_id,revoked_at FROM identity_grants WHERE user_id=?", (target_id,)).fetchall()]
+        assert grants_after == [("administrator", "partner", "partner-a", None)]
+
+        audit = [entry for entry in audit_actions() if entry[1] == "partner_admin_mfa_reset"]
+        assert audit
+        details = json.loads(audit[-1][2])
+        assert details["partner_id"] == "partner-a" and details["initiated_by_user_id"] == global_id
+
+        # The target must prove password control; the response is enrollment-only,
+        # old operations remain blocked, and no global grant was created.
+        recovery_login = _login_target(client, target_email)
+        assert recovery_login.status_code == 303
+        enrollment = partner_cookie_from(recovery_login)
+        assert enrollment and session_row(enrollment)["mfa_state"] == "enrollment_only"
+        assert client.post("/api/admin/customers/cust-a/camera-quota", cookies=cookies_for(enrollment), json={"camera_quota": 4}).status_code in (401, 403)
+        with connection() as db:
+            assert db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND scope_type='global' AND revoked_at IS NULL", (target_id,)).fetchone() is None
+
+        started = client.post("/api/platform-owner/mfa/enroll", json={}, cookies=cookies_for(enrollment))
+        assert started.status_code == 200
+        confirmed = client.post("/api/platform-owner/mfa/confirm", json={"code": totp_now(started.json()["secret_base32"])}, cookies=cookies_for(enrollment))
+        assert confirmed.status_code == 200 and confirmed.json()["sign_in_required"] is True
+        second_login = _login_target(client, target_email)
+        assert second_login.status_code == 200 and second_login.json()["status"] == "mfa_required"
+        second_verify = client.post("/api/platform-owner/mfa/verify", json={"mfa_pending_token": second_login.json()["mfa_pending_token"], "code": totp_now(started.json()["secret_base32"])})
+        assert second_verify.status_code == 303
+
+
+def _login_target(client, email):
+    return client.post("/api/portal-login", json={"email": email, "password": PASSWORD, "portal": "administrator"})
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_delegated_admin_cannot_enroll_or_recover_by_matching_local_email(tmp_path, monkeypatch, profile):
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        uid = make_partner_user(OWNER, "administrator", global_admin=True)
+        enroll_confirmed_mfa(uid)
+        delegated = partner_session_cookie(OWNER, "administrator", mfa_state="verified", auth_source="cloud_assertion", user_id=uid)
+        before = current_version(OWNER)
+        assert client.get("/api/platform-owner/mfa/status", cookies=cookies_for(delegated)).status_code == 403
+        assert client.post(f"/api/platform-owner/partner-administrators/{uid}/mfa-reset", cookies=cookies_for(delegated), json={"partner_id": "partner-a"}).status_code == 403
+        assert current_version(OWNER) == before

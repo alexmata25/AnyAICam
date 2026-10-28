@@ -48804,33 +48804,23 @@ def portal_login_submit(request: Request, payload: dict):
         )
         return response
 
-    # PLATFORM_OWNER_MFA_HOOK (2026-09-23): password (and, if delegated,
-    # cloud-assertion) verification above already fully decided this is
-    # a real, live scope_type='global' administrator login destined for
-    # /admin-portal -- see platform_owner.py's own module docstring.
-    # Linux 1.2.7.1 (D-AUTHZ-2b): on the cloud profile EVERY administrator
-    # sign-in (any scope) continues only through begin_admin_login() -- an
-    # MFA challenge when enrolled, an enrollment-only session when not --
-    # never a full administrator session without MFA. On an edge appliance the
-    # original hook (an enrolled global administrator verifies a code) stays.
+    # Every local partner_users administrator, global or partner-scoped,
+    # must enroll or complete MFA before receiving a full session on edge or
+    # cloud. Scope is rechecked against live grants in begin_admin_login and
+    # again when the pending MFA challenge is consumed. The legacy local
+    # emergency login above remains a separate, unchanged authentication path.
     destination = "/change-password" if partner_user and partner_user.get("must_change_password") else decision["destination"]
-    if cloud and decision["role"] == "administrator":
+    if decision["system"] == "partner" and decision["role"] == "administrator":
+        if own_appliance or (partner_user or {}).get("auth_source") == "cloud_assertion":
+            from admin_auth_policy import auth_audit
+            auth_audit("login.denied", actor_email=email, actor_role="administrator", reason="delegated_admin_mfa_unverified",
+                       entity_id=str((partner_user or {}).get("id") or ""))
+            raise HTTPException(status_code=403, detail="Administrator sign-in is unavailable until this identity provider supplies verifiable MFA.")
         if not partner_user or not partner_user.get("id"):
             record_login_failure(email)
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
+            raise HTTPException(status_code=401, detail="Administrator identity is not eligible for local MFA.")
         from platform_owner import begin_admin_login
         return begin_admin_login(request, user=partner_user, email=email, role="administrator", destination=destination)
-    if decision["system"] == "partner" and decision["destination"] == "/admin-portal" and partner_user and partner_user.get("id"):
-        from partner_db import connection as _pdb_connection
-        with _pdb_connection() as _mfa_db:
-            from platform_owner import mfa_is_confirmed
-            if mfa_is_confirmed(_mfa_db, user_id=partner_user["id"]):
-                from platform_owner import create_pending_mfa_login
-                pending_token = create_pending_mfa_login(
-                    _mfa_db, user_id=partner_user["id"], destination=decision["destination"], email=email,
-                    role=decision["role"], authorization_version_at_login=partner_authorization_version,
-                )
-                return {"status": "mfa_required", "mfa_pending_token": pending_token}
 
     from partner_portal import establish_partner_session
 
@@ -58683,7 +58673,12 @@ def partner_customers_api(request: Request) -> dict:
 
 
 
-    require_partner_access(request)
+    identity = require_partner_access(request)
+    from partner_db import require_permission
+    try:
+        require_permission(identity, "customer.view")
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="Customer view permission is required.") from error
     visible = partner_record_scope(request)
     return {"customers": [item for item in load_partner_customers() if visible(item.get("partner_id"))]}
 
@@ -58730,7 +58725,12 @@ def create_partner_customer(request: Request, customer: PartnerCustomerModel) ->
 
 
 
-    require_partner_access(request)
+    identity = require_partner_access(request)
+    from partner_db import require_permission
+    try:
+        require_permission(identity, "customer.create")
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="Customer creation permission is required.") from error
 
 
 
@@ -136061,7 +136061,7 @@ def partner_permission_denied(request: Request, permission: str, title: str, act
 
 
 def partner_record_scope(request: Request):
-    from appliance_identity import has_global_administrator_grant
+    from appliance_identity import live_administrator_grant_scope
     from partner_db import connection as _scope_connection
     from partner_portal import partner_identity
 
@@ -136071,9 +136071,24 @@ def partner_record_scope(request: Request):
         if has_permission(user, "manage_settings"):
             return lambda partner_id: True
         identity = {"email": "", "partner_id": None}
-    with _scope_connection() as db:
-        if identity.get("email") and has_global_administrator_grant(db, email=identity["email"]):
+    if identity.get("role") == "administrator":
+        user_id = str(identity.get("user_id") or "")
+        with _scope_connection() as db:
+            account = db.execute("SELECT partner_id,role FROM partner_users WHERE id=? AND lower(email)=?",
+                                 (user_id, str(identity.get("email") or "").lower())).fetchone()
+            scope = live_administrator_grant_scope(db, user_id=user_id) if account and account["role"] == "administrator" else None
+            grants = db.execute("SELECT scope_id FROM identity_grants WHERE user_id=? AND role='administrator' "
+                                "AND scope_type='partner' AND revoked_at IS NULL", (user_id,)).fetchall() if scope == "partner" else []
+        if identity.get("mfa_state") != "verified" or not account or scope is None:
+            return lambda partner_id: False
+        if scope == "global":
             return lambda partner_id: True
+        authorized_partner_ids = {str(row["scope_id"]) for row in grants if row["scope_id"]}
+        account_partner_id = str(account["partner_id"] or "")
+        session_partner_id = str(identity.get("partner_id") or "")
+        if account_partner_id not in authorized_partner_ids or session_partner_id != account_partner_id:
+            return lambda partner_id: False
+        return lambda partner_id: str(partner_id or "") == account_partner_id
     own = identity.get("partner_id") or "anyaicam-primary"
     return lambda partner_id: bool(partner_id) and partner_id == own
 
@@ -138145,7 +138160,12 @@ def update_partner_customer(
 
 
 
-    require_partner_access(request)
+    identity = require_partner_access(request)
+    from partner_db import require_permission
+    try:
+        require_permission(identity, "customer.edit")
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="Customer edit permission is required.") from error
 
 
 
@@ -140635,6 +140655,13 @@ def partner_customer_quote_page(quote_id: str, request: Request) -> Response:
 
         return authorization_response
 
+    identity = require_partner_access(request)
+    from partner_db import require_permission
+    try:
+        require_permission(identity, "quote.create")
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="Quote permission required.") from error
+
 
 
 
@@ -142926,7 +142953,12 @@ def create_partner_installation(request: Request, payload: PartnerInstallationCr
 
 
 
-    require_partner_access(request)
+    identity = require_partner_access(request)
+    from partner_db import require_permission
+    try:
+        require_permission(identity, "customer.edit")
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="Customer edit permission is required.") from error
 
 
 
@@ -143131,7 +143163,12 @@ def update_partner_installation(
 
 
 
-    require_partner_access(request)
+    identity = require_partner_access(request)
+    from partner_db import require_permission
+    try:
+        require_permission(identity, "customer.edit")
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail="Customer edit permission is required.") from error
 
 
 
@@ -143176,6 +143213,11 @@ def update_partner_installation(
 
 
 
+
+    if not record.get("customer_id") or not any(
+        customer.get("id") == record.get("customer_id") for customer in scoped_partner_customers(request)
+    ):
+        return {"status": "error", "message": "Installation record not found."}
 
     updates = payload.model_dump(exclude_none=True)
 

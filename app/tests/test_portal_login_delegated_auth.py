@@ -81,26 +81,23 @@ def test_unconfigured_instance_is_completely_unaffected_by_the_delegated_path(ht
 # =============================================================== configured -- delegated contract in effect
 
 
-def test_configured_instance_delegates_administrator_login_through_the_signed_assertion(http_client, monkeypatch):
+@pytest.mark.parametrize("scope_type,scope_id", [("global", None), ("partner", "partner-1")])
+def test_configured_instance_fails_closed_for_delegated_administrator_without_authoritative_mfa(http_client, monkeypatch, scope_type, scope_id):
     client, db_path = http_client
-    _seed_appliance_and_operator(db_path)
+    _seed_appliance_and_operator(db_path, scope_type=scope_type, scope_id=scope_id)
+    from authz_helpers import enroll_confirmed_mfa
+    enroll_confirmed_mfa("u-self")  # a local factor must not be silently linked to the delegated assertion
     _configure_own_appliance(monkeypatch)
 
     response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
-    assert response.status_code == 303
-    # scope_type='global' (this helper's default) -- reaches the real
-    # Admin Portal, not the Partner Portal's customer view. The session
-    # cookie is still the Partner Portal one: this is a cloud-delegated
-    # identity, not a legacy admin@local session -- see
-    # cloud_administrator_bridge() (main.py) for how /admin-portal
-    # itself comes to accept it.
-    assert response.headers["location"] == "/admin-portal"
-    assert partner_portal.SESSION_COOKIE in response.cookies
+    assert response.status_code == 403
+    assert "verifiable mfa" in response.json()["detail"].lower()
+    assert partner_portal.SESSION_COOKIE not in response.cookies
 
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            row = db.execute("SELECT authorization_version_at_login FROM user_sessions WHERE user_id='u-self'").fetchone()
-    assert row["authorization_version_at_login"] == 2  # default 1, +1 from create_grant()'s bump
+            assert db.execute("SELECT 1 FROM user_sessions WHERE user_id='u-self'").fetchone() is None
+            assert db.execute("SELECT 1 FROM platform_owner_mfa WHERE user_id='u-self' AND confirmed_at IS NOT NULL").fetchone()
 
 
 def test_configured_instance_rejects_a_grant_that_does_not_resolve_to_this_appliance(http_client, monkeypatch):
@@ -151,11 +148,14 @@ def test_broader_grant_wins_regardless_of_which_one_was_created_first(http_clien
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             appliance_identity.create_grant(db, user_id="u-self", role="administrator", scope_type="global", scope_id=None, granted_by="test")
+            delegated = appliance_identity.authenticate_operator(db, email="amata@anyaicam.com", password="Sup3rSecret!",
+                                                                  portal="administrator", cloud_id="AIC-SELF0001")
+    assert delegated["status"] == "ok" and delegated["assertion"]["scope_type"] == "global"
     _configure_own_appliance(monkeypatch)
 
     response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin-portal"  # the global grant, not /partner?tab=customers
+    assert response.status_code == 403  # no authoritative MFA claim; local MFA is not linked by assertion ID/email
+    assert partner_portal.SESSION_COOKIE not in response.cookies
 
 
 # =============================================================== new offline login denied while cloud unavailable
@@ -183,10 +183,10 @@ def test_cloud_unavailable_does_not_affect_an_already_established_session(http_c
     # involved at all -- unaffected by the cloud being unreachable for
     # a *new* login.
     client, db_path = http_client
-    _seed_appliance_and_operator(db_path)
+    _seed_appliance_and_operator(db_path, email="tech@example.test", role="technician", scope_type="appliance", scope_id="AIC-SELF0001")
     _configure_own_appliance(monkeypatch)
 
-    login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
+    login = client.post("/api/portal-login", json={"email": "tech@example.test", "password": "Sup3rSecret!", "portal": "technician"}, follow_redirects=False)
     cookie_value = login.cookies[partner_portal.SESSION_COOKIE]
 
     backend = appliance_identity.get_cloud_identity_backend()
@@ -196,7 +196,7 @@ def test_cloud_unavailable_does_not_affect_an_already_established_session(http_c
 
     monkeypatch.setattr(backend, "authenticate_operator", _raise_unavailable)
 
-    response = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: cookie_value})
+    response = client.get("/partner/appliance-dashboard", cookies={partner_portal.SESSION_COOKIE: cookie_value})
     assert response.status_code == 200  # the existing session still works; no cloud call was made to view this page
 
 
@@ -235,6 +235,7 @@ def test_stray_persisted_identity_on_a_non_edge_deployment_is_ignored(http_clien
         with connection() as db:
             db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-1", "Partner", "approved", "real", "2026-08-27T00:00:00"))
             db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)", ("u1", "partner-1", "real-admin@example.test", "Admin", "administrator", password_hash("Sup3rSecret!"), 1, "2026-08-27T00:00:00"))
+            appliance_identity.create_grant(db, user_id="u1", role="administrator", scope_type="global", scope_id=None, granted_by="test")
 
     with caplog.at_level(logging.WARNING, logger="anyaicam.main"):
         response = client.post(
@@ -243,10 +244,13 @@ def test_stray_persisted_identity_on_a_non_edge_deployment_is_ignored(http_clien
             follow_redirects=False,
         )
 
-    # The real account authenticates normally through partner_db --
-    # the stray identity never gets a chance to divert it.
+    # The stray identity is ignored; a real local administrator is given
+    # only an enrollment session until MFA has been confirmed.
     assert response.status_code == 303
+    assert response.headers["location"] == "/admin/mfa-setup"
     assert partner_portal.SESSION_COOKIE in response.cookies
+    from authz_helpers import session_row
+    assert session_row(response.cookies[partner_portal.SESSION_COOKIE])["mfa_state"] == "enrollment_only"
     assert any("portal_login.stray_appliance_identity_ignored" in record.message for record in caplog.records), \
         "a stray identity mismatch must be logged, never silent"
 
@@ -279,13 +283,13 @@ def test_stray_persisted_identity_never_denies_login_even_with_a_wrong_password(
 
 
 def test_a_stray_identity_on_a_genuine_edge_deployment_is_unaffected(http_client, monkeypatch):
-    """RUNTIME_ROLE=="edge" is the one case where own_appliance_identity()
-    being truthy is legitimate -- this fix must never break that."""
+    """A genuine edge delegated admin without an authoritative MFA claim
+    cannot enter protected administrator operations."""
     client, db_path = http_client
     monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
     _seed_appliance_and_operator(db_path)
     _configure_own_appliance(monkeypatch)
 
     response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin-portal"
+    assert response.status_code == 403
+    assert partner_portal.SESSION_COOKIE not in response.cookies

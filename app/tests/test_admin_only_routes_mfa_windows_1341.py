@@ -167,6 +167,22 @@ def test_edge_every_admin_only_route_refuses_admin_without_verified_mfa(edge, mf
     assert table_snapshot() == before
 
 
+@pytest.mark.parametrize("mfa_state", UNVERIFIED_STATES)
+def test_cloud_every_admin_only_route_refuses_admin_without_verified_mfa(tmp_path, monkeypatch, mfa_state):
+    with isolated_app(tmp_path, monkeypatch, cloud=True) as client:
+        _seed()
+        make_partner_user(OWNER, "administrator", global_admin=True)
+        before = table_snapshot()
+        failures = []
+        for method, path, body in ADMIN_ONLY_ROUTES:
+            token = partner_session_cookie(OWNER, "administrator", mfa_state=mfa_state)
+            response = client.request(method, path, cookies=cookies_for(token), json=body)
+            if response.status_code != _expected_refusal(mfa_state, cloud=True):
+                failures.append((method, path, response.status_code))
+        assert not failures, failures
+        assert table_snapshot() == before
+
+
 def test_edge_admin_only_refusal_is_audited_and_does_not_revoke_the_session(edge):
     make_partner_user(OWNER, "administrator", global_admin=True)
     token = partner_session_cookie(OWNER, "administrator", mfa_state=None)
@@ -211,6 +227,117 @@ def test_cloud_verified_partner_scoped_admin_still_needs_the_global_grant(cloud)
     token = partner_session_cookie("company-admin@partner.test", "administrator", mfa_state="verified")
     assert _people_counting(cloud, token).status_code == 403
     assert not _entitled()
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_delegated_admin_cannot_reuse_local_mfa_by_email_or_user_id(tmp_path, monkeypatch, profile):
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        _seed()
+        uid = make_partner_user(OWNER, "administrator", global_admin=True)
+        enroll_confirmed_mfa(uid)
+        delegated = partner_session_cookie(OWNER, "administrator", mfa_state="verified", auth_source="cloud_assertion", user_id=uid)
+        before = table_snapshot()
+        response = _people_counting(client, delegated)
+        assert response.status_code == 403
+        assert table_snapshot() == before
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_partner_scoped_admin_is_refused_by_all_global_only_routes_without_mutation(tmp_path, monkeypatch, profile):
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        _seed()
+        email = "company-admin@partner.test"
+        make_partner_user(email, "administrator", partner_id="partner-a", partner_admin_grant=True)
+        token = partner_session_cookie(email, "administrator", mfa_state="verified")
+        before = table_snapshot()
+        failures = []
+        for method, path, body in ADMIN_ONLY_ROUTES:
+            response = client.request(method, path, cookies=cookies_for(token), json=body)
+            if response.status_code != 403:
+                failures.append((method, path, response.status_code, response.text[:160]))
+        assert not failures, failures
+        assert table_snapshot() == before
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_revoked_global_grant_is_rechecked_by_every_admin_only_route(tmp_path, monkeypatch, profile):
+    import appliance_identity
+
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        _seed()
+        uid = make_partner_user(OWNER, "administrator", global_admin=True)
+        token = partner_session_cookie(OWNER, "administrator", mfa_state="verified")
+        assert _people_counting(client, token).status_code == 200
+        with connection() as db:
+            grant = db.execute("SELECT id FROM identity_grants WHERE user_id=? AND scope_type='global' AND revoked_at IS NULL", (uid,)).fetchone()
+            # Model a grant revoked by an external authority before local
+            # session reconciliation has bumped authorization_version.
+            db.execute("UPDATE identity_grants SET revoked_at='2026-10-28T12:00:00' WHERE id=?", (grant["id"],))
+        after_revoke = table_snapshot()
+        failures = []
+        for method, path, body in ADMIN_ONLY_ROUTES:
+            response = client.request(method, path, cookies=cookies_for(token), json=body)
+            if response.status_code != 403:
+                failures.append((method, path, response.status_code))
+        assert not failures, failures
+        assert table_snapshot() == after_revoke
+        assert session_row(token)["revoked_at"] is None
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_partner_admin_grant_must_match_account_partner_and_live_mfa(tmp_path, monkeypatch, profile):
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        _seed()
+        email = "mismatched-admin@partner.test"
+        uid = make_partner_user(email, "administrator", partner_id="partner-a", partner_admin_grant=True)
+        with connection() as db:
+            db.execute("UPDATE identity_grants SET scope_id='partner-b' WHERE user_id=? AND scope_type='partner'", (uid,))
+        token = partner_session_cookie(email, "administrator", mfa_state="verified")
+        response = client.get("/api/partner/customers", cookies=cookies_for(token))
+        assert response.status_code == 403
+        assert not _entitled()
+
+
+@pytest.mark.parametrize("profile", ["edge", "cloud"])
+def test_partner_admin_mfa_enrollment_is_limited_until_verified_then_stays_tenant_scoped(tmp_path, monkeypatch, profile):
+    import json
+    import main
+
+    with isolated_app(tmp_path, monkeypatch, cloud=profile == "cloud") as client:
+        _seed()
+        with connection() as db:
+            db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES('partner-b','B','approved','real','2026-10-28')")
+            db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-b','partner-b','Customer B','b@customers.test','active','real','2026-10-28')")
+        customer_file = tmp_path / "partner_customers.json"
+        customer_file.write_text(json.dumps([
+            {"id": "cust-a", "partner_id": "partner-a", "name": "Customer A"},
+            {"id": "cust-b", "partner_id": "partner-b", "name": "Customer B"},
+        ]), encoding="utf-8")
+        monkeypatch.setattr(main, "PARTNER_CUSTOMERS_FILE", customer_file)
+        email = "company-admin@partner.test"
+        uid = make_partner_user(email, "administrator", partner_id="partner-a", partner_admin_grant=True, password=PASSWORD)
+        login = client.post("/api/portal-login", json={"email": email, "password": PASSWORD, "portal": "administrator"})
+        assert login.status_code == 303, login.text
+        enrollment = partner_cookie_from(login)
+        assert enrollment and session_row(enrollment)["mfa_state"] == "enrollment_only"
+        assert client.get("/api/partner/customers", cookies=cookies_for(enrollment)).status_code in (401, 403)
+        assert client.post("/api/admin/customers/cust-a/camera-quota", cookies=cookies_for(enrollment), json={"camera_quota": 4}).status_code in (401, 403)
+
+        started = client.post("/api/platform-owner/mfa/enroll", json={}, cookies=cookies_for(enrollment))
+        assert started.status_code == 200, started.text
+        confirmed = client.post("/api/platform-owner/mfa/confirm", json={"code": totp_now(started.json()["secret_base32"])}, cookies=cookies_for(enrollment))
+        assert confirmed.status_code == 200 and confirmed.json()["sign_in_required"] is True
+        login = client.post("/api/portal-login", json={"email": email, "password": PASSWORD, "portal": "administrator"})
+        assert login.status_code == 200 and login.json()["status"] == "mfa_required"
+        verified = client.post("/api/platform-owner/mfa/verify", json={"mfa_pending_token": login.json()["mfa_pending_token"], "code": totp_now(started.json()["secret_base32"])})
+        assert verified.status_code == 303, verified.text
+        token = partner_cookie_from(verified)
+        assert session_row(token)["mfa_state"] == "verified"
+        customers = client.get("/api/partner/customers", cookies=cookies_for(token))
+        assert customers.status_code == 200, customers.text
+        assert {row["id"] for row in customers.json()["customers"]} == {"cust-a"}
+        assert client.post("/api/admin/customers/cust-a/camera-quota", cookies=cookies_for(token), json={"camera_quota": 4}).status_code == 403
+        assert not _entitled()
 
 
 # ----------------------------------------------------------- platform owner / session replacement

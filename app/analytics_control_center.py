@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse
 
 import analytics_platform
 from partner_db import connection
-from partner_portal import partner_identity
+from partner_portal import partner_identity, require_partner_access
 from customer_analytics_panel import analytics_license_summary, assign_entitlement, remove_entitlement, LicenseLimitExceeded
 
 ANALYTICS: dict[str, dict[str, str]] = {
@@ -331,17 +331,10 @@ def register_routes(app: FastAPI, page_shell: Callable) -> None:
         return who
 
     def lab_administrator_identity(request: Request) -> dict:
-        who = partner_identity(request)
-        if not who or who.get("role") != "administrator":
-            raise HTTPException(status_code=403, detail="Administrator access is required.")
-        # Windows 1.3.4.1 (D-AUTHZ-2b port): same rule as partner_portal._require
-        # for administrator-only routes -- the session must have passed MFA.
-        if who.get("mfa_state") != "verified":
-            from admin_auth_policy import auth_audit
-            auth_audit("access.denied", actor_email=who.get("email"), actor_role="administrator", reason="admin_without_mfa",
-                       entity_id=str(who.get("user_id") or ""))
-            raise HTTPException(status_code=403, detail="Administrator MFA verification required.")
-        return who
+        # Test Lab grant mutation is platform-global: use the same live MFA
+        # and global-grant gate as every administrator-only route on edge and
+        # cloud, rather than checking only the cookie role/MFA marker here.
+        return require_partner_access(request, {"administrator"})
 
     def camera_access(db, camera_id: str, who: dict, *, edit: bool) -> dict:
         row = db.execute("SELECT id,name,camera_number,customer_id,site_id,appliance_id,status,smart_motion_enabled FROM cameras WHERE id=? AND customer_id=?",

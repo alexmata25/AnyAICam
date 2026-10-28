@@ -498,6 +498,8 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.post('/api/partner/quotes/{quote_id}/deliver')
     def deliver_quote(request: Request,quote_id: str,payload: dict):
         identity=require_partner_access(request)
+        try: require_permission(identity,'quote.create')
+        except PermissionError as error: raise HTTPException(status_code=403,detail='Quote permission required.') from error
         # Directly-equivalent finding, same 2026-09-14 remediation pass:
         # this route had no tenant-ownership check of its own -- any
         # authenticated partner_owner/salesperson/technician could probe

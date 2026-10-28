@@ -275,12 +275,17 @@ def _mfa_actor(request: Request, *, allow_enrollment: bool = True) -> dict:
         enrollment = identity is not None
     if not identity or identity.get("role") != "administrator":
         raise HTTPException(status_code=403, detail="Platform owner access is required.")
+    # This application has no authoritative delegated-identity MFA claim.
+    # Never bind a local factor to a delegated assertion by email.
+    if identity.get("auth_source") == "cloud_assertion":
+        raise HTTPException(status_code=403, detail="Administrator MFA is unavailable for this delegated identity.")
     email = str(identity.get("email") or "").strip()
     from appliance_identity import live_administrator_grant_scope
     from partner_db import connection
 
+    user_id = str(identity.get("user_id") or "")
     with connection() as db:
-        user = db.execute("SELECT id,role FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone() if email else None
+        user = db.execute("SELECT id,role FROM partner_users WHERE id=? AND lower(email)=?", (user_id, email.lower())).fetchone() if email and user_id else None
         scope = live_administrator_grant_scope(db, user_id=user["id"]) if user and user["role"] == "administrator" else None
     if not user or scope is None or (identity.get("mfa_state") == "reenroll_required" and scope != "global"):
         raise HTTPException(status_code=403, detail="Platform owner access is required.")
@@ -289,12 +294,15 @@ def _mfa_actor(request: Request, *, allow_enrollment: bool = True) -> dict:
 
 
 def _require_global_grant_session(request: Request) -> dict:
-    """A full (on the cloud: MFA-verified) session of a live GLOBAL
+    """A full, MFA-verified session of a live GLOBAL
     administrator grant -- re-checked the same way current_user()/
     cloud_administrator_bridge() already does for every other Admin Portal
     route, not trusted from the session cookie's own role claim alone."""
     actor = _mfa_actor(request, allow_enrollment=False)
-    if actor["scope"] != "global":
+    if actor.get("mfa_state") != "verified" or actor["scope"] != "global":
+        from admin_auth_policy import auth_audit
+        auth_audit("access.denied", actor_email=actor.get("email"), actor_role="administrator",
+                   reason="global_admin_mfa_or_grant_required", entity_id=actor.get("user_id", ""))
         raise HTTPException(status_code=403, detail="Platform owner access is required.")
     return actor
 
@@ -433,10 +441,18 @@ def begin_admin_login(request: Request, *, user: dict, email: str, role: str, de
     enrollment surface and sign-out (L-2a, T-2). Never a full administrator
     session without MFA."""
     from admin_auth_policy import ENROLLMENT_SESSION_MINUTES, auth_audit
+    from appliance_identity import live_administrator_grant_scope
     from partner_db import connection
 
     with connection() as db:
-        current = db.execute("SELECT authorization_version FROM partner_users WHERE id=?", (user["id"],)).fetchone()
+        current = db.execute("SELECT authorization_version,role,approved,account_status FROM partner_users WHERE id=?", (user["id"],)).fetchone()
+        scope = live_administrator_grant_scope(db, user_id=user["id"])
+        active = bool(current and current["role"] == "administrator" and current["approved"]
+                      and str(current["account_status"] or "active").lower() not in {"suspended", "revoked", "pending", "disabled"})
+        if not active or scope is None:
+            raise HTTPException(status_code=403, detail="This account has no active administrator grant.")
+        if destination == "/admin-portal" and scope != "global":
+            raise HTTPException(status_code=403, detail="Global administrator access is required.")
         version = int(current["authorization_version"]) if current else None
         pending_token = None
         if mfa_is_confirmed(db, user_id=user["id"]):
@@ -458,6 +474,57 @@ def begin_admin_login(request: Request, *, user: dict, email: str, role: str, de
 
 
 def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
+    @app.post("/api/platform-owner/partner-administrators/{user_id}/mfa-reset")
+    def reset_partner_administrator_mfa(user_id: str, request: Request, payload: dict | None = None) -> dict:
+        """A verified global administrator may reset a partner-scoped
+        administrator's lost factor. The target must prove account control
+        with their existing password on the next login; that login receives
+        only an enrollment session. No email-based identity linking or
+        privilege change is performed."""
+        actor = _require_global_grant_session(request)
+        partner_id = str((payload or {}).get("partner_id") or "").strip()
+        if not user_id or not partner_id:
+            raise HTTPException(status_code=400, detail="A partner ID and administrator user ID are required.")
+
+        from appliance_identity import bump_authorization_version
+        from partner_db import audit as partner_audit, transaction
+
+        now = datetime.now().isoformat()
+        with transaction() as db:
+            target = db.execute(
+                "SELECT id,partner_id,role,approved,account_status FROM partner_users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            grant = db.execute(
+                "SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' "
+                "AND scope_type='partner' AND scope_id=? AND revoked_at IS NULL",
+                (user_id, partner_id),
+            ).fetchone()
+            global_grant = db.execute(
+                "SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' "
+                "AND scope_type='global' AND revoked_at IS NULL",
+                (user_id,),
+            ).fetchone()
+            if (not target or target["partner_id"] != partner_id or target["role"] != "administrator"
+                    or not target["approved"] or str(target["account_status"] or "active").lower()
+                    in {"suspended", "revoked", "pending", "disabled"} or not grant or global_grant):
+                raise HTTPException(status_code=404, detail="Eligible partner administrator not found.")
+
+            bump_authorization_version(db, user_id)
+            # Spend any password-verified but incomplete MFA challenges too.
+            db.execute("UPDATE pending_mfa_logins SET used_at=? WHERE user_id=? AND used_at IS NULL", (now, user_id))
+            db.execute("DELETE FROM platform_owner_recovery_codes WHERE user_id=?", (user_id,))
+            db.execute("DELETE FROM platform_owner_mfa WHERE user_id=?", (user_id,))
+            partner_audit(
+                {"email": actor["email"], "role": "administrator"},
+                "partner_admin_mfa_reset",
+                "partner_user",
+                user_id,
+                {"partner_id": partner_id, "initiated_by_user_id": actor["user_id"], "sessions_revoked": True},
+            )
+
+        return {"status": "reset", "message": "The partner administrator must sign in again and enroll a new MFA factor."}
+
     @app.get("/api/platform-owner/mfa/status")
     def platform_owner_mfa_status(request: Request) -> dict:
         """What the Admin Portal's sign-in security card shows: never the
@@ -589,7 +656,7 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
     def platform_owner_mfa_verify(request: Request, payload: dict):
         mfa_pending_token = str(payload.get("mfa_pending_token", ""))
         code = str(payload.get("code", ""))
-        from admin_auth_policy import auth_audit, is_cloud_profile, record_mfa_failure
+        from admin_auth_policy import auth_audit, record_mfa_failure
         from appliance_identity import has_global_administrator_grant, live_administrator_grant_scope
         from cloud_security import clear_login_failures, login_blocked, record_login_failure
         from partner_db import audit as partner_audit
@@ -627,10 +694,11 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
                 # Re-verify the account is STILL entitled right now -- the
                 # pending row is only a "password already checked, MFA still
                 # owed" marker, never itself a source of authorization.
+                live_scope = live_administrator_grant_scope(db, user_id=pending["user_id"])
                 if pending["destination"] == "/admin-portal":
-                    entitled = has_global_administrator_grant(db, email=pending["email"])
+                    entitled = live_scope == "global" and has_global_administrator_grant(db, email=pending["email"])
                 else:
-                    entitled = (not is_cloud_profile()) or live_administrator_grant_scope(db, user_id=pending["user_id"]) is not None
+                    entitled = live_scope is not None
                 if not active or not entitled:
                     failure, failure_kind = HTTPException(status_code=403, detail="This account no longer has platform owner access."), "no_access"
                 elif version is not None and int(version) != int(account["authorization_version"]):

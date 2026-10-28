@@ -292,32 +292,48 @@ def _require(request: Request, roles=PARTNER_ROLES) -> dict:
     identity = _identity(request)
     if not identity or identity['role'] not in roles:
         raise HTTPException(status_code=403, detail='Partner authorization required.')
-    # Linux 1.2.7.1 (cloud): an administrator-only route also needs a LIVE
-    # global administrator grant -- partner_users.role stays 'administrator'
-    # after a grant is revoked, and a partner-scoped administrator carries the
-    # same role label (coordinator evidence 2026-10-24, Green Z8d'). Partner-
-    # scoped administrators keep the routes open to partner roles.
-    if identity['role'] == 'administrator' and set(roles) <= {'administrator'}:
-        from admin_auth_policy import auth_audit, is_cloud_profile
-        # Windows 1.3.4.1 (D-AUTHZ-2b port): an administrator-only route needs
-        # the server-side MFA marker on EVERY profile. _evaluate() already ends
-        # an unmarked administrator session on the cloud; on an edge install
-        # these routes (appliance_cloud /api/admin/*, cloud_features,
-        # website_partner) are registered too, so refuse an administrator
-        # session that did not pass MFA verification here (the session itself
-        # stays valid for the surfaces that do not require MFA on the edge).
+    if identity['role'] == 'administrator':
+        from admin_auth_policy import auth_audit
+        if identity.get('auth_source') == 'cloud_assertion':
+            auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='delegated_mfa_unverified',
+                       entity_id=str(identity.get('user_id') or ''))
+            raise HTTPException(status_code=403, detail='Administrator MFA is not verified for this delegated identity.')
         if identity.get('mfa_state') != 'verified':
             auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='admin_without_mfa',
                        entity_id=str(identity.get('user_id') or ''))
             raise HTTPException(status_code=403, detail='Administrator MFA verification required.')
-        if is_cloud_profile():
-            from appliance_identity import has_global_administrator_grant
-            with connection() as db:
-                live = has_global_administrator_grant(db, email=identity.get('email', ''))
-            if not live:
-                auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='admin_without_global_grant',
-                           entity_id=str(identity.get('user_id') or ''))
-                raise HTTPException(status_code=403, detail='Global administrator grant required.')
+
+        # Resolve the live grant by the session's local user ID, and bind a
+        # partner-scoped grant to both the account's partner and this session.
+        # A signed role label or partner_id claim alone is never authorization.
+        from appliance_identity import live_administrator_grant_scope
+        with connection() as db:
+            user_id = str(identity.get('user_id') or '')
+            account = db.execute('SELECT partner_id,role FROM partner_users WHERE id=? AND lower(email)=?',
+                                 (user_id, str(identity.get('email') or '').lower())).fetchone()
+            scope = live_administrator_grant_scope(db, user_id=user_id) if account and account['role'] == 'administrator' else None
+            partner_grant = db.execute(
+                "SELECT scope_id FROM identity_grants WHERE user_id=? AND role='administrator' "
+                "AND scope_type='partner' AND revoked_at IS NULL ORDER BY granted_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone() if scope == 'partner' else None
+
+        if not account or scope is None:
+            auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='admin_without_live_grant',
+                       entity_id=user_id)
+            raise HTTPException(status_code=403, detail='A current administrator grant is required.')
+
+        administrator_only = set(roles) <= {'administrator'}
+        if administrator_only and scope != 'global':
+            auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='admin_without_global_grant',
+                       entity_id=user_id)
+            raise HTTPException(status_code=403, detail='Global administrator grant required.')
+        if scope == 'partner' and (not partner_grant or not partner_grant['scope_id']
+                                   or account['partner_id'] != partner_grant['scope_id']
+                                   or identity.get('partner_id') != partner_grant['scope_id']):
+            auth_audit('access.denied', actor_email=identity.get('email'), actor_role='administrator', reason='partner_admin_scope_mismatch',
+                       entity_id=user_id)
+            raise HTTPException(status_code=403, detail='Partner administrator grant does not match this account scope.')
     return identity
 
 
