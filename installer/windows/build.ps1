@@ -121,11 +121,14 @@ if ($Sign -or $AzureSign) {
     }
     & $signTool verify /pa $catalog | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
-    # Every catalogued file must verify against it.
-    $sample = Get-ChildItem -LiteralPath $catalogStage -Recurse -File | Select-Object -First 1
-    & $signTool verify /pa /c $catalog $sample.FullName | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "A catalogued file does not verify against the runtime catalog: $($sample.Name)" }
-    Write-Output 'Runtime catalog signed and verified.'
+    # Verify every staged native file against the catalog, not only one sample.
+    $catalogMembers = @(Get-ChildItem -LiteralPath $catalogStage -Recurse -File)
+    if (-not $catalogMembers.Count) { throw 'The runtime catalog has no staged members.' }
+    foreach ($member in $catalogMembers) {
+        & $signTool verify /pa /c $catalog $member.FullName | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "A catalogued file does not verify against the runtime catalog: $($member.FullName)" }
+    }
+    Write-Output "Runtime catalog signed and verified for all $($catalogMembers.Count) native files."
 }
 # The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
 # public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
@@ -148,8 +151,15 @@ $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+$setupPath = Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe')
+$setupArtifact = Get-Item -LiteralPath $setupPath -ErrorAction Stop
+$maxInstallerBytes = [long]750000000  # 750 MB decimal, strictly below a 750 MiB interpretation.
+if ($setupArtifact.Length -gt $maxInstallerBytes) {
+    throw "Installer size gate failed: $($setupArtifact.Length) bytes exceeds $maxInstallerBytes bytes (750 MB)."
+}
+Write-Output "Installer size gate passed: $($setupArtifact.Length) / $maxInstallerBytes bytes (750 MB)."
 if ($Sign -or $AzureSign) {
-    $setup = Get-Item (Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe'))
+    $setup = $setupArtifact
     # (Inno Setup 7 keeps no signed-uninstaller cache; the installed
     # unins000.exe is verified by the Windows Sandbox validation.)
     $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)

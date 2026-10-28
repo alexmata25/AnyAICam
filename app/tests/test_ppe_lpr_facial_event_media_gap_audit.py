@@ -146,6 +146,10 @@ def test_ppe_event_in_same_scan_shares_that_scans_clip(
     monkeypatch.setattr(main, "append_analytics_event", lambda event: analytics_events.append(event))
 
     monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera_number: True)
+    # The product also requires the appliance-wide PPE switch. The test
+    # replaces the PPE detector below, so explicitly enable that gate rather
+    # than depending on whether the host has a PPE model installed.
+    monkeypatch.setattr(main.ppe, "PPE_ENABLED", True)
     monkeypatch.setattr(
         main.recording_uploader, "_camera_identity",
         # Person + PPE in one scan: the person event needs Smart Motion on (bf05889).
@@ -259,6 +263,8 @@ def test_two_real_consecutive_scans_of_the_same_person_produce_one_ppe_event(
     analytics_events = []
     monkeypatch.setattr(main, "append_analytics_event", lambda event: analytics_events.append(event))
     monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera_number: True)
+    # Match the appliance-wide switch to this test's mocked detector.
+    monkeypatch.setattr(main.ppe, "PPE_ENABLED", True)
     monkeypatch.setattr(
         main.recording_uploader, "_camera_identity",
         lambda camera_number: {"ppe_enabled": True, "smart_motion_enabled": False},

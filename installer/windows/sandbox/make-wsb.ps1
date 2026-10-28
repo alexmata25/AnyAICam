@@ -33,24 +33,37 @@ param(
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Folder) { throw "Use a new folder: $Folder exists." }
 $setupFile = Get-Item -LiteralPath $Setup
-if ($setupFile.Name -notmatch '^AnyAiCam-VMS-Setup-\d+\.\d+\.\d+-[0-9a-f]{7}\.exe$') { throw "Not an AnyAiCam setup name: $($setupFile.Name)" }
+if ($setupFile.Name -notmatch '^AnyAiCam-VMS-Setup-\d+\.\d+\.\d+(?:\.\d+)?-[0-9a-f]{7}\.exe$') { throw "Not an AnyAiCam setup name: $($setupFile.Name)" }
 if ($KeysetKind -eq 'synthetic-test') {
     if (-not $SyntheticSigningKey) { throw 'A synthetic-test run needs -SyntheticSigningKey (make-synthetic-keyset.py).' }
     $syntheticKey = Get-Content -Raw -LiteralPath $SyntheticSigningKey | ConvertFrom-Json
     if ($syntheticKey.key_id -notlike 'sandbox-test-*') { throw 'Not a synthetic sandbox-test signing key.' }
 } elseif ($SyntheticSigningKey) { throw 'A production run never receives a signing key.' }
 if ($Functional -and $KeysetKind -ne 'synthetic-test') { throw 'A functional run uses the synthetic-test build only (SYNTHETIC-KEYSET / SIMULATED CAMERA).' }
-# 1.3.3 (2026-10-21): -Functional -Previous <accepted 1.3.2 setup> = the functional UPGRADE scenario U132-L / U132-H.
+# 1.3.4.1 acceptance: allow four-part setup versions and require the accepted, pinned, signed 1.3.4 setup as the upgrade baseline.
 if ($Functional -and $SimulatePrevious) { throw 'A functional run never plants simulated 1.3.0 leftovers: use -Previous with a real earlier setup.' }
 $root = New-Item -ItemType Directory -Path $Folder
 foreach ($sub in 'setup', 'results', 'scripts', 'previous') { New-Item -ItemType Directory -Path (Join-Path $root.FullName $sub) | Out-Null }
 Copy-Item -LiteralPath $setupFile.FullName -Destination (Join-Path $root.FullName 'setup')
 if ($Previous) {
     $previousFile = Get-Item -LiteralPath $Previous
-    if ($previousFile.Name -notmatch '^AnyAiCam-VMS-Setup-\d+\.\d+\.\d+-[0-9a-f]{7}\.exe$') { throw "Not an AnyAiCam setup name: $($previousFile.Name)" }
-    $newVersion = [version]($setupFile.Name -replace '^AnyAiCam-VMS-Setup-(\d+\.\d+\.\d+)-.*$', '$1')
-    $oldVersion = [version]($previousFile.Name -replace '^AnyAiCam-VMS-Setup-(\d+\.\d+\.\d+)-.*$', '$1')
+    if ($previousFile.Name -notmatch '^AnyAiCam-VMS-Setup-\d+\.\d+\.\d+(?:\.\d+)?-[0-9a-f]{7}\.exe$') { throw "Not an AnyAiCam setup name: $($previousFile.Name)" }
+    $newVersionText = $setupFile.Name -replace '^AnyAiCam-VMS-Setup-(\d+\.\d+\.\d+(?:\.\d+)?)-.*$', '$1'
+    $oldVersionText = $previousFile.Name -replace '^AnyAiCam-VMS-Setup-(\d+\.\d+\.\d+(?:\.\d+)?)-.*$', '$1'
+    $newVersion = [version]$newVersionText
+    $oldVersion = [version]$oldVersionText
     if ($oldVersion -ge $newVersion) { throw "-Previous $oldVersion is not older than $($newVersion) -- that is a downgrade, not a supported upgrade." }
+    if ($oldVersionText -match '^1\.3\.4(?:\.0)?$') {
+        $approvedPreviousSha256 = 'CAFC1D1BE9F457561094FBF756255D64266A249AE75C994C78A14A3E725DF034'
+        $actualPreviousSha256 = (Get-FileHash -LiteralPath $previousFile.FullName -Algorithm SHA256).Hash
+        if ($actualPreviousSha256 -cne $approvedPreviousSha256) { throw "Accepted 1.3.4 baseline SHA-256 mismatch: $actualPreviousSha256" }
+        $publisherPin = Join-Path $PSScriptRoot '..\publisher-pin.ps1'
+        if (-not (Test-Path -LiteralPath $publisherPin)) { throw 'Publisher identity verifier is missing; cannot accept the 1.3.4 upgrade baseline.' }
+        . $publisherPin
+        $signature = Get-AuthenticodeSignature -LiteralPath $previousFile.FullName
+        $publisherProblem = Get-AnyAiCamPublisherProblem $signature $previousFile.FullName
+        if ($publisherProblem) { throw "Accepted 1.3.4 baseline signature/publisher check failed: $publisherProblem" }
+    }
     Copy-Item -LiteralPath $previousFile.FullName -Destination (Join-Path $root.FullName 'previous')
 }
 if ($SimulatePrevious) { Set-Content -LiteralPath (Join-Path $root.FullName 'previous\SIMULATE-1.3.0') -Value 'plant Windows 1.3.0 leftovers' }
