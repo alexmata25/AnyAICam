@@ -51,6 +51,9 @@ $port = if ($settings['ANYAICAM_HTTP_PORT'] -match '^\d{2,5}$') { $settings['ANY
 # 1.3.3 D4: a VMS left over from an earlier service run (an orphan that survived a stop) holds port 8000 with the old
 # product mode, so every new VMS would fail to bind and the service would restart in a loop. Stop it first.
 try { & (Join-Path $PSScriptRoot 'stop-stale-vms.ps1') -InstallRoot $installRoot } catch { Write-Output "AnyAiCam VMS launcher: stale-process check failed: $($_.Exception.Message)" }
+# 1.3.4: one Job Object around the whole VMS (vms-job-limits.ps1): a CPU cap, an optional memory limit. Python and
+# its FFmpeg/MediaMTX/Tesseract children inherit it. Fail-open: without it the VMS still starts and records.
+try { . (Join-Path $PSScriptRoot 'vms-job-limits.ps1'); Write-Output (Set-AnyAiCamVmsJobLimits $settings) } catch { Write-Output "AnyAiCam VMS launcher: resource limits unavailable: $($_.Exception.Message)" }
 Set-Location (Join-Path $installRoot 'app')
 & (Join-Path $installRoot 'runtime\python\python.exe') -m uvicorn main:app --host $bindHost --port $port --proxy-headers
 exit $LASTEXITCODE
