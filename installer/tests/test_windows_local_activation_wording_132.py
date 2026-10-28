@@ -74,8 +74,8 @@ class WordingMatchesTheCodeTests(unittest.TestCase):
     """The wording is only true while the capacity code behaves this way; a change there must revisit the wording."""
     def test_an_accepted_capacity_is_not_expired_offline(self):
         source = (ROOT / "app" / "vms_capacity.py").read_text(encoding="utf-8")
-        accepted = source.split("def _accepted_signed()", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("_verified_capacity(snapshot, check_expiry=False, public_keys=accepted_keys)", accepted)
+        accepted = source.split("def _accepted_signed_detail(", 1)[1].split("\ndef _accepted_signed(", 1)[0]
+        self.assertIn("identity=local_identity, accepted=True)", accepted)
 
     def test_no_capacity_means_no_cameras(self):
         source = (ROOT / "app" / "vms_capacity.py").read_text(encoding="utf-8")
