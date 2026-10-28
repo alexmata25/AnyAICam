@@ -44,6 +44,7 @@ test_event_media_sharing.py / test_analytics_media_reuse_cloud.py; the
 PPE test below is now the positive path. LPR ("plate") is unchanged.
 """
 
+import asyncio
 import sys
 import threading
 import time
@@ -102,13 +103,28 @@ def fake_media_pipeline(monkeypatch):
 
 @pytest.fixture
 def background_loop():
-    loop = __import__("asyncio").new_event_loop()
+    loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=2)
-    loop.close()
+    try:
+        yield loop
+    finally:
+        async def drain():
+            pending = [task for task in asyncio.all_tasks()
+                       if task is not asyncio.current_task() and not task.done()]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await loop.shutdown_asyncgens()
+            await loop.shutdown_default_executor()
+
+        try:
+            asyncio.run_coroutine_threadsafe(drain(), loop).result(timeout=5)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+            assert not thread.is_alive(), "test event-loop thread failed to stop"
+            loop.close()
 
 
 def _wait_until(predicate, timeout=5.0, interval=0.02):
