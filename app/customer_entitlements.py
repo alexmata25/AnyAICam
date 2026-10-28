@@ -109,6 +109,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -633,6 +634,92 @@ def _load_vms_license_map() -> dict:
 PRICE_ID_VMS_LICENSE_MAP = _load_vms_license_map()
 
 
+# A single owner-created sandbox subscription predates the current VMS
+# billing catalog and contains both software and Local camera products.
+# These Price IDs are deliberately recognized only while BOTH the signed
+# Stripe event/current subscription and the configured API key are in test
+# mode. They are not added to the public catalog and can never be used by a
+# live-mode request. This enables safe recovery of the existing owner test
+# purchase without creating another subscription.
+OWNER_SANDBOX_VMS_SOFTWARE_PRICE_ID = "price_1UD4pLGllhK80H2ndirLM3wb"
+OWNER_SANDBOX_LOCAL_CAMERA_PRICE_ID = "price_1UD2xKGllhK80H2nFJwtFJvw"
+OWNER_SANDBOX_BUNDLE_PRICE_IDS = frozenset({
+    OWNER_SANDBOX_VMS_SOFTWARE_PRICE_ID,
+    OWNER_SANDBOX_LOCAL_CAMERA_PRICE_ID,
+})
+
+
+def _stripe_key_is_test() -> bool:
+    main = sys.modules.get("main")
+    key = str(getattr(main, "STRIPE_SECRET_KEY", "") or "").strip() if main else ""
+    # This narrow recovery path is sandbox-only. Fail closed for missing,
+    # publishable, live, or otherwise unrecognized credentials without ever
+    # logging the credential itself.
+    return key.startswith(("sk_test_", "rk_test_"))
+
+
+def _owner_sandbox_bundle_tiers(subscription: dict, *, event_livemode=None) -> Optional[list[dict]]:
+    """Recognize only the exact, two-item owner sandbox purchase.
+
+    The product names/prices are an owner test exception, not a customer
+    pricing model. A mode mismatch, extra/missing line item, changed amount,
+    unsupported interval, or browser-supplied quantity fails closed.
+    """
+    if (event_livemode is not None and event_livemode is not False) \
+            or subscription.get("livemode") is not False or not _stripe_key_is_test():
+        return None
+    expected = {
+        OWNER_SANDBOX_VMS_SOFTWARE_PRICE_ID: (VMS_LICENSE_PRODUCT, 8, 100),
+        OWNER_SANDBOX_LOCAL_CAMERA_PRICE_ID: ("camera_slots_local", 8, 60),
+    }
+    items = ((subscription.get("items") or {}).get("data") or [])
+    if len(items) != 2:
+        return None
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        price = item.get("price") or {}
+        price_id = str(price.get("id") if isinstance(price, dict) else price or "").strip()
+        if price_id not in expected or price_id in seen:
+            return None
+        seen.add(price_id)
+        quantity = item.get("quantity")
+        if type(quantity) is not int or quantity != 1:
+            return None
+        if not isinstance(price, dict):
+            return None
+        _product, _capacity, amount = expected[price_id]
+        unit_amount = price.get("unit_amount")
+        if type(unit_amount) is not int or unit_amount != amount:
+            return None
+        if str(price.get("currency") or "").lower() != "usd":
+            return None
+        recurring = price.get("recurring")
+        if not isinstance(recurring, dict) or recurring.get("interval") != "month":
+            return None
+        interval_count = recurring.get("interval_count", 1)
+        if type(interval_count) is not int or interval_count != 1:
+            return None
+    if seen != OWNER_SANDBOX_BUNDLE_PRICE_IDS:
+        return None
+    return [
+        {"product": product, "camera_slot_maximum": capacity, "billing_type": "recurring", "price_id": price_id}
+        for price_id, (product, capacity, _amount) in expected.items()
+    ]
+
+
+def _subscription_uses_owner_sandbox_price(subscription: dict) -> bool:
+    for item in ((subscription.get("items") or {}).get("data") or []):
+        if not isinstance(item, dict):
+            continue
+        price = item.get("price") or {}
+        price_id = str(price.get("id") if isinstance(price, dict) else price or "").strip()
+        if price_id in OWNER_SANDBOX_BUNDLE_PRICE_IDS:
+            return True
+    return False
+
+
 def resolve_vms_license(price_id: str) -> Optional[dict]:
     entry = PRICE_ID_VMS_LICENSE_MAP.get(price_id or "")
     return dict(entry) if isinstance(entry, dict) else None
@@ -695,7 +782,7 @@ def sync_entitlement_from_stripe_event(event: dict) -> dict:
 
     if event_type in CHECKOUT_GRANT_EVENT_TYPES:
         result = _sync_checkout_completed(event)
-    elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+    elif event_type in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
         result = _sync_subscription_change(event, cancelled=event_type.endswith("deleted"))
     else:
         result = {"status": "ignored", "reason": f"unhandled event type {event_type!r}"}
@@ -720,11 +807,152 @@ def _extract_checkout_fields(session_obj: dict) -> dict:
     }
 
 
+def _resolve_checkout_customer(authoritative_customer_id: str | None, stripe_customer_id: str | None):
+    """Resolve only from authenticated checkout metadata or an existing
+    canonical Stripe-customer binding. Email is never an identity key."""
+    if authoritative_customer_id:
+        customer = row("SELECT * FROM customers WHERE id=?", (authoritative_customer_id,))
+        return customer, (None if customer else "unknown authoritative AnyAiCam customer id")
+    if not stripe_customer_id:
+        return None, "checkout has no verified account association"
+    owners = __import__("stripe_state").stripe_customer_accounts(stripe_customer_id)
+    if len(owners) > 1:
+        return None, "Stripe customer has conflicting AnyAiCam account bindings"
+    if not owners:
+        return None, "Stripe customer is not bound to an AnyAiCam account"
+    customer_id = next(iter(owners))
+    customer = row("SELECT * FROM customers WHERE id=?", (customer_id,))
+    return customer, (None if customer else "bound AnyAiCam customer no longer exists")
+
+
+def _sync_owner_sandbox_bundle_subscription(
+    subscription: dict,
+    tiers: list[dict],
+    *,
+    customer_id: str | None = None,
+    checkout_session_id: str | None = None,
+) -> dict:
+    """Apply the two items in the owner-only sandbox subscription.
+
+    Both entitlement rows are upserted by (customer, product), keeping
+    retries and recovery idempotent. The only caller that may supply a
+    customer id without Stripe metadata is the authenticated admin recovery
+    operation.
+    """
+    stripe_customer_id = str(subscription.get("customer") or "")
+    subscription_id = str(subscription.get("id") or "")
+    metadata_customer_id = str((subscription.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
+    if not stripe_customer_id or not subscription_id or not _stripe_key_is_test():
+        return {"status": "ignored", "reason": "sandbox subscription could not be verified"}
+    if customer_id and metadata_customer_id and customer_id != metadata_customer_id:
+        return {"status": "rejected", "reason": "subscription metadata names a different customer account"}
+    customer_id = customer_id or metadata_customer_id
+    if not customer_id:
+        owners = __import__("stripe_state").stripe_customer_accounts(stripe_customer_id)
+        if len(owners) > 1:
+            return {"status": "rejected", "reason": "Stripe customer has conflicting AnyAiCam account bindings"}
+        customer_id = next(iter(owners), None)
+    if not customer_id:
+        return unresolved("owner_sandbox_bundle", subscription_id, stripe_customer_id)
+    customer = row("SELECT id,status FROM customers WHERE id=?", (customer_id,))
+    if not customer or str(customer.get("status") or "").lower() not in {"active", "approved"}:
+        return {"status": "rejected", "reason": "AnyAiCam customer is missing or inactive"}
+    if _bound_elsewhere(stripe_customer_id, customer_id):
+        return {"status": "rejected", "reason": "Stripe customer belongs to another AnyAiCam account"}
+
+    import checkout_guard
+    bound = checkout_guard.bound_stripe_customer(customer_id)
+    if bound and bound != stripe_customer_id:
+        return {"status": "rejected", "reason": "AnyAiCam account already has a different Stripe customer"}
+    if not bound and not checkout_guard.bind_stripe_customer(customer_id, stripe_customer_id):
+        return {"status": "rejected", "reason": "Stripe customer could not be bound to the account"}
+
+    stripe_status = str(subscription.get("status") or "")
+    inactive = stripe_status in SUBSCRIPTION_INACTIVE_STATUSES
+    if stripe_status == INITIAL_PAYMENT_INCOMPLETE:
+        return {"status": "not_granted", "reason": "the first payment has not completed"}
+    if not inactive and stripe_status not in {"active", "trialing", "past_due", "unpaid"}:
+        return {"status": "ignored", "reason": "subscription status does not grant service"}
+
+    existing_rows = {
+        tier["product"]: row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, tier["product"]))
+        for tier in tiers
+    }
+    for existing in existing_rows.values():
+        if existing:
+            conflict = conflicting_subscription(existing.get("stripe_subscription_id"), subscription)
+            if conflict:
+                return {"status": "ignored", "reason": conflict}
+    if not inactive and stripe_status in {"past_due", "unpaid"} and not any(
+        existing and existing.get("status") == "active" and existing.get("stripe_subscription_id") == subscription_id
+        for existing in existing_rows.values()
+    ):
+        return {"status": "not_granted", "reason": "a new subscription with an unpaid first period is not active"}
+
+    already_active = any(
+        existing and existing.get("status") == "active" and existing.get("stripe_subscription_id") == subscription_id
+        for existing in existing_rows.values()
+    )
+    reversal = None
+    if not inactive and stripe_status in {"active", "trialing"} and not already_active:
+        reversal = subscription_payment_reversal(subscription)
+    entitlement_status = "cancelled" if inactive else ("suspended" if reversal else "active")
+    output = []
+    for tier in tiers:
+        entitlement = upsert_entitlement(
+            customer_id=customer_id,
+            product=tier["product"],
+            camera_slot_quantity=0 if inactive else tier["camera_slot_maximum"],
+            status=entitlement_status,
+            stripe_customer_id=stripe_customer_id,
+            stripe_subscription_id=subscription_id,
+            stripe_checkout_session_id=checkout_session_id,
+            stripe_price_id=tier["price_id"],
+        )
+        if reversal:
+            _set_suspended_reason(entitlement["id"], reversal)
+        elif entitlement_status == "active":
+            _set_suspended_reason(entitlement["id"], None)
+        record_billing_state(entitlement["id"], subscription)
+        if tier["product"] in BASE_PLAN_PRODUCTS and not inactive:
+            supersede_other_base_plans(entitlement, subscription)
+        output.append(entitlement)
+    return {
+        "status": "entitlement_updated",
+        "customer_id": customer_id,
+        "subscription_id": subscription_id,
+        "entitlement_ids": [item["id"] for item in output],
+        "camera_capacity": 0 if inactive or reversal else 8,
+    }
+
+
 def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
     if awaiting_payment(session_obj):
         return awaiting_payment_result(session_obj)  # granted on async_payment_succeeded
     fields = _extract_checkout_fields(session_obj)
+    subscription_id = str(session_obj.get("subscription") or "") or None
+    current = current_subscription(subscription_id) if session_obj.get("mode") == "subscription" else None
+    if session_obj.get("mode") == "subscription" and current is None:
+        return {"status": "ignored", "reason": "subscription checkout without a subscription"}
+
+    current_customer = str((current or {}).get("customer") or "")
+    stripe_customer_id = fields["stripe_customer_id"] or current_customer or None
+    if current is not None and fields["stripe_customer_id"] and current_customer != fields["stripe_customer_id"]:
+        return {"status": "rejected", "reason": "checkout and its subscription disagree about the Stripe customer"}
+    if current and _subscription_uses_owner_sandbox_price(current):
+        tiers = _owner_sandbox_bundle_tiers(current, event_livemode=event.get("livemode"))
+        if not tiers:
+            return {"status": "rejected", "reason": "owner sandbox products require the exact two-item test-mode bundle"}
+        metadata_customer_id = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
+        if fields["authoritative_customer_id"] and metadata_customer_id and fields["authoritative_customer_id"] != metadata_customer_id:
+            return {"status": "rejected", "reason": "checkout and subscription metadata name different accounts"}
+        customer, reason = _resolve_checkout_customer(fields["authoritative_customer_id"] or metadata_customer_id, stripe_customer_id)
+        if not customer:
+            return {"status": "needs_account_link", "reason": reason or "authenticated account association is required"}
+        return _sync_owner_sandbox_bundle_subscription(
+            current, tiers, customer_id=customer["id"], checkout_session_id=fields["stripe_checkout_session_id"],
+        )
 
     # Fixed-tier lookup is server-side and Price-ID-keyed only -- never a
     # browser-submitted quantity (see module docstring). A Price ID with
@@ -752,10 +980,6 @@ def _sync_checkout_completed(event: dict) -> dict:
         # The Stripe customer already pays for a DIFFERENT AnyAiCam account:
         # never provision this one from it (2026-10-02, cross-tenant).
         return {"status": "rejected", "reason": "stripe customer belongs to another account", "customer_id": customer["id"]}
-    subscription_id = str(session_obj.get("subscription") or "") or None
-    current = current_subscription(subscription_id) if session_obj.get("mode") == "subscription" else None
-    if session_obj.get("mode") == "subscription" and current is None:
-        return {"status": "ignored", "reason": "subscription checkout without a subscription"}
     if current is not None:
         current_customer = str(current.get("customer") or "")
         current_meta = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "") or None
@@ -866,6 +1090,17 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     cancelled = current.get("status") in SUBSCRIPTION_INACTIVE_STATUSES
     stripe_customer_id = str(subscription_obj.get("customer") or "")
     metadata = subscription_obj.get("metadata") or {}
+    if _subscription_uses_owner_sandbox_price(subscription_obj):
+        tiers = _owner_sandbox_bundle_tiers(subscription_obj, event_livemode=event.get("livemode"))
+        if not tiers:
+            return {"status": "rejected", "reason": "owner sandbox products require the exact two-item test-mode bundle"}
+        metadata_customer_id = str(metadata.get("anyaicam_customer_id") or "") or None
+        owners = __import__("stripe_state").stripe_customer_accounts(stripe_customer_id)
+        if len(owners) > 1 or (metadata_customer_id and owners and owners != {metadata_customer_id}):
+            return {"status": "rejected", "reason": "subscription metadata and Stripe customer binding disagree"}
+        return _sync_owner_sandbox_bundle_subscription(
+            subscription_obj, tiers, customer_id=metadata_customer_id or next(iter(owners), None),
+        )
     price_id = _current_subscription_price_id(subscription_obj)
     metadata_customer_id = str(metadata.get("anyaicam_customer_id") or "") or None
     if not stripe_customer_id or not price_id:
@@ -947,6 +1182,69 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     # however its own answer was lost (webhook recovery).
     plan_changes.reconcile_upgrade_attempts(current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}
+
+
+def reconcile_owner_sandbox_subscription(
+    *,
+    customer_id: str,
+    subscription_id: str,
+    approved_by: str,
+) -> dict:
+    """Recover the known sandbox subscription after authenticated admin review.
+
+    The caller supplies no Stripe customer id or email. Stripe is read for
+    the customer and line items, and the administrator selects an existing
+    AnyAiCam account. This fails closed unless the configured key and current
+    subscription are both test mode and the exact two-price bundle is active.
+    Entitlements are written only through the normal webhook upsert logic.
+    """
+    customer_id = str(customer_id or "").strip()
+    subscription_id = str(subscription_id or "").strip()
+    approved_by = str(approved_by or "").strip()
+    if not customer_id or not subscription_id.startswith("sub_") or not approved_by:
+        raise ValueError("A customer account, subscription id, and authenticated administrator are required.")
+    if not _stripe_key_is_test():
+        raise ValueError("This recovery operation is restricted to the Stripe sandbox.")
+    current = current_subscription(subscription_id)
+    if not current or str(current.get("id") or "") != subscription_id:
+        raise ValueError("Stripe did not return the requested subscription.")
+    tiers = _owner_sandbox_bundle_tiers(current)
+    if not tiers:
+        raise ValueError("The subscription is not the verified two-item AnyAiCam sandbox bundle.")
+    if str(current.get("status") or "") not in {"active", "trialing"}:
+        raise ValueError("Only a currently active sandbox subscription can be recovered.")
+    customer = row("SELECT id,status FROM customers WHERE id=?", (customer_id,))
+    if not customer or str(customer.get("status") or "").lower() not in {"active", "approved"}:
+        raise ValueError("The selected AnyAiCam customer account is missing or inactive.")
+    stripe_customer_id = str(current.get("customer") or "")
+    if not stripe_customer_id:
+        raise ValueError("The Stripe subscription has no customer.")
+    metadata_customer_id = str((current.get("metadata") or {}).get("anyaicam_customer_id") or "")
+    if metadata_customer_id and metadata_customer_id != customer_id:
+        raise ValueError("Stripe subscription metadata names a different AnyAiCam account.")
+    owners = __import__("stripe_state").stripe_customer_accounts(stripe_customer_id)
+    if owners - {customer_id}:
+        raise ValueError("This Stripe customer is already associated with a different AnyAiCam account.")
+    import checkout_guard
+    bound = checkout_guard.bound_stripe_customer(customer_id)
+    if bound and bound != stripe_customer_id:
+        raise ValueError("The selected AnyAiCam account already has a different Stripe customer.")
+    for tier in tiers:
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, tier["product"]))
+        if existing and conflicting_subscription(existing.get("stripe_subscription_id"), current):
+            raise ValueError("The account has another current subscription for one of these entitlements.")
+    if not bound and not checkout_guard.bind_stripe_customer(customer_id, stripe_customer_id):
+        raise ValueError("The Stripe customer could not be bound to the selected account.")
+    result = _sync_owner_sandbox_bundle_subscription(current, tiers, customer_id=customer_id)
+    if result.get("status") != "entitlement_updated":
+        raise ValueError("Stripe was verified, but the sandbox subscription was not provisioned.")
+    main = sys.modules.get("main")
+    log = getattr(main, "structured_log", None) if main else None
+    if callable(log):
+        log("stripe.sandbox_subscription.reconciled", actor_id=approved_by, customer_id=customer_id,
+            subscription_id=subscription_id, entitlement_count=len(result.get("entitlement_ids") or []),
+            camera_capacity=result.get("camera_capacity"))
+    return result
 
 
 def _period_end(subscription: dict) -> int | None:

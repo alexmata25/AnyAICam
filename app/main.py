@@ -117230,6 +117230,9 @@ def create_stripe_customer_portal(
 
 
 
+
+
+
         "portal_url": portal_url,
 
 
@@ -117273,6 +117276,32 @@ def create_stripe_customer_portal(
 
 
 
+
+
+# Owner sandbox purchase recovery is a controlled account association,
+# not a customer claim: the handler is restricted to an authenticated live
+# global administrator and the service function itself refuses live Stripe.
+@app.post("/api/admin/billing/stripe/reconcile-owner-sandbox-subscription")
+async def reconcile_owner_sandbox_subscription(request: Request) -> dict:
+    administrator = _require_live_global_administrator(request)
+    try:
+        payload = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="A JSON request body is required.") from error
+    if not isinstance(payload, dict) or set(payload) != {"customer_id", "subscription_id"}:
+        raise HTTPException(status_code=400, detail="Provide only customer_id and subscription_id.")
+    from customer_entitlements import reconcile_owner_sandbox_subscription as reconcile
+    from stripe_state import RetryableStripeEventError
+    try:
+        return reconcile(
+            customer_id=str(payload.get("customer_id") or ""),
+            subscription_id=str(payload.get("subscription_id") or ""),
+            approved_by=str(administrator.get("id") or ""),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RetryableStripeEventError as error:
+        raise HTTPException(status_code=503, detail="Stripe's current subscription state could not be verified.") from error
 
 
 @app.post("/api/payments/stripe/webhook")
