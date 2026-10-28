@@ -84,6 +84,11 @@ def fake_uploader(monkeypatch):
     GIL, and this is exactly what the real cross-thread scheduling
     path needs to prove itself against."""
     calls = []
+    # These tests supply an already-built/uploadable clip, not a camera buffer.
+    # Explicit recording tests below replace this boundary with their own spy.
+    async def completed_local_recording(*args, **kwargs):
+        return None
+    monkeypatch.setattr(main, "persist_event_recording", completed_local_recording)
 
     def fake_upload_motion_event_media(**kwargs):
         calls.append(kwargs)
@@ -106,10 +111,24 @@ def background_loop():
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=2)
-    loop.close()
+    try:
+        yield loop
+    finally:
+        async def drain():
+            pending = [task for task in asyncio.all_tasks()
+                       if task is not asyncio.current_task() and not task.done()]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await loop.shutdown_asyncgens()
+            await loop.shutdown_default_executor()
+        try:
+            asyncio.run_coroutine_threadsafe(drain(), loop).result(timeout=5)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+            assert not thread.is_alive(), 'test event-loop thread failed to stop'
+            loop.close()
 
 
 def _wait_until(predicate, timeout=5.0, interval=0.02):
@@ -220,7 +239,7 @@ def test_a_closed_target_loop_is_logged_not_silently_swallowed(monkeypatch, tmp_
 
 
 def test_clip_build_exception_is_logged_not_silently_swallowed(
-    monkeypatch, tmp_path, capsys, background_loop
+    monkeypatch, tmp_path, capsys, fake_uploader, background_loop
 ):
     """This is the test that would have caught the real, live defect
     found in production on 2026-09-13: build_motion_event_clip()

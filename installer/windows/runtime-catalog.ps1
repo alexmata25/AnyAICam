@@ -76,6 +76,18 @@ function New-RuntimeCatalog([string]$Stage, [string]$CatalogPath, [string]$MakeC
 }
 
 # ------------------------------------------------------------ install time
+function Test-RuntimeCatalogFiles([string]$Stage, [string]$CatalogPath, [string]$SignTool) {
+    $files = @(Get-ChildItem -LiteralPath $Stage -Recurse -File | Sort-Object FullName)
+    if (-not $files.Count) { throw 'No staged runtime files to verify.' }
+    foreach ($file in $files) {
+        & $SignTool verify /pa /c $CatalogPath $file.FullName | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "A catalogued file does not verify against the runtime catalog: $($file.FullName) (exit $LASTEXITCODE)"
+        }
+    }
+    return $files.Count
+}
+
 # CryptCATAdmin* from wintrust.dll, declared in memory (Reflection.Emit): no
 # compiled helper file is written, so nothing unsigned is loaded to do this.
 function Get-CatalogApi {

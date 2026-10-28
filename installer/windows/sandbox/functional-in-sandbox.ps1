@@ -53,6 +53,10 @@ Set-Content -Path (Join-Path $results 'report.txt') -Value @(
     "LABEL: SYNTHETIC-KEYSET / SIMULATED CAMERA -- not production-keyset acceptance, not physical-camera acceptance.")
 $setup = Get-ChildItem 'C:\Validation\setup' -Filter 'AnyAiCam-VMS-Setup-*.exe' | Select-Object -First 1
 Check 'setup file present (SYNTHETIC-KEYSET build)' { if (-not $setup) { throw 'no setup' }; "$($setup.Name) $($setup.Length) bytes sha256=$((Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower())" }
+Check 'setup size is at most 750 MB (750000000 bytes)' {
+    if (-not $setup -or $setup.Length -le 0 -or $setup.Length -gt 750000000) { throw 'setup missing, empty or over 750000000 bytes' }
+    "$($setup.Length) bytes"
+}
 Check 'run settings: synthetic-test keyset (functional runs never use the production build)' {
     if ($settings.keyset_kind -ne 'synthetic-test' -or -not $settings.functional) { throw "keyset_kind $($settings.keyset_kind) functional $($settings.functional)" }
     "keyset synthetic-test; mode $mode"
@@ -506,7 +510,7 @@ Check 'discovery: a cloud scan job finds the simulated camera (agent scan, real 
 }
 $cloudCamera = $null
 Check 'provisioning: the owner adds the discovered camera; the agent verifies it (RTSP DESCRIBE) and the cloud provisions it' {
-    $p = Cloud POST '/api/customer/cameras/provision' @{ appliance_id = $cloudAppliance.id; device_key = $script:deviceKey; name = 'Simulated camera'; recording_mode = 'continuous' } -Owner
+    $p = Cloud POST '/api/customer/cameras/provision' @{ appliance_id = $cloudAppliance.id; device_key = $script:deviceKey; name = 'Simulated camera'; recording_mode = 'event' } -Owner
     $done = WaitFor 420 { $j = Cloud GET "/api/customer/camera-provisioning/$($p.job_id)" -Owner; if ($j.status -in 'provisioned', 'failed', 'timed_out') { $j } }
     $done | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $results 'provision-job.json')
     if (-not $done -or $done.status -ne 'provisioned') { throw "status $($done.status) $($done.failure_code) $($done.message)" }
@@ -523,6 +527,21 @@ Check 'edge sync: the camera reaches the VMS with its stream address and is lice
     "camera $($script:camNo) $($script:camera.onvif_endpoint); licensed"
 }
 $camId = if ($camera) { [string]$camera.id } else { 'none' }
+Check 'event-only: edge configuration is event mode and the segment recorder uses the private buffer' {
+    $row = @(EdgeSql "SELECT local_recording_mode FROM cameras WHERE camera_number=$camNo")[0]
+    if ($row.local_recording_mode -ne 'event') { throw "stored mode $($row.local_recording_mode)" }
+    $writers = WaitFor 120 {
+        $all = @(Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | Where-Object {
+            $_.CommandLine -match "camera$camNo[\\/]" -and $_.CommandLine -match '-f\s+segment'
+        })
+        if ($all.Count) { $all }
+    }
+    if (-not $writers) { throw 'no camera segment writer found' }
+    foreach ($writer in $writers) {
+        if ($writer.CommandLine -notmatch "camera$camNo[\\/]_event_buffer[\\/]") { throw 'continuous customer-facing segment writer detected' }
+    }
+    'stored event mode; segment writers use _event_buffer; idle retention/event playback still require their separate checks'
+}
 
 # ---------------------------------------------------------------- UPGRADE 1.3.2 -> setup under test (U132-L / U132-H)
 if ($upgrade) {

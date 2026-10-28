@@ -69,6 +69,38 @@ class CatalogScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.tmp / "escape.dll").exists())
 
+    def _verify_files(self, fail_second=False):
+        stage = self.tmp / "verification stage"
+        stage.mkdir()
+        for name in ("a.exe", "b.dll", "c.pyd"):
+            (stage / name).write_bytes(b"test verifier orchestration only")
+        calls = self.tmp / "verified.txt"
+        tool = self.tmp / "fake-signtool.cmd"
+        tool.write_text('@echo off\n' + f'echo %~nx5 >>"{calls}"\n'
+                        + ('if "%~nx5"=="b.dll" exit /b 7\n' if fail_second else '')
+                        + 'exit /b 0\n')
+        result = ps(f". {quote(SCRIPT)}; Test-RuntimeCatalogFiles {quote(stage)} {quote(self.tmp / 'test.cat')} {quote(tool)}")
+        return result, calls.read_text().splitlines()
+
+    def test_verifies_every_staged_file_including_later_entries(self):
+        result, calls = self._verify_files()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "3")
+        self.assertEqual([s.strip() for s in calls], ["a.exe", "b.dll", "c.pyd"])
+
+    def test_later_file_failure_stops_catalog_verification(self):
+        result, calls = self._verify_files(fail_second=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("b.dll", result.stderr)
+        self.assertEqual([s.strip() for s in calls], ["a.exe", "b.dll"])
+
+    def test_refuses_empty_verification_stage(self):
+        stage = self.tmp / "empty"
+        stage.mkdir()
+        result = ps(f". {quote(SCRIPT)}; Test-RuntimeCatalogFiles {quote(stage)} 'unused.cat' 'unused.exe'")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No staged runtime files", result.stderr)
+
     @unittest.skipUnless(MAKECAT.is_file(), "makecat.exe (Windows SDK) is required")
     def test_builds_one_sha256_catalog_of_every_staged_file(self):
         stage = self.tmp / "stage"
@@ -113,7 +145,7 @@ class CatalogWiringTests(unittest.TestCase):
             "New-RuntimeCatalog $catalogStage $catalog $makeCat",
             "& $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog",
             "(Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid'",
-            "& $signTool verify /pa /c $catalog $sample.FullName",
+            "Test-RuntimeCatalogFiles $catalogStage $catalog $signTool",
             "& $iscc @compilerArguments")]
         self.assertEqual(steps, sorted(steps))
         self.assertIn("& $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog", build)

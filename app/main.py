@@ -1,5 +1,6 @@
 from event_media import media_state as customer_event_media_state
 import asyncio
+from ai_finalizer_tasks import ActivityFinalizers
 from collections import OrderedDict, defaultdict
 
 
@@ -8532,6 +8533,7 @@ ai_event_clip_windows_lock = threading.Lock()
 # there, once, is sufficient for every later save_yolo_events() call for
 # any camera.
 _ai_event_media_loop: "asyncio.AbstractEventLoop | None" = None
+_ai_activity_finalizers = ActivityFinalizers()
 
 
 
@@ -40792,8 +40794,9 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         if _ai_event_media_loop is not None:
             try:
                 activity.has_finalizer = True
-                asyncio.run_coroutine_threadsafe(
+                _ai_activity_finalizers.submit(
                     _finalize_ai_activity(camera_number, activity, thumbnail_url), _ai_event_media_loop,
+                    name=f"ai_activity:{camera_number}:{activity.owner_id}",
                 )
             except RuntimeError as error:
                 activity.has_finalizer = False
@@ -40836,7 +40839,7 @@ async def _finalize_ai_activity(camera_number: int, activity, thumbnail_url: str
     owner_id = activity.owner_id
     registered = False
     try:
-        while True:
+        while not _ai_activity_finalizers.stopping:
             gap_seconds, max_seconds = _ai_activity_limits(camera_number)
             due = ai_activities.close_due(activity, clock(), gap_seconds=gap_seconds, max_seconds=max_seconds)
             if due is None:
@@ -42702,7 +42705,9 @@ async def lifespan(app: FastAPI):
 
 
 
-    global ffmpeg_processes
+    global ffmpeg_processes, _ai_event_media_loop
+    _ai_activity_finalizers.start()
+    _ai_event_media_loop = asyncio.get_running_loop()
 
 
 
@@ -43243,6 +43248,14 @@ async def lifespan(app: FastAPI):
 
 
         structured_log("shutdown.begin")
+        # Quiesce detection first, keeping recording supervisors/buffers alive
+        # until activity recordings and clip builders have had a chance to finish.
+        detection_tasks = list(dict.fromkeys(motion_tasks + ai_tasks + camera_worker_tasks()))
+        for task in detection_tasks:
+            task.cancel()
+        await asyncio.gather(*detection_tasks, return_exceptions=True)
+        finalizer_drain = await _ai_activity_finalizers.drain(extra_tasks=list(clip_tasks))
+        structured_log("shutdown.ai_finalizers", **finalizer_drain)
 
 
 
@@ -43580,7 +43593,8 @@ async def lifespan(app: FastAPI):
 
 
 
-        structured_log("shutdown.complete")
+        structured_log("shutdown.incomplete" if any(finalizer_drain[key] for key in
+                       ("timed_out", "remaining", "failed")) else "shutdown.complete")
 
 
 

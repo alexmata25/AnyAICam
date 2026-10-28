@@ -55,6 +55,15 @@ def test_simulated_camera_is_loopback_only():
     assert "@('127.0.0.4/30')" in script
 
 
+def test_event_only_provisioning_and_private_recorder_are_explicit_acceptance_checks():
+    script = _text(FUNCTIONAL)
+    assert "recording_mode = 'event'" in script
+    assert "recording_mode = 'continuous'" not in script
+    assert 'SELECT local_recording_mode FROM cameras' in script
+    assert 'continuous customer-facing segment writer detected' in script
+    assert 'setup.Length -gt 750000000' in script
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass

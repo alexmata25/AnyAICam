@@ -85,6 +85,16 @@ def fake_media_pipeline(monkeypatch):
     test can assert on exactly which ones fire for a given event type."""
     upload_calls = []
     register_calls = []
+    # This fixture supplies a fake PPE detector. Its positive-path tests need
+    # the appliance switch as well as the existing per-camera entitlement.
+    # Windows correctly defaults the real switch off without installed weights.
+    monkeypatch.setattr(main.ppe, "PPE_ENABLED", True)
+    # This is clip sharing coverage, not a real recorder/FFmpeg test. Event-only
+    # recording now precedes upload, so supply the completed local-recording
+    # boundary instead of waiting for post-roll from a nonexistent camera.
+    async def local_recording(*args, **kwargs):
+        return None
+    monkeypatch.setattr(main, "persist_event_recording", local_recording)
 
     def fake_upload_motion_event_media(**kwargs):
         upload_calls.append(kwargs)

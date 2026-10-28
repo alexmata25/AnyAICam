@@ -122,9 +122,8 @@ if ($Sign -or $AzureSign) {
     & $signTool verify /pa $catalog | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
     # Every catalogued file must verify against it.
-    $sample = Get-ChildItem -LiteralPath $catalogStage -Recurse -File | Select-Object -First 1
-    & $signTool verify /pa /c $catalog $sample.FullName | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "A catalogued file does not verify against the runtime catalog: $($sample.Name)" }
+    $verifiedNativeFiles = Test-RuntimeCatalogFiles $catalogStage $catalog $signTool
+    if ($verifiedNativeFiles -ne $catalogued) { throw "Runtime catalog coverage mismatch: catalogued=$catalogued verified=$verifiedNativeFiles" }
     Write-Output 'Runtime catalog signed and verified.'
 }
 # The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
@@ -148,6 +147,10 @@ $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+. (Join-Path $PSScriptRoot 'installer-size.ps1')
+$setupPath = Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe')
+$setupBytes = Assert-InstallerSize $setupPath
+Write-Output "Installer size accepted: $setupBytes bytes (limit 750000000)."
 if ($Sign -or $AzureSign) {
     $setup = Get-Item (Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe'))
     # (Inno Setup 7 keeps no signed-uninstaller cache; the installed

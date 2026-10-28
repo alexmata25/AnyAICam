@@ -138,6 +138,12 @@ def _ai_activities_end_within_their_test(request, monkeypatch):
     module = sys.modules.get("main")
     if module is not None and hasattr(module, "ai_activities"):
         module.ai_activities.reset()
+        # Each test models a fresh application lifetime. A TestClient shutdown
+        # legitimately seals its finalizer owner; do not reuse that closed owner
+        # in a later direct-call unit test that does not start a lifespan.
+        if hasattr(module, "_ai_activity_finalizers"):
+            from ai_finalizer_tasks import ActivityFinalizers
+            monkeypatch.setattr(module, "_ai_activity_finalizers", ActivityFinalizers())
     yield
     module = sys.modules.get("main")
     if module is not None and hasattr(module, "ai_activities"):

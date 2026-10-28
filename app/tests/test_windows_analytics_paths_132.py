@@ -42,6 +42,9 @@ def _linux_path_literals():
     found = []
     for path in sorted(APP.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported_native_paths = {alias.asname or alias.name for statement in ast.walk(tree)
+                                 if isinstance(statement, ast.ImportFrom) and statement.module == "platform_paths"
+                                 for alias in statement.names if alias.name == "native_path"}
         parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith(PREFIXES)):
@@ -50,7 +53,8 @@ def _linux_path_literals():
             if isinstance(parent, ast.Expr):
                 continue  # a docstring
             wrapped = (isinstance(parent, ast.Call) and parent.args and parent.args[0] is node
-                       and isinstance(parent.func, ast.Attribute) and parent.func.attr == "native_path")
+                       and ((isinstance(parent.func, ast.Attribute) and parent.func.attr == "native_path")
+                            or (isinstance(parent.func, ast.Name) and parent.func.id in imported_native_paths)))
             found.append((path.name, node.value, wrapped))
     return found
 
@@ -59,6 +63,17 @@ def test_every_linux_state_or_model_default_goes_through_native_path():
     unwrapped = [(name, value) for name, value, wrapped in _linux_path_literals()
                  if not wrapped and (name, value) not in ALLOWED]
     assert unwrapped == [], "a Linux absolute path default would mean C:\\... on Windows; use platform_paths.native_path"
+
+
+@pytest.mark.parametrize('source,wrapped', [
+    ('from platform_paths import native_path\nx = native_path("/opt/anyaicam/test", "config")', True),
+    ('x = native_path("/opt/anyaicam/test", "config")', False),
+    ('x = "/opt/anyaicam/test"', False),
+])
+def test_path_scanner_accepts_imported_helper_but_still_rejects_unrouted_literals(tmp_path, monkeypatch, source, wrapped):
+    (tmp_path / 'case.py').write_text(source)
+    monkeypatch.setitem(globals(), 'APP', tmp_path)
+    assert _linux_path_literals() == [('case.py', '/opt/anyaicam/test', wrapped)]
 
 
 def test_the_known_state_and_model_files_are_routed():

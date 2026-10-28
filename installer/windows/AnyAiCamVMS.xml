@@ -6,7 +6,7 @@
   <arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%BASE%\service-launcher.ps1"</arguments>
   <workingdirectory>%BASE%</workingdirectory>
   <startmode>Automatic</startmode>
-  <stoptimeout>30 sec</stoptimeout>
+  <stoptimeout>60 sec</stoptimeout>
   <onfailure action="restart" delay="10 sec" />
   <onfailure action="restart" delay="30 sec" />
   <resetfailure>1 hour</resetfailure>
