@@ -105,6 +105,17 @@ def cookies_for(token: str) -> dict:
     return {partner_portal.SESSION_COOKIE: token}
 
 
+def global_admin_session_cookie(email: str = "admin@example.test") -> str:
+    """A real, MFA-verified session for a live global administrator, creating the account (and its live global grant)
+    on first use in the current database. Idempotent, so older route tests that ask for an admin cookie several times
+    per test can use it in place of a session-less partner_portal._token(email, "administrator")."""
+    with connection() as db:
+        exists = db.execute("SELECT 1 FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()
+    if not exists:
+        make_partner_user(email, "administrator", partner_id=None, global_admin=True)
+    return partner_session_cookie(email, "administrator")
+
+
 def enroll_confirmed_mfa(user_id: str) -> str:
     """A confirmed TOTP factor for this account; returns the secret."""
     import platform_owner

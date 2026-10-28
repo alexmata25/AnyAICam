@@ -579,13 +579,24 @@ def test_only_authenticated_administrator_can_import_or_revoke_signed_grants(cli
     envelope = _signed_grant(monkeypatch, quantities={"ppe": 1})
     route = "/api/admin/test-lab/grants"
     assert _call(client, "POST", route, payload=envelope, cookies=_cookie()).status_code == 403
+    # Administrator cookies without a persisted session are intentionally
+    # rejected by the 1.2.7.1 authentication policy. Exercise the route with
+    # the same active, MFA-verified session shape used by a successful cloud
+    # administrator login instead of a legacy claim-only token.
+    from authz_helpers import cookies_for, partner_session_cookie
+    from global_admin_helper import make_live_global_admin
+    with override_target(sqlite_path=db_path):
+        admin_id = make_live_global_admin("admin@example.test")
+        admin_cookie = cookies_for(partner_session_cookie(
+            "admin@example.test", "administrator", mfa_state="verified", user_id=admin_id
+        ))
     imported = _call(client, "POST", route, payload=envelope,
-                     cookies=_cookie("admin@example.test", "administrator"))
+                     cookies=admin_cookie)
     assert imported.status_code == 200 and imported.json()["grant_id"] == "grant-1"
     assert _call(client, "POST", f"{route}/grant-1/revoke",
                  cookies=_cookie("owner@example.test", "customer_owner")).status_code == 403
     revoked = _call(client, "POST", f"{route}/grant-1/revoke",
-                    cookies=_cookie("admin@example.test", "administrator"))
+                    cookies=admin_cookie)
     assert revoked.status_code == 200 and revoked.json()["status"] == "revoked"
     with override_target(sqlite_path=db_path):
         with connection() as db:

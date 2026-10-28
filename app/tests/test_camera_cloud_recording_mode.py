@@ -14,7 +14,9 @@ documented constraint and test_appliance_cloud_analytics_events.py's
 own established pattern.
 """
 
+import os
 import secrets
+import tempfile
 import time
 
 import pytest
@@ -23,7 +25,10 @@ from fastapi.testclient import TestClient
 
 from database_backend import override_target
 
-with override_target(sqlite_path="/tmp/test_camera_cloud_recording_mode.db"):
+_IMPORT_TEST_DB = os.path.join(
+    tempfile.gettempdir(), f"test_camera_cloud_recording_mode-{os.getpid()}.db"
+)
+with override_target(sqlite_path=_IMPORT_TEST_DB):
     import appliance_cloud
     import partner_portal
     from partner_db import connection, password_hash
@@ -66,7 +71,9 @@ def _appliance_auth_headers(appliance_id: str, credential: str) -> dict:
 
 
 def _admin_cookie() -> str:
-    return partner_portal._token("admin@example.test", "administrator")
+    # 1.2.7.1 (D-AUTHZ-2b): a real, MFA-verified session of a live global administrator, not a session-less token.
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie()
 
 
 @pytest.fixture()
@@ -291,7 +298,8 @@ def test_an_explicit_mode_is_kept_on_a_hybrid_plan(client, db_path, explicit, ex
 
     response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
 
-    assert response.json()["cameras"][0]["recording_mode"] == explicit
+    # R-REC-1 as the docstring states: the expected value, not the stored one (a stored 'continuous' goes out as 'motion').
+    assert response.json()["cameras"][0]["recording_mode"] == expected
 
 
 @pytest.mark.parametrize("plan_key,status", [("ai_local", "active"), ("basic_local", "active"), ("hybrid", "suspended")])

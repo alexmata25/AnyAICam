@@ -68,7 +68,10 @@ def _partner_owner_cookie(partner_id, email="owner@example.test"):
 
 
 def _admin_cookie(email="admin@example.test"):
-    return partner_portal._token(email, "administrator")
+    # 1.2.7.1 D-AUTHZ-2b (CORRECTIVE-1.2.7.1.md): an administrator cookie must name a live, MFA-verified
+    # session bound to the (already seeded) account's current authorization version.
+    from authz_helpers import partner_session_cookie
+    return partner_session_cookie(email, "administrator")
 
 
 def _save_quote(client, cookies, customer="Test Customer", monthly_profit=100):

@@ -246,6 +246,16 @@ def portal(db_path, tmp_path, monkeypatch, fake_stripe_prices):
 
 def _cookie(email, role, customer_id=None):
     import partner_portal
+    if role == "administrator":
+        # 1.2.7.1 (D-AUTHZ-2b) refuses a session-less administrator cookie, so an administrator gets a real,
+        # MFA-verified session on an existing partner_users account (created here without any grant when absent;
+        # _make_global_admin() adds the live global grant).
+        from authz_helpers import partner_session_cookie
+        from partner_db import connection
+        with connection() as db:
+            db.execute("INSERT OR IGNORE INTO partner_users(id,email,name,role,password_hash,approved,created_at) "
+                       "VALUES(?,?,'Admin','administrator','x',1,'2026-01-01')", ("u-" + email.lower(), email.lower()))
+        return {partner_portal.SESSION_COOKIE: partner_session_cookie(email, "administrator")}
     return {partner_portal.SESSION_COOKIE: partner_portal._token(email, role, None, customer_id, None)}
 
 
@@ -260,7 +270,8 @@ def _make_global_admin(db_path, email="admin@example.test"):
                  "VALUES('grant-1','admin-1','administrator','global','2026-01-01')")
     conn.commit()
     conn.close()
-    return _cookie(email, "administrator")
+    with override_target(sqlite_path=str(db_path)):
+        return _cookie(email, "administrator")
 
 
 def _checkout_plan(client):

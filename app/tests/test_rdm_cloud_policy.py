@@ -55,8 +55,10 @@ def _seed_tenant(db_path, customer_id, partner_id=None):
 
 
 def _admin_cookie():
-    import partner_portal
-    return partner_portal._token("admin@example.test", "administrator")
+    # 1.2.7.1 (D-AUTHZ-2b): a real, MFA-verified session of a live global administrator, not a session-less token
+    # (partner_portal._evaluate refuses an administrator cookie that names no live session, 'no_session').
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie()
 
 
 def _viewer_cookie(customer_id):

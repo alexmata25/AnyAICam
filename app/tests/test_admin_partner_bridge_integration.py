@@ -258,16 +258,22 @@ def test_command_endpoint_partner_only_session_is_completely_unaffected_by_the_b
     # the fix, not loosening the new check -- this is exactly the
     # confirmed-safe, explicit, verifiable global authority path the
     # remediation requires.
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-2): the session must also be a REAL one -- a
+    # user_sessions row bound to this account's current authorization_version
+    # (MFA-verified) -- since a session-less administrator token is refused
+    # ('no_session'). The account carries no partner_id so the signed cookie's
+    # partner_id stays None, exactly as this test intends.
     conn.execute(
         "INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        ("admin-owner-1", "partner-1", "owner@example.test", "Admin", "administrator", "x", 1, "2026-01-01"),
+        ("admin-owner-1", None, "owner@example.test", "Admin", "administrator", "x", 1, "2026-01-01"),
     )
     conn.execute(
         "INSERT INTO identity_grants(id,user_id,role,scope_type,scope_id,granted_at,granted_by,revoked_at) VALUES(?,?,?,?,?,?,?,NULL)",
         ("grant-admin-owner-1", "admin-owner-1", "administrator", "global", None, "2026-01-01", "system:test"),
     )
     conn.commit()
-    partner_token = partner_portal._token("owner@example.test", "administrator", None, None, None)
+    from authz_helpers import partner_session_cookie
+    partner_token = partner_session_cookie("owner@example.test", "administrator")
 
     response = client.post(
         "/api/partner/appliances/appl-http-3/commands",

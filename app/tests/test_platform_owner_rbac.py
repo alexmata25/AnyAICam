@@ -23,6 +23,13 @@ from database_backend import override_target
 from partner_db import connection, initialize_database, password_hash
 
 
+def _owner_session():
+    """1.2.7.1 (D-AUTHZ-2b): a real session bound to the owner account's current authorization version, as a
+    password sign-in creates it; this edge profile needs no MFA marker before the owner has enrolled."""
+    from authz_helpers import partner_session_cookie
+    return partner_session_cookie("amata@anyaicam.com", "administrator", mfa_state=None)
+
+
 @pytest.fixture()
 def http_client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")
@@ -289,7 +296,7 @@ def test_recovery_code_single_use_holds_under_real_concurrent_redemption(http_cl
 def test_mfa_enroll_requires_a_real_global_grant_session(http_client):
     client, db_path = http_client
     _seed_operator(db_path)  # administrator role, but NO grant yet
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     response = client.post("/api/platform-owner/mfa/enroll", cookies={partner_portal.SESSION_COOKIE: session_cookie})
     assert response.status_code == 403
 
@@ -299,7 +306,7 @@ def test_mfa_enroll_and_confirm_full_flow(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
 
     enroll = client.post("/api/platform-owner/mfa/enroll", cookies={partner_portal.SESSION_COOKIE: session_cookie})
     assert enroll.status_code == 200
@@ -323,7 +330,7 @@ def test_mfa_confirm_with_wrong_code_does_not_confirm(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     client.post("/api/platform-owner/mfa/enroll", cookies={partner_portal.SESSION_COOKIE: session_cookie})
     confirm = client.post("/api/platform-owner/mfa/confirm", json={"code": "000000"}, cookies={partner_portal.SESSION_COOKIE: session_cookie})
     assert confirm.status_code == 400
@@ -365,7 +372,7 @@ def test_login_with_mfa_confirmed_requires_a_second_step(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     secret, _codes = _enroll_and_confirm_mfa(client, db_path, session_cookie)
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
@@ -382,7 +389,7 @@ def test_mfa_verify_with_correct_totp_completes_the_login(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     secret, _codes = _enroll_and_confirm_mfa(client, db_path, session_cookie)
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
@@ -403,7 +410,7 @@ def test_mfa_verify_with_a_recovery_code_completes_the_login(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     _secret, codes = _enroll_and_confirm_mfa(client, db_path, session_cookie)
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
@@ -423,7 +430,7 @@ def test_mfa_verify_with_wrong_code_does_not_establish_a_session(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     _enroll_and_confirm_mfa(client, db_path, session_cookie)
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
@@ -439,7 +446,7 @@ def test_mfa_pending_token_is_single_use(http_client):
     _seed_operator(db_path)
     admin_token = _admin_session()
     _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     secret, _codes = _enroll_and_confirm_mfa(client, db_path, session_cookie)
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
@@ -506,10 +513,11 @@ def test_break_glass_full_recovery_flow(http_client):
 
     redeem = client.post("/api/platform-owner/break-glass-recover", json={"email": "amata@anyaicam.com", "token": token}, follow_redirects=False)
     assert redeem.status_code == 303
-    assert redeem.headers["location"] == "/admin-portal"
+    # 1.2.7.1 RC-2 (GREEN-MFA-ACCEPTANCE-SPEC.md): redemption forces MFA re-enrollment.
+    assert redeem.headers["location"] == "/admin/mfa-setup"
     session_cookie = redeem.cookies[partner_portal.SESSION_COOKIE]
 
-    page = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie})
+    page = client.get("/admin/mfa-setup", cookies={partner_portal.SESSION_COOKIE: session_cookie})
     assert page.status_code == 200
 
 
@@ -668,6 +676,6 @@ def test_route_level_check_is_independent_of_any_nav_visibility(http_client):
     # exactly today's real amata@anyaicam.com starting state before
     # provisioning, and the exact case that used to 403 on legacy
     # Admin-Portal-gated pages while the sidebar showed them anyway.
-    session_cookie = partner_portal._token("amata@anyaicam.com", "administrator", None, None, None)
+    session_cookie = _owner_session()
     response = client.post("/api/platform-owner/mfa/enroll", cookies={partner_portal.SESSION_COOKIE: session_cookie})
     assert response.status_code == 403

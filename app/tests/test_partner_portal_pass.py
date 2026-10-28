@@ -274,8 +274,12 @@ def test_partner_applications_require_a_global_administrator(client):
         appliance_identity.create_grant(db, user_id="u-company-admin", role="administrator", scope_type="partner", scope_id="p-alpha", granted_by="test")
         db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES('u-global','p-alpha','global@anyaicam.test','G','administrator','x',1,?)", (NOW,))
         appliance_identity.create_grant(db, user_id="u-global", role="administrator", scope_type="global", scope_id=None, granted_by="test")
-    company_admin = {partner_portal.SESSION_COOKIE: partner_portal._token("company-admin@p-alpha.test", "administrator", "p-alpha")}
-    global_admin = {partner_portal.SESSION_COOKIE: partner_portal._token("global@anyaicam.test", "administrator", "p-alpha")}
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-2): administrator cookies must name a live,
+    # version-bound, MFA-verified (cloud) session -- a session-less administrator
+    # token is refused (401 'no_session') before the grant check this test is about.
+    from authz_helpers import partner_session_cookie
+    company_admin = {partner_portal.SESSION_COOKIE: partner_session_cookie("company-admin@p-alpha.test", "administrator", partner_id="p-alpha")}
+    global_admin = {partner_portal.SESSION_COOKIE: partner_session_cookie("global@anyaicam.test", "administrator", partner_id="p-alpha")}
     assert client.get("/api/admin/partner-applications", cookies=company_admin).status_code == 403
     assert client.put("/api/admin/partner-applications/x", json={"status": "approved"}, cookies=company_admin).status_code == 403
     assert client.get("/api/admin/partner-applications", cookies=global_admin).status_code == 200

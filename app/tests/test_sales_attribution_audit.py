@@ -26,9 +26,12 @@ def admin_client(db_path):
         conn.commit()
         conn.close()
         make_live_global_admin("platform@anyaicam.test")
+        # 1.2.7.1 D-AUTHZ-2b (CORRECTIVE-1.2.7.1.md): the administrator cookie names a live, MFA-verified
+        # session bound to this account (partner_id anyaicam-primary, as before) -- never a session-less token.
+        from authz_helpers import partner_session_cookie
+        admin_cookie = partner_session_cookie("platform@anyaicam.test", "administrator")
         with TestClient(main.app, base_url="https://app.anyaicam.com") as client:
-            client.cookies.set(partner_portal.SESSION_COOKIE,
-                               partner_portal._token("platform@anyaicam.test", "administrator", "anyaicam-primary"))
+            client.cookies.set(partner_portal.SESSION_COOKIE, admin_cookie)
             yield client
 
 

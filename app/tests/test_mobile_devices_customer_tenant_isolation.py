@@ -89,7 +89,17 @@ def _owner_cookie(customer_id, email="owner@example.test"):
 
 
 def _admin_cookie():
-    return partner_portal._token("admin@example.test", "administrator")
+    # 1.2.7.1 D-AUTHZ-2b (CORRECTIVE-1.2.7.1.md): an administrator cookie must name a live, MFA-verified
+    # session bound to a real account. The account deliberately has NO global grant, exactly as the
+    # session-less token's unknown e-mail had none before, so cloud_administrator_bridge() still finds
+    # nothing and current_user() keeps its anonymous fallback -- the behaviour this test pins.
+    from authz_helpers import make_partner_user, partner_session_cookie
+    from partner_db import connection
+    with connection() as db:
+        exists = db.execute("SELECT 1 FROM partner_users WHERE lower(email)='admin@example.test'").fetchone()
+    if not exists:
+        make_partner_user("admin@example.test", "administrator", partner_id=None)
+    return partner_session_cookie("admin@example.test", "administrator")
 
 
 def _create_pairing(client, cookies, device_name="Test Phone"):

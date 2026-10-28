@@ -26,7 +26,13 @@ def _admin_cookie(db_path, *, global_grant=True, email="ops@example.test"):
                      "VALUES(?,?,'administrator','global','2026-01-01')", (f"grant-{email}", f"admin-{email}"))
     conn.commit()
     conn.close()
-    return {partner_portal.SESSION_COOKIE: partner_portal._token(email, "administrator", None, None, None)}
+    # 1.2.7.1 (D-AUTHZ-2b): an administrator cookie must name a live user_sessions row bound to the account's current
+    # authorization_version (partner_portal._evaluate refuses a session-less one, 'no_session'), so this is a real,
+    # MFA-verified session. Without global_grant it is still refused (403) by the live-global-grant check.
+    from authz_helpers import partner_session_cookie
+    with override_target(sqlite_path=str(db_path)):
+        token = partner_session_cookie(email, "administrator")
+    return {partner_portal.SESSION_COOKIE: token}
 
 
 @pytest.fixture()

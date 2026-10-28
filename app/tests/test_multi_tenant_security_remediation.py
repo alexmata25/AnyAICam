@@ -155,7 +155,15 @@ def _seed_global_administrator(conn, *, user_id, email):
 
 
 def _cookie(email, role, partner_id=None, customer_id=None):
-    return {partner_portal.SESSION_COOKIE: partner_portal._token(email, role, partner_id, customer_id, None)}
+    session_id = None
+    if role == "administrator":
+        # 1.2.7.1 D-AUTHZ-2b (CORRECTIVE-1.2.7.1.md): an administrator cookie must name a live,
+        # MFA-verified user_sessions row bound to the account's current authorization version
+        # (a session-less administrator token is refused as 'no_session'). The cookie's own
+        # partner_id/customer_id claims are kept exactly as before.
+        from authz_helpers import partner_session_cookie, session_row
+        session_id = session_row(partner_session_cookie(email, role))["id"]
+    return {partner_portal.SESSION_COOKIE: partner_portal._token(email, role, partner_id, customer_id, session_id)}
 
 
 def _seed_two_tenants(conn):

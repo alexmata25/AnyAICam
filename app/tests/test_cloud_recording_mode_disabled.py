@@ -42,7 +42,9 @@ def _seed_camera(conn, camera_id="cam-1", camera_number=1):
 
 
 def _admin_cookie():
-    return partner_portal._token("admin@example.test", "administrator", None, None, None)
+    # 1.2.7.1 (D-AUTHZ-2b): a real, MFA-verified session of a live global administrator, not a session-less token.
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie()
 
 
 @pytest.fixture()

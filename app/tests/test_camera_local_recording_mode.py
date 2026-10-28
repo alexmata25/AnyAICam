@@ -13,7 +13,9 @@ override_target() before that import, matching this project's own
 documented constraint.
 """
 
+import os
 import secrets
+import tempfile
 import time
 
 import pytest
@@ -22,7 +24,10 @@ from fastapi.testclient import TestClient
 
 from database_backend import override_target
 
-with override_target(sqlite_path="/tmp/test_camera_local_recording_mode.db"):
+_IMPORT_TEST_DB = os.path.join(
+    tempfile.gettempdir(), f"test_camera_local_recording_mode-{os.getpid()}.db"
+)
+with override_target(sqlite_path=_IMPORT_TEST_DB):
     import appliance_cloud
     import partner_portal
     from partner_db import connection, password_hash
@@ -48,7 +53,9 @@ def _appliance_auth_headers(appliance_id: str, credential: str) -> dict:
 
 
 def _admin_cookie() -> str:
-    return partner_portal._token("admin@example.test", "administrator")
+    # 1.2.7.1 (D-AUTHZ-2b): a real, MFA-verified session of a live global administrator, not a session-less token.
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie()
 
 
 @pytest.fixture()

@@ -10,6 +10,7 @@ import time
 
 import platform_owner
 import partner_portal
+from authz_helpers import partner_session_cookie
 from partner_db import connection
 from test_platform_owner_rbac import (  # noqa: F401 -- fixtures and helpers
     _admin_session,
@@ -26,7 +27,9 @@ EMAIL = "amata@anyaicam.com"
 def _owner(client, db_path):
     _seed_operator(db_path)
     _grant_global(db_path, _admin_session(), client, email=EMAIL)
-    cookie = partner_portal._token(EMAIL, "administrator", None, None, None)
+    # 1.2.7.1 (D-AUTHZ-2b): an administrator cookie must name a live session (partner_portal._evaluate refuses one
+    # without, 'no_session'); edge profile, so the not-yet-enrolled owner's session needs no MFA marker.
+    cookie = partner_session_cookie(EMAIL, "administrator", mfa_state=None)
     client.cookies.set(partner_portal.SESSION_COOKIE, cookie)
     return cookie
 

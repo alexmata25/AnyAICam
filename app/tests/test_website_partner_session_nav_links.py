@@ -87,11 +87,20 @@ def _seed_global_grant(db_path, user_id):
     conn.commit()
 
 
+def _admin_session(email):
+    """Linux 1.2.7.1 (D-AUTHZ-2b, S-2): an administrator cookie must name a live
+    user_sessions row bound to the account's current authorization_version
+    (MFA-verified) -- a session-less administrator token is refused
+    ('no_session') and this endpoint then answers as anonymous."""
+    from authz_helpers import partner_session_cookie
+    return partner_session_cookie(email, "administrator", partner_id="partner-1")
+
+
 def test_edge_global_administrator_nav_link_points_to_local_admin_portal(http_client, db_path, monkeypatch):
     _seed_partner_user(db_path, email="admin@example.test", role="administrator", user_id="u-admin")
     _seed_global_grant(db_path, "u-admin")
     monkeypatch.setattr(website_partner, "settings", _edge_production())
-    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+    token = _admin_session("admin@example.test")
 
     response = http_client.get("/api/website/partner-session", cookies={partner_portal.SESSION_COOKIE: token}, headers={"host": "100.123.115.65:8000"})
 
@@ -107,7 +116,7 @@ def test_edge_partner_scoped_administrator_nav_link_stays_on_partner_view(http_c
     # No global grant -- only a partner-scoped one, or none at all; either
     # way this account is not a true platform administrator.
     monkeypatch.setattr(website_partner, "settings", _edge_production())
-    token = partner_portal._token("admin2@example.test", "administrator", "partner-1", None, None)
+    token = _admin_session("admin2@example.test")
 
     response = http_client.get("/api/website/partner-session", cookies={partner_portal.SESSION_COOKIE: token}, headers={"host": "192.168.0.165:8000"})
 
@@ -119,7 +128,7 @@ def test_edge_uses_whatever_host_this_particular_request_came_from(http_client, 
     _seed_partner_user(db_path, email="admin3@example.test", role="administrator", user_id="u-admin3")
     _seed_global_grant(db_path, "u-admin3")
     monkeypatch.setattr(website_partner, "settings", _edge_production())
-    token = partner_portal._token("admin3@example.test", "administrator", "partner-1", None, None)
+    token = _admin_session("admin3@example.test")
 
     response = http_client.get("/api/website/partner-session", cookies={partner_portal.SESSION_COOKIE: token}, headers={"host": "anyaicam-appliance.local:8000"})
 
@@ -132,7 +141,7 @@ def test_cloud_production_still_uses_the_fixed_configured_domain(http_client, db
     _seed_partner_user(db_path, email="admin4@example.test", role="administrator", user_id="u-admin4")
     _seed_global_grant(db_path, "u-admin4")
     monkeypatch.setattr(website_partner, "settings", _cloud_production())
-    token = partner_portal._token("admin4@example.test", "administrator", "partner-1", None, None)
+    token = _admin_session("admin4@example.test")
 
     response = http_client.get("/api/website/partner-session", cookies={partner_portal.SESSION_COOKIE: token}, headers={"host": "attacker.example"})
 

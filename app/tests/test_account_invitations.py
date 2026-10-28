@@ -144,7 +144,11 @@ def test_an_approved_partner_application_gets_a_link_not_a_password(client, monk
     from global_admin_helper import make_live_global_admin
     import partner_portal
     make_live_global_admin("platform@anyaicam.test")
-    admin = {partner_portal.SESSION_COOKIE: partner_portal._token("platform@anyaicam.test", "administrator", "anyaicam-primary")}
+    # 1.2.7.1 (D-AUTHZ-2b): a real, MFA-verified session bound to the account's current authorization_version;
+    # partner_portal._evaluate refuses a session-less administrator cookie ('no_session').
+    from authz_helpers import partner_session_cookie
+    admin = {partner_portal.SESSION_COOKIE: partner_session_cookie("platform@anyaicam.test", "administrator",
+                                                                   partner_id="anyaicam-primary")}
     with connection() as db:
         db.execute("INSERT INTO partner_applications(id,company_name,contact_name,email,status,submitted_at) "
                    "VALUES('app-1','Acme Installs','Ana','ana@acme.test','pending','2026-10-02')")

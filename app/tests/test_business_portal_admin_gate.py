@@ -50,7 +50,11 @@ def _customer():
 
 
 def _admin():
-    return {partner_portal.SESSION_COOKIE: partner_portal._token("platform@anyaicam.test", "administrator", None, None, None)}
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-2): a real session bound to the account's current
+    # authorization_version and MFA-verified (cloud) -- a session-less administrator
+    # token is refused ('no_session').
+    from authz_helpers import partner_session_cookie
+    return {partner_portal.SESSION_COOKIE: partner_session_cookie("platform@anyaicam.test", "administrator")}
 
 
 @pytest.mark.parametrize("method,path,body", ROUTES)
