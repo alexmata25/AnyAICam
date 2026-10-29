@@ -160,6 +160,15 @@ def _seed_global_administrator_grant(conn, email="admin@example.test", partner_i
     conn.commit()
 
 
+def _admin_token(partner_id, email="admin@example.test"):
+    """1.2.7.1 (D-AUTHZ-2b): an administrator cookie must name a live user_sessions row bound to the account's
+    current authorization_version (partner_portal._evaluate refuses a session-less one, 'no_session'). A real,
+    MFA-verified session of the account _seed_global_administrator_grant() created, carrying the same partner_id
+    claim the older session-less token did."""
+    from authz_helpers import partner_session_cookie
+    return partner_session_cookie(email, "administrator", partner_id=partner_id)
+
+
 # =============================================================== partner-role scoping (list + detail)
 
 
@@ -237,7 +246,7 @@ def test_administrator_sees_customers_across_every_partner(http_client):
     _seed_customer(conn, "cust-a", "partner-1", "CustomerA")
     _seed_customer(conn, "cust-b", "partner-2", "CustomerB")
     _seed_global_administrator_grant(conn)
-    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+    token = _admin_token("partner-1")
 
     response = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 200
@@ -269,7 +278,7 @@ def test_customer_list_survives_a_row_with_genuinely_null_optional_fields(http_c
     )
     conn.commit()
     _seed_global_administrator_grant(conn)
-    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+    token = _admin_token("partner-1")
 
     response = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: token})
 
@@ -303,7 +312,7 @@ def test_customer_detail_survives_a_plan_row_with_null_pricing_and_resolution(ht
     )
     conn.commit()
     _seed_global_administrator_grant(conn)
-    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+    token = _admin_token("partner-1")
 
     response = client.get("/partner/customers/cust-null-plan", cookies={partner_portal.SESSION_COOKIE: token})
 
@@ -318,7 +327,7 @@ def test_administrator_can_view_any_partners_customer_detail(http_client):
     conn = sqlite3.connect(db_path)
     _seed_customer(conn, "cust-b", "partner-2", "CustomerB")
     _seed_global_administrator_grant(conn)
-    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+    token = _admin_token("partner-1")
 
     response = client.get("/partner/customers/cust-b", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 200
@@ -330,7 +339,7 @@ def test_administrator_can_create_a_customer_for_an_explicit_partner_id(http_cli
     conn = sqlite3.connect(db_path)
     _seed_partner(conn, "partner-9")
     _seed_global_administrator_grant(conn)
-    token = partner_portal._token("admin@example.test", "administrator", "anyaicam-primary", None, None)
+    token = _admin_token("anyaicam-primary")
 
     response = client.post(
         "/api/partner/customers/onboard", json=_onboard_payload(partner_id="partner-9"),

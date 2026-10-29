@@ -112,14 +112,20 @@ def test_the_proxy_listens_on_loopback_only():
 
 # ---------------------------------------------------------------- functional-in-sandbox.ps1 wiring
 def test_upgrade_runs_install_the_previous_setup_first_and_upgrade_after_the_camera_records():
+    # 1.3.4.1 (O-2): the harness is version-neutral ("the previous setup" / "accepted previous baseline", any accepted
+    # release in C:\Validation\previous) and event-only: the upgrade evidence is a completed, listed EVENT clip, never a
+    # growing continuous segment. Same guarantees as before: previous setup first, upgrade after the camera records,
+    # identity/link/secrets kept, the old clips still listed and playable, downgrade refused, pricing re-checked.
     assert "$firstSetup = if ($upgrade) { $previousSetup } else { $setup }" in SCRIPT
-    upgrade = SCRIPT.index("# ---------------------------------------------------------------- UPGRADE 1.3.2")
+    upgrade = SCRIPT.index("# ---------------------------------------------------------------- upgrade from the accepted setup -> setup under test")
     assert SCRIPT.index("Check 'edge sync: the camera reaches the VMS") < upgrade < SCRIPT.index("# ---------------------------------------------------------------- live view")
     block = SCRIPT[upgrade:SCRIPT.index("# ---------------------------------------------------------------- live view")]
-    for expected in ("upgrade (before): 1.3.2 recorded", "upgrade: the setup under test runs over 1.3.2", "are kept",
-                     "the clips recorded by 1.3.2 are still listed and play", "(downgrade) and changes nothing",
-                     'SubscriptionCheck "$mode-after-upgrade"'):
+    for expected in ("upgrade (before): the previous setup recorded an event clip and lists it",
+                     "upgrade: the setup under test runs over the accepted previous baseline", "are kept",
+                     "upgrade: event clips recorded by the previous setup remain listed and playable on the new version",
+                     "(downgrade) and changes nothing", 'SubscriptionCheck "$mode-after-upgrade"'):
         assert expected in block, expected
+    assert "do not use a growing continuous segment as evidence" in block
 
 
 def test_fix_forward_runs_only_in_the_local_upgrade_scenario_before_the_revocation():
@@ -129,8 +135,8 @@ def test_fix_forward_runs_only_in_the_local_upgrade_scenario_before_the_revocati
     assert start < SCRIPT.index("[void](Cloud POST '/test/revoke-appliance' -Owner)")
     block = SCRIPT[start:SCRIPT.index("[void](Cloud POST '/test/revoke-appliance' -Owner)")]
     assert "rollback: uninstalling the new version" in block
-    assert "fix-forward: the 1.3.2 setup is refused over the newer data folder and changes nothing" in block
-    assert "if ($rbI.ExitCode -eq 0) { throw '1.3.2 installed over the newer data folder' }" in block
+    assert "fix-forward: the previous setup is refused over the newer data folder and changes nothing" in block
+    assert "if ($rbI.ExitCode -eq 0) { throw 'previous setup installed over the newer data folder' }" in block
     assert "fix-forward: the setup under test installs again (exit 0)" in block
     assert "Start-Process -FilePath $setup.FullName" in block
     assert "the accepted 1.3.2 installs again" not in SCRIPT
@@ -180,9 +186,15 @@ def test_saved_pages_are_included_in_the_secrets_scan():
     assert "'.log', '.txt', '.json', '.m3u8', '.html'" in SCRIPT
 
 
-def test_offline_recording_compares_against_the_segment_at_check_start_for_longer_than_one_segment():
-    # 906f7819 U132-L/H false FAIL: 256 KiB MKV steps at ~1 KB/s vs a 180 s window of 15 s samples.
-    block = SCRIPT[SCRIPT.index("Check 'offline: recording continues without the cloud'"):]
-    block = block[:block.index("Diag 'offline-recording'")]
-    assert '$g = WaitFor 330 {' in block and '$baseName' in block and '$baseLen' in block
-    assert 'WaitFor 180 { Growing $camNo }' not in block
+def test_offline_check_plays_the_completed_event_clip_without_the_cloud():
+    # 1.3.4.1 (O-2): recording is event-only (R-REC-1), so the old continuous "recording continues offline" segment-
+    # growth check (and its 906f7819 330 s timing fix) no longer applies. Offline evidence is now that the SAME completed
+    # event clip recorded online is still listed and its media plays (a probed video stream) with the cloud stopped.
+    assert "Check 'offline: recording continues without the cloud'" not in SCRIPT
+    assert 'WaitFor 180 { Growing $camNo }' not in SCRIPT
+    assert SCRIPT.index("StopCloud") < SCRIPT.index("Check 'offline: the completed local event clip remains playable without the cloud'")
+    block = SCRIPT[SCRIPT.index("Check 'offline: the completed local event clip remains playable without the cloud'"):]
+    block = block[:block.index("# ---------------------------------------------------------------- playback (offline)")]
+    assert "$script:eventClip" in block and "is not listed offline" in block
+    assert '/media" -Out $file' in block and "$media.status -ne 200" in block
+    assert "codec_type -eq 'video'" in block

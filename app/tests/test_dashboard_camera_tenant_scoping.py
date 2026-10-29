@@ -149,10 +149,17 @@ def test_customer_bs_cameras_never_appear_in_customer_as_status_response(http_cl
     response = http_client.get("/api/cameras/status", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
     data = response.json()
     assert len(data["cameras"]) == 5
-    # Customer A seeded: online for all 5, recording stopped only for #3.
+    # Customer A seeded: online for all 5, recording only for #1,#2,#4,#5.
+    # R-REC-1 (1.2.7.1, CORRECTIVE-1.2.7.1.md): every camera is event-only, so
+    # A's online-but-idle #3 now reads "armed" (main._customer_camera_status),
+    # no longer "stopped". B's leaked cameras would read "running" (online,
+    # recording=1), so #3 being armed -- and nothing else -- still proves none
+    # of B's cameras reached A's response.
     assert all(c["online"] for c in data["cameras"])
-    stopped = [c for c in data["cameras"] if c["recording"] == "stopped"]
-    assert [c["camera"] for c in stopped] == [3]
+    armed = [c for c in data["cameras"] if c["recording"] == "armed"]
+    assert [c["camera"] for c in armed] == [3]
+    running = sorted(c["camera"] for c in data["cameras"] if c["recording"] == "running")
+    assert running == [1, 2, 4, 5]
 
 
 def test_online_and_recording_reflect_the_real_appliance_heartbeat(http_client, db_path):

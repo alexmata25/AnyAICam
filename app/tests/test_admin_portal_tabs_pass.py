@@ -48,12 +48,25 @@ def _platform_admin_cookies(email="platform@anyaicam.test", *, grant_scope="glob
         )
         appliance_identity.create_grant(db, user_id=user_id, role="administrator", scope_type=grant_scope,
                                         scope_id=None if grant_scope == "global" else "partner-1", granted_by="test")
-    return {partner_portal.SESSION_COOKIE: partner_portal._token(email, "administrator", None, None, None)}
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-2): an administrator cookie must name a live
+    # user_sessions row bound to the account's authorization_version, MFA-verified
+    # on the cloud -- a session-less token is refused ('no_session').
+    from authz_helpers import partner_session_cookie
+    return {partner_portal.SESSION_COOKIE: partner_session_cookie(email, "administrator")}
 
 
 def _legacy_admin_cookies():
     main.save_users([{"id": "local-admin", "email": "admin@local", "role": "administrator", "enabled": True, "camera_ids": []}])
     return {main.SESSION_COOKIE_NAME: main.create_session("local-admin")}
+
+
+def _cloud_admin_cookies():
+    """The real cloud administrator (live global grant + MFA-verified bound
+    session). Linux 1.2.7.1 refuses the legacy users.json administrator on the
+    cloud (spec §5 S-1/S-4), so the route-fix tests below that used it to reach
+    an administrator route now use the only administrator the cloud accepts."""
+    from authz_helpers import global_admin_session_cookie
+    return {partner_portal.SESSION_COOKIE: global_admin_session_cookie()}
 
 
 def _nav_hrefs(html):
@@ -110,17 +123,27 @@ def test_revoked_grant_loses_master_pages_on_the_next_request(cloud_client):
 
 
 def test_legacy_local_admin_keeps_master_pages(cloud_client):
+    # Linux 1.2.7.1 changed this on the CLOUD profile (GREEN-MFA-ACCEPTANCE-SPEC.md
+    # §5 S-1/S-4, D-AUTHZ-2b-REMEDIATION-PLAN.md §4.1): a legacy users.json
+    # administrator session no longer carries any administrator access there.
+    # (The appliance keeps its local emergency sign-in, spec §8 E-1/E-2.)
     cookies = _legacy_admin_cookies()
-    assert "Master-controlled business accounts" in cloud_client.get("/business-users", cookies=cookies).text
-    assert cloud_client.get("/api/admin/analytics-entitlements", cookies=cookies).status_code == 200
+    page = cloud_client.get("/business-users", cookies=cookies, follow_redirects=False)
+    assert "Master-controlled business accounts" not in page.text
+    assert cloud_client.get("/api/admin/analytics-entitlements", cookies=cookies).status_code in (401, 403)
 
 
 # ------------------------------------------------------------ Facial Recognition nav
 
 
 def test_facial_recognition_link_only_shows_where_the_page_opens(cloud_client):
-    legacy = cloud_client.get("/admin-portal", cookies=_legacy_admin_cookies()).text
-    assert "/aac/people" not in _nav_hrefs(legacy)  # /aac/* authenticates Partner Portal sessions only
+    # Linux 1.2.7.1 (spec §5 S-4): on the cloud a legacy users.json administrator
+    # no longer reaches /admin-portal at all, so it is shown no nav (and no
+    # /aac/people link) -- it is sent to sign in instead.
+    legacy = cloud_client.get("/admin-portal", cookies=_legacy_admin_cookies(), follow_redirects=False)
+    assert legacy.status_code in (302, 303, 307, 401, 403)
+    assert not legacy.headers.get("location", "").startswith("/admin")
+    assert '<nav class="nav"' not in legacy.text
 
     platform_cookies = _platform_admin_cookies()
     platform = cloud_client.get("/admin-portal", cookies=platform_cookies).text
@@ -248,7 +271,7 @@ def test_backup_creation_no_longer_crashes(cloud_client, tmp_path, monkeypatch):
     (tmp_path / "backups").mkdir()
     monkeypatch.setattr(main, "BACKUP_JOBS_FILE", tmp_path / "backup_jobs.json")
     monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit.jsonl")
-    response = cloud_client.post("/api/backups", json={"label": "admin pass"}, cookies=_legacy_admin_cookies())
+    response = cloud_client.post("/api/backups", json={"label": "admin pass"}, cookies=_cloud_admin_cookies())
     assert response.status_code == 200, response.text[:300]  # was NameError: INVITATIONS_FILE
     assert list((tmp_path / "backups").iterdir()), "no archive was written"
 
@@ -256,7 +279,7 @@ def test_backup_creation_no_longer_crashes(cloud_client, tmp_path, monkeypatch):
 def test_investigation_case_create_and_update_succeed(cloud_client, tmp_path, monkeypatch):
     monkeypatch.setattr(main, "INVESTIGATION_CASES_FILE", tmp_path / "cases.json")
     monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit.jsonl")
-    cookies = _legacy_admin_cookies()
+    cookies = _cloud_admin_cookies()
     created = cloud_client.post("/api/investigation-cases", json={"title": "Break-in review"}, cookies=cookies)
     assert created.status_code == 200, created.text[:300]  # was NameError: append_audit_log after saving
     case_id = created.json()["case"]["id"]
@@ -292,7 +315,7 @@ def test_admin_can_still_edit_legacy_pricing_and_camera_settings(cloud_client, t
     import pricing_portal
     monkeypatch.setattr(pricing_portal, "save_pricing", lambda config: saved.update(config))
     monkeypatch.setattr(main, "ALERT_RULES_FILE", tmp_path / "alert_rules.json")
-    cookies = _legacy_admin_cookies()
+    cookies = _cloud_admin_cookies()
     assert cloud_client.put("/api/pricing-config-legacy", json={"trial_days": 14}, cookies=cookies).status_code == 200
     assert saved.get("trial_days") == 14
     assert cloud_client.put("/api/cameras/1/alert-rule", json={"camera": 1}, cookies=cookies).status_code == 200
@@ -302,7 +325,7 @@ def test_audit_log_filters_match_real_roles_and_namespaced_actions(cloud_client,
     monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit.jsonl")
     for action, role in (("billing.account_updated", "administrator"), ("investigation.case_created", "administrator"), ("view", "viewer")):
         main.append_audit_entry(main.AuditEntryModel(user_id="u", user_name="u", role=role, action=action, resource="r").model_dump(mode="json"))
-    cookies = _legacy_admin_cookies()
+    cookies = _cloud_admin_cookies()
     page = cloud_client.get("/audit-logs", cookies=cookies).text
     assert "<option>administrator</option>" in page
     get = lambda **params: [e["action"] for e in cloud_client.get("/api/audit-logs", params=params, cookies=cookies).json()["entries"] if e["action"] != "view" or params.get("action") == "view"]

@@ -36,7 +36,14 @@ def _cookies(token):
     return {partner_portal.SESSION_COOKIE: token}
 
 
-ADMIN = partner_portal._token("admin@example.test", "administrator")
+def _admin():
+    # 1.2.7.1 D-AUTHZ-2b (CORRECTIVE-1.2.7.1.md): an administrator cookie must name a live, MFA-verified
+    # session bound to the account (u-admin, live global grant, seeded in the fixture's database), so it
+    # is minted per test inside that database rather than once at import as a session-less token.
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie("admin@example.test")
+
+
 P1_OWNER = partner_portal._token("owner@p1.test", "partner_owner", "p1")
 P1_TECH = partner_portal._token("tech@p1.test", "technician", "p1")
 
@@ -60,17 +67,17 @@ def test_unknown_customer_answers_like_a_foreign_one(client):
 
 def test_global_administrator_reaches_every_customer(client):
     for cid in ("cust-a", "cust-b"):
-        assert client.get("/api/aac/people", params={"customer_id": cid}, cookies=_cookies(ADMIN)).status_code == 200
+        assert client.get("/api/aac/people", params={"customer_id": cid}, cookies=_cookies(_admin())).status_code == 200
 
 
 def test_customer_picker_lists_only_reachable_customers(client):
     names = lambda token: sorted(c["id"] for c in client.get("/api/aac/customers", cookies=_cookies(token)).json()["customers"])
-    assert names(ADMIN) == ["cust-a", "cust-b"]
+    assert names(_admin()) == ["cust-a", "cust-b"]
     assert names(P1_OWNER) == ["cust-a"]
     customer = partner_portal._token("c@a.test", "customer_owner", None, "cust-a")
     assert names(customer) == ["cust-a"]
 
 
 def test_staff_pages_offer_the_picker(client):
-    page = client.get("/aac/people", cookies=_cookies(ADMIN)).text
+    page = client.get("/aac/people", cookies=_cookies(_admin())).text
     assert 'list="aac-customer-options"' in page and "/api/aac/customers" in page

@@ -61,15 +61,38 @@ def _login(client, email, portal="administrator"):
 
 
 def _session(email):
-    return {partner_portal.SESSION_COOKIE: partner_portal._token(email, "administrator", None, None, None)}
+    """Linux 1.2.7.1 (D-AUTHZ-2b, S-2): a real session bound to the account's
+    current authorization_version and MFA-verified, as /mfa/verify issues it --
+    a session-less administrator token is refused ('no_session')."""
+    from authz_helpers import partner_session_cookie
+    return {partner_portal.SESSION_COOKIE: partner_session_cookie(email, "administrator")}
 
 
-def _enable_mfa(client, email):
-    cookies = _session(email)
+def _enrollment_session(client, email):
+    """Linux 1.2.7.1 (GREEN-MFA-ACCEPTANCE-SPEC.md L-2(a)): an un-enrolled
+    administrator's password sign-in on the cloud yields only an
+    enrollment-only session, sent to /admin/mfa-setup."""
+    response = _login(client, email)
+    assert response.status_code == 303 and response.headers["location"] == "/admin/mfa-setup"
+    return {partner_portal.SESSION_COOKIE: response.cookies[partner_portal.SESSION_COOKIE]}
+
+
+def _enable_mfa(client, email, cookies=None):
+    # EN-1: enrollment happens from the enrollment-only session the sign-in gave.
+    cookies = cookies or _enrollment_session(client, email)
     secret = client.post("/api/platform-owner/mfa/enroll", cookies=cookies).json()["secret_base32"]
     code = platform_owner._totp_code_at(secret, int(time.time() // 30))
     codes = client.post("/api/platform-owner/mfa/confirm", json={"code": code}, cookies=cookies).json()["recovery_codes"]
     return secret, codes
+
+
+def _mfa_sign_in(client, email, secret):
+    """L-1: password, then the TOTP second step; returns the MFA-verified cookie and where it was sent."""
+    pending = _login(client, email).json()["mfa_pending_token"]
+    code = platform_owner._totp_code_at(secret, int(time.time() // 30))
+    verified = client.post("/api/platform-owner/mfa/verify", json={"mfa_pending_token": pending, "code": code}, follow_redirects=False)
+    assert verified.status_code == 303
+    return {partner_portal.SESSION_COOKIE: verified.cookies[partner_portal.SESSION_COOKIE]}, verified.headers["location"]
 
 
 # ------------------------------------------------------------ cloud login routing
@@ -77,32 +100,62 @@ def _enable_mfa(client, email):
 
 def test_cloud_global_administrator_lands_on_the_admin_portal(cloud_client):
     _seed_admin("platform@anyaicam.test")
+    # Linux 1.2.7.1 (GREEN-MFA-ACCEPTANCE-SPEC.md §2 L-2(a)): an UN-enrolled global
+    # administrator's password sign-in no longer opens /admin-portal; it gets an
+    # enrollment-only session sent to /admin/mfa-setup that cannot reach the portal.
     response = _login(cloud_client, "platform@anyaicam.test")
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin-portal"
-    page = cloud_client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: response.cookies[partner_portal.SESSION_COOKIE]})
+    assert response.headers["location"] == "/admin/mfa-setup"
+    enrollment = {partner_portal.SESSION_COOKIE: response.cookies[partner_portal.SESSION_COOKIE]}
+    blocked = cloud_client.get("/admin-portal", cookies=enrollment, follow_redirects=False)
+    assert "Customer and billing overview" not in blocked.text
+    # After enrolling (EN-1) the global administrator signs in with MFA (L-1/EN-4)
+    # and lands on the Admin Portal.
+    secret, _codes = _enable_mfa(cloud_client, "platform@anyaicam.test", enrollment)
+    cookies, location = _mfa_sign_in(cloud_client, "platform@anyaicam.test", secret)
+    assert location == "/admin-portal"
+    page = cloud_client.get("/admin-portal", cookies=cookies)
     assert page.status_code == 200
     assert "Customer and billing overview" in page.text
 
 
 def test_cloud_partner_scoped_administrator_still_stays_on_the_partner_portal(cloud_client):
     _seed_admin("company-admin@anyaicam.test", scope_type="partner", scope_id="partner-1")
+    # Linux 1.2.7.1 (spec §2 L-2/L-6, §5 S-2: never an administrator session without
+    # MFA on the cloud): every administrator scope signs in through MFA, so the
+    # first password sign-in is enrollment-only (/admin/mfa-setup) ...
     response = _login(cloud_client, "company-admin@anyaicam.test")
     assert response.status_code == 303
-    assert response.headers["location"] == "/partner?tab=customers"
+    assert response.headers["location"] == "/admin/mfa-setup"
+    # ... and after enrolling, the partner-scoped administrator still lands on the
+    # Partner Portal, never /admin-portal.
+    secret, _codes = _enable_mfa(cloud_client, "company-admin@anyaicam.test",
+                                 {partner_portal.SESSION_COOKIE: response.cookies[partner_portal.SESSION_COOKIE]})
+    _cookies, location = _mfa_sign_in(cloud_client, "company-admin@anyaicam.test", secret)
+    assert location == "/partner?tab=customers"
 
 
 def test_cloud_administrator_without_any_grant_stays_on_the_partner_portal(cloud_client):
     _seed_admin("legacy-admin@anyaicam.test", scope_type=None)
+    # Linux 1.2.7.1 (CORRECTIVE-1.2.7.1.md "Fix scope widened", coordinator 2026-10-24
+    # Green Z8d'): on the cloud an administrator with no live grant is refused at
+    # sign-in (generic credential error, no session) instead of reaching /partner.
     response = _login(cloud_client, "legacy-admin@anyaicam.test")
-    assert response.headers["location"] == "/partner?tab=customers"
+    assert response.status_code == 401
+    assert partner_portal.SESSION_COOKIE not in response.cookies
+    assert "location" not in response.headers
 
 
 def test_revoked_global_grant_no_longer_routes_to_the_admin_portal(cloud_client):
     user_id = _seed_admin("revoked@anyaicam.test")
     with connection() as db:
         db.execute("UPDATE identity_grants SET revoked_at=? WHERE user_id=?", ("2026-09-26T01:00:00", user_id))
-    assert _login(cloud_client, "revoked@anyaicam.test").headers["location"] == "/partner?tab=customers"
+    # Linux 1.2.7.1 (CORRECTIVE-1.2.7.1.md "a revoked admin is refused at login as
+    # administrator"): no session at all, rather than a Partner Portal one.
+    response = _login(cloud_client, "revoked@anyaicam.test")
+    assert response.status_code == 401
+    assert partner_portal.SESSION_COOKIE not in response.cookies
+    assert "location" not in response.headers
 
 
 def test_wrong_password_is_still_rejected(cloud_client):
@@ -163,23 +216,52 @@ def test_recovery_code_signs_in_once(cloud_client):
 
 def test_mfa_status_reports_state_without_secrets(cloud_client):
     _seed_admin("platform@anyaicam.test")
-    cookies = _session("platform@anyaicam.test")
-    assert cloud_client.get("/api/platform-owner/mfa/status", cookies=cookies).json() == {"mfa_enabled": False, "recovery_codes_remaining": 0}
-    _enable_mfa(cloud_client, "platform@anyaicam.test")
+    # Linux 1.2.7.1: before enrolling, the only session the cloud gives is the
+    # enrollment-only one (spec L-2(a)); /mfa/status now also names the session
+    # kind ("enrollment_only" / "full", platform_owner.py:475-476) so the setup page
+    # can tell them apart. Still no secret and no code in the response.
+    enrollment = _enrollment_session(cloud_client, "platform@anyaicam.test")
+    before = cloud_client.get("/api/platform-owner/mfa/status", cookies=enrollment).json()
+    assert before == {"mfa_enabled": False, "recovery_codes_remaining": 0, "session": "enrollment_only"}
+    secret, _codes = _enable_mfa(cloud_client, "platform@anyaicam.test", enrollment)
+    cookies, _location = _mfa_sign_in(cloud_client, "platform@anyaicam.test", secret)
     status = cloud_client.get("/api/platform-owner/mfa/status", cookies=cookies).json()
-    assert status == {"mfa_enabled": True, "recovery_codes_remaining": 10}
+    assert status == {"mfa_enabled": True, "recovery_codes_remaining": 10, "session": "full"}
+    assert secret not in str(status) and secret not in str(before)
 
 
-def test_mfa_status_refuses_non_platform_sessions(cloud_client):
+def test_a_partner_scoped_administrator_can_enroll_mfa_but_gains_no_global_reach(cloud_client):
+    """Owner 2026-10-28 (EN-1 updated): partner-scoped administrators may enroll MFA. Enrolling must not widen what
+    they can reach: still no Admin Portal and no administrator API."""
+    from authz_helpers import admin_route_matrix, refused, table_snapshot
     _seed_admin("company-admin@anyaicam.test", scope_type="partner", scope_id="partner-1")
     assert cloud_client.get("/api/platform-owner/mfa/status").status_code == 401  # no session at all
-    assert cloud_client.get("/api/platform-owner/mfa/status", cookies=_session("company-admin@anyaicam.test")).status_code == 403
+    _enable_mfa(cloud_client, "company-admin@anyaicam.test")  # through the real enrollment-only sign-in session
+    verified = _session("company-admin@anyaicam.test")
+    status = cloud_client.get("/api/platform-owner/mfa/status", cookies=verified)
+    assert status.status_code == 200 and status.json()["mfa_enabled"] is True
+    assert refused(cloud_client.get("/admin-portal", cookies=verified, follow_redirects=False))
+    # Codex review 50f614eb note 5: every method of every administrator route, not only GET, and nothing written.
+    matrix = admin_route_matrix(include_enrollment=False)
+    assert {method for method, _path in matrix} >= {"GET", "POST"}
+    before = table_snapshot()
+    allowed = []
+    for method, path in matrix:
+        response = cloud_client.request(method, path, cookies=verified, follow_redirects=False,
+                                        json=None if method == "GET" else {"camera_quota": 1})
+        if not refused(response):
+            allowed.append((method, path, response.status_code))
+    assert allowed == [], allowed
+    assert table_snapshot() == before
 
 
 def test_admin_portal_renders_the_sign_in_security_card(cloud_client):
     _seed_admin("platform@anyaicam.test")
-    session = _login(cloud_client, "platform@anyaicam.test").cookies[partner_portal.SESSION_COOKIE]
-    page = cloud_client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session}).text
+    # Linux 1.2.7.1 (spec L-1/L-2): /admin-portal needs an MFA-verified session, so
+    # the administrator enrolls and signs in with the second step first.
+    secret, _codes = _enable_mfa(cloud_client, "platform@anyaicam.test")
+    cookies, _location = _mfa_sign_in(cloud_client, "platform@anyaicam.test", secret)
+    page = cloud_client.get("/admin-portal", cookies=cookies).text
     assert 'id="admin-signin-security"' in page
     for route in ("/api/platform-owner/mfa/status", "/api/platform-owner/mfa/enroll", "/api/platform-owner/mfa/confirm", "/api/platform-owner/recovery-codes/regenerate"):
         assert route in page
