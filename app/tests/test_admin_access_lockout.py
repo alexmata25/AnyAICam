@@ -99,44 +99,6 @@ def _all_audit_text(db_path):
 # ------------------------------------------------------------------ login + lockout
 
 
-def test_admin_login_success_and_wrong_password_failure(client, db_path):
-    _seed_admin(db_path)
-    assert _login(client).status_code in (200, 303)
-    wrong = _login(client, password="not-the-password-000")
-    assert wrong.status_code == 403 and "incorrect" in wrong.json()["detail"]
-
-
-def test_lockout_blocks_even_the_right_password_but_only_for_a_bounded_window(client, db_path, monkeypatch):
-    _seed_admin(db_path)
-    monkeypatch.setattr(cloud_security, "settings", dataclasses.replace(cloud_security.settings, login_attempt_limit=3))
-    for _ in range(3):
-        _login(client, password="wrong-password-000")
-    assert _login(client).status_code == 429  # locked: correct password refused too
-    with override_target(sqlite_path=str(db_path)):
-        with connection() as db:  # the window elapses
-            db.execute("UPDATE account_lockouts SET locked_until=? WHERE email=?", ((datetime.now() - timedelta(seconds=1)).isoformat(), ADMIN_EMAIL))
-    assert _login(client).status_code in (200, 303)
-
-
-def test_a_password_reset_recovers_a_locked_out_admin_immediately(client, db_path, monkeypatch):
-    _seed_admin(db_path)
-    monkeypatch.setattr(cloud_security, "settings", dataclasses.replace(cloud_security.settings, login_attempt_limit=2))
-    for _ in range(2):
-        _login(client, password="wrong-password-000")
-    assert _login(client).status_code == 429
-    capturing = _CapturingEmailService()
-    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
-    client.post("/api/password-reset/request", json={"email": ADMIN_EMAIL})
-    token = capturing.sent[0]["text"].split("token=")[1].split()[0]
-    assert client.post("/api/password-reset/complete", json={"token": token, "password": "recovered-admin-pass-2"}).status_code == 200
-    assert _login(client, password="recovered-admin-pass-2").status_code in (200, 303)  # lockout cleared by the reset
-    # A reset token is single-use; an unknown one is refused the same way.
-    for bad in (token, "abc.def", ""):
-        refused = client.post("/api/password-reset/complete", json={"token": bad, "password": "another-password-345"})
-        assert refused.status_code == 400
-    assert verify_password("recovered-admin-pass-2", _stored_hash(db_path))
-
-
 def test_break_glass_recovers_the_owner_even_while_the_account_is_locked_out(client, db_path, monkeypatch):
     _seed_admin(db_path)
     monkeypatch.setattr(cloud_security, "settings", dataclasses.replace(cloud_security.settings, login_attempt_limit=2))
@@ -153,36 +115,6 @@ def test_break_glass_recovers_the_owner_even_while_the_account_is_locked_out(cli
 # ------------------------------------------------------------------ password change
 
 
-def test_a_forced_first_password_change_does_not_need_the_temporary_password(client, db_path):
-    _seed_admin(db_path, password="temporary-issued-pass-9", must_change=1)
-    _login(client, password="temporary-issued-pass-9")
-    response = client.post("/api/partner/activate-account", json={"password": "my-own-new-password-1", "accept_terms": True})
-    assert response.status_code == 200
-    assert verify_password("my-own-new-password-1", _stored_hash(db_path))
-
-
-def test_a_voluntary_change_requires_the_current_password(client, db_path):
-    _seed_admin(db_path)
-    _login(client)
-    before = _stored_hash(db_path)
-    for attempt in ({}, {"current_password": "not-my-password-00"}):
-        refused = client.post("/api/partner/activate-account", json={"password": "hijacker-password-99", "accept_terms": True, **attempt})
-        assert refused.status_code == 403
-    assert _stored_hash(db_path) == before  # a signed-in session alone cannot take the account over
-    ok = client.post("/api/partner/activate-account", json={"password": "rotated-admin-pass-77", "current_password": ADMIN_PASSWORD, "accept_terms": True})
-    assert ok.status_code == 200 and verify_password("rotated-admin-pass-77", _stored_hash(db_path))
-    text = _all_audit_text(db_path)
-    assert "password.change_denied" in text
-    for secret in (ADMIN_PASSWORD, "hijacker-password-99", "not-my-password-00", "rotated-admin-pass-77"):
-        assert secret not in text
-
-
-def test_the_change_password_page_asks_for_the_current_password_only_when_not_forced(client, db_path):
-    _seed_admin(db_path)
-    _login(client)
-    assert 'id="current-password"' in client.get("/change-password").text
-
-
 # ------------------------------------------------------------------ never permanently locked out
 
 
@@ -191,26 +123,6 @@ def _local_admin_session(role="administrator"):
     # global administrator, 2026-10-02 -- identity grants require one).
     main.save_users([{"id": "admin-1", "email": ADMIN_EMAIL, "role": role, "enabled": True, "camera_ids": []}])
     return main.create_session("admin-1")
-
-
-def test_the_last_platform_administrator_grant_cannot_be_revoked(client, db_path):
-    grant_id = _seed_admin(db_path)
-    token = _local_admin_session()
-    refused = client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: token})
-    assert refused.status_code == 409 and "last active platform administrator" in refused.json()["detail"]
-    _seed_admin(db_path, user_id="u-second", email="second-admin@anyaicam.test")
-    allowed = client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: token})
-    assert allowed.status_code == 200 and allowed.json()["status"] == "revoked"
-
-
-def test_a_suspended_admin_does_not_count_as_the_remaining_administrator(client, db_path):
-    grant_id = _seed_admin(db_path)
-    _seed_admin(db_path, user_id="u-second", email="second-admin@anyaicam.test")
-    with override_target(sqlite_path=str(db_path)):
-        with connection() as db:
-            db.execute("UPDATE partner_users SET account_status='suspended' WHERE id='u-second'")
-    token = _local_admin_session()
-    assert client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: token}).status_code == 409
 
 
 def _manager_and_plain_roles():
@@ -252,13 +164,6 @@ def test_the_local_user_api_refuses_to_remove_the_last_user_manager(client):
 # ------------------------------------------------------------------ existing-user compatibility
 
 
-def test_an_existing_hash_with_older_parameters_still_logs_in(client, db_path):
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", ADMIN_PASSWORD.encode(), salt, 100000)
-    _seed_admin(db_path, encoded=f"pbkdf2_sha256$100000${salt.hex()}${digest.hex()}")
-    assert _login(client).status_code in (200, 303)
-
-
 def test_a_reset_link_issued_in_the_older_bare_token_format_still_works(client, db_path):
     _seed_admin(db_path)
     raw = secrets.token_urlsafe(32)
@@ -271,3 +176,172 @@ def test_a_reset_link_issued_in_the_older_bare_token_format_still_works(client, 
             )
     assert client.post("/api/password-reset/complete", json={"token": raw, "password": "legacy-link-password-1"}).status_code == 200
     assert raw not in _all_audit_text(db_path)
+
+
+# ------------------------------------------------------------------ Windows 1.3.4.1 (13415ef): administrator sign-in is MFA-only
+# 13415ef refuses administrators at /api/partner-login on every profile and requires an MFA-verified global-admin
+# session for identity grants. The 9 cases below replace the earlier partner-login / legacy-session versions of the
+# same properties (R-1, Blue 910a1db, Codex PASS-WITH-NOTES); the 4 cases above are unchanged.
+from authz_helpers import (cookies_for, enroll_confirmed_mfa, isolated_app, make_partner_user, partner_cookie_from,  # noqa: E402
+                           partner_session_cookie, session_row, totp_now)
+
+MFA_ADMIN = "owner@anyaicam.test"
+MFA_PASSWORD = "original-admin-password-1"
+
+
+@pytest.fixture()
+def mfa_edge(tmp_path, monkeypatch):
+    cloud_features._password_reset_email_limiter.events.clear()
+    cloud_features._password_reset_ip_limiter.events.clear()
+    cloud_features._password_reset_complete_ip_limiter.events.clear()
+    with isolated_app(tmp_path, monkeypatch, cloud=False) as client:
+        yield client
+
+
+def _mfa_admin(password=MFA_PASSWORD, must_change=0):
+    uid = make_partner_user(MFA_ADMIN, "administrator", global_admin=True, password=password)
+    if must_change:
+        with connection() as db:
+            db.execute("UPDATE partner_users SET must_change_password=1 WHERE id=?", (uid,))
+    return uid
+
+
+def _mfa_portal_login(client, password=MFA_PASSWORD):
+    return client.post("/api/portal-login", json={"email": MFA_ADMIN, "password": password, "portal": "administrator"})
+
+
+def _mfa_password_accepted(response) -> bool:
+    """The password was right: an MFA challenge (200 mfa_required) or an enrollment-only session (303)."""
+    if response.status_code == 200:
+        return response.json().get("status") == "mfa_required"
+    return response.status_code == 303
+
+
+def _mfa_hash(uid):
+    with connection() as db:
+        return db.execute("SELECT password_hash FROM partner_users WHERE id=?", (uid,)).fetchone()["password_hash"]
+
+
+def _mfa_verified_session(email=MFA_ADMIN):
+    return cookies_for(partner_session_cookie(email, "administrator", mfa_state="verified", auth_source="mfa"))
+
+
+def _mfa_global_grant_id(uid):
+    with connection() as db:
+        return db.execute("SELECT id FROM identity_grants WHERE user_id=? AND scope_type='global' AND revoked_at IS NULL", (uid,)).fetchone()["id"]
+
+
+# ------------------------------------------------------------------ login + lockout (was 3 tests)
+
+
+def test_admin_portal_login_accepts_the_right_password_and_refuses_a_wrong_one(mfa_edge):
+    _mfa_admin()
+    assert _mfa_password_accepted(_mfa_portal_login(mfa_edge))
+    assert _mfa_portal_login(mfa_edge, password="not-the-password-000").status_code in (401, 403)
+
+
+def test_lockout_blocks_even_the_right_password_but_only_for_a_bounded_window(mfa_edge, monkeypatch):
+    _mfa_admin()
+    monkeypatch.setattr(cloud_security, "settings", dataclasses.replace(cloud_security.settings, login_attempt_limit=3))
+    for _ in range(3):
+        _mfa_portal_login(mfa_edge, password="wrong-password-000")
+    assert _mfa_portal_login(mfa_edge).status_code == 429
+    with connection() as db:
+        db.execute("UPDATE account_lockouts SET locked_until=? WHERE email=?", ((datetime.now() - timedelta(seconds=1)).isoformat(), MFA_ADMIN))
+    assert _mfa_password_accepted(_mfa_portal_login(mfa_edge))
+
+
+def test_a_password_reset_recovers_a_locked_out_admin_immediately(mfa_edge, monkeypatch):
+    uid = _mfa_admin()
+    monkeypatch.setattr(cloud_security, "settings", dataclasses.replace(cloud_security.settings, login_attempt_limit=2))
+    for _ in range(2):
+        _mfa_portal_login(mfa_edge, password="wrong-password-000")
+    assert _mfa_portal_login(mfa_edge).status_code == 429
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    mfa_edge.post("/api/password-reset/request", json={"email": MFA_ADMIN})
+    assert capturing.sent, "no reset email was sent"
+    token = capturing.sent[0]["text"].split("token=")[1].split()[0]
+    assert mfa_edge.post("/api/password-reset/complete", json={"token": token, "password": "recovered-admin-pass-2"}).status_code == 200
+    assert _mfa_password_accepted(_mfa_portal_login(mfa_edge, password="recovered-admin-pass-2"))  # lockout cleared by the reset
+    for bad in (token, "abc.def", ""):
+        assert mfa_edge.post("/api/password-reset/complete", json={"token": bad, "password": "another-password-345"}).status_code == 400
+    assert verify_password("recovered-admin-pass-2", _mfa_hash(uid))
+
+
+# ------------------------------------------------------------------ password change (was 3 tests)
+
+
+def test_a_forced_first_password_change_works_through_mfa_enrollment_without_the_temporary_password(mfa_edge):
+    uid = _mfa_admin(password="temporary-issued-pass-9", must_change=1)
+    first = _mfa_portal_login(mfa_edge, password="temporary-issued-pass-9")
+    assert first.status_code == 303, first.text[:200]
+    enrollment = partner_cookie_from(first)
+    assert session_row(enrollment)["mfa_state"] == "enrollment_only"
+    # An enrollment-only session cannot change the password yet.
+    assert mfa_edge.post("/api/partner/activate-account", json={"password": "my-own-new-password-1", "accept_terms": True},
+                     cookies=cookies_for(enrollment)).status_code in (401, 403)
+    started = mfa_edge.post("/api/platform-owner/mfa/enroll", json={}, cookies=cookies_for(enrollment))
+    assert started.status_code == 200, started.text[:200]
+    secret = started.json()["secret_base32"]
+    assert mfa_edge.post("/api/platform-owner/mfa/confirm", json={"code": totp_now(secret)}, cookies=cookies_for(enrollment)).status_code == 200
+    challenge = _mfa_portal_login(mfa_edge, password="temporary-issued-pass-9")
+    assert challenge.status_code == 200 and challenge.json()["status"] == "mfa_required", challenge.text[:200]
+    verified = mfa_edge.post("/api/platform-owner/mfa/verify", json={"mfa_pending_token": challenge.json()["mfa_pending_token"], "code": totp_now(secret)})
+    assert verified.status_code == 303, verified.text[:200]
+    token = partner_cookie_from(verified)
+    assert session_row(token)["mfa_state"] == "verified"
+    changed = mfa_edge.post("/api/partner/activate-account", json={"password": "my-own-new-password-1", "accept_terms": True}, cookies=cookies_for(token))
+    assert changed.status_code == 200, changed.text[:200]
+    assert verify_password("my-own-new-password-1", _mfa_hash(uid))
+
+
+def test_a_voluntary_change_requires_the_current_password(mfa_edge):
+    uid = _mfa_admin()
+    cookies = _mfa_verified_session()
+    before = _mfa_hash(uid)
+    for attempt in ({}, {"current_password": "not-my-password-00"}):
+        refused = mfa_edge.post("/api/partner/activate-account", json={"password": "hijacker-password-99", "accept_terms": True, **attempt}, cookies=cookies)
+        assert refused.status_code == 403
+    assert _mfa_hash(uid) == before
+    ok = mfa_edge.post("/api/partner/activate-account", json={"password": "rotated-admin-pass-77", "current_password": MFA_PASSWORD, "accept_terms": True}, cookies=cookies)
+    assert ok.status_code == 200 and verify_password("rotated-admin-pass-77", _mfa_hash(uid))
+
+
+def test_the_change_password_page_asks_for_the_current_password_when_not_forced(mfa_edge):
+    _mfa_admin()
+    page = mfa_edge.get("/change-password", cookies=_mfa_verified_session())
+    assert page.status_code == 200 and 'id="current-password"' in page.text
+
+
+# ------------------------------------------------------------------ never permanently locked out (was 2 tests)
+
+
+def test_the_last_platform_administrator_grant_cannot_be_revoked(mfa_edge):
+    uid = _mfa_admin()
+    grant_id = _mfa_global_grant_id(uid)
+    refused = mfa_edge.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies=_mfa_verified_session())
+    assert refused.status_code == 409 and "last active platform administrator" in refused.json()["detail"]
+    make_partner_user("second-admin@anyaicam.test", "administrator", global_admin=True, password=MFA_PASSWORD)
+    allowed = mfa_edge.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies=_mfa_verified_session())
+    assert allowed.status_code == 200 and allowed.json()["status"] == "revoked"
+
+
+def test_a_suspended_admin_does_not_count_as_the_remaining_administrator(mfa_edge):
+    uid = _mfa_admin()
+    second = make_partner_user("second-admin@anyaicam.test", "administrator", global_admin=True, password=MFA_PASSWORD)
+    with connection() as db:
+        db.execute("UPDATE partner_users SET account_status='suspended' WHERE id=?", (second,))
+    assert mfa_edge.post(f"/api/operations/identity-grants/{_mfa_global_grant_id(uid)}/revoke", cookies=_mfa_verified_session()).status_code == 409
+
+
+# ------------------------------------------------------------------ existing-user compatibility (was 1 test)
+
+
+def test_an_existing_hash_with_older_parameters_still_logs_in(mfa_edge):
+    uid = _mfa_admin()
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", MFA_PASSWORD.encode(), salt, 100000)
+    with connection() as db:
+        db.execute("UPDATE partner_users SET password_hash=? WHERE id=?", (f"pbkdf2_sha256$100000${salt.hex()}${digest.hex()}", uid))
+    assert _mfa_password_accepted(_mfa_portal_login(mfa_edge))

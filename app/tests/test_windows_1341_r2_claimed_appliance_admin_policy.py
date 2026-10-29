@@ -147,3 +147,38 @@ def test_a_refused_cloud_admin_sign_in_changes_no_appliance_camera_or_recording_
     assert table_snapshot() == before  # cameras, appliances, recording settings and grants untouched
     after = sorted(p.name for p in main.RECORDINGS_FOLDER.glob("*")) if main.RECORDINGS_FOLDER.exists() else []
     assert after == recordings
+
+
+# ------------------------------------------------------------------ Codex PASS-WITH-NOTES follow-ups (2026-10-29)
+
+
+def test_the_first_refused_sign_in_changes_only_the_dev_cloud_signing_key(claimed):
+    # Codex note: assess the FIRST refusal separately. The only permitted change is the v1/dev combined cloud
+    # backend creating its manifest-signing key (identity_signing_keys) on first use; nothing appliance-, camera-,
+    # grant-, session- or recording-related may change.
+    _cloud_admin("global", enrolled=True)
+    before = table_snapshot()
+    assert _admin_login(claimed).status_code == 403
+    after = table_snapshot()
+    changed = sorted(table for table in set(before) | set(after) if before.get(table) != after.get(table))
+    assert changed in ([], ["identity_signing_keys"]), changed
+
+
+def test_the_emergency_login_session_has_no_identity_grant_authority(claimed, tmp_path, monkeypatch):
+    # D-1 / Codex note: the local emergency /login reaches the Admin Portal for recovery, but it never acquires
+    # persistent-grant authority -- it can neither list, create nor revoke identity grants.
+    monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit_log.jsonl")
+    uid = _cloud_admin("global")
+    with connection() as db:
+        grant_id = db.execute("SELECT id FROM identity_grants WHERE user_id=?", (uid,)).fetchone()["id"]
+    main.save_users([{"id": "local-owner", "display_name": "Local owner", "email": "owner@local.test", "role": "administrator",
+                      "enabled": True, "password_hash": main.hash_password("Local-Owner-Pass-1"), "site_ids": ["home"], "camera_ids": []}])
+    login = claimed.post("/login", data={"email": "owner@local.test", "password": "Local-Owner-Pass-1", "next_url": "/"}, follow_redirects=False)
+    cookies = {main.SESSION_COOKIE_NAME: login.cookies.get(main.SESSION_COOKIE_NAME)}
+    before = table_snapshot()
+    assert claimed.get("/api/operations/identity-grants", cookies=cookies).status_code in (401, 403)
+    created = claimed.post("/api/operations/identity-grants", cookies=cookies,
+                           json={"email": "owner@local.test", "role": "administrator", "scope_type": "global"})
+    assert created.status_code in (401, 403)
+    assert claimed.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies=cookies).status_code in (401, 403)
+    assert table_snapshot() == before
