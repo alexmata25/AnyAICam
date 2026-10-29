@@ -71,8 +71,8 @@ propcache==0.5.4
 proto-plus==1.29.0
 protobuf==7.36.2
 psutil==7.2.2
-psycopg-binary==3.2.3
-psycopg==3.2.3
+# psycopg / psycopg-binary 3.2.3 (LGPL-3.0) are intentionally NOT shipped on Windows: the edge runs SQLite only
+# (cloud_config.database_backend defaults to sqlite; the installer never selects PostgreSQL). See DEPENDENCIES.md.
 py-cpuinfo==9.0.0
 py-vapid==1.9.2
 pyasn1==0.6.4

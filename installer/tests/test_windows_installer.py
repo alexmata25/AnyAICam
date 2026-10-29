@@ -166,11 +166,38 @@ class PinTests(unittest.TestCase):
         for name, digest in pinned.items():
             self.assertIn(digest, deps, name)
 
+    # 1.3.4.1: the ONLY Linux pins deliberately not shipped on Windows (see DEPENDENCIES.md "Excluded on Windows").
+    WINDOWS_EXCLUDED = {"psycopg"}  # LGPL-3.0 PostgreSQL client; the Windows edge is SQLite-only
+
     def test_windows_packages_match_the_linux_image_pins(self):
         windows = pins(WIN / "requirements-windows.txt")
+        seen_excluded = set()
         for source in ("requirements.txt", "requirements-cpu.txt", "requirements-push.txt"):
             for name, version in pins(ROOT / source).items():
+                if name in self.WINDOWS_EXCLUDED:
+                    seen_excluded.add(name)
+                    self.assertNotIn(name, windows, f"{source}: {name} is excluded on Windows")
+                    continue
                 self.assertEqual(windows.get(name), version, f"{source}: {name}")
+        # The exclusion list may not silently grow or go stale: every entry must still be a real Linux pin.
+        self.assertEqual(seen_excluded, self.WINDOWS_EXCLUDED)
+
+    def test_postgresql_client_is_not_shipped_and_windows_stays_sqlite_only(self):
+        windows = pins(WIN / "requirements-windows.txt")
+        self.assertNotIn("psycopg", windows)
+        self.assertNotIn("psycopg-binary", windows)
+        self.assertNotIn("psycopg", read("wheels.lock.sha256").lower())
+        # Guard: nothing in the Windows installer may select PostgreSQL, and the app default must stay SQLite.
+        for name in ("AnyAiCam-VMS.iss", "build.ps1"):
+            text = read(name).lower()
+            self.assertNotIn("anyaicam_database_backend", text, name)
+            self.assertNotIn("postgres", text, name)
+        config = (ROOT / "app" / "cloud_config.py").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("ANYAICAM_DATABASE_BACKEND", "sqlite")', config)
+        backend = (ROOT / "app" / "database_backend.py").read_text(encoding="utf-8")
+        self.assertIn("Install psycopg[binary] to use PostgreSQL.", backend)  # fails closed, never crashes at import
+        # imported lazily inside the PostgreSQL branch only, never at module level
+        self.assertFalse(any(line.startswith(("import psycopg", "from psycopg")) for line in backend.splitlines()))
 
     def test_wheel_lock_covers_every_package(self):
         lock = read("wheels.lock.sha256").splitlines()

@@ -20,3 +20,11 @@ Setup order: Visual C++ runtime (exit 0, 1638 already installed, or 3010 restart
 `pytesseract` remains installed because the LPR module imports it, but the external OCR engine is called only when LPR analysis runs. Its absence does not block core VMS startup, camera recording, HLS, or playback.
 
 The build-time keyset validator can use the verified per-user CPython 3.12.10 explicitly with `build.ps1 -PythonExe <absolute-path-to-python.exe>`. This avoids relying on a system Python Launcher registration. The build script verifies that the selected executable reports exactly Python 3.12.10 before it validates the public entitlement keyset.
+
+## Excluded on Windows (1.3.4.1)
+
+| Package | Licence | Why excluded | Effect |
+|---|---|---|---|
+| `psycopg` / `psycopg-binary` 3.2.3 (pinned on Linux as `psycopg[binary]==3.2.3`) | LGPL-3.0 | The Windows edge is SQLite-only: `cloud_config.database_backend` defaults to `sqlite`, the installer never sets `ANYAICAM_DATABASE_BACKEND`/`ANYAICAM_DATABASE_URL`, and `psycopg` is imported only inside `database_backend.py`'s PostgreSQL branch. No other wheel requires it. | None at runtime; selecting PostgreSQL on Windows fails closed with `Install psycopg[binary] to use PostgreSQL.` Removes the LGPL psycopg item from the Windows distribution. |
+
+Not excluded: `libiconv` 1.18 (LGPL-2.1) inside the Tesseract bundle -- `tesseract.exe` imports `archive.dll`, which imports `iconv.dll` + `charset.dll`; removing them would stop LPR. It can only go with the minimal Tesseract rebuild (`-DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON`).
