@@ -37,10 +37,11 @@ UNVERIFIED_STATES = [None, "enrollment_only", "reenroll_required"]
 
 
 def _expected_refusal(mfa_state, *, cloud: bool) -> int:
-    """403 = a full administrator session that reached the route without MFA (the
-    corrected rule). 401 = main.app's authentication middleware already found no
-    full identity: an MFA (re-)enrollment-only session, a session-less token, or
-    (cloud, D-AUTHZ-2b) an unmarked session revoked on sight."""
+    """Unverified, enrollment-only, and re-enrollment sessions receive a
+    permission denial. An unmarked cloud session is invalidated before route
+    dispatch, so its API response remains the middleware's authentication 401."""
+    if mfa_state in {"enrollment_only", "reenroll_required"}:
+        return 403
     return 403 if mfa_state is None and not cloud else 401
 
 # (method, path, json body) -- one request per administrator-only route family.
@@ -187,10 +188,12 @@ def test_edge_admin_only_refusal_is_audited_and_does_not_revoke_the_session(edge
     make_partner_user(OWNER, "administrator", global_admin=True)
     token = partner_session_cookie(OWNER, "administrator", mfa_state=None)
     assert _people_counting(edge, token).status_code == 403
-    assert _mfa_denials() == 1
+    assert _mfa_denials() == 0  # the edge middleware now blocks before the route guard
+    import json
+    assert any(action == "access.denied" and json.loads(details or "{}").get("reason") == "admin_bridge_mfa_or_grant_required"
+               for _, action, details, _ in audit_actions())
     assert session_row(token)["revoked_at"] is None
-    # Linux E-2 is unchanged: the edge Admin Portal itself still opens for it.
-    assert edge.get("/admin-portal", cookies=cookies_for(token)).status_code == 200
+    assert edge.get("/admin-portal", cookies=cookies_for(token)).status_code == 403
 
 
 def test_edge_mfa_verified_admin_keeps_neighbouring_routes(edge):

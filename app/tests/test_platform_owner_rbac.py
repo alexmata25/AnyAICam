@@ -34,21 +34,11 @@ def _owner_session():
 def http_client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")
     monkeypatch.setattr(main, "SESSIONS_FILE", tmp_path / "sessions.json")
-    # The scope_type='global' -> /admin-portal routing this module's MFA
-    # hook depends on is ONLY evaluated on the cloud-delegated-appliance
-    # login path (own_appliance_identity() truthy) -- resolve_portal_
-    # login() never even looks at identity_grants on the direct
-    # partner_db path, by design (see main.py's own portal_login_
-    # submit() docstring). So, like test_cloud_administrator_bridge.py's
-    # own fixture, this instance must be configured as an activated
-    # appliance for these tests to exercise the real routing at all --
-    # env vars "win outright" over any stray persisted appliance_
-    # identity.json left on this machine from unrelated testing (see
-    # own_appliance_identity()'s own docstring), so this also
-    # neutralizes that same cross-test-file contamination risk.
-    monkeypatch.setenv("ANYAICAM_APPLIANCE_ID", "appl-platform-owner")
-    monkeypatch.setenv("ANYAICAM_APPLIANCE_CLOUD_ID", "AIC-PLATFORM-OWNER")
-    monkeypatch.setenv("ANYAICAM_APPLIANCE_CREDENTIAL", "platform-owner-credential")
+    # Exercise the local partner_users authentication path. Delegated edge
+    # assertions are tested separately and must fail closed without an
+    # authoritative IdP MFA signal.
+    for key in ("ANYAICAM_APPLIANCE_ID", "ANYAICAM_APPLIANCE_CLOUD_ID", "ANYAICAM_APPLIANCE_CREDENTIAL"):
+        monkeypatch.delenv(key, raising=False)
     db_path = tmp_path / "test_platform_owner.db"
     with override_target(sqlite_path=db_path):
         initialize_database()
@@ -57,8 +47,6 @@ def http_client(tmp_path, monkeypatch):
             db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-1", "Partner", "approved", "real", now))
             db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,company,email,status,trial_status,source,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("cust-1", "partner-1", "Customer", "", "cust1@example.test", "active", "eligible", "real", now))
             db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", ("site-1", "cust-1", "Site", now))
-            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,partner_id,created_at) VALUES(?,?,?,?,?,?)", ("appl-platform-owner", "cust-1", "site-1", "AIC-PLATFORM-OWNER", "partner-1", now))
-            db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", ("cred-platform-owner", "appl-platform-owner", password_hash("platform-owner-credential"), now))
         appliance_identity.reset_cloud_identity_backend_for_tests()
         with TestClient(main.app) as test_client:
             yield test_client, db_path
@@ -79,27 +67,28 @@ def _seed_second_global_admin(db_path):
             create_grant(db, user_id="u-backup-admin", role="administrator", scope_type="global", scope_id=None, granted_by="test", now=now)
 
 
-def _seed_operator(db_path, email="amata@anyaicam.com", partner_id="partner-1"):
+def _seed_operator(db_path, email="amata@anyaicam.com", partner_id="partner-1", role="administrator"):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             now = "2026-09-23T00:00:00"
             db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", (partner_id, "Partner", "approved", "real", now))
-            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)", (f"u-{email}", partner_id, email, "Operator", "administrator", password_hash("x"), 1, now))
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)", (f"u-{email}", partner_id, email, "Operator", role, password_hash("x"), 1, now))
     return f"u-{email}"
 
 
 def _admin_session():
-    main.save_users([{"id": "admin-1", "email": "admin@local", "role": "administrator", "enabled": True, "camera_ids": []}])
-    from global_admin_helper import make_live_global_admin
-    make_live_global_admin("admin@local")  # identity grants require a live global administrator (2026-10-02)
-    return main.create_session("admin-1")
+    from authz_helpers import enroll_confirmed_mfa, make_partner_user, partner_session_cookie
+    user_id = make_partner_user("admin@local", "administrator", partner_id=None, global_admin=True)
+    enroll_confirmed_mfa(user_id)
+    return partner_session_cookie("admin@local", "administrator", mfa_state="verified", auth_source="mfa")
 
 
 def _grant(db_path, admin_token, client, *, email, role, scope_type, scope_id=None):
     payload = {"email": email, "role": role, "scope_type": scope_type}
     if scope_id:
         payload["scope_id"] = scope_id
-    response = client.post("/api/operations/identity-grants", json=payload, cookies={main.SESSION_COOKIE_NAME: admin_token})
+    from authz_helpers import cookies_for
+    response = client.post("/api/operations/identity-grants", json=payload, cookies=cookies_for(admin_token))
     assert response.status_code == 200, response.text
     return response.json()["grant_id"]
 
@@ -353,10 +342,9 @@ def _enroll_and_confirm_mfa(client, db_path, session_cookie):
 # ------------------------------------------------------------ login-time MFA gate
 
 
-def test_login_without_mfa_confirmed_establishes_session_directly_unaffected(http_client):
-    """The whole point: an account with NO MFA enrolled logs in exactly
-    as before this module existed -- proves the hook is inert until
-    MFA is actually confirmed."""
+def test_login_without_mfa_confirmed_gets_only_an_enrollment_session(http_client):
+    """A global administrator without a confirmed factor can enroll but
+    cannot receive a full administrator session."""
     client, db_path = http_client
     _seed_operator(db_path)
     admin_token = _admin_session()
@@ -364,7 +352,9 @@ def test_login_without_mfa_confirmed_establishes_session_directly_unaffected(htt
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
     assert login.status_code == 303
-    assert login.headers["location"] == "/admin-portal"
+    assert login.headers["location"] == "/admin/mfa-setup"
+    token = login.cookies[partner_portal.SESSION_COOKIE]
+    assert client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: token}).status_code == 403
 
 
 def test_login_with_mfa_confirmed_requires_a_second_step(http_client):
@@ -475,19 +465,23 @@ def test_pending_mfa_login_single_use_holds_under_real_concurrent_completion(htt
     assert sorted(outcomes) == [False, True]
 
 
-def test_mfa_gate_never_applies_to_a_partner_scoped_administrator(http_client):
-    """The hook's own scoping condition: destination must be exactly
-    /admin-portal (a live global grant) -- a partner-scoped
-    administrator (or any other role) is never routed through it, MFA
-    enrolled or not."""
+def test_partner_scoped_administrator_never_becomes_global_through_delegated_login(http_client):
+    """Partner scope remains tenant-limited; this edge has no authoritative
+    IdP MFA signal, so its delegated administrator login fails closed."""
     client, db_path = http_client
     _seed_operator(db_path)
     admin_token = _admin_session()
-    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "partner", "scope_id": "partner-1"}, cookies={main.SESSION_COOKIE_NAME: admin_token})
+    _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="administrator", scope_type="partner", scope_id="partner-1")
+
+    decision = main.resolve_portal_login(selected_portal="administrator", legacy_role=None, partner_role="administrator",
+                                         partner_administrator_scope="partner", cloud_profile=False)
+    assert decision["destination"] == "/partner?tab=customers"
 
     login = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
     assert login.status_code == 303
-    assert login.headers["location"] == "/partner?tab=customers"  # never mfa_required, never /admin-portal
+    assert login.headers["location"] == "/admin/mfa-setup"  # enrollment-only; never a global Admin Portal session
+    token = login.cookies[partner_portal.SESSION_COOKIE]
+    assert client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: token}).status_code == 403
 
 
 # ----------------------------------------------------------------------- break-glass
@@ -568,7 +562,8 @@ def test_break_glass_recovery_does_not_bypass_a_since_revoked_grant(http_client)
     with connection() as db:
         token = platform_owner.create_break_glass_token(db, email="amata@anyaicam.com", reason="test", created_by="ops@anyaicam.com")
 
-    client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: admin_token})
+    from authz_helpers import cookies_for
+    client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies=cookies_for(admin_token))
 
     redeem = client.post("/api/platform-owner/break-glass-recover", json={"email": "amata@anyaicam.com", "token": token}, follow_redirects=False)
     assert redeem.status_code == 403
@@ -638,7 +633,7 @@ def test_granting_one_account_does_not_grant_a_second_unrelated_account(http_cli
 
 def test_ordinary_partner_owner_login_completely_unaffected_by_this_module(http_client):
     client, db_path = http_client
-    _seed_operator(db_path, email="owner@example.test")
+    _seed_operator(db_path, email="owner@example.test", role="partner_owner")
     admin_token = _admin_session()
     _grant(db_path, admin_token, client, email="owner@example.test", role="partner_owner", scope_type="partner", scope_id="partner-1")
     login = client.post("/api/portal-login", json={"email": "owner@example.test", "password": "x", "portal": "partner"}, follow_redirects=False)

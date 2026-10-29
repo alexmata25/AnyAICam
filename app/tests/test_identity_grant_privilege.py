@@ -14,6 +14,7 @@ import main
 import partner_portal
 from database_backend import override_target
 from partner_db import connection
+from authz_helpers import cookies_for, partner_session_cookie
 from test_platform_owner_rbac import _seed_operator, http_client  # noqa: F401 -- fixtures and helpers
 
 ROUTES = (
@@ -31,6 +32,10 @@ def _legacy(role, email):
 
 def _portal(email, role, partner_id=None, customer_id=None):
     return {partner_portal.SESSION_COOKIE: partner_portal._token(email, role, partner_id, customer_id, None)}
+
+
+def _verified_global_admin(email="platform@anyaicam.test"):
+    return cookies_for(partner_session_cookie(email, "administrator", mfa_state="verified", auth_source="mfa"))
 
 
 def _seed(db_path):
@@ -85,7 +90,7 @@ def test_everyone_but_a_live_global_administrator_is_refused(http_client, who):
 def test_a_live_global_administrator_can_manage_grants(http_client):
     client, db_path = http_client
     grant = _seed(db_path)
-    cookies = _legacy("administrator", "platform@anyaicam.test")
+    cookies = _verified_global_admin()
     assert client.get("/api/operations/identity-grants", cookies=cookies).status_code == 200
     created = client.post("/api/operations/identity-grants", cookies=cookies,
                           json={"email": "target@anyaicam.test", "role": "administrator", "scope_type": "global"})
@@ -97,7 +102,7 @@ def test_a_live_global_administrator_can_manage_grants(http_client):
 def test_losing_the_global_grant_removes_access_on_the_next_request(http_client):
     client, db_path = http_client
     _seed(db_path)
-    cookies = _legacy("administrator", "platform@anyaicam.test")
+    cookies = _verified_global_admin()
     assert client.get("/api/operations/identity-grants", cookies=cookies).status_code == 200
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -114,7 +119,7 @@ def test_the_last_active_global_administrator_is_still_protected(http_client):
                                 "WHERE u.email='second-platform@anyaicam.test' AND g.scope_type='global'").fetchone()[0]
             own = db.execute("SELECT g.id FROM identity_grants g JOIN partner_users u ON u.id=g.user_id "
                              "WHERE u.email='platform@anyaicam.test' AND g.scope_type='global'").fetchone()[0]
-    cookies = _legacy("administrator", "platform@anyaicam.test")
+    cookies = _verified_global_admin()
     assert client.post(f"/api/operations/identity-grants/{second}/revoke", cookies=cookies).json()["status"] == "revoked"
     refused = client.post(f"/api/operations/identity-grants/{own}/revoke", cookies=cookies)
     assert refused.status_code == 409 and "last active platform administrator" in refused.json()["detail"]

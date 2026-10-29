@@ -11648,51 +11648,59 @@ def authenticated_user(request: Request) -> dict | None:
 
 
 def cloud_administrator_bridge(request: Request) -> dict | None:
-    """Lets a cloud-delegated Partner Portal session with a LIVE,
-    GLOBAL-scoped 'administrator' grant use the legacy Admin Portal --
-    exactly what "amata@anyaicam.com + Administrator selection ->
-    /admin-portal" requires, without ever creating a legacy users.json
-    row for that person (see this session's own explicit instruction
-    against that). This is the one, single choke point current_user()
-    falls back to when there's no legacy session at all; because nearly
-    every Admin Portal route already calls current_user()/has_permission()
-    without modification, this bridge applies uniformly across the whole
-    Admin Portal rather than needing to be wired into each route.
-
-    Re-verifies against the LIVE identity_grants table on every call
-    (appliance_identity.has_global_administrator_grant()) -- never
-    trusts the partner session cookie's own embedded role claim alone.
-    A revoked grant loses Admin Portal access on this function's very
-    next call, not only after the appliance's own manifest-
-    reconciliation cycle catches up. A partner-scoped administrator
-    (company-level admin, scope_type='partner') is deliberately
-    excluded -- has_global_administrator_grant() only matches
-    scope_type='global' -- so a partner-scoped admin can never silently
-    become a global AnyAiCam administrator through this path. Partner/
-    Technician/Customer roles are excluded outright by the role=='administrator'
-    check below; admin@local's own local-recovery session path
-    (authenticated_user()) is completely separate from and unaffected
-    by this function -- it's only ever consulted when that path found
-    nothing."""
+    """Return a Partner Portal identity only for a currently MFA-verified, exact-account-bound global administrator session. The legacy Admin Portal bridge is global scope on edge and cloud. Delegated identities, stale sessions, partner-scoped grants, and enrollment-only sessions do not qualify. The separate local emergency /login path remains governed by authenticated_user and gains no additional authority here."""
     try:
-        from partner_portal import partner_identity
+        from partner_portal import EDGE_DELEGATED_AUTH_SOURCES, partner_identity
         identity = partner_identity(request)
     except Exception:
         return None
     if not identity or identity.get("role") != "administrator":
         return None
-    email = str(identity.get("email") or "").strip()
-    if not email:
+
+    email = str(identity.get("email") or "").strip().lower()
+    user_id = str(identity.get("user_id") or "").strip()
+    session_id = str(identity.get("session_id") or "").strip()
+    if (not email or not user_id or not session_id or identity.get("mfa_state") != "verified"
+            or not identity.get("mfa_verified_at") or identity.get("auth_source") in EDGE_DELEGATED_AUTH_SOURCES):
+        try:
+            from admin_auth_policy import auth_audit
+            auth_audit("access.denied", actor_email=email, actor_role="administrator",
+                       reason="admin_bridge_mfa_or_binding_required", entity_id=user_id)
+        except Exception:
+            pass
         return None
-    from appliance_identity import has_global_administrator_grant
+
+    from datetime import datetime
     from partner_db import connection as partner_connection
+    now = datetime.now().isoformat()
     with partner_connection() as db:
-        if not has_global_administrator_grant(db, email=email):
+        bound = db.execute(
+            "SELECT u.id,u.email,u.role,u.approved,u.account_status,u.authorization_version,"
+            "s.authorization_version_at_login,s.mfa_state,s.mfa_verified_at,s.revoked_at,s.expires_at "
+            "FROM user_sessions s JOIN partner_users u ON u.id=s.user_id "
+            "WHERE s.id=? AND s.user_id=? AND lower(s.email)=? AND lower(u.email)=? "
+            "AND s.role='administrator' AND u.role='administrator'",
+            (session_id, user_id, email, email),
+        ).fetchone()
+        if (not bound or not bound["approved"] or str(bound["account_status"] or "active").lower()
+                in {"suspended", "revoked", "pending", "disabled"} or bound["revoked_at"]
+                or str(bound["expires_at"] or "") <= now or bound["mfa_state"] != "verified"
+                or not bound["mfa_verified_at"]
+                or int(bound["authorization_version_at_login"] if bound["authorization_version_at_login"] is not None else -1)
+                != int(bound["authorization_version"] or 0)):
             return None
+        grant = db.execute(
+            "SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' "
+            "AND scope_type='global' AND revoked_at IS NULL LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if not grant:
+            return None
+
     return {
-        "id": f"cloud-administrator:{email}", "display_name": email, "email": email,
+        "id": user_id, "user_id": user_id, "display_name": email, "email": email,
         "role": "administrator", "enabled": True, "site_ids": [], "camera_ids": list(get_camera_numbers()),
-        "via_cloud_administrator_grant": True,
+        "via_cloud_administrator_grant": True, "mfa_state": "verified", "session_id": session_id,
     }
 
 
@@ -45012,6 +45020,21 @@ async def authentication_middleware(request: Request, call_next):
     except Exception:
         portal_identity = None
 
+    # Enrollment/re-enrollment cookies are intentionally not full portal
+    # identities. Refuse them at the middleware boundary everywhere except
+    # the explicit MFA setup and verification endpoints; otherwise a denied
+    # route can fall through to a legacy handler that renders a 200 page.
+    if not portal_identity:
+        try:
+            from partner_portal import partner_enrollment_identity
+            enrollment_identity = partner_enrollment_identity(request)
+        except Exception:
+            enrollment_identity = None
+        if enrollment_identity and not is_mfa_enrollment_path(path):
+            if path.startswith("/api/"):
+                return JSONResponse({"status": "error", "message": "Complete administrator MFA enrollment before continuing."}, status_code=403)
+            return HTMLResponse("Complete administrator MFA enrollment before continuing.", status_code=403)
+
     if portal_identity:
         request.state.partner_identity = portal_identity
         # The appliance's own local APIs read THIS host's files with no tenant
@@ -45034,16 +45057,16 @@ async def authentication_middleware(request: Request, call_next):
         # to partner roles. (MFA and the session version are enforced in
         # partner_portal._identity() itself.)
         if portal_identity.get("role") == "administrator" and is_admin_namespace_path(path) and not is_mfa_enrollment_path(path):
-            from admin_auth_policy import auth_audit, is_cloud_profile
-            if is_cloud_profile():
-                from appliance_identity import has_global_administrator_grant
-                from partner_db import connection as _grant_connection
-                with _grant_connection() as _grant_db:
-                    _live_global = has_global_administrator_grant(_grant_db, email=str(portal_identity.get("email") or ""))
-                if not _live_global:
-                    auth_audit("access.denied", actor_email=portal_identity.get("email"), actor_role="administrator",
-                               reason="admin_without_global_grant", entity_id=str(portal_identity.get("user_id") or ""))
-                    return JSONResponse({"status": "error", "message": "Global administrator grant required."}, status_code=403)
+            # The legacy Admin Portal bridge is global scope on both edge and
+            # cloud. A live-looking partner cookie is insufficient unless its
+            # exact account/session is MFA verified and still globally granted.
+            if cloud_administrator_bridge(request) is None:
+                from admin_auth_policy import auth_audit
+                auth_audit("access.denied", actor_email=portal_identity.get("email"), actor_role="administrator",
+                           reason="admin_bridge_mfa_or_grant_required", entity_id=str(portal_identity.get("user_id") or ""))
+                if path.startswith("/api/"):
+                    return JSONResponse({"status": "error", "message": "Verified global administrator access is required."}, status_code=403)
+                return HTMLResponse("Verified global administrator access is required.", status_code=403)
         if request.method == "GET" and not path.startswith(("/api/", "/static/")) and path not in {"/change-password", "/partner-logout", "/logout"}:
             if _partner_must_change_password(portal_identity):
                 return RedirectResponse("/change-password", status_code=303)
@@ -55140,24 +55163,19 @@ _GRANT_ROLE_LABELS = {
 }
 
 
-def _is_live_global_administrator(user) -> bool:
-    """Identity grants decide who may administer every appliance, so only a
-    LIVE global administrator grant may see or change them (2026-10-02,
-    Codex launch blocker): manage_settings alone let a legacy support_admin
-    create a global administrator grant and escalate any portal account."""
-    if not user or not has_permission(user, "manage_settings") or not user.get("email"):
-        return False
-    from appliance_identity import has_global_administrator_grant
-    from partner_db import connection as partner_connection
-    with partner_connection() as db:
-        return has_global_administrator_grant(db, email=str(user.get("email")))
-
-
 def _require_live_global_administrator(request: Request) -> dict:
-    user = current_user(request)
-    if not _is_live_global_administrator(user):
-        raise HTTPException(status_code=403, detail="Platform administrator access is required.")
-    return user
+    """Require the platform MFA/session/grant gate, including on edge.
+
+    Legacy local emergency sessions intentionally do not satisfy this helper:
+    the emergency ``/login`` exception is not an identity-grant authority.
+    """
+    from platform_owner import _require_global_grant_session
+
+    actor = _require_global_grant_session(request)
+    return {
+        "id": actor["user_id"], "user_id": actor["user_id"], "email": actor["email"],
+        "role": "administrator", "enabled": True, "via_verified_global_mfa": True,
+    }
 
 
 @app.get("/api/operations/identity-grants")
@@ -55233,8 +55251,9 @@ def revoke_identity_grant(request: Request, grant_id: str) -> dict:
 
 @app.get("/operations/identity-grants", response_class=HTMLResponse)
 def identity_grants_page(request: Request) -> str:
-    user = current_user(request)
-    if not _is_live_global_administrator(user):
+    try:
+        user = _require_live_global_administrator(request)
+    except HTTPException:
         return permission_denied_page("Identity grants", "operations", "manage_settings")
     record_audit(request, "view", "operations:identity-grants", "Opened identity grant management.")
     from partner_db import connection as partner_connection

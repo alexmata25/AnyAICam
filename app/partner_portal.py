@@ -482,12 +482,13 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
                 auth_audit('login.denied',actor_email=email,actor_role=str(account.get('role') or ''),reason='env_account_on_cloud')
                 raise HTTPException(status_code=403,detail='The email or password is incorrect.')
             role = account['role']; env_account = True
-        if role=='administrator' and cloud:
-            # L-6 (1.2.7.1): administrator access on the cloud starts only at
-            # the Admin portal sign-in, which requires MFA (begin_admin_login).
+        if role=='administrator':
+            # Administrators must use the MFA-aware portal-login flow on every
+            # profile. /api/partner-login is for partner/customer operations;
+            # on edge it must not mint a password-only administrator session.
             auth_audit('login.denied',actor_email=email,actor_role='administrator',reason='admin_requires_mfa_sign_in',
                        entity_id=str(user.get('id','') if user else ''))
-            raise HTTPException(status_code=403,detail='Administrators sign in through the Admin portal sign-in, with two-factor authentication.')
+            raise HTTPException(status_code=403,detail='Administrators must sign in through the administrator sign-in with two-factor authentication.')
         if role and payload.get('partner_only') and role not in PARTNER_ROLES:
             audit(user or {'email':email,'role':role},'login.denied','partner_portal','',{'reason':'customer_account'})
             raise HTTPException(status_code=403,detail='Customer accounts cannot enter the Partner Portal. Use the customer sign-in page.')

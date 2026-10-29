@@ -24,6 +24,7 @@ import main
 import partner_portal
 from database_backend import override_target
 from partner_db import connection, initialize_database, password_hash
+from authz_helpers import cookies_for, make_partner_user, partner_session_cookie
 
 
 @pytest.fixture()
@@ -57,10 +58,8 @@ def http_client(tmp_path, monkeypatch):
 
 
 def _admin_session():
-    main.save_users([{"id": "admin-1", "email": "admin@local", "role": "administrator", "enabled": True, "camera_ids": []}])
-    from global_admin_helper import make_live_global_admin
-    make_live_global_admin("admin@local")  # identity grants require a live global administrator (2026-10-02)
-    return main.create_session("admin-1")
+    make_partner_user("admin@local", "administrator", partner_id=None, global_admin=True)
+    return partner_session_cookie("admin@local", "administrator", mfa_state="verified", auth_source="mfa")
 
 
 def _seed_operator(db_path, email="amata@anyaicam.com", partner_id="partner-1"):
@@ -76,7 +75,7 @@ def _grant(db_path, admin_token, client, *, email, role, scope_type, scope_id=No
     payload = {"email": email, "role": role, "scope_type": scope_type}
     if scope_id:
         payload["scope_id"] = scope_id
-    response = client.post("/api/operations/identity-grants", json=payload, cookies={main.SESSION_COOKIE_NAME: admin_token})
+    response = client.post("/api/operations/identity-grants", json=payload, cookies=cookies_for(admin_token))
     assert response.status_code == 200, response.text
     return response.json()["grant_id"]
 
@@ -135,7 +134,7 @@ def test_partner_grant_remains_usable_if_only_administrator_grant_is_revoked(htt
     admin_grant_id = _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="administrator", scope_type="global")
     _grant(db_path, admin_token, client, email="amata@anyaicam.com", role="partner_owner", scope_type="partner", scope_id="partner-1")
 
-    client.post(f"/api/operations/identity-grants/{admin_grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: admin_token})
+    client.post(f"/api/operations/identity-grants/{admin_grant_id}/revoke", cookies=cookies_for(admin_token))
 
     as_partner = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "partner"}, follow_redirects=False)
     assert as_partner.status_code == 303
@@ -155,7 +154,7 @@ def test_removing_administrator_grant_immediately_denies_admin_portal_even_with_
     assert login.status_code == 403
     assert partner_portal.SESSION_COOKIE not in login.cookies
 
-    client.post(f"/api/operations/identity-grants/{admin_grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: admin_token})
+    client.post(f"/api/operations/identity-grants/{admin_grant_id}/revoke", cookies=cookies_for(admin_token))
 
     denied = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "x", "portal": "administrator"}, follow_redirects=False)
     assert denied.status_code in (401, 403)
@@ -226,7 +225,8 @@ def test_customer_session_cannot_reach_admin_portal(http_client):
 
 def test_admin_local_still_works_via_the_legacy_session_path_unaffected(http_client):
     client, db_path = http_client
-    token = _admin_session()
+    main.save_users([{"id": "admin-1", "email": "admin@local", "role": "administrator", "enabled": True, "camera_ids": []}])
+    token = main.create_session("admin-1")
     page = client.get("/admin-portal", cookies={main.SESSION_COOKIE_NAME: token})
     assert page.status_code == 200
 

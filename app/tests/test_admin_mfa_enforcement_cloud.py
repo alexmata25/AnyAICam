@@ -354,11 +354,12 @@ def test_edge_local_emergency_login_still_works(edge):
     assert protected.status_code in (401, 403)
 
 
-def test_edge_admin_partner_session_needs_no_cloud_mfa(edge):
+def test_edge_admin_partner_session_without_verified_mfa_cannot_open_global_admin_portal(edge):
     make_partner_user(OWNER, "administrator", global_admin=True)
     token = partner_session_cookie(OWNER, "administrator", mfa_state=None)
     assert partner_portal.partner_identity(_request(token)) is not None
-    assert edge.get("/admin-portal", cookies=cookies_for(token)).status_code == 200
+    assert edge.get("/admin-portal", cookies=cookies_for(token)).status_code == 403
+    assert edge.get("/api/operations/identity-grants", cookies=cookies_for(token)).status_code == 403
 
 
 def test_edge_delegated_session_without_a_local_account_keeps_working(edge):
