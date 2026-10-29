@@ -46,6 +46,19 @@ BOOTSTRAP_PASSWORD = "Sup3rSecret!123"
 BOOTSTRAP_PARTNER_ID = "anyaicam-primary"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_recordings(tmp_path, monkeypatch):
+    # Codex note on 108a132: never read or write the shared recordings root (C:\app\recordings) -- every
+    # recordings-derived path (audit log, alerts, AAC faces/events, identity file, email previews...) goes to tmp_path.
+    from recordings_isolation import isolate_recordings
+    return isolate_recordings(monkeypatch, tmp_path)
+
+
+def test_recordings_derived_paths_are_isolated_for_this_module(_isolated_recordings):
+    from recordings_isolation import assert_isolated
+    assert_isolated(_isolated_recordings)
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_bootstrap_admin.db"

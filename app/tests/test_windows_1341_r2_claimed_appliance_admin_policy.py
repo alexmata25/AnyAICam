@@ -23,6 +23,19 @@ PASSWORD = "Sup3rSecret!-cloud-1"
 CLOUD_ID = "AIC-R2POLICY1"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_recordings(tmp_path, monkeypatch):
+    # Codex note on 108a132: never read or write the shared recordings root (C:\app\recordings) -- every
+    # recordings-derived path (audit log, alerts, AAC faces/events, identity file, email previews...) goes to tmp_path.
+    from recordings_isolation import isolate_recordings
+    return isolate_recordings(monkeypatch, tmp_path)
+
+
+def test_recordings_derived_paths_are_isolated_for_this_module(_isolated_recordings):
+    from recordings_isolation import assert_isolated
+    assert_isolated(_isolated_recordings)
+
+
 def _seed_claimed_appliance():
     now = "2026-10-29T00:00:00"
     with connection() as db:
@@ -157,11 +170,15 @@ def test_the_first_refused_sign_in_changes_only_the_dev_cloud_signing_key(claime
     # backend creating its manifest-signing key (identity_signing_keys) on first use; nothing appliance-, camera-,
     # grant-, session- or recording-related may change.
     _cloud_admin("global", enrolled=True)
+    with connection() as db:  # the dev cloud backend has not created its key yet in this fresh database
+        assert db.execute("SELECT COUNT(*) AS n FROM identity_signing_keys").fetchone()["n"] == 0
     before = table_snapshot()
     assert _admin_login(claimed).status_code == 403
     after = table_snapshot()
     changed = sorted(table for table in set(before) | set(after) if before.get(table) != after.get(table))
-    assert changed in ([], ["identity_signing_keys"]), changed
+    assert changed == ["identity_signing_keys"], changed  # created when absent -- and nothing else changed
+    with connection() as db:
+        assert db.execute("SELECT COUNT(*) AS n FROM identity_signing_keys").fetchone()["n"] == 1
 
 
 def test_the_emergency_login_session_has_no_identity_grant_authority(claimed, tmp_path, monkeypatch):
@@ -174,7 +191,12 @@ def test_the_emergency_login_session_has_no_identity_grant_authority(claimed, tm
     main.save_users([{"id": "local-owner", "display_name": "Local owner", "email": "owner@local.test", "role": "administrator",
                       "enabled": True, "password_hash": main.hash_password("Local-Owner-Pass-1"), "site_ids": ["home"], "camera_ids": []}])
     login = claimed.post("/login", data={"email": "owner@local.test", "password": "Local-Owner-Pass-1", "next_url": "/"}, follow_redirects=False)
-    cookies = {main.SESSION_COOKIE_NAME: login.cookies.get(main.SESSION_COOKIE_NAME)}
+    assert login.status_code == 303, login.text[:200]
+    token = login.cookies.get(main.SESSION_COOKIE_NAME)
+    assert token, "the emergency /login must issue a non-empty session cookie"
+    cookies = {main.SESSION_COOKIE_NAME: token}
+    portal = claimed.get("/admin-portal", cookies=cookies)  # the session really authenticates (recovery surface)
+    assert portal.status_code == 200 and '<p class="eyebrow">Access control</p>' not in portal.text
     before = table_snapshot()
     assert claimed.get("/api/operations/identity-grants", cookies=cookies).status_code in (401, 403)
     created = claimed.post("/api/operations/identity-grants", cookies=cookies,
