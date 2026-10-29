@@ -117,10 +117,27 @@ def test_bootstrap_admin_can_log_in_before_activation(http_client, monkeypatch):
     assert response.status_code == 303
 
 
-def test_bootstrap_admin_can_still_log_in_after_appliance_activation(http_client, db_path, monkeypatch):
-    # The exact live failure: this must succeed now, not return the
-    # generic "Invalid email or password" the missing grant used to
-    # cause.
+# Windows 1.3.4.1 owner policy R-2 (2026-10-29): on a CLAIMED appliance a cloud-credential administrator needs an
+# explicit, authorized appliance-local grant AND completed MFA before any Admin Portal access. Cloud credentials
+# (even a live global grant) alone must never grant appliance administration, and the refusal fails closed. These
+# three tests used to assert the opposite (pre-1.3.4.1 behaviour) and are rewritten to the approved policy. The
+# appliance-local grant + MFA path itself does not exist yet (see R-2 design proposal); until it does, every
+# cloud-delegated administrator sign-in on a claimed appliance is refused and the local emergency /login is the
+# on-appliance administrator recovery path.
+
+
+def _denial_reasons(db_path):
+    import json
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            rows = db.execute("SELECT details_json FROM audit_logs WHERE action='login.denied'").fetchall()
+    return [json.loads(row["details_json"] or "{}").get("reason") for row in rows]
+
+
+def test_bootstrap_admin_cloud_credentials_alone_do_not_open_the_admin_portal_after_activation(http_client, db_path, monkeypatch):
+    # R-2 requirement 1: the correct cloud password (and the live global grant bootstrap_admin() created) is not
+    # enough on a claimed appliance; no session of any kind is issued, and the refusal is audited.
+    import partner_portal
     _seed_activated_appliance_under_bootstrap_partner(db_path)
     _configure_own_appliance(monkeypatch)
 
@@ -129,19 +146,16 @@ def test_bootstrap_admin_can_still_log_in_after_appliance_activation(http_client
         json={"email": BOOTSTRAP_EMAIL, "password": BOOTSTRAP_PASSWORD, "portal": "administrator"},
         follow_redirects=False,
     )
-    assert response.status_code == 303
-    # scope_type='global' -- reaches the real Admin Portal, not the
-    # Partner Portal's customer view (see the module docstring's #2).
-    assert response.headers["location"] == "/admin-portal"
+    assert response.status_code == 403
+    assert "verifiable mfa" in response.json()["detail"].lower()
+    assert partner_portal.SESSION_COOKIE not in response.cookies
+    assert main.SESSION_COOKIE_NAME not in response.cookies
+    assert "delegated_admin_mfa_unverified" in _denial_reasons(db_path)
 
 
-def test_admin_portal_manage_settings_pages_are_reachable_after_activation(http_client, db_path, monkeypatch):
-    # The exact second live failure: login succeeding is not enough --
-    # every Admin Portal sidebar page is gated on has_permission(user,
-    # "manage_settings"), which only a scope_type='global' grant
-    # satisfies via cloud_administrator_bridge(). Proves the bootstrap
-    # admin actually reaches manage_settings-gated content, not just a
-    # "your role doesn't include manage_settings" page rendered at 200.
+def test_admin_portal_manage_settings_pages_stay_closed_after_a_refused_cloud_admin_sign_in(http_client, db_path, monkeypatch):
+    # R-2 requirements 1 and 3: with no appliance-local grant and no MFA there is no route into manage_settings
+    # pages -- the refused sign-in leaves the client with no cookie, and the Admin Portal sends it to sign in.
     _seed_activated_appliance_under_bootstrap_partner(db_path)
     _configure_own_appliance(monkeypatch)
 
@@ -150,21 +164,11 @@ def test_admin_portal_manage_settings_pages_are_reachable_after_activation(http_
         json={"email": BOOTSTRAP_EMAIL, "password": BOOTSTRAP_PASSWORD, "portal": "administrator"},
         follow_redirects=False,
     )
-    assert login.status_code == 303
-    assert login.headers["location"] == "/admin-portal"
-    # partner_portal.SESSION_COOKIE is the actual cookie establish_
-    # partner_session() sets for a cloud-delegated login (matches
-    # test_cloud_administrator_bridge.py's identical pattern).
-    import partner_portal
-    session_cookie = login.cookies[partner_portal.SESSION_COOKIE]
-
-    page = http_client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie})
-    assert page.status_code == 200
-    # The exact live symptom: "Your current role does not include
-    # manage_settings" rendered at 200 instead of real page content.
-    assert "does not include" not in page.text
-    assert "manage_settings" not in page.text.lower()
-
+    assert login.status_code == 403
+    for path in ("/admin-portal", "/customer-accounts", "/operations/identity-grants"):
+        page = http_client.get(path, cookies=login.cookies, follow_redirects=False)
+        refused = page.status_code in (302, 303, 401, 403) or '<p class="eyebrow">Access control</p>' in page.text
+        assert refused, (path, page.status_code)
 
 def test_duplicate_bootstrap_runs_do_not_create_duplicate_grants(http_client, db_path):
     # bootstrap_admin() already ran once via the http_client fixture's
@@ -258,12 +262,11 @@ def test_password_less_backfill_is_also_idempotent(http_client, db_path, monkeyp
     assert count == 1
 
 
-def test_password_less_backfilled_admin_can_log_in_after_activation(http_client, db_path, monkeypatch):
-    # The exact live scenario end to end: password env var gone,
-    # backfill runs on email alone, and the account still authenticates
-    # successfully via the cloud-delegated path once its appliance is
-    # activated -- using the ORIGINAL password from account creation,
-    # never re-supplied.
+def test_password_less_backfilled_admin_is_refused_on_a_claimed_appliance_without_local_grant_and_mfa(http_client, db_path, monkeypatch):
+    # The backfilled bootstrap account still authenticates to the cloud with its ORIGINAL password (the cloud
+    # check runs first), but R-2 then refuses it fail-closed: a wrong password is refused too, and neither path
+    # yields a session.
+    import partner_portal
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
@@ -275,13 +278,12 @@ def test_password_less_backfilled_admin_can_log_in_after_activation(http_client,
     _seed_activated_appliance_under_bootstrap_partner(db_path)
     _configure_own_appliance(monkeypatch)
 
-    response = http_client.post(
-        "/api/portal-login",
-        json={"email": BOOTSTRAP_EMAIL, "password": BOOTSTRAP_PASSWORD, "portal": "administrator"},
-        follow_redirects=False,
-    )
-    assert response.status_code == 303
-
+    right = http_client.post("/api/portal-login", json={"email": BOOTSTRAP_EMAIL, "password": BOOTSTRAP_PASSWORD, "portal": "administrator"},
+                             follow_redirects=False)
+    assert right.status_code == 403 and partner_portal.SESSION_COOKIE not in right.cookies
+    wrong = http_client.post("/api/portal-login", json={"email": BOOTSTRAP_EMAIL, "password": "not-the-password-0", "portal": "administrator"},
+                             follow_redirects=False)
+    assert wrong.status_code in (401, 403) and partner_portal.SESSION_COOKIE not in wrong.cookies
 
 def test_no_new_account_is_created_without_a_password(http_client, db_path, monkeypatch):
     # The other half of "password required only to create a brand-new
