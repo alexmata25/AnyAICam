@@ -143,3 +143,13 @@ def test_the_restart_check_does_not_claim_a_resume_time_it_cannot_measure():
     block = FUNCTIONAL.split("Check 'live view resumes after the service restart", 1)[1].split("MotionReaderRtsp 'motion'", 1)[0]
     assert "within 60 s of its start" not in block and "first playlist write" not in block
     assert "$written -gt $started" in block and "if ($age -ge 10)" in block
+
+
+def test_every_motion_event_of_the_run_must_become_a_complete_clip():
+    # Codex review 2026-10-30: one clip is not multi-event completeness. Validated against the preserved runs:
+    # a294da8 PASS (4/4); 46713ee run 1 FAIL (2 short + 2 concat_failed, although its single-clip check passed).
+    block = FUNCTIONAL.split("Check 'recording: EVERY motion event of the run became a complete clip", 1)[1].split("\n}\n", 1)[0]
+    assert FUNCTIONAL.index("(Join-Path $results 'service-logs')") < FUNCTIONAL.index("Check 'recording: EVERY motion event")
+    assert "if ($triggered.Count -lt 2) { throw" in block
+    assert "concat_failed|no_sources|no_buffer_folder|duration_mismatch" in block and "if ($bad) { throw" in block
+    assert "AddSeconds(-90)" in block and "if ($lost) { throw" in block

@@ -32,11 +32,15 @@ function Export-CodeIntegrityEvidence {
     $files | Set-Content (Join-Path $results 'codeintegrity-files.txt')
     $wouldBlock = @($events | Where-Object { $_.Id -in 3076, 3091 }).Count
     $blocked = @($events | Where-Object { $_.Id -in 3077, 3092 }).Count
-    Check 'Smart App Control evidence (diagnostic): Code Integrity audit/block events exported' { "$wouldBlock would-block (3076/3091), $blocked blocked (3077/3092), $($files.Count) distinct files; codeintegrity-events.txt" }
+    "$wouldBlock would-block (3076/3091), $blocked blocked (3077/3092), $($files.Count) distinct files; codeintegrity-events.txt"
 }
+$script:acceptanceFailed = 0
 function WriteAcceptanceSummary {
-    try { Export-CodeIntegrityEvidence } catch { Add-Content (Join-Path $results 'report.txt') ("FAIL  Code Integrity export  {0}" -f $_.Exception.Message) }
+    # Codex review 2026-10-30: an export exception used to reach report.txt only, so report.json, DONE and the totals
+    # could still say success. It is now an ordinary check: a structured FAIL, counted, and a nonzero exit below.
+    Check 'Smart App Control evidence (diagnostic): Code Integrity audit/block events exported' { Export-CodeIntegrityEvidence }
     $failed = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
+    $script:acceptanceFailed = $failed
     $notTested = @($checks | Where-Object { $_.status -eq 'NOT TESTED' }).Count
     $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
     Add-Content (Join-Path $results 'report.txt') ("RESULT: {0} checks, {1} failed, {2} not tested" -f $checks.Count, $failed, $notTested)
@@ -628,3 +632,6 @@ Check 'no claim code or credential in any log' {
 }
 
 WriteAcceptanceSummary
+# Any failed check (including the Code Integrity export) makes the run exit nonzero, as the terminating-error trap does.
+if ($script:acceptanceFailed -gt 0) { exit 1 }
+exit 0

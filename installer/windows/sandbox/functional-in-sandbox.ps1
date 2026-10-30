@@ -1063,6 +1063,26 @@ Start-Sleep -Seconds 5
 & robocopy.exe (Join-Path $data 'agent') (Join-Path $results 'agent-logs') *.log /B /R:1 /W:1 /NP /NJH /NJS | Out-Null
 & robocopy.exe (Join-Path $data 'recordings') (Join-Path $results 'recordings-stores') *.jsonl analytics_events.json /B /R:1 /W:1 /NP /NJH /NJS | Out-Null
 Info 'collected logs' { (@(Get-ChildItem $results -Recurse -File -Include *.log | ForEach-Object { "$($_.Directory.Name)\$($_.Name)" }) -join ', ') }
+Check 'recording: EVERY motion event of the run became a complete clip (>= 2 events; no concat failure, no missing source, no short clip)' {
+    # Codex review 2026-10-30: the clip checks above prove one clip, not that every event was kept. Read the VMS's own
+    # event_recording log for the whole run (services stopped, logs collected). Each trigger must end "persisted";
+    # only a trigger whose event ended in the last 90 s before the final stop may still be in flight.
+    $lines = @(Get-ChildItem (Join-Path $results 'service-logs') -Filter 'AnyAiCamVMS*.err.log' -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-Content -LiteralPath $_.FullName } | Where-Object { $_ -match 'anyaicam\.event_recording event_recording\.' })
+    $triggered = @{}
+    foreach ($l in $lines) { if ($l -match 'event_recording\.triggered .*trigger_id=(\w+) .*event_end=(\S+)') { $triggered[$Matches[1]] = [datetime]$Matches[2] } }
+    $persisted = @($lines | Where-Object { $_ -match 'event_recording\.persisted ' } | ForEach-Object { if ($_ -match 'trigger_id=(\w+)') { $Matches[1] } } | Sort-Object -Unique)
+    $bad = @($lines | Where-Object { $_ -match 'event_recording\.(concat_failed|no_sources|no_buffer_folder|duration_mismatch) ' } | ForEach-Object { ($_ -split 'WARNING ', 2)[-1] })
+    if ($triggered.Count -lt 2) { throw "only $($triggered.Count) motion event(s) triggered in the run; need at least 2" }
+    if ($bad) { throw "$($bad.Count) event(s) lost or short: $($bad[0..([math]::Min(2, $bad.Count - 1))] -join ' | ')" }
+    $lastLine = @(Get-ChildItem (Join-Path $results 'service-logs') -Filter 'AnyAiCamVMS*.err.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Tail 1 })
+    $lastTime = ($lastLine | ForEach-Object { if ($_ -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)') { [datetime]$Matches[1] } } | Sort-Object | Select-Object -Last 1)
+    $unresolved = @($triggered.Keys | Where-Object { $persisted -notcontains $_ })
+    $late = @($unresolved | Where-Object { $lastTime -and $triggered[$_] -gt $lastTime.AddSeconds(-90) })
+    $lost = @($unresolved | Where-Object { $late -notcontains $_ })
+    if ($lost) { throw "$($lost.Count) of $($triggered.Count) triggered event(s) never became a clip (trigger ids $($lost -join ', '))" }
+    "$($triggered.Count) event(s) triggered, $($persisted.Count) persisted, 0 concat/missing/short; $($late.Count) still in flight at the final stop"
+}
 $credential = [string](Get-Content -Raw (Join-Path $agentState 'credential.json') -ErrorAction SilentlyContinue | ConvertFrom-Json).credential
 Check 'no link code, credential or synthetic password in any collected log or report' {
     $secrets = @($linkCodes) + @($credential, $cloudPassword, $appliancePassword) | Where-Object { $_ }
