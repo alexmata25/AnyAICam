@@ -33,7 +33,7 @@ def test_the_python_helper_reads_a_real_exit_code_under_windows_powershell_5_1()
     helper = HARNESS.split("function AppPython([string]$Code) {", 1)[1].split("\nfunction ", 1)[0]
     start = helper.index("Start-Process -FilePath $py")
     assert start < helper.index("$null = $process.Handle") < helper.index("$process.WaitForExit(30000)")
-    assert helper.index("$process.WaitForExit(30000)") < helper.index("$process.WaitForExit()\n".replace("\n", "")) or "$process.WaitForExit()" in helper
+    assert helper.index("$process.WaitForExit(30000)") < helper.index("$process.WaitForExit()")
     assert "if ($process.ExitCode -ne 0)" in helper
 
 
