@@ -40,3 +40,21 @@ def test_the_python_helper_reads_a_real_exit_code_under_windows_powershell_5_1()
 def test_the_port_check_waits_for_the_listener_instead_of_sampling_once():
     line = next(l for l in SCRIPT.splitlines() if l.startswith("Check 'listening on the local network (0.0.0.0:8000)'"))
     assert "foreach ($try in 1..30)" in line and "Start-Sleep 2" in line and "'0.0.0.0'" in line
+
+
+def test_smart_app_control_evidence_is_exported_before_the_summary():
+    # Owner 2026-10-29: capture exact Smart App Control evidence. The Sandbox runs SAC in evaluation mode (state 2), so
+    # Code Integrity audit events name every file that enforced SAC would block.
+    export = SCRIPT.split("function Export-CodeIntegrityEvidence {", 1)[1].split("\nfunction ", 1)[0]
+    assert "Microsoft-Windows-CodeIntegrity/Operational" in export
+    for event_id in ("3076", "3077", "3091", "3092"):
+        assert event_id in export
+    assert "codeintegrity-events.txt" in export and "codeintegrity-files.txt" in export
+    summary = SCRIPT.split("function WriteAcceptanceSummary {", 1)[1]
+    assert summary.index("Export-CodeIntegrityEvidence") < summary.index("$failed = ")
+    import re
+    message = ("Code Integrity determined that a process (\Device\HarddiskVolume3\Program Files\AnyAiCam\runtime\python\python.exe) "
+               "attempted to load \Device\HarddiskVolume3\Program Files\AnyAiCam\runtime\python\Lib\site-packages\cv2\cv2.pyd "
+               "that did not meet the Enterprise signing level requirements.")
+    pattern = re.search(r"-match '([^']+)'", export.split("$files = ", 1)[1]).group(1).replace("(?is)", "")
+    assert re.search(pattern, message, re.I | re.S).group(1).endswith("cv2.pyd")

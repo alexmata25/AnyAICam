@@ -20,8 +20,23 @@ function NotTested([string]$Name, [string]$Reason) {
     $checks.Add([pscustomobject]@{ name = $Name; status = 'NOT TESTED'; ok = $null; detail = $Reason })
     Add-Content -Path (Join-Path $results 'report.txt') -Value ("NOT TESTED  {0}  {1}" -f $Name, $Reason)
 }
+function Export-CodeIntegrityEvidence {
+    # 1.3.4.1 (owner, 2026-10-29): Smart App Control evidence. In evaluation mode (VerifiedAndReputablePolicyState=2,
+    # as in this Sandbox) Code Integrity logs 3076/3091 for each file that ENFORCED Smart App Control would block, and
+    # 3077/3092 when it actually blocks one. Diagnostic only: the file list is the evidence for the signing decision.
+    $ids = 3033, 3034, 3076, 3077, 3089, 3091, 3092
+    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = $ids } -ErrorAction SilentlyContinue)
+    $events | Sort-Object TimeCreated | ForEach-Object { "{0:o}  {1}  {2}" -f $_.TimeCreated, $_.Id, ($_.Message -replace '\s+', ' ') } |
+        Set-Content (Join-Path $results 'codeintegrity-events.txt')
+    $files = @($events | ForEach-Object { if ($_.Message -match '(?is)attempted to load (.+?) that did not') { $Matches[1].Trim() } } | Sort-Object -Unique)
+    $files | Set-Content (Join-Path $results 'codeintegrity-files.txt')
+    $wouldBlock = @($events | Where-Object { $_.Id -in 3076, 3091 }).Count
+    $blocked = @($events | Where-Object { $_.Id -in 3077, 3092 }).Count
+    Check 'Smart App Control evidence (diagnostic): Code Integrity audit/block events exported' { "$wouldBlock would-block (3076/3091), $blocked blocked (3077/3092), $($files.Count) distinct files; codeintegrity-events.txt" }
+}
 function WriteAcceptanceSummary {
-    $failed = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
+    try { Export-CodeIntegrityEvidence } catch { Add-Content (Join-Path $results 'report.txt') ("FAIL  Code Integrity export  {0}" -f $_.Exception.Message) }
+    $failed =@($checks | Where-Object { $_.status -eq 'FAIL' }).Count
     $notTested = @($checks | Where-Object { $_.status -eq 'NOT TESTED' }).Count
     $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
     Add-Content (Join-Path $results 'report.txt') ("RESULT: {0} checks, {1} failed, {2} not tested" -f $checks.Count, $failed, $notTested)
