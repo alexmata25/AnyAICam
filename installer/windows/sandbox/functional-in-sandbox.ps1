@@ -510,7 +510,16 @@ Restart-Service AnyAiCamAgent -Force
 $ownerEmail = 'owner@example.test'
 $cloudPassword = 'Synthetic-Cloud-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
 $appliancePassword = 'Synthetic-Appliance-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
-[void](Cloud POST '/test/owner' @{ password = $cloudPassword } -Owner)
+# F-L on signed e4c7bdc (2026-10-30, host under load): this seed call's result was discarded ([void]); when it failed
+# or timed out, the owner never existed in the test cloud, every later sign-in was "incorrect" and 16 dependent checks
+# failed. Seeding is now a check of its own: retried for up to 120 s (the seed is idempotent), and the run says so if
+# it never succeeds.
+Check 'test cloud: the synthetic owner account is created (seed acknowledged)' {
+    $script:seedError = ''
+    $seeded = WaitFor 120 { try { [void](Cloud POST '/test/owner' @{ password = $cloudPassword } -Owner); $true } catch { $script:seedError = $_.Exception.Message; $false } }
+    if (-not $seeded) { throw "the test cloud never acknowledged the owner seed in 120 s: $script:seedError" }
+    'owner seeded'
+}
 Check 'sign-in: a never-linked PC refuses customer sign-in (403, no session)' {
     $r = Edge POST '/api/partner-login' @{ email = $ownerEmail; password = $cloudPassword; customer_only = $true } -Jar 'C:\Sim\unlinked.cookies'
     if ($r.status -ne 403) { throw "status $($r.status) $($r.body | ConvertTo-Json -Compress)" }

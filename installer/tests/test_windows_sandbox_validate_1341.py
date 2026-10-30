@@ -153,3 +153,11 @@ def test_every_motion_event_of_the_run_must_become_a_complete_clip():
     assert "if ($triggered.Count -lt 2) { throw" in block
     assert "concat_failed|no_sources|no_buffer_folder|duration_mismatch" in block and "if ($bad) { throw" in block
     assert "AddSeconds(-90)" in block and "if ($lost) { throw" in block
+
+
+def test_the_owner_seed_is_a_checked_prerequisite_not_a_discarded_call():
+    # F-L on signed e4c7bdc: the discarded seed left no owner; 16 checks failed as "incorrect password".
+    assert "[void](Cloud POST '/test/owner'" not in FUNCTIONAL.split("Check 'test cloud: the synthetic owner account is created", 1)[0][-400:]
+    block = FUNCTIONAL.split("Check 'test cloud: the synthetic owner account is created (seed acknowledged)' {", 1)[1].split("\n}\n", 1)[0]
+    assert "WaitFor 120" in block and "throw" in block
+    assert FUNCTIONAL.index("seed acknowledged") < FUNCTIONAL.index("Check 'sign-in: a never-linked PC refuses customer sign-in")
