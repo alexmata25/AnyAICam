@@ -53,8 +53,8 @@ def test_smart_app_control_evidence_is_exported_before_the_summary():
     summary = SCRIPT.split("function WriteAcceptanceSummary {", 1)[1]
     assert summary.index("Export-CodeIntegrityEvidence") < summary.index("$failed = ")
     import re
-    message = ("Code Integrity determined that a process (\Device\HarddiskVolume3\Program Files\AnyAiCam\runtime\python\python.exe) "
-               "attempted to load \Device\HarddiskVolume3\Program Files\AnyAiCam\runtime\python\Lib\site-packages\cv2\cv2.pyd "
-               "that did not meet the Enterprise signing level requirements.")
+    message = (r"Code Integrity determined that a process (\Device\HarddiskVolume3\Program Files\AnyAiCam\runtime\python\python.exe) "
+               r"attempted to load \Device\HarddiskVolume3\Program Files\AnyAiCam\runtime\python\Lib\site-packages\cv2\cv2.pyd "
+               r"that did not meet the Enterprise signing level requirements.")
     pattern = re.search(r"-match '([^']+)'", export.split("$files = ", 1)[1]).group(1).replace("(?is)", "")
     assert re.search(pattern, message, re.I | re.S).group(1).endswith("cv2.pyd")

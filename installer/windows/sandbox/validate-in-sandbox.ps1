@@ -36,7 +36,7 @@ function Export-CodeIntegrityEvidence {
 }
 function WriteAcceptanceSummary {
     try { Export-CodeIntegrityEvidence } catch { Add-Content (Join-Path $results 'report.txt') ("FAIL  Code Integrity export  {0}" -f $_.Exception.Message) }
-    $failed =@($checks | Where-Object { $_.status -eq 'FAIL' }).Count
+    $failed = @($checks | Where-Object { $_.status -eq 'FAIL' }).Count
     $notTested = @($checks | Where-Object { $_.status -eq 'NOT TESTED' }).Count
     $checks | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $results 'report.json')
     Add-Content (Join-Path $results 'report.txt') ("RESULT: {0} checks, {1} failed, {2} not tested" -f $checks.Count, $failed, $notTested)
