@@ -37,9 +37,12 @@ def test_the_python_helper_reads_a_real_exit_code_under_windows_powershell_5_1()
     assert "if ($process.ExitCode -ne 0)" in helper
 
 
-def test_the_port_check_waits_for_the_listener_instead_of_sampling_once():
-    line = next(l for l in SCRIPT.splitlines() if l.startswith("Check 'listening on the local network (0.0.0.0:8000)'"))
-    assert "foreach ($try in 1..30)" in line and "Start-Sleep 2" in line and "'0.0.0.0'" in line
+def test_the_port_check_waits_and_cross_checks_netstat_but_still_requires_all_interfaces():
+    block = SCRIPT.split("Check 'listening on the local network (0.0.0.0:8000)' {", 1)[1].split("\n}\n", 1)[0]
+    assert "foreach ($try in 1..30)" in block and "Start-Sleep 2" in block
+    assert "Get-NetTCPConnection -LocalPort 8000 -State Listen" in block and "netstat -ano -p tcp" in block
+    assert "'^TCP 0\\.0\\.0\\.0:8000 '" in block  # a loopback-only listener is still a failure
+    assert 'throw "listening on' in block and "nothing listens on port 8000" in block
 
 
 def test_smart_app_control_evidence_is_exported_before_the_summary():
