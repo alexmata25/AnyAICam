@@ -17520,6 +17520,12 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 EVENT_BUFFER_SEGMENT_SECONDS = 30
 # Options for the Matroska muxer inside the event-buffer segment muxer; see start_event_recording_buffer().
 EVENT_BUFFER_MUXER_OPTIONS = "flush_packets=1:cluster_time_limit=1000"
+# persist_event_recording(): how long to keep rebuilding a clip whose open source segment has not reached the end of
+# the event window yet (the muxer writes a cluster only when it closes, at a keyframe: up to one GOP behind), how
+# often to retry, and how short a clip may be and still count as complete (the duration_mismatch threshold).
+EVENT_BUFFER_COVERAGE_WAIT_SECONDS = 15.0
+EVENT_BUFFER_COVERAGE_RETRY_SECONDS = 2.0
+EVENT_CLIP_DURATION_TOLERANCE_SECONDS = 1.5
 EVENT_BUFFER_SUBFOLDER_NAME = "_event_buffer"
 LOCAL_RECORDING_MODE = "event"
 # (camera_number, stored value) pairs already logged as coerced to event,
@@ -17894,13 +17900,28 @@ async def persist_event_recording(
             lines += [f"file '{source}'\n" for _, source in sources[1:]]
             list_file.write_text("".join(lines))
             temp_output = destination.with_suffix(".tmp.mkv")
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-                 "-t", f"{duration_seconds:.3f}",
-                 "-c", "copy", str(temp_output)],
-                capture_output=True, timeout=60, check=False,
-            )
+            # The newest source is the segment ffmpeg is still writing. Even with EVENT_BUFFER_MUXER_OPTIONS the
+            # Matroska muxer starts a cluster only at a keyframe and writes it when it closes, so the file on disk
+            # can trail real time by up to one GOP (Windows 1.3.4.1 Sandbox, signed e4c7bdc: a 19.1 s event came
+            # out 13.9 s, short by about the simulated camera's 5.6 s GOP). Rebuild until the clip covers the
+            # window (or the concat succeeds at all), bounded so a camera that stops sending cannot hold the lock.
+            deadline = time.monotonic() + EVENT_BUFFER_COVERAGE_WAIT_SECONDS
+            while True:
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                     "-t", f"{duration_seconds:.3f}",
+                     "-c", "copy", str(temp_output)],
+                    capture_output=True, timeout=60, check=False,
+                )
+                built = result.returncode == 0 and temp_output.exists()
+                built_seconds = await asyncio.to_thread(_probe_recording_duration_seconds, temp_output) if built else None
+                # Retry only what is known to be incomplete: a failed concat, or a MEASURED clip that is short. An
+                # unmeasurable clip is kept as before (duration_mismatch below cannot judge it either).
+                short = built_seconds is not None and built_seconds < duration_seconds - EVENT_CLIP_DURATION_TOLERANCE_SECONDS
+                if (built and not short) or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(EVENT_BUFFER_COVERAGE_RETRY_SECONDS)
             if result.returncode == 0 and temp_output.exists():
                 temp_output.replace(destination)
                 # Off the event loop -- same reason as
@@ -17913,7 +17934,7 @@ async def persist_event_recording(
                     camera_number, detector, trigger_id, destination, true_start.isoformat(), inpoint,
                     round(duration, 1) if duration is not None else None,
                 )
-                if duration is not None and abs(duration - duration_seconds) > 1.5:
+                if duration is not None and abs(duration - duration_seconds) > EVENT_CLIP_DURATION_TOLERANCE_SECONDS:
                     # The label no longer describes the content: say so.
                     log.warning(
                         "event_recording.duration_mismatch camera=%s trigger_id=%s path=%s "
