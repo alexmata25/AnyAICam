@@ -161,3 +161,17 @@ def test_the_owner_seed_is_a_checked_prerequisite_not_a_discarded_call():
     block = FUNCTIONAL.split("Check 'test cloud: the synthetic owner account is created (seed acknowledged)' {", 1)[1].split("\n}\n", 1)[0]
     assert "WaitFor 120" in block and "throw" in block
     assert FUNCTIONAL.index("seed acknowledged") < FUNCTIONAL.index("Check 'sign-in: a never-linked PC refuses customer sign-in")
+
+
+LPR = (Path(__file__).resolve().parents[2] / "installer" / "windows" / "sandbox" / "lpr-in-sandbox.ps1").read_text(encoding="utf-8-sig")
+
+
+def test_system_probes_run_from_a_local_folder_not_the_host_mapped_one():
+    # 2026-10-30: with SAC enforced from boot, SYSTEM tasks produced nothing from scripts on C:\Validation (mapped).
+    # (the embedded probe script has its own closing braces: cut at the next check instead)
+    probe = FUNCTIONAL.split("Check 'service identity and LocalSystem Tesseract/SAPI execution' {", 1)[1].split("\nCheck 'WinSW VMS Python process", 1)[0]
+    assert r"$probeDir = Join-Path $env:ProgramData 'AnyAiCamAcceptance\localsystem-probe'" in probe
+    assert "Copy-Item -Path (Join-Path $probeDir '*') -Destination $evidenceDir" in probe
+    system = LPR.split("Check 'the same read as LocalSystem (the service identity)' {", 1)[1].split("\n}\n", 1)[0]
+    assert r"$local = Join-Path $env:ProgramData 'AnyAiCamAcceptance\lpr'" in system
+    assert "$wrapper = Join-Path $local 'lpr-system.ps1'" in system and "'$localProbe' '$localSample'" in system

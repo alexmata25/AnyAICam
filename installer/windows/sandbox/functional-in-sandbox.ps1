@@ -109,8 +109,14 @@ Check 'service identity and LocalSystem Tesseract/SAPI execution' {
         throw "VMS process owner is '$($owner.Domain)\$($owner.User)', expected SYSTEM"
     }
 
-    $probeDir = Join-Path $results 'localsystem-probe'
+    # 1.3.4.1 (2026-10-30): run the SYSTEM probe from a LOCAL folder. When the Sandbox boots with Smart App Control
+    # already enforced (state 1), a SYSTEM task produced nothing from a script on the host-mapped C:\Validation folder
+    # (passed when SAC was switched on after boot); the product's own SYSTEM scripts under Program Files ran fine.
+    # Results are copied back to $results\localsystem-probe for the evidence.
+    $probeDir = Join-Path $env:ProgramData 'AnyAiCamAcceptance\localsystem-probe'
     New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    $evidenceDir = Join-Path $results 'localsystem-probe'
+    New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
     $probeScript = Join-Path $probeDir 'probe.ps1'
     $resultPath = Join-Path $probeDir 'result.json'
     $wavePath = Join-Path $probeDir 'sapi.wav'
@@ -157,6 +163,7 @@ try {
     } finally {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $probeScript -Force -ErrorAction SilentlyContinue
+        Copy-Item -Path (Join-Path $probeDir '*') -Destination $evidenceDir -Force -ErrorAction SilentlyContinue
     }
 }
 

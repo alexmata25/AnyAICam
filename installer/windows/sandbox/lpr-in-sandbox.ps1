@@ -96,13 +96,19 @@ Check 'real OCR reads the sample plate ZPN720 (installed lpr.py + bundled Tesser
     "read $text in $($j.recognize_seconds) s: $($j.recognized | ConvertTo-Json -Compress)"
 }
 Check 'the same read as LocalSystem (the service identity)' {
-    $out = Join-Path $results 'lpr-system.json'
-    $wrapper = Join-Path $results 'lpr-system.ps1'
+    # Run from a LOCAL folder: with Smart App Control enforced from boot, a SYSTEM task produced nothing from the
+    # host-mapped C:\Validation folders (LPR run 3). Copy the probe and sample in; copy the result back for evidence.
+    $local = Join-Path $env:ProgramData 'AnyAiCamAcceptance\lpr'
+    New-Item -ItemType Directory -Force -Path $local | Out-Null
+    Copy-Item $probe, $sample -Destination $local -Force
+    $localProbe = Join-Path $local (Split-Path $probe -Leaf); $localSample = Join-Path $local (Split-Path $sample -Leaf)
+    $out = Join-Path $local 'lpr-system.json'
+    $wrapper = Join-Path $local 'lpr-system.ps1'
     $lines = @(
         "`$env:PATH = '$tessDir;$app\runtime\tools\ffmpeg;' + `$env:PATH",
         "`$env:TESSDATA_PREFIX = '$tessDir\tessdata'",
         "Set-Location '$app\app'",
-        "& '$py' '$probe' '$sample' 2>&1 | Out-File -Encoding utf8 '$out'"
+        "& '$py' '$localProbe' '$localSample' 2>&1 | Out-File -Encoding utf8 '$out'"
     )
     Set-Content -Path $wrapper -Value $lines
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapper`""
@@ -114,6 +120,7 @@ Check 'the same read as LocalSystem (the service identity)' {
     while ((Get-Date) -lt $deadline -and -not ((Test-Path $out) -and ((Get-Content -Raw $out) -match '\}\s*$'))) { Start-Sleep 3 }
     $taskState = (Get-ScheduledTask -TaskName 'AnyAiCamLprProbe' -ErrorAction SilentlyContinue).State
     Unregister-ScheduledTask -TaskName 'AnyAiCamLprProbe' -Confirm:$false
+    Copy-Item $out, $wrapper -Destination $results -Force -ErrorAction SilentlyContinue
     if (-not ((Test-Path $out) -and ((Get-Content -Raw $out) -match '\}\s*$'))) { throw "SYSTEM probe produced no result in 600 s (task state $taskState)" }
     $j = Get-Content -Raw $out | ConvertFrom-Json
     if ($j.error) { throw (($j.error -split "`n" | Select-Object -Last 3) -join ' | ') }
