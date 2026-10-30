@@ -371,7 +371,9 @@ function MoqCheck([string]$Label) {
     Check "MoQ ($Label): the VMS MediaMTX runs, no MoQ listener (8892 TCP/UDP, 8893 UDP), WebRTC 8889 TCP + 8189 UDP present" {
         $vms = WaitFor 90 { @(Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" })[0] }
         if (-not $vms) { throw 'no VMS MediaMTX process' }
-        Start-Sleep -Seconds 5
+        # 1.3.4.1 (F-L run 2 on 46713ee): one sample 5 s after MediaMTX (re)started listed 9997 and 8189 but not yet the
+        # WebRTC HTTP listener (127.0.0.1:8889), which answered WHEP moments later. Wait up to 60 s for it; still required.
+        [void](WaitFor 60 { @(Get-NetTCPConnection -State Listen -LocalPort 8889 -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue).Count -gt 0 })
         $tcp = @(Get-NetTCPConnection -State Listen -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
         $udp = @(Get-NetUDPEndpoint -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
         if (-not $tcp -and -not $udp -and (SocketTableBlind)) {
@@ -837,24 +839,27 @@ Check 'shutdown: WinSW stop during delayed event finalization is bounded and pre
     if (-not ((Probe $file).streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'post-stop event clip is not playable' }
     "stop completed in $([math]::Round($stopwatch.Elapsed.TotalSeconds,1)) seconds; finalized event clip is playable"
 }
-Check 'live view resumes after the service restart: camera<N>.m3u8 rewritten by the NEW VMS within 60 s of its start, then fresh (< 10 s)' {
+Check 'live view resumes after the service restart: the NEW VMS rewrites camera<N>.m3u8 and it is fresh (< 10 s)' {
     # New in 1.3.4.1: a restarted VMS must bring live view back on its own. The playlist file survives the restart
     # (append_list), so only a write AFTER the new VMS process started counts.
     $python = @(VmsProcess | Select-Object -First 1)
     if (-not $python) { throw 'VMS Python process not found after the restart' }
     $started = (Get-Process -Id $python[0].ProcessId -ErrorAction Stop).StartTime
     $pl = Join-Path $data "hls\camera$camNo.m3u8"
+    # This check runs after the shutdown check (which itself waits for health and a new clip), so it cannot time the
+    # FIRST write after the restart -- LastWriteTime is the latest write. It proves the restarted VMS keeps live view
+    # going: a write after its start, fresh now. Waits at most 60 s from here, never from the restart.
     $deadline = $started.AddSeconds(60)
+    if ($deadline -lt (Get-Date).AddSeconds(60)) { $deadline = (Get-Date).AddSeconds(60) }
     do {
         $written = if (Test-Path -LiteralPath $pl) { (Get-Item -LiteralPath $pl).LastWriteTime } else { [datetime]::MinValue }
         if ($written -gt $started) { break }
         Start-Sleep -Seconds 1
     } while ((Get-Date) -lt $deadline)
-    if ($written -le $started) { throw "no playlist write since the VMS started at $($started.ToString('HH:mm:ss')) (60 s); last write $($written.ToString('HH:mm:ss'))" }
-    $resumeSeconds = [math]::Round(($written - $started).TotalSeconds, 1)
+    if ($written -le $started) { throw "no playlist write since the VMS started at $($started.ToString('HH:mm:ss')); last write $($written.ToString('HH:mm:ss'))" }
     $age = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $pl).LastWriteTime).TotalSeconds, 1)
-    if ($age -ge 10) { throw "first write $resumeSeconds s after the VMS started, but the playlist is $age s old now" }
-    "first playlist write $resumeSeconds s after the VMS started; age now $age s"
+    if ($age -ge 10) { throw "the restarted VMS wrote the playlist, but it is $age s old now" }
+    "restarted VMS (started $($started.ToString('HH:mm:ss'))) is rewriting the playlist; age now $age s"
 }
 MotionReaderRtsp 'motion'
 Info 'motion: /api/events?camera=<N> with the owner session' { $r = Edge GET "/api/events?camera=$camNo"; "status $($r.status); events $(@($r.body.events).Count)" }

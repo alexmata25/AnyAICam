@@ -130,3 +130,16 @@ def test_port_8000_is_not_tested_never_passed_when_the_socket_table_is_empty():
     head = SCRIPT.split("$tableListeners = ", 1)[1].split("Check 'listening on the local network (0.0.0.0:8000)' {", 1)[0]
     assert "if ($tableListeners -eq 0) {" in head and "NotTested 'listening on the local network (0.0.0.0:8000)'" in head
     assert "Check '" not in head
+
+
+def test_moq_check_waits_for_the_webrtc_listener_but_still_requires_it():
+    moq = FUNCTIONAL.split("function MoqCheck([string]$Label) {", 1)[1].split("\n}\n", 1)[0]
+    wait = moq.index("WaitFor 60 { @(Get-NetTCPConnection -State Listen -LocalPort 8889")
+    assert wait < moq.index("$tcp = @(Get-NetTCPConnection -State Listen -OwningProcess")
+    assert "if ($tcp -notcontains 8889 -or $udp -notcontains 8189) { throw" in moq
+
+
+def test_the_restart_check_does_not_claim_a_resume_time_it_cannot_measure():
+    block = FUNCTIONAL.split("Check 'live view resumes after the service restart", 1)[1].split("MotionReaderRtsp 'motion'", 1)[0]
+    assert "within 60 s of its start" not in block and "first playlist write" not in block
+    assert "$written -gt $started" in block and "if ($age -ge 10)" in block
