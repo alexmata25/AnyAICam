@@ -250,7 +250,14 @@ Check 'listening on the local network (0.0.0.0:8000)' {
         Start-Sleep 2
     }
     $netAll = @($net | Where-Object { $_ -match '^TCP 0\.0\.0\.0:8000 ' })
-    if (-not $cim -and -not $net) { throw "nothing listens on port 8000 (60 s); Get-NetTCPConnection: $cimError" }
+    if (-not $cim -and -not $net) {
+        # Tell "the VMS does not listen" from "this VM's TCP table is empty": list every listener netstat can see,
+        # and whether 127.0.0.1:8000 answers right now (a socket the table does not show).
+        $listening = @(netstat -ano -p tcp | Where-Object { $_ -match '\sLISTENING\s' } | ForEach-Object { $_.Trim() -replace '\s+', ' ' })
+        $answers = try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri 'http://127.0.0.1:8000/health').StatusCode } catch { "no ($($_.Exception.Message))" }
+        Set-Content (Join-Path $results 'port-8000-diagnostic.txt') (@("127.0.0.1:8000/health answers: $answers", "netstat LISTENING total: $($listening.Count)") + $listening)
+        throw "nothing listens on port 8000 (60 s); Get-NetTCPConnection: $cimError; netstat LISTENING total=$($listening.Count); /health answers: $answers"
+    }
     if (($cim -and ($cim.LocalAddress -contains '0.0.0.0')) -or $netAll) {
         $source = @($(if ($cim) { 'Get-NetTCPConnection' }), $(if ($netAll) { 'netstat' })) -join ' + '
         return "0.0.0.0:8000 ($source)$(if (-not $cim) { "; Get-NetTCPConnection saw nothing: $cimError" })"
