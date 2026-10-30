@@ -90,6 +90,12 @@ Check 'install: /version is 1.2.7 with the full build commit' { $v = (Http '/ver
 $app = Join-Path $env:ProgramFiles 'AnyAiCam'
 $data = Join-Path $env:ProgramData 'AnyAiCam'
 $agentState = Join-Path $data 'agent'
+# 1.3.4.1 (F-L on 46713ee): defined before the first check that uses it. PowerShell defines a script's functions only
+# when execution reaches them, so the LocalSystem and Job Object checks failed with "VmsProcess is not recognized".
+function VmsProcess {
+    # The running VMS: <app>\runtime\python\python.exe -m uvicorn main:app (the agent uses the same python, other args).
+    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" -and $_.CommandLine -match 'uvicorn\s+main:app' })
+}
 
 Check 'service identity and LocalSystem Tesseract/SAPI execution' {
     $service = Get-CimInstance Win32_Service -Filter "Name='AnyAiCamVMS'"
@@ -236,10 +242,6 @@ function EdgeSql([string]$Sql) {
     ($json | ConvertFrom-Json) | ForEach-Object { $_ }   # one pipeline object per row (none for an UPDATE)
 }
 function CurrentMode { AppPython 'import product_mode; print(product_mode.current_mode())' }
-function VmsProcess {
-    # The running VMS: <app>\runtime\python\python.exe -m uvicorn main:app (the agent uses the same python, other args).
-    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.ExecutablePath -like "$app\*" -and $_.CommandLine -match 'uvicorn\s+main:app' })
-}
 function VmsStartedAfterModeSaved {
     # 1.3.3 D3: product_mode.json alone gave a false PASS -- the VMS restarted (restart_vms) BEFORE the mode was saved
     # and kept the old mode's flags. The running VMS must have started after the mode file was last written.

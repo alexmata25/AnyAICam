@@ -82,3 +82,15 @@ def test_without_the_switch_the_sandbox_command_is_unchanged():
     command = MAKE_WSB.split("<Command>", 1)[1].split("</Command>", 1)[0]
     assert "$(if ($EnforceSmartAppControl)" in command
     assert r"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\$(if ($Functional)" in command
+
+
+FUNCTIONAL = (Path(__file__).resolve().parents[2] / "installer" / "windows" / "sandbox" / "functional-in-sandbox.ps1").read_text(encoding="utf-8-sig")
+
+
+def test_the_vms_process_helper_is_defined_before_the_1341_gate_checks_use_it():
+    # F-L on 46713ee: the LocalSystem Tesseract/SAPI (A1/A3) and Job Object (A4) checks called VmsProcess before the
+    # script had reached its definition ("The term 'VmsProcess' is not recognized").
+    definition = FUNCTIONAL.index("function VmsProcess {")
+    first_use = FUNCTIONAL.index("VmsProcess |")
+    assert definition < first_use
+    assert FUNCTIONAL.count("function VmsProcess {") == 1
