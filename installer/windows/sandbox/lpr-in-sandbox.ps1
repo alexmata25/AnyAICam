@@ -117,6 +117,24 @@ Check 'the same read as LocalSystem (the service identity)' {
     if ("$text" -ne 'ZPN720') { throw "SYSTEM read '$text'" }
     "identity $($j.identity); read $text in $($j.recognize_seconds) s"
 }
+# Additional lab samples (owner 2026-10-30: "LPR lab verification with additional samples"): assets\samples.json lists
+# { file, expected } -- the expected text read by eye. Each sample is its own exact-match check (no fuzzy pass).
+$manifest = Join-Path $assets 'samples.json'
+if (Test-Path $manifest) {
+    foreach ($s in @(Get-Content -Raw $manifest | ConvertFrom-Json)) {
+        Check "LPR sample $($s.file): reads $($s.expected)" {
+            $out = Join-Path $results ("lpr-sample-" + [IO.Path]::GetFileNameWithoutExtension($s.file) + ".json")
+            Push-Location (Join-Path $app 'app')
+            try { & $py $probe (Join-Path $assets $s.file) 2>&1 | Out-File -Encoding utf8 $out } finally { Pop-Location }
+            $j = Get-Content -Raw $out | ConvertFrom-Json
+            if ($j.error) { throw (($j.error -split "`n" | Select-Object -Last 3) -join ' | ') }
+            $text = Plate $j
+            if (-not $text) { throw "no plate recognized; detection=$($j.detection | ConvertTo-Json -Compress); glyph_read=$($j.glyph_read | ConvertTo-Json -Compress); text_read=$($j.text_read | ConvertTo-Json -Compress)" }
+            if ("$text" -ne $s.expected) { throw "read '$text': $($j.recognized | ConvertTo-Json -Compress)" }
+            "read $text in $($j.recognize_seconds) s: $($j.recognized | ConvertTo-Json -Compress)"
+        }
+    }
+}
 Check 'Code Integrity: nothing blocked under enforcement' {
     $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = 3033, 3076, 3077, 3089, 3091, 3092 } -ErrorAction SilentlyContinue)
     $ev | ForEach-Object { "{0:o}  {1}  {2}" -f $_.TimeCreated, $_.Id, ($_.Message -replace '\s+', ' ') } | Set-Content (Join-Path $results 'codeintegrity-events.txt')
