@@ -350,6 +350,22 @@ function MotionReaderRtsp([string]$Label) {
         "$($readers.Count) reader(s) on rtsp://"
     }
 }
+function SocketTableBlind {
+    # True when neither Get-NetTCPConnection nor netstat lists ANY listener: a working Windows always has some (RPC 135,
+    # SMB 445, ...), so an empty table means this VM cannot report sockets, not that nothing listens.
+    $cim = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)
+    $net = @(netstat -ano -p tcp | Where-Object { $_ -match '\sLISTENING\s' })
+    ($cim.Count -eq 0 -and $net.Count -eq 0)
+}
+function TcpAccepts([int]$Port) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try { $task = $client.ConnectAsync('127.0.0.1', $Port); ($task.Wait(3000) -and $client.Connected) } catch { $false } finally { $client.Dispose() }
+}
+function UdpPortFree([int]$Port) {
+    # An exclusive bind succeeds only if no other socket holds the port.
+    $socket = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Dgram, [System.Net.Sockets.ProtocolType]::Udp)
+    try { $socket.ExclusiveAddressUse = $true; $socket.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, $Port))); $true } catch { $false } finally { $socket.Dispose() }
+}
 function MoqCheck([string]$Label) {
     # O3: MediaMTX 1.21's default MoQ server (8892 TCP/UDP, 8893 UDP) must not run next to the VMS; WebRTC must.
     Check "MoQ ($Label): the VMS MediaMTX runs, no MoQ listener (8892 TCP/UDP, 8893 UDP), WebRTC 8889 TCP + 8189 UDP present" {
@@ -358,6 +374,18 @@ function MoqCheck([string]$Label) {
         Start-Sleep -Seconds 5
         $tcp = @(Get-NetTCPConnection -State Listen -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
         $udp = @(Get-NetUDPEndpoint -OwningProcess $vms.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
+        if (-not $tcp -and -not $udp -and (SocketTableBlind)) {
+            # 1.3.4.1 (F-L on 46713ee): this Sandbox's socket table is empty for EVERY process (WebRTC played over
+            # 127.0.0.1:8189 while the table showed nothing), so an empty list would make "no MoQ listener" pass
+            # vacuously. Prove both halves directly instead: connect for TCP, an exclusive bind for UDP.
+            $problems = @()
+            if (-not (TcpAccepts 8889)) { $problems += 'WebRTC TCP 8889 refuses connections' }
+            if (TcpAccepts 8892) { $problems += 'MoQ TCP 8892 accepts connections' }
+            foreach ($port in 8892, 8893) { if (-not (UdpPortFree $port)) { $problems += "MoQ UDP $port is held" } }
+            if (UdpPortFree 8189) { $problems += 'WebRTC UDP 8189 is not held' }
+            if ($problems) { throw ($problems -join '; ') }
+            return 'socket table empty in this Sandbox; probes: TCP 8889 accepts, TCP 8892 refuses, UDP 8892/8893 free, UDP 8189 held'
+        }
         if ($tcp -contains 8892 -or $udp -contains 8892 -or $udp -contains 8893) { throw "MoQ listening: tcp $($tcp -join ',') udp $($udp -join ',')" }
         if ($tcp -notcontains 8889 -or $udp -notcontains 8189) { throw "WebRTC ports missing: tcp $($tcp -join ',') udp $($udp -join ',')" }
         "tcp $($tcp -join ','); udp $($udp -join ',')"
@@ -751,6 +779,10 @@ Check 'motion (basic, default ON): the moving box produces motion events' {
     if (-not $events) { throw "no motion event for camera $camNo (motion_events.jsonl exists: $(Test-Path $file)); see diag-motion.txt" }
     "$(@($events).Count) motion event line(s)"
 }
+# 1.3.4.1 (F-L on 46713ee): back where 1.3.3 had it, right after motion is detected and with the same 10 s rule.
+# 224270c had moved it behind the WinSW stop/start test, so it sampled a playlist the restarted VMS had not yet
+# rewritten (age 25.5 s). The restart is now covered by its own timed check below.
+PlaylistFresh 'motion'
 Check 'recording: a motion event produces a finished playable event clip' {
     $clips = WaitFor 420 { $items = @(CurrentClips); if ($items.Count) { $items } }
     if (-not $clips) { Diag 'event-recording'; throw 'motion was detected but no finished event clip appeared' }
@@ -805,7 +837,25 @@ Check 'shutdown: WinSW stop during delayed event finalization is bounded and pre
     if (-not ((Probe $file).streams | Where-Object { $_.codec_type -eq 'video' })) { throw 'post-stop event clip is not playable' }
     "stop completed in $([math]::Round($stopwatch.Elapsed.TotalSeconds,1)) seconds; finalized event clip is playable"
 }
-PlaylistFresh 'motion'
+Check 'live view resumes after the service restart: camera<N>.m3u8 rewritten by the NEW VMS within 60 s of its start, then fresh (< 10 s)' {
+    # New in 1.3.4.1: a restarted VMS must bring live view back on its own. The playlist file survives the restart
+    # (append_list), so only a write AFTER the new VMS process started counts.
+    $python = @(VmsProcess | Select-Object -First 1)
+    if (-not $python) { throw 'VMS Python process not found after the restart' }
+    $started = (Get-Process -Id $python[0].ProcessId -ErrorAction Stop).StartTime
+    $pl = Join-Path $data "hls\camera$camNo.m3u8"
+    $deadline = $started.AddSeconds(60)
+    do {
+        $written = if (Test-Path -LiteralPath $pl) { (Get-Item -LiteralPath $pl).LastWriteTime } else { [datetime]::MinValue }
+        if ($written -gt $started) { break }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    if ($written -le $started) { throw "no playlist write since the VMS started at $($started.ToString('HH:mm:ss')) (60 s); last write $($written.ToString('HH:mm:ss'))" }
+    $resumeSeconds = [math]::Round(($written - $started).TotalSeconds, 1)
+    $age = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $pl).LastWriteTime).TotalSeconds, 1)
+    if ($age -ge 10) { throw "first write $resumeSeconds s after the VMS started, but the playlist is $age s old now" }
+    "first playlist write $resumeSeconds s after the VMS started; age now $age s"
+}
 MotionReaderRtsp 'motion'
 Info 'motion: /api/events?camera=<N> with the owner session' { $r = Edge GET "/api/events?camera=$camNo"; "status $($r.status); events $(@($r.body.events).Count)" }
 Check 'analytics: premium analytics are OFF by default on the new camera; Windows-unavailable ones say why' {

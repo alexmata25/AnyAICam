@@ -241,6 +241,14 @@ Check 'static assets served' { (Http '/static/brand-icon.png').StatusCode -eq 20
 # 1.3.4.1 (P-L on 46713ee, twice): Get-NetTCPConnection returned nothing for 60 s while /health on 127.0.0.1:8000 had
 # just answered and the service log said "Uvicorn running on http://0.0.0.0:8000". netstat (the kernel's TCP table)
 # is read alongside; the check still requires a 0.0.0.0:8000 listener and records which source saw it.
+$tableListeners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue).Count + @(netstat -ano -p tcp | Where-Object { $_ -match '\sLISTENING\s' }).Count
+if ($tableListeners -eq 0) {
+    # 1.3.4.1: this Sandbox reports NO listening socket at all (a working Windows always has RPC/SMB listeners), so the
+    # all-interfaces bind cannot be observed here. Recorded as NOT TESTED with the evidence, never as a pass.
+    $bindLine = @(Get-ChildItem (Join-Path $env:ProgramData 'AnyAiCam\logs') -Filter 'AnyAiCamVMS*.err.log' -ErrorAction SilentlyContinue |
+        ForEach-Object { Select-String -LiteralPath $_.FullName -Pattern 'Uvicorn running on http://\S+' -ErrorAction SilentlyContinue } | Select-Object -Last 1)
+    NotTested 'listening on the local network (0.0.0.0:8000)' "this Sandbox's socket table is empty for every process (Get-NetTCPConnection and netstat list 0 listeners); service log: $(if ($bindLine) { $bindLine.Matches[0].Value } else { 'no bind line' })"
+} else {
 Check 'listening on the local network (0.0.0.0:8000)' {
     $cim = $null; $net = @(); $cimError = ''
     foreach ($try in 1..30) {
@@ -263,6 +271,7 @@ Check 'listening on the local network (0.0.0.0:8000)' {
         return "0.0.0.0:8000 ($source)$(if (-not $cim) { "; Get-NetTCPConnection saw nothing: $cimError" })"
     }
     throw "listening on $((@($cim.LocalAddress) + $net) -join ', ')"
+}
 }
 
 # ---------------------------------------------------------------- files, data, permissions

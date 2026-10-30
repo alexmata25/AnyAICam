@@ -94,3 +94,39 @@ def test_the_vms_process_helper_is_defined_before_the_1341_gate_checks_use_it():
     first_use = FUNCTIONAL.index("VmsProcess |")
     assert definition < first_use
     assert FUNCTIONAL.count("function VmsProcess {") == 1
+
+
+def test_motion_freshness_is_sampled_right_after_motion_with_the_unchanged_10_second_rule():
+    # F-L on 46713ee: 224270c had moved PlaylistFresh 'motion' behind the WinSW stop/start test (age 25.5 s).
+    motion = FUNCTIONAL.index("Check 'motion (basic, default ON): the moving box produces motion events'")
+    fresh = FUNCTIONAL.index("PlaylistFresh 'motion'")
+    clip = FUNCTIONAL.index("Check 'recording: a motion event produces a finished playable event clip'")
+    shutdown = FUNCTIONAL.index("Check 'shutdown: WinSW stop during delayed event finalization")
+    assert motion < fresh < clip < shutdown
+    assert FUNCTIONAL.count("PlaylistFresh 'motion'") == 1
+    assert "if ($a -ge 10) { throw \"age $a s\" }" in FUNCTIONAL  # criterion untouched
+
+
+def test_live_view_must_resume_on_its_own_after_the_service_restart():
+    shutdown = FUNCTIONAL.index("Check 'shutdown: WinSW stop during delayed event finalization")
+    resume = FUNCTIONAL.index("Check 'live view resumes after the service restart")
+    assert shutdown < resume
+    block = FUNCTIONAL[resume:FUNCTIONAL.index("MotionReaderRtsp 'motion'", resume)]
+    assert "$started.AddSeconds(60)" in block and "$written -gt $started" in block  # only a write by the NEW VMS counts
+    assert "if ($age -ge 10)" in block
+
+
+def test_moq_check_never_passes_vacuously_on_an_empty_socket_table():
+    moq = FUNCTIONAL.split("function MoqCheck([string]$Label) {", 1)[1].split("\n}\n", 1)[0]
+    blind = moq.split("(SocketTableBlind)", 1)[1].split("return ", 1)[0]
+    for probe in ("TcpAccepts 8889", "TcpAccepts 8892", "UdpPortFree $port", "UdpPortFree 8189"):
+        assert probe in blind, probe
+    assert "foreach ($port in 8892, 8893)" in blind and "throw ($problems -join '; ')" in blind
+    helpers = FUNCTIONAL.split("function SocketTableBlind {", 1)[1].split("function MoqCheck", 1)[0]
+    assert "ExclusiveAddressUse = $true" in helpers and "$cim.Count -eq 0 -and $net.Count -eq 0" in helpers
+
+
+def test_port_8000_is_not_tested_never_passed_when_the_socket_table_is_empty():
+    head = SCRIPT.split("$tableListeners = ", 1)[1].split("Check 'listening on the local network (0.0.0.0:8000)' {", 1)[0]
+    assert "if ($tableListeners -eq 0) {" in head and "NotTested 'listening on the local network (0.0.0.0:8000)'" in head
+    assert "Check '" not in head
