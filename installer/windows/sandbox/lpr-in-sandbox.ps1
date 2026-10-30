@@ -40,6 +40,9 @@ Check 'lab plate model placed (not from the installer)' {
 $probe = Join-Path $results 'lpr_probe.py'
 $probeSource = @'
 import json, os, sys, time, hashlib
+# The embeddable runtime puts the SCRIPT's folder (results) on sys.path, not the working directory: add the
+# installed app folder explicitly (the service runs uvicorn main:app from there).
+sys.path.insert(0, os.path.join(os.environ["ProgramFiles"], "AnyAiCam", "app"))
 result = {"identity": os.environ.get("USERNAME")}
 try:
     os.environ.setdefault("YOLO_OFFLINE", "true")
