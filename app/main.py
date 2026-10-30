@@ -17518,6 +17518,8 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 # 'continuous', unknown or unreadable local_recording_mode included --
 # records through the event buffer below (Codex NO-GO b8c7a7ed, R-REC-1).
 EVENT_BUFFER_SEGMENT_SECONDS = 30
+# Options for the Matroska muxer inside the event-buffer segment muxer; see start_event_recording_buffer().
+EVENT_BUFFER_MUXER_OPTIONS = "flush_packets=1:cluster_time_limit=1000"
 EVENT_BUFFER_SUBFOLDER_NAME = "_event_buffer"
 LOCAL_RECORDING_MODE = "event"
 # (camera_number, stored value) pairs already logged as coerced to event,
@@ -17611,7 +17613,16 @@ def start_event_recording_buffer(camera_number: int) -> subprocess.Popen:
         "-map", "0:v:0", "-map", "0:a:0?",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
         "-f", "segment", "-segment_time", str(EVENT_BUFFER_SEGMENT_SECONDS),
-        "-reset_timestamps", "1", "-strftime", "1", output_pattern,
+        "-reset_timestamps", "1", "-strftime", "1",
+        # persist_event_recording() concats the segment ffmpeg is STILL WRITING (post-roll ends in it). By default the
+        # inner Matroska muxer holds whole clusters and a 32 KB I/O buffer in memory, so on a low-bitrate stream the
+        # open segment stayed 0 bytes on disk for 40+ s: the concat failed ("Invalid data", returncode 3199971767) or
+        # produced a clip a fraction of the event (Windows 1.3.4.1 Sandbox F-L, 5 of 8 events lost; reproduced at
+        # 60 kbit/s with FFmpeg 8.1.2). Flush every packet and close a cluster at least every second, so the file on
+        # disk trails real time by about a second at any bitrate (same reproduction: every concat succeeds, clip
+        # length = elapsed time).
+        "-segment_format_options", EVENT_BUFFER_MUXER_OPTIONS,
+        output_pattern,
     ]
     return subprocess.Popen(command, stderr=subprocess.PIPE)  # drained + redacted by process_supervisor
 
