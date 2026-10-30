@@ -108,9 +108,13 @@ Check 'the same read as LocalSystem (the service identity)' {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapper`""
     Register-ScheduledTask -TaskName 'AnyAiCamLprProbe' -Action $action -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
     Start-ScheduledTask -TaskName 'AnyAiCamLprProbe'
-    $deadline = (Get-Date).AddSeconds(240)
+    # LPR run 3: under host load the SYSTEM probe produced nothing within 240 s and the check reported an empty read.
+    # Wait up to 600 s and report a timeout as a timeout (with the task state), never as an empty plate.
+    $deadline = (Get-Date).AddSeconds(600)
     while ((Get-Date) -lt $deadline -and -not ((Test-Path $out) -and ((Get-Content -Raw $out) -match '\}\s*$'))) { Start-Sleep 3 }
+    $taskState = (Get-ScheduledTask -TaskName 'AnyAiCamLprProbe' -ErrorAction SilentlyContinue).State
     Unregister-ScheduledTask -TaskName 'AnyAiCamLprProbe' -Confirm:$false
+    if (-not ((Test-Path $out) -and ((Get-Content -Raw $out) -match '\}\s*$'))) { throw "SYSTEM probe produced no result in 600 s (task state $taskState)" }
     $j = Get-Content -Raw $out | ConvertFrom-Json
     if ($j.error) { throw (($j.error -split "`n" | Select-Object -Last 3) -join ' | ') }
     $text = Plate $j
@@ -121,7 +125,10 @@ Check 'the same read as LocalSystem (the service identity)' {
 # { file, expected } -- the expected text read by eye. Each sample is its own exact-match check (no fuzzy pass).
 $manifest = Join-Path $assets 'samples.json'
 if (Test-Path $manifest) {
-    foreach ($s in @(Get-Content -Raw $manifest | ConvertFrom-Json)) {
+    # Windows PowerShell 5.1 emits a JSON array as ONE pipeline object; @(...) around the pipeline then iterates once
+    # over the whole array (LPR run 3). Assign first, then enumerate.
+    $samples = Get-Content -Raw $manifest | ConvertFrom-Json
+    foreach ($s in $samples) {
         Check "LPR sample $($s.file): reads $($s.expected)" {
             $out = Join-Path $results ("lpr-sample-" + [IO.Path]::GetFileNameWithoutExtension($s.file) + ".json")
             Push-Location (Join-Path $app 'app')
