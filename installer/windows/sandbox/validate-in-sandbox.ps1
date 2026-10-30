@@ -68,7 +68,7 @@ function WaitHealthy([int]$Seconds) {
 Set-Content -Path (Join-Path $results 'report.txt') -Value ("AnyAiCam Windows validation " + (Get-Date -Format o) + " on " + [Environment]::OSVersion.VersionString)
 $setup = Get-ChildItem 'C:\Validation\setup' -Filter 'AnyAiCam-VMS-Setup-*.exe' | Select-Object -First 1
 Check 'setup file present' { if (-not $setup) { throw 'no AnyAiCam-VMS-Setup-*.exe' }; "$($setup.Name) $($setup.Length) bytes sha256=$((Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower())" }
-$expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+)-') { $Matches[1] } else { '' }
+$expectedVersion = if ($setup -and $setup.Name -match 'Setup-(\d+\.\d+\.\d+(?:\.\d+)?)-') { $Matches[1] } else { '' }
 # 2026-10-20 (owner): the customer-facing release (1.2.7) is the setup file's own Product version; the Windows setup
 # version (1.3.2) is in the file name. Setups before 1.3.2 had one number for both.
 $expectedCommit = if ($setup -and $setup.Name -match '-([0-9a-f]{7})\.exe$') { $Matches[1] } else { '' }
