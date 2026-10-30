@@ -216,7 +216,7 @@ Check 'VMS answers /health within 3 minutes' { WaitHealthy 180 }
 Check '/version reports the customer release and the exact build commit' { $v = (Http '/version').Content | ConvertFrom-Json; if ($expectedRelease -and $v.version -ne $expectedRelease) { throw "version $($v.version), expected $expectedRelease" }; if ($expectedCommit -and -not "$($v.build_id)".StartsWith($expectedCommit)) { throw "build $($v.build_id), expected commit $expectedCommit" }; if ("$($v.build_id)" -notmatch '^[0-9a-f]{40}$') { throw "build id $($v.build_id) is not a full commit" }; "version $($v.version) build $($v.build_id)" }
 Check '/login page served' { (Http '/login').StatusCode -eq 200 }
 Check 'static assets served' { (Http '/static/brand-icon.png').StatusCode -eq 200 }
-Check 'listening on the local network (0.0.0.0:8000)' { $l = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop; if (-not ($l.LocalAddress -contains '0.0.0.0')) { throw "listening on $($l.LocalAddress -join ',')" }; '0.0.0.0:8000' }
+Check 'listening on the local network (0.0.0.0:8000)' { $l = $null; foreach ($try in 1..30) { $l = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue; if ($l) { break }; Start-Sleep 2 }; if (-not $l) { throw 'nothing listens on port 8000 (60 s)' }; if (-not ($l.LocalAddress -contains '0.0.0.0')) { throw "listening on $($l.LocalAddress -join ',')" }; '0.0.0.0:8000' }
 
 # ---------------------------------------------------------------- files, data, permissions
 $app = Join-Path $env:ProgramFiles 'AnyAiCam'

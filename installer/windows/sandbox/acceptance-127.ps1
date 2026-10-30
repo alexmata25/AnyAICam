@@ -55,10 +55,15 @@ os.chdir(r'$app\app')
         # even when the helper intentionally exits 0 after a fail-closed result.
         $process = Start-Process -FilePath $py -ArgumentList ('"' + $file + '"') -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        # 1.3.4.1 (Sandbox P-L on 46713ee): Windows PowerShell 5.1 reports no ExitCode for a -PassThru process whose
+        # handle was never opened, so every helper call failed as "python exit :" with correct output. Cache the
+        # handle now and let the exit complete after the timed wait.
+        $null = $process.Handle
         if (-not $process.WaitForExit(30000)) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             throw 'python timed out after 30 seconds'
         }
+        $process.WaitForExit()
         $out = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw } else { '' }
         $err = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw } else { '' }
     } finally {
