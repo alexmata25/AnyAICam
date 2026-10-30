@@ -61,3 +61,24 @@ def test_smart_app_control_evidence_is_exported_before_the_summary():
                r"that did not meet the Enterprise signing level requirements.")
     pattern = re.search(r"-match '([^']+)'", export.split("$files = ", 1)[1]).group(1).replace("(?is)", "")
     assert re.search(pattern, message, re.I | re.S).group(1).endswith("cv2.pyd")
+
+
+MAKE_WSB = (Path(__file__).resolve().parents[2] / "installer" / "windows" / "sandbox" / "make-wsb.ps1").read_text(encoding="utf-8-sig")
+ENFORCE = (Path(__file__).resolve().parents[2] / "installer" / "windows" / "sandbox" / "enforce-sac.ps1").read_text(encoding="utf-8-sig")
+
+
+def test_enforced_smart_app_control_runs_turn_it_on_inside_the_sandbox_first():
+    # Since 2026-10-23 the Dell's Sandbox starts in SAC evaluation mode (state 2), where nothing is blocked.
+    assert "[switch]$EnforceSmartAppControl" in MAKE_WSB
+    assert "enforce_smart_app_control = $true" in MAKE_WSB and "'enforce-sac.ps1'" in MAKE_WSB
+    command = MAKE_WSB.split("<Command>", 1)[1].split("</Command>", 1)[0]
+    assert command.index("enforce-sac.ps1") < command.index("validate-in-sandbox.ps1")
+    assert "-Value 1 -Type DWord" in ENFORCE and "CiTool.exe') --refresh" in ENFORCE and "SAC-STATE" in ENFORCE
+    check = SCRIPT.split("if ($acceptanceSettings.enforce_smart_app_control) {", 1)[1].split("\n}\n", 1)[0]
+    assert "if ($state -ne 1) { throw" in check and "not enforced-SAC evidence" in check
+
+
+def test_without_the_switch_the_sandbox_command_is_unchanged():
+    command = MAKE_WSB.split("<Command>", 1)[1].split("</Command>", 1)[0]
+    assert "$(if ($EnforceSmartAppControl)" in command
+    assert r"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\$(if ($Functional)" in command

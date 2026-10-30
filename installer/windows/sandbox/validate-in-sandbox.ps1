@@ -192,6 +192,13 @@ Check 'code integrity / Smart App Control state (diagnostic)' {
     $signature = Get-AuthenticodeSignature -LiteralPath $setup.FullName
     "VerifiedAndReputablePolicyState=$($ci.VerifiedAndReputablePolicyState); setup signature=$($signature.Status)"
 }
+if ($acceptanceSettings.enforce_smart_app_control) {
+    Check 'Smart App Control ENFORCED for this run (make-wsb -EnforceSmartAppControl)' {
+        $state = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+        if ($state -ne 1) { throw "VerifiedAndReputablePolicyState=$($state): enforcement was requested but is not active; this run is not enforced-SAC evidence" }
+        'VerifiedAndReputablePolicyState=1 (enforced)'
+    }
+}
 # 2026-10-07: the first Sandbox run found torch's DLLs need the Visual C++
 # runtime, which a clean Windows lacks; setup now installs it and preflights.
 $installLog = Get-Content (Join-Path $results 'setup-install.log') -ErrorAction SilentlyContinue

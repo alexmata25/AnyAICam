@@ -28,7 +28,9 @@ param(
     # 2026-10-08: plant Windows 1.3.0's leftovers instead of running its
     # (unsigned) setup, for Smart App Control machines.
     [switch]$SimulatePrevious,
-    [switch]$Functional
+    [switch]$Functional,
+    # 1.3.4.1: turn Smart App Control ON inside the Sandbox before the run (enforce-sac.ps1); it starts in evaluation mode.
+    [switch]$EnforceSmartAppControl
 )
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Folder) { throw "Use a new folder: $Folder exists." }
@@ -77,6 +79,7 @@ if ($KeysetKind -eq 'synthetic-test') { Copy-Item -LiteralPath $SyntheticSigning
 # Functional scenario (2026-10-21): its entry script, the edge HTTP helper and the simulated ONVIF camera.
 if ($Functional) { foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', 'onvif-camera-sim.py', 'sandbox-proxy.py') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $root.FullName 'scripts') } }
 $runSettings = [ordered]@{ product_mode = $ProductMode; keyset_kind = $KeysetKind; expected_keyset_sha256 = $ExpectedKeysetSha256 }
+if ($EnforceSmartAppControl) { $runSettings.enforce_smart_app_control = $true; Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'enforce-sac.ps1') -Destination (Join-Path $root.FullName 'scripts') }
 if ($Functional) { $runSettings.functional = $true; if ($Previous) { $runSettings.functional_upgrade = $true } }
 $runSettings |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root.FullName 'scripts\acceptance.json') -Encoding ASCII
@@ -91,7 +94,7 @@ $wsb = @"
     <MappedFolder><HostFolder>$(& $escape (Join-Path $root.FullName 'results'))</HostFolder><SandboxFolder>C:\Validation\results</SandboxFolder><ReadOnly>false</ReadOnly></MappedFolder>
   </MappedFolders>
   <LogonCommand>
-    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\$(if ($Functional) { 'functional-in-sandbox.ps1' } else { 'validate-in-sandbox.ps1' })</Command>
+    <Command>$(if ($EnforceSmartAppControl) { 'cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\enforce-sac.ps1 &amp; ' })powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Validation\scripts\$(if ($Functional) { 'functional-in-sandbox.ps1' } else { 'validate-in-sandbox.ps1' })</Command>
   </LogonCommand>
 </Configuration>
 "@
