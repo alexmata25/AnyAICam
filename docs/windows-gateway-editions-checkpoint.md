@@ -10,6 +10,34 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Installer recovery handoff (from d95780e)
+
+Existing remediation document now opens with the exact sealed recovery request
+and shared-installer edition arguments. No prerequisite/cache audit was repeated.
+The current host is ALEXDELLSERVER; original-machine records identify
+AlexDellLaptop. No other machine connection was assumed or attempted.
+The recorded parity package `R430-win134-parity-d6b4244` remains unavailable at
+the checked local folder/zip/7z paths; request it unchanged with SHA256SUMS.txt
+digest `e9d6d867a764e48c07f6090d196ef0660dfac6c30f1dd91e6e49267e32bd43a0`.
+
+Important recovery correction: the approved Python 3.12.10 installer is present
+in the existing Blue supplement. Its current SHA-256 matches the sealed record:
+`67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb`.
+Supplement manifest/authenticity record and 579578b HANDOFF.md also match their
+recorded hashes. This supplies the installer file, not an installed helper;
+installation still needs approval and current signature verification remains
+a pre-installation prerequisite. No download
+is needed for this file. The original signed VMS baseline setup is present,
+but is not a source-cache substitute and was not extracted/installed.
+
+Blue's handoff also reports its prior signing certificate expired 2026-10-27;
+new signing needs current authorization, without exposing credentials. Build
+still uses one shared package with edition chosen during setup. No runtime,
+Blue source/handoff, retention or feature code was changed in this preparation.
+Fourteen targeted installer source/configuration checks passed in 7.118 seconds;
+git diff --check passed. The 84-check runtime suite was not repeated for these
+documentation-only updates.
+
 ## Active runtime integration (from 476ca2a)
 
 Committed as `0229300` after 80 focused checks passed; tree was clean before

@@ -1,5 +1,67 @@
 # Gateway build prerequisite remediation — 2026-11-02
 
+## Immediate recovery procedure (source d95780e)
+
+1. **Request the sealed dependency directory**, not a newly resolved environment:
+   `R430-win134-parity-d6b4244`, sealed 2026-10-27. Its original `SHA256SUMS.txt`
+   must hash to **`e9d6d867a764e48c07f6090d196ef0660dfac6c30f1dd91e6e49267e32bd43a0`**.
+   Blue's verified local `R430-win1341-release-handoff-579578b/HANDOFF.md` §6
+   identifies this package as containing vendor files, 108 wheels, Inno **7.1.0**
+   and the public keyset. The current 579578b package does **not** duplicate them.
+   Folder, `.zip` and `.7z` variants were unavailable at the recorded local
+   `C:\AnyAiCam-Transfer\` paths. Do not infer the earlier package's exact asset
+   filenames or completeness until its sealed manifest is supplied.
+2. **Request Blue's Tesseract artifact** from
+   `anyaicam-blue\windows-parity-scope-20261023\handoff-artifacts-d6b4244` if it
+   is not in that package: `tesseract-5.5.2-win64-anyaicam.zip`, SHA-256
+   `221b4599a9310737d8f3a2d8a93477eb3c495d41b5eca8af6ed7b79e0781fbf7`.
+   Check the recovered set against all eight names/hashes in build.ps1 and all
+   108 unchanged wheel pins; do not substitute a newer get-pip/redist, generic
+   Tesseract installer, or freshly rebuilt wheel. Exact versions/sources follow.
+3. **Reuse the Python installer already here**; no download is needed:
+   `C:\AnyAiCam-Transfer\R430-win1341-supplement-20261028\tools\python-3.12.10-amd64.exe`.
+   Current SHA-256 matches the sealed supplement:
+   **`67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb`**,
+   26,964,224 bytes. The supplement's manifest/authenticity-record hashes also
+   match. Blue recorded a valid Python Software Foundation signature and original
+   python.org provenance. Current Authenticode/Sigstore verification was not run.
+   Obtain approval before installation; then supply the installed 3.12.10
+   interpreter via -PythonExe. The installer EXE itself is not -PythonExe.
+4. **Original Dell access is not assumed.** This session is ALEXDELLSERVER;
+   the supplement identifies the original as AlexDellLaptop and records Python's
+   source under `C:\Users\Alejandro Mata\.codex\worktrees\540d\AnyAiCam-VMS\test-artifacts\rc11-normal-user-20261025-170614\`.
+   The original build directory `C:\VMS134Build\rc11-e3d7edab` is unavailable
+   here. No laptop connection was attempted. Owner must transfer the sealed
+   package or explicitly provide/authorize access to the correct machine/paths.
+5. **Before compilation**, recover/verify the pinned inputs into the ignored
+   vendor cache; approve Inno 7.1.0 and Python installation, setup/ReleaseVersion, and the public
+   keyset/environment/digest. The historical public keyset pin is
+   `2389a655fb3e5ed91e8a4a9216f9c45b97feb3847571b0536384b8305979af7c`;
+   independently confirm it before use. Select a current authorized signing
+   mode/session. The handoff reports its then-current signing certificate expired
+   2026-10-27; that does not invalidate an already timestamped baseline installer,
+   but it cannot be assumed usable for a new signature. No credentials are needed
+   in chat. A separate resource-window approval is still required to compile.
+
+**Packaging confirmation:** build.ps1 produces one shared VMS setup, with all
+eight vendor inputs and the full locked runtime. Edition selection is an
+installation-time argument to that setup, **not a build.ps1 switch**:
+
+| Fresh installation | Setup arguments |
+|---|---|
+| Local Gateway | `/GatewayEdition=local_gateway` (Local bootstrap) |
+| Cloud Gateway | `/GatewayEdition=cloud_gateway` (Hybrid bootstrap; uploads remain off) |
+| Full VMS | `/GatewayEdition=full_vms /ProductMode=local` or `hybrid` |
+
+All package the same recursive app source, edition helper, AppId, WinSW services
+and protected data layout. They are not separate applications or side-by-side
+installations. Existing repair/upgrade keeps its saved edition/mode. The accepted
+signed 1.3.4 setup is present in the 579578b handoff (618,425,712 bytes); it is
+lifecycle evidence, not a replacement for build dependencies and was not extracted.
+
+No installation, download, broad cache rescan, build, service or VM action was
+performed for this targeted recovery check. Blue's sealed handoffs were read only.
+
 Source baseline `f7d7533`; machine inspected: **AlexDellServer**. No software
 installed, binaries downloaded, installers extracted, build compiled, VM changed,
 certificate/private-key store opened or AWS/Stripe service accessed.
