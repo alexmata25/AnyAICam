@@ -10,10 +10,13 @@ param(
     # Optional explicit build interpreter. This avoids relying on a machine-wide
     # Python Launcher registration when the approved interpreter is per-user.
     [string]$PythonExe = '',
+    [string]$GitExe = '',
     [switch]$Sign,
     [switch]$AzureSign
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-tools.ps1')
+$GitExe = Resolve-BuildGit $GitExe
 . (Join-Path $PSScriptRoot 'publisher-pin.ps1')
 if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
 # Three or four decimal parts (1.3.2, or a hotfix 1.3.2.1): exactly what install-version-guard.ps1 accepts.
@@ -24,13 +27,27 @@ if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found:
 # The setup is built from a clean, committed tree: its name and the
 # ANYAICAM_BUILD_ID it installs both carry this exact commit.
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
-$sourceCommit = (& git -C $repo rev-parse HEAD).Trim()
+$sourceCommit = (& $GitExe -C $repo rev-parse HEAD).Trim()
 if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not read the source commit.' }
 # Every packaged repository folder (read from the .iss, so appliance-agent
 # is included) must be exactly the commit: see source-integrity.ps1.
 . (Join-Path $PSScriptRoot 'source-integrity.ps1')
-$sourceProblems = @(Get-PackagedSourceProblems $repo (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss'))
+$sourceProblems = @(Get-PackagedSourceProblems $repo (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss') -GitExe $GitExe)
 if ($sourceProblems.Count) { throw ("The packaged sources are not exactly commit $sourceCommit; build only from a committed tree:`n  " + ($sourceProblems -join "`n  ")) }
+# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
+# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
+if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
+$keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
+if ($PythonExe) {
+    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
+    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
+    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+} else {
+    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+}
+if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset was refused; nothing was built.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
 # Every vendored input is pinned by SHA-256 (DEPENDENCIES.md), not just present.
 $vendor = Join-Path $PSScriptRoot 'vendor'
 $pinned = [ordered]@{
@@ -130,20 +147,6 @@ if ($Sign -or $AzureSign) {
     }
     Write-Output "Runtime catalog signed and verified for all $($catalogMembers.Count) native files."
 }
-# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
-# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
-if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
-$keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
-if ($PythonExe) {
-    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
-    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
-    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
-} else {
-    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
-}
-if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset was refused; nothing was built.' }
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
 $compilerArguments += "/DAppVersion=$Version"
 $compilerArguments += "/DReleaseVersion=$ReleaseVersion"

@@ -27,7 +27,8 @@ telemetry. Do not start/modify Hyper-V VMs or terminate processes to make room.
 
 - [ ] **B01 Inventory:** review `windows-gateway-beta-prerequisites.json` and rerun
   the presence-only auditor if inputs change. On AlexDellServer it found missing
-  Inno Setup 7, Git on the build-shell PATH, 8 pinned vendor inputs and 108 wheels.
+  Inno Setup 7, 8 pinned vendor inputs and 108 wheels. Git is now resolved from
+  the existing installation without PATH changes; -GitExe supports explicit selection.
   SDK makecat/signtool exist; their integrity and usability remain unverified.
   Azure signing DLL/metadata were absent at their configured/default locations;
   certificate signing variables were unset. Signing mode remains an explicit decision.

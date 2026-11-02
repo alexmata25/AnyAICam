@@ -36,13 +36,13 @@ function Get-PackagedRepoFolders([string]$IssPath) {
     return $folders
 }
 
-function Get-PackagedSourceProblems([string]$Repo, [string]$IssPath) {
+function Get-PackagedSourceProblems([string]$Repo, [string]$IssPath, [string]$GitExe = 'git') {
     $folders = Get-PackagedRepoFolders $IssPath
     if (-not $folders.Contains('app') -or -not $folders.Contains('appliance-agent/anyaicam_agent')) {
         throw "Expected app and appliance-agent/anyaicam_agent among the packaged folders of $IssPath."
     }
     $paths = @($folders.Keys) + @('installer/windows')
-    $status = & git -C $Repo -c core.quotepath=off status --porcelain=v1 --ignored --untracked-files=all -- @paths
+    $status = & $GitExe -C $Repo -c core.quotepath=off status --porcelain=v1 --ignored --untracked-files=all -- @paths
     if ($LASTEXITCODE -ne 0) { throw 'git status failed; cannot verify the packaged sources.' }
     $problems = @()
     foreach ($entry in @($status)) {

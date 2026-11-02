@@ -1,12 +1,11 @@
 {
-  "recorded_at_utc": "2026-11-02T18:04:17.785800+00:00",
+  "recorded_at_utc": "2026-11-02T18:15:13.646724+00:00",
   "machine": "AlexDellServer",
   "checkout": "C:\\AnyAiCam-Gateway-Dev",
   "kind": "presence_only",
   "build_readiness": "NOT_VALIDATED",
   "missing_dependencies": [
     "inno_setup_7",
-    "git_on_path",
     "vendor_inputs",
     "wheels"
   ],
@@ -17,6 +16,11 @@
     },
     "git_on_path": {
       "present": false
+    },
+    "build_git": {
+      "path": "C:\\Program Files\\Git\\cmd\\git.exe",
+      "present": true,
+      "resolution": "installed_fallback"
     },
     "makecat": {
       "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\makecat.exe",

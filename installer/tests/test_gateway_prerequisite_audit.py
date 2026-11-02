@@ -27,7 +27,7 @@ class PrerequisiteAuditTests(unittest.TestCase):
             (win / 'wheels.lock.sha256').write_text('c' * 64 + '  a.whl\n')
             report = audit(root, env={'LOCALAPPDATA': str(root)}, which=lambda name: None)
             self.assertIn('inno_setup_7', report['missing_dependencies'])
-            self.assertIn('git_on_path', report['missing_dependencies'])
+            self.assertIn('build_git', report['missing_dependencies'])
             self.assertEqual(report['checks']['vendor_inputs']['missing'], ['a.zip'])
             self.assertEqual(report['checks']['wheels']['missing'], ['a.whl'])
             compiler = root / 'Programs/Inno Setup 7/ISCC.exe'

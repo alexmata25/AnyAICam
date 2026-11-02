@@ -11,6 +11,9 @@ is `windows-gateway-beta-prerequisites.json`; refresh it with
 `python tools/audit_windows_gateway_prerequisites.py --output docs/windows-gateway-beta-prerequisites.json`.
 The auditor executes no build tools, hashes no large inputs and contacts no
 services. NOT_VALIDATED is not permission or readiness to build.
+The follow-up `windows-gateway-prerequisite-remediation.md` records Blue's exact
+7.1.0 compiler provenance, all eight vendor roles, 108-wheel/cache reconciliation,
+interpreter roles and specific owner actions. Git discovery is resolved locally.
 
 ## Permitted lightweight verification
 

@@ -10,13 +10,52 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Build prerequisite remediation (from f7d7533)
+
+Full findings/owner actions: `docs/windows-gateway-prerequisite-remediation.md`.
+Blue's sealed 579578b handoff records Inno Setup **7.1.0** and the earlier
+`R430-win134-parity-d6b4244` package as the source of vendor inputs, wheels,
+compiler and public keyset. That package is unavailable at its recorded location
+here. Upstream source/verification pages were checked without obtaining binaries.
+Upstream 7.1.1 is different; no replacement or installation was authorized. The
+repo previously specified major 7 only, not an exact compiler patch.
+
+The bounded cache audit reconciled all 108 wheel locks with all 108 Windows pins
+and top-level manifests: zero missing requirements or version mismatches, including
+the CPU variants. No exact-name candidate for the 108 wheels or eight vendor
+inputs was found in the explicitly scanned caches. See
+`windows-gateway-wheel-audit.json` and `.csv` for scope/limits and per-wheel pins.
+No global disk-absence claim is made; inaccessible locations were not bypassed.
+All eight vendor inputs remain required for the shared installer.
+
+Git now resolves from its existing Program Files installation without PATH
+changes. Optional -GitExe is forwarded to both commit lookup and the unchanged
+packaged-source-integrity policy. Interpreter/pinned public-keyset validation
+now precedes vendor hashing/native extraction/catalog signing. PowerShell parser,
+helper and source-integrity tests pass without executing build.ps1. No pins,
+source-integrity exclusions or signing gates were weakened. DEPENDENCIES.md's
+stale 'Tesseract not bundled' row was removed; the pinned bundle is preserved.
+
+python --version / py --list-paths show only 3.15.0, the test interpreter. The
+explicit build-helper path needs verified 3.12.10; Blue's existing py -3.11 helper
+fallback remains. Shipped Python stays embedded 3.12.10. No qualifying helper
+was found at the documented paths/launcher. SDK tools exist; public keyset/pin,
+versions and signing configuration still require owner confirmation. No private
+key/credential/certificate-store contents were inspected or output.
+
+Owner actions: restore the approved sealed inputs or authorize exact-pin recovery;
+approve compiler/helper installation if no existing approved tools are supplied;
+confirm keyset/environment/digest, release versions and signing mode securely.
+Git/repository checks are resolved; vendor/wheel recovery is not. No build,
+installation, large download, VM change, live AWS/Stripe, push/merge/deploy occurred.
+
 ## Beta preparation update
 
 The presence-only audit is `tools/audit_windows_gateway_prerequisites.py`, with
 the recorded result in `docs/windows-gateway-beta-prerequisites.json`. It reads
 the build script and wheel lock directly; no tool execution, dependency download,
 large-file hashing, certificate-store inspection or external call occurs.
-On AlexDellServer it found Inno Setup 7 absent, Git absent from the build shell's
+The initial audit on AlexDellServer found Inno Setup 7 absent, Git absent from the build shell's
 PATH, all 8 pinned vendor inputs absent and all 108 locked wheels absent.
 makecat.exe and signtool.exe exist at the build's SDK paths, but their integrity
 and usability are unverified. No build interpreter or approved keyset was supplied.
@@ -189,7 +228,7 @@ No quota, retention period, billing policy or deletion behavior was changed.
 
 ## Validation and remaining work
 
-60 focused unittest checks passed sequentially, covering edition defaults, explicit override
+66 focused unittest checks passed sequentially, covering edition defaults, explicit override
 boundaries, Full VMS compatibility, Gateway notices, isolated actual transport
 functions with mocks, real PowerShell edition and product-mode blocks, event
 entitlement/retention policy with in-memory SQLite, and existing acceptance,

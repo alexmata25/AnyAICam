@@ -47,9 +47,13 @@ def audit(root=ROOT, env=None, which=shutil.which, build_python=None, keyset=Non
     azure_metadata = Path(env.get('ANYAICAM_AZURE_SIGNING_METADATA') or r'C:\AnyAiCamSigning\metadata.json')
     missing_inputs = [name for name in pinned if not (win / 'vendor' / name).is_file()]
     missing_wheels = [name for name in wheels if not (win / 'vendor/wheels' / name).is_file()]
+    path_git = which('git')
+    installed_git = Path(env.get('ProgramFiles', 'missing-programfiles')) / 'Git/cmd/git.exe'
+    resolved_git = str(path_git) if path_git else (str(installed_git) if installed_git.is_file() else None)
     checks = {
         'inno_setup_7': {'path': str(compiler), 'present': compiler.is_file()},
-        'git_on_path': {'present': bool(which('git'))},
+        'git_on_path': {'present': bool(path_git)},
+        'build_git': {'path': resolved_git, 'present': bool(resolved_git), 'resolution': 'PATH' if path_git else 'installed_fallback'},
         'makecat': {'path': str(makecat), 'present': makecat.is_file()},
         'signtool': {'path': str(signtool), 'present': signtool.is_file()},
         'build_python': {'provided': bool(build_python), 'present': bool(build_python and Path(build_python).is_file()), 'version_verified': False},
@@ -64,7 +68,7 @@ def audit(root=ROOT, env=None, which=shutil.which, build_python=None, keyset=Non
         'vendor_inputs': {'required_count': len(pinned), 'missing': missing_inputs, 'hashes_verified': False},
         'wheels': {'required_count': len(wheels), 'missing': missing_wheels, 'hashes_verified': False},
     }
-    missing = [name for name in ('inno_setup_7', 'git_on_path', 'makecat', 'signtool') if not checks[name]['present']]
+    missing = [name for name in ('inno_setup_7', 'build_git', 'makecat', 'signtool') if not checks[name]['present']]
     if missing_inputs:
         missing.append('vendor_inputs')
     if missing_wheels:
