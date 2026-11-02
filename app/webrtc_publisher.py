@@ -1102,7 +1102,53 @@ def _forward_client_ice_candidate(session_location: str, candidate: dict) -> Non
         logger.info("webrtc_publisher.ice_forward_failed error=%s", error)
 
 
+def _gateway_runtime() -> bool:
+    from gateway_edition import current_edition
+    return current_edition() != "full_vms"
+
+
+def _remote_access_allowed() -> bool:
+    return not _gateway_runtime() or product_mode._resolve("ANYAICAM_LIVE_P2P_ENABLED", False)
+
+
+def _close_remote_whep_sessions() -> None:
+    """Close only cloud-brokered sessions, preserving LAN sessions and paths."""
+    from urllib.parse import urlsplit
+    base = urlsplit(MEDIAMTX_WEBRTC_BASE)
+    with _lock:
+        sessions = list(_whep_sessions.items())
+    for session_id, location in sessions:
+        target = urlsplit(location)
+        if (target.scheme, target.netloc) != (base.scheme, base.netloc):
+            continue  # never send a capability DELETE to another origin
+        closed = False
+        try:
+            request = urllib.request.Request(location, method="DELETE")
+            with urllib.request.urlopen(request, timeout=3) as response:
+                closed = 200 <= response.status < 300
+        except urllib.error.HTTPError as error:
+            closed = error.code in {404, 410}
+        except (OSError, TimeoutError):
+            pass
+        if closed:
+            with _lock:
+                if _whep_sessions.get(session_id) == location:
+                    _whep_sessions.pop(session_id, None)
+        else:
+            logger.warning("webrtc_publisher.remote_session_close_pending session_id=%s", session_id)
+
+
+async def _remote_access_guard() -> None:
+    while True:
+        if not _remote_access_allowed():
+            await asyncio.to_thread(_close_remote_whep_sessions)
+        await asyncio.sleep(SCAN_SECONDS)
+
+
 def _handle_pending_signal(camera_url_fn, item: dict) -> None:
+    if not _remote_access_allowed():
+        _close_remote_whep_sessions()
+        return
     session_id = item.get("session_id")
     camera_id = item.get("camera_id")
     kind = item.get("kind")
@@ -1123,7 +1169,11 @@ def _handle_pending_signal(camera_url_fn, item: dict) -> None:
         if result is None:
             return
         location, answer_sdp = result
-        _whep_sessions[session_id] = location
+        with _lock:
+            _whep_sessions[session_id] = location
+        if not _remote_access_allowed():
+            _close_remote_whep_sessions()
+            return
         _control_plane_post(f"/api/appliance/live/{camera_id}/p2p/answer", {"session_id": session_id, "sdp": answer_sdp})
     elif kind == "ice_client":
         location = _whep_sessions.get(session_id)
@@ -1161,6 +1211,9 @@ async def _bridge_tick(camera_url_fn) -> bool:
 
     Returns True when the cloud honored a long-poll (echoed
     long_poll_seconds), so the worker can re-poll without sleeping."""
+    if not _remote_access_allowed():
+        await asyncio.to_thread(_close_remote_whep_sessions)
+        return False
     path, timeout = _pending_poll_request()
     response = await asyncio.to_thread(_control_plane_get, path, timeout)
     if not isinstance(response, dict):
@@ -1183,7 +1236,7 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
     defaulting false -- this task does nothing (not even spawn MediaMTX)
     until that flag is explicitly set, matching the same fail-closed
     default every other opt-in worker in this codebase already uses."""
-    if RUNTIME_ROLE not in {"edge", "combined"} or not LIVE_P2P_ENABLED:
+    if RUNTIME_ROLE not in {"edge", "combined"} or (not LIVE_P2P_ENABLED and not _gateway_runtime()):
         webrtc_publisher_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)
@@ -1193,10 +1246,16 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
     # -inf, not 0.0: time.monotonic() counts from boot, so 0.0 delayed the
     # first refresh (the first path sync) until CONFIG_REFRESH_SECONDS of uptime.
     last_config_refresh = float("-inf")
+    remote_guard = asyncio.create_task(_remote_access_guard()) if _gateway_runtime() else None
     try:
         while True:
             long_poll_honored = False
             try:
+                if not _remote_access_allowed():
+                    webrtc_publisher_state["worker_status"] = "remote_disabled"
+                    await asyncio.sleep(SCAN_SECONDS)
+                    continue
+                webrtc_publisher_state["worker_status"] = "running"
                 _ensure_mediamtx_running()
                 now = time.monotonic()
                 if now - last_config_refresh >= CONFIG_REFRESH_SECONDS:
@@ -1221,4 +1280,7 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
             # yield to the loop and poll again straight away.
             await asyncio.sleep(_delay_after_poll(long_poll_honored))
     finally:
+        if remote_guard is not None:
+            remote_guard.cancel()
+            await asyncio.gather(remote_guard, return_exceptions=True)
         stop_mediamtx()

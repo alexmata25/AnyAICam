@@ -123,6 +123,37 @@ def is_hybrid() -> bool:
     return current_mode() == "hybrid"
 
 
+def remote_access_authorized() -> bool:
+    """A Gateway's local licence/bootstrap/override is not a remote-service grant."""
+    from gateway_edition import current_edition
+    if current_edition() == "full_vms":
+        return True
+    try:
+        return _read_persisted_mode() == "hybrid" and current_mode() == "hybrid"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def gateway_tunnel_request_denied(peer_host: str) -> bool:
+    """Revoke the existing WireGuard proxy without disabling LAN media routes."""
+    import ipaddress
+    try:
+        peer = ipaddress.ip_address(peer_host)
+        gateway = ipaddress.ip_address(os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_ADDRESS", "10.70.0.1").strip())
+    except ValueError:
+        return False
+    return peer == gateway and not remote_access_authorized()
+
+
+def apply_configuration_mode(configuration: dict) -> bool:
+    """Consume the existing authenticated configuration, including explicit cancellation."""
+    from gateway_edition import current_edition
+    mode = str(configuration.get("product_mode") or "").strip().lower()
+    if current_edition() != "full_vms" and "product_mode" in configuration and mode not in VALID_MODES:
+        mode = "local"  # no active remote plan; preserve the signed local licence
+    return persist_mode(mode)
+
+
 def persist_mode(mode: str) -> bool:
     """Called by edge_camera_sync.py when the cloud's own
     GET /api/appliance/configuration response reports a product_mode
@@ -178,6 +209,8 @@ def resolve_cloud_flag(env_var: str, *, legacy_default: bool = False) -> bool:
 
 
 def _resolve(env_var: str, legacy_default: bool) -> bool:
+    if env_var == "ANYAICAM_LIVE_P2P_ENABLED" and not remote_access_authorized():
+        return False
     from gateway_edition import VIDEO_FLAGS, video_transport_allowed
     if env_var in VIDEO_FLAGS and not video_transport_allowed(VIDEO_FLAGS[env_var]):
         return False

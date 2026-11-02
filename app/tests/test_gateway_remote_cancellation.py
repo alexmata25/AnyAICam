@@ -1,0 +1,183 @@
+"""Gateway cancellation uses authenticated configuration, never a local licence override."""
+import asyncio
+import os
+from pathlib import Path
+import tempfile
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, patch
+import urllib.error
+import urllib.request
+
+from app.tests.test_gateway_licensing import load_functions
+import product_mode as pm
+
+
+class GatewayRemoteCancellationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        state = patch.object(pm, 'STATE_FILE', Path(self.temp.name) / 'mode.json')
+        state.start(); self.addCleanup(state.stop)
+        env = patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'cloud_gateway',
+            pm.PRODUCT_MODE_ENV:'hybrid', pm.BOOTSTRAP_MODE_ENV:'hybrid', 'ANYAICAM_LIVE_P2P_ENABLED':'true'})
+        env.start(); self.addCleanup(env.stop)
+
+    def test_bootstrap_and_local_licence_do_not_enable_remote_service(self):
+        self.assertEqual(pm.current_mode(), 'hybrid')
+        self.assertFalse(pm.remote_access_authorized())
+        self.assertFalse(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', True))
+
+    def test_wireguard_cancellation_preserves_lan_and_full_vms(self):
+        with patch.dict(os.environ, {'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':'10.70.0.1'}):
+            self.assertTrue(pm.gateway_tunnel_request_denied('10.70.0.1'))
+            self.assertFalse(pm.gateway_tunnel_request_denied('192.168.1.50'))
+            self.assertFalse(pm.gateway_tunnel_request_denied('127.0.0.1'))
+            pm.apply_configuration_mode({'product_mode':'hybrid'})
+            self.assertFalse(pm.gateway_tunnel_request_denied('10.70.0.1'))
+            pm.apply_configuration_mode({'product_mode':''})
+            self.assertTrue(pm.gateway_tunnel_request_denied('10.70.0.1'))
+            with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'full_vms'}):
+                self.assertFalse(pm.gateway_tunnel_request_denied('10.70.0.1'))
+
+    def test_cancelled_tunnel_stops_before_static_hls_or_maintenance_io(self):
+        ns = {}
+        load_functions('main.py', {'maintenance_mode_middleware'}, ns)
+        ns['JSONResponse'] = lambda **kwargs: kwargs
+        ns['asyncio'] = asyncio
+        ns['load_maintenance_state'] = Mock(side_effect=AssertionError('must not read maintenance state'))
+        call_next = Mock(side_effect=AssertionError('must not serve static media'))
+        request = SimpleNamespace(client=SimpleNamespace(host='10.70.0.1'))
+        with patch.dict(os.environ, {'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':'10.70.0.1'}):
+            response = asyncio.run(ns['maintenance_mode_middleware'](request, call_next))
+        self.assertEqual(response['status_code'], 403)
+        call_next.assert_not_called()
+
+    def test_explicit_cancel_overrules_admin_mode_and_feature_override(self):
+        self.assertTrue(pm.apply_configuration_mode({'product_mode':'hybrid'}))
+        self.assertTrue(pm.remote_access_authorized())
+        self.assertTrue(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', False))
+        self.assertTrue(pm.apply_configuration_mode({'product_mode':''}))
+        self.assertEqual(pm.current_mode(), 'hybrid')  # administrative mode still retained
+        self.assertFalse(pm.remote_access_authorized())
+        self.assertFalse(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', True))
+
+    def test_old_configuration_omission_is_not_confused_with_explicit_cancellation(self):
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        self.assertFalse(pm.apply_configuration_mode({}))
+        self.assertTrue(pm.remote_access_authorized())
+        for value in (None, 'unknown', 'local'):
+            pm.apply_configuration_mode({'product_mode':'hybrid'})
+            pm.apply_configuration_mode({'product_mode':value})
+            self.assertFalse(pm.remote_access_authorized())
+
+    def test_reactivation_and_admin_disable(self):
+        pm.apply_configuration_mode({'product_mode':'local'})
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        self.assertTrue(pm.remote_access_authorized())
+        with patch.dict(os.environ, {pm.PRODUCT_MODE_ENV:'local'}):
+            self.assertFalse(pm.remote_access_authorized())
+        with patch.dict(os.environ, {'ANYAICAM_LIVE_P2P_ENABLED':'false'}):
+            self.assertFalse(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', True))
+
+    def test_full_vms_retains_legacy_override_and_empty_mode_behavior(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'full_vms'}):
+            pm.persist_mode('hybrid')
+            self.assertFalse(pm.apply_configuration_mode({'product_mode':''}))
+            self.assertTrue(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', False))
+
+    def test_malformed_mode_state_fails_closed(self):
+        pm.STATE_FILE.write_text('[]', encoding='utf-8')
+        self.assertFalse(pm.remote_access_authorized())
+
+    def publisher(self):
+        response = Mock(); response.status = 204
+        response.__enter__ = Mock(return_value=response); response.__exit__ = Mock(return_value=False)
+        http = Mock(return_value=response)
+        ns = {'product_mode':pm, 'MEDIAMTX_WEBRTC_BASE':'http://127.0.0.1:8889',
+              '_lock':threading.Lock(), '_whep_sessions':{}, '_known_paths':{'c1'},
+              'logger':Mock(), 'urllib':SimpleNamespace(request=SimpleNamespace(Request=urllib.request.Request, urlopen=http), error=urllib.error),
+              'whep_offer':Mock(return_value=('http://127.0.0.1:8889/c1/whep/token', 'answer')),
+              '_control_plane_post':Mock(), '_forward_client_ice_candidate':Mock()}
+        load_functions('webrtc_publisher.py', {'_gateway_runtime','_remote_access_allowed','_close_remote_whep_sessions','_handle_pending_signal'}, ns)
+        return ns, http
+
+    def test_cancel_closes_only_remote_session_and_denies_new_offer(self):
+        ns, http = self.publisher()
+        ns['_whep_sessions']['s1'] = 'http://127.0.0.1:8889/c1/whep/token'
+        pm.apply_configuration_mode({'product_mode':'local'})
+        ns['_handle_pending_signal'](Mock(), {'session_id':'s2','camera_id':'c1','kind':'offer','payload':{'sdp':'offer'}})
+        self.assertEqual(ns['_whep_sessions'], {})
+        self.assertEqual(ns['_known_paths'], {'c1'})  # LAN paths unchanged
+        self.assertEqual(http.call_args.args[0].method, 'DELETE')
+        ns['whep_offer'].assert_not_called(); ns['_control_plane_post'].assert_not_called()
+
+    def test_cancel_during_offer_never_publishes_answer(self):
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        ns, http = self.publisher()
+        def offer(*args):
+            pm.apply_configuration_mode({'product_mode':'local'})
+            return 'http://127.0.0.1:8889/c1/whep/token', 'answer'
+        ns['whep_offer'].side_effect = offer
+        ns['_handle_pending_signal'](Mock(), {'session_id':'s1','camera_id':'c1','kind':'offer','payload':{'sdp':'offer'}})
+        ns['_control_plane_post'].assert_not_called()
+        http.assert_called_once(); self.assertEqual(ns['_whep_sessions'], {})
+
+    def test_failed_close_is_retained_for_retry_and_foreign_origin_is_not_contacted(self):
+        ns, http = self.publisher()
+        ns['_whep_sessions'] = {'s1':'http://127.0.0.1:8889/c1/whep/token', 'foreign':'https://untrusted.invalid/token'}
+        http.side_effect = OSError('mock unavailable')
+        ns['_close_remote_whep_sessions']()
+        self.assertEqual(len(ns['_whep_sessions']), 2)
+        self.assertEqual(http.call_count, 1)
+        http.side_effect = None
+        ns['_close_remote_whep_sessions']()
+        self.assertEqual(set(ns['_whep_sessions']), {'foreign'})
+
+    def test_guard_closes_sessions_independently_of_blocked_control_poll(self):
+        class TickComplete(Exception): pass
+        async def to_thread(function): function()
+        async def sleep(delay): raise TickComplete()
+        close = Mock()
+        ns = {'asyncio':SimpleNamespace(to_thread=to_thread, sleep=sleep),
+              '_remote_access_allowed':lambda:False, '_close_remote_whep_sessions':close, 'SCAN_SECONDS':1}
+        load_functions('webrtc_publisher.py', {'_remote_access_guard'}, ns)
+        with self.assertRaises(TickComplete): asyncio.run(ns['_remote_access_guard']())
+        close.assert_called_once()
+
+    def test_dormant_gateway_worker_can_activate_without_restarting_vms(self):
+        class TickComplete(BaseException): pass
+        allowed = [False]
+        sleeps = []
+        async def sleep(delay):
+            sleeps.append(delay)
+            if len(sleeps) > 1: raise TickComplete()
+            allowed[0] = True
+        async def guard(): pass
+        async def gather(*args, **kwargs): return []
+        guard_task = Mock()
+        def create_task(coroutine):
+            coroutine.close()  # no background task in this isolated test
+            return guard_task
+        start = Mock(side_effect=TickComplete())
+        stop = Mock()
+        ns = {'RUNTIME_ROLE':'edge', 'LIVE_P2P_ENABLED':False, 'SCAN_SECONDS':1,
+              '_gateway_runtime':lambda:True, '_remote_access_allowed':lambda:allowed[0],
+              '_remote_access_guard':guard, '_ensure_mediamtx_running':start,
+              'stop_mediamtx':stop, 'webrtc_publisher_state':{}, 'logger':Mock(),
+              'asyncio':SimpleNamespace(sleep=sleep, create_task=create_task, gather=gather, CancelledError=asyncio.CancelledError)}
+        load_functions('webrtc_publisher.py', {'webrtc_publisher_worker'}, ns)
+        with self.assertRaises(TickComplete): asyncio.run(ns['webrtc_publisher_worker'](Mock()))
+        self.assertEqual(sleeps, [1])
+        start.assert_called_once()
+        guard_task.cancel.assert_called_once()
+
+    def test_cancelled_tunnel_token_is_refused_before_file_or_secret_lookup(self):
+        class Refused(Exception):
+            def __init__(self, status_code, detail): self.status_code = status_code
+        pm.apply_configuration_mode({'product_mode':'local'})
+        ns = {'HTTPException':Refused}
+        load_functions('main.py', {'appliance_media_fetch_endpoint'}, ns)
+        with self.assertRaises(Refused) as error:
+            ns['appliance_media_fetch_endpoint']('/recordings/test.mp4', 9999999999, 'old-token')
+        self.assertEqual(error.exception.status_code, 403)

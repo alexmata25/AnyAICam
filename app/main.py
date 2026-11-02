@@ -39744,6 +39744,9 @@ def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime,
 
 
 def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms" and not effective_analytics(recording_uploader._camera_identity(camera_number), camera_number):
+        return []  # revoked/expired inference must not create thumbnails or events
 
 
 
@@ -41467,6 +41470,12 @@ def effective_analytics(identity, camera_number: int, flags=AI_DETECTOR_ANALYTIC
     """The analytics actually active on this camera: camera flag AND appliance-wide switch. Never raises."""
     if not identity:
         return []
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms":
+        try:
+            identity = recording_uploader._entitled_identity(identity)
+        except Exception:
+            return []
     active = []
     for flag in flags:
         try:
@@ -43867,6 +43876,9 @@ async def maintenance_mode_middleware(request: Request, call_next):
     # Health and readiness endpoints use this middleware too. Keep filesystem
     # latency off the ASGI event loop so a slow recordings/config mount cannot
     # stall every request.
+    from product_mode import gateway_tunnel_request_denied
+    if request.client and gateway_tunnel_request_denied(request.client.host):
+        return JSONResponse(status_code=403, content={"detail": "Remote access is not active for this Gateway."})
     state = await asyncio.to_thread(load_maintenance_state)
 
 
@@ -146389,6 +146401,9 @@ def customer_event_media_download(camera_id: str, event_id: str, request: Reques
 
 @app.get("/api/appliance/media-fetch")
 def appliance_media_fetch_endpoint(path: str, expires: int, token: str):
+    from product_mode import remote_access_authorized
+    if not remote_access_authorized():
+        raise HTTPException(status_code=403, detail="Remote access is not active for this Gateway.")
     """The appliance-side half of customer_event_media_direct()'s
     authenticated fetch (2026-09-19) -- runs identically whether this
     process is the cloud portal or a real edge appliance, but is only

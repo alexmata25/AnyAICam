@@ -10,6 +10,44 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Remote cancellation and detection boundaries (from 8bbcca2)
+
+Both approved roots passed temporary-file create/read/delete probes:
+`C:\AnyAiCam-Gateway-Dev` and `C:\AAC-Dev-Reports`. The external master checklist
+was reconciled first: its standalone Linux branch/CLI and commercial-policy
+claims are preserved as historical context, not Windows requirements.
+
+Gateway remote access now requires persisted Hybrid configuration from the
+existing authenticated configuration channel. Bootstrap, administrative flags
+and a retained local licence cannot substitute for that grant. Explicit empty,
+null or unknown configuration mode revokes remote access; an omitted key retains
+compatibility. Full VMS keeps its existing mode and override behavior.
+The publisher rechecks authorization before offers, after an in-flight offer,
+and independently of long polling. Revocation retries closure of cloud-brokered
+WHEP sessions using their existing local capabilities, preserving LAN paths.
+A dormant Gateway publisher can activate after a later configuration grant.
+Media-fetch tokens cannot bypass cancellation; requests from the configured
+WireGuard gateway address are refused before static HLS/media delivery while
+remote access is inactive. Installed acceptance must verify the actual proxy
+source address and trusted-proxy configuration against this configured address.
+
+Cancellation takes effect after configuration is received; this does not add
+an offline subscription-expiry deadline. Existing configuration-change restart
+behavior is preserved. These changes do not promise uninterrupted recording
+during that existing restart, nor alter local licensing or retention.
+
+Gateway premium detection rechecks signed per-camera analytic grants at use
+and before persisting inference results. Cached camera flags and a combined
+role cannot bypass the gate. Basic Motion/local recording fields and valid
+independent local analytic grants survive remote-plan cancellation. Full VMS
+retains its existing behavior. No billing, quota or deletion policy changed.
+
+Validation: the fixed sequential runner now contains the original 84 checks
+plus 20 remote/detection regressions (104 total). All passed with mocks and
+small temporary files; no application, service, inference model or AWS client
+was started. Installed cancellation timing, actual WHEP teardown, WireGuard
+proxy identity and Blue's lifecycle acceptance remain hardware acceptance gates.
+
 ## Installer recovery handoff (from d95780e)
 
 Existing remediation document now opens with the exact sealed recovery request

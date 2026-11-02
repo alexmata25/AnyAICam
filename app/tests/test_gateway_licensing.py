@@ -18,7 +18,7 @@ import vms_capacity
 
 def load_functions(source, names, namespace):
     tree = ast.parse((ROOT / 'app' / source).read_text(encoding='utf-8'))
-    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    functions = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
     assert len(functions) == len(names)
     for function in functions:
         function.decorator_list = []  # call route logic without registering a web app

@@ -14,6 +14,8 @@ TEST_MODULES = (
     'app.tests.test_gateway_local_runtime',
     'app.tests.test_gateway_local_notifications',
     'app.tests.test_gateway_outbox_persistence',
+    'app.tests.test_gateway_remote_cancellation',
+    'app.tests.test_gateway_detection_boundaries',
     'installer.tests.test_gateway_edition_integration',
     'installer.tests.test_gateway_configuration_contract',
     'installer.tests.test_gateway_prerequisite_audit',

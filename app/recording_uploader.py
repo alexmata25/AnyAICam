@@ -512,7 +512,8 @@ def _entitled_identity(identity: dict | None) -> dict | None:
     read, so an expiring offline snapshot or a revocation stops processing at the next pipeline pass. Non-premium
     fields (camera id, site, recording mode) are never touched: basic motion, recording, live view and playback do
     not depend on it. Fails closed (premium off) if the check itself fails."""
-    if identity is None or RUNTIME_ROLE != "edge":
+    from gateway_edition import current_edition
+    if identity is None or (RUNTIME_ROLE != "edge" and current_edition() == "full_vms"):
         return identity
     import copy
     gated = copy.copy(identity)
