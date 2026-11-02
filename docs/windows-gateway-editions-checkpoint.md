@@ -10,6 +10,59 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Approved two-agent source sprint (from f72a112)
+
+Owner approved two agents, separate worktrees and combined 2 GiB additional
+RAM / 1 GiB disk planning allowance. Read-only telemetry before launch:
+ALEXDELLSERVER 2026-11-02 15:54:24 CST, 5.59 GiB available RAM, C: 5082.90 GiB
+free. Application and installer worktrees under
+`C:\AAC-Dev-Reports\Gateway-Worktrees` each started at f72a112. Application
+agent owned app/tests; installer agent owned installer/prerequisite checks and
+acceptance docs; coordinator owned integration, checkpoint/master and all test
+execution. Tests ran sequentially through one coordinator slot.
+
+Application commit `ea0a0bc` was applied locally as
+`f1d8e2d5ecf4ca95517984b18c097a0a210b740c`:
+
+- Non-object persisted mode JSON no longer crashes startup/configuration
+  recovery; it cannot serve as a remote-service grant.
+- Malformed WHEP session locations do not prevent cleanup of valid sessions.
+- The independent cancellation guard retries unexpected cleanup failures with
+  capability-safe logging while propagating task cancellation normally.
+- Four actual-function/mock regressions cover those failure/recovery paths.
+
+Installer commit `21e8ea8` was applied locally as
+`f3fd265b48f4a978835daea9360c87e9c31b9824`:
+
+- Build-only metadata guard requires numeric Inno version 7.1.0.0 before
+  staging or compiler execution. Wrong/missing/incomplete metadata fails closed.
+  This does not establish authenticity or replace sealed provenance checks.
+- Presence inventory explicitly reports required version and unverified version
+  status, preventing file presence from being mistaken for validated toolchain.
+- Two regressions plus strengthened inventory assertions cover the guard;
+  prerequisite/dependency/build/acceptance documents reflect it and disk gates.
+
+Coordinator targeted validation: 23 application checks passed in 1.726s and
+8 installer/prerequisite checks in 2.572s. Integrated fixed sequential runner:
+**115 passed in 22.058s**, preserving all 109 baseline checks. `git diff --check`
+passed. No new runtime imports, compiler execution, package installs, inference,
+VMS/VM startup, real video/cloud calls or signing operations occurred.
+
+At 15:59:04 CST, free RAM was 5.43 GiB and disk 5082.81 GiB; two worktrees
+occupied 85.17 MiB. These are resource snapshots, not a measured peak-memory
+profile. Worktree branches remain available as clean local evidence. All commits
+use repository-approved Alejandro Mata <amata@anyaicam.com> identity.
+
+No wholesale Blue merge occurred. Shared VMS architecture, edition transport
+boundaries, local licence/recording/playback/Basic Motion and retention policy
+are preserved. Latest-source certification still needs an authoritative current
+branch/ref or newer sealed handoff; the available 579578b/Blue bundles were
+already compared. The dependency payload/keyset remain unlocated in searched
+paths; Python installer and SDK are present but tool installation, versions,
+signing authorization and isolated installed acceptance still need their
+separate approvals. This sprint creates a validated source candidate, not a
+compiled/signed/installed 1.3.4.1 beta.
+
 ## 1.3.4.1 alignment comparison (from 2f501a6)
 
 Owner approves verified 1.3.4 as minimum, with 1.3.4.1 target. Gateway's direct
