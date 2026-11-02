@@ -51,7 +51,8 @@ def audit(root=ROOT, env=None, which=shutil.which, build_python=None, keyset=Non
     installed_git = Path(env.get('ProgramFiles', 'missing-programfiles')) / 'Git/cmd/git.exe'
     resolved_git = str(path_git) if path_git else (str(installed_git) if installed_git.is_file() else None)
     checks = {
-        'inno_setup_7': {'path': str(compiler), 'present': compiler.is_file()},
+        'inno_setup_7': {'path': str(compiler), 'present': compiler.is_file(),
+                         'required_version': '7.1.0', 'version_verified': False},
         'git_on_path': {'present': bool(path_git)},
         'build_git': {'path': resolved_git, 'present': bool(resolved_git), 'resolution': 'PATH' if path_git else 'installed_fallback'},
         'makecat': {'path': str(makecat), 'present': makecat.is_file()},
@@ -77,7 +78,7 @@ def audit(root=ROOT, env=None, which=shutil.which, build_python=None, keyset=Non
         'recorded_at_utc': datetime.now(timezone.utc).isoformat(), 'machine': platform.node(),
         'checkout': str(root), 'kind': 'presence_only', 'build_readiness': 'NOT_VALIDATED',
         'missing_dependencies': missing, 'checks': checks,
-        'remaining_gates': ['Approved setup and release versions', 'Verified build interpreter version',
+        'remaining_gates': ['Approved setup and release versions', 'Verified Inno Setup 7.1.0 metadata and approved provenance', 'Verified build interpreter version',
             'Approved public keyset and independently pinned hash', 'All vendor/wheel hashes and signatures',
             'Packaged source integrity and signing configuration', 'Licence/distribution review from DEPENDENCIES.md',
             'Separate resource-window approval; no build or VM operation has run'],

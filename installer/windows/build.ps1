@@ -23,7 +23,7 @@ if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or A
 if ($Version -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2,3}$') { throw "Version must look like 1.3.2 or 1.3.2.1 (got '$Version')." }
 if ($ReleaseVersion -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$') { throw "ReleaseVersion must look like 1.2.7 (got '$ReleaseVersion')." }
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
-if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+Assert-BuildInnoCompiler $iscc
 # The setup is built from a clean, committed tree: its name and the
 # ANYAICAM_BUILD_ID it installs both carry this exact commit.
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')

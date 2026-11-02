@@ -57,9 +57,11 @@ AWS/Stripe modification, push, merge or deployment is authorized here.
    approved customer-facing ReleaseVersion. Neither is implicitly changed by
    edition selection. Record the exact committed source SHA and clean packaged
    source state using the existing source-integrity checks.
-2. Confirm Inno Setup **7** at `%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe`,
+2. Confirm approved Inno Setup **7.1.0** at `%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe`,
    the exact path used by build.ps1. This dependency was not present in this
-   session. No installation or download was attempted.
+   session. Its numeric PE metadata is now checked before staging or compiler
+   execution; this does not replace sealed hash/provenance verification. No
+   installation or download was attempted.
 3. Supply the approved public entitlement keyset and its independently pinned
    lowercase SHA-256. Never include private signing keys or weaken the trust
    anchor. Confirm the verified build interpreter accepted by build.ps1

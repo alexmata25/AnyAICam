@@ -16,6 +16,7 @@ All installed-system rows currently remain **NOT RUN**.
 | Target | Explicitly approved isolated host/guest; no live Dell installation or customer footage |
 | Test identity | Approved isolated signed activation/entitlement fixtures; no live cloud credentials |
 | Resources | Timestamp, R430 current available/total RAM, estimated additional peak RAM, duration and basis |
+| Disk | Current free space on staging/temp/evidence volumes and estimated peak additional space; separate approval before large dependency recovery or build |
 | Existing VMs | Names, running states and allocations; explicitly list every VM that will remain running unchanged |
 | Evidence | Test-only logs/JSON/screenshots, without passwords, private keys or raw credential files |
 

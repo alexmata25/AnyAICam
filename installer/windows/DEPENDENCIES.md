@@ -6,8 +6,10 @@ The shared Full VMS / Local Gateway / Cloud Gateway installer requires all eight
 pinned vendor inputs and the complete 108-wheel lock. Optional runtime analytics
 do not make their packaged dependencies optional build inputs. Gateway editions
 must not silently strip Vosk, Tesseract or the Full VMS dependency set.
-Blue's sealed 1.3.4 handoff records Inno Setup **7.1.0**; build.ps1's existing
-compiler path specifies major version 7, not a patch-level pin. Prefer recovery
+Blue's sealed 1.3.4 handoff records Inno Setup **7.1.0**; build.ps1 checks the
+compiler's numeric PE version metadata before staging or compiler execution.
+This check does not establish authenticity; approved provenance/hashes and
+normal publisher verification are still required. Prefer recovery
 of the sealed toolchain; any replacement version/install needs owner approval.
 See `../../docs/windows-gateway-prerequisite-remediation.md` for provenance,
 local-cache findings, interpreter roles and unresolved approval gates.

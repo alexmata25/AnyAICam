@@ -9,6 +9,36 @@ WIN = ROOT / 'installer/windows'
 
 
 class GatewayBuildToolsTests(unittest.TestCase):
+    def test_compiler_metadata_refuses_wrong_patch_missing_metadata_and_non_executable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fake = Path(folder) / 'ISCC.exe'
+            fake.write_bytes(b'not executable; must never be run')
+            script = """
+            $ErrorActionPreference = 'Stop'
+            . '%s'
+            $accepted = [pscustomobject]@{FileMajorPart=7;FileMinorPart=1;FileBuildPart=0;FilePrivatePart=0}
+            if (Get-BuildInnoVersionProblem $accepted) { throw 'approved metadata refused' }
+            foreach ($field in @('FileMajorPart','FileMinorPart','FileBuildPart','FilePrivatePart')) {
+                $changed = $accepted.PSObject.Copy()
+                $changed.$field = $changed.$field + 1
+                if (-not (Get-BuildInnoVersionProblem $changed)) { throw 'other compiler version accepted' }
+            }
+            if (-not (Get-BuildInnoVersionProblem $null)) { throw 'absent metadata accepted' }
+            if (-not (Get-BuildInnoVersionProblem ([pscustomobject]@{FileMajorPart=7}))) { throw 'incomplete metadata accepted' }
+            foreach ($path in @('%s','%s','%s')) {
+                $refused = $false
+                try { Assert-BuildInnoCompiler $path } catch { $refused = $true }
+                if (-not $refused) { throw 'unverified compiler accepted' }
+            }
+            """ % (WIN / 'build-tools.ps1', fake, Path(folder) / 'missing.exe', folder)
+            result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_compiler_guard_precedes_staging_and_compilation(self):
+        source = (WIN / 'build.ps1').read_text(encoding='utf-8')
+        self.assertLess(source.index('Assert-BuildInnoCompiler $iscc'), source.index('Export-NativeFiles'))
+        self.assertLess(source.index('Assert-BuildInnoCompiler $iscc'), source.index('& $iscc @compilerArguments'))
+
     def test_explicit_git_and_source_integrity_guard_without_path_changes(self):
         with tempfile.TemporaryDirectory() as folder:
             fake = Path(folder) / 'fake git.ps1'

@@ -35,6 +35,8 @@ class PrerequisiteAuditTests(unittest.TestCase):
             compiler.write_bytes(b'not an executable')
             report = audit(root, env={'LOCALAPPDATA': str(root)}, which=lambda name: None)
             self.assertNotIn('inno_setup_7', report['missing_dependencies'])
+            self.assertEqual(report['checks']['inno_setup_7']['required_version'], '7.1.0')
+            self.assertFalse(report['checks']['inno_setup_7']['version_verified'])
             self.assertEqual(report['build_readiness'], 'NOT_VALIDATED')
             self.assertFalse(report['checks']['vendor_inputs']['hashes_verified'])
             self.assertFalse(report['r430_resource_window']['approval_requested'])
