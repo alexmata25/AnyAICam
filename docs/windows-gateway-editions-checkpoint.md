@@ -12,6 +12,9 @@ Normal apply_patch create/read/delete access verified within this checkout.
 
 ## Active runtime integration (from 476ca2a)
 
+Committed as `0229300` after 80 focused checks passed; tree was clean before
+the next persistence milestone.
+
 Gateway local camera operation now uses the independent vms_license_capacity
 component of the same verified, identity-bound accepted signed grant. A zero
 remote-plan count no longer disables local cameras when a valid local licence
@@ -40,9 +43,29 @@ contacting a camera, starting FFmpeg, importing the VMS or querying cloud servic
 Windows service startup validates Gateway edition and edge role before directory
 creation, stale-process cleanup or Job Object changes. Invalid Gateway roles
 fail early; Full VMS role behavior and Blue's remaining launcher fixes are kept.
-No launcher/service was executed; only its pure configuration helper was tested.
+No installed launcher or service was executed. The helper and existing isolated
+launcher fixture (with the application invocation replaced) were tested.
 Local recording strategy, retention, premium analytics grants and customer
 authentication/offline-grace security policies are unchanged.
+
+## Event-media retry persistence
+
+Concurrent clip completion/retry threads previously performed unlocked
+load/modify/save operations with the same .tmp filename. A write could lose
+another event or fail replacing a temporary file another writer had renamed.
+event_media_outbox now serializes in-process mutations with a reentrant lock
+and writes a unique temporary file in the protected outbox directory, flushes
+it, and atomically replaces the destination. Failed replacement leaves the
+previous file intact and cleans up its own temporary file. This is an
+in-process thread-safety fix, not a cross-process locking protocol.
+
+Four focused persistence tests use tiny disposable JSON files, including one
+bounded two-writer unit test (no stress workload or parallel test suite).
+They verify both events survive, failed-write preservation, saved retry metadata,
+denial/backoff, disabled-transport preservation and successful retry after
+authorization recovers. No media file, retention setting, quota or grant is
+deleted or changed by this fix. Full VMS uses the same corrected persistence
+mechanism without changing its upload eligibility/defaults.
 
 ## Build prerequisite remediation (from f7d7533)
 
@@ -262,7 +285,7 @@ No quota, retention period, billing policy or deletion behavior was changed.
 
 ## Validation and remaining work
 
-80 focused unittest checks passed sequentially, covering edition defaults, explicit override
+84 focused unittest checks passed sequentially, covering edition defaults, explicit override
 boundaries, Full VMS compatibility, Gateway notices, isolated actual transport
 functions with mocks, real PowerShell edition and product-mode blocks, event
 entitlement/retention policy with in-memory SQLite, and existing acceptance,
