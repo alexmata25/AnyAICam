@@ -1,11 +1,14 @@
 """Gateway cancellation uses authenticated configuration, never a local licence override."""
 import asyncio
+from contextlib import contextmanager
 import json
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import tempfile
 import threading
+import sqlite3
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -24,6 +27,8 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         env = patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'cloud_gateway',
             pm.PRODUCT_MODE_ENV:'hybrid', pm.BOOTSTRAP_MODE_ENV:'hybrid', 'ANYAICAM_LIVE_P2P_ENABLED':'true'})
         env.start(); self.addCleanup(env.stop)
+        denied = patch.object(pm, '_GATEWAY_REMOTE_DENIED', False)
+        denied.start(); self.addCleanup(denied.stop)
 
     def test_bootstrap_and_local_licence_do_not_enable_remote_service(self):
         self.assertEqual(pm.current_mode(), 'hybrid')
@@ -82,6 +87,89 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         self.assertEqual(pm._read_persisted_mode(), 'local')
         self.assertFalse(pm.remote_access_authorized())
         self.assertEqual(list(pm.STATE_FILE.parent.glob('*.tmp')), [])
+
+    def test_failed_cancellation_denies_remote_before_io_and_preserves_lan_live_view(self):
+        ns = {'asyncio':asyncio, 'load_maintenance_state':lambda:{'enabled':False},
+              'JSONResponse':lambda **kwargs:kwargs}
+        load_functions('main.py', {'maintenance_mode_middleware'}, ns)
+        async def serve(request):
+            return 'local HLS reached'
+        for edition in ('local_gateway', 'cloud_gateway'):
+            for operation in ('fsync', 'replace'):
+                with self.subTest(edition=edition, operation=operation), patch.dict(os.environ, {
+                        'ANYAICAM_GATEWAY_EDITION':edition,
+                        'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':'10.70.0.1'}):
+                    pm.apply_configuration_mode({'product_mode':'hybrid'})
+                    def failed_io(*args):
+                        self.assertFalse(pm.remote_access_authorized())
+                        raise OSError('fixture cancellation write failure')
+                    with patch.object(pm.os, operation, side_effect=failed_io):
+                        with self.assertRaises(OSError):
+                            pm.apply_configuration_mode({'product_mode':''})
+                    self.assertEqual(pm._read_persisted_mode(), 'hybrid')
+                    self.assertFalse(pm.remote_access_authorized())
+                    self.assertFalse(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', True))
+                    remote = SimpleNamespace(client=SimpleNamespace(host='10.70.0.1'))
+                    self.assertEqual(asyncio.run(ns['maintenance_mode_middleware'](remote, serve))['status_code'], 403)
+                    local = SimpleNamespace(client=SimpleNamespace(host='192.168.1.50'),
+                                            url=SimpleNamespace(path='/static/hls/camera1.m3u8'))
+                    self.assertEqual(asyncio.run(ns['maintenance_mode_middleware'](local, serve)), 'local HLS reached')
+                    with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'full_vms'}):
+                        self.assertTrue(pm.remote_access_authorized())
+                        self.assertTrue(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', False))
+
+    def test_failed_cancellation_requires_successful_explicit_cloud_grant_to_reopen(self):
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        with patch.object(pm.os, 'replace', side_effect=OSError('fixture replace failure')):
+            with self.assertRaises(OSError):
+                pm.apply_configuration_mode({'product_mode':'local'})
+        pm.apply_configuration_mode({})
+        pm.persist_mode('hybrid')  # direct cache use is not an authenticated reactivation
+        self.assertFalse(pm.remote_access_authorized())
+        pm.apply_configuration_mode({'product_mode':'invalid'})
+        pm.persist_mode('hybrid')
+        self.assertFalse(pm.remote_access_authorized())
+        pm.persist_mode('local')
+        with patch.object(pm.os, 'replace', side_effect=OSError('fixture fresh grant failure')):
+            with self.assertRaises(OSError):
+                pm.apply_configuration_mode({'product_mode':'hybrid'})
+        self.assertFalse(pm.remote_access_authorized())
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        self.assertTrue(pm.remote_access_authorized())
+
+    def test_failed_cancellation_preserves_licensed_camera_source_and_local_playback(self):
+        import vms_capacity
+        db = sqlite3.connect(':memory:'); db.row_factory = sqlite3.Row
+        self.addCleanup(db.close)
+        db.executescript("CREATE TABLE cameras(id,name,camera_number,former_camera_number); CREATE TABLE recordings(id,camera_id,s3_key,status); INSERT INTO cameras VALUES('c1','Test',1,NULL); INSERT INTO recordings VALUES('r1','c1','prefix/camera1_test.mkv','available');")
+        @contextmanager
+        def connection():
+            yield db
+        root = Path(self.temp.name) / 'recordings'
+        (root / 'camera1').mkdir(parents=True)
+        (root / 'camera1/camera1_test.mkv').write_bytes(b'fixture')
+        cloud = Mock(side_effect=AssertionError('local playback must not request cloud URL'))
+        ns = {'Path':Path, 'RECORDINGS_FOLDER':root, '_presigned_recording_url':cloud,
+              'get_camera_numbers':lambda:[1], '_provisioned_camera_stream':lambda number:{
+                  'rtsp_url':'rtsp://test-camera/stream', 'username':'', 'password':''},
+              'credentialed_rtsp_url':lambda url, user, password:url,
+              'CameraNotLicensedError':PermissionError, 'CameraNotConfiguredError':LookupError}
+        load_functions('main.py', {'camera_url', '_customer_recording_url', '_customer_local_recording_path'}, ns)
+        for edition in ('local_gateway', 'cloud_gateway'):
+            with self.subTest(edition=edition), patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':edition}):
+                capacity = vms_capacity._record({'camera_slot_quantity':0, 'vms_license_capacity':1}, 'signed')
+                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                with patch.object(pm.os, 'replace', side_effect=OSError('fixture cancellation failure')):
+                    with self.assertRaises(OSError):
+                        pm.apply_configuration_mode({'product_mode':''})
+                self.assertFalse(pm.remote_access_authorized())
+                with patch.object(vms_capacity, 'load_capacity', return_value=capacity), \
+                        patch.dict(sys.modules, {'partner_db':SimpleNamespace(connection=connection)}):
+                    self.assertEqual(ns['camera_url'](1), 'rtsp://test-camera/stream')
+                    with self.assertRaises(PermissionError):
+                        ns['camera_url'](2)
+                    self.assertEqual(ns['_customer_recording_url']('c1', 'r1'), '/api/customer/recordings/c1/r1/local')
+                cloud.assert_not_called()
 
     def test_existing_renewal_grace_deadline_is_not_redefined(self):
         ns = {'datetime':datetime, 'GRACE_PERIOD':timedelta(days=7)}

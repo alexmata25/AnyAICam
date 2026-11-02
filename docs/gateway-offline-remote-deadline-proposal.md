@@ -2,8 +2,9 @@
 
 Status: proposal only, 2026-11-02. No remote deadline, billing rule, trust
 purpose, retention setting or local licence behavior is changed by this
-document. The source references below describe the preserved application
-branch following `9bf20fe`.
+document. Numbered source references below describe the inspected baseline
+following `9bf20fe`; the independent in-process mitigation below is a later
+follow-up and does not supply the missing deadline contract.
 
 ## Finding
 
@@ -18,6 +19,17 @@ dispute or trust-key revocation instantly. A bounded signed authorization
 can limit this delay; its maximum window and renewal/grace treatment require
 an explicit remote-access contract. Scheduled expiry already known to the
 server can be represented exactly once that contract is defined.
+
+The follow-up in `product_mode.apply_configuration_mode` adds an independent
+process-local denial latch before persisting an explicit Gateway cancellation.
+If a state write fails, the running process denies remote access despite an
+older Hybrid file remaining readable. An omitted field, malformed mode,
+direct cache write or failed fresh Hybrid write cannot clear that denial;
+only a successfully persisted explicit Hybrid configuration can reopen it.
+This changes no deadline or local capacity rule and Full VMS retains its
+existing behavior. It is deliberately not durable revocation: after process
+restart an older readable Hybrid cache can still exist. The protected
+generation, state integrity and restart decisions below remain required.
 
 The Linux adapter document
 `RED-TO-GREEN-GATEWAY-API-CONTRACT-DRAFT12-REV6-20261101.md` is not an
@@ -226,6 +238,12 @@ without inventing online billing status. Preserve existing feature/analytics
 and Full VMS regression contracts. Installed tunnel, lifecycle and UI checks
 remain a separately authorized isolated acceptance exercise.
 
-No new runtime code or tests accompany this proposal: the missing contract
-prevents specifying truthful expected remote expiry behavior. Existing
-completed tests are not presented as new evidence of that behavior.
+No remote-expiry implementation or policy tests accompany this proposal:
+the missing contract prevents specifying truthful expected remote expiry
+behavior. The independent process-local write-failure mitigation has isolated
+regressions for receipt-time denial, both Gateway editions, failed flush/
+replace, reactivation, actual LAN HLS middleware passage, licensed camera
+source selection and local-first playback. These are cancellation and local
+continuity checks, not proof of offline subscription expiry or durable
+revocation across restart. Existing completed tests are not presented as new
+evidence of either missing guarantee.

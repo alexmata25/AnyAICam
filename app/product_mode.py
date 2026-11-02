@@ -91,6 +91,11 @@ STATE_FILE = Path(os.environ.get(
     str(_CONFIG_DIR / "product_mode.json"),
 ))
 
+# A received cancellation must stop this process's remote access even when
+# the state disk refuses the update. This is not a durable revocation proof.
+_GATEWAY_REMOTE_DENIED = False
+_GATEWAY_MODE_APPLY_LOCK = threading.Lock()
+
 
 def _read_persisted_mode() -> str:
     try:
@@ -131,6 +136,8 @@ def remote_access_authorized() -> bool:
     from gateway_edition import current_edition
     if current_edition() == "full_vms":
         return True
+    if _GATEWAY_REMOTE_DENIED:
+        return False
     try:
         return _read_persisted_mode() == "hybrid" and current_mode() == "hybrid"
     except (OSError, ValueError, TypeError, AttributeError):
@@ -155,9 +162,20 @@ def apply_configuration_mode(configuration: dict) -> bool:
     """Consume the existing authenticated configuration, including explicit cancellation."""
     from gateway_edition import current_edition
     mode = str(configuration.get("product_mode") or "").strip().lower()
-    if current_edition() != "full_vms" and "product_mode" in configuration and mode not in VALID_MODES:
+    if current_edition() == "full_vms":
+        return persist_mode(mode)
+    if "product_mode" not in configuration:
+        return False  # omission cannot undo a previously received cancellation
+    if mode not in VALID_MODES:
         mode = "local"  # no active remote plan; preserve the signed local licence
-    return persist_mode(mode)
+    global _GATEWAY_REMOTE_DENIED
+    with _GATEWAY_MODE_APPLY_LOCK:
+        if mode == "local":
+            _GATEWAY_REMOTE_DENIED = True
+        changed = persist_mode(mode)  # failure retains the process-local denial
+        if mode == "hybrid":
+            _GATEWAY_REMOTE_DENIED = False  # only a durable explicit grant reopens access
+        return changed
 
 
 def persist_mode(mode: str) -> bool:

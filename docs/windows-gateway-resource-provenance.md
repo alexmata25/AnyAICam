@@ -71,3 +71,40 @@ retention or billing change is authorized by this resource report.
 
 This investigation adds exact provenance and reuse distinctions; it does not
 repeat the exhausted broad artifact searches or claim global absence.
+
+## Smallest next decisions, in order
+
+| Stage | Existing resources reused | Exact owner input / later approval |
+|---|---|---|
+| 1. Recovery only, now | Existing baseline setup, source commits/bundle, Python installer, SDK and dependency specifications need no replacement. Python installer has prior hash verification; baseline/SDK have presence plus recorded provenance, not fresh binary verification. | Supply exact accessible path/share/link to unchanged sealed parity payload, plus independent package seal and intended keyset environment confirmation. Request separate public-only keyset or Tesseract input only if package verification shows it missing. No installation/signing/VM approval requested at this stage. |
+| 2. Verify recovered bytes | Unchanged pins and existing canonical keyset helper | Check package manifest seal and each vendor/wheel member; verify Inno installer provenance/version. Tooling presence alone never marks PASS. Report actual missing members before requesting any recovery beyond stage1. |
+| 3. Tool installation | Already available verified Python 3.12.10 installer; recovered approved Inno 7.1.0 installer | Approve precise installation scope/path only after recovery checks. Do not request another Python download or another SDK. |
+| 4. Signed build | Existing shared Inno setup/build scripts and publisher pins | Confirm setup 1.3.4.1/customer release 1.2.7; select existing signing flow/current secure session. Approve named build host window with fresh RAM/disk and workload estimates after inputs verified. |
+| 5. Installed acceptance | Existing accepted baseline and lifecycle/UI procedures | Confirm current disposable Windows target and recoverable checkpoint/image identifier. Approve exact install/service operations only after fresh target resource measurements and rollback plan. Historical VM name is a lead, not approval. |
+
+Follow-up exact-path check found no
+`installer\windows\output\entitlement-signing-public-keys.json` under any of
+`C:\AnyAiCam-Gateway-Dev`, `C:\AAC-Dev-Reports\Gateway-Worktrees\application`, or
+`C:\AAC-Dev-Reports\Gateway-Worktrees\installer`. No setup extraction or live trust
+store access was attempted. Reusing the existing signed baseline for lifecycle
+testing does not remove the requirement to establish the public keyset's intended
+environment and independent digest before building.
+
+Payload verification uses every unchanged full SHA-256 in
+`installer/windows/build.ps1`'s `$pinned` table and each line of
+`installer/windows/wheels.lock.sha256`; these are required bytes, not download
+instructions. All following payloads are unavailable in the current worktree's
+vendor folder; the single sealed-package recovery action covers them first.
+
+| Exact input | Per-input action after sealed-package access |
+|---|---|
+| `python-3.12.10-embed-amd64.zip` | Verify pinned archive; available helper installer does not replace it. |
+| `get-pip.py` | Verify pinned historical script; do not substitute today's rolling script. |
+| `WinSW-x64.exe` | Verify pinned 2.12.0 executable. |
+| `ffmpeg-8.1.2-essentials_build.zip` | Verify pinned archive. |
+| `mediamtx_v1.21.0_windows_amd64.zip` | Verify pinned archive. |
+| `vc_redist.x64-14.44.35211.exe` | Verify pinned bytes and existing Microsoft signature checks. |
+| `vosk-model-small-en-us-0.15.zip` | Verify pinned archive and existing per-file model manifest. |
+| `tesseract-5.5.2-win64-anyaicam.zip` | Verify pinned deterministic bundle; ask original bundle path only if absent from recovered package. |
+| 108 wheels named in `wheels.lock.sha256` | Verify each locked filename/hash, CPU variants included; ask only for actual missing/mismatched members after verification. |
+| Public keyset packaged with parity toolchain | Confirm intended environment and independent digest, then canonical-validate; standalone public-file request only if package lacks it. |

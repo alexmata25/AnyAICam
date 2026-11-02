@@ -10,6 +10,36 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Minimal next-stage inputs and cancellation/lifecycle safeguards
+
+Current reference documents remain `windows-gateway-resource-provenance.md`
+and `gateway-offline-remote-deadline-proposal.md`. Resource recovery is now
+staged: first identify an accessible unchanged sealed package and confirm its
+seal/intended trust environment. Separate public keyset or Tesseract requests
+are conditional on their absence from that package. Existing Python installer,
+SDK, baseline and source are not requested again. Tool installation, current
+signing/version selection, build resources and disposable Windows target/rollback
+are later gates, not a blanket execution request. All eight vendor filenames
+and the 108-wheel lock are enumerated in the resource report.
+
+Gateway cancellation now sets a process-local remote denial before attempting
+mode persistence, so failed flush/replacement cannot keep that process authorized.
+Missing configuration, invalid mode or a direct cache write cannot clear denial;
+a successful explicit authenticated Hybrid configuration can. This does not
+provide durable restart revocation or invent an offline subscription deadline.
+Actual middleware/camera/playback regressions cover remote denial with LAN HLS,
+licensed camera source and local-first playback continuity in both editions.
+Full VMS behavior is preserved.
+
+Lifecycle comparisons now also require nondecreasing aggregate recording bytes;
+missing byte evidence is BLOCKED. This detects same-count truncation but does
+not prove individual file integrity. Only synthetic snapshots were used.
+
+Targeted application 39 tests passed in 2.730s; installer 6 passed in 14.997s.
+Integrated sequential lightweight runner **127 passed in 32.589s**; diff check
+passed. No compilation/acceptance retry, key generation, security bypass,
+RAM-intensive testing, VM change, deployment, billing or retention change ran.
+
 ## Resource provenance and offline remote deadline investigation
 
 Existing agents continued on preserved worktrees. New bounded historical

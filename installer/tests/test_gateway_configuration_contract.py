@@ -112,6 +112,25 @@ class GatewayConfigurationTests(unittest.TestCase):
                 self.assertEqual(data['result'], 'BLOCKED')
                 self.assertIn('identity file could not be hashed', data['blocked_reason'])
 
+    def test_lifecycle_detects_truncated_recordings_without_count_change(self):
+        for after_bytes, expected in [(100, 0), (120, 0), (99, 1), (0, 1), (None, 2)]:
+            with self.subTest(bytes=after_bytes), tempfile.TemporaryDirectory() as temp:
+                before, after = copy.deepcopy(BASE_STATE), copy.deepcopy(BASE_STATE)
+                after['data']['recordings']['bytes'] = after_bytes
+                b, a, report = (Path(temp) / name for name in ('before.json', 'after.json', 'result.json'))
+                b.write_text(json.dumps(before), encoding='utf-8')
+                a.write_text(json.dumps(after), encoding='utf-8')
+                result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+                    str(WIN / 'acceptance/Compare-AnyAiCamInstallState.ps1'), '-Before', str(b), '-After', str(a),
+                    '-Step', 'Repair', '-OutputPath', str(report)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                data = json.loads(report.read_text(encoding='utf-8-sig'))
+                failed = [item['name'] for item in data['checks'] if not item['passed']]
+                self.assertEqual(failed, ['recordings kept (bytes not lower)'] if expected == 1 else [])
+                if expected == 2:
+                    self.assertEqual(data['result'], 'BLOCKED')
+                    self.assertIn('recording byte totals are missing', data['blocked_reason'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -15,6 +15,11 @@ folder or hash an identity file. Two `unreadable` placeholders do not prove
 identity preservation. Resolve access on the approved test target and take new
 snapshots; do not edit the JSON or count BLOCKED as PASS.
 
+Recording preservation compares both file count and total bytes. A stable count
+with reduced bytes fails; missing byte totals produce BLOCKED and require new
+snapshots. These aggregate checks do not establish per-file media
+integrity; use the synthetic clips' offline playback checks too.
+
 ## 0. Preconditions
 - [ ] VM checkpoint taken before step 1 (name: `pre-1341-lifecycle`), so each step can be repeated from a clean state.
 - [ ] Both setups' SHA-256 verified (`Get-FileHash`). Both setups' Authenticode `Valid` with the pinned AnyAiCam publisher (`publisher-pin.ps1`).

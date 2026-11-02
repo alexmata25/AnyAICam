@@ -29,7 +29,12 @@ if (@($bi.Values + $ai.Values | Where-Object { $_ -eq 'unreadable' }).Count -gt 
     "A6 BLOCKED: $($final.blocked_reason)"; exit 2
 }
 foreach ($k in $bi.Keys) { Check "identity file unchanged: $k" ($ai[$k] -eq $bi[$k]) "" }
+if ($null -eq $b.data.recordings.bytes -or $null -eq $a.data.recordings.bytes) {
+    $final = Complete-AcceptanceResult $result $OutputPath 'recording byte totals are missing; take new snapshots with the current collector'
+    "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+}
 Check 'recordings kept (count not lower)' ($a.data.recordings.count -ge $b.data.recordings.count) "$($b.data.recordings.count) -> $($a.data.recordings.count)"
+Check 'recordings kept (bytes not lower)' ($a.data.recordings.bytes -ge $b.data.recordings.bytes) "$($b.data.recordings.bytes) -> $($a.data.recordings.bytes)"
 Check 'database kept' ($null -eq $b.data.database -or $null -ne $a.data.database) ''
 $missingKeys = @($b.data.vms_env_keys | Where-Object { @($a.data.vms_env_keys) -notcontains $_ })
 Check 'vms.env keeps every key' ($null -eq $b.data.vms_env_keys -or $missingKeys.Count -eq 0) "missing: $($missingKeys -join ', ')"
