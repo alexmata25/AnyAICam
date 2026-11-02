@@ -228,7 +228,7 @@ def test_a_deleted_registry_after_an_older_setup_stays_failed_closed(edge):
     assert_every_grant(edge, False)
 
 
-@pytest.mark.parametrize("contents", ["{", "[]", '{"trust_generation": "1"}'])
+@pytest.mark.parametrize("contents", ["{", "[]", "{}", '{"schema": 2}', '{"trust_generation": "1"}'])
 def test_present_malformed_accepted_record_keeps_rollback_floor(edge, contents):
     holds_every_grant(edge)
     vms_capacity.ACCEPTED_FILE.write_text(contents, encoding="utf-8")
@@ -272,9 +272,16 @@ def test_genuinely_missing_accepted_record_retains_legacy_floor(edge):
     assert ae._accepted_trust_generation() == 0
 
 
-@pytest.mark.parametrize("contents", ['{"trust_generation": 0}', '{"schema": 2, "accepted_key": "legacy"}'])
-def test_valid_legacy_accepted_record_retains_legacy_floor(edge, contents):
-    vms_capacity.ACCEPTED_FILE.write_text(contents, encoding="utf-8")
+@pytest.mark.parametrize("legacy_generation", ["missing", 0])
+def test_valid_legacy_accepted_record_retains_legacy_floor(edge, legacy_generation):
+    holds_every_grant(edge)
+    state = json.loads(vms_capacity.ACCEPTED_FILE.read_text(encoding="utf-8"))
+    if legacy_generation == "missing":
+        state.pop("signer", None)
+        state.pop("trust_generation", None)
+    else:
+        state["trust_generation"] = 0
+    vms_capacity.ACCEPTED_FILE.write_text(json.dumps(state), encoding="utf-8")
     assert ae._accepted_trust_generation() == 0
 
 

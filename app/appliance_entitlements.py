@@ -636,13 +636,26 @@ def _accepted_trust_generation() -> int:
         data = json.loads(raw)
         if not isinstance(data, dict):
             return 1
-        # Schema-2 1.2.7 and legacy-mode 1.3.4 accepted records predate trust generations; they are valid floor zero.
-        if "trust_generation" not in data:
-            return 0
         generation = data.get("trust_generation")
-        if type(generation) is int and generation >= 0:
+        if type(generation) is int and generation > 0:
             return generation
-        return 1
+        # A zero/missing generation is compatible only with the actual legacy accepted-state shape, not an arbitrary
+        # object such as {} that could silently erase the anti-rollback marker.
+        legacy = (
+            data.get("schema") == 2 and
+            _bound_identity(data.get("identity")) is not None and
+            isinstance(data.get("snapshot"), dict) and
+            isinstance(data["snapshot"].get("signature"), dict) and
+            isinstance(data["snapshot"]["signature"].get("key_id"), str) and
+            isinstance(data.get("accepted_key"), str) and
+            isinstance(data.get("high_water"), dict) and
+            isinstance(data["high_water"].get("issued_at"), str) and
+            isinstance(data["high_water"].get("digest"), str) and
+            isinstance(data.get("accepted_at"), str) and
+            data.get("source") == "cloud" and
+            ("trust_generation" not in data or generation == 0)
+        )
+        return 0 if legacy else 1
     except Exception:
         # Presence was established above whenever possible; if the check/read itself fails, do not enter legacy mode.
         return 1
