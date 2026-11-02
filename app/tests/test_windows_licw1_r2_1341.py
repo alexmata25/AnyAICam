@@ -272,6 +272,19 @@ def test_genuinely_missing_accepted_record_retains_legacy_floor(edge):
     assert ae._accepted_trust_generation() == 0
 
 
+def test_inaccessible_accepted_record_keeps_rollback_floor(edge, monkeypatch):
+    accepted = vms_capacity.ACCEPTED_FILE
+    real_lstat = ae.os.lstat
+
+    def inaccessible(path, *args, **kwargs):
+        if Path(path) == accepted:
+            raise PermissionError("synthetic metadata denial")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(ae.os, "lstat", inaccessible)
+    assert ae._accepted_trust_generation() >= 1
+
+
 @pytest.mark.parametrize("legacy_generation", ["missing", 0])
 def test_valid_legacy_accepted_record_retains_legacy_floor(edge, legacy_generation):
     holds_every_grant(edge)

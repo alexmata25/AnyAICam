@@ -628,8 +628,12 @@ def _accepted_trust_generation() -> int:
     try:
         import vms_capacity
         accepted_file = vms_capacity.ACCEPTED_FILE
-        if not os.path.lexists(accepted_file):
+        try:
+            os.lstat(accepted_file)
+        except FileNotFoundError:
             return 0
+        except OSError:
+            return 1
         raw = _read_single_name(accepted_file, 512 * 1024)
         if len(raw) > 512 * 1024:
             return 1
