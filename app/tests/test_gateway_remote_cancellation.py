@@ -53,6 +53,19 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         self.assertEqual(response['status_code'], 403)
         call_next.assert_not_called()
 
+    def test_mapped_ipv4_tunnel_cannot_bypass_cancellation(self):
+        with patch.dict(os.environ, {'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':'10.70.0.1'}):
+            self.assertTrue(pm.gateway_tunnel_request_denied('::ffff:10.70.0.1'))
+            self.assertFalse(pm.gateway_tunnel_request_denied('::ffff:192.168.1.50'))
+            pm.apply_configuration_mode({'product_mode':'hybrid'})
+            self.assertFalse(pm.gateway_tunnel_request_denied('::ffff:10.70.0.1'))
+
+    def test_configured_ipv6_gateway_matches_only_its_peer(self):
+        for gateway, peer in [('::ffff:10.70.0.1', '10.70.0.1'), ('fd70::1', 'fd70:0:0:0:0:0:0:1')]:
+            with self.subTest(gateway=gateway), patch.dict(os.environ, {'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':gateway}):
+                self.assertTrue(pm.gateway_tunnel_request_denied(peer))
+                self.assertFalse(pm.gateway_tunnel_request_denied('fd70::2'))
+
     def test_explicit_cancel_overrules_admin_mode_and_feature_override(self):
         self.assertTrue(pm.apply_configuration_mode({'product_mode':'hybrid'}))
         self.assertTrue(pm.remote_access_authorized())

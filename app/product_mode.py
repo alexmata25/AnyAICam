@@ -142,6 +142,9 @@ def gateway_tunnel_request_denied(peer_host: str) -> bool:
         gateway = ipaddress.ip_address(os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_ADDRESS", "10.70.0.1").strip())
     except ValueError:
         return False
+    # Dual-stack ASGI servers can expose an IPv4 peer as ::ffff:a.b.c.d.
+    peer = getattr(peer, "ipv4_mapped", None) or peer
+    gateway = getattr(gateway, "ipv4_mapped", None) or gateway
     return peer == gateway and not remote_access_authorized()
 
 

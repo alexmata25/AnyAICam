@@ -42,6 +42,7 @@ Before proposing a build, full suite or VM acceptance session, report:
 | Current RAM | Timestamp, current free and total RAM; do not substitute the owner's earlier report |
 | Estimated requirement | Peak additional RAM for the specific command/guest, including toolchain and guest allocation; state the basis and uncertainty |
 | Expected duration | Estimate for that operation, with its basis; do not reuse lightweight test timing as build timing |
+| Disk | Current free bytes on build, temporary/staging and evidence volumes; estimated peak additional space for the specific operation and retained artifacts |
 | Scope | Exact build/test operation, evidence destination and test-only target |
 | Existing VMs | Running VM names/states/allocations and the explicit list that will remain running unchanged |
 

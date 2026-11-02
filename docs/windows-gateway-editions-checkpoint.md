@@ -10,6 +10,36 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Installer and acceptance preparation (from c52a07b)
+
+Confirmed the existing shared `AnyAiCam-VMS.iss` architecture, AppId,
+edition-selection helper and WinSW launch path; no separate Gateway installer
+or application is introduced. A targeted presence check still finds no Inno
+Setup compiler at the build-script path and no sealed
+`R430-win134-parity-d6b4244` directory. The already hash-verified Python 3.12.10
+installer remains present in the supplement; it was not installed or re-audited.
+Existing remediation remains authoritative for all eight pinned vendor inputs,
+108 locked wheels, public keyset/digest, version and current signing approval.
+Compilation is NOT READY until those inputs/tool installations and the resource
+window are approved/resolved. No cache rescan or dependency download occurred.
+
+Extended the existing beta checklist with R01-R08 and W01-W05: authenticated
+cancellation/expiration fixtures, local video/notification continuity, independent
+local licensing, WHEP retry/long-poll teardown, reactivation, WireGuard peer and
+proxy-trust evidence, per-camera event upload and media-access protection.
+It explicitly records that offline remote grants have no new expiry deadline
+and existing mode-change restarts may interrupt recording. If immediate offline
+expiry is required, an approved expiry/grace contract and authenticated expiry
+data are still needed. No live billing cancellation is part of acceptance.
+
+Fixed IPv4-mapped IPv6 peer comparison in the Gateway tunnel cancellation gate;
+native IPv6 and equivalent configured addresses are covered. Full VMS and LAN
+behavior remain intact. All 106 sequential lightweight checks passed in 20.291s
+(the original 104 plus two regressions); `git diff --check` passed. No model,
+service, upload, installer compilation or VM was started. Build approval now
+explicitly requires current disk availability/estimated staging usage as well
+as machine/RAM/duration/unchanged running VMs. No heavy window is requested now.
+
 ## Remote cancellation and detection boundaries (from 8bbcca2)
 
 Both approved roots passed temporary-file create/read/delete probes:

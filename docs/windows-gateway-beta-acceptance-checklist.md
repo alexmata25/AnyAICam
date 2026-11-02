@@ -122,6 +122,56 @@ mock PASS is code evidence, not real S3 or installed-system acceptance.
 Real S3 delivery and real external provider integration remain NOT RUN and
 require separate authorization. This checklist does not authorize AWS access.
 
+## Remote cancellation, expiry and WireGuard acceptance (prepared, NOT RUN)
+
+Execute only in a separately approved isolated installed environment. Do not
+cancel a real subscription or edit Stripe. Use the existing authenticated
+configuration channel with an approved test identity/control-plane fixture and
+valid test signing chain; do not hand-edit grants and call that activation.
+Apply R01-R08 to both Gateway editions. Local Gateway must still block every
+AWS video transport even while separately entitled remote access is active.
+
+Before each case record source/setup hashes, edition, licence validity/slots,
+camera number, nonsecret effective mode/flags, configuration receive time,
+remote session IDs (no capability URLs), LAN playback timestamps and existing
+retention settings. Keep tokens, credentials, private keys and raw configuration
+responses out of evidence. Use synthetic footage and mock upload endpoints.
+
+| ID | Procedure | Required evidence/result |
+|---|---|---|
+| R01 | With a valid independent local licence, activate remote access via authenticated Hybrid configuration; open LAN viewing/playback and one brokered remote session | Accepted local capacity, working local recording, and separately authorized remote session; installer bootstrap alone cannot authorize remote access |
+| R02 | Deliver explicit Local/empty/null mode from the isolated control plane to represent cancellation | Record receipt and persisted-state transition; new remote offers and media-token fetches refused; existing remote session closes; no new remote answer if cancellation arrives during offer creation |
+| R03 | Trigger local motion and record/play/seek before and after R02; inspect local notifications/read state | Local licensed operation and existing footage remain; Basic Motion notifications work; retained local licence is not revoked merely by remote-plan loss. Record any existing mode-change service restart and recording gap rather than claiming zero interruption |
+| R04 | Simulate remote-plan expiration at the test control plane, then poll configuration | Same refusal and local continuity criteria as R02/R03 once cancellation configuration arrives; invalid/expired local licence must still fail closed independently |
+| R05 | Disconnect the isolated control plane before expiration/configuration delivery, then reconnect | Record last accepted mode and outage interval. Current implementation retains persisted grant offline: there is no independently timed remote-subscription deadline. Do not mark immediate offline expiry enforcement PASS; if beta requires it, owner-approved expiry/grace contract and authenticated expiry data are blockers |
+| R06 | Fault-inject one local WHEP DELETE failure, then restore; repeat with signaling long poll held open | Session remains pending and is retried by independent guard; eventual DELETE success/404/410 removes it. Capture actual teardown latency and configured scan interval; sequential per-session DELETE timeout is 3 seconds, not a guaranteed global deadline. No LAN path/session teardown |
+| R07 | Restore valid Hybrid configuration after cancellation, without changing installer bootstrap or upload flags | Dormant remote publisher resumes authorized signaling; no unnecessary application reinstall; Cloud event uploads stay off unless separately opted in/entitled |
+| R08 | Repeat Full VMS Local/Hybrid baseline and authorized local analytics after remote cancellation | Full VMS legacy behavior unchanged; valid independent local analytic grants remain; unsigned/stale per-camera premium flags cannot produce new inference events |
+
+### WireGuard connection and proxy boundary
+
+| ID | Procedure | Required evidence/result |
+|---|---|---|
+| W01 | Review test tunnel enrollment and actual route/source mapping, without exposing keys | Approved existing WireGuard installation/enrollment required separately; shared VMS setup is not proof that a Windows tunnel is installed/configured. Record tunnel addresses, gateway address, appliance port and intended route; never change to full-tunnel routing to fix connectivity |
+| W02 | Compare configured `ANYAICAM_WIREGUARD_GATEWAY_ADDRESS` (default `10.70.0.1`) to actual ASGI `request.client.host` seen through the proxy | Exact effective peer match, including IPv4-mapped IPv6 normalization. NAT/source mismatch, missing tunnel or invalid address is BLOCKED; do not widen firewall rules or disable guards to obtain PASS |
+| W03 | Inspect Uvicorn proxy trust and forwarding behavior on the installed candidate | Launcher uses `--proxy-headers`; inspect effective `FORWARDED_ALLOW_IPS` and proxy topology. A caller-controlled forwarded address must not disguise a tunnel peer. Wildcard trust/unverified reverse-proxy rewriting blocks acceptance pending an approved configuration/fix |
+| W04 | With grant active fetch test HLS playlist/segment and event media through approved proxy; cancel, then request fresh playlist, segment and previously issued media token | Allowed only while authorized; cancelled tunnel requests/media tokens return 403. Existing browser-buffered bytes need not disappear. Same media stays available to permitted LAN viewers |
+| W05 | Interrupt and restore only the approved isolated connectivity fixture | Local recording/playback continue under local licence; bounded connection failure is reported; authorized reconnect works. No production firewall, Hyper-V or live tunnel changes permitted |
+
+### Cloud event entitlement and media protection
+
+Use U01-U09 above plus R02/R04 with mock transports. Revoke camera A's cloud
+event entitlement while camera B remains entitled: A must make no AWS write,
+must not reuse old credentials, and must retain valid retry intent; B may upload
+only its authorized producer event clip/optional JPEG and register it. Exercise
+wrong camera/event prefix, expired credentials, cancellation between attempts,
+registration failure and later authorized retry. Verify no bulk/live-relay
+fallback and zero Local Gateway video writes under all flag combinations.
+Test wrong-tenant media requests and cancelled/expired media tokens through
+existing route authorization; never infer tenant security from peer matching
+alone. Keep existing retention settings unchanged; source/mock evidence does
+not prove real cloud delivery or installed lifecycle acceptance.
+
 ## Full VMS and Blue component gates
 
 - [ ] **V01:** Full VMS Local/Hybrid match accepted baseline for discovery,
