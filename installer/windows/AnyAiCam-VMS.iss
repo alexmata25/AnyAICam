@@ -278,8 +278,8 @@ begin
     end;
 end;
 
-// What install-runtime.ps1 receives. A silent NEW install without /ProductMode= passes nothing, so it is refused
-// there -- the same rule as the Linux unattended install (never a silent default).
+// A silent NEW Full VMS install without /ProductMode= passes nothing and is
+// refused by preflight and install-runtime.ps1 (never a silent default).
 function ProductModeChoice(): String;
 begin
   Result := Lowercase(ExpandConstant('{param:ProductMode|}'));
@@ -363,6 +363,10 @@ begin
     exit;
   end;
   if not ExistingInstall() then begin
+    if Requested = '' then begin
+      Result := 'A new installation needs a product mode: choose Local or Hybrid (silent install: /ProductMode=local or /ProductMode=hybrid).';
+      exit;
+    end;
     if ((GatewayEditionChoice() = 'local_gateway') and (Requested <> 'local')) or
        ((GatewayEditionChoice() = 'cloud_gateway') and (Requested <> 'hybrid')) then begin
       Result := 'The requested product mode conflicts with the Gateway edition.';

@@ -139,6 +139,22 @@ class GatewayIntegrationTests(unittest.TestCase):
         runtime = (ROOT / 'installer/windows/install-runtime.ps1').read_text(encoding='utf-8')
         self.assertLess(runtime.index('Set-GatewayEdition -Values'), runtime.index('[IO.File]::WriteAllLines($environmentFile'))
 
+    def test_new_silent_install_requires_mode_before_mutation(self):
+        source = (ROOT / 'installer/windows/AnyAiCam-VMS.iss').read_text(encoding='utf-8')
+        validation = source.split('function ProductModeProblem(): String;', 1)[1].split('function GatewayEditionProblem()', 1)[0]
+        fresh = validation.split('if not ExistingInstall() then begin', 1)[1]
+        self.assertIn("if Requested = '' then begin", fresh)
+        message = 'A new installation needs a product mode: choose Local or Hybrid (silent install: /ProductMode=local or /ProductMode=hybrid).'
+        self.assertIn(message, fresh)
+        self.assertLess(fresh.index(message), fresh.index("GatewayEditionChoice() = 'local_gateway'"))
+        runtime = (ROOT / 'installer/windows/install-runtime.ps1').read_text(encoding='utf-8')
+        self.assertIn(message, runtime)
+        # Gateway selections still derive their mode before reaching this guard;
+        # existing installs skip it and retain their saved or legacy defaults.
+        choice = source.split('function ProductModeChoice(): String;', 1)[1].split('var VcRuntimeNeedsRestart', 1)[0]
+        self.assertIn("if GatewayEditionChoice() = 'local_gateway' then Result := 'local'", choice)
+        self.assertIn("if GatewayEditionChoice() = 'cloud_gateway' then Result := 'hybrid'", choice)
+
 
 if __name__ == '__main__':
     unittest.main()
