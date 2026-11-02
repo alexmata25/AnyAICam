@@ -96,6 +96,8 @@ def _read_persisted_mode() -> str:
         data = json.loads(STATE_FILE.read_text())
     except (OSError, ValueError):
         return ""
+    if not isinstance(data, dict):
+        return ""  # a corrupt cache must not prevent configuration recovery
     mode = str(data.get("mode") or "").strip().lower()
     return mode if mode in VALID_MODES else ""
 

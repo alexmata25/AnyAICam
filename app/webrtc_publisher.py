@@ -1118,7 +1118,13 @@ def _close_remote_whep_sessions() -> None:
     with _lock:
         sessions = list(_whep_sessions.items())
     for session_id, location in sessions:
-        target = urlsplit(location)
+        try:
+            target = urlsplit(location)
+        except (TypeError, ValueError, AttributeError):
+            # A bad local response must not prevent other sessions closing.
+            # Never log the capability URL or send it to an unvalidated origin.
+            logger.warning("webrtc_publisher.remote_session_location_invalid session_id=%s", session_id)
+            continue
         if (target.scheme, target.netloc) != (base.scheme, base.netloc):
             continue  # never send a capability DELETE to another origin
         closed = False
@@ -1140,8 +1146,15 @@ def _close_remote_whep_sessions() -> None:
 
 async def _remote_access_guard() -> None:
     while True:
-        if not _remote_access_allowed():
-            await asyncio.to_thread(_close_remote_whep_sessions)
+        try:
+            if not _remote_access_allowed():
+                await asyncio.to_thread(_close_remote_whep_sessions)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Retry next tick even if a local cleanup operation fails in an
+            # unexpected way. Error text can contain a WHEP capability URL.
+            logger.warning("webrtc_publisher.remote_session_cleanup_retry")
         await asyncio.sleep(SCAN_SECONDS)
 
 

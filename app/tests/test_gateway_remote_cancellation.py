@@ -1,5 +1,6 @@
 """Gateway cancellation uses authenticated configuration, never a local licence override."""
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -28,6 +29,18 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         self.assertEqual(pm.current_mode(), 'hybrid')
         self.assertFalse(pm.remote_access_authorized())
         self.assertFalse(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', True))
+
+    def test_non_object_mode_cache_cannot_crash_startup_or_configuration_recovery(self):
+        for value in (None, [], 'hybrid', 1, True):
+            with self.subTest(value=value):
+                pm.STATE_FILE.write_text(json.dumps(value))
+                with patch.dict(os.environ, {pm.PRODUCT_MODE_ENV:''}):
+                    self.assertEqual(pm.current_mode(), 'hybrid')  # bootstrap only
+                    self.assertFalse(pm.remote_access_authorized())
+                    with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'full_vms', pm.BOOTSTRAP_MODE_ENV:''}):
+                        self.assertEqual(pm.current_mode(), '')  # legacy default
+                self.assertTrue(pm.apply_configuration_mode({'product_mode':'local'}))
+                self.assertEqual(json.loads(pm.STATE_FILE.read_text()), {'mode':'local'})
 
     def test_login_offline_grace_boundary_is_independent_of_remote_mode(self):
         ns = {'timedelta':timedelta, 'get_ttl_config':lambda:{'offline_grace_hours':72}}
@@ -175,6 +188,15 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         ns['_close_remote_whep_sessions']()
         self.assertEqual(set(ns['_whep_sessions']), {'foreign'})
 
+    def test_malformed_session_location_does_not_block_other_session_teardown(self):
+        ns, http = self.publisher()
+        ns['_whep_sessions'] = {'invalid':'http://[invalid/capability-secret',
+                                'valid':'http://127.0.0.1:8889/c1/whep/token'}
+        ns['_close_remote_whep_sessions']()
+        self.assertEqual(set(ns['_whep_sessions']), {'invalid'})
+        http.assert_called_once()
+        self.assertNotIn('capability-secret', str(ns['logger'].mock_calls))
+
     def test_guard_closes_sessions_independently_of_blocked_control_poll(self):
         class TickComplete(Exception): pass
         async def to_thread(function): function()
@@ -185,6 +207,36 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         load_functions('webrtc_publisher.py', {'_remote_access_guard'}, ns)
         with self.assertRaises(TickComplete): asyncio.run(ns['_remote_access_guard']())
         close.assert_called_once()
+
+    def test_guard_retries_unexpected_cleanup_failure_without_logging_capabilities(self):
+        class TickComplete(BaseException): pass
+        ticks = []
+        async def to_thread(function): function()
+        async def sleep(delay):
+            ticks.append(delay)
+            if len(ticks) == 2: raise TickComplete()
+        close = Mock(side_effect=[RuntimeError('http://local/capability-secret'), None])
+        log = Mock()
+        ns = {'asyncio':SimpleNamespace(to_thread=to_thread, sleep=sleep, CancelledError=asyncio.CancelledError),
+              '_remote_access_allowed':lambda:False, '_close_remote_whep_sessions':close,
+              'SCAN_SECONDS':1, 'logger':log}
+        load_functions('webrtc_publisher.py', {'_remote_access_guard'}, ns)
+        with self.assertRaises(TickComplete): asyncio.run(ns['_remote_access_guard']())
+        self.assertEqual(close.call_count, 2)
+        self.assertEqual(ticks, [1, 1])
+        log.warning.assert_called_once_with('webrtc_publisher.remote_session_cleanup_retry')
+        self.assertNotIn('capability-secret', str(log.mock_calls))
+
+    def test_guard_cancellation_propagates_without_retry(self):
+        async def to_thread(function): raise asyncio.CancelledError()
+        sleep = Mock()
+        ns = {'asyncio':SimpleNamespace(to_thread=to_thread, sleep=sleep, CancelledError=asyncio.CancelledError),
+              '_remote_access_allowed':lambda:False, '_close_remote_whep_sessions':Mock(),
+              'SCAN_SECONDS':1, 'logger':Mock()}
+        load_functions('webrtc_publisher.py', {'_remote_access_guard'}, ns)
+        with self.assertRaises(asyncio.CancelledError): asyncio.run(ns['_remote_access_guard']())
+        sleep.assert_not_called()
+        ns['logger'].warning.assert_not_called()
 
     def test_dormant_gateway_worker_can_activate_without_restarting_vms(self):
         class TickComplete(BaseException): pass
