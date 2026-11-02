@@ -620,17 +620,29 @@ def _installed_trust() -> tuple[str, dict | None, dict | None, str | None, str |
 
 
 def _accepted_trust_generation() -> int:
-    """The registry generation the protected accepted capacity was accepted/migrated under (0 when none). A floor:
-    once a grant recorded generation >= 1, a missing registry is a rollback for every purpose, never legacy."""
+    """Return the rollback floor; only a genuinely absent accepted record means legacy mode (floor zero).
+
+    A present record that is linked, unreadable, malformed, or has an invalid generation must fail closed. Treating
+    those states as zero would let a damaged/deleted registry fall back to the legacy flat keyset.
+    """
     try:
         import vms_capacity
-        data = json.loads(_read_single_name(vms_capacity.ACCEPTED_FILE, 512 * 1024))
-        generation = data.get("trust_generation", 0) if isinstance(data, dict) else 0
-        return generation if type(generation) is int and generation > 0 else 0
-    except _UnsafeLicensingFile:
-        return 1  # a second name on the accepted file must not turn a deleted registry into legacy mode
+        accepted_file = vms_capacity.ACCEPTED_FILE
+        if not os.path.lexists(accepted_file):
+            return 0
+        data = json.loads(_read_single_name(accepted_file, 512 * 1024))
+        if not isinstance(data, dict):
+            return 1
+        # Schema-2 1.2.7 and legacy-mode 1.3.4 accepted records predate trust generations; they are valid floor zero.
+        if "trust_generation" not in data:
+            return 0
+        generation = data.get("trust_generation")
+        if type(generation) is int and generation >= 0:
+            return generation
+        return 1
     except Exception:
-        return 0
+        # Presence was established above whenever possible; if the check/read itself fails, do not enter legacy mode.
+        return 1
 
 
 def _trusted_keys() -> dict[str, str]:
@@ -876,7 +888,9 @@ def _trust_fingerprint() -> tuple:
     for path in (TRUST_ANCHOR_FILE, TRUST_REGISTRY_FILE, TRUST_STATE_FILE):
         try:
             info = os.lstat(path)
-            found.append((info.st_mtime_ns, info.st_size, info.st_ino))
+            # Link count is part of the identity: adding a hard link does not necessarily alter mtime, size, or inode,
+            # but it makes the trust file unsafe. Invalidate a cached grant before it can outlive that change.
+            found.append((info.st_mtime_ns, info.st_size, info.st_ino, info.st_nlink, info.st_mode))
         except OSError:
             found.append(None)
     return tuple(found)

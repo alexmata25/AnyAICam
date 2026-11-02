@@ -151,6 +151,17 @@ def test_the_cache_still_answers_when_nothing_changed(edge, monkeypatch):
     assert ae.camera_analytic_allowed("cam-1", "lpr") is True
 
 
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
+def test_adding_a_trust_hard_link_invalidates_cached_analytics_immediately(edge, tmp_path):
+    holds_every_grant(edge)
+    assert ae.camera_analytic_allowed("cam-1", "lpr") is True
+    before = dict(ae._grant_cache)
+    assert before["grants"] is not None
+    os.link(ae.TRUST_REGISTRY_FILE, tmp_path / "registry-second-name")
+    assert ae._trust_fingerprint() != before["trust"]
+    assert ae.camera_analytic_allowed("cam-1", "lpr") is False
+
+
 def test_revocation_stops_grants_with_no_cloud_and_no_clock_change(edge):
     """Offline operation: the installed registry alone decides."""
     revoked(edge)
@@ -215,6 +226,43 @@ def test_a_deleted_registry_after_an_older_setup_stays_failed_closed(edge):
     ae.TRUST_REGISTRY_FILE.unlink()
     restart()
     assert_every_grant(edge, False)
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", '{"trust_generation": "1"}'])
+def test_present_malformed_accepted_record_keeps_rollback_floor(edge, contents):
+    holds_every_grant(edge)
+    vms_capacity.ACCEPTED_FILE.write_text(contents, encoding="utf-8")
+    ae.TRUST_REGISTRY_FILE.unlink()
+    ae.TRUST_STATE_FILE.unlink()
+    restart()
+    assert ae._accepted_trust_generation() >= 1
+    assert ae._trusted_keys() == {}
+    assert ae.feature_allowed("talk_down") is False
+
+
+def test_unreadable_accepted_record_keeps_rollback_floor(edge, monkeypatch):
+    holds_every_grant(edge)
+    accepted = vms_capacity.ACCEPTED_FILE
+    real_read = ae._read_single_name
+
+    def unreadable(path, limit):
+        if path == accepted:
+            raise PermissionError("synthetic read denial")
+        return real_read(path, limit)
+
+    monkeypatch.setattr(ae, "_read_single_name", unreadable)
+    assert ae._accepted_trust_generation() >= 1
+
+
+def test_genuinely_missing_accepted_record_retains_legacy_floor(edge):
+    vms_capacity.ACCEPTED_FILE.unlink(missing_ok=True)
+    assert ae._accepted_trust_generation() == 0
+
+
+@pytest.mark.parametrize("contents", ['{"trust_generation": 0}', '{"schema": 2, "accepted_key": "legacy"}'])
+def test_valid_legacy_accepted_record_retains_legacy_floor(edge, contents):
+    vms_capacity.ACCEPTED_FILE.write_text(contents, encoding="utf-8")
+    assert ae._accepted_trust_generation() == 0
 
 
 def test_a_fresh_grant_from_an_active_key_recovers_after_the_upgrade(edge):
