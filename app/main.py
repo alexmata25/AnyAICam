@@ -14241,6 +14241,8 @@ def cloud_recording_s3_key(path: Path, camera_number: int | None) -> str:
 
 
 def enqueue_cloud_upload(path: Path, camera_number: int | None = None) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise PermissionError("This edition does not allow recording backup queues")
 
 
 
@@ -122398,6 +122400,8 @@ def cloud_recording_api(request: Request) -> dict:
 
 
 def cloud_recording_scan(request: Request) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise HTTPException(status_code=403, detail="Recording backup uploads are unavailable in this edition.")
 
 
 
@@ -122488,6 +122492,8 @@ def cloud_recording_scan(request: Request) -> dict:
 
 
 def cloud_recording_queue_file(payload: CloudUploadQueueModel, request: Request) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise HTTPException(status_code=403, detail="Recording backup uploads are unavailable in this edition.")
 
 
 
@@ -122641,6 +122647,8 @@ def cloud_recording_queue_file(payload: CloudUploadQueueModel, request: Request)
 
 
 def cloud_recording_retry(payload: CloudUploadRetryModel, request: Request) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise HTTPException(status_code=403, detail="Recording backup uploads are unavailable in this edition.")
 
 
 
@@ -122820,6 +122828,9 @@ def cloud_recording_page(request: Request) -> str:
 
 
 
+    if not _edition_video_transport_allowed("backup"):
+        from gateway_edition import cloud_recording_page_html
+        return page_shell("Cloud video", "cloud-recording", cloud_recording_page_html())
     content = """<header class="topbar"><div><p class="eyebrow">Amazon S3</p><h1>Cloud recording</h1></div></header>
 
 

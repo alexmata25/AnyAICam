@@ -10,3 +10,11 @@ function Set-GatewayEdition {
     # No selection on an existing install means keep its original defaults.
     # Do not write upload flags: changing edition must never enable transport.
 }
+
+function Resolve-GatewayProductMode {
+    param([string]$Edition, [string]$ProductMode, [bool]$ExistingInstall)
+    if ($ExistingInstall -or $Edition -notin @('local_gateway', 'cloud_gateway')) { return $ProductMode }
+    $expected = if ($Edition -eq 'local_gateway') { 'local' } else { 'hybrid' }
+    if ($ProductMode -and $ProductMode -cne $expected) { throw 'The requested product mode conflicts with the Gateway edition.' }
+    return $expected
+}

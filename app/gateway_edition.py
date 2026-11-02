@@ -3,6 +3,7 @@
 Selecting an edition never changes recording, retention, analytics or licensing.
 Existing installations without a selection retain Full VMS behavior.
 """
+import math
 import os
 
 EDITION_ENV = "ANYAICAM_GATEWAY_EDITION"
@@ -67,9 +68,43 @@ def event_clip_reference_allowed(event_id: str, clip_url: str) -> bool:
     return clip_url == f"/recordings/clips/motion/motion_{event_id}.mp4"
 
 
+def event_clip_duration_allowed(duration: float | None) -> bool:
+    if current_edition() == "full_vms":
+        return True
+    # Reuse the existing event-media sanity limit, never a new quota or
+    # retention policy. Unknown/unprobeable media must not upload first.
+    from event_media_policy import _MAX_SINGLE_CLIP_SECONDS
+    return (type(duration) in (int, float) and 0 < duration <= _MAX_SINGLE_CLIP_SECONDS
+            and math.isfinite(duration))
+
+
+def event_thumbnail_allowed(path) -> bool:
+    if current_edition() == "full_vms" or path is None:
+        return True
+    try:
+        if path.suffix.lower() not in {".jpg", ".jpeg"}:
+            return False
+        with path.open("rb") as handle:
+            return handle.read(3) == b"\xff\xd8\xff"
+    except OSError:
+        return False
+
+
 def _capacity_status() -> dict:
     from vms_capacity import capacity_status
     return capacity_status()
+
+
+def cloud_recording_page_html() -> str:
+    """Gateway explanation replaces controls for the unavailable bulk uploader."""
+    if current_edition() == "full_vms":
+        return ""
+    detail = ("Video stays on this computer. Cloud video uploads are disabled in Local Gateway."
+              if current_edition() == "local_gateway" else
+              "Cloud Gateway supports authorized event clips and their JPEG thumbnails. Continuous recording backups and live video uploads are unavailable. Event upload stays disabled until explicitly configured and entitled.")
+    return ('<header class="topbar"><h1>Cloud video</h1></header><section class="panel">'
+            f'<p>{detail}</p><p>Local recording, playback and retention keep their existing settings.</p>'
+            '<a href="/analytics">View events</a></section>')
 
 
 def edition_notice_html() -> str:

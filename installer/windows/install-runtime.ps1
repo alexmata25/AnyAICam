@@ -264,6 +264,7 @@ $values['ANYAICAM_BUILD_ID'] = $SourceCommit
 # Local / Hybrid (Requirement 9): the same rules as Linux installer/03-product-mode.sh. A new installation records
 . (Join-Path $PSScriptRoot 'gateway-edition.ps1')
 Set-GatewayEdition -Values $values -Edition $GatewayEdition
+$ProductMode = Resolve-GatewayProductMode -Edition $GatewayEdition -ProductMode $ProductMode -ExistingInstall $hadEnvironmentFile
 # the chosen mode as the bootstrap mode (used until the cloud reports one); Setup never switches a saved mode; an
 # earlier installation that never recorded one is left unset, so its runtime defaults are kept exactly.
 $savedMode = ''

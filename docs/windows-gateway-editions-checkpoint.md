@@ -5,6 +5,7 @@ Owner-approved Git identity configured repository-locally: Alejandro Mata
 <amata@anyaicam.com>. No global Git configuration changed. The 38 focused checks
 were rerun successfully before committing the installer/UI implementation.
 Installer/UI and transport-boundary implementation committed as `0d47a74`.
+Licensing and fresh event authorization follow-up committed as `f996e72`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
 ## Implemented foundation
@@ -78,6 +79,34 @@ Installer preflight preserves Blue's legacy unreadable-config repair behavior
 when no edition is requested; explicit edition changes still require a readable
 saved choice, and invalid or switched saved editions remain refused.
 
+## Media preflight, configuration and UI completion
+
+Cloud Gateway now probes event duration before requesting credentials or creating
+an AWS client. Unknown, non-finite, zero and oversized durations fail closed,
+leaving local retry intent intact. This reuses the existing event policy's
+individual clip sanity ceiling; it introduces no retention or daily quota change.
+The successful preflight duration is reused for registration, avoiding a second
+probe. Optional thumbnails require a JPEG extension and JPEG header, preventing
+ordinary video files from being passed through the thumbnail argument. Full VMS
+keeps its existing probe timing and optional thumbnail behavior.
+
+The shared Cloud recording page now shows an edition-specific explanation for
+Gateways, with a link to events and no bulk scan/retry controls or queue polling.
+Its existing settings permission check remains in place. The Full VMS page keeps
+the original controls/polling. Gateway scan, queue and retry endpoints return 403
+without changing state; internal recording-backup enqueue is also blocked.
+
+Fresh installer configuration now derives Gateway bootstrap mode in the runtime
+helper as well as Inno Setup and refuses conflicting explicit edition/mode pairs
+before service changes. Existing mode choices, legacy upgrades and saved upload
+and retention switches are preserved. No upload flag is automatically enabled.
+
+Blue's lifecycle snapshot allowlist now includes edition, video-upload switches,
+RETENTION_DAYS and local management/deletion switches. Existing comparison logic
+detects changed values. Synthetic comparisons prove an edition, upload flag or
+retention change fails while an unchanged repair passes. Secret values remain
+excluded. No installed-system snapshot was collected in this work.
+
 ## Blue acceptance inspection
 
 `16fba66` integrates Blue's acceptance tooling; `579578b` updates the accepted
@@ -123,7 +152,7 @@ No quota, retention period, billing policy or deletion behavior was changed.
 
 ## Validation and remaining work
 
-47 focused unittest checks passed, covering edition defaults, explicit override
+55 focused unittest checks passed sequentially, covering edition defaults, explicit override
 boundaries, Full VMS compatibility, Gateway notices, isolated actual transport
 functions with mocks, real PowerShell edition and product-mode blocks, event
 entitlement/retention policy with in-memory SQLite, and existing acceptance,
@@ -133,6 +162,10 @@ a fully mock-backed authorized event upload and catalog registration, capacity
 failures, cached-session refusal, expired/malformed credentials, event-reference
 validation and licence UI notices. Tests never send a network request; their
 media file is a few disposable bytes. No real video was uploaded.
+Added media preflight, Gateway versus Full VMS page behavior, backup API refusal,
+fresh-install conflicts, saved configuration and synthetic lifecycle regressions.
+The fixed non-discovery runner is `python tools/run_windows_gateway_light.py`;
+it imports no VMS application, starts no services and runs no actual AWS client.
 git diff --check passed. Python 3.15 reports existing invalid-escape warnings
 when parsing main.py. The pytest-based installer mode suite could not import
 because pytest is unavailable; its page-order/argument/preflight assertions
@@ -144,3 +177,13 @@ Next: installer compilation and Windows lifecycle/UI acceptance in an authorized
 test environment. R430/SAC/signed-upgrade gates remain open. There is no new
 Gateway buffering/deletion policy. Real service/deployment/merge and RAM-intensive
 acceptance require separate approval. No push, deployment or merge occurred.
+
+Build/lifecycle preparation is in `docs/windows-gateway-build-lifecycle-plan.md`.
+It specifies source/dependency/keyset/signing checks, fresh edition and lifecycle
+matrices and Blue's remaining A1/A3/A4/A5/A6/A7 evidence. The actual Inno Setup 7
+path used by build.ps1 was checked and was unavailable; nothing was installed.
+The R430's owner-reported 4.66 GB free / 31.91 GB is not a current measurement.
+No heavy operation is proposed now. Any later proposal must state actual machine,
+fresh free RAM, estimated additional RAM and duration and obtain approval before
+execution. Do not compile, run a full suite, touch Hyper-V or terminate processes
+under the present authorization.

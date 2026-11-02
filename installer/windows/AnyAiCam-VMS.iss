@@ -362,6 +362,13 @@ begin
     Result := 'The product mode must be exactly local or hybrid.';
     exit;
   end;
+  if not ExistingInstall() then begin
+    if ((GatewayEditionChoice() = 'local_gateway') and (Requested <> 'local')) or
+       ((GatewayEditionChoice() = 'cloud_gateway') and (Requested <> 'hybrid')) then begin
+      Result := 'The requested product mode conflicts with the Gateway edition.';
+      exit;
+    end;
+  end;
   if not SavedProductMode(Saved) or (Saved = '') then exit;
   if (Saved <> 'local') and (Saved <> 'hybrid') then
     Result := 'The product mode saved on this computer (' + Saved + ') is not exactly local or hybrid; fix it before installing.'

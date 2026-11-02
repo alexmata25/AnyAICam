@@ -62,6 +62,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                     '_edition_upload_allowed': lambda: gateway_edition.video_transport_allowed('event'),
                     '_event_camera_authorized': lambda number, identity: True,
                     '_event_upload_session': recording._ensure_session,
+                    '_duration_seconds': lambda path: 10,
                     '_safe_recording_url': lambda value: value,
                     '_local_path_from_recording_url': lambda value: Path('fake.mp4') if value else None,
                     'event_media_outbox': outbox, 'recording_upload': recording, 'logger': Mock(),
