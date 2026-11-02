@@ -51,6 +51,38 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         self.assertFalse(check(last_verified_at=accepted, now=accepted+timedelta(hours=72, microseconds=1)))
         self.assertFalse(pm.remote_access_authorized())
 
+    def test_mode_change_publishes_complete_state_at_replace_boundary(self):
+        pm.persist_mode('hybrid')
+        replace = os.replace
+        observed = []
+        def publish(source, target):
+            observed.append((pm._read_persisted_mode(), json.loads(Path(source).read_text())))
+            replace(source, target)
+        with patch.object(pm.os, 'replace', side_effect=publish):
+            self.assertTrue(pm.persist_mode('local'))
+        self.assertEqual(observed, [('hybrid', {'mode':'local'})])
+        self.assertEqual(pm._read_persisted_mode(), 'local')
+        self.assertFalse(pm.remote_access_authorized())
+        self.assertEqual(list(pm.STATE_FILE.parent.glob('*.tmp')), [])
+
+    def test_failed_mode_flush_preserves_last_accepted_state(self):
+        pm.persist_mode('local')
+        with patch.object(pm.os, 'fsync', side_effect=OSError('fixture disk failure')):
+            with self.assertRaises(OSError):
+                pm.persist_mode('hybrid')
+        self.assertEqual(pm._read_persisted_mode(), 'local')
+        self.assertFalse(pm.remote_access_authorized())
+        self.assertEqual(list(pm.STATE_FILE.parent.glob('*.tmp')), [])
+
+    def test_failed_mode_replace_preserves_last_accepted_state(self):
+        pm.persist_mode('local')
+        with patch.object(pm.os, 'replace', side_effect=PermissionError('fixture replace refusal')):
+            with self.assertRaises(PermissionError):
+                pm.persist_mode('hybrid')
+        self.assertEqual(pm._read_persisted_mode(), 'local')
+        self.assertFalse(pm.remote_access_authorized())
+        self.assertEqual(list(pm.STATE_FILE.parent.glob('*.tmp')), [])
+
     def test_existing_renewal_grace_deadline_is_not_redefined(self):
         ns = {'datetime':datetime, 'GRACE_PERIOD':timedelta(days=7)}
         load_functions('billing_status.py', {'grace_ends_at'}, ns)

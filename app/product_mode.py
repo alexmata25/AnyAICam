@@ -65,6 +65,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -186,7 +187,22 @@ def persist_mode(mode: str) -> bool:
     if previous == mode:
         return False
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"mode": mode}))
+    # Readers include the live remote-access guard. Publish only complete,
+    # flushed state; a failed write must not destroy the last accepted mode.
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=STATE_FILE.name + ".", suffix=".tmp", dir=STATE_FILE.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"mode": mode}))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, STATE_FILE)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
     logger.warning(
         "product_mode.changed previous=%s new=%s restart_required=true",
         previous or "unset", mode,
