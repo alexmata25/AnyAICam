@@ -5,6 +5,13 @@ and have not been executed. Source remains the shared Windows VMS 1.3.4 lineage
 on `codex/windows-gateway-editions`; all editions use the same application,
 AppId, services and protected data paths.
 
+The precise beta evidence matrix is in
+`windows-gateway-beta-acceptance-checklist.md`. The read-only presence inventory
+is `windows-gateway-beta-prerequisites.json`; refresh it with
+`python tools/audit_windows_gateway_prerequisites.py --output docs/windows-gateway-beta-prerequisites.json`.
+The auditor executes no build tools, hashes no large inputs and contacts no
+services. NOT_VALIDATED is not permission or readiness to build.
+
 ## Permitted lightweight verification
 
 From the checkout, run `python tools/run_windows_gateway_light.py`. It uses an
@@ -33,6 +40,7 @@ Before proposing a build, full suite or VM acceptance session, report:
 | Estimated requirement | Peak additional RAM for the specific command/guest, including toolchain and guest allocation; state the basis and uncertainty |
 | Expected duration | Estimate for that operation, with its basis; do not reuse lightweight test timing as build timing |
 | Scope | Exact build/test operation, evidence destination and test-only target |
+| Existing VMs | Running VM names/states/allocations and the explicit list that will remain running unchanged |
 
 Obtain explicit approval before executing that operation. If estimates are
 unknown, resolve them with the owner or existing build evidence first. No

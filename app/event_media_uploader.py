@@ -427,10 +427,16 @@ def upload_motion_event_media(
         return False
     from gateway_edition import current_edition, event_clip_duration_allowed, event_thumbnail_allowed
     gateway_duration = None
+    gateway_window = None
     if current_edition() == "cloud_gateway":
         gateway_duration = _duration_seconds(clip_path)
         if not event_clip_duration_allowed(gateway_duration):
             logger.warning("event_media.invalid_clip_duration event_id=%s camera=%s", event_id, camera_number)
+            return False
+        try:
+            gateway_window = compute_clip_window(event_start, event_end)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("event_media.invalid_event_window event_id=%s camera=%s", event_id, camera_number)
             return False
         # A caller must not smuggle another video through the optional image
         # argument. The existing producer emits JPEG event thumbnails.
@@ -509,7 +515,7 @@ def upload_motion_event_media(
             )
             thumbnail_key = None
 
-    window = compute_clip_window(event_start, event_end)
+    window = gateway_window if gateway_window is not None else compute_clip_window(event_start, event_end)
 
     actual_duration = gateway_duration if gateway_duration is not None else _duration_seconds(clip_path)
     duration_seconds = (

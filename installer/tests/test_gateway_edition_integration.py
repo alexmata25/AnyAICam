@@ -12,6 +12,7 @@ from unittest.mock import patch, Mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'app'))
 import gateway_edition
+from event_clips import compute_clip_window
 
 
 class GatewayIntegrationTests(unittest.TestCase):
@@ -63,6 +64,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                     '_event_camera_authorized': lambda number, identity: True,
                     '_event_upload_session': recording._ensure_session,
                     '_duration_seconds': lambda path: 10,
+                    'compute_clip_window': compute_clip_window,
                     '_safe_recording_url': lambda value: value,
                     '_local_path_from_recording_url': lambda value: Path('fake.mp4') if value else None,
                     'event_media_outbox': outbox, 'recording_upload': recording, 'logger': Mock(),

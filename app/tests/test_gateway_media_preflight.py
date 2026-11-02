@@ -1,5 +1,5 @@
 """Gateway media rejection occurs before credentials or AWS client creation."""
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from app.tests.test_gateway_licensing import load_functions
 import gateway_edition as edition
+from event_clips import compute_clip_window
 
 
 class GatewayMediaPreflightTests(unittest.TestCase):
@@ -53,6 +54,7 @@ class GatewayMediaPreflightTests(unittest.TestCase):
                     '_safe_recording_url': lambda url: url,
                     '_local_path_from_recording_url': lambda url: thumbnail if url == 'thumbnail' else Path('clip.mp4'),
                     '_duration_seconds': Mock(return_value=duration),
+                    'compute_clip_window': compute_clip_window,
                     'recording_upload': recording, 'logger': Mock(), 'event_media_outbox': Mock(),
                 }
                 load_functions('event_media_uploader.py', {'upload_motion_event_media'}, ns)
@@ -62,6 +64,26 @@ class GatewayMediaPreflightTests(unittest.TestCase):
                 self.assertFalse(result)
                 ns['event_media_outbox'].put.assert_called_once()
                 ns['event_media_outbox'].remove.assert_not_called()
+                recording._ensure_session.assert_not_called()
+                recording.boto3.client.assert_not_called()
+
+    def test_invalid_event_windows_are_rejected_before_transport(self):
+        for start, end in [(datetime(2026, 11, 2), datetime(2026, 11, 1)),
+                           (datetime(2026, 11, 1), datetime(2026, 11, 1, tzinfo=timezone.utc)),
+                           (datetime.min, datetime.min)]:
+            with self.subTest(start=start, end=end):
+                recording = Mock()
+                recording._camera_identity.return_value = {'cloud_recording_mode': 'motion', 'camera_id': 'c1'}
+                ns = {'EVENT_MEDIA_CAPTURE_ENABLED': True, 'EVENT_MEDIA_UPLOAD_ENABLED': True,
+                      '_edition_upload_allowed': lambda: True, '_event_camera_authorized': lambda *args: True,
+                      '_event_upload_session': recording._ensure_session, '_safe_recording_url': lambda url: url,
+                      '_local_path_from_recording_url': lambda url: Path('clip.mp4') if url else None,
+                      '_duration_seconds': lambda path: 10, 'compute_clip_window': compute_clip_window,
+                      'recording_upload': recording, 'logger': Mock(), 'event_media_outbox': Mock()}
+                load_functions('event_media_uploader.py', {'upload_motion_event_media'}, ns)
+                self.assertFalse(ns['upload_motion_event_media'](event_id='e1', camera_number=1,
+                    event_start=start, event_end=end, clip_url='/recordings/clips/motion/motion_e1.mp4',
+                    thumbnail_url=None, already_classified=True))
                 recording._ensure_session.assert_not_called()
                 recording.boto3.client.assert_not_called()
 

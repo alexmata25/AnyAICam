@@ -121,7 +121,7 @@ class GatewayLicensingTests(unittest.TestCase):
             ns['_event_upload_session'](1, 'c1')
             recording._ensure_session.assert_called_once_with(1, 'c1')
 
-    def test_authorized_gateway_clip_uses_only_event_objects_with_mock_transport(self):
+    def mock_event_upload(self, registration_accepted=True):
         # Execute the actual uploader/session functions. Every transport is a
         # mock; the only media is a tiny disposable file, never a real camera.
         with tempfile.TemporaryDirectory() as temp:
@@ -140,7 +140,7 @@ class GatewayLicensingTests(unittest.TestCase):
                                 'expiration': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()},
                 'bucket': 'fake-bucket', 'key_prefix': 'recordings/customer/site/appliance/c1/', 'region': 'test-region',
             }
-            recording_ns['_control_plane_post'].side_effect = lambda url, payload: response if url.endswith('/credentials') else {'status': 'accepted'}
+            recording_ns['_control_plane_post'].side_effect = lambda url, payload: response if url.endswith('/credentials') else ({'status': 'accepted'} if registration_accepted else None)
             load_functions('recording_uploader.py', {'session_region'}, recording_ns)
             recording = SimpleNamespace(**recording_ns)
             outbox = Mock()
@@ -155,6 +155,7 @@ class GatewayLicensingTests(unittest.TestCase):
                 'compute_clip_window': lambda a, b: SimpleNamespace(start=a, end=b),
                 '_duration_seconds': lambda path: 10,
                 'EVENT_MEDIA_CACHE_CONTROL': 'test-cache',
+                'time': SimpleNamespace(sleep=Mock()),
             }
             load_functions('event_media_uploader.py', {'_edition_upload_allowed', '_event_camera_authorized',
                 '_event_upload_session', 'upload_motion_event_media'}, ns)
@@ -162,13 +163,27 @@ class GatewayLicensingTests(unittest.TestCase):
                 result = ns['upload_motion_event_media'](event_id='e1', camera_number=1,
                     event_start=start, event_end=end, clip_url='/recordings/clips/motion/motion_e1.mp4',
                     thumbnail_url=None, already_classified=True)
-            self.assertTrue(result)
-            client.upload_file.assert_called_once()
-            self.assertEqual(client.upload_file.call_args.args[1], 'fake-bucket')
-            self.assertTrue(client.upload_file.call_args.args[2].endswith('/2026/11/01/events/motion_e1.mp4'))
-            self.assertEqual(recording._control_plane_post.call_args_list[0].args[0], '/api/appliance/recordings/c1/credentials')
-            self.assertEqual(recording._control_plane_post.call_args_list[1].args[0], '/api/appliance/analytics/c1/events/e1/media')
-            outbox.remove.assert_called_once_with('e1')
+            return result, client, recording, outbox
+
+    def test_authorized_gateway_clip_uses_only_event_objects_with_mock_transport(self):
+        result, client, recording, outbox = self.mock_event_upload()
+        self.assertTrue(result)
+        client.upload_file.assert_called_once()
+        self.assertEqual(client.upload_file.call_args.args[1], 'fake-bucket')
+        self.assertTrue(client.upload_file.call_args.args[2].endswith('/2026/11/01/events/motion_e1.mp4'))
+        self.assertEqual(recording._control_plane_post.call_args_list[0].args[0], '/api/appliance/recordings/c1/credentials')
+        self.assertEqual(recording._control_plane_post.call_args_list[1].args[0], '/api/appliance/analytics/c1/events/e1/media')
+        outbox.remove.assert_called_once_with('e1')
+
+    def test_registration_failure_does_not_discard_uploaded_event_retry_intent(self):
+        result, client, recording, outbox = self.mock_event_upload(registration_accepted=False)
+        self.assertFalse(result)
+        client.upload_file.assert_called_once()
+        outbox.put.assert_called_once()
+        outbox.remove.assert_not_called()
+        # One credential authorization, then the existing twelve bounded
+        # registration attempts. Sleeps and every transport are mocks.
+        self.assertEqual(recording._control_plane_post.call_count, 13)
 
 
 if __name__ == '__main__':

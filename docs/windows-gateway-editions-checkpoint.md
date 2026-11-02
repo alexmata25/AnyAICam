@@ -6,7 +6,44 @@ Owner-approved Git identity configured repository-locally: Alejandro Mata
 were rerun successfully before committing the installer/UI implementation.
 Installer/UI and transport-boundary implementation committed as `0d47a74`.
 Licensing and fresh event authorization follow-up committed as `f996e72`.
+Media/configuration/UI safeguards and initial lifecycle preparation committed
+as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
+
+## Beta preparation update
+
+The presence-only audit is `tools/audit_windows_gateway_prerequisites.py`, with
+the recorded result in `docs/windows-gateway-beta-prerequisites.json`. It reads
+the build script and wheel lock directly; no tool execution, dependency download,
+large-file hashing, certificate-store inspection or external call occurs.
+On AlexDellServer it found Inno Setup 7 absent, Git absent from the build shell's
+PATH, all 8 pinned vendor inputs absent and all 108 locked wheels absent.
+makecat.exe and signtool.exe exist at the build's SDK paths, but their integrity
+and usability are unverified. No build interpreter or approved keyset was supplied.
+Azure signing DLL/metadata are absent at configured/default locations; certificate
+signing variables are unset. No signing mode or credential was selected. The
+audit always reports NOT_VALIDATED, even if all file-presence checks pass.
+
+The precise per-edition acceptance record is
+`docs/windows-gateway-beta-acceptance-checklist.md`: installation/repair/upgrade,
+activation, discovery, local recording/playback, notifications, mock upload and
+denial cases, Full VMS regression and all Blue component gates. Each installed
+gate requires its own result/evidence; no beta installer was built or accepted.
+
+Code review found Cloud Gateway computed its event time window after uploading.
+Reversed timestamps, mixed timezones or datetime overflow could therefore fail
+after bytes had been sent. Gateway time-window computation now runs before
+credentials/AWS work and is reused for registration. Invalid input fails closed;
+Full VMS timing/behavior remains unchanged. New mock-backed tests also verify
+that catalog registration failure retains retry intent after a simulated upload;
+all sleeps and transports are mocked. Local retention and event quotas are unchanged.
+
+No further code-level blocker was identified by this focused review. This is
+not installed-system acceptance or a complete code audit. Missing build inputs,
+approved versions/keyset/signing decisions and the unexecuted lifecycle gates
+remain beta blockers. R430 RAM and VM inventory have not been queried; no heavy
+window is requested. Before any such request, report fresh R430 RAM, estimated
+additional RAM/duration with basis, and the existing VMs that will remain running.
 
 ## Implemented foundation
 
@@ -152,7 +189,7 @@ No quota, retention period, billing policy or deletion behavior was changed.
 
 ## Validation and remaining work
 
-55 focused unittest checks passed sequentially, covering edition defaults, explicit override
+60 focused unittest checks passed sequentially, covering edition defaults, explicit override
 boundaries, Full VMS compatibility, Gateway notices, isolated actual transport
 functions with mocks, real PowerShell edition and product-mode blocks, event
 entitlement/retention policy with in-memory SQLite, and existing acceptance,
@@ -164,6 +201,9 @@ validation and licence UI notices. Tests never send a network request; their
 media file is a few disposable bytes. No real video was uploaded.
 Added media preflight, Gateway versus Full VMS page behavior, backup API refusal,
 fresh-install conflicts, saved configuration and synthetic lifecycle regressions.
+Additional beta checks cover prerequisite parsing/presence-versus-integrity,
+invalid time windows before transport and retained retry intent after failed
+mock registration.
 The fixed non-discovery runner is `python tools/run_windows_gateway_light.py`;
 it imports no VMS application, starts no services and runs no actual AWS client.
 git diff --check passed. Python 3.15 reports existing invalid-escape warnings

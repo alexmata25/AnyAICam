@@ -13,6 +13,7 @@ TEST_MODULES = (
     'app.tests.test_gateway_media_preflight',
     'installer.tests.test_gateway_edition_integration',
     'installer.tests.test_gateway_configuration_contract',
+    'installer.tests.test_gateway_prerequisite_audit',
     'installer.tests.test_windows_1341_acceptance_static',
     'installer.tests.test_windows_local_activation_wording_132',
     'installer.tests.test_windows_hybrid_state_dir_132',
