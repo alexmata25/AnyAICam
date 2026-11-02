@@ -385,7 +385,9 @@ begin
   Saved := '';
   if ExistingInstall() then begin
     if not LoadStringsFromFile(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'), Lines) then begin
-      Result := 'Cannot read the saved edition; repair access before installing.';
+      // Blue's legacy repair path fixes old data ACLs in install-runtime.ps1.
+      // With no requested edition there is no selection to switch; preserve it.
+      if Requested <> '' then Result := 'Cannot read the saved edition; repair access before installing.';
       exit;
     end;
     for I := 0 to GetArrayLength(Lines) - 1 do begin

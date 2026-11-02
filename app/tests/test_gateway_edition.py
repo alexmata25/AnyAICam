@@ -21,6 +21,9 @@ class GatewayEditionTests(unittest.TestCase):
         state = patch.object(pm, 'STATE_FILE', Path(self.temp.name) / 'mode.json')
         state.start()
         self.addCleanup(state.stop)
+        capacity = patch.object(edition, '_capacity_status', return_value={'state': 'fail_closed'})
+        capacity.start()
+        self.addCleanup(capacity.stop)
 
     def test_full_vms_preserves_legacy_default(self):
         self.assertEqual(edition.current_edition(), 'full_vms')

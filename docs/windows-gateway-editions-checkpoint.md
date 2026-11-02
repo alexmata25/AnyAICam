@@ -4,6 +4,7 @@ Branch: `codex/windows-gateway-editions`. Foundation commit: `862ceb48ba77376f2b
 Owner-approved Git identity configured repository-locally: Alejandro Mata
 <amata@anyaicam.com>. No global Git configuration changed. The 38 focused checks
 were rerun successfully before committing the installer/UI implementation.
+Installer/UI and transport-boundary implementation committed as `0d47a74`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
 ## Implemented foundation
@@ -46,6 +47,36 @@ enables this flag. No development or live environment was configured for upload.
 Full VMS transport behavior is preserved. Transport flags and low-level upload
 entry points enforce boundaries, including the recording pilot-scope path.
 Local event capture/outbox writes remain separate from transport.
+
+## Licensing and authorization follow-up
+
+Gateway event uploads now also require the existing accepted camera-capacity
+licence for the provisioned camera number. Missing, zero, revoked or unreadable
+capacity fails closed. A cloud-control-plane runtime's capacity exemption is
+not an edge licence. No new licence issuer, unsigned bypass or expiration rule
+was introduced; accepted-capacity offline behavior stays in vms_capacity.py.
+The Full VMS path retains its existing authorization behavior.
+
+Cloud Gateway reauthorizes every clip through the existing credentials endpoint
+instead of reusing a cached STS session. That endpoint already checks camera
+ownership, effective cloud event entitlement and motion_event_policy before
+issuing narrowly scoped event credentials. A denial/outage discards the old
+cached session/client and leaves the clip pending locally. Malformed, expired
+or timezone-naive fresh credentials are rejected. This adds one authorization
+request per Gateway clip; Full VMS credential caching remains unchanged.
+
+Gateway clip references must match the existing producer's
+`/recordings/clips/motion/motion_{event_id}.mp4` output, preventing ordinary
+recording segments from being passed directly to the event uploader. Existing
+path containment checks still apply. Shared media registration also checks the
+camera licence; it uploads no new video objects.
+
+Gateway UI notices now report accepted camera-slot capacity or the need to
+activate, plus whether Cloud Gateway event upload is explicitly configured.
+They do not expose raw trust failure details or enable upload settings.
+Installer preflight preserves Blue's legacy unreadable-config repair behavior
+when no edition is requested; explicit edition changes still require a readable
+saved choice, and invalid or switched saved editions remain refused.
 
 ## Blue acceptance inspection
 
@@ -92,11 +123,16 @@ No quota, retention period, billing policy or deletion behavior was changed.
 
 ## Validation and remaining work
 
-38 focused unittest checks passed, covering edition defaults, explicit override
+47 focused unittest checks passed, covering edition defaults, explicit override
 boundaries, Full VMS compatibility, Gateway notices, isolated actual transport
 functions with mocks, real PowerShell edition and product-mode blocks, event
 entitlement/retention policy with in-memory SQLite, and existing acceptance,
-activation wording, Hybrid state-folder and premium-default checks.
+activation wording, Hybrid state-folder and premium-default checks. Added
+coverage executes actual session and uploader functions in isolation, including
+a fully mock-backed authorized event upload and catalog registration, capacity
+failures, cached-session refusal, expired/malformed credentials, event-reference
+validation and licence UI notices. Tests never send a network request; their
+media file is a few disposable bytes. No real video was uploaded.
 git diff --check passed. Python 3.15 reports existing invalid-escape warnings
 when parsing main.py. The pytest-based installer mode suite could not import
 because pytest is unavailable; its page-order/argument/preflight assertions
@@ -104,8 +140,7 @@ were updated for the edition page, but that suite was not run. No full app test
 suite or installer build/compilation was run. No VMS process, service, Hyper-V
 operation or external service was started.
 
-Next: continue installer/UI and entitlement enforcement, then installer
-compilation and Windows lifecycle/UI acceptance in an authorized
+Next: installer compilation and Windows lifecycle/UI acceptance in an authorized
 test environment. R430/SAC/signed-upgrade gates remain open. There is no new
 Gateway buffering/deletion policy. Real service/deployment/merge and RAM-intensive
 acceptance require separate approval. No push, deployment or merge occurred.

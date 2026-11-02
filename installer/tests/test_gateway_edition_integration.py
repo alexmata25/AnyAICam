@@ -60,6 +60,8 @@ class GatewayIntegrationTests(unittest.TestCase):
                 namespace = {
                     'EVENT_MEDIA_CAPTURE_ENABLED': True, 'EVENT_MEDIA_UPLOAD_ENABLED': True,
                     '_edition_upload_allowed': lambda: gateway_edition.video_transport_allowed('event'),
+                    '_event_camera_authorized': lambda number, identity: True,
+                    '_event_upload_session': recording._ensure_session,
                     '_safe_recording_url': lambda value: value,
                     '_local_path_from_recording_url': lambda value: Path('fake.mp4') if value else None,
                     'event_media_outbox': outbox, 'recording_upload': recording, 'logger': Mock(),
@@ -67,7 +69,7 @@ class GatewayIntegrationTests(unittest.TestCase):
                 exec(compile(ast.Module(body=[function], type_ignores=[]), 'event_media_uploader.py', 'exec', flags=__future__.annotations.compiler_flag), namespace)
                 result = namespace['upload_motion_event_media'](event_id='e1', camera_number=1,
                     event_start=datetime(2026, 11, 1), event_end=datetime(2026, 11, 1, 0, 0, 10),
-                    clip_url='/recordings/camera1/event.mp4', thumbnail_url=None, already_classified=True)
+                    clip_url='/recordings/clips/motion/motion_e1.mp4', thumbnail_url=None, already_classified=True)
                 outbox.put.assert_called_once()
                 if edition == 'local_gateway' or not opted_in:
                     self.assertTrue(result)

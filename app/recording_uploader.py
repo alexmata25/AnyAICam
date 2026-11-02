@@ -611,7 +611,12 @@ def _session_expires_soon(session: dict) -> bool:
     return remaining <= SESSION_RENEW_MARGIN_SECONDS
 
 
-def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
+def _ensure_session(camera_number: int, camera_id: str, *, force_refresh: bool = False) -> dict | None:
+    if force_refresh:
+        # Gateway clips must recheck the current server entitlement, even if
+        # an earlier STS session remains valid after a plan cancellation.
+        _sessions.pop(camera_number, None)
+        _clients.pop(camera_number, None)
     session = _sessions.get(camera_number)
     if session and not _session_expires_soon(session):
         return session
@@ -653,6 +658,9 @@ def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
         # install never had AWS_REGION in its environment.
         "region": response["region"].strip() if isinstance(response.get("region"), str) and response["region"].strip() else None,
     }
+    if force_refresh and _session_expires_soon(session):
+        _invalid("expired_or_invalid_expiration")
+        return None
     _sessions[camera_number] = session
     # A freshly (re-)issued session invalidates whatever S3 client was
     # built from the previous one -- that client has the old credentials
