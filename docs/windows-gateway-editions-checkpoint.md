@@ -10,6 +10,64 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## 1.3.4.1 alignment comparison (from 2f501a6)
+
+Owner approves verified 1.3.4 as minimum, with 1.3.4.1 target. Gateway's direct
+base remains `579578b604cdf1b641905193cf8891de1e1a0a1f`. Available origin is a
+sealed local bundle, not a current upstream service. Its branch tip is still
+579578b. Read-only connected GitHub search found no accessible AnyAiCam-VMS
+repository; this does not prove no newer private source exists. Current
+authoritative repository/branch or newer sealed handoff has been requested.
+No claim of global latest-source alignment is possible until it is supplied.
+
+Compared both existing Windows bundles in an isolated bare review repository
+under AAC-Dev-Reports. Blue's parallel `028846f` (2026-10-28 10:26 -0500) is
+earlier than integration `16fba66` (10:52) and tip 579578b (11:07). All twelve
+acceptance helper files plus installer-size-policy.ps1 match byte-for-byte
+between Blue's original and 579578b. The integration additionally verifies all
+native catalog members rather than a sample, preserves the pre-sign size gate,
+adds generated Python launcher cleanup and reconciles activation wording.
+No unintegrated newer authoritative Windows commit was found in these sources.
+Linux/Red bundles found alongside these transfers are not treated as approved
+Windows 1.3.4.1 successors merely because their dates are later.
+
+All 109 lightweight checks passed again sequentially in 21.553s;
+`git diff --check` passed. This milestone changes documentation only; no source
+runtime, dependency pin, signing key or architecture was modified.
+
+An isolated `git merge-tree --write-tree --name-only` simulation against the
+unchanged Gateway tip found conflicts if Blue's original parallel history were
+merged wholesale: `installer/tests/test_windows_acceptance_tools_1341.py`
+(add/add), `installer/windows/acceptance/Get-AnyAiCamInstallState.ps1` (add/add),
+and `installer/windows/build.ps1` (content). No actual merge/index/worktree or
+Gateway ref was changed. That merge is unnecessary for the available sources.
+
+Focused integration plan if a newer authoritative source is supplied:
+
+1. Confirm owner-approved source tip, provenance, ancestry to e3d7eda/d6b4244
+   and relationship to 579578b; inspect it in an isolated review checkout.
+2. Compare unique commits and actual patch/blob contents so already reconciled
+   Blue work is not applied twice. Simulate the proposed integration first.
+3. Review overlaps in build.ps1 (early keyset/interpreter checks, Git discovery,
+   all-member catalog/size/publisher checks), edition wizard/runtime configuration,
+   service state paths, lifecycle snapshot allowlist and acceptance tests.
+4. Review runtime overlaps in product_mode/edge sync, recording/event/P2P upload
+   boundaries, independent local capacity, per-camera analytics and main.py.
+   Preserve Local zero-video-upload, Cloud event-only fresh authorization,
+   cancellation/session retries, Basic Motion/local playback and retention.
+5. Present exact commits/conflicts/resolutions for owner approval before merging.
+   Preserve the current Gateway tip, apply only approved integration in isolation,
+   then rerun the complete 109-check lightweight baseline and relevant new tests.
+   Installed acceptance and installer compilation remain separate approvals.
+
+Installer architecture and prerequisite findings are unchanged: one shared VMS
+setup for all editions. Build still needs sealed vendor/wheel payload, verified
+Inno 7.1.0 and installed approved helper interpreter, confirmed public keyset/
+digest/environment, approved setup/release versions, current signing workflow
+and an approved resource window. Original sealed package and current-source
+handoff are separate recovery needs; neither a parallel commit nor a successful
+mock suite substitutes for binary dependencies or installed acceptance.
+
 ## Prerequisite recovery and expiry evidence (from 056bbd5)
 
 Extended the existing remediation with the requested component/version/location/
