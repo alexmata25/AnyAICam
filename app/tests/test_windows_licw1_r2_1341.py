@@ -240,6 +240,14 @@ def test_present_malformed_accepted_record_keeps_rollback_floor(edge, contents):
     assert ae.feature_allowed("talk_down") is False
 
 
+def test_oversized_parseable_accepted_record_keeps_rollback_floor(edge):
+    holds_every_grant(edge)
+    payload = b'{"trust_generation":0}' + b" " * (512 * 1024)
+    assert len(payload) > 512 * 1024
+    vms_capacity.ACCEPTED_FILE.write_bytes(payload)
+    assert ae._accepted_trust_generation() >= 1
+
+
 def test_unreadable_accepted_record_keeps_rollback_floor(edge, monkeypatch):
     holds_every_grant(edge)
     accepted = vms_capacity.ACCEPTED_FILE
@@ -251,7 +259,12 @@ def test_unreadable_accepted_record_keeps_rollback_floor(edge, monkeypatch):
         return real_read(path, limit)
 
     monkeypatch.setattr(ae, "_read_single_name", unreadable)
+    ae.TRUST_REGISTRY_FILE.unlink()
+    ae.TRUST_STATE_FILE.unlink()
+    restart()
     assert ae._accepted_trust_generation() >= 1
+    assert ae._trusted_keys() == {}
+    assert ae.feature_allowed("talk_down") is False
 
 
 def test_genuinely_missing_accepted_record_retains_legacy_floor(edge):

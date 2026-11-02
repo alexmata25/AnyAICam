@@ -630,7 +630,10 @@ def _accepted_trust_generation() -> int:
         accepted_file = vms_capacity.ACCEPTED_FILE
         if not os.path.lexists(accepted_file):
             return 0
-        data = json.loads(_read_single_name(accepted_file, 512 * 1024))
+        raw = _read_single_name(accepted_file, 512 * 1024)
+        if len(raw) > 512 * 1024:
+            return 1
+        data = json.loads(raw)
         if not isinstance(data, dict):
             return 1
         # Schema-2 1.2.7 and legacy-mode 1.3.4 accepted records predate trust generations; they are valid floor zero.
