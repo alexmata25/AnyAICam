@@ -6,6 +6,18 @@ transport results do not establish installed-system acceptance. Each row below
 requires PASS / FAIL / BLOCKED / NOT RUN, tester, timestamp and evidence path.
 All installed-system rows currently remain **NOT RUN**.
 
+## Current autonomous source validation
+
+The latest integrated lightweight run passed **130 tests in 34.894s**. New
+coverage binds lifecycle evidence to the same computer/install/data roots and
+exercises actual local notification fanout/inbox permission transitions for
+both editions, preserving earlier removed-camera coverage. Targeted installer
+configuration/lifecycle checks passed 13 tests in 25.771s; application notification
+checks passed 8 in 3.002s. No installed service, VM, compiler or provider ran.
+These source results supersede earlier test counts below, not installed rows.
+
+Current blocker/next-step handoff: `gateway-development-handoff.md`.
+
 ## Source acceptance progress, 2026-11-02 follow-up
 
 New rendered-HTML checks exercise both Gateway notices through bootstrap-only,

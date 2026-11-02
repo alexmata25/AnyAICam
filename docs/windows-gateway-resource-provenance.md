@@ -108,3 +108,32 @@ vendor folder; the single sealed-package recovery action covers them first.
 | `tesseract-5.5.2-win64-anyaicam.zip` | Verify pinned deterministic bundle; ask original bundle path only if absent from recovered package. |
 | 108 wheels named in `wheels.lock.sha256` | Verify each locked filename/hash, CPU variants included; ask only for actual missing/mismatched members after verification. |
 | Public keyset packaged with parity toolchain | Confirm intended environment and independent digest, then canonical-validate; standalone public-file request only if package lacks it. |
+
+## One targeted recovery pass: result
+
+The additional bounded metadata lead
+`C:\AAC-Dev-Reports\External-Drive-Transfer-Review-20261030-224344` contains
+`integrity.json`, `git-verification.json` and a source-review TAR. The integrity
+record lists adapter source bundles, VMS source references and test/readme files;
+no sealed parity payload, public keyset or Windows toolchain member is recorded.
+The already documented Dell-to-R430 archive's evidence also describes source
+bundles. No archive was extracted or binary payload read. Previously exhausted
+transfer/profile/build/cache paths were not searched again.
+
+**Last documented location is not a last verified recovery location:** the
+2026-10-28 handoff prepared on **AlexDellLaptop**,
+`R430-win1341-release-handoff-579578b\HANDOFF.md` section6, names
+`C:\AnyAiCam-Transfer\R430-win134-parity-d6b4244` as an already-delivered sealed
+package sealed **2026-10-27** and records its expected manifest seal. No accessible manifest/payload
+bytes from that package have been located or verified in these searches. The
+historical original Dell keyset/build paths are recovery leads, not current
+verified copies. There is no substantiated alternative backup path to report.
+
+Historical intended trust environment **production** is explicitly established
+by `docs/windows-1.3.2-exe-build-checklist.md`, Gate2: public-keyset digest
+`2389a655fb3e5ed91e8a4a9216f9c45b97feb3847571b0536384b8305979af7c` is labelled
+production; the separate synthetic keyset is DO-NOT-SHIP. This public metadata
+does not establish that a recovered file is current or approved for the next
+candidate. Recovery stops until an exact accessible original package/backup path
+is supplied; independently confirm the intended current production environment
+and digest before accepting recovered keyset bytes.

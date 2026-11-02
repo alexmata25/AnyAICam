@@ -131,6 +131,23 @@ class GatewayConfigurationTests(unittest.TestCase):
                     self.assertEqual(data['result'], 'BLOCKED')
                     self.assertIn('recording byte totals are missing', data['blocked_reason'])
 
+    def test_lifecycle_blocks_comparison_across_targets(self):
+        for field, value in [('computer', 'OTHER-HOST'), ('install_root', r'D:\OtherInstall'),
+                             ('data_root', r'D:\OtherData'), ('computer', None)]:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temp:
+                before, after = copy.deepcopy(BASE_STATE), copy.deepcopy(BASE_STATE)
+                after[field] = value
+                b, a, report = (Path(temp) / name for name in ('before.json', 'after.json', 'result.json'))
+                b.write_text(json.dumps(before), encoding='utf-8')
+                a.write_text(json.dumps(after), encoding='utf-8')
+                result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+                    str(WIN / 'acceptance/Compare-AnyAiCamInstallState.ps1'), '-Before', str(b), '-After', str(a),
+                    '-Step', 'Repair', '-OutputPath', str(report)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                data = json.loads(report.read_text(encoding='utf-8-sig'))
+                self.assertEqual(data['result'], 'BLOCKED')
+                self.assertIn('target', data['blocked_reason'])
+
 
 if __name__ == '__main__':
     unittest.main()

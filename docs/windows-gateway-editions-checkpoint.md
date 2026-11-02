@@ -10,6 +10,30 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Autonomous bounded recovery and source follow-through
+
+The single new recovery pass inspected existing external-drive transfer metadata;
+it describes adapter source, not the sealed parity payload. No candidate was
+found and no archive was extracted. The original Dell handoff is a last recorded
+origin, not a current verified copy. Historical public metadata explicitly labels
+the pinned 2389a655...af7c keyset production, distinct from synthetic DO-NOT-SHIP.
+
+Lifecycle comparison now blocks different/missing computer/install/data roots.
+Customer notification retrieval now matches fanout's existing all-camera/no-rows
+viewer policy while enforcing own-recipient/customer scope, explicit permissions,
+selected-mode denial and camera-less exclusion. Existing removed-camera regression
+was retained when integrating the added tests. No local licence/remote policy,
+billing or retention rule changed.
+
+13 focused installer checks passed in 25.771s; 8 application checks in 3.002s.
+Final integrated sequential runner **130 passed in 34.894s**; diff check passed.
+The unified beta checklist and `gateway-development-handoff.md` distinguish source
+evidence from blocked build/installed acceptance. Both agents assessed remaining
+work: sealed inputs/toolchain, authoritative remote-expiry decisions and approved
+isolated Windows acceptance are the concrete blockers; no speculative source
+work or repeated search is substituted for them. No heavy tests, VM/hardware,
+R430/Ryzen, production, billing or retention changes occurred.
+
 ## Minimal next-stage inputs and cancellation/lifecycle safeguards
 
 Current reference documents remain `windows-gateway-resource-provenance.md`

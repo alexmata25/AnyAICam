@@ -20,6 +20,10 @@ with reduced bytes fails; missing byte totals produce BLOCKED and require new
 snapshots. These aggregate checks do not establish per-file media
 integrity; use the synthetic clips' offline playback checks too.
 
+Both snapshots must identify the same computer, install root and data root.
+Mismatched or missing target identifiers produce BLOCKED; snapshots from another
+VM or another data directory cannot prove preservation on this target.
+
 ## 0. Preconditions
 - [ ] VM checkpoint taken before step 1 (name: `pre-1341-lifecycle`), so each step can be repeated from a clean state.
 - [ ] Both setups' SHA-256 verified (`Get-FileHash`). Both setups' Authenticode `Valid` with the pinned AnyAiCam publisher (`publisher-pin.ps1`).

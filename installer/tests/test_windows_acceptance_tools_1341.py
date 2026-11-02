@@ -365,6 +365,7 @@ class InstalledReadOnlyTests(unittest.TestCase):
 
 
 BASE_STATE = {
+    "computer": "SYNTHETIC-WINDOWS", "install_root": r"C:\Program Files\AnyAiCam", "data_root": r"C:\ProgramData\AnyAiCam",
     "registered": True, "version": "1.3.4", "program_folder_exists": True,
     "services": {name: {"state": "Running", "start_mode": "Auto", "account": "LocalSystem", "path": "x"} for name in ("AnyAiCamVMS", "AnyAiCamAgent")},
     "program_file_list": ["app\\main.py", "service\\service-launcher.ps1"], "scripts": {"service\\service-launcher.ps1": "aa"},

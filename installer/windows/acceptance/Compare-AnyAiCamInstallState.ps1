@@ -15,6 +15,16 @@ $b = Get-Content -Raw -LiteralPath $Before | ConvertFrom-Json
 $a = Get-Content -Raw -LiteralPath $After | ConvertFrom-Json
 $result = New-AcceptanceResult "A6-lifecycle-$($Step.ToLowerInvariant())" $Step
 if (-not $OutputPath) { $OutputPath = [IO.Path]::ChangeExtension($After, ".compare-$($Step.ToLowerInvariant()).json") }
+foreach ($field in 'computer', 'install_root', 'data_root') {
+    if ([string]::IsNullOrWhiteSpace([string]$b.$field) -or [string]::IsNullOrWhiteSpace([string]$a.$field)) {
+        $final = Complete-AcceptanceResult $result $OutputPath 'snapshot target identity is incomplete; take new snapshots with the current collector'
+        "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+    }
+    if ([string]$b.$field -ine [string]$a.$field) {
+        $final = Complete-AcceptanceResult $result $OutputPath "snapshots describe different targets ($field)"
+        "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+    }
+}
 if (-not $b.data.readable -or -not $a.data.readable) {
     $final = Complete-AcceptanceResult $result $OutputPath 'a snapshot could not read the data folder (take snapshots elevated)'
     "A6 BLOCKED: $($final.blocked_reason)"; exit 2

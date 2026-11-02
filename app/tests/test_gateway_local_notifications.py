@@ -96,6 +96,46 @@ class GatewayLocalNotificationTests(unittest.TestCase):
             self.assertEqual(gateway_notifications.publish_local_motion(self.alert), 2)
         self.external.assert_not_called(); self.push.assert_not_called()
 
+    def test_all_camera_viewer_reads_own_local_motion_without_explicit_permission_rows(self):
+        self.db.execute("UPDATE partner_users SET camera_access_mode='all' WHERE id='denied'")
+        ns = {'CUSTOMER_PORTAL_ROLES':{'customer_owner','customer_viewer'}}
+        load_functions('main.py', {'_customer_notifications'}, ns)
+        request = SimpleNamespace(identity={'role':'customer_viewer', 'customer_id':'customer1', 'email':'denied@test'})
+        for edition in ('local_gateway', 'cloud_gateway'):
+            with self.subTest(edition=edition), patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':edition}):
+                self.db.execute('DELETE FROM notifications')
+                self.assertEqual(gateway_notifications.publish_local_motion(self.alert), 3)
+                expected = self.db.execute("SELECT id FROM notifications WHERE user_id='denied'").fetchone()[0]
+                # Camera-less rows never become visible to a viewer through
+                # the all-camera exception, even if fan-out created one.
+                self.engine.fanout_appliance_event({'customer_id':'customer1', 'site_id':'site1'},
+                    {'id':'system', 'event_type':'motion', 'dedupe_key':'system'}, local_only=True)
+                for inbox in (None, 'active'):
+                    result = ns['_customer_notifications'](request, inbox_view=inbox, camera_number=1)
+                    self.assertEqual([row['id'] for row in result], [expected])
+                self.assertEqual([row['id'] for row in ns['_customer_notifications'](request)], [expected])
+                request.identity['customer_id'] = 'customer2'
+                self.assertEqual(ns['_customer_notifications'](request), [])
+                request.identity['customer_id'] = 'customer1'
+        self.external.assert_not_called(); self.push.assert_not_called()
+
+    def test_all_camera_viewer_explicit_alert_denial_overrides_mode_and_hides_old_rows(self):
+        self.db.execute("UPDATE partner_users SET camera_access_mode='all' WHERE id='denied'")
+        self.assertEqual(gateway_notifications.publish_local_motion(self.alert), 3)
+        ns = {'CUSTOMER_PORTAL_ROLES':{'customer_owner','customer_viewer'}}
+        load_functions('main.py', {'_customer_notifications'}, ns)
+        request = SimpleNamespace(identity={'role':'customer_viewer', 'customer_id':'customer1', 'email':'denied@test'})
+        self.assertEqual(len(ns['_customer_notifications'](request, inbox_view='active')), 1)
+        self.db.execute("INSERT INTO customer_camera_permissions VALUES('denied','c1',0)")
+        self.assertEqual(ns['_customer_notifications'](request, inbox_view='active'), [])
+        self.assertEqual(gateway_notifications.publish_local_motion({**self.alert, 'event_id':'motion2'}), 2)
+        self.db.execute("UPDATE customer_camera_permissions SET can_alerts=1 WHERE user_id='denied'")
+        self.assertEqual(len(ns['_customer_notifications'](request, inbox_view='active')), 1)
+        self.db.execute("UPDATE partner_users SET camera_access_mode='selected' WHERE id='denied'")
+        self.assertEqual(len(ns['_customer_notifications'](request, inbox_view='active')), 1)
+        self.db.execute("DELETE FROM customer_camera_permissions WHERE user_id='denied'")
+        self.assertEqual(ns['_customer_notifications'](request, inbox_view='active'), [])
+
     def test_removed_camera_does_not_consume_active_notification_capacity(self):
         import vms_capacity
         self.db.execute("UPDATE cameras SET camera_number=2 WHERE id='c1'")

@@ -58331,10 +58331,10 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
 
     Scoping mirrors _customer_detection_events() exactly: customer_owner
     sees every notification for their own customer_id; customer_viewer
-    is restricted to cameras they hold can_playback=1 on (reusing that
-    existing permission, same smallest-change reasoning), and never
-    sees a camera-less system alert (no camera to check permission
-    against). camera_number optionally narrows to one camera -- used by
+    sees their own rows for can_alerts-granted cameras, or all cameras
+    when their stored access mode is 'all' and no permission rows exist,
+    matching fanout_appliance_event. Viewers never see camera-less system
+    alerts. camera_number optionally narrows to one camera -- used by
     the focused Live View's own Smart Alerts panel, resolved server-side
     from the authenticated identity's own fleet, never trusted from a
     request parameter."""
@@ -58389,7 +58389,7 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
             ).fetchall()
         else:
             user = db.execute(
-                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                'SELECT id,camera_access_mode FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
                 (identity.get("email", ""), identity.get("customer_id")),
             ).fetchone()
             if not user:
@@ -58412,11 +58412,18 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
             # and every other viewer's, not just their own -- because
             # fanout_appliance_event() inserts one independent row per
             # recipient. Both close the same class of gap this phase's
-            # own audit exists to find.
+            # own audit exists to find. Match fanout_appliance_event's
+            # existing all-mode exception only when the viewer has NO
+            # explicit permission rows. Once rows exist, can_alerts decides;
+            # an explicit denial cannot be bypassed by the all-mode setting.
             rows = db.execute(
-                select + 'JOIN customer_camera_permissions p ON p.camera_id = n.camera_id AND p.user_id = ? AND p.can_alerts = 1 '
-                f'WHERE n.customer_id = ? {camera_filter}{inbox_filter}AND n.user_id = ? ORDER BY n.timestamp DESC LIMIT ?',
-                (user["id"], *params, user["id"], limit),
+                select + f'WHERE n.customer_id = ? {camera_filter}{inbox_filter}AND n.user_id = ? '
+                'AND n.camera_id IS NOT NULL AND ('
+                'EXISTS (SELECT 1 FROM customer_camera_permissions p '
+                'WHERE p.camera_id=n.camera_id AND p.user_id=? AND p.can_alerts=1) '
+                "OR (?='all' AND NOT EXISTS (SELECT 1 FROM customer_camera_permissions p WHERE p.user_id=?))) "
+                'ORDER BY n.timestamp DESC LIMIT ?',
+                (*params, user["id"], user["id"], user["camera_access_mode"] or 'selected', user["id"], limit),
             ).fetchall()
     return [
         {
