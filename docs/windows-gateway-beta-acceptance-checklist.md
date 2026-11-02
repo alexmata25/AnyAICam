@@ -148,6 +148,22 @@ responses out of evidence. Use synthetic footage and mock upload endpoints.
 | R07 | Restore valid Hybrid configuration after cancellation, without changing installer bootstrap or upload flags | Dormant remote publisher resumes authorized signaling; no unnecessary application reinstall; Cloud event uploads stay off unless separately opted in/entitled |
 | R08 | Repeat Full VMS Local/Hybrid baseline and authorized local analytics after remote cancellation | Full VMS legacy behavior unchanged; valid independent local analytic grants remain; unsigned/stale per-camera premium flags cannot produce new inference events |
 
+### Existing authenticated expiry and grace rules
+
+These are distinct existing mechanisms, not a new Gateway cancellation policy:
+
+| Mechanism | Existing source behavior | Acceptance implication |
+|---|---|---|
+| Server renewal failure | `billing_status.py` uses 7 days from first unpaid renewal; repeated failures do not extend it. `sweep_grace` suspends overdue active entitlements. Initial incomplete purchases never receive this grace | Use isolated server fixtures; do not change live subscriptions. Inspect actual server entitlement state, including per-camera v2, rather than assuming an elapsed date changed a disconnected appliance |
+| Product mode | `customer_entitlements.product_mode_for_customer` uses active per-camera v2 mode, then legacy active Local/Hybrid rows. Edge accepts mode via authenticated configuration and persists it without an expiry timestamp | Gateway explicit no-active-mode response revokes remote access on receipt. Persisted Hybrid alone has no offline deadline; a 7-day billing grace is not a 7-day remote cache TTL |
+| Signed paid-feature snapshot | `appliance_entitlements` verifies signature, bound appliance/cloud/customer, trust and expiry on use; documented default TTL 24 hours, cloud-configurable | Paid feature expiry is separate from remote access; never reuse its TTL as an invented remote-access rule |
+| Signed camera analytics | Signed identity-bound per-camera grant; maximum window 168 hours plus existing clock skew; expiry checked even during cache reuse | Expired premium analytic grants deny premium detections; no effect on Basic Motion/local recording by policy substitution |
+| Accepted local camera capacity | Expiry enforced on acceptance; protected accepted capacity is reverified for trust/identity on reads with no subsequent clock-expiry enforcement | Preserve offline licensed recording after remote loss; signer revocation/trust failure remains enforceable. This does not grant remote access or paid analytics |
+| Appliance login session | `appliance_identity` defaults: assertion 15 minutes, session 8 hours, offline verification grace 72 hours. Environment overrides bounded: assertion 1-60 minutes, session 1-168 hours, offline grace 1-720 hours | Login freshness is not subscription entitlement or local licence expiry. Record effective settings; do not turn login grace into a remote subscription deadline |
+
+No new TTL, cancellation grace or auto-granted local licence is introduced.
+Full VMS existing behavior and protected local capacity remain unchanged.
+
 ### WireGuard connection and proxy boundary
 
 | ID | Procedure | Required evidence/result |

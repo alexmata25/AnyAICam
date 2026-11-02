@@ -1,5 +1,6 @@
 """Gateway cancellation uses authenticated configuration, never a local licence override."""
 import asyncio
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -27,6 +28,33 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         self.assertEqual(pm.current_mode(), 'hybrid')
         self.assertFalse(pm.remote_access_authorized())
         self.assertFalse(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', True))
+
+    def test_login_offline_grace_boundary_is_independent_of_remote_mode(self):
+        ns = {'timedelta':timedelta, 'get_ttl_config':lambda:{'offline_grace_hours':72}}
+        load_functions('appliance_identity.py', {'session_within_offline_grace'}, ns)
+        accepted = datetime(2026, 11, 1, tzinfo=timezone.utc)
+        check = ns['session_within_offline_grace']
+        self.assertTrue(check(last_verified_at=accepted, now=accepted+timedelta(hours=72)))
+        self.assertFalse(check(last_verified_at=accepted, now=accepted+timedelta(hours=72, microseconds=1)))
+        self.assertFalse(pm.remote_access_authorized())
+
+    def test_existing_renewal_grace_deadline_is_not_redefined(self):
+        ns = {'datetime':datetime, 'GRACE_PERIOD':timedelta(days=7)}
+        load_functions('billing_status.py', {'grace_ends_at'}, ns)
+        check = ns['grace_ends_at']
+        self.assertEqual(check('2026-11-01T00:00:00+00:00'), datetime(2026,11,8,tzinfo=timezone.utc))
+        self.assertIsNone(check(None))
+        self.assertIsNone(check('invalid'))
+
+    def test_only_active_per_camera_plan_supplies_remote_mode(self):
+        current = {'status':'active', 'plan_key':'fixture'}
+        ns = {'entitlement_for_customer':lambda customer:current,
+              'PLANS':{'fixture':{'mode':'hybrid'}}}
+        load_functions('per_camera_billing.py', {'product_mode'}, ns)
+        self.assertEqual(ns['product_mode']('fixture-customer'), 'hybrid')
+        for status in ('suspended', 'canceled', 'incomplete'):
+            current['status'] = status
+            self.assertEqual(ns['product_mode']('fixture-customer'), '')
 
     def test_wireguard_cancellation_preserves_lan_and_full_vms(self):
         with patch.dict(os.environ, {'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':'10.70.0.1'}):

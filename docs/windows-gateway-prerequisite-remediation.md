@@ -1,5 +1,32 @@
 # Gateway build prerequisite remediation — 2026-11-02
 
+## Recovery evidence refresh (from 056bbd5)
+
+Read-only search covered the transfer directory's existing handoffs/manifests,
+candidate filenames under `C:\AnyAiCam-Transfer` and Administrator Downloads,
+the previously bounded cache audit, repository build/signing documentation and
+recorded original-machine paths. No remote machine was contacted, no binary was
+extracted and no other project's files were changed. This is not an all-disks
+absence claim. A reference to a package on AlexDellLaptop is a recovery lead,
+not evidence of accessible bytes on this host.
+
+| Component | Required version / identifier | Existing location | Verification status | Exact action needed |
+|---|---|---|---|---|
+| Sealed dependency package | `R430-win134-parity-d6b4244`; SHA256SUMS digest `e9d6d867a764e48c07f6090d196ef0660dfac6c30f1dd91e6e49267e32bd43a0` | Referenced by local `C:\AnyAiCam-Transfer\R430-win1341-release-handoff-579578b\HANDOFF.md` section 6; payload not found in searched paths | Handoff current SHA-256 matches its manifest (`190ae127...5898`); package seal cannot be checked without payload | Owner transfer the unchanged package plus independently confirmed seal, or authorize exact original-machine access; verify every manifest entry before staging |
+| Build-helper Python installer | 3.12.10 x64 | `C:\AnyAiCam-Transfer\R430-win1341-supplement-20261028\tools\python-3.12.10-amd64.exe` | Found outside workspace; current SHA-256 `67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb` matches supplement; not installed | Approve installation and normal authenticity validation, then pass installed interpreter as `-PythonExe`; existing 3.11 helper fallback is not the shipped runtime |
+| Embedded Python and seven other vendor inputs | Embedded 3.12.10, get-pip pinned capture, WinSW 2.12.0, FFmpeg 8.1.2, MediaMTX 1.21.0, VC redist 14.44.35211, Vosk 0.15, AnyAiCam Tesseract 5.5.2 | Earlier sealed package; separate Tesseract handoff lead below | Exact archives not found in prior bounded cache audit; versions/hashes remain in build.ps1/DEPENDENCIES.md | Recover pinned archives; full Python installer does not replace embedded ZIP; do not regenerate or substitute binaries |
+| Wheels | 108 exact locked Windows/cp312 or compatible wheels | Lock/manifests in checkout; payload expected in sealed package | Prior reconciliation 108/108 pins consistent; no verified matching cache payload | Restore all locked files and verify hashes; no resolver/download performed |
+| Inno Setup | Baseline 7.1.0 | Referenced in sealed package; expected compiler `%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe` absent | build.ps1 requires major-7 path but does not itself pin patch metadata; 7.1.0 comes from sealed provenance | Recover approved installer/hash, verify provenance/version and obtain installation approval; do not silently use another patch |
+| Public entitlement keyset | Canonical Ed25519 public-only set; historical digest `2389a655fb3e5ed91e8a4a9216f9c45b97feb3847571b0536384b8305979af7c` | Referenced in sealed package; approved payload not located | Historical pin known; current intended environment and actual key IDs not verified | Owner confirm intended environment/digest and recover approved file; enumerate public key IDs only after canonical validation; never infer IDs from test fixtures or supply private keys |
+| SDK/signing | SDK tools 10.0.26100.0; current authorized certificate or Azure signing session matching publisher pin | `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\{makecat,signtool}.exe` present | Presence only; no execution/login/store inspection. Historical setup signer expired 2026-10-27 | Owner authorize current signing workflow/session; preserve publisher subject/EKU/root pins; do not change signing keys or assume timestamped baseline's leaf can sign anew |
+| Installer baseline/version | Historical setup 1.3.4, product release 1.2.7 | `C:\AnyAiCam-Transfer\R430-win1341-release-handoff-579578b\installer\AnyAiCam-VMS-Setup-1.3.4-e3d7eda.exe` | Handoff records 618,425,712 bytes and SHA `cafc1d1be9f457561094fbf756255d64266a249ae75c994c78a14a3e725df034`; not rehashed or signature-checked this refresh | Approve new monotonically ordered `-Version` and three-part `-ReleaseVersion`; 1.3.4.1 is historical planned work, not an approved beta version or existing candidate |
+
+All editions still use one `AnyAiCam-VMS.iss`, AppId and WinSW layout. Edition
+arguments select installation configuration; they do not omit dependency inputs
+or create separate architectures. Readiness remains BLOCKED for compilation;
+files present outside the checkout (Python installer, handoffs, SDK tools and
+baseline setup) must not be described as missing dependencies.
+
 ## Immediate recovery procedure (source d95780e)
 
 1. **Request the sealed dependency directory**, not a newly resolved environment:

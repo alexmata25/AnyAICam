@@ -97,6 +97,23 @@ Do not reinterpret an explicit saved mode as a request to switch an edition.
 
 ## Lifecycle evidence after separate approval
 
+No installed-test machine is assigned or requested by this preparation. Do not
+assume the Dell/R430 or any existing VM is available. Before requesting a window,
+name an owner-approved disposable Windows target, measure its current available
+RAM and disk, estimate peak additional RAM and staging/media/evidence disk usage
+from the selected build/test workload, and state duration and uncertainty. These
+values are unmeasured/unestimated until a target and exact workload are chosen;
+do not replace them with the earlier 4.66 GB report.
+
+Rollback proposal for that later approval: use a disposable test-target restore
+point/image approved and created by its owner; retain the candidate, baseline
+installer and nonsecret before-state evidence outside the disposable target.
+Use only synthetic media/test identities. On failure, retain logs, stop the test
+under the approved procedure and restore the owner-managed image; never force a
+downgrade past the existing version guard or overwrite protected capacity/trust
+state. Creating/restoring images, VM operations and service changes require that
+separate approval. If no recoverable image/test target exists, acceptance is BLOCKED.
+
 Use the existing A6 procedure in
 `installer/windows/acceptance/LIFECYCLE-ACCEPTANCE-CHECKLIST.md` on its isolated
 test target only. Do not use a live Dell installation. No Hyper-V instructions

@@ -10,6 +10,35 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Prerequisite recovery and expiry evidence (from 056bbd5)
+
+Extended the existing remediation with the requested component/version/location/
+verification/action table. Read only existing transfer handoffs/manifests,
+candidate filenames in transfer/Downloads, build documentation and previous
+bounded cache evidence; no remote original-machine access was assumed. Rehashed
+the small handoff and 26.96 MB Python installer: both match their manifests.
+Python 3.12.10 installer, baseline 1.3.4 setup (size confirmed), and SDK
+10.0.26100.0 tools exist outside the workspace. Package payload, approved public
+keyset and Inno 7.1.0 remain unlocated in searched paths, not proven absent from
+every machine. Historical keyset digest is known; actual key IDs/current intended
+environment still require the approved public file and owner confirmation.
+The shared VMS setup remains the only installer architecture for all editions.
+
+Documented distinct server 7-day renewal grace, signed feature snapshot TTL,
+168-hour analytic grant maximum, accepted local-capacity offline protection,
+login TTL/offline grace and untimed persisted remote mode in the beta checklist.
+No signed expiry value exists in persisted remote mode; do not transplant login,
+analytics or billing TTLs into a new cancellation policy. No billing, trust,
+local-capacity, retention or runtime behavior changed in this milestone.
+
+Three isolated existing-function regressions added: login offline-grace exact
+boundary, renewal-grace calculation and active-only per-camera product mode.
+All 109 sequential checks passed in 22.121s, preserving the original 106;
+`git diff --check` passed. Existing installer acceptance plan now requires a
+named approved disposable target, fresh resource measurements/estimates and an
+owner-managed rollback image before a test-window request. No target assigned,
+resource-heavy operation proposed or infrastructure changed.
+
 ## Installer and acceptance preparation (from c52a07b)
 
 Confirmed the existing shared `AnyAiCam-VMS.iss` architecture, AppId,
