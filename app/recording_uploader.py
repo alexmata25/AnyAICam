@@ -1256,6 +1256,9 @@ def _upload_recording(
     started_at: datetime,
     camera_number: int,
 ) -> str:
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("recording"):
+        raise PermissionError("This edition does not allow recording uploads")
     # client is caller-provided (one per session, reused across every file
     # in a scan -- see _ensure_client()) rather than constructed here per
     # file. Caller guarantees it is not None before calling this.
@@ -1476,7 +1479,8 @@ async def recording_upload_worker() -> None:
     # mirrors (appliance_cloud.py) -- RECORDING_UPLOAD_ENABLED=false
     # still means every non-pilot camera is skipped by the per-camera
     # scope check in the loop below, unchanged.
-    if RUNTIME_ROLE not in {"edge", "combined"} or not (RECORDING_UPLOAD_ENABLED or RECORDING_UPLOAD_CAMERA_SCOPE):
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("recording") or RUNTIME_ROLE not in {"edge", "combined"} or not (RECORDING_UPLOAD_ENABLED or RECORDING_UPLOAD_CAMERA_SCOPE):
         recording_upload_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)

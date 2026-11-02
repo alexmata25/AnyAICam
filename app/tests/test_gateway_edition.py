@@ -51,6 +51,38 @@ class GatewayEditionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pm.current_mode()
 
+    def test_local_gateway_blocks_video_even_with_hybrid_and_explicit_flags(self):
+        os.environ[edition.EDITION_ENV] = 'local_gateway'
+        os.environ[pm.PRODUCT_MODE_ENV] = 'hybrid'
+        for flag, kind in edition.VIDEO_FLAGS.items():
+            with patch.dict(os.environ, {flag: 'true'}):
+                self.assertFalse(pm._resolve(flag, True))
+                self.assertFalse(edition.video_transport_allowed(kind))
+        # Non-video functions retain the existing mode/override rules.
+        self.assertTrue(pm._resolve('ANYAICAM_ANALYTICS_SYNC_ENABLED', False))
+
+    def test_cloud_gateway_requires_explicit_event_opt_in(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        self.assertFalse(pm._resolve('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED', True))
+        with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED': 'true'}):
+            self.assertTrue(pm._resolve('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED', False))
+            for kind in ('recording', 'live', 'backup'):
+                self.assertFalse(edition.video_transport_allowed(kind))
+
+    def test_full_vms_preserves_explicit_video_flags(self):
+        for flag in edition.VIDEO_FLAGS:
+            for enabled in (True, False):
+                with patch.dict(os.environ, {flag: str(enabled).lower()}):
+                    self.assertEqual(pm._resolve(flag, not enabled), enabled)
+
+    def test_gateway_notice_and_full_vms_ui(self):
+        self.assertEqual(edition.edition_notice_html(), '')
+        os.environ[edition.EDITION_ENV] = 'local_gateway'
+        self.assertIn('Local Gateway', edition.edition_notice_html())
+        self.assertIn('uploads are disabled', edition.edition_notice_html())
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        self.assertIn('eligible plan', edition.edition_notice_html())
+
 
 if __name__ == '__main__':
     unittest.main()

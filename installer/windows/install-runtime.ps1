@@ -27,7 +27,8 @@ param(
     [Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256,
     # Requirement 9 (1.2.7): Local or Hybrid, chosen in Setup (or /ProductMode= for a silent install). Empty on an
     # upgrade, which keeps the saved mode. Mirrors installer/03-product-mode.sh.
-    [string]$ProductMode = ''
+    [string]$ProductMode = '',
+    [string]$GatewayEdition = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
@@ -261,6 +262,8 @@ $values['ANYAICAM_PUBLIC_URL'] = 'http://127.0.0.1:8000'
 $values['ANYAICAM_VMS_COMMIT'] = $SourceCommit
 $values['ANYAICAM_BUILD_ID'] = $SourceCommit
 # Local / Hybrid (Requirement 9): the same rules as Linux installer/03-product-mode.sh. A new installation records
+. (Join-Path $PSScriptRoot 'gateway-edition.ps1')
+Set-GatewayEdition -Values $values -Edition $GatewayEdition
 # the chosen mode as the bootstrap mode (used until the cloud reports one); Setup never switches a saved mode; an
 # earlier installation that never recorded one is left unset, so its runtime defaults are kept exactly.
 $savedMode = ''

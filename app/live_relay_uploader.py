@@ -358,6 +358,9 @@ def _remember_uploaded(camera_number: int, segment_name: str) -> None:
 
 
 def _upload_segment(session: dict, local_path: Path) -> str:
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("live"):
+        raise PermissionError("This edition does not allow live video uploads")
     if boto3 is None:
         raise RuntimeError("boto3 is not installed.")
     if not AWS_REGION:

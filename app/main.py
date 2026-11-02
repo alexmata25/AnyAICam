@@ -1282,7 +1282,8 @@ CLOUDFRONT_URL = os.environ.get("ANYAICAM_CLOUDFRONT_URL", "").strip().rstrip("/
 
 
 
-CLOUD_UPLOAD_ENABLED = os.environ.get("ANYAICAM_CLOUD_UPLOAD_ENABLED", "false").lower() == "true"
+from gateway_edition import video_transport_allowed as _edition_video_transport_allowed
+CLOUD_UPLOAD_ENABLED = os.environ.get("ANYAICAM_CLOUD_UPLOAD_ENABLED", "false").lower() == "true" and _edition_video_transport_allowed("backup")
 
 
 
@@ -14852,6 +14853,9 @@ def scan_recordings_for_cloud_upload() -> int:
 
 
 def upload_cloud_recording_job(job: dict) -> dict:
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("backup"):
+        raise PermissionError("This edition does not allow cloud recording backup")
 
 
 
@@ -50918,6 +50922,8 @@ def _aaco_enabled_for(user) -> bool:
 
 
 def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
+    from gateway_edition import edition_notice_html
+    content = edition_notice_html() + content
 
 
 

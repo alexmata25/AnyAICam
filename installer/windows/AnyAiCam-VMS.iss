@@ -77,6 +77,7 @@ Source: "stop-stale-vms.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 ; 1.3.4: the VMS Job Object (CPU cap, optional memory limit) the launcher applies before starting Python.
 Source: "vms-job-limits.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "gateway-edition.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "python-launchers.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; Stops processes still running from {app} after the services are removed (PrepareToInstall from {tmp}; the
@@ -162,6 +163,7 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 var
   ProductModePage: TInputOptionWizardPage;
+  GatewayEditionPage: TInputOptionWizardPage;
 
 // Requirement 9 (1.2.7): Local or Hybrid. An existing installation keeps its saved mode (no page, nothing passed).
 function ExistingInstall(): Boolean;
@@ -231,11 +233,19 @@ end;
 
 procedure InitializeWizard;
 begin
+  GatewayEditionPage := CreateInputOptionPage(wpSelectDir, 'Choose your AnyAiCam edition',
+    'One Windows VMS, with edition-specific cloud video controls.',
+    'All editions keep camera discovery, local recording, playback, notifications and licensing. ' +
+    'Gateway selection does not enable cloud uploads. Link once online to activate cameras.', True, False);
+  GatewayEditionPage.Add('Full VMS: existing Local or Hybrid configuration');
+  GatewayEditionPage.Add('Local Gateway: local video; no cloud video uploads');
+  GatewayEditionPage.Add('Cloud Gateway: eligible event clips only; uploads require explicit configuration and a plan');
+  GatewayEditionPage.SelectedValueIndex := 0;
   // Supported first-time activation (1.3.2, Codex FAIL on ef93b503): cameras run only after this PC is linked to an
   // AnyAiCam account ONCE, online (the cloud's first signed camera capacity). After that the accepted capacity has no
   // expiry, so Local cameras, recording and live view keep working without internet. Never claim fully offline
   // (air-gapped) activation: there is no approved offline licence yet (docs/windows-1.3.2-local-licensing-proposal.md).
-  ProductModePage := CreateInputOptionPage(wpSelectDir, 'How will you use AnyAiCam?',
+  ProductModePage := CreateInputOptionPage(GatewayEditionPage.ID, 'How will you use AnyAiCam?',
     'You can change this later from your AnyAiCam account.',
     'Choose the mode for this computer, then click Next.' + #13#10#13#10 +
     'Both modes need this computer linked to your AnyAiCam account once, with an internet connection, before your ' +
@@ -249,6 +259,23 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := (PageID = ProductModePage.ID) and (ExistingInstall() or (ExpandConstant('{param:ProductMode|}') <> ''));
+  if PageID = GatewayEditionPage.ID then
+    Result := ExistingInstall() or (ExpandConstant('{param:GatewayEdition|}') <> '');
+  if (PageID = ProductModePage.ID) and
+     ((GatewayEditionPage.SelectedValueIndex > 0) or
+      (ExpandConstant('{param:GatewayEdition|}') = 'local_gateway') or
+      (ExpandConstant('{param:GatewayEdition|}') = 'cloud_gateway')) then Result := True;
+end;
+
+function GatewayEditionChoice(): String;
+begin
+  Result := Lowercase(ExpandConstant('{param:GatewayEdition|}'));
+  if (Result = '') and not ExistingInstall() and not WizardSilent() then
+    case GatewayEditionPage.SelectedValueIndex of
+      0: Result := 'full_vms';
+      1: Result := 'local_gateway';
+      2: Result := 'cloud_gateway';
+    end;
 end;
 
 // What install-runtime.ps1 receives. A silent NEW install without /ProductMode= passes nothing, so it is refused
@@ -256,6 +283,10 @@ end;
 function ProductModeChoice(): String;
 begin
   Result := Lowercase(ExpandConstant('{param:ProductMode|}'));
+  if (Result = '') and not ExistingInstall() then begin
+    if GatewayEditionChoice() = 'local_gateway' then Result := 'local';
+    if GatewayEditionChoice() = 'cloud_gateway' then Result := 'hybrid';
+  end;
   if (Result = '') and not ExistingInstall() and not WizardSilent() then
   begin
     if ProductModePage.SelectedValueIndex = 1 then Result := 'hybrid' else Result := 'local';
@@ -338,11 +369,47 @@ begin
     Result := 'Setup cannot switch the existing product mode (' + Saved + '); change it from your AnyAiCam account instead.';
 end;
 
+function GatewayEditionProblem(): String;
+var
+  Requested, Saved, Candidate: String;
+  Lines: TArrayOfString;
+  I: Integer;
+begin
+  Result := '';
+  Requested := GatewayEditionChoice();
+  if (Requested <> '') and (Requested <> 'full_vms') and
+     (Requested <> 'local_gateway') and (Requested <> 'cloud_gateway') then begin
+    Result := 'The edition must be full_vms, local_gateway or cloud_gateway.';
+    exit;
+  end;
+  Saved := '';
+  if ExistingInstall() then begin
+    if not LoadStringsFromFile(ExpandConstant('{commonappdata}\AnyAiCam\config\vms.env'), Lines) then begin
+      Result := 'Cannot read the saved edition; repair access before installing.';
+      exit;
+    end;
+    for I := 0 to GetArrayLength(Lines) - 1 do begin
+      Candidate := 'ANYAICAM_GATEWAY_EDITION=';
+      if Pos(Candidate, Lines[I]) = 1 then Saved := Copy(Lines[I], Length(Candidate) + 1, Length(Lines[I]));
+    end;
+  end;
+  if (Saved <> '') and (Saved <> 'full_vms') and
+     (Saved <> 'local_gateway') and (Saved <> 'cloud_gateway') then
+    Result := 'Invalid saved Gateway edition; fix it before installing.'
+  else if (Saved <> '') and (Requested <> '') and (Saved <> Requested) then
+    Result := 'Setup cannot switch the saved Gateway edition.';
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
   ServiceExecutable: String;
 begin
+  Result := GatewayEditionProblem();
+  if Result <> '' then begin
+    Log('Install refused before any change: ' + Result);
+    exit;
+  end;
   Result := ProductModeProblem();
   if Result <> '' then begin
     Log('Install refused before any change: ' + Result);
@@ -454,7 +521,7 @@ begin
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -TesseractArchive "' + ExpandConstant('{tmp}\tesseract-5.5.2-win64-anyaicam.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -TesseractArchive "' + ExpandConstant('{tmp}\tesseract-5.5.2-win64-anyaicam.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '" -GatewayEdition "' + GatewayEditionChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');

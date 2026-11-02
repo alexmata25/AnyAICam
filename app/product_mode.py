@@ -178,6 +178,10 @@ def resolve_cloud_flag(env_var: str, *, legacy_default: bool = False) -> bool:
 
 
 def _resolve(env_var: str, legacy_default: bool) -> bool:
+    from gateway_edition import VIDEO_FLAGS, video_transport_allowed
+    if env_var in VIDEO_FLAGS and not video_transport_allowed(VIDEO_FLAGS[env_var]):
+        return False
+    # Explicit flags retain precedence within the edition's transport boundary.
     raw = os.environ.get(env_var)
     if raw is not None and raw.strip() != "":
         return raw.strip().lower() == "true"

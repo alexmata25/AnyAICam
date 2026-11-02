@@ -59,6 +59,11 @@ EVENT_MEDIA_CAPTURE_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_CAPTURE_ENABL
 # mode -- it never contacts the cloud at all (see its own comment).
 EVENT_MEDIA_UPLOAD_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED")
 
+
+def _edition_upload_allowed() -> bool:
+    from gateway_edition import video_transport_allowed
+    return video_transport_allowed("event")
+
 # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
 # every event clip/thumbnail object was written with no CacheControl
 # metadata at all, so nothing ever told a browser (or a future CDN sitting
@@ -312,7 +317,7 @@ def upload_motion_event_media(
 
     # This is the hard local-only boundary.  Nothing below it may run unless
     # the explicit transport flag is true.
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         logger.info(
             "event_media.captured_local event_id=%s camera=%s thumbnail=%s",
             event_id,
@@ -581,7 +586,7 @@ def register_shared_event_media(
     always be recovered later WITHOUT this call, or its retry, ever
     encoding or uploading anything. Removed from the outbox only on a
     confirmed accepted/duplicate response."""
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         logger.info(
             "event_media.shared_registration_skipped_disabled "
             "event_id=%s camera=%s",
@@ -671,7 +676,7 @@ def report_media_failed(*, event_id: str, camera_number: int, reason: str) -> bo
     is truly gone -- a clip still in the outbox is pending, not failed, and
     keeps being retried. Best effort: if this cannot be delivered the
     event simply stays 'pending'."""
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         return False
     if any(str(job.get("event_id")) == str(event_id) for job in event_media_outbox.load()):
         return False  # still queued for retry
@@ -734,7 +739,7 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     # diagnostics, and future supervisors may call this synchronous entry
     # point directly.  An upload-disabled local-capture run must never turn
     # into transport because of such a call.
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         return {"attempted": 0, "completed": 0, "pending": len(event_media_outbox.load())}
     attempted = completed = 0
     for job in event_media_outbox.due()[:max(1, max_jobs)]:
@@ -802,7 +807,7 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
 
 
 async def event_media_retry_worker() -> None:
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         event_media_retry_state["worker_status"] = "disabled"
         while True: await asyncio.sleep(3600)
     event_media_retry_state["worker_status"] = "running"
