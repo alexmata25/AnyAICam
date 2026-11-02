@@ -96,6 +96,23 @@ class GatewayLocalNotificationTests(unittest.TestCase):
             self.assertEqual(gateway_notifications.publish_local_motion(self.alert), 2)
         self.external.assert_not_called(); self.push.assert_not_called()
 
+    def test_removed_camera_does_not_consume_active_notification_capacity(self):
+        import vms_capacity
+        self.db.execute("UPDATE cameras SET camera_number=2 WHERE id='c1'")
+        self.db.execute("INSERT INTO cameras VALUES('removed','customer1','site1','a1',1,'removed','Old')")
+        alert = {**self.alert, 'camera': 2}
+        # Exercise the real capacity selection rather than accepting every camera.
+        with patch.object(vms_capacity, 'load_capacity', return_value={'camera_slot_quantity': 1}), \
+             patch.object(vms_capacity, 'camera_licensed', side_effect=lambda number, numbers:
+                          number in vms_capacity.licensed_camera_numbers(numbers)):
+            for edition in ('local_gateway', 'cloud_gateway'):
+                with self.subTest(edition=edition), patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': edition}):
+                    self.db.execute('DELETE FROM notification_deliveries')
+                    self.db.execute('DELETE FROM notifications')
+                    self.assertEqual(gateway_notifications.publish_local_motion(alert), 2)
+                    self.assertEqual(gateway_notifications.publish_local_motion({**alert, 'camera': 1}), 0)
+        self.external.assert_not_called(); self.push.assert_not_called()
+
     def test_unlicensed_camera_and_full_vms_do_not_use_gateway_bridge(self):
         with patch('vms_capacity.camera_licensed', return_value=False):
             self.assertEqual(gateway_notifications.publish_local_motion(self.alert), 0)

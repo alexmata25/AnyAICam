@@ -20,7 +20,7 @@ def publish_local_motion(alert: dict) -> int:
     from notification_engine import event_dedupe_key, fanout_appliance_event
     with connection() as db:
         camera = db.execute("SELECT id,customer_id,site_id,appliance_id FROM cameras WHERE camera_number=? AND COALESCE(status,'')!='removed'", (alert["camera"],)).fetchone()
-        numbers = [row["camera_number"] for row in db.execute("SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number").fetchall()]
+        numbers = [row["camera_number"] for row in db.execute("SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL AND COALESCE(status,'')!='removed' ORDER BY camera_number").fetchall()]
     if not camera or not camera_licensed(alert["camera"], numbers):
         return 0
     event = {**alert, 'id': str(event_id), 'camera_id': camera['id'],

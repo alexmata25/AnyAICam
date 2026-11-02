@@ -10,6 +10,33 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Resource provenance and offline remote deadline investigation
+
+Existing agents continued on preserved worktrees. New bounded historical
+records distinguish the existing Python installer, SDK, baseline setup and
+source bundle from missing sealed dependencies/public keyset. The historical
+Windows VM was running; its disposable status and rollback checkpoint are
+unproven. No build/acceptance retry or VM operation ran. Exact owner inputs and
+reuse conditions are in `windows-gateway-resource-provenance.md`.
+
+`gateway-offline-remote-deadline-proposal.md` traces stored billing period/end
+facts through mode resolution to the unsigned, deadline-free edge cache. It
+proposes a separate identity-bound signed remote grant using authoritative
+service-end data, bounded revalidation, protected generations/time and explicit
+migration/cancellation rules. It records unresolved policy and trust rollout
+decisions; no expiry behavior, replacement key or billing change was introduced.
+Local capacity/recording/playback remain independent.
+
+Independent development fixed local notification licensing candidates: removed
+camera rows no longer consume capacity and suppress active-camera Basic Motion
+notifications. A SQLite regression uses real capacity selection for both editions
+and checks removed-camera refusal and absence of external delivery. Seven
+notification tests passed in 1.229s; integrated sequential runner **123 passed
+in 25.940s**; diff check passed. No heavy test, deployment, retention change or
+production operation occurred. Before any RAM-intensive run, the named machine,
+fresh free memory, workload RAM estimate and duration must be presented for
+owner approval. This pass makes no execution-window request.
+
 ## Resumed application and installer sprint (2026-11-02)
 
 Create/write/delete probes passed in the main checkout and both existing
