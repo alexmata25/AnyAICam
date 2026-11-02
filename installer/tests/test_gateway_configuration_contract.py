@@ -95,6 +95,23 @@ class GatewayConfigurationTests(unittest.TestCase):
         for secret in ('ANYAICAM_CAMERA_CREDENTIAL_KEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'):
             self.assertNotIn(secret, allowlist)
 
+    def test_lifecycle_blocks_unverifiable_identity_preservation(self):
+        for before_hash, after_hash in [('unreadable', 'unreadable'), ('abc', 'unreadable'), ('unreadable', 'abc')]:
+            with self.subTest(before=before_hash, after=after_hash), tempfile.TemporaryDirectory() as temp:
+                before, after = copy.deepcopy(BASE_STATE), copy.deepcopy(BASE_STATE)
+                before['data']['identity_sha256'] = {'agent/credential.json': before_hash}
+                after['data']['identity_sha256'] = {'agent/credential.json': after_hash}
+                b, a, report = (Path(temp) / name for name in ('before.json', 'after.json', 'result.json'))
+                b.write_text(json.dumps(before), encoding='utf-8')
+                a.write_text(json.dumps(after), encoding='utf-8')
+                result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+                    str(WIN / 'acceptance/Compare-AnyAiCamInstallState.ps1'), '-Before', str(b), '-After', str(a),
+                    '-Step', 'Repair', '-OutputPath', str(report)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                data = json.loads(report.read_text(encoding='utf-8-sig'))
+                self.assertEqual(data['result'], 'BLOCKED')
+                self.assertIn('identity file could not be hashed', data['blocked_reason'])
+
 
 if __name__ == '__main__':
     unittest.main()

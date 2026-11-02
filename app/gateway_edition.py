@@ -123,4 +123,13 @@ def edition_notice_html() -> str:
     if edition == "cloud_gateway":
         message += (" Event upload is configured; each clip still requires camera authorization."
                     if video_transport_allowed("event") else " Event upload is currently disabled.")
-    return f'<section class="panel" aria-label="Gateway edition"><strong>{label}</strong><p>{message}</p><p>{activation}</p></section>'
+    from product_mode import remote_access_authorized
+    remote = ("Remote access is allowed by the last received cloud configuration. "
+              "Subscription changes cannot be checked while offline."
+              if remote_access_authorized() else
+              "Remote access is unavailable under the current configuration.")
+    if licensed:
+        activation += (" Local recording, playback and Basic Motion notifications use this "
+                       "licence and your permissions independently of remote access.")
+    return (f'<section class="panel" aria-label="Gateway edition"><strong>{label}</strong>'
+            f'<p>{message}</p><p>{activation}</p><p role="status">{remote}</p></section>')

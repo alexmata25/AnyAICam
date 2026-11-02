@@ -6,6 +6,38 @@ transport results do not establish installed-system acceptance. Each row below
 requires PASS / FAIL / BLOCKED / NOT RUN, tester, timestamp and evidence path.
 All installed-system rows currently remain **NOT RUN**.
 
+## Source acceptance progress, 2026-11-02 follow-up
+
+New rendered-HTML checks exercise both Gateway notices through bootstrap-only,
+authenticated Hybrid, cancellation, reactivation and administrative Local
+override. The notice reports authorization from the last received configuration,
+not current subscription verification while disconnected. Accepted local
+licence wording covers recording/playback/Basic Motion independence; an
+unlicensed appliance receives no continuity promise. These are HTML parsing and
+actual configuration-function checks, not browser or installed UI acceptance.
+
+Lifecycle comparison now returns BLOCKED when either snapshot contains an
+unreadable identity hash. Matching unreadable markers cannot prove preservation.
+Synthetic before/after fixtures exercise this without touching installed data.
+
+Coordinator validation: 10 edition/UI tests passed in 0.098s; 5 lifecycle
+configuration tests passed in 8.375s; integrated sequential lightweight runner
+passed **122 tests in 23.767s**, including existing local playback, notification,
+licensing, cancellation and media tests. Diff check passed. Earlier completed
+119-test baseline was not rerun separately in this follow-up.
+
+Compilation remains BLOCKED: exact-path recheck found no installed Inno 7.1.0,
+Python 3.12.10 interpreter, sealed parity package or historical public keyset.
+The previously verified Python installer remains present. No repeated recovery
+search, install or build ran. An accessible artifact path and disposable Windows
+target/rollback have been requested. Current signing, candidate metadata and
+measured build/acceptance resources still need resolution after inputs arrive.
+
+Remote mode has no independent offline expiry timestamp. This follow-up does
+not invent a subscription deadline or change existing signed-feature expiry,
+camera licensing, billing or retention. F01-F09, installed cancellation/tunnel
+checks and lifecycle steps remain NOT RUN until an isolated target is available.
+
 ## Record before requesting an execution window
 
 | Field | Required evidence |

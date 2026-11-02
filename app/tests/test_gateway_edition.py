@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
@@ -85,6 +86,48 @@ class GatewayEditionTests(unittest.TestCase):
         self.assertIn('uploads are disabled', edition.edition_notice_html())
         os.environ[edition.EDITION_ENV] = 'cloud_gateway'
         self.assertIn('eligible plan', edition.edition_notice_html())
+
+    def test_rendered_remote_status_tracks_configuration_without_expiring_local_licence(self):
+        class VisibleText(HTMLParser):
+            def __init__(self, markup):
+                super().__init__()
+                self.parts = []
+                self.feed(markup)
+            def handle_data(self, data):
+                self.parts.append(data)
+        def visible():
+            return ' '.join(VisibleText(edition.edition_notice_html()).parts)
+        capacity = {'state':'licensed', 'camera_slot_quantity':2}
+        for name in ('local_gateway', 'cloud_gateway'):
+            with self.subTest(edition=name), patch.dict(os.environ, {
+                    edition.EDITION_ENV:name, pm.PRODUCT_MODE_ENV:'hybrid'}), \
+                    patch.object(edition, '_capacity_status', return_value=capacity):
+                pm.STATE_FILE.unlink(missing_ok=True)
+                self.assertIn('Remote access is unavailable', visible())
+                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                accepted = visible()
+                self.assertIn('allowed by the last received cloud configuration', accepted)
+                self.assertIn('Subscription changes cannot be checked while offline', accepted)
+                # Reading the cached grant does not invent a remote expiry date.
+                self.assertEqual(visible(), accepted)
+                pm.apply_configuration_mode({'product_mode':''})
+                cancelled = visible()
+                self.assertIn('Remote access is unavailable', cancelled)
+                self.assertNotIn('Remote access is allowed', cancelled)
+                self.assertIn('2 camera slots', cancelled)
+                self.assertIn('Local recording, playback and Basic Motion notifications', cancelled)
+                self.assertIn('independently of remote access', cancelled)
+                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                self.assertIn('Remote access is allowed', visible())
+                with patch.dict(os.environ, {pm.PRODUCT_MODE_ENV:'local'}):
+                    self.assertIn('Remote access is unavailable', visible())
+
+    def test_unlicensed_gateway_notice_does_not_promise_local_continuity(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        markup = edition.edition_notice_html()
+        self.assertIn('Camera licence required', markup)
+        self.assertNotIn('independently of remote access', markup)
+        self.assertIn('Remote access is unavailable', markup)
 
 
 if __name__ == '__main__':

@@ -24,6 +24,10 @@ function Check([string]$Name, [bool]$Passed, [string]$Detail = '') { Add-Accepta
 
 # Customer data must survive every step, uninstall included (the .iss marks ProgramData folders uninsneveruninstall).
 $bi = Props $b.data.identity_sha256; $ai = Props $a.data.identity_sha256
+if (@($bi.Values + $ai.Values | Where-Object { $_ -eq 'unreadable' }).Count -gt 0) {
+    $final = Complete-AcceptanceResult $result $OutputPath 'an identity file could not be hashed (take snapshots elevated and resolve file access)'
+    "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+}
 foreach ($k in $bi.Keys) { Check "identity file unchanged: $k" ($ai[$k] -eq $bi[$k]) "" }
 Check 'recordings kept (count not lower)' ($a.data.recordings.count -ge $b.data.recordings.count) "$($b.data.recordings.count) -> $($a.data.recordings.count)"
 Check 'database kept' ($null -eq $b.data.database -or $null -ne $a.data.database) ''

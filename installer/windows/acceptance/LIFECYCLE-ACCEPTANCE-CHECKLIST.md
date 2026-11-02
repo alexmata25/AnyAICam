@@ -10,6 +10,11 @@
 
 **Run all commands elevated** from `installer\windows\acceptance\` of the same source tree. Every snapshot is read-only. `vms.env` values are recorded only for non-secret switches.
 
+A comparison exits **2 / BLOCKED** if either snapshot cannot read the data
+folder or hash an identity file. Two `unreadable` placeholders do not prove
+identity preservation. Resolve access on the approved test target and take new
+snapshots; do not edit the JSON or count BLOCKED as PASS.
+
 ## 0. Preconditions
 - [ ] VM checkpoint taken before step 1 (name: `pre-1341-lifecycle`), so each step can be repeated from a clean state.
 - [ ] Both setups' SHA-256 verified (`Get-FileHash`). Both setups' Authenticode `Valid` with the pinned AnyAiCam publisher (`publisher-pin.ps1`).
