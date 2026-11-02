@@ -10,6 +10,33 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Resumed application and installer sprint (2026-11-02)
+
+Create/write/delete probes passed in the main checkout and both existing
+application/installer worktrees. All three began clean; their existing branches
+and commits were preserved. Previous agent processes were unavailable, so the
+application and installer roles were recreated on the same worktrees.
+
+Application `fc8976d` integrated as `5397e9b`: product-mode persistence now
+publishes a flushed complete temporary file using atomic replacement. Failed
+flush/replacement preserves the accepted state. Three mock-backed regressions
+cover visibility and failure recovery, including local remote-access denial.
+
+Installer `fce2d8c` integrated as `f75d0ba`: fresh silent Full VMS setup missing
+a required product mode is rejected during preflight, before installation
+mutation. Explicit Gateway editions still derive their existing modes; existing
+installation handling is preserved. One source regression covers the guard.
+
+Coordinator ran tests sequentially: baseline 115 passed in 22.672s; application
+26 passed in 2.123s; installer 10 passed in 8.270s; integrated fixed runner
+**119 passed in 21.773s**. Diff check passed. Historical Python invalid-escape
+warnings remain; the final run filtered those warnings. Installer validation is
+source-level, with no compiler or installed-system acceptance claim.
+
+No production, billing or retention changes occurred. No build, install,
+download, signing, VM or service operation ran. Sealed dependency/keyset access,
+toolchain approvals and isolated Windows lifecycle/UI acceptance remain pending.
+
 ## Approved two-agent source sprint (from f72a112)
 
 Owner approved two agents, separate worktrees and combined 2 GiB additional
