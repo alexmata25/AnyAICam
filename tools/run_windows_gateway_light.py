@@ -11,6 +11,8 @@ TEST_MODULES = (
     'app.tests.test_gateway_licensing',
     'app.tests.test_gateway_event_retention_contract',
     'app.tests.test_gateway_media_preflight',
+    'app.tests.test_gateway_local_runtime',
+    'app.tests.test_gateway_local_notifications',
     'installer.tests.test_gateway_edition_integration',
     'installer.tests.test_gateway_configuration_contract',
     'installer.tests.test_gateway_prerequisite_audit',

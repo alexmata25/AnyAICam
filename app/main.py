@@ -36355,6 +36355,11 @@ def append_in_app_alert(alert: dict) -> None:
 
 
 
+    try:
+        from gateway_notifications import publish_local_motion
+        publish_local_motion(alert)
+    except Exception as error:
+        structured_log("gateway.local_notification_failed", error_type=type(error).__name__)
     dispatch_external_notifications(alert)
 
 
@@ -125182,6 +125187,15 @@ def _customer_alert_text(notification: dict) -> tuple[str, str]:
     return title, message
 
 
+def _customer_notification_playback_href(notification: dict) -> str | None:
+    if notification.get("event_id") and notification.get("has_event_clip"):
+        return _customer_event_playback_href(notification.get("camera_id"), notification.get("timestamp"), notification.get("event_id"), True)
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms" and notification.get("camera_id") and notification.get("timestamp"):
+        return _customer_event_playback_href(notification["camera_id"], notification["timestamp"])
+    return None
+
+
 def _render_customer_alerts(request: Request) -> str:
     """Smart Alerts: the customer's attention inbox (smart_alerts.py) --
     grouped, filterable, with actions on each card and active INTRUSION
@@ -125211,11 +125225,7 @@ def _render_customer_alerts(request: Request) -> str:
             }
 
     def clip_href(notification: dict):
-        if notification.get("event_id") and notification.get("has_event_clip"):
-            return _customer_event_playback_href(
-                notification.get("camera_id"), notification.get("timestamp"), notification.get("event_id"), True,
-            )
-        return None
+        return _customer_notification_playback_href(notification)
 
     content, scripts = smart_alerts.render_inbox(
         groups, view=view, tz=APPLIANCE_TIMEZONE, alert_text=_customer_alert_text,
@@ -145908,6 +145918,10 @@ def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
         ).fetchone()
     if not row:
         return None
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms" and row["camera_number"] is not None:
+        if _customer_local_recording_path(row["s3_key"], row["camera_number"]) is not None:
+            return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
     cloud_url = _presigned_recording_url(row["s3_key"])
     if cloud_url:
         return cloud_url

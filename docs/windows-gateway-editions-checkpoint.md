@@ -10,6 +10,40 @@ Media/configuration/UI safeguards and initial lifecycle preparation committed
 as `cca96a1afb13ec6f7409cff44c3058db2501cf8a`.
 Normal apply_patch create/read/delete access verified within this checkout.
 
+## Active runtime integration (from 476ca2a)
+
+Gateway local camera operation now uses the independent vms_license_capacity
+component of the same verified, identity-bound accepted signed grant. A zero
+remote-plan count no longer disables local cameras when a valid local licence
+remains. No new grant is invented: missing/invalid/revoked trust still fails
+closed, malformed licence values are refused, migrated unsigned records do not
+gain this capability and old signed grants without a separate licence component
+retain their old count. Full VMS keeps its existing plan-limited capacity.
+Cloud event writes still require per-camera eligibility and fresh server
+authorization; local licence capacity never grants cloud service entitlement.
+
+Basic Motion already wrote legacy JSON in-app alerts, but the customer inbox
+reads the notifications table, so Gateway customer accounts saw an empty inbox.
+gateway_notifications.py bridges the existing alert into that table using
+notification_engine's recipient/camera permissions, per-user dedupe and read
+state. The explicit local_only fanout mode never queues push/email/SMS; the
+existing legacy external dispatch remains untouched. Full VMS does not enter
+the Gateway bridge, and fanout's default external behavior is preserved.
+
+Gateway alert cards now link to local camera/timestamp Playback without requiring
+an uploaded event-media row. Gateway recording URLs prefer an existing local MKV
+before cloud URL signing; existing authenticated /local/remux routes and history
+permissions remain in place. Full VMS retains cloud-first behavior. Tests exercise
+the actual local registry/credential lookup and camera licence gate without
+contacting a camera, starting FFmpeg, importing the VMS or querying cloud services.
+
+Windows service startup validates Gateway edition and edge role before directory
+creation, stale-process cleanup or Job Object changes. Invalid Gateway roles
+fail early; Full VMS role behavior and Blue's remaining launcher fixes are kept.
+No launcher/service was executed; only its pure configuration helper was tested.
+Local recording strategy, retention, premium analytics grants and customer
+authentication/offline-grace security policies are unchanged.
+
 ## Build prerequisite remediation (from f7d7533)
 
 Full findings/owner actions: `docs/windows-gateway-prerequisite-remediation.md`.
@@ -228,7 +262,7 @@ No quota, retention period, billing policy or deletion behavior was changed.
 
 ## Validation and remaining work
 
-66 focused unittest checks passed sequentially, covering edition defaults, explicit override
+80 focused unittest checks passed sequentially, covering edition defaults, explicit override
 boundaries, Full VMS compatibility, Gateway notices, isolated actual transport
 functions with mocks, real PowerShell edition and product-mode blocks, event
 entitlement/retention policy with in-memory SQLite, and existing acceptance,

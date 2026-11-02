@@ -83,6 +83,15 @@ def _record(capacity: dict, source: str) -> dict | None:
     quantity = _quantity(capacity.get("camera_slot_quantity"))
     if quantity is None:
         return None
+    # Gateway local operation uses the independent licence component of the
+    # SAME verified grant, never unsigned sync or a guessed billing allowance.
+    # Full VMS and legacy grants without this component retain the old limit.
+    from gateway_edition import current_edition
+    if source == "signed" and current_edition() in {"local_gateway", "cloud_gateway"} and "vms_license_capacity" in capacity:
+        local_quantity = _quantity(capacity["vms_license_capacity"])
+        if local_quantity is None:
+            return None
+        quantity = local_quantity
     return {"camera_slot_quantity": quantity, "plan_camera_slots": capacity.get("plan_camera_slots"),
             "vms_license_capacity": capacity.get("vms_license_capacity"), "source": source}
 

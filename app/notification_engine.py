@@ -349,7 +349,7 @@ def event_dedupe_key(camera_id, local_event_id) -> str | None:
     return f"{camera_id}:{local_event_id}"
 
 
-def fanout_appliance_event(appliance: dict,event: dict):
+def fanout_appliance_event(appliance: dict,event: dict, *, local_only: bool = False):
     customer_id=appliance.get('customer_id'); site_id=appliance.get('site_id'); camera_id=str(event.get('camera_id') or '') or None; event_type=notification_event_type(str(event.get('event_type') or ''))
     if not customer_id or event_type not in SUPPORTED: return 0
     if event_type in OPT_IN_EVENT_TYPES and not any(opted_in(user['id'],event_type) for user in rows(
@@ -397,8 +397,11 @@ def fanout_appliance_event(appliance: dict,event: dict):
             inserted=db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at,dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity') or ('critical' if event_type in EMERGENCY_EVENT_TYPES else 'info'),title,message,timestamp,event.get('thumbnail'),now.isoformat(),dedupe_key)).rowcount
             if not inserted:
                 continue  # this person already has this event's notification
-            _enqueue_mobile_push(db, notification_id)
-            external=_external_channels(db,user=user,customer_id=customer_id,camera_id=camera_id,event_type=event_type,current_time=current_time,now=now,notification_id=notification_id)
+            if local_only:
+                external={'email':False,'sms':False,'email_address':'','phone_number':''}
+            else:
+                _enqueue_mobile_push(db, notification_id)
+                external=_external_channels(db,user=user,customer_id=customer_id,camera_id=camera_id,event_type=event_type,current_time=current_time,now=now,notification_id=notification_id)
         recipients={'in_app':'local','email':external['email_address'],'sms':external['phone_number']}
         channels={'in_app':True,'email':external['email'],'sms':external['sms']}
         if event_type in EMERGENCY_EVENT_TYPES and channels['sms'] and site_id and not _security_sms_wanted(customer_id,site_id):

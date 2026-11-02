@@ -13,6 +13,31 @@ WIN = ROOT / 'installer/windows'
 
 
 class GatewayConfigurationTests(unittest.TestCase):
+    def test_gateway_service_role_validation_precedes_service_side_effects(self):
+        script = """
+        $ErrorActionPreference = 'Stop'
+        . '%s'
+        Assert-GatewayRuntimeConfiguration '' ''
+        Assert-GatewayRuntimeConfiguration 'full_vms' 'cloud'
+        foreach ($edition in @('local_gateway','cloud_gateway')) {
+            Assert-GatewayRuntimeConfiguration $edition 'edge'
+            foreach ($role in @('cloud','combined','')) {
+                $refused = $false
+                try { Assert-GatewayRuntimeConfiguration $edition $role } catch { $refused = $true }
+                if (-not $refused) { throw 'invalid Gateway runtime role accepted' }
+            }
+        }
+        $refused = $false
+        try { Assert-GatewayRuntimeConfiguration 'invalid' 'edge' } catch { $refused = $true }
+        if (-not $refused) { throw 'invalid edition accepted' }
+        """ % (WIN / 'gateway-edition.ps1')
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        launcher = (WIN / 'service-launcher.ps1').read_text(encoding='utf-8')
+        check = launcher.index('Assert-GatewayRuntimeConfiguration ')
+        self.assertLess(check, launcher.index('New-Item -ItemType Directory'))
+        self.assertLess(check, launcher.index("'stop-stale-vms.ps1'"))
+
     def test_fresh_install_modes_and_saved_configuration(self):
         script = """
         $ErrorActionPreference = 'Stop'

@@ -56,6 +56,10 @@ class LauncherRunTests(unittest.TestCase):
             "ANYAICAM_STATE_DIR=C:\\elsewhere\nANYAICAM_HTTP_PORT=8000\n", encoding="utf-8")
 
     def run_launcher(self, name):
+        # Mirror the installer's new shared edition helper; the fixture still
+        # replaces Python and never starts an installed service/application.
+        (self.install / "installer").mkdir(exist_ok=True)
+        (self.install / "installer" / "gateway-edition.ps1").write_text(read("gateway-edition.ps1"), encoding="utf-8")
         text = read(name)
         self.assertEqual(len(PYTHON_LINE.findall(text)), 1)
         text = PYTHON_LINE.sub("Get-ChildItem env:ANYAICAM_* | ForEach-Object { \"$($_.Name)=$($_.Value)\" }", text)
