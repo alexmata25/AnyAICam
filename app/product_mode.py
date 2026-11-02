@@ -27,7 +27,9 @@ Resolution order for the mode itself (current_mode()):
    -> Hybrid) or a subscription cancellation (Hybrid -> Local) apply
    automatically the next time this appliance polls its configuration,
    with no manual re-flagging.
-3. "" (unset/legacy) -- no mode has ever been configured for this
+3. Installer bootstrap choice, then ANYAICAM_GATEWAY_EDITION's default
+   (local_gateway -> local, cloud_gateway -> hybrid).
+4. "" (unset/legacy, including the default full_vms edition) -- no mode has ever been configured for this
    appliance. Every governed flag then falls back to its own
    pre-product-mode literal default (see resolve_cloud_flag()'s
    legacy_default), so an appliance that has never opted into product
@@ -107,7 +109,10 @@ def current_mode() -> str:
     if persisted in VALID_MODES:  # what the cloud last said
         return persisted
     bootstrap = os.environ.get(BOOTSTRAP_MODE_ENV, "").strip().lower()
-    return bootstrap if bootstrap in VALID_MODES else persisted
+    if bootstrap in VALID_MODES:
+        return bootstrap
+    from gateway_edition import default_product_mode
+    return default_product_mode()
 
 
 def is_local() -> bool:
