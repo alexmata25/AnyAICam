@@ -1111,6 +1111,17 @@ def _remote_access_allowed() -> bool:
     return not _gateway_runtime() or product_mode._resolve("ANYAICAM_LIVE_P2P_ENABLED", False)
 
 
+def _gateway_whep_location_allowed(location: str) -> bool:
+    """A gateway must send signaling only to its configured local WHEP origin."""
+    from urllib.parse import urlsplit
+    try:
+        target = urlsplit(location)
+        base = urlsplit(MEDIAMTX_WEBRTC_BASE)
+        return bool(target.scheme and target.netloc) and (target.scheme, target.netloc) == (base.scheme, base.netloc)
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def _close_remote_whep_sessions() -> None:
     """Close only cloud-brokered sessions, preserving LAN sessions and paths."""
     from urllib.parse import urlsplit
@@ -1182,6 +1193,10 @@ def _handle_pending_signal(camera_url_fn, item: dict) -> None:
         if result is None:
             return
         location, answer_sdp = result
+        if _gateway_runtime() and not _gateway_whep_location_allowed(location):
+            # Never publish or retain an untrusted signaling capability.
+            logger.warning("webrtc_publisher.remote_session_location_invalid session_id=%s", session_id)
+            return
         with _lock:
             _whep_sessions[session_id] = location
         if not _remote_access_allowed():
@@ -1190,7 +1205,7 @@ def _handle_pending_signal(camera_url_fn, item: dict) -> None:
         _control_plane_post(f"/api/appliance/live/{camera_id}/p2p/answer", {"session_id": session_id, "sdp": answer_sdp})
     elif kind == "ice_client":
         location = _whep_sessions.get(session_id)
-        if location:
+        if location and (not _gateway_runtime() or _gateway_whep_location_allowed(location)):
             _forward_client_ice_candidate(location, payload)
         # No location yet (offer not processed first, or already failed) --
         # dropped, matching _forward_client_ice_candidate()'s own

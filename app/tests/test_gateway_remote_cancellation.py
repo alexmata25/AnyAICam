@@ -273,7 +273,7 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
               'logger':Mock(), 'urllib':SimpleNamespace(request=SimpleNamespace(Request=urllib.request.Request, urlopen=http), error=urllib.error),
               'whep_offer':Mock(return_value=('http://127.0.0.1:8889/c1/whep/token', 'answer')),
               '_control_plane_post':Mock(), '_forward_client_ice_candidate':Mock()}
-        load_functions('webrtc_publisher.py', {'_gateway_runtime','_remote_access_allowed','_close_remote_whep_sessions','_handle_pending_signal'}, ns)
+        load_functions('webrtc_publisher.py', {'_gateway_runtime','_remote_access_allowed','_gateway_whep_location_allowed','_close_remote_whep_sessions','_handle_pending_signal'}, ns)
         return ns, http
 
     def test_cancel_closes_only_remote_session_and_denies_new_offer(self):
@@ -296,6 +296,44 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         ns['_handle_pending_signal'](Mock(), {'session_id':'s1','camera_id':'c1','kind':'offer','payload':{'sdp':'offer'}})
         ns['_control_plane_post'].assert_not_called()
         http.assert_called_once(); self.assertEqual(ns['_whep_sessions'], {})
+
+    def test_gateway_rejects_foreign_whep_location_before_answer_or_ice(self):
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        ns, _ = self.publisher()
+        ns['whep_offer'].return_value = ('https://untrusted.invalid/capability-secret', 'answer')
+        ns['_handle_pending_signal'](Mock(), {'session_id':'s1','camera_id':'c1','kind':'offer','payload':{'sdp':'offer'}})
+        self.assertEqual(ns['_whep_sessions'], {})
+        ns['_control_plane_post'].assert_not_called()
+        self.assertNotIn('capability-secret', str(ns['logger'].mock_calls))
+        ns['_whep_sessions']['s2'] = 'https://untrusted.invalid/capability-secret'
+        ns['_handle_pending_signal'](Mock(), {'session_id':'s2','camera_id':'c1','kind':'ice_client','payload':{'candidate':'test'}})
+        ns['_forward_client_ice_candidate'].assert_not_called()
+
+    def test_gateway_forwards_ice_to_configured_whep_origin(self):
+        pm.apply_configuration_mode({'product_mode':'hybrid'})
+        ns, _ = self.publisher()
+        ns['_whep_sessions']['s1'] = 'http://127.0.0.1:8889/c1/whep/token'
+        ns['_handle_pending_signal'](Mock(), {'session_id':'s1','camera_id':'c1','kind':'ice_client','payload':{'candidate':'test'}})
+        ns['_forward_client_ice_candidate'].assert_called_once()
+
+    def test_malformed_whep_location_is_refused_for_each_gateway(self):
+        for edition in ('local_gateway', 'cloud_gateway'):
+            with self.subTest(edition=edition), patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':edition}):
+                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                ns, _ = self.publisher()
+                ns['whep_offer'].return_value = ('http://[invalid/capability-secret', 'answer')
+                ns['_handle_pending_signal'](Mock(), {'session_id':'s1','camera_id':'c1','kind':'offer','payload':{'sdp':'offer'}})
+                self.assertEqual(ns['_whep_sessions'], {})
+                ns['_control_plane_post'].assert_not_called()
+                self.assertNotIn('capability-secret', str(ns['logger'].mock_calls))
+
+    def test_full_vms_keeps_existing_whep_location_behavior(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'full_vms'}):
+            ns, _ = self.publisher()
+            ns['whep_offer'].return_value = ('https://legacy.invalid/whep/token', 'answer')
+            ns['_handle_pending_signal'](Mock(), {'session_id':'s1','camera_id':'c1','kind':'offer','payload':{'sdp':'offer'}})
+            self.assertEqual(ns['_whep_sessions']['s1'], 'https://legacy.invalid/whep/token')
+            ns['_control_plane_post'].assert_called_once()
 
     def test_failed_close_is_retained_for_retry_and_foreign_origin_is_not_contacted(self):
         ns, http = self.publisher()
