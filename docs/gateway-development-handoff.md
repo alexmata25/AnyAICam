@@ -3,6 +3,10 @@
 Updated 2026-11-02. Continue on existing main, application and installer branches;
 preserve their commits. No deployment or live-system acceptance is implied.
 
+Consolidated current readiness and exact owner decisions:
+`gateway-consolidated-readiness.md`. The final bounded review found no further
+proven package-independent task; no unchanged tests or recovery searches were rerun.
+
 ## Current references
 
 - `windows-gateway-resource-provenance.md`: exact reusable assets, all eight

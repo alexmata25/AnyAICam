@@ -6,6 +6,9 @@ transport results do not establish installed-system acceptance. Each row below
 requires PASS / FAIL / BLOCKED / NOT RUN, tester, timestamp and evidence path.
 All installed-system rows currently remain **NOT RUN**.
 
+The consolidated current status, evidence limits and owner decisions are in
+`gateway-consolidated-readiness.md`; this file retains the detailed acceptance matrix.
+
 ## Current autonomous source validation
 
 The latest integrated lightweight run passed **130 tests in 34.894s**. New
