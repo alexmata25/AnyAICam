@@ -32,6 +32,22 @@ if (-not $b.data.readable -or -not $a.data.readable) {
 function Props($o) { if ($null -eq $o) { return @{} }; $h = @{}; foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value }; return $h }
 function Check([string]$Name, [bool]$Passed, [string]$Detail = '') { Add-AcceptanceCheck $result $Name $Passed $Detail }
 
+# The collector uses this sentinel for existing files it cannot hash. Never
+# mistake matching sentinels, or a truthy sentinel, for installed-file evidence.
+$unreadable = $false
+if ($Step -eq 'Repair') {
+    $beforeScripts = Props $b.scripts; $afterScripts = Props $a.scripts
+    $unreadable = @($beforeScripts.Values + $afterScripts.Values | Where-Object { $_ -eq 'unreadable' }).Count -gt 0
+    $unreadable = $unreadable -or $b.tesseract_manifest -eq 'unreadable'
+}
+if ($Step -in @('Upgrade', 'Repair')) {
+    $unreadable = $unreadable -or $a.tesseract_manifest -eq 'unreadable' -or $a.runtime_catalog -eq 'unreadable'
+}
+if ($unreadable) {
+    $final = Complete-AcceptanceResult $result $OutputPath 'a required installed file could not be hashed (take new snapshots with sufficient access)'
+    "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+}
+
 # Customer data must survive every step, uninstall included (the .iss marks ProgramData folders uninsneveruninstall).
 $bi = Props $b.data.identity_sha256; $ai = Props $a.data.identity_sha256
 if (@($bi.Values + $ai.Values | Where-Object { $_ -eq 'unreadable' }).Count -gt 0) {

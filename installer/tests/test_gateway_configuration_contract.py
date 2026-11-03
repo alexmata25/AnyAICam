@@ -112,6 +112,32 @@ class GatewayConfigurationTests(unittest.TestCase):
                 self.assertEqual(data['result'], 'BLOCKED')
                 self.assertIn('identity file could not be hashed', data['blocked_reason'])
 
+    def test_lifecycle_blocks_unreadable_required_installed_files(self):
+        cases = [('Repair', 'scripts', 'before'), ('Repair', 'scripts', 'after'), ('Repair', 'scripts', 'both'),
+                 ('Repair', 'tesseract_manifest', 'before'), ('Repair', 'tesseract_manifest', 'after'),
+                 ('Repair', 'tesseract_manifest', 'both'),
+                 ('Repair', 'runtime_catalog', 'after'), ('Upgrade', 'tesseract_manifest', 'after'),
+                 ('Upgrade', 'runtime_catalog', 'after')]
+        for step, field, which in cases:
+            with self.subTest(step=step, field=field, snapshot=which), tempfile.TemporaryDirectory() as temp:
+                before, after = copy.deepcopy(BASE_STATE), copy.deepcopy(BASE_STATE)
+                targets = (before, after) if which == 'both' else (before if which == 'before' else after,)
+                for target in targets:
+                    if field == 'scripts':
+                        target[field]['service\\service-launcher.ps1'] = 'unreadable'
+                    else:
+                        target[field] = 'unreadable'
+                b, a, report = (Path(temp) / name for name in ('before.json', 'after.json', 'result.json'))
+                b.write_text(json.dumps(before), encoding='utf-8')
+                a.write_text(json.dumps(after), encoding='utf-8')
+                result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+                    str(WIN / 'acceptance/Compare-AnyAiCamInstallState.ps1'), '-Before', str(b), '-After', str(a),
+                    '-Step', step, '-OutputPath', str(report)], capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                data = json.loads(report.read_text(encoding='utf-8-sig'))
+                self.assertEqual(data['result'], 'BLOCKED')
+                self.assertIn('required installed file could not be hashed', data['blocked_reason'])
+
     def test_lifecycle_detects_truncated_recordings_without_count_change(self):
         for after_bytes, expected in [(100, 0), (120, 0), (99, 1), (0, 1), (None, 2)]:
             with self.subTest(bytes=after_bytes), tempfile.TemporaryDirectory() as temp:
