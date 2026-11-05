@@ -6,7 +6,9 @@ stays short (duration_mismatch) instead of passing it silently."""
 import asyncio
 import logging
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import pytest
@@ -47,19 +49,29 @@ def harness(tmp_path, monkeypatch):
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         returncode = state["returncodes"].pop(0) if state["returncodes"] else 0
         open(command[-1], "wb").write(f"clip-{state['calls']}".encode() if returncode == 0 else b"partial")
+        if state.get("after_first") and state["calls"] == 1:
+            state["after_first"]()
         return Completed(returncode)
 
     def fake_probe(path):
         return state["durations"].pop(0) if state["durations"] else state["last"]
 
-    def fake_attempt_probe(path, timeout):
-        state["probe_timeouts"].append(timeout)
+    def fake_clip_probe(path, deadline):
+        # Used for the attempt probes and for the final probe of the saved recording; only the attempts' remaining
+        # time is checked against the retry deadline (the final probe has its own budget).
+        state["probe_calls"].append(path.name)
+        if ".attempt" in path.name:
+            state["probe_timeouts"].append(deadline - time.monotonic())
         return fake_probe(path)
 
+    state["probe_calls"] = []
     monkeypatch.setattr(main.subprocess, "run", fake_run)
     monkeypatch.setattr(main, "_probe_recording_duration_seconds", fake_probe)
-    # raising=False: the same tests also run against the uncorrected 01a493c code to show they fail there.
-    monkeypatch.setattr(main, "_probe_event_clip_attempt_seconds", fake_attempt_probe, raising=False)
+    # raising=False: the same tests also run against the uncorrected code to show they fail there -- 2598f88 (01a493c)
+    # and 7b2f515, whose attempt probe took a relative timeout under an earlier name.
+    monkeypatch.setattr(main, "_probe_event_clip_seconds", fake_clip_probe, raising=False)
+    monkeypatch.setattr(main, "_probe_event_clip_attempt_seconds",
+                        lambda path, timeout: fake_clip_probe(path, time.monotonic() + timeout), raising=False)
     main._open_event_recordings.pop(1, None)
     main._event_recording_locks.pop(1, None)
     yield state
@@ -124,7 +136,7 @@ def test_a_rebuild_that_hangs_is_killed_at_the_deadline_and_the_lock_is_released
     with caplog.at_level(logging.INFO):
         _persist()
     elapsed = time.monotonic() - started
-    assert harness["timeouts"][0] == 60.0        # the first build keeps the single build's own bound
+    assert 59.0 < harness["timeouts"][0] <= 60.0  # the first build keeps the single build's own bound
     assert 0 < harness["timeouts"][1] <= 0.5     # a rebuild gets only the time left before the deadline
     assert elapsed < 0.5 + 1.0
     assert not main._event_recording_locks[1].locked()
@@ -154,13 +166,15 @@ def test_the_attempt_probe_gives_up_when_the_shared_ffprobe_slots_stay_busy(tmp_
         while main._ffprobe_semaphore.acquire(blocking=False):
             held += 1
         started = time.monotonic()
-        assert main._probe_event_clip_attempt_seconds(tmp_path / "clip.mkv", 0.3) is None
+        with pytest.raises(main._ProbeOutOfTime):
+            main._probe_event_clip_seconds(tmp_path / "clip.mkv", time.monotonic() + 0.3)
         assert time.monotonic() - started < 0.3 + 0.5
     finally:
         for _ in range(held):
             main._ffprobe_semaphore.release()
     assert held >= 1 and launched == []
-    assert main._probe_event_clip_attempt_seconds(tmp_path / "clip.mkv", 0.0) is None
+    with pytest.raises(main._ProbeOutOfTime):       # a deadline already passed never waits at all
+        main._probe_event_clip_seconds(tmp_path / "clip.mkv", time.monotonic())
 
 
 def test_a_later_failed_rebuild_never_destroys_the_earlier_clip(harness, caplog, monkeypatch):
@@ -221,3 +235,95 @@ def test_a_temp_file_left_by_an_interrupted_run_is_never_promoted(harness, monke
     harness["returncodes"] = [3199971767] * 100000
     _persist()
     assert not stale.exists() and _camera_clips(harness) == []
+
+
+# 2026-11-05, Codex notes on 7b2f515: (1) asyncio.to_thread() waited however long a job sat in the thread pool's queue,
+# so a queued rebuild or probe could still run after the deadline with the lock held; (2) the probe of the saved
+# recording (for the persisted log line) waited without limit for a shared ffprobe slot, under the same lock.
+
+REAL_CLIP_PROBE = getattr(main, "_probe_event_clip_seconds", None)
+REAL_RECORDING_PROBE = main._probe_recording_duration_seconds
+
+
+def _persist_on_one_busy_worker(harness, busy_seconds):
+    """persist_event_recording() with a one-thread default pool. Right after the first build, that thread is given
+    `busy_seconds` of unrelated work, so everything persist submits next waits in the queue. Returns the time
+    persist itself took (asyncio.run() then waits for the busy work at shutdown)."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    harness["after_first"] = lambda: pool.submit(time.sleep, busy_seconds)
+
+    async def scenario():
+        asyncio.get_running_loop().set_default_executor(pool)
+        started = time.monotonic()
+        await main.persist_event_recording(1, T0 + timedelta(seconds=10), T0 + timedelta(seconds=15),
+                                           detector="basic_motion", trigger_id="t1")
+        return time.monotonic() - started
+
+    return asyncio.run(scenario())
+
+
+def test_a_rebuild_queued_behind_a_busy_thread_pool_never_runs_past_the_deadline(harness, caplog, monkeypatch):
+    monkeypatch.setattr(main, "EVENT_BUFFER_COVERAGE_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(main, "EVENT_CLIP_FINAL_PROBE_SECONDS", 0.3, raising=False)
+    harness["returncodes"] = [3199971767]        # the first build fails, so a rebuild is due -- and queues
+    harness["last"] = 20.0                       # what a late rebuild would measure, if it ever ran
+    with caplog.at_level(logging.INFO):
+        elapsed = _persist_on_one_busy_worker(harness, 2.0)
+    assert elapsed < 0.5 + 1.0                   # not the 2 s the queue would have taken
+    assert harness["calls"] == 1                 # the abandoned rebuild never ran, not even after the queue cleared
+    assert not main._event_recording_locks[1].locked()
+    assert "event_recording.concat_failed" in caplog.text
+
+
+def test_a_probe_queued_behind_a_busy_thread_pool_never_runs_past_the_deadline(harness, caplog, monkeypatch):
+    monkeypatch.setattr(main, "EVENT_BUFFER_COVERAGE_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(main, "EVENT_CLIP_FINAL_PROBE_SECONDS", 0.3, raising=False)
+    harness["durations"] = [20.0]
+    harness["last"] = 20.0
+    with caplog.at_level(logging.INFO):
+        elapsed = _persist_on_one_busy_worker(harness, 2.0)
+    assert elapsed < 0.5 + 0.3 + 1.0
+    assert harness["probe_calls"] == []          # neither queued probe ran, even after the queue cleared
+    assert _kept_clip() == b"clip-1"             # an unmeasured first clip is kept, as before
+    assert not main._event_recording_locks[1].locked()
+    assert "event_recording.persisted" in caplog.text and "event_recording.duration_probe_timeout" in caplog.text
+
+
+def test_the_final_probe_gives_up_when_the_shared_ffprobe_slots_stay_busy_and_keeps_the_clip(
+        harness, caplog, monkeypatch):
+    # The real probes this time, with every appliance-wide ffprobe slot held elsewhere for 3 s. The attempt probe
+    # is still faked (the clip measures complete), so only the saved recording's probe meets the busy slots.
+    monkeypatch.setattr(main, "EVENT_CLIP_FINAL_PROBE_SECONDS", 0.3, raising=False)
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", REAL_RECORDING_PROBE)
+    harness["durations"] = [20.0]                # the attempt measures complete (on the old code, via the harness)
+    harness["last"] = 20.0
+    if REAL_CLIP_PROBE is not None:
+        monkeypatch.setattr(main, "_probe_event_clip_seconds", lambda path, deadline: (
+            20.0 if ".attempt" in path.name else REAL_CLIP_PROBE(path, deadline)))
+    held, release = 0, threading.Lock()
+
+    def release_all():
+        nonlocal held
+        with release:
+            for _ in range(held):
+                main._ffprobe_semaphore.release()
+            held = 0
+
+    while main._ffprobe_semaphore.acquire(blocking=False):
+        held += 1
+    timer = threading.Timer(3.0, release_all)    # so the uncorrected code finishes (late) instead of hanging
+    timer.start()
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.INFO):
+            _persist()
+        elapsed = time.monotonic() - started
+    finally:
+        timer.cancel()
+        release_all()
+    assert elapsed < 0.3 + 1.0
+    assert harness["calls"] == 1                 # one build; no ffprobe was launched while the slots were busy
+    assert _kept_clip() == b"clip-1"
+    assert not main._event_recording_locks[1].locked()
+    assert "event_recording.duration_probe_timeout" in caplog.text
+    assert "event_recording.persisted" in caplog.text and "duration_seconds=None" in caplog.text

@@ -115,7 +115,7 @@ def test_the_backfill_never_blocks_the_event_loop(monkeypatch):
     assert asyncio.run(scenario()) < 0.5
 
 
-FFPROBE_WORK = {"linked_recording_for", "_probe_recording_duration_seconds", "_probe_event_clip_attempt_seconds", "_probe_motion_clip_candidates", "_catalog_local_recordings_for_camera"}
+FFPROBE_WORK = {"linked_recording_for", "_probe_recording_duration_seconds", "_probe_event_clip_seconds", "_probe_motion_clip_candidates", "_catalog_local_recordings_for_camera"}
 
 
 def _async_functions_reaching(targets: set[str]) -> list[str]:
