@@ -1,5 +1,6 @@
 """PowerShell helpers and source ordering only; never invokes build.ps1."""
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
@@ -35,22 +36,13 @@ class GatewayBuildToolsTests(unittest.TestCase):
         result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],capture_output=True,text=True,timeout=30)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
-    def test_compiler_metadata_refuses_wrong_patch_missing_metadata_and_non_executable(self):
+    def test_compiler_guard_refuses_missing_unpinned_and_non_executable(self):
         with tempfile.TemporaryDirectory() as folder:
             fake = Path(folder) / 'ISCC.exe'
             fake.write_bytes(b'not executable; must never be run')
             script = """
             $ErrorActionPreference = 'Stop'
             . '%s'
-            $accepted = [pscustomobject]@{FileMajorPart=7;FileMinorPart=1;FileBuildPart=0;FilePrivatePart=0}
-            if (Get-BuildInnoVersionProblem $accepted) { throw 'approved metadata refused' }
-            foreach ($field in @('FileMajorPart','FileMinorPart','FileBuildPart','FilePrivatePart')) {
-                $changed = $accepted.PSObject.Copy()
-                $changed.$field = $changed.$field + 1
-                if (-not (Get-BuildInnoVersionProblem $changed)) { throw 'other compiler version accepted' }
-            }
-            if (-not (Get-BuildInnoVersionProblem $null)) { throw 'absent metadata accepted' }
-            if (-not (Get-BuildInnoVersionProblem ([pscustomobject]@{FileMajorPart=7}))) { throw 'incomplete metadata accepted' }
             foreach ($path in @('%s','%s','%s')) {
                 $refused = $false
                 try { Assert-BuildInnoCompiler $path } catch { $refused = $true }
@@ -58,6 +50,75 @@ class GatewayBuildToolsTests(unittest.TestCase):
             }
             """ % (WIN / 'build-tools.ps1', fake, Path(folder) / 'missing.exe', folder)
             result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_compiler_manifest_rejects_malformed_duplicate_and_unsafe_entries(self):
+        digest = 'a' * 64
+        cases = ['', 'not a manifest', f'{digest}  ../ISCC.exe', f'{digest}  ISCC.exe\n{digest}  ISCC.exe',
+                 f'{digest}  ISCmplr.dll', f'{digest.upper()}  ISCC.exe', f'{digest} ISCC.exe']
+        with tempfile.TemporaryDirectory() as folder:
+            for index, text in enumerate(cases):
+                (Path(folder) / f'm{index}.sha256').write_text(text, encoding='ascii')
+            script = """
+            $ErrorActionPreference = 'Stop'
+            . '%s'
+            [void](Read-BuildInnoManifest '%s')
+            foreach ($index in 0..%d) {
+                $refused = $false
+                try { [void](Read-BuildInnoManifest (Join-Path '%s' "m$index.sha256")) } catch { $refused = $true }
+                if (-not $refused) { throw "unsafe manifest $index accepted" }
+            }
+            """ % (WIN / 'build-tools.ps1', WIN / 'inno-setup-7.1.0.sha256', len(cases) - 1, folder)
+            result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_compiler_signature_requires_pinned_publisher_and_valid_status(self):
+        script = """
+        $ErrorActionPreference = 'Stop'
+        . '%s'
+        if (-not (Get-BuildInnoSignatureProblem $null)) { throw 'missing signature accepted' }
+        foreach ($status in @('NotSigned','HashMismatch','NotTrusted','UnknownError')) {
+            if (-not (Get-BuildInnoSignatureProblem ([pscustomobject]@{Status=$status;SignerCertificate=$null}))) { throw "$status accepted" }
+        }
+        $other = [pscustomobject]@{Thumbprint='0000000000000000000000000000000000000000'}
+        if (-not (Get-BuildInnoSignatureProblem ([pscustomobject]@{Status='Valid';SignerCertificate=$other}))) { throw 'other publisher accepted' }
+        if (-not (Get-BuildInnoSignatureProblem ([pscustomobject]@{Status='Valid';SignerCertificate=$null}))) { throw 'no signer accepted' }
+        """ % (WIN / 'build-tools.ps1')
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_installed_compiler_copy_is_accepted_and_every_tamper_is_refused(self):
+        installed = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Inno Setup 7'
+        if not (installed / 'ISCC.exe').is_file():
+            self.skipTest('Inno Setup 7.1.0 is not installed on this machine')
+        with tempfile.TemporaryDirectory() as folder:
+            script = """
+            $ErrorActionPreference = 'Stop'
+            . '%s'
+            $source = '%s'; $root = '%s'
+            function Copy-Compiler([string]$Name) {
+                $target = Join-Path $root $Name
+                Copy-Item -LiteralPath $source -Destination $target -Recurse
+                return $target
+            }
+            function Assert-Refused([string]$Folder, [string]$Expected) {
+                $problems = @(Get-BuildInnoCompilerProblems (Join-Path $Folder 'ISCC.exe') '%s')
+                if (-not ($problems -match [regex]::Escape($Expected))) { throw "tamper not refused ($Expected): $($problems -join '; ')" }
+            }
+            $clean = Copy-Compiler 'clean'
+            Assert-BuildInnoCompiler (Join-Path $clean 'ISCC.exe')
+            $changed = Copy-Compiler 'changed'
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $changed 'Setup.e64')); $bytes[1024] = $bytes[1024] -bxor 1
+            [IO.File]::WriteAllBytes((Join-Path $changed 'Setup.e64'), $bytes)
+            Assert-Refused $changed 'does not match the pinned Inno Setup 7.1.0: Setup.e64'
+            $planted = Copy-Compiler 'planted'
+            Copy-Item -LiteralPath (Join-Path $planted 'ISPP.dll') -Destination (Join-Path $planted 'version.dll')
+            Assert-Refused $planted 'unexpected file in the compiler folder: version.dll'
+            $missing = Copy-Compiler 'missing'
+            Remove-Item -LiteralPath (Join-Path $missing 'Languages') -Recurse
+            Assert-Refused $missing 'pinned compiler file is missing: Languages/'
+            """ % (WIN / 'build-tools.ps1', installed, folder, WIN / 'inno-setup-7.1.0.sha256')
+            result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True, timeout=300)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_compiler_guard_precedes_staging_and_compilation(self):

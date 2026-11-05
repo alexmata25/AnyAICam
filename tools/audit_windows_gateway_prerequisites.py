@@ -78,7 +78,7 @@ def audit(root=ROOT, env=None, which=shutil.which, build_python=None, keyset=Non
         'recorded_at_utc': datetime.now(timezone.utc).isoformat(), 'machine': platform.node(),
         'checkout': str(root), 'kind': 'presence_only', 'build_readiness': 'NOT_VALIDATED',
         'missing_dependencies': missing, 'checks': checks,
-        'remaining_gates': ['Approved setup and release versions', 'Verified Inno Setup 7.1.0 metadata and approved provenance', 'Verified build interpreter version',
+        'remaining_gates': ['Approved setup and release versions', 'Inno Setup 7.1.0 pinned file hashes and publisher signature (build-tools.ps1)', 'Verified build interpreter version',
             'Approved public keyset and independently pinned hash', 'All vendor/wheel hashes and signatures',
             'Packaged source integrity and signing configuration', 'Licence/distribution review from DEPENDENCIES.md',
             'Separate resource-window approval; no build or VM operation has run'],
