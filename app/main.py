@@ -17905,24 +17905,49 @@ async def persist_event_recording(
             # can trail real time by up to one GOP (Windows 1.3.4.1 Sandbox, signed e4c7bdc: a 19.1 s event came
             # out 13.9 s, short by about the simulated camera's 5.6 s GOP). Rebuild until the clip covers the
             # window (or the concat succeeds at all), bounded so a camera that stops sending cannot hold the lock.
+            # 2026-11-05 (Codex FAIL on 01a493c): the deadline is real wall-clock time for the whole retry phase. The
+            # first build keeps the single build's own 60 s ffmpeg bound; a rebuild starts only before the deadline,
+            # and its ffmpeg and every duration probe get only the time left, so the lock is held at most
+            # max(60 s, EVENT_BUFFER_COVERAGE_WAIT_SECONDS) here. Each attempt writes attempt_output; only a better
+            # clip replaces temp_output, so a later failed or shorter attempt never destroys the best clip so far.
+            attempt_output = destination.with_suffix(".attempt.mkv")
+            temp_output.unlink(missing_ok=True)      # never promote a temp file left by an earlier, interrupted run
             deadline = time.monotonic() + EVENT_BUFFER_COVERAGE_WAIT_SECONDS
+            kept = False
+            best_seconds = None
+            first_attempt = True
             while True:
-                result = await asyncio.to_thread(
-                    subprocess.run,
-                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-                     "-t", f"{duration_seconds:.3f}",
-                     "-c", "copy", str(temp_output)],
-                    capture_output=True, timeout=60, check=False,
-                )
-                built = result.returncode == 0 and temp_output.exists()
-                built_seconds = await asyncio.to_thread(_probe_recording_duration_seconds, temp_output) if built else None
+                concat_timeout = 60.0 if first_attempt else deadline - time.monotonic()
+                first_attempt = False
+                attempt_output.unlink(missing_ok=True)
+                try:
+                    result = await asyncio.to_thread(
+                        subprocess.run,
+                        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                         "-t", f"{duration_seconds:.3f}",
+                         "-c", "copy", str(attempt_output)],
+                        capture_output=True, timeout=concat_timeout, check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    # subprocess.run() has already killed ffmpeg: a failed attempt, not a hung lock.
+                    result = subprocess.CompletedProcess([], returncode="timeout")
+                built = result.returncode == 0 and attempt_output.exists()
+                built_seconds = (await asyncio.to_thread(_probe_event_clip_attempt_seconds, attempt_output,
+                                                         deadline - time.monotonic()) if built else None)
                 # Retry only what is known to be incomplete: a failed concat, or a MEASURED clip that is short. An
                 # unmeasurable clip is kept as before (duration_mismatch below cannot judge it either).
                 short = built_seconds is not None and built_seconds < duration_seconds - EVENT_CLIP_DURATION_TOLERANCE_SECONDS
+                # Keep the first valid clip; after that only a MEASURED clip that is complete or longer replaces it
+                # (a clip kept so far is always measured and short, or the loop would have stopped).
+                if built and (not kept or (built_seconds is not None and (not short or built_seconds > best_seconds))):
+                    attempt_output.replace(temp_output)
+                    kept, best_seconds = True, built_seconds
                 if (built and not short) or time.monotonic() >= deadline:
                     break
-                await asyncio.sleep(EVENT_BUFFER_COVERAGE_RETRY_SECONDS)
-            if result.returncode == 0 and temp_output.exists():
+                await asyncio.sleep(min(EVENT_BUFFER_COVERAGE_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
+            if kept:
                 temp_output.replace(destination)
                 # Off the event loop -- same reason as
                 # _backfill_ai_event_linked_recording()'s own call: a real
@@ -17950,6 +17975,7 @@ async def persist_event_recording(
         finally:
             list_file.unlink(missing_ok=True)
             destination.with_suffix(".tmp.mkv").unlink(missing_ok=True)
+            destination.with_suffix(".attempt.mkv").unlink(missing_ok=True)
 
 
 
@@ -145460,6 +145486,32 @@ def _probe_recording_duration_seconds(path: Path) -> float | None:
         return duration
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
+
+
+def _probe_event_clip_attempt_seconds(path: Path, timeout: float) -> float | None:
+    """ffprobe duration of one persist_event_recording() rebuild attempt, finished within `timeout` seconds of
+    wall-clock time including the wait for the appliance-wide _ffprobe_semaphore (2026-11-05, Codex FAIL on
+    01a493c: an unbounded probe could hold the per-camera lock past the coverage deadline). Same ffprobe invocation
+    as _probe_recording_duration_seconds(), but uncached: the attempt file is rewritten under the same name, so a
+    cached (path, mtime) entry could describe an earlier attempt. Never raises; None when the time runs out or the
+    probe fails, which the caller treats as "unmeasurable"."""
+    deadline = time.monotonic() + timeout
+    if timeout <= 0 or not _ffprobe_semaphore.acquire(timeout=timeout):
+        return None
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=min(15.0, remaining), check=False,
+        )
+        duration = float(probe.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    finally:
+        _ffprobe_semaphore.release()
+    return duration if duration > 0 else None
 
 
 def _catalog_local_recordings_for_camera(camera_id: str, *, budget_seconds: float | None = PLAYBACK_CATALOG_BUDGET_SECONDS) -> int:
