@@ -18,7 +18,8 @@ $required = @(
     'installer\windows\open-claim-link.ps1',
     'installer\windows\source-integrity.ps1',
     'installer\windows\runtime-catalog.ps1',
-    'appliance-agent\anyaicam_agent\windows.py'
+    'appliance-agent\anyaicam_agent\windows.py',
+    'appliance-agent\system\trust_install_windows.py'
 )
 foreach ($relative in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $relative))) { throw "Missing $relative" }
@@ -34,7 +35,7 @@ foreach ($name in @('ANYAICAM_STATIC_FOLDER', 'ANYAICAM_RECORDINGS_FOLDER', 'ANY
     if (-not $paths.Contains($name)) { throw "The VMS is missing $name Windows path support" }
 }
 $iss = Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\AnyAiCam-VMS.iss')
-foreach ($text in @('uninsneveruninstall', 'AnyAiCamVMS.exe', 'python-3.12.10-embed-amd64.zip', 'get-pip.py', 'vendor\wheels\*', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip', 'firewall.ps1', '[InstallDelete]', 'Start-Sleep -Seconds 3', 'PrivilegesRequired=admin', 'vc_redist.x64-14.44.35211.exe', 'runtime-preflight.py')) {
+foreach ($text in @('uninsneveruninstall', 'AnyAiCamVMS.exe', 'python-3.12.10-embed-amd64.zip', 'get-pip.py', 'vendor\wheels\*', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip', 'firewall.ps1', '[InstallDelete]', 'Start-Sleep -Seconds 3', 'PrivilegesRequired=admin', 'vc_redist.x64-14.44.35211.exe', 'runtime-preflight.py', 'trust_install_windows.py', 'entitlement-trust-registry.json')) {
     if (-not $iss.Contains($text)) { throw "Installer manifest is missing $text" }
 }
 $runtime = Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\install-runtime.ps1')

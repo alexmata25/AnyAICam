@@ -74,6 +74,19 @@ def test_a_real_user_writable_file_is_refused_on_windows(tmp_path):
     assert problem and ("owned by" in problem or "writable by" in problem)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="needs Windows")
+def test_a_file_with_a_second_hard_link_is_refused_on_windows(tmp_path, monkeypatch):
+    """LIC-W1: not a reparse point, and the ACL is the file's own, so only the link count shows it."""
+    monkeypatch.setattr(platform_paths, "_windows_sddl", lambda _path: "")
+    monkeypatch.setattr(platform_paths, "sddl_write_problem", lambda _sddl: "")
+    candidate = tmp_path / "entitlement_trust_registry.json"
+    candidate.write_text("{}", encoding="utf-8")
+    assert platform_paths.windows_write_problem(candidate) == ""
+    assert platform_paths.windows_write_problem(tmp_path) == ""
+    os.link(candidate, tmp_path / "second-name")
+    assert platform_paths.windows_write_problem(candidate) == "has more than one hard link"
+
+
 # ---------------------------------------------------------------- the readers use it on Windows
 def test_the_keyset_check_applies_the_windows_rule_on_windows(monkeypatch, tmp_path):
     monkeypatch.setattr(appliance_entitlements.os, "name", "nt")

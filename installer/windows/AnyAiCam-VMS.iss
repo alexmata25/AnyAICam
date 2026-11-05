@@ -18,6 +18,9 @@
 #ifndef KeysetSha256
   #error KeysetSha256 is required: build with build.ps1 -EntitlementKeyset ... -EntitlementKeysetSha256 ...
 #endif
+#ifndef RegistrySha256
+  #error RegistrySha256 is required: build with build.ps1 -EntitlementTrustRegistry ... -EntitlementTrustRegistrySha256 ...
+#endif
 [Setup]
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
 AppName={#AppName}
@@ -86,6 +89,8 @@ Source: "stop-app-processes.ps1"; DestDir: "{app}\installer"; Flags: ignoreversi
 ; Run from {tmp} by InitializeSetup before anything is installed (downgrade / unknown-version guard).
 Source: "install-version-guard.ps1"; Flags: dontcopy
 Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; LIC-W1: the entitlement trust registry (build.ps1). Also extracted early by TrustRegistryProblem.
+Source: "output\entitlement-trust-registry.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
@@ -97,6 +102,12 @@ Source: "agent-main.py"; DestDir: "{app}\agent"; Flags: ignoreversion
 ; signed-format / identity / expiry / replay policy; vms_capacity.apply_sync() runs it from {app}\agent\system.
 Source: "..\..\appliance-agent\system\capacity_accept.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
 Source: "..\..\appliance-agent\system\capacity_accept_windows.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
+Source: "..\..\appliance-agent\system\trust_install_windows.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
+; LIC-W1: run from {tmp} by TrustRegistryProblem on the installed Python, before the services stop.
+Source: "..\..\appliance-agent\system\trust_install_windows.py"; Flags: dontcopy
+Source: "..\..\appliance-agent\system\capacity_accept_windows.py"; Flags: dontcopy
+Source: "..\..\appliance-agent\system\capacity_accept.py"; Flags: dontcopy
+Source: "..\..\app\platform_paths.py"; Flags: dontcopy
 Source: "agent-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "AnyAiCamAgent.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamAgent.exe"; Flags: ignoreversion
@@ -339,12 +350,66 @@ begin
     Result := 'Setup cannot switch the existing product mode (' + Saved + '); change it from your AnyAiCam account instead.';
 end;
 
+// LIC-W1: the trust registry is decided HERE too, for the same reason as the product mode: install-runtime.ps1 decides
+// again, but only after both services are gone, so a refusal there leaves a PC with no running VMS. This run writes
+// nothing. It needs the Python already on this PC, so a new install, or a reinstall after an uninstall, has only the
+// later check. Setup continues past here ONLY on the helper's exit 0, or when no VMS is installed here at all: a helper
+// that cannot start, crashes, or is missing beside installed services proves nothing, and the services must not stop on
+// that. An exception would otherwise be reported and leave Result empty, so it is caught.
+const TrustRegistryRefused = 3;
+
+function TrustRegistryProblem(): String;
+var
+  ResultCode: Integer;
+  Python: String;
+begin
+  Result := 'Setup could not confirm that this computer''s license signing keys are safe to update, so it has stopped ' +
+    'without changing anything. Your cameras keep working. Contact AnyAiCam support.';
+  try
+    Python := ExpandConstant('{app}\runtime\python\python.exe');
+    if not FileExists(Python) then begin
+      if FileExists(ExpandConstant('{app}\service\AnyAiCamVMS.exe')) or
+         FileExists(ExpandConstant('{app}\service\AnyAiCamAgent.exe')) then
+        Log('Trust registry check: the VMS is installed but its Python is missing.')
+      else
+        Result := '';
+      exit;
+    end;
+    ExtractTemporaryFile('trust_install_windows.py');
+    ExtractTemporaryFile('capacity_accept_windows.py');
+    ExtractTemporaryFile('capacity_accept.py');
+    ExtractTemporaryFile('platform_paths.py');
+    ExtractTemporaryFile('entitlement-trust-registry.json');
+    ResultCode := -1;
+    if not ExecAndLogOutput(Python, '-B "' + ExpandConstant('{tmp}\trust_install_windows.py') + '" --check "' +
+        ExpandConstant('{tmp}\entitlement-trust-registry.json') + '" {#RegistrySha256}', '', SW_HIDE,
+        ewWaitUntilTerminated, ResultCode, nil) then begin
+      Log('Trust registry check: the helper could not start.');
+      exit;
+    end;
+    if ResultCode = 0 then
+      Result := ''
+    else if ResultCode = TrustRegistryRefused then
+      Result := 'This setup''s license signing keys do not match this computer, so it has stopped without changing ' +
+        'anything. Your cameras keep working. Contact AnyAiCam support.'
+    else
+      Log('Trust registry check: the helper failed with exit code ' + IntToStr(ResultCode) + '.');
+  except
+    Log('Trust registry check failed: ' + GetExceptionMessage);
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
   ServiceExecutable: String;
 begin
   Result := ProductModeProblem();
+  if Result <> '' then begin
+    Log('Install refused before any change: ' + Result);
+    exit;
+  end;
+  Result := TrustRegistryProblem();
   if Result <> '' then begin
     Log('Install refused before any change: ' + Result);
     exit;
@@ -461,7 +526,7 @@ begin
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -TesseractArchive "' + ExpandConstant('{tmp}\tesseract-5.5.2-win64-anyaicam.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '" -MediaMtxArchive "' + ExpandConstant('{tmp}\mediamtx_v1.21.0_windows_amd64.zip') + '" -TesseractArchive "' + ExpandConstant('{tmp}\tesseract-5.5.2-win64-anyaicam.zip') + '" -SttModelArchive "' + ExpandConstant('{tmp}\vosk-model-small-en-us-0.15.zip') + '" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "' + ExpandConstant('{param:PortalUrl|}') + '" -RuntimeCatalog "' + ExpandConstant('{tmp}\AnyAiCamRuntime.cat') + '" -EntitlementKeyset "' + ExpandConstant('{tmp}\entitlement-signing-public-keys.json') + '" -EntitlementKeysetSha256 "{#KeysetSha256}" -EntitlementTrustRegistry "' + ExpandConstant('{tmp}\entitlement-trust-registry.json') + '" -EntitlementTrustRegistrySha256 "{#RegistrySha256}" -ProductMode "' + ProductModeChoice() + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamAgent.exe'), 'install', 'Installing the AnyAiCam cloud agent service...');

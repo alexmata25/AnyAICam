@@ -154,7 +154,7 @@ are never touched.
 **Legacy mode.** With no registry installed **and** no generation >= 1
 recorded in the protected state or in the accepted capacity, the flat keyset
 is trusted as active for every purpose (existing 1.2.7 installs; Windows
-1.3.3 until Blue's packaging ships the registry). A key stored in an accepted
+1.3.4 and earlier, which ship no registry). A key stored in an accepted
 grant never confers trust in any mode. A 1.2.7.1+ release always carries a
 registry (the builder refuses otherwise), so a Linux 1.2.7.1 appliance never
 runs in legacy mode after install. **Upgrade path:** the 1.2.7 Software
@@ -203,6 +203,82 @@ Talk Down/Voice Call snapshot for up to 24 h after its issue, analytics for
 up to 168 h. The delay therefore equals the time until that appliance
 installs the revoking release. A cloud-delivered, update-key-signed
 demotion-only notice that would shorten this is Phase 2 (owner decision).
+
+### Windows (1.3.4.1): setup is the only delivery
+
+Windows uses the **same registry document and digest** as Linux, never one
+generated for Windows. It may lag a generation; it never forks one. Files are
+in `%ProgramData%\AnyAiCam\update`, owned by Administrators or SYSTEM, writable
+by nobody else.
+
+| | |
+|---|---|
+| Build | `build.ps1 -EntitlementTrustRegistry registry.json -EntitlementTrustRegistrySha256 <digest>`, mandatory. Every key in the pinned flat keyset must be in the registry, active, with the same key material, and the flat keyset must be its projection. A key kept for verification only must be named in `-EntitlementRetiredKeyIds`. A signed build also requires environment `production` |
+| Chain | Digest from the cloud host, pinned at build, Authenticode-signed setup, verified again at install. An entitlement key never signs the registry. **An unsigned test build has no authenticity guarantee** |
+| Early check | `PrepareToInstall`, before the services stop, no writes: `trust_install_windows.py --check`. Setup continues only on exit 0. A refusal, a helper that fails or can't start, or installed services with no Python all stop Setup with the PC untouched. A new install or a reinstall after uninstall has no Python yet, so it has only the later check |
+| Install | `install-runtime.ps1`, then `trust_install_windows.py`: registry, state, accepted grant's `signer` and `trust_generation`, then the flat keyset. Runs at install because the acceptor's ratchet needs a pending grant |
+
+A first install has no history, so `next_trust_state` and
+`check_trust_registry_transition` cannot see a dropped key. Setup therefore
+reads the accepted grant's signer first:
+
+| Signer in the incoming registry | Setup |
+|---|---|
+| Active or retired | Continues |
+| Explicitly revoked, same key material | Continues; cameras stop until a newer grant |
+| Absent, or different key material | **Refuses; trust files unchanged** |
+
+A trust file with a second hard link is refused by Setup and by the VMS, which
+then licenses 0 cameras until the other name is removed and Setup reruns.
+
+Setup checks only the capacity grant's signer. Feature and analytics grants are
+re-verified against the installed registry on every read and expire, so a
+signer they lose fails closed until the next online sync.
+
+**Rotating a Windows key** uses the same registry as Linux, across setups:
+
+1. Add the new key as active; the old key stays active. Build and ship setup.
+2. Move the cloud to the new key, once enough PCs hold it.
+3. Mark the old key `retired` at the next generation and build with
+   `-EntitlementRetiredKeyIds <old-id>`. Pin the flat keyset with both keys.
+4. Accepted capacity from the old key keeps working with no time limit;
+   cached features and analytics keep working until they expire. A retired key
+   never signs a new grant, and each PC needs a newer grant before step 5.
+5. Revoke only by explicit tombstone, never by dropping the key: Setup refuses
+   a registry that drops a key a PC has bound or that its grant needs.
+
+A PC that skipped step 1 can't accept grants from the new key until it runs a
+setup holding it. Nothing here changes a PC remotely (LIC-W9).
+
+Windows has no Software Update and no remote revocation path.
+
+> Key revocation on Windows is delivered only by running a new AnyAiCam setup.
+> A PC that never runs that setup keeps honouring grants from a revoked key:
+> accepted camera capacity with no time limit, Talk Down and Voice Call for up
+> to 24 hours after issue, analytics for up to 168 hours. Windows has no remote
+> update path, so there's no way to reach such a PC remotely.
+
+Signed remote revocation is tracked separately as **LIC-W9**. It must not be
+unsigned or unverified.
+
+**Older setups can bypass revocation, and LIC-W1 can't prevent it.** The
+version guard compares version numbers only; it knows nothing of keys or
+generations.
+
+| Setup run after 1.3.4.1 | Guard | Result |
+|---|---|---|
+| 1.3.0 or 1.3.1 | None: it predates the guard | Installs over the newer version. Its runtime reads no registry |
+| 1.3.2, 1.3.3 | Refuses while the uninstall entry or `vms.env` records a newer version | Refused, also after an uninstall, because `vms.env` survives it |
+| 1.3.4 | Same | Refused the same way. Its runtime does read the registry |
+| Any guarded setup, with `vms.env` and the program files removed by an administrator | Sees a clean install | Installs. Runtimes before 1.3.4 ignore the registry and state |
+
+The trust files survive all of this, and a later current setup checks against
+them again, so the downgrade doesn't erase the record. But a runtime before
+1.3.4 never reads them. Nothing in a new setup can change how an old one
+behaves, and a local administrator can always remove the guard's evidence.
+Reducing the exposure means withdrawing setups before 1.3.4 from distribution
+and having the cloud stop issuing grants to them, both outside this code. Do
+not treat revocation as enforced on a PC where an older setup can be run.
 
 ### Backups
 

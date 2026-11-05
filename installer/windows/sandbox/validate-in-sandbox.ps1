@@ -279,6 +279,20 @@ Check 'listening on the local network (0.0.0.0:8000)' {
 }
 
 # ---------------------------------------------------------------- files, data, permissions
+if ($acceptanceSettings.expected_trust_registry_sha256) {
+    Check 'trust registry: installed, equals the pin, state names it (LIC-W1)' {
+        $update = Join-Path $env:ProgramData 'AnyAiCam\update'
+        $hash = (Get-FileHash -LiteralPath (Join-Path $update 'entitlement_trust_registry.json') -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $acceptanceSettings.expected_trust_registry_sha256) { throw "registry sha256 $hash" }
+        $state = Get-Content -Raw -LiteralPath (Join-Path $update 'entitlement_trust_state.json') | ConvertFrom-Json
+        if ($state.registry_sha256 -ne $hash -or [int]$state.generation -lt 1) { throw "state names $($state.registry_sha256) generation $($state.generation)" }
+        foreach ($name in 'entitlement_trust_registry.json', 'entitlement_trust_state.json') {
+            $owner = (Get-Acl -LiteralPath (Join-Path $update $name)).Owner
+            if ($owner -notmatch 'Administrators$|SYSTEM$') { throw "$name owner $owner" }
+        }
+        "generation $($state.generation) sha256 $hash"
+    }
+}
 $app = Join-Path $env:ProgramFiles 'AnyAiCam'
 $data = Join-Path $env:ProgramData 'AnyAiCam'
 Check 'MediaMTX installed' { Test-Path (Join-Path $app 'runtime\tools\mediamtx\mediamtx.exe') }

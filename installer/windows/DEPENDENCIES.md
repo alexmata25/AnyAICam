@@ -19,7 +19,7 @@ Setup order: Visual C++ runtime (exit 0, 1638 already installed, or 3010 restart
 
 `pytesseract` remains installed because the LPR module imports it, but the external OCR engine is called only when LPR analysis runs. Its absence does not block core VMS startup, camera recording, HLS, or playback.
 
-The build-time keyset validator can use the verified per-user CPython 3.12.10 explicitly with `build.ps1 -PythonExe <absolute-path-to-python.exe>`. This avoids relying on a system Python Launcher registration. The build script verifies that the selected executable reports exactly Python 3.12.10 before it validates the public entitlement keyset.
+The build-time keyset validator can use the verified per-user CPython 3.12.10 explicitly with `build.ps1 -PythonExe <absolute-path-to-python.exe>`. This avoids relying on a system Python Launcher registration. The build script verifies that the selected executable reports exactly Python 3.12.10 before it validates the public entitlement keyset and trust registry.
 
 ## Excluded on Windows (1.3.4.1)
 

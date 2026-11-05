@@ -64,6 +64,17 @@ negative control. Every report says `BASELINE TRUST SEEDED IN SANDBOX -- not cus
 covers the older-setup refusal, uninstall, reinstall over kept data, and recovery from a setup that failed after the
 services were removed (same version only).
 
+## Entitlement trust registry (LIC-W1) -- SYNTHETIC registry
+
+`-ExpectedTrustRegistrySha256 <digest>` makes a run check the installed registry, state and owners. On a functional run
+it also deletes the registry and repairs it with the same setup. `-TrustRefusedSetup <exe>` adds a same-version build
+whose registry omits the grant's signer: Setup must stop before the services do. `-TrustRevokingSetup <exe>` adds a later
+generation with that key revoked. Each setup carries one registry, so both are extra synthetic-test builds. A pass here
+is never evidence about the production registry.
+
+Not scripted yet: a newer active grant recovering cameras after revocation, and uninstall followed by the 1.3.4 setup.
+The focused tests in `app/tests/test_windows_trust_install_1341.py` cover the policy, not these Windows paths.
+
 ## Functional scenarios F-L / F-H (2026-10-21, Blue) -- SYNTHETIC-KEYSET / SIMULATED CAMERA
 
 `make-wsb.ps1 -Functional -KeysetKind synthetic-test -SyntheticSigningKey <key> -ProductMode local|hybrid ...`

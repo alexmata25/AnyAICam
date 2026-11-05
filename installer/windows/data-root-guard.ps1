@@ -34,6 +34,18 @@ function Assert-AnyAiCamDataRootHasNoLinks([string]$Root) {
     }
 }
 
+# LIC-W1: a hard link is not a reparse point, so the link checks above cannot see it. It shares the file's ACL, so a
+# repair through it changes the other name's file too, and that name can reach a trust file's content. Throws (fail
+# closed) on any file in the trust folder with a second link. The trust files themselves are refused again by the VMS
+# (platform_paths.windows_write_problem) and by trust_install_windows.py.
+function Assert-AnyAiCamTrustFolderHasNoHardLinks([string]$Folder) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Folder -Recurse -File -Force)) {
+        if ($file.LinkType -eq 'HardLink') {
+            throw "Refusing to install: $($file.FullName) has a second hard link. Remove the other name, then run the setup again."
+        }
+    }
+}
+
 # Reset one entry without a recursive icacls/takeown operation. The caller has
 # already restricted the parent directory, so a standard user cannot replace
 # this entry while its ACL is repaired. Directories are reset before they are
@@ -48,6 +60,9 @@ function Set-AnyAiCamEntryAcl([System.IO.FileSystemInfo]$Entry) {
     $clean = $false
     try { $clean = Test-AnyAiCamAclClean (Get-Acl -LiteralPath $Entry.FullName -ErrorAction Stop) } catch { $clean = $false }
     if (-not $clean) {
+        if ((Get-Item -LiteralPath $Entry.FullName -Force).LinkType -eq 'HardLink') {
+            throw "Refusing to repair permissions through hard link $($Entry.FullName)."
+        }
         & icacls.exe $Entry.FullName /setowner '*S-1-5-32-544' /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of $($Entry.FullName) (icacls exit $LASTEXITCODE)." }
         & icacls.exe $Entry.FullName /reset /C /Q | Out-Null

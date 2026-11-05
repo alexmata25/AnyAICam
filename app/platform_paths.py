@@ -10,13 +10,15 @@ installer restricts %ProgramData%\\AnyAiCam to SYSTEM and Administrators; the tr
 variable could be set by an unprivileged user).
 
 windows_write_problem() is the Windows counterpart of appliance_entitlements.ownership_problem(): an entry is safe
-only when it is not a reparse point (symlink / junction), its owner is SYSTEM or Administrators, and no allow-ACE
-grants a modifying right to anyone else.
+only when it is not a reparse point (symlink / junction), it is not a file with a second hard link (LIC-W1: the
+ownership_problem rule's st_nlink twin; a hard link is not a reparse point and shares the file's ACL), its owner is
+SYSTEM or Administrators, and no allow-ACE grants a modifying right to anyone else.
 """
 from __future__ import annotations
 
 import os
 import re
+import stat
 from pathlib import Path
 
 WINDOWS = os.name == "nt"
@@ -132,4 +134,6 @@ def windows_write_problem(path: Path) -> str:
     info = os.lstat(path)
     if getattr(info, "st_file_attributes", 0) & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
         return "is a reparse point (link)"
+    if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+        return "has more than one hard link"
     return sddl_write_problem(_windows_sddl(path))

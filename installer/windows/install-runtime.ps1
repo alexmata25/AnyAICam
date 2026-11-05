@@ -25,6 +25,9 @@ param(
     # Requirement 9 (1.2.7): the entitlement-signing PUBLIC keyset and its pinned SHA-256 (build.ps1).
     [Parameter(Mandatory=$true)][string]$EntitlementKeyset,
     [Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256,
+    # LIC-W1: the entitlement trust registry and its pinned SHA-256 (build.ps1); always installed before the flat keyset.
+    [Parameter(Mandatory=$true)][string]$EntitlementTrustRegistry,
+    [Parameter(Mandatory=$true)][string]$EntitlementTrustRegistrySha256,
     # Requirement 9 (1.2.7): Local or Hybrid, chosen in Setup (or /ProductMode= for a silent install). Empty on an
     # upgrade, which keeps the saved mode. Mirrors installer/03-product-mode.sh.
     [string]$ProductMode = ''
@@ -191,12 +194,22 @@ Assert-AnyAiCamDataRootHasNoLinks $DataRoot  # again, now that nothing below is 
 # administrator creates is owned by that user, so ownership is set explicitly.
 $updateRoot = Join-Path $DataRoot 'update'
 if (-not (Test-Path -LiteralPath $updateRoot)) { New-Item -ItemType Directory -Path $updateRoot -Force | Out-Null }
+Assert-AnyAiCamTrustFolderHasNoHardLinks $updateRoot
 Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $updateRoot -Force)
 if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'The pinned entitlement keyset SHA-256 is malformed.' }
 $keysetBytes = [IO.File]::ReadAllBytes($EntitlementKeyset)
 $keysetText = [Text.Encoding]::ASCII.GetString($keysetBytes).ToUpperInvariant()
 if ($keysetText.Contains('PRIVATE') -or $keysetText.Contains('BEGIN') -or $keysetText.Contains('OPENSSH')) { throw 'The packaged entitlement keyset contains private key material; refusing to install it.' }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $EntitlementKeyset).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The packaged entitlement keyset does not match its pinned SHA-256; refusing to trust it.' }
+# LIC-W1: entitlement_trust_registry.json, then entitlement_trust_state.json, then the accepted grant's signer fields,
+# before the flat keyset, under the acceptance lock (trust_install_windows.py). Any refusal stops the setup with the
+# trust files as they were. The VMS and the helper trust an entry only when SYSTEM or Administrators owns it, and a file
+# an administrator creates is owned by that user, so the walk that repaired this folder above runs again. Both services
+# are stopped here, so nothing reads these files before their owner is right.
+if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'The pinned entitlement trust registry SHA-256 is malformed.' }
+& $python (Join-Path $InstallRoot 'agent\system\trust_install_windows.py') $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $EntitlementKeyset
+if ($LASTEXITCODE -ne 0) { throw "The entitlement trust registry was not installed (exit $LASTEXITCODE); the setup log has the reason." }
+Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $updateRoot -Force)
 $keysetTarget = Join-Path $updateRoot 'entitlement_signing_keys.json'
 $keysetTemp = Join-Path $updateRoot ('.entitlement_signing_keys.' + [guid]::NewGuid().ToString('N') + '.tmp')
 [IO.File]::WriteAllBytes($keysetTemp, $keysetBytes)

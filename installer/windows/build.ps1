@@ -7,6 +7,11 @@ param(
     # (docs/entitlement-signing-keys.md). Without it a Windows install trusts no signed capacity: 0 cameras.
     [Parameter(Mandatory=$true)][string]$EntitlementKeyset,
     [Parameter(Mandatory=$true)][string]$EntitlementKeysetSha256,
+    # LIC-W1: the same entitlement trust registry and pinned SHA-256 as the Linux release (docs/entitlement-signing-keys.md).
+    # There is no registry-less build: every pinned key must be in it, active and with the same key material.
+    [Parameter(Mandatory=$true)][string]$EntitlementTrustRegistry,
+    [Parameter(Mandatory=$true)][string]$EntitlementTrustRegistrySha256,
+    [string[]]$EntitlementRetiredKeyIds = @(),
     # Optional explicit build interpreter. This avoids relying on a machine-wide
     # Python Launcher registration when the approved interpreter is per-user.
     [string]$PythonExe = '',
@@ -129,18 +134,28 @@ if ($Sign -or $AzureSign) {
 # The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
 # public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
 if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
+if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementTrustRegistrySha256 must be a 64-character lowercase SHA-256.' }
 $keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
+$registryOut = Join-Path $PSScriptRoot 'output\entitlement-trust-registry.json'
+# A signed setup is a release candidate: only a production registry. Synthetic registries are for unsigned test builds.
+$registryEnvironment = if ($Sign -or $AzureSign) { 'production' } else { 'any' }
+# A rotation build names the keys kept for verification only. Passed only when there are some: PowerShell 5.1 drops an
+# empty argument. prepare-keyset.py stops the build on a retired key not named here.
+$retiredKeyArgument = @()
+if ($EntitlementRetiredKeyIds.Count) { $retiredKeyArgument = @($EntitlementRetiredKeyIds -join ',') }
 if ($PythonExe) {
     if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
     $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
-    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
 } else {
-    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut
+    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
 }
-if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset was refused; nothing was built.' }
+if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset or trust registry was refused; nothing was built.' }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $registryOut).Hash.ToLowerInvariant() -ne $EntitlementTrustRegistrySha256) { throw 'The prepared entitlement trust registry does not match its pinned SHA-256.' }
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
+$compilerArguments += "/DRegistrySha256=$EntitlementTrustRegistrySha256"
 $compilerArguments += "/DAppVersion=$Version"
 $compilerArguments += "/DReleaseVersion=$ReleaseVersion"
 $compilerArguments += "/DSourceCommit=$sourceCommit"

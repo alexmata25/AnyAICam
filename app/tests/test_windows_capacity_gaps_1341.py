@@ -77,7 +77,9 @@ def test_the_windows_lock_really_holds_a_second_acceptance_back(tmp_path):
     assert order == ["second"]
 
 
-@pytest.mark.xfail(strict=True, reason="Known gap LIC-W1: Windows ships the flat keyset, so revocation and rotation "
-                                        "cannot reach installed PCs. Owner and Codex decide before release")
 def test_windows_setup_installs_the_trust_registry():
-    assert "entitlement_trust_registry" in (INSTALLER / "install-runtime.ps1").read_text(encoding="utf-8")
+    """LIC-W1. Partial closure: setup is the only delivery, so a PC that never runs it is not reached (LIC-W9)."""
+    runtime = (INSTALLER / "install-runtime.ps1").read_text(encoding="utf-8")
+    install = runtime.index("agent\\system\\trust_install_windows.py")
+    assert install < runtime.index("$keysetTemp = Join-Path $updateRoot")
+    assert runtime.index("if ($LASTEXITCODE -ne 0)", install) < runtime.index("$keysetTemp = Join-Path $updateRoot")

@@ -1099,6 +1099,70 @@ if ($upgrade -and $mode -eq 'local') {
         "recovered; identity, link, secrets, keyset kept; $($ids.Count) clip(s) listed"
     }
 }
+# ---------------------------------------------------------------- entitlement trust registry (LIC-W1)
+# SYNTHETIC registry. Each scenario's setup carries one registry, so variants are separate synthetic-test builds.
+if ($settings.expected_trust_registry_sha256) {
+    $trustDir = Join-Path $data 'update'
+    $registryFile = Join-Path $trustDir 'entitlement_trust_registry.json'
+    $stateFile = Join-Path $trustDir 'entitlement_trust_state.json'
+    $acceptedFile = Join-Path $trustDir 'vms_capacity_accepted.json'
+    # The accepted grant stays out: the running test cloud may replace it at any time.
+    function TrustHashes { @($registryFile, $stateFile, $keysetFile) | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash } }
+    Check 'trust: registry equals the pin, state names it, grant kept with signer and generation, owners safe' {
+        $hash = (Get-FileHash -LiteralPath $registryFile -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $settings.expected_trust_registry_sha256) { throw "registry sha256 $hash" }
+        $state = Get-Content -Raw -LiteralPath $stateFile | ConvertFrom-Json
+        if ($state.registry_sha256 -ne $hash) { throw "state names $($state.registry_sha256)" }
+        $grant = Get-Content -Raw -LiteralPath $acceptedFile | ConvertFrom-Json
+        if (-not $grant.signer.key_id -or [int]$grant.trust_generation -lt 1) { throw 'accepted grant has no signer or generation' }
+        foreach ($file in $registryFile, $stateFile, $acceptedFile) {
+            $owner = (Get-Acl -LiteralPath $file).Owner
+            if ($owner -notmatch 'Administrators$|SYSTEM$') { throw "$file owner $owner" }
+        }
+        "generation $($state.generation) signer $($grant.signer.key_id)"
+    }
+    $refused = Get-ChildItem 'C:\Validation\scripts\trust-refused' -Filter 'AnyAiCam-VMS-Setup-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($refused) {
+        $before = TrustHashes
+        $attempt = Start-Process -FilePath $refused.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+            ('/LOG="' + (Join-Path $results 'setup-trust-refused.log') + '"') -Wait -PassThru
+        Check 'trust: a registry omitting the grant''s signer is refused before the services stop; PC unchanged and running' {
+            if ($attempt.ExitCode -eq 0) { throw 'setup accepted it' }
+            if ((Get-Service AnyAiCamVMS).Status -ne 'Running' -or -not (WaitHealthy 60)) { throw 'the VMS stopped' }
+            $after = TrustHashes; if (($after -join ',') -ne ($before -join ',')) { throw 'trust files changed' }
+            "exit $($attempt.ExitCode); running; trust files byte-identical"
+        }
+    }
+    $before = TrustHashes
+    Stop-Service AnyAiCamAgent, AnyAiCamVMS -Force
+    Remove-Item -LiteralPath $registryFile -Force
+    Start-Service AnyAiCamVMS, AnyAiCamAgent
+    [void](WaitHealthy 180)
+    Info 'trust: deleted registry, capacity diagnostic (focused tests assert registry_rollback; observed here)' { (Http '/health').Content }
+    $repair = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+        ('/LOG="' + (Join-Path $results 'setup-trust-repair.log') + '"') -Wait -PassThru
+    Check 'trust: rerunning the setup restores a deleted registry exactly; state unchanged' {
+        if ($repair.ExitCode -ne 0) { throw "exit $($repair.ExitCode)" }
+        if (-not (WaitHealthy 240)) { throw 'not healthy' }
+        $after = TrustHashes; if (($after -join ',') -ne ($before -join ',')) { throw 'trust files differ' }
+        'restored; byte-identical'
+    }
+    $revoking = Get-ChildItem 'C:\Validation\scripts\trust-revoking' -Filter 'AnyAiCam-VMS-Setup-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($revoking) {
+        $signer = (Get-Content -Raw -LiteralPath $acceptedFile | ConvertFrom-Json).signer.key_id
+        $clipsBefore = @(Mkv $camNo).Count
+        $revokeRun = Start-Process -FilePath $revoking.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+            ('/LOG="' + (Join-Path $results 'setup-trust-revoking.log') + '"') -Wait -PassThru
+        Check 'trust: a revoking registry installs, the signer is revoked in the state, recordings kept' {
+            if ($revokeRun.ExitCode -ne 0) { throw "exit $($revokeRun.ExitCode)" }
+            if (-not (WaitHealthy 240)) { throw 'not healthy' }
+            $state = Get-Content -Raw -LiteralPath $stateFile | ConvertFrom-Json
+            if (-not $state.revoked.$signer) { throw "$signer not revoked" }
+            if (@(Mkv $camNo).Count -lt $clipsBefore) { throw 'recordings lost' }
+            "$signer revoked; $clipsBefore recording file(s) kept"
+        }
+    }
+}
 [void](Cloud POST '/test/revoke-appliance' -Owner)
 Check 'revoked appliance: the cloud refuses it and online customer sign-in on this PC is refused' {
     # Prior U132-L run: VMS was not running (failed rollback), Edge returned status 0, reported as 'accepted'.

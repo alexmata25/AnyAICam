@@ -18,6 +18,9 @@
 # -BaselineKeyset (1.3.4.1, U134-F): the setup under test's PUBLIC synthetic keyset, seeded over the real production
 # baseline inside the disposable Sandbox, so a signed-capacity upgrade can run on the accepted baseline bytes. It must
 # hash to -ExpectedKeysetSha256 and carry no private material. Functional synthetic-test upgrades only.
+# LIC-W1: -ExpectedTrustRegistrySha256 makes a run check the installed entitlement trust files. -TrustRefusedSetup (same
+# version as -Setup, a registry omitting the grant's signer) and -TrustRevokingSetup (a later generation with that key
+# revoked) add those functional scenarios; both are synthetic-test builds of the same source.
 # -ProductMode local|hybrid is the /ProductMode the run installs with. -Previous must be an OLDER version than -Setup
 # (a downgrade, e.g. from Windows 1.3.x, is refused here).
 param(
@@ -33,6 +36,9 @@ param(
     [switch]$SimulatePrevious,
     [switch]$Functional,
     [string]$BaselineKeyset = '',
+    [ValidatePattern('^([0-9a-f]{64})?$')][string]$ExpectedTrustRegistrySha256 = '',
+    [string]$TrustRefusedSetup = '',
+    [string]$TrustRevokingSetup = '',
     # 1.3.4.1: turn Smart App Control ON inside the Sandbox before the run (enforce-sac.ps1); it starts in evaluation mode.
     [switch]$EnforceSmartAppControl
 )
@@ -48,6 +54,7 @@ if ($KeysetKind -eq 'synthetic-test') {
 if ($Functional -and $KeysetKind -ne 'synthetic-test') { throw 'A functional run uses the synthetic-test build only (SYNTHETIC-KEYSET / SIMULATED CAMERA).' }
 # 1.3.4.1 acceptance: allow four-part setup versions and require the accepted, pinned, signed 1.3.4 setup as the upgrade baseline.
 if ($Functional -and $SimulatePrevious) { throw 'A functional run never plants simulated 1.3.0 leftovers: use -Previous with a real earlier setup.' }
+if (($TrustRefusedSetup -or $TrustRevokingSetup) -and (-not $Functional -or -not $ExpectedTrustRegistrySha256)) { throw 'The trust scenarios are functional runs with -ExpectedTrustRegistrySha256.' }
 if ($BaselineKeyset) {
     if (-not $Functional -or -not $Previous) { throw '-BaselineKeyset is for a functional upgrade run with -Previous.' }
     if ((Get-FileHash -LiteralPath $BaselineKeyset -Algorithm SHA256).Hash.ToLower() -ne $ExpectedKeysetSha256) { throw '-BaselineKeyset does not match -ExpectedKeysetSha256.' }
@@ -90,6 +97,14 @@ if ($Functional) { foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', '
 $runSettings = [ordered]@{ product_mode = $ProductMode; keyset_kind = $KeysetKind; expected_keyset_sha256 = $ExpectedKeysetSha256 }
 if ($EnforceSmartAppControl) { $runSettings.enforce_smart_app_control = $true; Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'enforce-sac.ps1') -Destination (Join-Path $root.FullName 'scripts') }
 if ($Functional) { $runSettings.functional = $true; if ($Previous) { $runSettings.functional_upgrade = $true } }
+if ($ExpectedTrustRegistrySha256) { $runSettings.expected_trust_registry_sha256 = $ExpectedTrustRegistrySha256 }
+foreach ($variant in @(@('refused', $TrustRefusedSetup), @('revoking', $TrustRevokingSetup))) {
+    if (-not $variant[1]) { continue }
+    $variantFile = Get-Item -LiteralPath $variant[1]
+    if ($variantFile.Name -notmatch '^AnyAiCam-VMS-Setup-\d+\.\d+\.\d+(?:\.\d+)?-[0-9a-f]{7}\.exe$') { throw "Not an AnyAiCam setup name: $($variantFile.Name)" }
+    $variantFolder = New-Item -ItemType Directory -Path (Join-Path $root.FullName "scripts\trust-$($variant[0])")
+    Copy-Item -LiteralPath $variantFile.FullName -Destination $variantFolder.FullName
+}
 if ($BaselineKeyset) { $runSettings.baseline_trust_seeded = $true; Copy-Item -LiteralPath $BaselineKeyset -Destination (Join-Path $root.FullName 'scripts\baseline-seed-keyset.json') }
 $runSettings |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root.FullName 'scripts\acceptance.json') -Encoding ASCII
