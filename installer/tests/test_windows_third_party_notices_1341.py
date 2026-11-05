@@ -19,6 +19,14 @@ def test_the_opencv_ffmpeg_dll_is_declared_and_its_notice_ships():
     assert 'LGPLv2.1' in notice and 'libvpx' in notice and 'libaom' in notice
 
 
+def test_the_ffmpeg_licence_text_ships_on_install_and_on_upgrade():
+    script = (WINDOWS / 'install-runtime.ps1').read_text(encoding='utf-8')
+    assert "$ffmpegLicense = Join-Path $InstallRoot 'licenses\\ffmpeg\\LICENSE'" in script
+    assert 'if (-not $ffmpegPresent -or -not (Test-Path -LiteralPath $ffmpegLicense)) {' in script
+    assert "throw 'FFmpeg archive does not contain its LICENSE.'" in script
+    assert 'Copy-Item -LiteralPath $license -Destination $ffmpegLicense -Force' in script
+
+
 def test_the_source_offer_is_marked_unfinished_until_the_mirror_exists():
     assert '[PENDING' in (WINDOWS / 'notices' / 'opencv-ffmpeg-NOTICE.txt').read_text(encoding='utf-8')
 

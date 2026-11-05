@@ -68,14 +68,24 @@ if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam runtime preflight failed: the bundled
 if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam agent preflight failed: the bundled Python cannot load the cloud agent.' }
 
 $ffmpegRoot = Join-Path $InstallRoot 'runtime\tools\ffmpeg'
-if (-not (Test-Path (Join-Path $ffmpegRoot 'ffmpeg.exe'))) {
+# 1.3.4.1: FFmpeg's GPL licence sits beside bin\ in the archive, so the copy below never reached it. An upgrade over a
+# copy without it opens the archive for the licence alone and leaves the programs as they are.
+$ffmpegLicense = Join-Path $InstallRoot 'licenses\ffmpeg\LICENSE'
+$ffmpegPresent = Test-Path (Join-Path $ffmpegRoot 'ffmpeg.exe')
+if (-not $ffmpegPresent -or -not (Test-Path -LiteralPath $ffmpegLicense)) {
     $ffmpegTemp = Join-Path $env:TEMP ('anyaicam-ffmpeg-' + [guid]::NewGuid().ToString('N'))
     try {
         Expand-Archive -LiteralPath $FFmpegArchive -DestinationPath $ffmpegTemp -Force
         $ffmpeg = Get-ChildItem -LiteralPath $ffmpegTemp -Filter ffmpeg.exe -Recurse | Select-Object -First 1
         if (-not $ffmpeg) { throw 'FFmpeg archive does not contain ffmpeg.exe.' }
-        New-Item -ItemType Directory -Force -Path $ffmpegRoot | Out-Null
-        Copy-Item -Path (Join-Path $ffmpeg.Directory.FullName '*') -Destination $ffmpegRoot -Recurse -Force
+        $license = Join-Path $ffmpeg.Directory.Parent.FullName 'LICENSE'
+        if (-not (Test-Path -LiteralPath $license)) { throw 'FFmpeg archive does not contain its LICENSE.' }
+        if (-not $ffmpegPresent) {
+            New-Item -ItemType Directory -Force -Path $ffmpegRoot | Out-Null
+            Copy-Item -Path (Join-Path $ffmpeg.Directory.FullName '*') -Destination $ffmpegRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ffmpegLicense) | Out-Null
+        Copy-Item -LiteralPath $license -Destination $ffmpegLicense -Force
     } finally { if (Test-Path $ffmpegTemp) { Remove-Item $ffmpegTemp -Recurse -Force } }
 }
 
