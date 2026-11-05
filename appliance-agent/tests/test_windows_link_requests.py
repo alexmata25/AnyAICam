@@ -12,14 +12,18 @@ import logging
 import os
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from anyaicam_agent import service, windows
 from anyaicam_agent.config import load_claim_state, save_claim_state, save_credential
+from anyaicam_agent.claim_id import claim_id_for
 from anyaicam_agent.headless_claim import ON_DEMAND_IDLE_SECONDS, PENDING_POLL_SECONDS, HeadlessClaim, ineligibility
 from anyaicam_agent.windows_link import REQUEST_MAX_AGE, RESPONSE_MAX_AGE, STARTUP_GRACE, LinkRequests, request_folder
 from anyaicam_agent.portal import PortalClient
 from test_headless_claim import ACTIVATED, DEVICE_ID, PORTAL, Base, FakePortal, _http
+
+CLAIM_ID = claim_id_for(DEVICE_ID)
 
 NONCE = '0123456789abcdef0123456789abcdef'
 
@@ -230,6 +234,7 @@ class FakeClaim:
     def __init__(self, codes):
         self.codes = list(codes)
         self.done = False
+        self.device_id = DEVICE_ID
 
     def link_code(self):
         return self.codes.pop(0) if self.codes else None
@@ -261,17 +266,24 @@ class LinkRequestTests(OnDemandBase):
     def test_answers_with_a_link_that_carries_a_fresh_code_only_in_the_fragment(self):
         self.ask()
         self.assertEqual(self.requests.poll_once(), 1)
-        self.assertEqual(self.answer(), {'status': 'ok', 'link': f'{PORTAL}/claim#code=AB12CD34&link=windows'})
+        self.assertEqual(self.answer(), {'status': 'ok', 'link': f'{PORTAL}/claim#code=AB12CD34&link=windows&claim={CLAIM_ID}'})
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [f'{NONCE}.response'])  # request gone, no .tmp
         other = 'f' * 32
         self.ask(other)
         self.requests.poll_once()
-        self.assertEqual(self.answer(other)['link'], f'{PORTAL}/claim#code=EF56GH78&link=windows')
+        self.assertEqual(self.answer(other)['link'], f'{PORTAL}/claim#code=EF56GH78&link=windows&claim={CLAIM_ID}')
+
+    def test_a_linked_pc_also_gives_its_claim_id(self):
+        self.is_linked = True
+        identity = Path(self.config.installer_identity_file)
+        identity.parent.mkdir(parents=True, exist_ok=True)
+        identity.write_text(json.dumps({'appliance_id': DEVICE_ID}), encoding='utf-8')
+        self.assertEqual(self.requests.answer_for()['claim_id'], CLAIM_ID)
 
     def test_a_linked_pc_says_so(self):
         self.is_linked = True
         self.ask(); self.requests.poll_once()
-        self.assertEqual(self.answer(), {'status': 'linked'})
+        self.assertEqual(self.answer()['status'], 'linked')
         self.assertEqual(self.claim_object.codes, ['AB12CD34', 'EF56GH78'])  # no claim opened
 
     def test_waits_briefly_for_the_claim_then_says_unavailable(self):

@@ -2,7 +2,7 @@
 #
 # Asks the AnyAiCamAgent service for a fresh, one-time account link and opens
 # it in the browser -- nobody sees, copies or types a claim code:
-#   <portal>/claim#code=XXXXXXXX&link=windows
+#   <portal>/claim#code=XXXXXXXXXXXX&link=windows (8 characters from an older cloud)
 # The code travels only in the URL fragment (never sent to a server; /claim
 # moves it into the tab and out of the address bar). The owner signs in,
 # chooses a site and confirms; the agent completes the link. Each request
@@ -25,12 +25,15 @@
 #   -Prepare <file>  the setup (already elevated): requests the link and
 #                    writes it to <file> in the setup's own temporary folder;
 #                    the setup opens it as the person who ran it.
-# Nothing is written to a log or the console.
+# Nothing is written to a log or the console; the signed-in administrator alone
+# sees the Claim ID and code, in a message box. The link may also carry the
+# non-secret Claim ID; the one-time code stays the proof of possession.
 param([switch]$Elevated, [string]$Handoff = '', [string]$Prepare = '')
 $ErrorActionPreference = 'Stop'
 
-$LinkPattern = '^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/claim#code=[0-9A-Z]{8}&link=windows$'
+$LinkPattern = '^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/claim#code=([0-9A-Z]{8}|[0-9A-Z]{12})&link=windows(&claim=CID(-[0-9A-Z]{4}){4})?$'
 $NoncePattern = '^[0-9a-f]{32}$'
+$ClaimIdPattern = '^CID(-[0-9A-Z]{4}){4}$'
 
 function New-Nonce {
     $bytes = New-Object byte[] 16
@@ -62,7 +65,7 @@ function Request-AccountLink([string]$DataRoot, [int]$TimeoutSeconds = 45) {
                 try { $answer = Get-Content -Raw -LiteralPath $response | ConvertFrom-Json } finally { Remove-Item -LiteralPath $response -Force -ErrorAction SilentlyContinue }
                 $status = [string]$answer.status
                 if ($status -eq 'ok' -and ([string]$answer.link) -cmatch $LinkPattern) { return @{ status = 'ok'; link = [string]$answer.link } }
-                if ($status -eq 'linked') { return @{ status = 'linked'; link = '' } }
+                if ($status -eq 'linked') { return @{ status = 'linked'; link = $(if (([string]$answer.claim_id) -cmatch $ClaimIdPattern) { [string]$answer.claim_id } else { '' }) } }
                 return @{ status = 'unavailable'; link = '' }
             }
             Start-Sleep -Milliseconds 250
@@ -92,13 +95,26 @@ function Read-Result([string]$Path) {
 
 function Get-HandoffPath([string]$Nonce) { return Join-Path ([IO.Path]::GetTempPath()) "anyaicam-link-$Nonce.txt" }
 
-function Get-AccountLinkResult([string]$DataRoot) {
-    if ((Get-LinkState $DataRoot) -eq 'linked') { return @{ status = 'linked'; link = '' } }
+# -WithClaimId asks the agent, so a linked PC can also show its Claim ID; the
+# setup doesn't, because the service may not have started yet.
+function Get-AccountLinkResult([string]$DataRoot, [switch]$WithClaimId) {
+    if ((Get-LinkState $DataRoot) -eq 'linked') {
+        if ($WithClaimId) { $asked = Request-AccountLink $DataRoot 10; if ($asked.status -eq 'linked') { return $asked } }
+        return @{ status = 'linked'; link = '' }
+    }
     return Request-AccountLink $DataRoot
 }
 
-function Show-Message([string]$Text, [int]$Icon = 64) {
-    try { [void](New-Object -ComObject WScript.Shell).Popup($Text, 0, 'AnyAiCam', $Icon) } catch { }
+function Show-Message([string]$Text, [int]$Icon = 64, [int]$Seconds = 0) {
+    try { [void](New-Object -ComObject WScript.Shell).Popup($Text, $Seconds, 'AnyAiCam', $Icon) } catch { }
+}
+
+# The typed fallback, for when the browser is on another device or the link
+# failed. Shown only to the administrator who asked, closes when the code's
+# 15 minutes end, and is never logged. '' for a link with no Claim ID.
+function Get-ManualLinkText([string]$Link) {
+    if ($Link -cnotmatch '#code=([0-9A-Z]{8}|[0-9A-Z]{12})&link=windows&claim=(CID(-[0-9A-Z]{4}){4})$') { return '' }
+    return ("To link from another device, sign in to AnyAiCam, open Claim appliance, and enter:`n`nClaim ID: {0}`nOne-time code: {1}`n`nThe code works once, for 15 minutes. Don't share it." -f $Matches[2], $Matches[1])
 }
 
 function Test-Administrator {
@@ -116,7 +132,7 @@ function Invoke-OpenClaimLink {
     }
     if ($Elevated) {
         if ($Handoff -cnotmatch $NoncePattern) { exit 1 }
-        $result = if (Test-Administrator) { Get-AccountLinkResult $dataRoot } else { @{ status = 'denied'; link = '' } }
+        $result = if (Test-Administrator) { Get-AccountLinkResult $dataRoot -WithClaimId } else { @{ status = 'denied'; link = '' } }
         Write-Result (Get-HandoffPath $Handoff) $result
         exit 0
     }
@@ -133,8 +149,13 @@ function Invoke-OpenClaimLink {
     }
     $result = Read-Result (Get-HandoffPath $nonce)
     switch ($result.status) {
-        'ok' { Start-Process -FilePath $result.link; exit 0 }  # as the signed-in user, never elevated
-        'linked' { Show-Message 'This computer is already linked to an AnyAiCam account.'; exit 0 }
+        'ok' {
+            Start-Process -FilePath $result.link  # as the signed-in user, never elevated
+            $manual = Get-ManualLinkText $result.link
+            if ($manual) { Show-Message $manual 64 900 }
+            exit 0
+        }
+        'linked' { Show-Message ('This computer is already linked to an AnyAiCam account.' + $(if ($result.link -cmatch $ClaimIdPattern) { "`n`nClaim ID: $($result.link)" })); exit 0 }
         'denied' { Show-Message 'Linking this computer to AnyAiCam needs an administrator of this PC.' 48; exit 1 }
         'unavailable' { Show-Message 'AnyAiCam could not reach the AnyAiCam cloud. Check that this PC is connected to the internet, then try again.' 48; exit 1 }
         'timeout' { Show-Message 'The AnyAiCam Cloud Agent service did not answer. Restart the computer, then try again.' 48; exit 1 }

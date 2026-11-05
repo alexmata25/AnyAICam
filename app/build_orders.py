@@ -30,6 +30,7 @@ that sets a product, price or Stripe Price ID:
 """
 from __future__ import annotations
 
+from claim_id import display_cloud_id
 import logging
 import os
 from datetime import datetime, timedelta
@@ -841,7 +842,7 @@ def held_storage_starts() -> list[dict]:
             "checkout_session_id": plan["checkout_session_id"], "ordered_at": plan["created_at"],
             "hardware_still_paid": _order_still_paid(plan),
             "appliance_enrolled": customer_has_activated_appliance(plan["customer_id"]),
-            "appliances": appliances,
+            "appliances": [{**item, "cloud_id": display_cloud_id(item["cloud_id"])} for item in appliances],
         })
     return out
 

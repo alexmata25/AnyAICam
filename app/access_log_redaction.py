@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import re
 
+from claim_id import mask_device_path
+
 SENSITIVE_PARAMS = frozenset({
     "token", "reset_token", "access_token", "refresh_token", "id_token", "code", "password", "passwd",
     "secret", "client_secret", "key", "api_key", "apikey", "signature", "sig", "credential", "otp",
@@ -21,7 +23,10 @@ _QUERY_PAIR = re.compile(r"(?P<sep>[?&;])(?P<name>[^=&;#\s]+)=(?P<value>[^&;#\s]
 
 
 def redact_url(text: str) -> str:
-    if not isinstance(text, str) or "=" not in text:
+    if not isinstance(text, str):
+        return text
+    text = mask_device_path(text)  # appliance routes name the device UUID
+    if "=" not in text:
         return text
 
     def replace(match: re.Match) -> str:

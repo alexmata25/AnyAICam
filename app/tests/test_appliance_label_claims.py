@@ -9,6 +9,8 @@ database, same rate-limiter resets, same claim-flow key)."""
 import hashlib
 import logging
 
+from claim_id import claim_id_for
+
 import pytest
 
 from test_appliance_claims import (  # noqa: F401  (pytest fixtures)
@@ -109,7 +111,7 @@ def test_lookup_by_label_code_finds_the_waiting_appliance(client, db_path):
     _begin(client, verifier=_verifier())
     response = _lookup_label(client, "7k3m 9qx2 h4tb")
     assert response.status_code == 200
-    assert response.json()["device_id"] == VALID_DEVICE_ID
+    assert response.json()["claim_public_id"] == claim_id_for(VALID_DEVICE_ID) and "device_id" not in response.json()
 
 
 def test_lookup_with_a_wrong_label_code_is_404(client, db_path):
@@ -123,8 +125,8 @@ def test_label_lookup_matches_only_its_own_appliance(client, db_path):
     _seeded_customer(db_path)
     _begin(client, verifier=_verifier())
     _begin(client, device_id=OTHER_DEVICE_ID, verifier=_verifier("ABCDEFGHJKMN"), secret=DEVICE_SECRET + "-other")
-    assert _lookup_label(client, LABEL_CODE).json()["device_id"] == VALID_DEVICE_ID
-    assert _lookup_label(client, "ABCD-EFGH-JKMN").json()["device_id"] == OTHER_DEVICE_ID
+    assert _lookup_label(client, LABEL_CODE).json()["claim_public_id"] == claim_id_for(VALID_DEVICE_ID)
+    assert _lookup_label(client, "ABCD-EFGH-JKMN").json()["claim_public_id"] == claim_id_for(OTHER_DEVICE_ID)
 
 
 def test_label_lookup_requires_a_signed_in_customer_owner(client, db_path):
@@ -164,7 +166,7 @@ def test_full_label_claim_completes_and_never_logs_the_code(client, db_path, cap
     _seeded_customer(db_path)
     session = _begin(client, verifier=_verifier()).json()
     confirm = _confirm_label(client, LABEL_CODE)
-    assert confirm.status_code == 200 and confirm.json()["device_id"] == VALID_DEVICE_ID
+    assert confirm.status_code == 200 and "device_id" not in confirm.json()
     assert _confirm_label(client, LABEL_CODE).status_code == 404  # no longer pending
     status = _status(client, session["claim_session_id"]).json()
     assert status["status"] == "claimed" and status["claim_proof"]

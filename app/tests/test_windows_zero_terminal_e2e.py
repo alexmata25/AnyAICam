@@ -26,6 +26,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from claim_id import claim_id_for
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -206,7 +208,7 @@ class WindowsZeroTerminalTests(unittest.TestCase):
         status, found = _cloud('POST', '/api/portal/claims/lookup', {'claim_code': code}, cookie=self.cookie)
         if status != 200:
             return status
-        self.assertEqual(found['device_id'], self.device_id)
+        self.assertEqual(found['claim_public_id'], claim_id_for(self.device_id))
         status, _ = _cloud('POST', '/api/portal/claims/confirm', {'claim_code': code, 'site_id': self.site}, cookie=self.cookie)
         return status
 
@@ -228,7 +230,7 @@ class WindowsZeroTerminalTests(unittest.TestCase):
         with connection() as db:
             row = dict(db.execute('SELECT customer_id, site_id FROM appliances WHERE cloud_id=?', (self.device_id.upper(),)).fetchone())
         self.assertEqual(row, {'customer_id': self.customer, 'site_id': self.site})
-        self.assertEqual(self.administrator_asks(), {'status': 'linked'})
+        self.assertEqual(self.administrator_asks()['status'], 'linked')
         everything = '\n'.join(self.log.lines)
         self.assertNotIn(code, everything)
         self.assertNotIn(credential['credential'], everything)

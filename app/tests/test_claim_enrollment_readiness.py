@@ -5,6 +5,8 @@ and the appliance can still fail and roll back. "Ready" now requires THIS
 appliance to have authenticated with its own credential and sent a heartbeat
 after that credential was issued (appliance_readiness.py), via
 GET /api/portal/claims/enrollment. Fixtures come from test_appliance_claims.py."""
+import hashlib
+
 import pytest
 
 from test_appliance_claims import (  # noqa: F401  (pytest fixtures)
@@ -18,7 +20,9 @@ OTHER_DEVICE = "22222222-2222-4222-9222-222222222222"
 
 
 @pytest.fixture(autouse=True)
-def _reset_limiter():
+def _reset_limiter(db_path):
+    global DATABASE
+    DATABASE = db_path
     appliance_claims.claim_enrollment_limiter.events.clear()
 
 
@@ -36,9 +40,14 @@ def _seed(db_path, *, customer="cust-1", device=DEVICE, appliance_id="appl-1", c
                        ("cred-" + appliance_id, appliance_id, "x", credential_created, credential_used, revoked, "claim"))
 
 
-def _enrollment(client, device=DEVICE, cookie=None):
+def _enrollment(client, device=DEVICE, cookie=None, customer="cust-1"):
     cookies = {partner_portal.SESSION_COOKIE: cookie or _customer_cookie()}
-    return client.get("/api/portal/claims/enrollment", params={"device_id": device}, cookies=cookies)
+    handle = hashlib.md5(device.encode()).hexdigest()
+    with override_target(sqlite_path=str(DATABASE)):
+        with connection() as db:
+            db.execute("INSERT OR IGNORE INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,customer_id) VALUES(?,?,?,?,?,?,?,?)",
+                       (handle, device, handle, "x", "claimed", "2026-10-08T11:00:00", "2026-10-08T10:00:00", customer))
+    return client.get("/api/portal/claims/enrollment", params={"claim": handle}, cookies=cookies)
 
 
 def test_nothing_yet_is_waiting(client, db_path):
@@ -76,10 +85,17 @@ def test_another_accounts_appliance_is_never_revealed(client, db_path):
     assert _enrollment(client).json() == {"status": "waiting"}  # no appliance_id, no status
 
 
-def test_requires_a_signed_in_customer_owner_and_a_device_id(client, db_path):
+def test_requires_a_signed_in_customer_owner_and_a_claim_handle(client, db_path):
     _seed(db_path)
-    assert client.get("/api/portal/claims/enrollment", params={"device_id": DEVICE}).status_code in (401, 403)
-    assert _enrollment(client, device="not-a-uuid").status_code == 400
+    assert client.get("/api/portal/claims/enrollment", params={"claim": "0" * 32}).status_code in (401, 403)
+    cookies = {partner_portal.SESSION_COOKIE: _customer_cookie()}
+    assert client.get("/api/portal/claims/enrollment", params={"device_id": DEVICE}, cookies=cookies).status_code == 400
+    assert client.get("/api/portal/claims/enrollment", params={"claim": DEVICE}, cookies=cookies).status_code == 400
+
+
+def test_another_accounts_claim_handle_reveals_nothing(client, db_path):
+    _seed(db_path, credential_used="2026-10-08T10:00:05", check_in="2026-10-08T10:00:20")
+    assert _enrollment(client, customer="cust-other").json() == {"status": "waiting"}
 
 
 def test_polling_is_rate_limited(client, db_path):
@@ -91,7 +107,7 @@ def test_polling_is_rate_limited(client, db_path):
 def test_claim_page_waits_for_readiness_and_selects_that_appliance(client, db_path):
     _seed(db_path)
     body = client.get("/customer/claim-appliance?return=setup", cookies={partner_portal.SESSION_COOKIE: _customer_cookie()}).text
-    assert "fetch('/api/portal/claims/enrollment?device_id='+encodeURIComponent(claimedDevice))" in body
+    assert "fetch('/api/portal/claims/enrollment?claim='+encodeURIComponent(claimedHandle))" in body
     assert "s.status==='ready'&&applianceId" in body
     assert "continueLink.href='/customer/setup?step=4&appliance='+encodeURIComponent(applianceId)" in body
     # Not ready in time: its status, never discovery.

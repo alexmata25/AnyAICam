@@ -143,11 +143,7 @@ def _windows_lock(path: Path):
     class Lock:
         def __enter__(self):
             self.stream = path.open("a+b")
-            self.stream.seek(0)
-            if self.stream.read(1) == b"":
-                self.stream.write(b"\0")
-                self.stream.flush()
-            self.stream.seek(0)
+            self.stream.seek(0)  # A byte past the end can be locked; reading a held one raises instead of waiting.
             msvcrt.locking(self.stream.fileno(), msvcrt.LK_LOCK, 1)
             return self
 

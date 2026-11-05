@@ -297,7 +297,7 @@ def test_ready_endpoint_responds_200_not_500(tmp_path):
     # instead of raising: 500 (an unhandled TypeError) is what the arity
     # bug actually produced.
     assert response.status_code in (200, 503)
-    assert response.json()["cameras_total"] == 0
+    assert set(response.json()) == {"ready", "self_test"}
 
 
 # =============================================================== downstream UI surfaces: no fake Camera 1-4 selectors

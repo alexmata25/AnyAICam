@@ -1,3 +1,4 @@
+from claim_id import display_cloud_id
 import csv
 import io
 import json
@@ -182,7 +183,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
 
     @app.get('/health/ready')
     def readiness():
-        status=deployment_status()
+        status={key:value for key,value in deployment_status().items() if key!='environment'}  # public; staff read it at deployment-verification
         if status['checks']['configuration']!='ok' or status['checks']['database']!='ok': raise HTTPException(status_code=503,detail=status)
         return status
 
@@ -477,7 +478,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
 
     @app.get('/api/admin/audit-export')
     def export_audit(request: Request,format: str='csv'):
-        identity=require_partner_access(request,{'administrator'}); records=rows('SELECT * FROM audit_logs ORDER BY created_at DESC')
+        identity=require_partner_access(request,{'administrator'}); records=[{**item,'actor_email':display_cloud_id(item['actor_email']) if item['actor_role']=='appliance' else item['actor_email']} for item in rows('SELECT * FROM audit_logs ORDER BY created_at DESC')]  # rows written before actors were masked
         audit(identity,'audit.exported','audit','all',{'format':format,'records':len(records)})
         if format=='json': return StreamingResponse(iter([json.dumps(records,indent=2)]),media_type='application/json',headers={'Content-Disposition':'attachment; filename=anyaicam-audit.json'})
         output=io.StringIO(); fields=['id','actor_email','actor_role','action','entity_type','entity_id','details_json','created_at']; writer=csv.DictWriter(output,fieldnames=fields); writer.writeheader(); writer.writerows([{key:item.get(key) for key in fields} for item in records]); return StreamingResponse(iter([output.getvalue()]),media_type='text/csv',headers={'Content-Disposition':'attachment; filename=anyaicam-audit.csv'})

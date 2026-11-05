@@ -73,7 +73,9 @@ class PortalClient:
     # printed on this unit's label, so the owner can claim it with that code;
     # omitted for a claim started from the appliance's own terminal.
     def claim_begin(self,device_id,device_secret,label_verifier=None,clear_label_verifier=False):
-        payload={'device_id':device_id,'device_secret':device_secret}
+        # long_code: this agent accepts a 60-bit code on every claim path. A cloud
+        # that predates it ignores the field and answers with 8 characters.
+        payload={'device_id':device_id,'device_secret':device_secret,'long_code':True}
         if label_verifier: payload['label_verifier']=label_verifier
         # Windows 1.3.1 (2026-10-08): the claim this appliance resumes stops
         # answering to its retired label code (only sent when true).

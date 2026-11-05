@@ -11,6 +11,7 @@ The panels render one data contract (Red's GET /api/customer/software-license; L
 """
 from __future__ import annotations
 
+from claim_id import cloud_id_label, display_cloud_id
 import re
 from datetime import datetime
 from html import escape
@@ -89,7 +90,7 @@ def _local_contract(customer_id: str, payload: dict | None) -> dict:
         version = reported_version(a.get("software_version"))
         status = str(a.get("activation_status") or "")
         appliances.append({
-            "appliance_id": a["id"], "cloud_id": a["cloud_id"], "name": a.get("site_name") or a["cloud_id"],
+            "appliance_id": a["id"], "cloud_id": display_cloud_id(a["cloud_id"]), "name": a.get("site_name") or display_cloud_id(a["cloud_id"]),
             "connection": "never" if not a.get("last_check_in") else ("online" if a.get("online_status") in ("online", "degraded") else "offline"),
             "last_check_in": a.get("last_check_in"), "installed_version": version, "version_reported_at": a.get("last_check_in") if version else None,
             "registration": "activated" if status == "activated" else ("deactivated" if status in ("deactivated", "revoked") else "claimed_pending"),
@@ -194,7 +195,7 @@ def appliances_panel(contract: dict) -> str:
         registration = {"activated": "Activated", "claimed_pending": "Waiting to finish activation", "deactivated": "Deactivated"}[item["registration"]]
         rows_html += (f'<div class="sl-appliance" data-cloud-id="{escape(item["cloud_id"], quote=True)}">'
                       f'<h3 style="margin:10px 0 4px">{escape(_appliance_title(item, index, len(items)))}'
-                      f'<br><small class="health-detail" style="font-weight:400">Cloud ID {escape(item["cloud_id"])}</small></h3>'
+                      f'<br><small class="health-detail" style="font-weight:400">{escape(cloud_id_label(item["cloud_id"]))}</small></h3>'
                       + _row("Connection", connection) + _row("Installed version", version_text) + _row("Registration", registration) + "</div>")
     return f'<section class="panel" style="margin-top:14px" id="sl-appliances"><h2>My registered appliances</h2>{rows_html}</section>'
 

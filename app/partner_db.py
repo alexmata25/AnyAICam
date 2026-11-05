@@ -1,3 +1,4 @@
+from claim_id import display_cloud_id
 import hashlib
 import hmac
 import json
@@ -469,7 +470,7 @@ def authorize_appliance_tenant(db, identity: dict, appliance_id: str) -> dict | 
 
 
 def audit(actor: dict,action: str,entity_type: str='',entity_id: str='',details=None) -> None:
-    with connection() as db: db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',(actor.get('email'),actor.get('role'),action,entity_type,entity_id,json.dumps(details or {}),datetime.now().isoformat()))
+    with connection() as db: db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',(display_cloud_id(actor.get('email')) if actor.get('role')=='appliance' else actor.get('email'),actor.get('role'),action,entity_type,entity_id,json.dumps(details or {}),datetime.now().isoformat()))
 
 
 def rows(query: str,params=()) -> list[dict]:

@@ -53,6 +53,8 @@ if ($upgrade) {
 Set-Content -Path (Join-Path $results 'report.txt') -Value @(
     "AnyAiCam Windows FUNCTIONAL scenario $run " + (Get-Date -Format o) + " on " + [Environment]::OSVersion.VersionString,
     "LABEL: SYNTHETIC-KEYSET / SIMULATED CAMERA -- not production-keyset acceptance, not physical-camera acceptance.")
+if ($settings.baseline_trust_seeded) { Add-Content (Join-Path $results 'report.txt') 'LABEL: BASELINE TRUST SEEDED IN SANDBOX -- not customer upgrade state.' }
+if ($upgrade) { Add-Content (Join-Path $results 'report.txt') 'LABEL: FIX-FORWARD RECOVERY ONLY -- no check here returns a PC to the earlier version. Actual rollback is NOT TESTED.' }
 $setup = Get-ChildItem 'C:\Validation\setup' -Filter 'AnyAiCam-VMS-Setup-*.exe' | Select-Object -First 1
 Check 'setup file present (SYNTHETIC-KEYSET build)' { if (-not $setup) { throw 'no setup' }; "$($setup.Name) $($setup.Length) bytes sha256=$((Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower())" }
 Check 'setup size is at most 750 MB (750000000 bytes)' {
@@ -90,6 +92,29 @@ Check 'install: /version is 1.2.7 with the full build commit' { $v = (Http '/ver
 $app = Join-Path $env:ProgramFiles 'AnyAiCam'
 $data = Join-Path $env:ProgramData 'AnyAiCam'
 $agentState = Join-Path $data 'agent'
+$keysetFile = Join-Path $data 'update\entitlement_signing_keys.json'
+# U134-F (1.3.4.1): the real 1.3.4 baseline trusts the production key only, and the test cloud signs with the synthetic
+# one. The baseline bytes stay untouched; only this disposable Sandbox's public keyset changes, with the installer's steps.
+if ($settings.baseline_trust_seeded) {
+    Check 'baseline trust: the real baseline holds another keyset before seeding (negative control)' {
+        $h = (Get-FileHash -LiteralPath $keysetFile -Algorithm SHA256).Hash.ToLower()
+        if ($h -eq $settings.expected_keyset_sha256) { throw 'the baseline already holds the synthetic keyset' }; "sha256 $h"
+    }
+    Check 'baseline trust: public synthetic keyset seeded with the installer''s owner and ACL steps; VMS healthy' {
+        $source = 'C:\Validation\scripts\baseline-seed-keyset.json'
+        if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLower() -ne $settings.expected_keyset_sha256) { throw 'seed keyset hash differs from the pin' }
+        Stop-Service AnyAiCamAgent, AnyAiCamVMS -Force
+        $temp = Join-Path (Split-Path $keysetFile) ('.seed.' + [guid]::NewGuid().ToString('N') + '.tmp')
+        [IO.File]::WriteAllBytes($temp, [IO.File]::ReadAllBytes($source))
+        Move-Item -LiteralPath $temp -Destination $keysetFile -Force
+        & icacls.exe $keysetFile /setowner '*S-1-5-32-544' /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { throw "icacls owner exit $LASTEXITCODE" }
+        & icacls.exe $keysetFile /reset /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { throw "icacls reset exit $LASTEXITCODE" }
+        Start-Service AnyAiCamVMS, AnyAiCamAgent
+        if (-not (WaitHealthy 180)) { throw 'not healthy after seeding' }
+        if ((Get-FileHash -LiteralPath $keysetFile -Algorithm SHA256).Hash.ToLower() -ne $settings.expected_keyset_sha256) { throw 'installed hash differs after seeding' }
+        'seeded; hash equals the pin; healthy'
+    }
+}
 # 1.3.4.1 (F-L on 46713ee): defined before the first check that uses it. PowerShell defines a script's functions only
 # when execution reaches them, so the LocalSystem and Job Object checks failed with "VmsProcess is not recognized".
 function VmsProcess {
@@ -482,6 +507,7 @@ function UpgradeState {
         capacity     = [string](Capacity)
         camera       = [string](@(EdgeSql "SELECT id, camera_number, onvif_endpoint FROM cameras WHERE id='$camId'")[0] | ConvertTo-Json -Compress)
         enrolled     = [string]@(EdgeSql "SELECT user_id FROM local_customer_credentials WHERE revoked_at IS NULL").Count
+        keyset       = (Get-FileHash -LiteralPath $keysetFile -Algorithm SHA256).Hash
     }
 }
 function ClipIds {
@@ -537,7 +563,7 @@ Check 'sign-in: a never-linked PC refuses customer sign-in (403, no session)' {
 # ---------------------------------------------------------------- linking: invalid, expired, used link codes
 . (Join-Path $app 'installer\open-claim-link.ps1')
 $ErrorActionPreference = 'Continue'
-function LinkCodeOf([string]$Link) { if ($Link -cmatch '#code=([0-9A-Z]{8})&link=windows$') { return $Matches[1] }; return '' }
+function LinkCodeOf([string]$Link) { if ($Link -cmatch '#code=([0-9A-Z]{8}|[0-9A-Z]{12})&link=windows(&|$)') { return $Matches[1] }; return '' }
 $linkCodes = New-Object System.Collections.Generic.List[string]
 $applianceId = [string](Get-Content -Raw (Join-Path $data 'config\appliance_identity.json') | ConvertFrom-Json).appliance_id
 Check 'linking: an invalid link code finds no computer' { if (-not (CloudFails POST '/api/portal/claims/lookup' @{ claim_code = 'ZZZZ2222' })) { throw 'lookup succeeded' }; 'refused' }
@@ -555,7 +581,7 @@ Check 'linking: after expiry the computer gives a fresh, different one-time link
     $b = WaitFor 120 { $x = Request-AccountLink $data 60; if ($x.status -eq 'ok' -and (LinkCodeOf $x.link) -ne $script:expiredCode) { $x } }
     if (-not $b) { throw 'no fresh link' }
     $script:code = LinkCodeOf $b.link; $script:linkCodes.Add($script:code)
-    if ((Cloud POST '/api/portal/claims/lookup' @{ claim_code = $script:code } -Owner).device_id -ne $applianceId) { throw 'new code finds another device' }
+    if ((Cloud POST '/api/portal/claims/lookup' @{ claim_code = $script:code } -Owner).claim_public_id -cne ($b.link -split '&claim=')[1]) { throw 'new code finds another device' }
     'new code finds this PC'
 }
 Check 'linking: the owner confirms the fresh link and the agent completes the claim' {
@@ -1015,17 +1041,17 @@ if ($upgrade -and $mode -eq 'local') {
     $rbState = UpgradeState; $rbMkv = (Mkv $camNo).Count; $rbClips = ClipIds
     $unins = Get-ChildItem $app -Filter 'unins*.exe' | Select-Object -First 1
     $rbU = Start-Process -FilePath $unins.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/LOG="' + (Join-Path $results 'setup-rollback-uninstall.log') + '"') -Wait -PassThru
-    Check 'rollback: uninstalling the new version (exit 0) keeps data, link credential and recordings' {
+    Check 'fix-forward: uninstalling the new version (exit 0) keeps data, link credential and recordings' {
         if ($rbU.ExitCode -ne 0) { throw "exit $($rbU.ExitCode)" }
         if (-not (Test-Path (Join-Path $agentState 'credential.json'))) { throw 'credential gone' }
         if ((Mkv $camNo).Count -lt $rbMkv) { throw 'recordings gone' }
         "exit 0; credential and $rbMkv recording file(s) kept"
     }
     $rbI = Start-Process -FilePath $previousSetup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
-        ('/LOG="' + (Join-Path $results 'setup-rollback-install.log') + '"') -Wait -PassThru
+        ('/LOG="' + (Join-Path $results 'setup-fix-forward-refused.log') + '"') -Wait -PassThru
     Check 'fix-forward: the previous setup is refused over the newer data folder and changes nothing' {
         if ($rbI.ExitCode -eq 0) { throw 'previous setup installed over the newer data folder' }
-        $text = [IO.File]::ReadAllText((Join-Path $results 'setup-rollback-install.log'))
+        $text = [IO.File]::ReadAllText((Join-Path $results 'setup-fix-forward-refused.log'))
         if ($text -notmatch 'Downgrade refused') { throw "exit $($rbI.ExitCode) without the downgrade refusal" }
         if (Test-Path $uninstallKey) { throw 'an uninstall entry appeared' }
         if (-not (Test-Path (Join-Path $agentState 'credential.json'))) { throw 'credential gone' }
@@ -1042,6 +1068,35 @@ if ($upgrade -and $mode -eq 'local') {
         foreach ($k in 'appliance_id', 'credential', 'secrets') { if ("$($now[$k])" -ne "$($rbState[$k])") { throw "$k changed" } }
         $ids = ClipIds; $missing = @($rbClips | Where-Object { $ids -notcontains $_ }); if ($missing) { throw "$($missing.Count) clip(s) missing" }
         "$(SetupVersionOf $setup) again; identity, link, secrets kept; $($ids.Count) clip(s) listed"
+    }
+    # R4 (1.3.4.1): a setup that fails after the services were removed, then fix-forward: run it again. Nothing here
+    # returns the PC to the earlier version.
+    # Same-version only: the baseline is already gone here. The forced step is the one validate-in-sandbox.ps1 uses.
+    $r4State = UpgradeState; $r4Clips = ClipIds
+    $r4Env = Join-Path $data 'config\vms.env'; $r4Backup = Join-Path $env:TEMP 'vms.env.r4-backup'
+    Copy-Item -LiteralPath $r4Env -Destination $r4Backup -Force
+    Remove-Item -LiteralPath $r4Env -Force
+    New-Item -ItemType Directory -Path $r4Env | Out-Null
+    $r4Fail = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+        ('/LOG="' + (Join-Path $results 'setup-failed-mid-install.log') + '"') -Wait -PassThru
+    Check 'failed setup: exit 20, no service left, data and link credential kept' {
+        if ($r4Fail.ExitCode -ne 20) { throw "exit $($r4Fail.ExitCode)" }
+        if (Get-Service AnyAiCamVMS, AnyAiCamAgent -ErrorAction SilentlyContinue) { throw 'a service is still installed' }
+        if (-not (Test-Path (Join-Path $agentState 'credential.json'))) { throw 'credential gone' }
+        'exit 20; services gone; credential kept'
+    }
+    Remove-Item -LiteralPath $r4Env -Force
+    Copy-Item -LiteralPath $r4Backup -Destination $r4Env -Force
+    & icacls.exe $r4Env /reset /C /Q | Out-Null
+    $r4Again = Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/PortalUrl=$TestPortal", "/ProductMode=$mode",
+        ('/LOG="' + (Join-Path $results 'setup-recovery-install.log') + '"') -Wait -PassThru
+    Check 'fix-forward: running the failed setup again recovers; identity, link, secrets and clips kept' {
+        if ($r4Again.ExitCode -ne 0) { throw "exit $($r4Again.ExitCode)" }
+        if (-not (WaitHealthy 240)) { throw 'not healthy' }
+        $now = UpgradeState
+        foreach ($k in 'appliance_id', 'credential', 'secrets', 'keyset') { if ("$($now[$k])" -ne "$($r4State[$k])") { throw "$k changed" } }
+        $ids = ClipIds; $missing = @($r4Clips | Where-Object { $ids -notcontains $_ }); if ($missing) { throw "$($missing.Count) clip(s) missing" }
+        "recovered; identity, link, secrets, keyset kept; $($ids.Count) clip(s) listed"
     }
 }
 [void](Cloud POST '/test/revoke-appliance' -Owner)

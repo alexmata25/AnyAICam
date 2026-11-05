@@ -149,6 +149,26 @@ if (Test-Path $manifest) {
         }
     }
 }
+# Real-world field run (proposal 2026-10-31): assets\field holds manifest.json, frames\, ground-truth.csv, field_probe.py,
+# containment.py, scoring.py and, for the comparison, lpr-13a845c.py. Frames, raw results and logs can hold plate text, so
+# they stay in this Sandbox's own private folder and die with it; only scoring.py's plate-free report comes back.
+$field = Join-Path $assets 'field'
+if (Test-Path (Join-Path $field 'manifest.json')) {
+    foreach ($variant in @(@{ Name = 'candidate'; Lpr = '' }, @{ Name = '13a845c'; Lpr = (Join-Path $field 'lpr-13a845c.py') })) {
+        Check "LPR field run: $($variant.Name)" {
+            $private = Join-Path $HOME 'anyaicam-blue\lpr-field-private'
+            $out = Join-Path $private "field-$($variant.Name).jsonl"
+            $arguments = @((Join-Path $field 'field_probe.py'), (Join-Path $field 'manifest.json'), (Join-Path $field 'frames'), $out)
+            if ($variant.Lpr) { $arguments += $variant.Lpr }
+            Push-Location (Join-Path $app 'app')
+            try { & $py @arguments 2>&1 | Out-Null } finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+            & $py (Join-Path $field 'scoring.py') (Join-Path $field 'ground-truth.csv') $out | Out-File -Encoding utf8 (Join-Path $results "field-$($variant.Name)-report.json")
+            if ($LASTEXITCODE -ne 0) { throw "scoring exit $LASTEXITCODE" }
+            "$((Get-Content $out | Measure-Object -Line).Lines) frames"
+        }
+    }
+}
 Check 'Code Integrity: nothing blocked under enforcement' {
     $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = 3033, 3076, 3077, 3089, 3091, 3092 } -ErrorAction SilentlyContinue)
     $ev | ForEach-Object { "{0:o}  {1}  {2}" -f $_.TimeCreated, $_.Id, ($_.Message -replace '\s+', ' ') } | Set-Content (Join-Path $results 'codeintegrity-events.txt')

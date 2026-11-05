@@ -52,6 +52,18 @@ the finish page's entries. In a fresh Sandbox, with a standard
    page says "This computer is linked". With the network cable out, the last
    page says to link later from the Start menu.
 
+## Upgrade from the accepted 1.3.4 baseline (1.3.4.1)
+
+**U134-P:** `make-wsb.ps1 -Setup <production 1.3.4.1> -Previous <1.3.4> -KeysetKind production ...` runs the
+non-functional validation over the real baseline. It proves install, identity, link and version. It does not prove
+licensed cameras or clips.
+
+**U134-F:** add `-Functional -KeysetKind synthetic-test -BaselineKeyset <public keyset>`. The baseline trusts only the
+production key, so its keyset is replaced by the setup under test's public synthetic keyset inside the Sandbox, after a
+negative control. Every report says `BASELINE TRUST SEEDED IN SANDBOX -- not customer upgrade state`. A Local run also
+covers the older-setup refusal, uninstall, reinstall over kept data, and recovery from a setup that failed after the
+services were removed (same version only).
+
 ## Functional scenarios F-L / F-H (2026-10-21, Blue) -- SYNTHETIC-KEYSET / SIMULATED CAMERA
 
 `make-wsb.ps1 -Functional -KeysetKind synthetic-test -SyntheticSigningKey <key> -ProductMode local|hybrid ...`

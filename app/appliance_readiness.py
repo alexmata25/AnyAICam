@@ -17,6 +17,7 @@ itself, so they compare as strings.
 """
 from __future__ import annotations
 
+from claim_id import is_device_cloud_id
 from partner_db import row, rows
 
 
@@ -90,6 +91,13 @@ def customer_has_activated_appliance(customer_id: str) -> bool:
     return any(appliance_activated(candidate) for candidate in candidates)
 
 
+def token_recovery_refusal(appliance: dict) -> str:
+    """What the customer is told when activation_token_recovery_allowed() says no."""
+    if appliance.get('activated_via') == 'claim' or is_device_cloud_id(appliance.get('cloud_id')):
+        return 'This appliance was linked with a claim and does not use activation tokens. If it has stopped connecting, contact support.'
+    return 'This appliance is already activated. A new activation token is not needed.'
+
+
 def activation_token_recovery_allowed(appliance: dict | None) -> bool:
     """A new one-time activation token (customer self-service recovery) only
     for an appliance that was never set up and is still in service: not
@@ -97,6 +105,11 @@ def activation_token_recovery_allowed(appliance: dict | None) -> bool:
     credential (a claimed appliance has one from claim/complete). Anything
     else would hand out a way to take the appliance over."""
     if not appliance:
+        return False
+    # A claimed appliance has no token path: a token's QR payload would have to
+    # carry its cloud_id, the device UUID. Nor can a Claim ID link it again: that
+    # proves nothing. One with a lost credential needs staff.
+    if appliance.get('activated_via') == 'claim' or is_device_cloud_id(appliance.get('cloud_id')):
         return False
     if str(appliance.get('activation_status') or '') in ('activated', 'released'):
         return False

@@ -35,7 +35,7 @@
 ## Verification
 
 - [ ] `/health` returns 200
-- [ ] `/version` reports expected environment and build
+- [ ] `/version` reports the expected version and build
 - [ ] `/ready` returns 200 after cloud requirements are configured
 - [ ] ALB health check uses `/health`
 - [ ] CloudWatch receives JSON logs

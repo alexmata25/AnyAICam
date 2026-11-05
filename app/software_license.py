@@ -29,6 +29,7 @@ claim, appliance identity, recording or subscription.
 """
 from __future__ import annotations
 
+from claim_id import display_cloud_id
 import re
 from datetime import datetime, timezone
 
@@ -162,7 +163,7 @@ def customer_appliances(customer_id: str) -> list[dict]:
     for item in found:
         site = str(item.get("site_name") or "").strip()
         result.append({
-            "appliance_id": item["id"], "cloud_id": item["cloud_id"],
+            "appliance_id": item["id"], "cloud_id": display_cloud_id(item["cloud_id"]),
             "name": f"AnyAiCam appliance · {site}" if site else "AnyAiCam appliance",
             "connection": connection_state(item, now=now), "last_check_in": item.get("last_check_in") or None,
             "installed_version": installed_version_of(item),

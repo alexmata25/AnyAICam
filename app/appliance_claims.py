@@ -96,6 +96,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from appliance_cloud import activation_limiter
 from appliance_protocol import RateLimiter, decrypt_claim_flow_secret, encrypt_claim_flow_secret
+from claim_attempts import attempt, give_back
+from claim_id import claim_id_for, display_cloud_id, normalize_claim_id
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
 from partner_portal import partner_identity
 
@@ -121,6 +123,33 @@ claim_status_limiter = RateLimiter(120, 60)
 claim_portal_limiter = RateLimiter(30, 60)
 # Polled by the claim page while the appliance finishes enrolling (every 3 s).
 claim_enrollment_limiter = RateLimiter(60, 60)
+# Wrong one-time codes (2026-10-31 proposal). Claim IDs are public, so nothing
+# keyed on the ID alone may block or retire a code: a stranger could then shut
+# the owner out. Limits fall on the account guessing, in the database
+# (claim_attempts.py), and cover code-only lookups, which reach the same codes.
+# Counts follow the customer, not an email or a user, so renaming a login or
+# adding one buys no attempts. Only code length bounds guessing across many
+# accounts without a shared block, so agents that ask get a 60-bit code and the
+# Claim ID path takes nothing shorter: 1% odds on one code then means about
+# 11 quadrillion guesses. Agents shipped before this asked for nothing and refuse
+# anything but 8 characters (headless_claim.CLAIM_CODE_PATTERN), so they keep
+# 32 bits on the code-only path until they update. Many accounts could share out
+# those guesses, so 32-bit guesses alone also spend one cloud-wide budget. It is
+# a block, but only on this path: labels, 60-bit codes and Claim IDs never touch
+# it. One short code always open takes 16 years at the full budget to reach 1% odds. Heavy
+# guessing raises audit events for support.
+CLAIM_CODE_ACCOUNT_ATTEMPTS = 20
+CLAIM_CODE_ACCOUNT_WINDOW_SECONDS = 3600
+CLAIM_CODE_ACCOUNT_DAY_ATTEMPTS = 50
+CLAIM_CODE_ACCOUNT_DAY_SECONDS = 86400
+CLAIM_CODE_CLOUD_ALERT_ATTEMPTS = 500
+SHORT_CODE_CLOUD_SCOPE = 'cloud:short-codes'
+SHORT_CODE_CLOUD_ATTEMPTS = 300
+CLAIM_ID_ACCOUNT_ATTEMPTS = 5
+CLAIM_ID_WINDOW_SECONDS = 900
+CLAIM_ID_ALERT_ATTEMPTS = 20
+# Checked when no claim is open, so the time taken doesn't reveal that one is.
+NO_CLAIM_CODE_HASH = password_hash(secrets.token_hex(16))
 
 CLAIM_SESSION_TTL_MINUTES = 15
 CLAIM_PROOF_TTL_MINUTES = 5
@@ -143,9 +172,11 @@ CREDENTIAL_RECOVERY_TTL_MINUTES = 15
 # activated it -- confirmed as a working end-to-end exploit during the
 # audit this hardening pass closes.
 #
-# installer/09-identity.sh is the ONLY place in this repository that
-# generates an appliance-local identifier intended for exactly this
-# purpose: `appliance_id="$(cat /proc/sys/kernel/random/uuid)"`. Per
+# installer/09-identity.sh and, on Windows, installer/windows/cloud-link.ps1
+# ([guid]::NewGuid()) are the ONLY places in this repository that generate
+# an appliance-local identifier intended for exactly this purpose:
+# `appliance_id="$(cat /proc/sys/kernel/random/uuid)"`. This pattern checks
+# the form, not the randomness: the cloud cannot tell a weak UUID. Per
 # the Linux kernel's own contract for that interface, this is always a
 # random (version 4) UUID in canonical lowercase form -- so requiring
 # a proper UUIDv4 here matches the only real identifier this
@@ -291,16 +322,119 @@ def _find_claim_by_label(label_code: str) -> dict | None:
     return None
 
 
-def _find_claim_for_portal(payload: dict) -> dict | None:
-    """A portal request names the appliance by its label code (label_code)
-    or by the code its own terminal showed (claim_code)."""
+def _account_of(identity: dict) -> str | None:
+    """The stable customer behind the session; None takes no attempts at all."""
+    customer_id = identity.get('customer_id')
+    return str(customer_id) if customer_id else None
+
+
+def _take_code_attempt(account: str | None) -> bool:
+    if not account:
+        return False
+    moment = _now().timestamp()
+    return (attempt(f'account:{account}', CLAIM_CODE_ACCOUNT_WINDOW_SECONDS, moment) <= CLAIM_CODE_ACCOUNT_ATTEMPTS
+            and attempt(f'day:{account}', CLAIM_CODE_ACCOUNT_DAY_SECONDS, moment) <= CLAIM_CODE_ACCOUNT_DAY_ATTEMPTS)
+
+
+def _take_short_code_budget(identity: dict) -> bool:
+    """The one budget all accounts share for 32-bit guesses. Blocks only this
+    path, so a guesser can stop short-code linking for an hour and no more."""
+    used = attempt(SHORT_CODE_CLOUD_SCOPE, CLAIM_CODE_ACCOUNT_WINDOW_SECONDS, _now().timestamp())
+    if used == SHORT_CODE_CLOUD_ATTEMPTS + 1:
+        audit(identity, 'appliance_claim.short_code_budget_spent', 'appliance_claim', 'all')
+        logger.warning('Short claim code guesses reached the cloud-wide limit')
+    return used <= SHORT_CODE_CLOUD_ATTEMPTS
+
+
+def _return_code_attempt(account: str) -> None:
+    give_back(f'account:{account}')
+    give_back(f'day:{account}')
+
+
+def _note_wrong_code(identity: dict) -> None:
+    """Alerts only: a block here would let one guesser stop every customer."""
+    if attempt('cloud:wrong-codes', CLAIM_CODE_ACCOUNT_WINDOW_SECONDS, _now().timestamp()) == CLAIM_CODE_CLOUD_ALERT_ATTEMPTS:
+        audit(identity, 'appliance_claim.cloud_code_guessing', 'appliance_claim', 'all')
+        logger.warning('Wrong claim codes reached the cloud-wide alert level')
+
+
+def _find_claim_by_claim_id(claim_id: str, claim_code: str, identity: dict) -> dict | None:
+    """The pending claim of this Claim ID, only with its one-time code. Every
+    refusal looks the same to the caller: the ID never confirms that a PC
+    exists, is linked or has a claim open."""
+    normalized = normalize_claim_id(claim_id)
+    claim_code = normalize_label_code(claim_code)  # the same 12-character form, so a typed O or dash still works
+    if not normalized or not claim_code:
+        return None
+    account = _account_of(identity)
+    pair = f'pair:{account}:{normalized}'
+    if not _take_code_attempt(account) or attempt(pair, CLAIM_ID_WINDOW_SECONDS, _now().timestamp()) > CLAIM_ID_ACCOUNT_ATTEMPTS:
+        return None
+    claim = row("SELECT * FROM appliance_claims WHERE claim_public_id=? AND status='pending' AND expires_at>?",
+                (normalized, _now().isoformat()))
+    matched = verify_password(claim_code, claim['claim_code_hash'] if claim else NO_CLAIM_CODE_HASH)
+    if claim and matched:
+        _return_code_attempt(account)
+        give_back(pair)
+        return claim
+    _note_wrong_code(identity)
+    if claim and attempt(f'id:{normalized}', CLAIM_ID_WINDOW_SECONDS, _now().timestamp()) == CLAIM_ID_ALERT_ATTEMPTS:
+        audit(identity, 'appliance_claim.code_guessing', 'appliance_claim', claim['id'])
+        logger.warning('Repeated wrong codes for claim_id=%s', claim['id'])
+    return None
+
+
+def _find_claim_by_typed_code(text: str, identity: dict) -> dict | None:
+    """The code an appliance showed, with no Claim ID. Only a 60-bit code skips
+    the shared budget; any other text can only be a guess at a 32-bit code."""
+    long_code = normalize_label_code(text)
+    account = _account_of(identity)
+    if not text or not _take_code_attempt(account):
+        return None
+    if not long_code and not _take_short_code_budget(identity):
+        return None
+    claim = _find_claim_by_code(long_code or text)
+    if claim:
+        _return_code_attempt(account)
+        if not long_code:
+            give_back(SHORT_CODE_CLOUD_SCOPE)
+    else:
+        _note_wrong_code(identity)
+    return claim
+
+
+def _find_claim_for_portal(payload: dict, identity: dict) -> dict | None:
+    """A portal request names the appliance by its label code (label_code),
+    by its Claim ID with the one-time code (claim_id, claim_code), or by the
+    code its own terminal showed (claim_code)."""
+    if str(payload.get('claim_id', '') or '').strip():
+        return _find_claim_by_claim_id(str(payload['claim_id']), str(payload.get('claim_code', '')).strip().upper(), identity)
     if str(payload.get('label_code', '') or '').strip():
-        return _find_claim_by_label(str(payload['label_code']))
-    claim_code = str(payload.get('claim_code', '')).strip()
-    return _find_claim_by_code(claim_code) if claim_code else None
+        # The page can't tell a label from a typed 12-character claim code.
+        label_code = str(payload['label_code'])
+        claim = _find_claim_by_label(label_code)
+        if claim:
+            return {**claim, 'matched_label': True}
+        return _find_claim_by_typed_code(label_code, identity) if normalize_label_code(label_code) else None
+    return _find_claim_by_typed_code(str(payload.get('claim_code', '')).strip(), identity)
 
 
-def _generate_claim_code() -> str:
+CLAIM_HANDLE_PATTERN = re.compile(r'^[0-9a-f]{32}$')
+
+
+def _browser_view(claim: dict) -> dict:
+    """What a browser may hold about a claim. Never the device UUID: claim/begin
+    accepts any unclaimed UUID, so it must not reach pages, URLs or browser
+    logs. The handle is the claim's random row id and proves nothing alone."""
+    return {'claim_handle': claim['id'], 'claim_public_id': claim['claim_public_id']}
+
+
+def _generate_claim_code(long_code: bool = False) -> str:
+    # long_code: 12 Crockford characters, 60 bits, like a label code. Current
+    # agents always ask. The cloud can't tell an older agent from its request,
+    # and those refuse anything but 8, so it never upgrades one unasked.
+    if long_code:
+        return ''.join(secrets.choice(LABEL_ALPHABET) for _ in range(LABEL_LENGTH))
     # 8 uppercase hex characters (32 bits) -- short enough to type from
     # a small display, long enough combined with claim_begin_limiter's
     # rate limit and the 15-minute expiry that brute-forcing a specific
@@ -491,7 +625,7 @@ def record_claim_activation(appliance_id: str, *, background: bool = False) -> b
         if changed == 1:
             db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) '
                        'VALUES(?,?,?,?,?,?,?)',
-                       (appliance['cloud_id'], 'appliance', 'appliance.activated', 'appliance', appliance_id,
+                       (display_cloud_id(appliance['cloud_id']), 'appliance', 'appliance.activated', 'appliance', appliance_id,
                         json.dumps({'via': 'claim', 'customer_id': appliance['customer_id']}), now))
     if changed != 1:
         return False
@@ -562,11 +696,14 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         device_secret = _device_secret(payload)
         verifier = _label_verifier_from(payload)
         clear_label = _clear_label_requested(payload)
+        long_code = payload.get('long_code') is True
         if clear_label and verifier:
             raise HTTPException(status_code=400, detail='label_verifier and clear_label_verifier cannot be combined.')
         existing_appliance = row('SELECT id FROM appliances WHERE cloud_id=?', (device_id.upper(),))
         if existing_appliance:
-            raise HTTPException(status_code=409, detail='This device is already provisioned. Use the existing activation flow.')
+            # Agents match "already provisioned". Possession of the UUID proves
+            # nothing, so a device that lost its credential goes through staff.
+            raise HTTPException(status_code=409, detail='This device is already provisioned. If it can no longer connect, contact support.')
         resumable = _find_pending_claim_for_device(device_id)
         if resumable:
             # Only the appliance that opened this claim may resume it: a
@@ -578,10 +715,12 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             # one was gone -- a closed terminal, a reboot -- the customer had
             # nothing to enter and a new claim was refused until this one
             # expired. The previous code stops working; same expiry.
-            claim_code = _generate_claim_code()
+            claim_code = _generate_claim_code(long_code)
             with connection() as db:
                 db.execute("UPDATE appliance_claims SET claim_code_hash=? WHERE id=? AND status='pending'",
                            (password_hash(claim_code), resumable['id']))
+                db.execute("UPDATE appliance_claims SET claim_public_id=? WHERE id=? AND status='pending'",
+                           (claim_id_for(device_id), resumable['id']))
                 if verifier:
                     db.execute("UPDATE appliance_claims SET label_verifier_hash=? WHERE id=? AND status='pending'",
                                (password_hash(verifier), resumable['id']))
@@ -592,7 +731,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                     # it expires.
                     db.execute("UPDATE appliance_claims SET label_verifier_hash=NULL WHERE id=? AND status='pending'",
                                (resumable['id'],))
-            logger.info('Claim session resumed with a new code claim_id=%s%s', resumable['id'],
+            logger.info('Claim session resumed with a new code claim_id=%s short_code=%s%s', resumable['id'], not long_code,
                         ' (label verifier cleared)' if clear_label else '')
             answer = {
                 'claim_session_id': resumable['claim_session_id'],
@@ -607,17 +746,17 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             return answer
         claim_id = secrets.token_hex(16)
         claim_session_id = secrets.token_urlsafe(24)
-        claim_code = _generate_claim_code()
+        claim_code = _generate_claim_code(long_code)
         now = _now()
         expires_at = (now + timedelta(minutes=CLAIM_SESSION_TTL_MINUTES)).isoformat()
         with connection() as db:
             db.execute(
-                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash,label_verifier_hash) VALUES(?,?,?,?,?,?,?,?,?)',
+                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash,label_verifier_hash,claim_public_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
                 (claim_id, device_id, claim_session_id, password_hash(claim_code), 'pending', expires_at, now.isoformat(), password_hash(device_secret),
-                 password_hash(verifier) if verifier else None),
+                 password_hash(verifier) if verifier else None, claim_id_for(device_id)),
             )
         # Never log the session id: it is a bearer value for this claim.
-        logger.info('Claim session opened claim_id=%s', claim_id)
+        logger.info('Claim session opened claim_id=%s short_code=%s', claim_id, not long_code)
         answer = {
             'claim_session_id': claim_session_id,
             'claim_code': claim_code,
@@ -682,15 +821,15 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
     def portal_claim_lookup(request: Request, payload: dict) -> dict:
         identity = _customer_owner(request)
         _require_self_link_permission(identity)
-        if not claim_portal_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
+        if not claim_portal_limiter.allow(str(_account_of(identity))):
             raise HTTPException(status_code=429, detail='Claim lookup rate exceeded.')
-        claim = _find_claim_for_portal(payload)
+        claim = _find_claim_for_portal(payload, identity)
         if not claim:
             raise HTTPException(status_code=404, detail='Claim code not found or expired.')
-        return {'device_id': claim['device_id'], 'expires_at': claim['expires_at']}
+        return {**_browser_view(claim), 'expires_at': claim['expires_at']}
 
     @app.get('/api/portal/claims/enrollment')
-    def portal_claim_enrollment(request: Request, device_id: str = '') -> dict:
+    def portal_claim_enrollment(request: Request, claim: str = '') -> dict:
         """Has the appliance just claimed by this customer really enrolled?
         (2026-10-08) 'ready' only once THAT appliance has authenticated with
         its own credential and sent a heartbeat (appliance_readiness.py) --
@@ -701,10 +840,10 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         _require_self_link_permission(identity)
         if not claim_enrollment_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
             raise HTTPException(status_code=429, detail='Too many checks; slow down.')
-        device_id = str(device_id or '').strip()
-        if not _valid_device_id(device_id):
-            raise HTTPException(status_code=400, detail='device_id must be a valid UUIDv4.')
-        appliance = row('SELECT id,customer_id FROM appliances WHERE cloud_id=?', (_normalize_device_id(device_id).upper(),))
+        if not CLAIM_HANDLE_PATTERN.match(str(claim or '')):
+            raise HTTPException(status_code=400, detail='claim is required.')
+        own_claim = row('SELECT device_id FROM appliance_claims WHERE id=? AND customer_id=?', (claim, identity['customer_id']))
+        appliance = row('SELECT id,customer_id FROM appliances WHERE cloud_id=?', (own_claim['device_id'].upper(),)) if own_claim else None
         if not appliance or appliance['customer_id'] != identity['customer_id']:
             return {'status': 'waiting'}
         from appliance_readiness import enrollment_ready
@@ -714,14 +853,14 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
     def portal_claim_confirm(request: Request, payload: dict) -> dict:
         identity = _customer_owner(request)
         _require_self_link_permission(identity)
-        if not claim_portal_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
+        if not claim_portal_limiter.allow(str(_account_of(identity))):
             raise HTTPException(status_code=429, detail='Claim confirmation rate exceeded.')
         site_id = str(payload.get('site_id', '')).strip()
         if not str(payload.get('claim_code', '') or '').strip() and not str(payload.get('label_code', '') or '').strip():
             raise HTTPException(status_code=400, detail='claim_code or label_code is required.')
         if not site_id:
             raise HTTPException(status_code=400, detail='site_id is required.')
-        claim = _find_claim_for_portal(payload)
+        claim = _find_claim_for_portal(payload, identity)
         if not claim:
             raise HTTPException(status_code=404, detail='Claim code not found or expired.')
         site = row('SELECT id FROM sites WHERE id=? AND customer_id=?', (site_id, identity['customer_id']))
@@ -744,7 +883,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         # to the claim -- a label verifier cleared (Windows 1.3.1) or a claim
         # code replaced (a resumed claim) between the lookup above and this
         # update must not let the old code through.
-        matched_column = 'label_verifier_hash' if str(payload.get('label_code', '') or '').strip() else 'claim_code_hash'
+        matched_column = 'label_verifier_hash' if claim.get('matched_label') else 'claim_code_hash'
         with connection() as db:
             changed = db.execute(
                 "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_encrypted=?,proof_expires_at=? "
@@ -773,7 +912,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         # bounded.
         audit(identity, 'appliance_claim.confirmed', 'appliance_claim', claim['id'])
         logger.info('Claim confirmed claim_id=%s customer_id=%s site_id=%s', claim['id'], identity['customer_id'], site_id)
-        return {'status': 'claimed', 'device_id': claim['device_id']}
+        return {'status': 'claimed', **_browser_view(claim)}
 
     @app.post('/api/appliance/claim/complete')
     def claim_complete(request: Request, payload: dict) -> dict:
@@ -895,8 +1034,8 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 )
             except ActivationConflict as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
-        audit({'email': cloud_id, 'role': 'appliance'}, 'appliance_claim.completed', 'appliance', appliance_id)
-        logger.info('Claim completed appliance_id=%s cloud_id=%s', appliance_id, cloud_id)
+        audit({'email': display_cloud_id(cloud_id), 'role': 'appliance'}, 'appliance_claim.completed', 'appliance', appliance_id)
+        logger.info('Claim completed appliance_id=%s', appliance_id)
         return {
             'appliance_id': appliance_id,
             'cloud_id': cloud_id,
@@ -951,6 +1090,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         <section class="panel">
           <div id="claim-step-code">
             <p>Enter the claim code your appliance shows while it waits to be linked: on its screen during setup, the claim code printed on its label (or scan the label's QR code with your phone), or, on a PC still running the older AnyAiCam for Windows 1.3.0, Start menu &gt; AnyAiCam &gt; Show AnyAiCam claim code. The current Windows setup needs no code: it opens this site for you to confirm. A new appliance can take a few minutes to start after it is plugged into power and your network.</p>
+            <label>Claim ID (shown on the computer)<input id="claim-id-input" maxlength="24" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="CID-XXXX-XXXX-XXXX-XXXX"></label>
             <label>Claim code<input id="claim-code-input" maxlength="20" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="Claim code"></label>
             <button class="action-button" id="claim-lookup-button">Look up</button>
             <p id="claim-lookup-message" class="health-detail"></p>
@@ -968,10 +1108,12 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           </div>
         </section>'''
         scripts = '''<script>
-        // A label code is 12 characters (dashes/spaces ignored); the code an
-        // appliance's own terminal shows is 8. Sent in the POST body only.
+        // 12 characters (dashes/spaces ignored) is a label or a current claim
+        // code; an older appliance's terminal shows 8. Sent in the POST body only.
         function claimBody(){
-          if(linkCode)return {claim_code:linkCode};
+          if(linkCode)return linkClaimId?{claim_id:linkClaimId,claim_code:linkCode}:{claim_code:linkCode};
+          const typedId=document.getElementById('claim-id-input').value.trim().toUpperCase();
+          if(typedId)return {claim_id:typedId,claim_code:document.getElementById('claim-code-input').value.trim().toUpperCase()};
           const raw=document.getElementById('claim-code-input').value.trim().toUpperCase(),compact=raw.replace(/[\\s-]/g,'');
           return compact.length===12?{label_code:compact}:{claim_code:raw};
         }
@@ -982,16 +1124,19 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         // The code stays in this variable -- never shown on the page -- and the
         // appliance is looked up at once; the owner only chooses the site and
         // confirms.
-        let linkCode='',claimedDevice='',linkSource='';
+        let linkCode='',claimedHandle='',linkSource='',linkClaimId='';
+        try{linkClaimId=sessionStorage.getItem('anyaicam.claimId')||'';sessionStorage.removeItem('anyaicam.claimId')}catch(e){}
+        if(!/^CID(-[0-9A-Z]{4}){4}$/.test(linkClaimId))linkClaimId='';
         try{linkCode=sessionStorage.getItem('anyaicam.claimCode')||'';sessionStorage.removeItem('anyaicam.claimCode')}catch(e){}
         // Windows (2026-10-08): the same link mode from the Windows setup or
         // its Start menu entry (/claim#code=...&link=windows); only the words
         // differ -- a PC, not an appliance with a setup page.
         try{linkSource=sessionStorage.getItem('anyaicam.claimLinkSource')||'';sessionStorage.removeItem('anyaicam.claimLinkSource')}catch(e){}
-        if(!/^[0-9A-Z]{8}$/.test(linkCode))linkCode='';
+        if(!/^([0-9A-Z]{8}|[0-9A-Z]{12})$/.test(linkCode))linkCode='';
         const fromWindows=Boolean(linkCode)&&linkSource==='windows';
         if(linkCode){
           document.getElementById('claim-code-input').closest('label').hidden=true;
+          document.getElementById('claim-id-input').closest('label').hidden=true;
           document.getElementById('claim-lookup-button').hidden=true;
           document.getElementById('claim-lookup-message').textContent=fromWindows?'Finding your computer…':'Finding your appliance…';
         }
@@ -999,13 +1144,13 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
           const message=document.getElementById('claim-lookup-message');
           message.textContent='';
           const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(claimBody())}),body=await response.json();
-          if(!response.ok&&linkCode){linkCode='';document.getElementById('claim-code-input').closest('label').hidden=false;document.getElementById('claim-lookup-button').hidden=false;message.textContent=fromWindows?'This link has expired or was already used. On the computer, choose Start menu → AnyAiCam → Link this computer to AnyAiCam again.':'This link has expired or was already used. On the appliance, open AnyAiCam Setup and choose “Link this appliance” again.';return}
+          if(!response.ok&&linkCode){linkCode='';document.getElementById('claim-code-input').closest('label').hidden=false;document.getElementById('claim-id-input').closest('label').hidden=false;document.getElementById('claim-id-input').value=linkClaimId;document.getElementById('claim-lookup-button').hidden=false;message.textContent=fromWindows?'This link has expired or was already used. On the computer, choose Start menu → AnyAiCam → Link this computer to AnyAiCam again.':'This link has expired or was already used. On the appliance, open AnyAiCam Setup and choose “Link this appliance” again.';return}
           if(!response.ok){message.textContent=response.status===404?'No appliance is waiting with that code. Check the code, and that the appliance is plugged into power and your network (it can take a few minutes to start).':(body.detail||'Claim code not found or expired.');return}
-          claimedDevice=String(body.device_id||'');
+          claimedHandle=String(body.claim_handle||'');
           // A link can be sent by anyone: confirm only one's own appliance.
           if(linkCode)document.getElementById('claim-confirm-message').textContent=fromWindows?'Only confirm if you just chose to link your own computer to AnyAiCam (at the end of its AnyAiCam setup, or Start menu → AnyAiCam → Link this computer to AnyAiCam).':'Only confirm if you just chose “Link this appliance” on your own AnyAiCam appliance.';
           // A readable name, not the raw device UUID (2026-10-02).
-          document.getElementById('claim-device-id').textContent=(fromWindows?'Your Windows computer (ID ending ':'AnyAiCam appliance (ID ending ')+String(body.device_id||'').replace(/-/g,'').slice(-6).toUpperCase()+')';
+          document.getElementById('claim-device-id').textContent=(fromWindows?'Your Windows computer (ID ending ':'AnyAiCam appliance (ID ending ')+String(body.claim_public_id||'').replace(/-/g,'').slice(-6)+')';
           document.getElementById('claim-step-code').hidden=true;
           document.getElementById('claim-step-confirm').hidden=false;
         };
@@ -1032,11 +1177,11 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         // (/api/portal/claims/enrollment), not when the claim is confirmed.
         async function waitForAppliance(){
           const continueLink=document.getElementById('claim-done-continue'),note=document.getElementById('claim-done-message');
-          if(!claimedDevice||!continueLink.getAttribute('href').startsWith('/customer/setup'))return;
+          if(!claimedHandle||!continueLink.getAttribute('href').startsWith('/customer/setup'))return;
           continueLink.hidden=true;note.textContent='Claim confirmed. Waiting for the appliance to finish linking…';
           let applianceId='';
           for(let i=0;i<60;i++){
-            try{const r=await fetch('/api/portal/claims/enrollment?device_id='+encodeURIComponent(claimedDevice));if(r.ok){const s=await r.json();
+            try{const r=await fetch('/api/portal/claims/enrollment?claim='+encodeURIComponent(claimedHandle));if(r.ok){const s=await r.json();
               if(s.appliance_id)applianceId=String(s.appliance_id);
               if(s.status==='ready'&&applianceId){note.textContent='Your appliance is linked. Next: discover your cameras.';continueLink.href='/customer/setup?step=4&appliance='+encodeURIComponent(applianceId);continueLink.textContent='Discover cameras';continueLink.hidden=false;return}}}catch(e){}
             await new Promise(done=>setTimeout(done,3000));
@@ -1066,10 +1211,12 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
   var match=/(?:^|[#&])label=([0-9A-Za-z -]{12,20})(?:&|$)/.exec(hash);
   if(match){try{sessionStorage.setItem('anyaicam.claimLabel',decodeURIComponent(match[1]).toUpperCase())}catch(e){}}
   // From the appliance's own "AnyAiCam Setup" page (zero-terminal onboarding).
-  var linked=/(?:^|[#&])code=([0-9A-Za-z]{8})(?:&|$)/.exec(hash);
+  var linked=/(?:^|[#&])code=([0-9A-Za-z]{8}|[0-9A-Za-z]{12})(?:&|$)/.exec(hash);
   if(linked){try{sessionStorage.setItem('anyaicam.claimCode',linked[1].toUpperCase())}catch(e){}}
   // From the Windows setup or its Start menu entry (2026-10-08).
   if(linked&&/(?:^|[#&])link=windows(?:&|$)/.test(hash)){try{sessionStorage.setItem('anyaicam.claimLinkSource','windows')}catch(e){}}
+  var claimId=/(?:^|[#&])claim=(CID(?:-[0-9A-Z]{4}){4})(?:&|$)/.exec(hash);
+  if(linked&&claimId){try{sessionStorage.setItem('anyaicam.claimId',claimId[1])}catch(e){}}
   try{history.replaceState(null,'',location.pathname)}catch(e){}
   location.replace('/customer/claim-appliance?return=setup');
 })();

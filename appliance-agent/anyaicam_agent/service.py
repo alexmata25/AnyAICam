@@ -10,6 +10,7 @@ import urllib.request
 import uuid
 
 from .commands import execute
+from .claim_id import display_cloud_id,mask_device_path
 from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
                              LocalVmsStatusReader,atomic_write_json,
                              auto_bind_discovered_cameras,
@@ -300,7 +301,7 @@ class ApplianceAgent:
         except (OSError,json.JSONDecodeError): return []
     def send_or_queue(self,path,payload,item_id=None):
         try: self.client.request('POST',path,payload); return True
-        except PortalError as error: self.queue.put(item_id or str(uuid.uuid4()),'POST',path,sanitize(payload)); self.log.warning('Queued offline update path=%s error=%s',path,error); return False
+        except PortalError as error: self.queue.put(item_id or str(uuid.uuid4()),'POST',path,sanitize(payload)); self.log.warning('Queued offline update path=%s error=%s',mask_device_path(path),mask_device_path(str(error))); return False
     def flush(self):
         for item in self.queue.ready():
             try: self.client.request(item['method'],item['path'],json.loads(item['payload_json'])); self.queue.success(item['id'])
@@ -604,7 +605,7 @@ class ApplianceAgent:
             credential=load_credential(self.config)
             if credential and credential.get('credential'):
                 self.client.appliance_id=credential.get('appliance_id'); self.client.credential=credential.get('credential')
-                self.log.info('Appliance activation detected; resuming normal operation cloud_id=%s',self.config.cloud_id)
+                self.log.info('Appliance activation detected; resuming normal operation cloud_id=%s',display_cloud_id(self.config.cloud_id))
                 return
             if headless is None and time.monotonic()>=next_recheck:
                 next_recheck=time.monotonic()+HEADLESS_RECHECK_SECONDS
@@ -664,7 +665,7 @@ class ApplianceAgent:
         if self.stop_event.is_set():
             self.log.info('AnyAiCam appliance agent stopped (still waiting for activation)')
             return
-        self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',self.config.cloud_id,self.config.mode)
+        self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',display_cloud_id(self.config.cloud_id),self.config.mode)
         self.resolve_update_state()
         while not self.stop_event.is_set():
             try: self.cycle()

@@ -134,7 +134,7 @@ def test_fix_forward_runs_only_in_the_local_upgrade_scenario_before_the_revocati
     start = SCRIPT.index("if ($upgrade -and $mode -eq 'local') {")
     assert start < SCRIPT.index("[void](Cloud POST '/test/revoke-appliance' -Owner)")
     block = SCRIPT[start:SCRIPT.index("[void](Cloud POST '/test/revoke-appliance' -Owner)")]
-    assert "rollback: uninstalling the new version" in block
+    assert "fix-forward: uninstalling the new version" in block
     assert "fix-forward: the previous setup is refused over the newer data folder and changes nothing" in block
     assert "if ($rbI.ExitCode -eq 0) { throw 'previous setup installed over the newer data folder' }" in block
     assert "fix-forward: the setup under test installs again (exit 0)" in block

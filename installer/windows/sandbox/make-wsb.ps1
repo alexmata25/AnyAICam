@@ -15,6 +15,9 @@
 # camera, live view, recording, playback, motion, analytics, offline, Local<->Hybrid, link expiry/revocation).
 # SYNTHETIC-KEYSET / SIMULATED CAMERA only: refused for a production-keyset run and with -Previous/-SimulatePrevious.
 # Without -Functional the folder is exactly what it was before (validate-in-sandbox.ps1).
+# -BaselineKeyset (1.3.4.1, U134-F): the setup under test's PUBLIC synthetic keyset, seeded over the real production
+# baseline inside the disposable Sandbox, so a signed-capacity upgrade can run on the accepted baseline bytes. It must
+# hash to -ExpectedKeysetSha256 and carry no private material. Functional synthetic-test upgrades only.
 # -ProductMode local|hybrid is the /ProductMode the run installs with. -Previous must be an OLDER version than -Setup
 # (a downgrade, e.g. from Windows 1.3.x, is refused here).
 param(
@@ -29,6 +32,7 @@ param(
     # (unsigned) setup, for Smart App Control machines.
     [switch]$SimulatePrevious,
     [switch]$Functional,
+    [string]$BaselineKeyset = '',
     # 1.3.4.1: turn Smart App Control ON inside the Sandbox before the run (enforce-sac.ps1); it starts in evaluation mode.
     [switch]$EnforceSmartAppControl
 )
@@ -44,6 +48,11 @@ if ($KeysetKind -eq 'synthetic-test') {
 if ($Functional -and $KeysetKind -ne 'synthetic-test') { throw 'A functional run uses the synthetic-test build only (SYNTHETIC-KEYSET / SIMULATED CAMERA).' }
 # 1.3.4.1 acceptance: allow four-part setup versions and require the accepted, pinned, signed 1.3.4 setup as the upgrade baseline.
 if ($Functional -and $SimulatePrevious) { throw 'A functional run never plants simulated 1.3.0 leftovers: use -Previous with a real earlier setup.' }
+if ($BaselineKeyset) {
+    if (-not $Functional -or -not $Previous) { throw '-BaselineKeyset is for a functional upgrade run with -Previous.' }
+    if ((Get-FileHash -LiteralPath $BaselineKeyset -Algorithm SHA256).Hash.ToLower() -ne $ExpectedKeysetSha256) { throw '-BaselineKeyset does not match -ExpectedKeysetSha256.' }
+    if ((Get-Content -Raw -LiteralPath $BaselineKeyset) -match 'PRIVATE|BEGIN|OPENSSH|private_key') { throw '-BaselineKeyset carries private key material.' }
+}
 $root = New-Item -ItemType Directory -Path $Folder
 foreach ($sub in 'setup', 'results', 'scripts', 'previous') { New-Item -ItemType Directory -Path (Join-Path $root.FullName $sub) | Out-Null }
 Copy-Item -LiteralPath $setupFile.FullName -Destination (Join-Path $root.FullName 'setup')
@@ -81,6 +90,7 @@ if ($Functional) { foreach ($f in 'functional-in-sandbox.ps1', 'edge-http.py', '
 $runSettings = [ordered]@{ product_mode = $ProductMode; keyset_kind = $KeysetKind; expected_keyset_sha256 = $ExpectedKeysetSha256 }
 if ($EnforceSmartAppControl) { $runSettings.enforce_smart_app_control = $true; Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'enforce-sac.ps1') -Destination (Join-Path $root.FullName 'scripts') }
 if ($Functional) { $runSettings.functional = $true; if ($Previous) { $runSettings.functional_upgrade = $true } }
+if ($BaselineKeyset) { $runSettings.baseline_trust_seeded = $true; Copy-Item -LiteralPath $BaselineKeyset -Destination (Join-Path $root.FullName 'scripts\baseline-seed-keyset.json') }
 $runSettings |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root.FullName 'scripts\acceptance.json') -Encoding ASCII
 $escape = { param($s) [Security.SecurityElement]::Escape($s) }

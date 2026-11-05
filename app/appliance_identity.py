@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import secrets
+from claim_id import display_cloud_id
 from datetime import datetime, timedelta
 
 logger = logging.getLogger("anyaicam.identity")
@@ -646,7 +647,7 @@ def build_manifest(db, *, cloud_id: str, ttl_minutes: int = 60) -> dict:
     doesn't exist."""
     appliance = _appliance_scope(db, cloud_id=cloud_id)
     if not appliance:
-        raise ValueError(f"No activated appliance with cloud_id={cloud_id!r}.")
+        raise ValueError(f"No activated appliance with cloud_id={display_cloud_id(cloud_id)!r}.")
     identities = _load_identities_for_appliance(db, appliance=appliance)
     now = datetime.now()
     body = {
@@ -692,7 +693,7 @@ def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_i
 
     appliance = _appliance_scope(db, cloud_id=cloud_id)
     if not appliance:
-        raise ValueError(f"No activated appliance with cloud_id={cloud_id!r}.")
+        raise ValueError(f"No activated appliance with cloud_id={display_cloud_id(cloud_id)!r}.")
     user = db.execute(
         "SELECT id,email,role,password_hash,approved,account_status,authorization_version FROM partner_users WHERE lower(email)=?",
         (email.strip().lower(),),

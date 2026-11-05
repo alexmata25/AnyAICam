@@ -44,6 +44,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from claim_id import display_cloud_id
 import runtime_paths
 
 ACTIVATION_IDENTITY_FILE = Path(os.getenv("ANYAICAM_APPLIANCE_IDENTITY_FILE", runtime_paths.recordings_default("appliance_identity.json")))
@@ -163,8 +164,8 @@ def persist_activation(*, appliance_id: str, cloud_id: str, credential: str, cus
     existing = load_persisted_identity()
     if existing and existing["cloud_id"] != cloud_id and not allow_overwrite:
         raise ActivationConflict(
-            f"This appliance is already activated as {existing['cloud_id']!r}. "
-            f"Refusing to silently switch to {cloud_id!r} -- reset the local activation identity first."
+            f"This appliance is already activated as {display_cloud_id(existing['cloud_id'])!r}. "
+            f"Refusing to silently switch to {display_cloud_id(cloud_id)!r} -- reset the local activation identity first."
         )
     version = existing["activation_version"] + 1 if existing and existing["cloud_id"] == cloud_id else 1
     data = {

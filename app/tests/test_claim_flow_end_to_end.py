@@ -35,6 +35,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from claim_id import claim_id_for
 from pathlib import Path
 from unittest.mock import patch
 import contextlib
@@ -290,10 +292,11 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         # 2. customer authenticates, selects the authorized site, confirms
         status, lookup_body = _http_post('/api/portal/claims/lookup', {'claim_code': shown_code}, cookie=self.cookie)
         self.assertEqual(status, 200)
-        self.assertEqual(lookup_body['device_id'], device_id)
+        self.assertEqual(lookup_body['claim_public_id'], claim_id_for(device_id))
         status, confirm_body = self._confirm(shown_code)
         self.assertEqual(status, 200, confirm_body)
-        self.assertEqual(confirm_body, {'status': 'claimed', 'device_id': device_id})
+        self.assertEqual(confirm_body['status'], 'claimed')
+        self.assertNotIn('device_id', confirm_body)
 
         # 3. appliance polls status -> completes claim
         claim_proof = setup_wizard._wait_for_claim_proof(client, config, state, sleep_fn=lambda _: None)

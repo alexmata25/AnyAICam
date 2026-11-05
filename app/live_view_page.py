@@ -28,6 +28,7 @@ relay start/stop, segment delivery) is driven entirely by those
 already-reviewed, unchanged routes.
 """
 
+from claim_id import display_cloud_id
 import json
 import video_profile  # measured camera video line (2026-10-11)
 from datetime import datetime
@@ -1892,7 +1893,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             tiles = ''.join(
                 f'<div class="live-grid-appliance-heading" style="grid-column:1/-1;font-weight:600;margin-top:14px">'
                 f'AnyAiCam appliance {index}'
-                f' <small style="font-weight:400;opacity:.7">{escape(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid) or "")}</small></div>'
+                f' <small style="font-weight:400;opacity:.7">{escape(display_cloud_id(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid)) or "")}</small></div>'
                 + ''.join(_tile(c) for c in cameras if c['appliance_id'] == aid)
                 for index, aid in enumerate(distinct_appliance_ids, start=1)
             )

@@ -55,7 +55,7 @@ def test_claim_begin_posts_device_id_unauthenticated():
     assert request.full_url == "https://portal.example.test/api/appliance/claim/begin"
     assert request.get_header("Authorization") is None
     body = json.loads(request.data.decode())
-    assert body == {"device_id": "AIC-DEVICE-0001", "device_secret": "secret-0123456789abcdef0123456789abcdef"}
+    assert body == {"device_id": "AIC-DEVICE-0001", "device_secret": "secret-0123456789abcdef0123456789abcdef", "long_code": True}
 
 
 def test_activation_optionally_carries_the_factory_identity_for_signed_capacity_binding():

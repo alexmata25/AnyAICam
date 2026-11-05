@@ -22,6 +22,7 @@ marker) already exist.
 """
 from __future__ import annotations
 
+from claim_id import display_cloud_id
 import json
 import re
 import secrets
@@ -199,7 +200,7 @@ def software_status(db, customer_id: str) -> dict:
         if progress:
             progress["label"] = IN_PROGRESS_LABELS.get(progress["state"], "Updating")
         appliances.append({
-            "id": row["id"], "name": row["cloud_id"], "current_version": version, "current_build": build,
+            "id": row["id"], "name": display_cloud_id(row["cloud_id"]), "current_version": version, "current_build": build,
             "last_check_in": row["last_check_in"], "online": (row["online_status"] or "") == "online",
             "update_available": bool(release and version and is_newer(release["version"], version)) and not windows,
             "platform": "windows" if windows else "linux",

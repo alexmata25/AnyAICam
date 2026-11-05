@@ -56,6 +56,7 @@ refactoring a working, already-tested route for a naming preference
 alone. /api/customer/appliances/link IS the claim endpoint; see the
 Phase 1 report for this explicit decision.
 """
+from claim_id import display_cloud_id
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request
@@ -109,7 +110,7 @@ def register_provisioning_api_routes(app: FastAPI) -> None:
         )
         return {
             "customer_id": customer_id,
-            "installations": installations,
+            "installations": [{**item, "cloud_id": display_cloud_id(item["cloud_id"])} for item in installations],
             "camera_slots_purchased": total_camera_slots(customer_id),
             "installations_claimed": sum(1 for item in installations if item["activation_status"] in ("linked", "activated")),
         }

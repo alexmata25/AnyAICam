@@ -28,6 +28,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from claim_id import claim_id_for
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -220,16 +222,17 @@ class ZeroTerminalOnboardingTests(unittest.TestCase):
         status, claim_page = _cloud('GET', '/customer/claim-appliance?return=setup', cookie=self.cookie)
         self.assertEqual(status, 200)
         self.assertIn("sessionStorage.getItem('anyaicam.claimCode')", claim_page)
-        self.assertIn('if(linkCode)return {claim_code:linkCode};', claim_page)
+        self.assertIn('if(linkCode)return linkClaimId?{claim_id:linkClaimId,claim_code:linkCode}:{claim_code:linkCode};', claim_page)
         status, found = _cloud('POST', '/api/portal/claims/lookup', {'claim_code': code}, cookie=self.cookie)
         if status != 200:
             return status
-        self.assertEqual(found['device_id'], self.device_id)
+        self.assertEqual(found['claim_public_id'], claim_id_for(self.device_id))
+        self.claim_handle = found['claim_handle']
         status, _ = _cloud('POST', '/api/portal/claims/confirm', {'claim_code': code, 'site_id': self.site}, cookie=self.cookie)
         return status
 
     def enrollment(self):
-        status, body = _cloud('GET', f'/api/portal/claims/enrollment?device_id={self.device_id}', cookie=self.cookie)
+        status, body = _cloud('GET', f'/api/portal/claims/enrollment?claim={self.claim_handle}', cookie=self.cookie)
         self.assertEqual(status, 200)
         return body
 

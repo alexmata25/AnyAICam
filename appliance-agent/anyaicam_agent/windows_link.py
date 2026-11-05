@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .claim_id import claim_id_for
 from .headless_claim import CLAIM_CODE_PATTERN, portal_origin
 
 FOLDER_NAME = 'link-requests'
@@ -142,7 +143,7 @@ class LinkRequests:
         """The answer to a request, or None to wait (the service has just
         started and its claim does not exist yet)."""
         if self.linked():
-            return {'status': 'linked'}
+            return {'status': 'linked', 'claim_id': self._own_claim_id()}
         headless = self.headless()
         if headless is None and age < STARTUP_GRACE:
             return None
@@ -152,7 +153,14 @@ class LinkRequests:
             self.log.info('An administrator asked to link this PC; no link could be prepared now.')
             return {'status': 'unavailable'}
         self.log.info('An administrator asked to link this PC; link prepared.')
-        return {'status': 'ok', 'link': f'{origin}/claim#code={code}&link=windows'}
+        return {'status': 'ok', 'link': f'{origin}/claim#code={code}&link=windows&claim={claim_id_for(headless.device_id)}'}
+
+    def _own_claim_id(self) -> str | None:
+        try:
+            with open(self.config.installer_identity_file, encoding='utf-8') as handle:
+                return claim_id_for(str(json.load(handle)['appliance_id']).strip().lower())
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def _write(self, nonce: str, answer: dict) -> None:
         body = json.dumps(answer)

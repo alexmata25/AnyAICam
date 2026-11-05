@@ -359,7 +359,7 @@ Check 'setup provisioned identity, portal and release; no permanent claim code' 
 $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\AnyAiCam'
 . (Join-Path $app 'installer\open-claim-link.ps1')
 $ErrorActionPreference = 'Continue'  # (the helper sets Stop; every check here must run)
-function LinkCodeOf([string]$Link) { if ($Link -cmatch '#code=([0-9A-Z]{8})&link=windows$') { return $Matches[1] }; return '' }
+function LinkCodeOf([string]$Link) { if ($Link -cmatch '#code=([0-9A-Z]{8}|[0-9A-Z]{12})&link=windows(&|$)') { return $Matches[1] }; return '' }
 if ($previousIdentity) {
     Check "upgrade keeps the $previousRelease appliance identity" {
         $now = [string](Get-Content -Raw (Join-Path $data 'config\appliance_identity.json') | ConvertFrom-Json).appliance_id
@@ -456,7 +456,7 @@ Check 'a new request replaces the earlier code' {
     try { Cloud POST '/api/portal/claims/lookup' @{ claim_code = (LinkCodeOf $script:firstLink) } -Owner | Out-Null; throw 'earlier code still works' }
     catch { if ($_.Exception.Message -eq 'earlier code still works') { throw } }
     $found = Cloud POST '/api/portal/claims/lookup' @{ claim_code = $code } -Owner
-    if ($found.device_id -ne $script:applianceId) { throw 'the new code finds another device' }
+    if ($found.claim_public_id -cne ($answer.link -split '&claim=')[1]) { throw 'the new code finds another device' }
     'earlier code refused; new code finds this PC'
 }
 Check 'owner confirms through the latest link' {

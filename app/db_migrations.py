@@ -3,6 +3,7 @@ import logging
 import re
 from datetime import datetime
 
+from claim_id import claim_id_for
 from database_backend import connect
 # Module-level alias: apply_migrations() itself also does `from database_backend import backend` further down, which
 # makes the plain name local to the whole function (UnboundLocalError if used earlier).
@@ -1510,6 +1511,11 @@ CREATE TABLE IF NOT EXISTS test_account_closures(
  plan_sha256 TEXT NOT NULL, closed_at TEXT NOT NULL, closed_by TEXT NOT NULL, backup_sha256 TEXT, details_json TEXT
 )
 '''),
+    ('20261031_claim_attempt_counters','''
+CREATE TABLE IF NOT EXISTS claim_attempt_counters(
+ scope TEXT PRIMARY KEY, attempts INTEGER NOT NULL, window_started_at BIGINT NOT NULL
+)
+'''),
 ]
 
 
@@ -1962,8 +1968,13 @@ def apply_migrations():
             # Headless label claim (2026-10-07): hash of the verifier of the
             # claim code printed on the appliance's label (appliance_claims.py).
             ('label_verifier_hash','TEXT'),
+            # Non-secret Claim ID of the installation (claim_id.py).
+            ('claim_public_id','TEXT'),
         ):
             if name not in claim_columns: db.execute(f'ALTER TABLE appliance_claims ADD COLUMN {name} {definition}')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_appliance_claims_public_id ON appliance_claims(claim_public_id)')
+        for item in db.execute('SELECT id,device_id FROM appliance_claims WHERE claim_public_id IS NULL').fetchall():
+            db.execute('UPDATE appliance_claims SET claim_public_id=? WHERE id=?', (claim_id_for(item['device_id']), item['id']))
 
         # Smart Motion shared-media authorization (2026-09-14 Phase A --
         # see appliance_cloud.py's analytics_event_available() and the

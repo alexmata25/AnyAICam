@@ -1199,10 +1199,12 @@ def appliance_hostname() -> str:
         return "unknown"
 
 
+from claim_id import cloud_id_label, display_cloud_id
+
+
 def build_identifier() -> dict:
-    """The single source every build-identifier surface (the /version
-    API and page_shell()'s sidebar footer) reads from, so the two can
-    never drift apart. cloud_id is only present once this appliance
+    """What page_shell()'s staff sidebar footer shows. Not for /version,
+    which anyone can read. cloud_id is only present once this appliance
     has actually activated (own_appliance_identity()) -- never the
     permanent credential itself, only the public Cloud ID."""
     identity = own_appliance_identity()
@@ -1210,7 +1212,7 @@ def build_identifier() -> dict:
         "version": APP_VERSION,
         "build_id": BUILD_ID,
         "hostname": appliance_hostname(),
-        "cloud_id": identity["cloud_id"] if identity else None,
+        "cloud_id": display_cloud_id(identity["cloud_id"]) if identity else None,
     }
 
 
@@ -48734,7 +48736,7 @@ def portal_login_submit(request: Request, payload: dict):
     if own_appliance and RUNTIME_ROLE != "edge":
         logging.getLogger("anyaicam.main").warning(
             "portal_login.stray_appliance_identity_ignored appliance_id=%s cloud_id=%s runtime_role=%s",
-            own_appliance.get("appliance_id"), own_appliance.get("cloud_id"), RUNTIME_ROLE,
+            own_appliance.get("appliance_id"), display_cloud_id(own_appliance.get("cloud_id")), RUNTIME_ROLE,
         )
         own_appliance = None
     if own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS:
@@ -51526,8 +51528,9 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         if _show_aaco:
             from aaco_web import render_aaco_floating_widget
             aaco_widget_html = render_aaco_floating_widget()
-    # Customers see only the version; build, host and Cloud ID are for staff (2026-10-16).
-    if shell_role in CUSTOMER_PORTAL_ROLES:
+    # Customers and signed-out visitors see only the version; build, host and
+    # Cloud ID are for staff (2026-10-16).
+    if (shell_user or {}).get("id", "") == "anonymous" or not shell_user or shell_role in CUSTOMER_PORTAL_ROLES:
         build_badge = f'<div class="sidebar-build-badge">v{escape(APP_VERSION)}</div>'
     else:
         build_badge = (f'<div class="sidebar-build-badge" title="Cloud ID: {escape(build_identifier()["cloud_id"] or "not activated")}">'
@@ -52216,33 +52219,6 @@ def health_endpoint() -> JSONResponse:
 
 
 
-            "environment": DEPLOYMENT_ENV,
-
-
-
-
-
-
-
-
-            "runtime_role": RUNTIME_ROLE,
-
-
-
-
-
-
-
-
-            "uptime_seconds": max(0, int((datetime.now() - STARTED_AT).total_seconds())),
-
-
-
-
-
-
-
-
             "checked_at": datetime.now().isoformat(),
 
 
@@ -52289,33 +52265,16 @@ def health_endpoint() -> JSONResponse:
 
 
 @app.get("/ready")
-
-
-
-
-
-
-
-
 def ready_endpoint() -> JSONResponse:
-
-
-
-
-
-
-
-
+    # Anyone can read this, so it answers ready or not and no more. Administrators
+    # read the full snapshot at /api/operations/diagnostics. self_test.ok already
+    # fails on a critical configuration issue, and installers match the exact text
+    # "self_test":{"ok":true, so ok stays the first key.
     snapshot = readiness_snapshot()
-
-
-
-
-
-
-
-
-    return JSONResponse(snapshot, status_code=200 if snapshot["ready"] else 503)
+    return JSONResponse(
+        {"ready": snapshot["ready"], "self_test": {"ok": snapshot["self_test"]["ok"]}},
+        status_code=200 if snapshot["ready"] else 503,
+    )
 
 
 
@@ -52343,122 +52302,13 @@ def ready_endpoint() -> JSONResponse:
 
 
 @app.get("/version")
-
-
-
-
-
-
-
-
 def version_endpoint() -> dict:
-
-
-
-
-
-
-
-
+    # Anyone can read this, so it names the release and nothing about the
+    # machine. Deploy, rollback and update checks need only version and build_id.
     return {
-
-
-
-
-
-
-
-
         "product": "AnyAiCam VMS",
-
-
-
-
-
-
-
-
         "version": APP_VERSION,
-
-
-
-
-
-
-
-
         "build_id": BUILD_ID,
-
-
-
-
-
-
-
-
-        "hostname": appliance_hostname(),
-
-
-
-
-
-
-
-
-        "cloud_id": (own_appliance_identity() or {}).get("cloud_id"),
-
-
-
-
-
-
-
-
-        "environment": DEPLOYMENT_ENV,
-
-
-
-
-
-
-
-
-        "runtime_role": RUNTIME_ROLE,
-
-
-
-
-
-
-
-
-        "aws_region": AWS_REGION or None,
-
-
-
-
-
-
-
-
-        "started_at": STARTED_AT.isoformat(),
-
-
-
-
-
-
-
-
-        "uptime_seconds": max(0, int((datetime.now() - STARTED_AT).total_seconds())),
-
-
-
-
-
-
-
-
     }
 
 
@@ -53698,7 +53548,7 @@ def operations_page(request: Request) -> str:
 
 
 
-            <a class="ghost-button" href="/ready" target="_blank">Readiness JSON</a>
+            <a class="ghost-button" href="/api/operations/diagnostics" target="_blank">Diagnostics JSON</a>
 
 
             <a class="ghost-button" href="/operations/rdm">Remote device management</a>
@@ -55026,7 +54876,7 @@ def operations_rdm_page(request: Request) -> str:
             actions = '<div class="health-detail">Your Partner Portal role can view this appliance but not act on it (appliance.action permission required).</div>'
         cards.append(
             '<article class="panel">'
-            f'<div class="panel-head"><div><h2>{escape(item.get("cloud_id") or item["id"])}</h2>'
+            f'<div class="panel-head"><div><h2>{escape(display_cloud_id(item.get("cloud_id")) or item["id"])}</h2>'
             f'<div class="health-detail">{escape(item.get("customer_name") or "Unassigned")} · {escape(item.get("site_name") or "No site")} · {escape(item.get("software_version") or "Unknown version")}</div></div>'
             f'<span class="pill">{escape(item.get("state") or item.get("online_status") or "offline")}</span></div>'
             f'<div class="health-row"><span>Last check-in</span><strong>{escape(item.get("last_check_in") or "Never")}</strong></div>'
@@ -55062,7 +54912,7 @@ def operations_rdm_page(request: Request) -> str:
         command_params,
     )
     command_table = "".join(
-        f'<tr><td>{escape(item["cloud_id"])}</td><td>{escape(item["command"].replace("_", " "))}</td>'
+        f'<tr><td>{escape(display_cloud_id(item["cloud_id"]))}</td><td>{escape(item["command"].replace("_", " "))}</td>'
         f'<td><span class="pill">{escape(item["status"])}</span></td><td>{escape(item["created_at"])}</td>'
         f'<td>{escape(item.get("error") or "")}</td></tr>'
         for item in command_rows
@@ -55174,7 +55024,7 @@ def reset_appliance_activation_identity(request: Request) -> dict:
     reset_persisted_identity()
     record_audit(
         request, "reset", "appliance_activation_identity",
-        f"Reset local activation identity (was {previous['cloud_id']!r})." if previous else "Reset local activation identity (none was set).",
+        f"Reset local activation identity (was {display_cloud_id(previous['cloud_id'])!r})." if previous else "Reset local activation identity (none was set).",
     )
     return {"status": "reset", "message": "Local activation identity cleared. This appliance can now be activated as a different Cloud ID."}
 
@@ -55343,7 +55193,7 @@ def fetch_appliance_identity_manifest(request: Request) -> dict:
         request, "fetch", "appliance_identity_manifest",
         f"Fetched identity manifest ({len(manifest['identities'])} identities, version {manifest['manifest_version']}).",
     )
-    return {"status": "connected", "cloud_id": manifest["appliance"]["cloud_id"], "identity_count": len(manifest["identities"]), "manifest_version": manifest["manifest_version"]}
+    return {"status": "connected", "cloud_id": display_cloud_id(manifest["appliance"]["cloud_id"]), "identity_count": len(manifest["identities"]), "manifest_version": manifest["manifest_version"]}
 
 
 @app.get("/operations/appliance-activation", response_class=HTMLResponse)
@@ -55353,11 +55203,12 @@ def appliance_activation_page(request: Request) -> str:
         return permission_denied_page("Appliance activation", "operations", "manage_settings")
     record_audit(request, "view", "operations:appliance-activation", "Opened appliance activation.")
     from appliance_activation import load_persisted_identity
+    from claim_id import display_cloud_id
     identity = load_persisted_identity()
     if identity:
         status_html = (
             '<section class="panel"><h2>Activated</h2>'
-            f'<div class="health-row"><span>Cloud ID</span><strong>{escape(identity["cloud_id"])}</strong></div>'
+            f'<div class="health-row"><span>{"Claim ID" if str(display_cloud_id(identity["cloud_id"])).startswith("CID-") else "Cloud ID"}</span><strong>{escape(display_cloud_id(identity["cloud_id"]))}</strong></div>'
             f'<div class="health-row"><span>Customer</span><strong>{escape(identity["customer_id"] or "—")}</strong></div>'
             f'<div class="health-row"><span>Site</span><strong>{escape(identity["site_id"] or "—")}</strong></div>'
             f'<div class="health-row"><span>Partner</span><strong>{escape(identity["partner_id"] or "—")}</strong></div>'
@@ -141609,7 +141460,7 @@ def partner_installations_page(request: Request) -> Response:
 
 
 
-                    · Cloud ID: {escape(str(record.get("cloud_id") or "Not assigned"))}<br>
+                    · {escape(cloud_id_label(record["cloud_id"]) if record.get("cloud_id") else "Cloud ID Not assigned")}<br>
 
 
 

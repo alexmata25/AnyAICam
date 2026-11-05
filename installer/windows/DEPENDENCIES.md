@@ -28,3 +28,7 @@ The build-time keyset validator can use the verified per-user CPython 3.12.10 ex
 | `psycopg` / `psycopg-binary` 3.2.3 (pinned on Linux as `psycopg[binary]==3.2.3`) | LGPL-3.0 | The Windows edge is SQLite-only: `cloud_config.database_backend` defaults to `sqlite`, the installer never sets `ANYAICAM_DATABASE_BACKEND`/`ANYAICAM_DATABASE_URL`, and `psycopg` is imported only inside `database_backend.py`'s PostgreSQL branch. No other wheel requires it. | None at runtime; selecting PostgreSQL on Windows fails closed with `Install psycopg[binary] to use PostgreSQL.` Removes the LGPL psycopg item from the Windows distribution. |
 
 Not excluded: `libiconv` 1.18 (LGPL-2.1) inside the Tesseract bundle -- `tesseract.exe` imports `archive.dll`, which imports `iconv.dll` + `charset.dll`; removing them would stop LPR. It can only go with the minimal Tesseract rebuild (`-DDISABLE_ARCHIVE=ON -DDISABLE_CURL=ON`).
+
+## Inside a Python wheel
+
+`opencv_python-4.10.0.84` carries `cv2/opencv_videoio_ffmpeg4100_64.dll`, SHA-256 `3de83b84588b3ee8bacdbea85a8f92d4855a32a1108183963315a7db06ad5744`: FFmpeg 4.4.4 (LGPL-2.1-or-later) with libvpx 1.14.0 (BSD-3-Clause) and libaom 3.9.0 (BSD-2-Clause), built from `opencv/opencv_3rdparty` commit `394dca6ceb3085c979415e6385996b6570e94153`. It reads HLS frames for analytics. Notice: `notices/opencv-ffmpeg-NOTICE.txt`, installed in `licenses/`.

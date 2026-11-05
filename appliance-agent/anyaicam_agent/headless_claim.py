@@ -56,11 +56,12 @@ from datetime import datetime
 from typing import Callable
 from urllib.parse import urlsplit
 
+from .claim_id import display_cloud_id
 from .config import AgentConfig, clear_claim_state, load_claim_state, save_claim_state
 from .portal import PortalClient, PortalError
 
 VERIFIER_PATTERN = re.compile(r'^[0-9a-f]{64}$')
-CLAIM_CODE_PATTERN = re.compile(r'^[0-9A-Z]{8}$')  # what claim/begin returns (appliance_claims._generate_claim_code)
+CLAIM_CODE_PATTERN = re.compile(r'^([0-9A-Z]{8}|[0-9A-Z]{12})$')  # what claim/begin returns (appliance_claims._generate_claim_code)
 DEVICE_ID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1', '0.0.0.0'}
 
@@ -305,7 +306,7 @@ class HeadlessClaim:
         clear_claim_state(self.config)
         self.done = True
         self._ok()
-        self.log.info('Appliance claimed and activated cloud_id=%s', activated.get('cloud_id'))
+        self.log.info('Appliance claimed and activated cloud_id=%s', display_cloud_id(activated.get('cloud_id')))
         return 0.0
 
     # ---------------------------------------------------------------- local setup page

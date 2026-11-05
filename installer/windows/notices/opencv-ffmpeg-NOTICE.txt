@@ -1,0 +1,15 @@
+AnyAiCam VMS includes opencv_videoio_ffmpeg4100_64.dll, part of opencv-python 4.10.0.84.
+
+This software uses libraries from the FFmpeg project under the LGPLv2.1.
+FFmpeg 4.4.4 (https://ffmpeg.org) is licensed under the GNU Lesser General Public
+License, version 2.1 or later. AnyAiCam does not own FFmpeg. The licence text is in
+runtime/python/Lib/site-packages/cv2/LICENSE-3RD-PARTY.txt.
+
+The same DLL contains:
+  libvpx 1.14.0, BSD-3-Clause, Copyright The WebM Project authors
+  libaom 3.9.0, BSD-2-Clause, Copyright Alliance for Open Media
+
+Exact build: github.com/opencv/opencv_3rdparty, commit
+394dca6ceb3085c979415e6385996b6570e94153, folder ffmpeg.
+
+SOURCE OFFER: [PENDING: the URL of AnyAiCam's source mirror goes here before release.]

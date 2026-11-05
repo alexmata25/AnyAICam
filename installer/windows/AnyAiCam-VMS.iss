@@ -122,6 +122,7 @@ Source: "vendor\vosk-model-small-en-us-0.15.zip"; DestDir: "{tmp}"; Flags: delet
 Source: "install-stt-model.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "vosk-model-small-en-us-0.15.sha256"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "notices\vosk-model-small-en-us-0.15-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "notices\opencv-ffmpeg-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 ; Microsoft Visual C++ 2015-2022 runtime (x64): torch/cv2 DLLs need it and a
 ; clean Windows does not have it. Installed before the Python runtime; left in
 ; place on uninstall (a shared system component other programs may use).
@@ -406,17 +407,23 @@ var
   AccountLink: String;
   AccountLinkStatus: String;
 
-// https://<cloud>/claim#code=XXXXXXXX&link=windows and nothing else: it is
-// put inside single quotes on a PowerShell command line.
+// https://<cloud>/claim#code=<8 or 12 characters>&link=windows, optionally followed by
+// &claim=CID-XXXX-XXXX-XXXX-XXXX, and nothing else: it is put inside single
+// quotes on a PowerShell command line.
 function IsAccountLink(const Link: String): Boolean;
 var
-  I, Code: Integer;
+  I, Code, CodeLength: Integer;
+  Base: String;
 begin
   Result := False;
   if (Pos('https://', Link) <> 1) or (Length(Link) > 200) then Exit;
+  Base := Link;
+  if Pos('&claim=CID-', Base) = Length(Base) - 29 then Base := Copy(Base, 1, Length(Base) - 30);
   Code := Pos('/claim#code=', Link);
-  if (Code = 0) or (Length(Link) <> Code + Length('/claim#code=') + 8 + Length('&link=windows') - 1) then Exit;
-  if Copy(Link, Length(Link) - Length('&link=windows') + 1, Length('&link=windows')) <> '&link=windows' then Exit;
+  if Code = 0 then Exit;
+  CodeLength := Length(Base) - (Code + Length('/claim#code=') - 1) - Length('&link=windows');
+  if (CodeLength <> 8) and (CodeLength <> 12) then Exit;
+  if Copy(Base, Length(Base) - Length('&link=windows') + 1, Length('&link=windows')) <> '&link=windows' then Exit;
   for I := 1 to Length(Link) do
     if Pos(Copy(Link, I, 1), 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:/-#=&') = 0 then Exit;
   Result := True;
@@ -489,6 +496,17 @@ begin
   Result := (not PostInstallFailed) and (not IsLinked) and (AccountLink <> '');
 end;
 
+// The non-secret Claim ID from the link, for the finish page; '' if it has none.
+function ClaimIdText(): String;
+var
+  At: Integer;
+begin
+  Result := '';
+  At := Pos('&claim=', AccountLink);
+  if At > 0 then
+    Result := #13#10#13#10 + 'Claim ID of this computer: ' + Copy(AccountLink, At + Length('&claim='), 24);
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID <> wpFinished) or PostInstallFailed then Exit;
@@ -499,7 +517,7 @@ begin
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
       'Your cameras start once this computer is linked to your AnyAiCam account (needed once, with an internet ' +
       'connection). Keep "Link this computer to my AnyAiCam account" ticked and click Finish. ' +
-      'Your browser opens AnyAiCam: sign in (or create an account), choose a site and confirm. There is no code to type.' + #13#10#13#10 +
+      'Your browser opens AnyAiCam: sign in (or create an account), choose a site and confirm. There is no code to type.' + ClaimIdText() + #13#10#13#10 +
       'After this first link, Local mode keeps recording without internet. ' +
       'Later: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an administrator of this PC).'
   else

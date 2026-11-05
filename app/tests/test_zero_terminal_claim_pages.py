@@ -24,7 +24,7 @@ def _claim_page(client, query="?return=setup"):
 
 def test_claim_entry_accepts_a_code_from_the_appliance_setup_page(client, db_path):
     body = client.get("/claim").text
-    assert "(?:^|[#&])code=([0-9A-Za-z]{8})(?:&|$)" in body
+    assert "(?:^|[#&])code=([0-9A-Za-z]{8}|[0-9A-Za-z]{12})(?:&|$)" in body
     assert "sessionStorage.setItem('anyaicam.claimCode',linked[1].toUpperCase())" in body
     assert "history.replaceState(null,'',location.pathname)" in body  # out of the address bar and history
     # The label QR flow is unchanged.
@@ -36,10 +36,10 @@ def test_claim_page_uses_the_code_without_ever_showing_it(client, db_path):
     body = _claim_page(client)
     assert "linkCode=sessionStorage.getItem('anyaicam.claimCode')||''" in body
     assert "sessionStorage.removeItem('anyaicam.claimCode')" in body  # read once
-    assert "if(!/^[0-9A-Z]{8}$/.test(linkCode))linkCode='';" in body  # nothing but a code is accepted
+    assert "if(!/^([0-9A-Z]{8}|[0-9A-Z]{12})$/.test(linkCode))linkCode='';" in body  # nothing but a code is accepted
     # Hidden input and button; the code goes into the request body only.
     assert "document.getElementById('claim-code-input').closest('label').hidden=true;" in body
-    assert "if(linkCode)return {claim_code:linkCode};" in body
+    assert "if(linkCode)return linkClaimId?{claim_id:linkClaimId,claim_code:linkCode}:{claim_code:linkCode};" in body
     assert "claim-code-input').value=linkCode" not in body
     assert "if(linkCode)document.getElementById('claim-lookup-button').onclick();" in body  # looks it up by itself
 
@@ -49,7 +49,7 @@ def test_after_confirming_the_page_waits_for_the_appliance_then_goes_to_discover
     body = _claim_page(client)
     # Codex finding 3: readiness of THAT appliance, then discovery with it
     # selected (test_claim_enrollment_readiness.py covers the endpoint).
-    assert "fetch('/api/portal/claims/enrollment?device_id='" in body
+    assert "fetch('/api/portal/claims/enrollment?claim='" in body
     assert "continueLink.href='/customer/setup?step=4&appliance='+encodeURIComponent(applianceId)" in body
     assert "Discover cameras" in body
     # A failed link asks the customer to use the appliance's page again (no code to type).
