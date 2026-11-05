@@ -261,7 +261,8 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             state = setup_wizard._open_or_resume_claim(client, config, self.device_id)
-        match = re.search(r"Claim code:\s+([0-9A-F]{8})", out.getvalue())
+        # Current agents ask for the 12-character code, so an 8-character one here is a failure.
+        match = re.search(r"Claim code:\s+([0-9A-HJKMNP-TV-Z]{12})\s*$", out.getvalue(), re.MULTILINE)
         return state, (match.group(1) if match else None)
 
     def test_full_workflow_reaches_authenticate_appliance_success(self):

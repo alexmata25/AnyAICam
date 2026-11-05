@@ -382,13 +382,16 @@ class OpenClaimLinkTests(unittest.TestCase):
         elevated, start_menu = rest.split("$powershell = ", 1)
         self.assertIn("if (-not (Test-Administrator) -or (Split-Path -Leaf $Prepare) -ne 'anyaicam-account-link.txt') { exit 1 }", prepare)
         self.assertIn("if ($Handoff -cnotmatch $NoncePattern) { exit 1 }", elevated)
-        self.assertIn("if (Test-Administrator) { Get-AccountLinkResult $dataRoot } else { @{ status = 'denied'", elevated)
+        self.assertIn("if (Test-Administrator) { Get-AccountLinkResult $dataRoot -WithClaimId } else { @{ status = 'denied'", elevated)
         # The Start menu copy never reads the request folder itself: it starts
         # the elevated copy (UAC) and opens what that hands back, as itself.
         self.assertNotIn("Get-AccountLinkResult", start_menu)
         self.assertNotIn("Request-AccountLink", start_menu)
         self.assertLess(start_menu.index("-Verb RunAs"), start_menu.index("Read-Result"))
-        self.assertIn("'ok' { Start-Process -FilePath $result.link; exit 0 }", start_menu)
+        opens = [line for line in start_menu.splitlines() if "$result.link" in line and "Start-Process" in line]
+        self.assertEqual(len(opens), 1)
+        self.assertIn("Start-Process -FilePath $result.link", opens[0])
+        self.assertNotIn("-Verb", opens[0])
         self.assertNotIn("explorer.exe", text)
         self.assertIn("[IO.FileMode]::CreateNew", text)
 

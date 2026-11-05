@@ -53,6 +53,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from authz_helpers import make_partner_user, partner_session_cookie
+from claim_id import claim_id_for
 from database_backend import override_target
 
 with override_target(sqlite_path="/tmp/test_appliance_claims_import.db"):
@@ -446,11 +448,27 @@ def test_claim_page_redirects_unauthenticated_visitors_to_login(client, db_path)
 
 
 def test_claim_page_rejects_non_customer_owner_roles(client, db_path):
-    admin_cookie = partner_portal._token("admin@example.test", "administrator", None, None)
+    # A real administrator session, so the request reaches the page's own role
+    # check. An administrator token with no session counts as signed out; the
+    # next test holds that case.
+    with override_target(sqlite_path=str(db_path)):
+        make_partner_user("admin@example.test", "administrator")
+        admin_cookie = partner_session_cookie("admin@example.test", "administrator")
 
-    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie})
+    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie}, follow_redirects=False)
 
     assert response.status_code == 403
+    assert "Claim an appliance" not in response.text
+
+
+def test_claim_page_treats_an_administrator_token_without_a_session_as_signed_out(client, db_path):
+    admin_cookie = partner_portal._token("admin@example.test", "administrator", None, None)
+
+    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/customer-login.html?next=%2Fcustomer%2Fclaim-appliance"
+    assert "Claim an appliance" not in response.text
 
 
 def test_claim_page_renders_the_customers_own_sites(client, db_path):
@@ -507,7 +525,12 @@ def test_portal_confirm_succeeds_for_own_site(client, db_path):
     response = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
 
     assert response.status_code == 200
-    assert response.json() == {"status": "claimed", "device_id": VALID_DEVICE_ID}
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            claim = db.execute("SELECT id FROM appliance_claims WHERE device_id=?", (VALID_DEVICE_ID,)).fetchone()
+    # The browser gets the opaque handle and the Claim ID, never the device UUID.
+    assert response.json() == {"status": "claimed", "claim_handle": claim["id"], "claim_public_id": claim_id_for(VALID_DEVICE_ID)}
+    assert VALID_DEVICE_ID not in response.text
 
 
 def test_portal_confirm_twice_is_conflict(client, db_path):

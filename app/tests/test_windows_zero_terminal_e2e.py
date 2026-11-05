@@ -212,6 +212,10 @@ class WindowsZeroTerminalTests(unittest.TestCase):
         status, _ = _cloud('POST', '/api/portal/claims/confirm', {'claim_code': code, 'site_id': self.site}, cookie=self.cookie)
         return status
 
+    def owner(self):
+        """The identity a signed-in owner's request carries into the claim lookup."""
+        return {'email': self.email, 'role': 'customer_owner', 'customer_id': self.customer}
+
     def pending_claims(self):
         with connection() as db:
             return [dict(r) for r in db.execute("SELECT label_verifier_hash FROM appliance_claims WHERE device_id=? AND status='pending'", (self.device_id,))]
@@ -297,20 +301,24 @@ class WindowsZeroTerminalTests(unittest.TestCase):
 
     def test_a_label_lookup_in_flight_cannot_confirm_once_the_label_is_cleared(self):
         self.open_legacy_label_claim()
-        stale = appliance_claims._find_claim_for_portal({'label_code': self.LEGACY_CODE})  # looked up just before
+        stale = appliance_claims._find_claim_for_portal({'label_code': self.LEGACY_CODE}, self.owner())  # looked up just before
+        self.assertTrue(stale and stale['matched_label'])
         self.run_agent(1)
-        with patch.object(appliance_claims, '_find_claim_for_portal', lambda payload: stale):
+        with patch.object(appliance_claims, '_find_claim_for_portal', lambda payload, identity: stale):
             status, _ = _cloud('POST', '/api/portal/claims/confirm', {'label_code': self.LEGACY_CODE, 'site_id': self.site}, cookie=self.cookie)
         self.assertEqual(status, 409)
         self.assertEqual(len(self.pending_claims()), 1)  # still pending, not claimed
 
     def test_a_replaced_claim_code_in_flight_cannot_confirm(self):
         first = self.link_code()
-        stale = appliance_claims._find_claim_for_portal({'claim_code': first})
-        self.link_code()  # a new request replaces the code
-        with patch.object(appliance_claims, '_find_claim_for_portal', lambda payload: stale):
+        stale = appliance_claims._find_claim_for_portal({'claim_code': first}, self.owner())
+        self.assertTrue(stale)
+        replacement = self.link_code()  # a new request replaces the code
+        self.assertNotEqual(replacement, first)
+        with patch.object(appliance_claims, '_find_claim_for_portal', lambda payload, identity: stale):
             status, _ = _cloud('POST', '/api/portal/claims/confirm', {'claim_code': first, 'site_id': self.site}, cookie=self.cookie)
         self.assertEqual(status, 409)
+        self.assertEqual(len(self.pending_claims()), 1)  # still pending, not claimed
 
     def test_an_expired_legacy_claim_is_dropped_without_opening_another(self):
         self.open_legacy_label_claim()

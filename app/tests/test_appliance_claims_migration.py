@@ -30,9 +30,12 @@ def test_appliance_claims_table_and_indexes_are_created(tmp_path):
         "device_secret_hash",
         # Headless label claim (2026-10-07).
         "label_verifier_hash",
+        # Non-secret Claim ID of the installation (claim_id.py).
+        "claim_public_id",
     }
     assert "idx_appliance_claims_device_id" in indexes
     assert "idx_appliance_claims_status" in indexes
+    assert "idx_appliance_claims_public_id" in indexes
 
 
 def test_hardening_columns_are_idempotent_across_repeated_initialize(tmp_path):
