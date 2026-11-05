@@ -55,6 +55,27 @@ class GatewayLicensingTests(unittest.TestCase):
             with patch.dict(os.environ, {edition.EDITION_ENV: 'local_gateway'}):
                 self.assertFalse(edition.event_camera_authorized(1, {'cloud_recording_mode': 'motion'}, [1]))
 
+    def test_cloud_event_upload_requires_opt_in_and_current_camera_grant(self):
+        identity = {'cloud_recording_mode': 'motion'}
+        with patch.object(vms_capacity, 'licensed_camera_numbers', return_value=[1]) as licensed:
+            self.assertTrue(edition.event_camera_authorized(1, identity, [1, 2]))
+            self.assertFalse(edition.event_camera_authorized(2, identity, [1, 2]))
+            licensed.return_value = []
+            self.assertFalse(edition.event_camera_authorized(1, identity, [1, 2]))
+            licensed.return_value = [1]
+            with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED': 'false'}):
+                self.assertFalse(edition.event_camera_authorized(1, identity, [1, 2]))
+            self.assertFalse(edition.event_camera_authorized(1, {'cloud_recording_mode': 'disabled'}, [1, 2]))
+
+    def test_cloud_event_authorization_rejects_malformed_identity_and_camera(self):
+        with patch.object(vms_capacity, 'licensed_camera_numbers', return_value=[1]):
+            for identity in (None, [], 'motion'):
+                with self.subTest(identity=identity):
+                    self.assertFalse(edition.event_camera_authorized(1, identity, [1]))
+            for camera in (True, '1', None, 0, -1):
+                with self.subTest(camera=camera):
+                    self.assertFalse(edition.event_camera_authorized(camera, {'cloud_recording_mode':'motion'}, [1]))
+
     def test_gateway_rejects_bulk_recordings_or_other_event_references(self):
         self.assertTrue(edition.event_clip_reference_allowed('event-1', '/recordings/clips/motion/motion_event-1.mp4'))
         for url in ('/recordings/camera1/segment.mkv', '/recordings/camera1/segment.mp4',
@@ -121,26 +142,39 @@ class GatewayLicensingTests(unittest.TestCase):
             ns['_event_upload_session'](1, 'c1')
             recording._ensure_session.assert_called_once_with(1, 'c1')
 
-    def mock_event_upload(self, registration_accepted=True):
+    def mock_event_upload(self, registration_accepted=True, revoke=None):
         # Execute the actual uploader/session functions. Every transport is a
         # mock; the only media is a tiny disposable file, never a real camera.
         with tempfile.TemporaryDirectory() as temp:
             clip = Path(temp) / 'event.mp4'
             clip.write_bytes(b'test clip')
+            thumbnail = Path(temp) / 'event.jpg'
+            thumbnail.write_bytes(b'\xff\xd8\xffsynthetic')
             client = Mock()
+            permission = {'enabled':True, 'camera_id':'c1', 'licensed':True}
             recording_ns = self.session_namespace()
             recording_ns.update({
                 'AWS_REGION': '',
                 'boto3': SimpleNamespace(client=Mock(return_value=client)),
                 '_refresh_camera_map': Mock(), '_known_camera_numbers': lambda: [1],
-                '_camera_identity': lambda number: {'camera_id': 'c1', 'cloud_recording_mode': 'motion'},
+                '_camera_identity': lambda number: {'camera_id': permission['camera_id'], 'cloud_recording_mode': 'motion' if permission['enabled'] else 'disabled'},
             })
             response = {
                 'credentials': {'access_key_id': 'fake', 'secret_access_key': 'fake', 'session_token': 'fake',
                                 'expiration': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()},
                 'bucket': 'fake-bucket', 'key_prefix': 'recordings/customer/site/appliance/c1/', 'region': 'test-region',
             }
-            recording_ns['_control_plane_post'].side_effect = lambda url, payload: response if url.endswith('/credentials') else ({'status': 'accepted'} if registration_accepted else None)
+            def control(url, payload):
+                if url.endswith('/credentials'):
+                    if revoke == 'camera': permission['enabled'] = False
+                    if revoke == 'identity': permission['camera_id'] = 'different-camera'
+                    if revoke == 'capacity': permission['licensed'] = False
+                    if revoke == 'opt_in': os.environ['ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED'] = 'false'
+                    return response
+                return {'status':'accepted'} if registration_accepted else None
+            recording_ns['_control_plane_post'].side_effect = control
+            if revoke == 'after_clip':
+                client.upload_file.side_effect = lambda *args, **kwargs: permission.update(enabled=False)
             load_functions('recording_uploader.py', {'session_region'}, recording_ns)
             recording = SimpleNamespace(**recording_ns)
             outbox = Mock()
@@ -150,7 +184,7 @@ class GatewayLicensingTests(unittest.TestCase):
                 'recording_upload': recording, 'event_media_outbox': outbox, 'logger': Mock(),
                 'EVENT_MEDIA_CAPTURE_ENABLED': True, 'EVENT_MEDIA_UPLOAD_ENABLED': True,
                 '_safe_recording_url': lambda url: url,
-                '_local_path_from_recording_url': lambda url: clip if url else None,
+                '_local_path_from_recording_url': lambda url: (thumbnail if url.endswith('.jpg') else clip) if url else None,
                 '_ensure_detection_event_synced': lambda event, camera: True,
                 'compute_clip_window': lambda a, b: SimpleNamespace(start=a, end=b),
                 '_duration_seconds': lambda path: 10,
@@ -159,10 +193,10 @@ class GatewayLicensingTests(unittest.TestCase):
             }
             load_functions('event_media_uploader.py', {'_edition_upload_allowed', '_event_camera_authorized',
                 '_event_upload_session', 'upload_motion_event_media'}, ns)
-            with patch.object(vms_capacity, 'load_capacity', return_value={'camera_slot_quantity': 1}):
+            with patch.object(vms_capacity, 'load_capacity', side_effect=lambda *args, **kwargs: {'camera_slot_quantity': 1} if permission['licensed'] else None):
                 result = ns['upload_motion_event_media'](event_id='e1', camera_number=1,
                     event_start=start, event_end=end, clip_url='/recordings/clips/motion/motion_e1.mp4',
-                    thumbnail_url=None, already_classified=True)
+                    thumbnail_url='/recordings/clips/motion/motion_e1.jpg' if revoke == 'after_clip' else None, already_classified=True)
             return result, client, recording, outbox
 
     def test_authorized_gateway_clip_uses_only_event_objects_with_mock_transport(self):
@@ -184,6 +218,22 @@ class GatewayLicensingTests(unittest.TestCase):
         # One credential authorization, then the existing twelve bounded
         # registration attempts. Sleeps and every transport are mocks.
         self.assertEqual(recording._control_plane_post.call_count, 13)
+
+    def test_revocation_during_session_prevents_provider_handoff(self):
+        for revoke in ('camera', 'identity', 'capacity', 'opt_in'):
+            with self.subTest(revoke=revoke), patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED':'true'}):
+                result, client, recording, outbox = self.mock_event_upload(revoke=revoke)
+                self.assertFalse(result)
+                recording.boto3.client.assert_not_called()
+                client.upload_file.assert_not_called()
+                outbox.remove.assert_not_called()
+
+    def test_revocation_after_clip_stops_thumbnail_handoff(self):
+        result, client, recording, outbox = self.mock_event_upload(revoke='after_clip')
+        self.assertFalse(result)
+        self.assertEqual(client.upload_file.call_count, 1)
+        self.assertTrue(client.upload_file.call_args.args[2].endswith('.mp4'))
+        outbox.remove.assert_not_called()
 
 
 if __name__ == '__main__':

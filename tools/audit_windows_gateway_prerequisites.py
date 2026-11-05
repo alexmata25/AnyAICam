@@ -22,13 +22,13 @@ def pinned_inputs(build_source: str) -> list[str]:
 
 def locked_wheels(lock_source: str) -> list[str]:
     names = []
+    seen = set()
     for line in lock_source.splitlines():
-        if not line.strip():
-            continue
-        match = re.fullmatch(r'[0-9a-f]{64}  ([^/\\]+\.whl)', line)
-        if not match or match[1] in names:
+        match = re.fullmatch(r'[0-9a-f]{64}  ([A-Za-z0-9_+.-]+\.whl)', line)
+        if not match or match[1].casefold() in seen:
             raise ValueError('Wheel lock contains an invalid or duplicate entry')
         names.append(match[1])
+        seen.add(match[1].casefold())
     if not names:
         raise ValueError('Wheel lock is empty')
     return names

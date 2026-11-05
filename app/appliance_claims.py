@@ -335,7 +335,7 @@ def _possesses(claim: dict, secret: str) -> bool:
 def _find_pending_claim_for_device(device_id: str) -> dict | None:
     now_text = _now().isoformat()
     candidates = rows(
-        "SELECT * FROM appliance_claims WHERE device_id=? AND status='pending' AND expires_at>? ORDER BY created_at DESC",
+        "SELECT * FROM appliance_claims WHERE LOWER(device_id)=? AND status='pending' AND revoked_at IS NULL AND expires_at>? ORDER BY created_at DESC",
         (device_id, now_text),
     )
     return candidates[0] if candidates else None
@@ -346,7 +346,7 @@ def _find_claim_by_code(claim_code: str) -> dict | None:
     module's docstring for why an indexed exact lookup is deliberately
     not used here."""
     now_text = _now().isoformat()
-    for candidate in rows("SELECT * FROM appliance_claims WHERE status='pending' AND expires_at>?", (now_text,)):
+    for candidate in rows("SELECT * FROM appliance_claims WHERE status='pending' AND revoked_at IS NULL AND expires_at>?", (now_text,)):
         if verify_password(claim_code, candidate['claim_code_hash']):
             return candidate
     return None
@@ -384,6 +384,8 @@ def _expire_if_due(claim: dict) -> dict:
         one-way and needed for audit-trail purposes, matching
         appliance_activation_tokens's own forever-retention of used/
         expired token hashes)."""
+    if claim.get('revoked_at'):
+        return {**claim, 'status':'revoked', 'claim_proof_encrypted':None, 'claim_proof_plaintext':None}
     if claim['status'] == 'pending':
         if _still_valid(claim['expires_at']):
             return claim
@@ -567,6 +569,12 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         existing_appliance = row('SELECT id FROM appliances WHERE cloud_id=?', (device_id.upper(),))
         if existing_appliance:
             raise HTTPException(status_code=409, detail='This device is already provisioned. Use the existing activation flow.')
+        # Refuse to create or resume sessions unless the database enforces the
+        # device reservation. This guard is read-only and never runs migrations.
+        from gateway_schema_readiness import claim_session_index_ready
+        with connection() as db:
+            if not claim_session_index_ready(db):
+                raise HTTPException(status_code=503, detail='Claim service is awaiting schema readiness.')
         resumable = _find_pending_claim_for_device(device_id)
         if resumable:
             # Only the appliance that opened this claim may resume it: a
@@ -580,8 +588,10 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             # expired. The previous code stops working; same expiry.
             claim_code = _generate_claim_code()
             with connection() as db:
-                db.execute("UPDATE appliance_claims SET claim_code_hash=? WHERE id=? AND status='pending'",
-                           (password_hash(claim_code), resumable['id']))
+                changed = db.execute("UPDATE appliance_claims SET claim_code_hash=? WHERE id=? AND status='pending' AND revoked_at IS NULL AND expires_at>? AND claim_code_hash=?",
+                           (password_hash(claim_code), resumable['id'], _now().isoformat(), resumable['claim_code_hash'])).rowcount
+                if changed != 1:
+                    raise HTTPException(status_code=409, detail='Claim changed; retry.')
                 if verifier:
                     db.execute("UPDATE appliance_claims SET label_verifier_hash=? WHERE id=? AND status='pending'",
                                (password_hash(verifier), resumable['id']))
@@ -611,11 +621,17 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         now = _now()
         expires_at = (now + timedelta(minutes=CLAIM_SESSION_TTL_MINUTES)).isoformat()
         with connection() as db:
-            db.execute(
-                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash,label_verifier_hash) VALUES(?,?,?,?,?,?,?,?,?)',
+            # Expire only the stale sessions for this device, clearing any
+            # recoverable claim proof before reserving a new session.
+            db.execute("UPDATE appliance_claims SET status='expired',claim_proof_encrypted=NULL,claim_proof_plaintext=NULL WHERE LOWER(device_id)=? AND revoked_at IS NULL AND ((status='pending' AND expires_at<=?) OR (status='claimed' AND (proof_expires_at IS NULL OR proof_expires_at<=?)))",
+                       (device_id,now.isoformat(),now.isoformat()))
+            changed = db.execute(
+                'INSERT INTO appliance_claims(id,device_id,claim_session_id,claim_code_hash,status,expires_at,created_at,device_secret_hash,label_verifier_hash) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING',
                 (claim_id, device_id, claim_session_id, password_hash(claim_code), 'pending', expires_at, now.isoformat(), password_hash(device_secret),
                  password_hash(verifier) if verifier else None),
-            )
+            ).rowcount
+            if changed != 1:
+                raise HTTPException(status_code=409, detail='A claim is already in progress for this device; retry.')
         # Never log the session id: it is a bearer value for this claim.
         logger.info('Claim session opened claim_id=%s', claim_id)
         answer = {
@@ -748,9 +764,9 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
         with connection() as db:
             changed = db.execute(
                 "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_encrypted=?,proof_expires_at=? "
-                f"WHERE id=? AND status='pending' AND {matched_column}=?",
+                f"WHERE id=? AND status='pending' AND revoked_at IS NULL AND expires_at>? AND {matched_column}=?",
                 (identity['customer_id'], site_id, identity.get('email'), now.isoformat(), password_hash(claim_proof), encrypted_proof, proof_expires_at, claim['id'],
-                 claim[matched_column]),
+                 now.isoformat(), claim[matched_column]),
             ).rowcount
         if changed != 1:
             raise HTTPException(status_code=409, detail='Claim is no longer pending (already claimed or expired).')
@@ -786,7 +802,7 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             raise HTTPException(status_code=400, detail='claim_session_id and claim_proof are required.')
         device_secret = _device_secret(payload)
         claim = row('SELECT * FROM appliance_claims WHERE claim_session_id=?', (claim_session_id,))
-        if (not claim or not _possesses(claim, device_secret) or not claim.get('claim_proof_hash')
+        if (not claim or claim.get('revoked_at') or not _possesses(claim, device_secret) or not claim.get('claim_proof_hash')
                 or not verify_password(claim_proof, claim['claim_proof_hash'])):
             raise HTTPException(status_code=403, detail='Claim is not ready to be completed.')
         if claim['status'] == 'completed':
@@ -818,8 +834,8 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             # closed with 409, never a second appliances row or a
             # second credential.
             changed = db.execute(
-                "UPDATE appliance_claims SET status='completed',completed_at=?,claim_proof_encrypted=NULL WHERE id=? AND status='claimed'",
-                (now.isoformat(), claim['id']),
+                "UPDATE appliance_claims SET status='completed',completed_at=?,claim_proof_encrypted=NULL WHERE id=? AND status='claimed' AND revoked_at IS NULL AND proof_expires_at>?",
+                (now.isoformat(), claim['id'], now.isoformat()),
             ).rowcount
             if changed != 1:
                 raise HTTPException(status_code=409, detail='Claim proof was already used.')
@@ -845,6 +861,12 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             db.execute('UPDATE appliances SET capacity_identity_transition_json=? WHERE id=?',
                        (json.dumps(initial_transition, sort_keys=True, separators=(',', ':')), appliance_id))
             db.execute('UPDATE appliance_claims SET appliance_id=? WHERE id=?', (appliance_id, claim['id']))
+            # Default-off until the additive schema and recovery path have
+            # passed isolated acceptance. The ID is not a possession proof.
+            import gateway_stable_claim_id
+            if gateway_stable_claim_id.STABLE_CLAIM_ID_READY:
+                gateway_stable_claim_id.issue_after_verified_claim(db,appliance_id=appliance_id,
+                    customer_id=claim['customer_id'],completed_claim_id=claim['id'])
             credential = secrets.token_urlsafe(48)
             credential_id = secrets.token_hex(8)
             db.execute(

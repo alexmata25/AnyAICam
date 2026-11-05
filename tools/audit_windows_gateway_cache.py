@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.audit_windows_gateway_prerequisites import pinned_inputs
+from tools.audit_windows_gateway_prerequisites import locked_wheels, pinned_inputs
 
 
 def normalize(name):
@@ -76,10 +76,10 @@ def audit(root, cache_roots):
     for name in ('requirements.txt', 'requirements-cpu.txt', 'requirements-push.txt'):
         top.update(requirements((root / name).read_text(encoding='utf-8-sig')))
     locks = {}
-    for line in (win / 'wheels.lock.sha256').read_text(encoding='utf-8-sig').splitlines():
+    lock_source = (win / 'wheels.lock.sha256').read_text(encoding='utf-8-sig')
+    locked_wheels(lock_source)
+    for line in lock_source.splitlines():
         digest, name = line.split('  ', 1)
-        if not re.fullmatch('[0-9a-f]{64}', digest) or Path(name).name != name:
-            raise ValueError('Invalid wheel lock')
         locks[name] = digest
     build_source = (win / 'build.ps1').read_text(encoding='utf-8-sig')
     vendor_names = pinned_inputs(build_source)

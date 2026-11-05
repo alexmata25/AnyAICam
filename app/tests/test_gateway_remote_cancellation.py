@@ -27,6 +27,13 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         env = patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'cloud_gateway',
             pm.PRODUCT_MODE_ENV:'hybrid', pm.BOOTSTRAP_MODE_ENV:'hybrid', 'ANYAICAM_LIVE_P2P_ENABLED':'true'})
         env.start(); self.addCleanup(env.stop)
+        # These mode tests isolate authorization transitions from lease
+        # cryptography, which has its own dedicated fixture coverage.
+        import local_gateway_remote_lease as lease
+        verifier = patch.object(lease, 'accept', return_value=True)
+        verifier.start(); self.addCleanup(verifier.stop)
+        validity = patch.object(lease, 'allowed', return_value=True)
+        validity.start(); self.addCleanup(validity.stop)
         denied = patch.object(pm, '_GATEWAY_REMOTE_DENIED', False)
         denied.start(); self.addCleanup(denied.stop)
 
@@ -99,7 +106,7 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
                 with self.subTest(edition=edition, operation=operation), patch.dict(os.environ, {
                         'ANYAICAM_GATEWAY_EDITION':edition,
                         'ANYAICAM_WIREGUARD_GATEWAY_ADDRESS':'10.70.0.1'}):
-                    pm.apply_configuration_mode({'product_mode':'hybrid'})
+                    pm.apply_configuration_mode({'product_mode':'hybrid', 'local_gateway_remote_access':True})
                     def failed_io(*args):
                         self.assertFalse(pm.remote_access_authorized())
                         raise OSError('fixture cancellation write failure')
@@ -157,8 +164,8 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
         load_functions('main.py', {'camera_url', '_customer_recording_url', '_customer_local_recording_path'}, ns)
         for edition in ('local_gateway', 'cloud_gateway'):
             with self.subTest(edition=edition), patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':edition}):
-                capacity = vms_capacity._record({'camera_slot_quantity':0, 'vms_license_capacity':1}, 'signed')
-                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                capacity = vms_capacity._record({'camera_slot_quantity':0, 'vms_license_capacity':1, 'purchased_vms_license_capacity':1}, 'signed')
+                pm.apply_configuration_mode({'product_mode':'hybrid', 'local_gateway_remote_access':True})
                 with patch.object(pm.os, 'replace', side_effect=OSError('fixture cancellation failure')):
                     with self.assertRaises(OSError):
                         pm.apply_configuration_mode({'product_mode':''})
@@ -170,6 +177,68 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
                         ns['camera_url'](2)
                     self.assertEqual(ns['_customer_recording_url']('c1', 'r1'), '/api/customer/recordings/c1/r1/local')
                 cloud.assert_not_called()
+
+    def test_local_gateway_cancel_and_reactivate_do_not_mutate_signed_capacity(self):
+        import vms_capacity
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway',
+                                     pm.PRODUCT_MODE_ENV: ''}):
+            grant = {'camera_slot_quantity': 0, 'plan_camera_slots': 0,
+                     'vms_license_capacity': 3, 'purchased_vms_license_capacity': 3}
+            capacity = vms_capacity._record(grant, 'signed')
+            with patch.object(vms_capacity, 'load_capacity', return_value=capacity):
+                pm.apply_configuration_mode({'product_mode': 'hybrid', 'local_gateway_remote_access': True})
+                self.assertTrue(pm.remote_access_authorized())
+                pm.apply_configuration_mode({'product_mode': 'hybrid', 'local_gateway_remote_access': False})
+                self.assertFalse(pm.remote_access_authorized())
+                self.assertEqual(vms_capacity.licensed_camera_numbers([1, 2, 3, 4]), [1, 2, 3])
+                pm.apply_configuration_mode({'product_mode': 'hybrid', 'local_gateway_remote_access': True})
+                self.assertTrue(pm.remote_access_authorized())
+                self.assertEqual(vms_capacity.licensed_camera_numbers([1, 2, 3, 4]), [1, 2, 3])
+            self.assertEqual(grant['vms_license_capacity'], 3)
+
+    def test_remote_denial_states_preserve_local_licensed_cameras(self):
+        import vms_capacity
+        grant = {'camera_slot_quantity':0, 'plan_camera_slots':0,
+                 'vms_license_capacity':3, 'purchased_vms_license_capacity':3}
+        signed_capacity = vms_capacity._record(grant, 'signed')
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'local_gateway', pm.PRODUCT_MODE_ENV:''}), \
+                patch.object(vms_capacity, 'load_capacity', return_value=signed_capacity):
+            for state in ('pending', 'canceled', 'expired', 'suspended'):
+                with self.subTest(remote_state=state):
+                    pm.apply_configuration_mode({'local_gateway_remote_access':False})
+                    self.assertFalse(pm.remote_access_authorized())
+                    self.assertEqual(vms_capacity.licensed_camera_numbers([1,2,3,4]), [1,2,3])
+                    self.assertEqual(grant['purchased_vms_license_capacity'], 3)
+
+    def test_local_gateway_legacy_hybrid_cannot_grant_remote_access(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway',
+                                     pm.PRODUCT_MODE_ENV: 'hybrid'}):
+            pm.persist_mode('hybrid')
+            self.assertFalse(pm.remote_access_authorized())
+            pm.apply_configuration_mode({'product_mode': 'hybrid',
+                                         'local_gateway_remote_access': False})
+            self.assertFalse(pm.remote_access_authorized())
+            pm.apply_configuration_mode({'product_mode': 'hybrid'})
+            self.assertFalse(pm.remote_access_authorized())
+            pm.apply_configuration_mode({'product_mode': 'local',
+                                         'local_gateway_remote_access': True})
+            self.assertTrue(pm.remote_access_authorized())
+
+    def test_failed_cancellation_then_restart_needs_fresh_authenticated_grant(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION':'local_gateway',
+                                     pm.PRODUCT_MODE_ENV:''}):
+            pm.apply_configuration_mode({'local_gateway_remote_access':True})
+            self.assertTrue(pm.remote_access_authorized())
+            with patch.object(pm.os, 'replace', side_effect=OSError('write failed')):
+                with self.assertRaises(OSError):
+                    pm.apply_configuration_mode({'local_gateway_remote_access':False})
+            self.assertFalse(pm.remote_access_authorized())
+            # Simulate new-process initialization with the old hybrid file intact.
+            with patch.object(pm, '_GATEWAY_REMOTE_DENIED', False), \
+                    patch.object(pm, '_LOCAL_GATEWAY_VERIFIED_THIS_PROCESS', False):
+                self.assertFalse(pm.remote_access_authorized())
+                pm.apply_configuration_mode({'local_gateway_remote_access':True})
+                self.assertTrue(pm.remote_access_authorized())
 
     def test_existing_renewal_grace_deadline_is_not_redefined(self):
         ns = {'datetime':datetime, 'GRACE_PERIOD':timedelta(days=7)}
@@ -259,6 +328,9 @@ class GatewayRemoteCancellationTests(unittest.TestCase):
             pm.persist_mode('hybrid')
             self.assertFalse(pm.apply_configuration_mode({'product_mode':''}))
             self.assertTrue(pm._resolve('ANYAICAM_LIVE_P2P_ENABLED', False))
+            # Full VMS uses its established remote path; Gateway decision
+            # schema availability is not consulted for this edition.
+            self.assertTrue(pm.remote_access_authorized())
 
     def test_malformed_mode_state_fails_closed(self):
         pm.STATE_FILE.write_text('[]', encoding='utf-8')

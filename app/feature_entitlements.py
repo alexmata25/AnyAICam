@@ -226,6 +226,10 @@ def appliance_snapshot(appliance: dict, *, now: datetime | None = None) -> dict:
     # large legacy license cannot make the entire signed snapshot invalid.
     camera_capacity = {field: min(MAX_CAMERA_SLOTS, max(0, int(breakdown.get(field) or 0)))
                        for field in ("camera_slot_quantity", "plan_camera_slots", "vms_license_capacity")}
+    # A Local Gateway's purchased licence must not inherit v2 plan quantity.
+    purchased = customer_entitlements._purchased_vms_license_capacity(
+        customer_entitlements.get_entitlements_for_customer(customer_id)) if customer_id else 0
+    camera_capacity["purchased_vms_license_capacity"] = min(MAX_CAMERA_SLOTS, max(0, purchased))
     identity = {"appliance_id": str(appliance.get("id") or ""),
                 "cloud_id": str(appliance.get("cloud_id") or ""),
                 "customer_id": str(customer_id or "")}

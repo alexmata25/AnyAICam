@@ -999,7 +999,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         analytics_snapshot=feature_entitlements.analytics_entitlement_snapshot(appliance,authorized_analytics,lab_expiries=lab_expiries)
         with connection() as db:
             signing_public_keys=_identity_keys.active_public_keys(db)
-        return {'feature_entitlements':entitlement_snapshot,'analytics_entitlements':analytics_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
+        from local_gateway_remote_billing import issue_remote_lease
+        local_gateway_lease = issue_remote_lease(appliance, request.headers.get('x-request-nonce', ''))
+        return {'local_gateway_remote_access':bool(local_gateway_lease),'local_gateway_remote_lease':local_gateway_lease,'feature_entitlements':entitlement_snapshot,'analytics_entitlements':analytics_snapshot,'signing_public_keys':signing_public_keys,'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'usable_camera_capacity':__import__('customer_entitlements').capacity_breakdown(appliance['customer_id']) if appliance.get('customer_id') else {'camera_slot_quantity':0},'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -2111,7 +2113,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=403,detail='Provisioning job does not belong to this appliance.')
         success=bool(payload.get('success')); message=str(payload.get('message',''))[:500]; failure_code=None
         now=datetime.now().isoformat(); camera_id=None
-        with connection() as db:
+        from partner_db import transaction
+        with transaction() as db:
             from database_backend import lock_customer_camera_capacity
             if not lock_customer_camera_capacity(db,job['customer_id']):
                 raise HTTPException(status_code=404,detail='Customer not found.')
@@ -2142,8 +2145,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if success:
                 already_known=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
                 if not already_known:
-                    from customer_entitlements import capacity_refusal, usable_camera_capacity
-                    slot_limit=usable_camera_capacity(job['customer_id'])
+                    from customer_entitlements import capacity_refusal, usable_camera_capacity_for_appliance
+                    slot_limit=usable_camera_capacity_for_appliance(job['customer_id'], appliance['id'])
                     configured=db.execute('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',(job['customer_id'],)).fetchone()['n']
                     if configured>=slot_limit:
                         success=False
@@ -2192,7 +2195,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # duplicate-path bug) and has been deleted -- this is now
                 # the only camera-creation implementation, so there is
                 # nothing left to stay consistent with.
-                existing=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
+                existing=db.execute('SELECT id,appliance_id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
                 if existing:
                     # The same physical camera, rediscovered -- possibly
                     # via a different appliance than whichever one last
@@ -2204,6 +2207,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     # never left pointing at a stale appliance/site after
                     # a successful reprovision.
                     camera_id=existing['id']
+                    if existing['appliance_id'] != appliance['id']:
+                        from cloud_gateway_camera_entitlements import retire_for_camera_transition
+                        retire_for_camera_transition(db,{'email':appliance['cloud_id'],'role':'appliance'},
+                            customer_id=job['customer_id'],appliance_id=existing['appliance_id'],
+                            camera_id=camera_id,reason='appliance_reassigned')
                     db.execute(
                         "UPDATE cameras SET name=?,appliance_id=?,site_id=?,status='configured',local_recording_mode='event' WHERE id=?",
                         (job['camera_name'],appliance['id'],job['site_id'],camera_id),
@@ -2237,6 +2245,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     ).fetchone()
                     if placeholder:
                         camera_id=placeholder['id']
+                        from cloud_gateway_camera_entitlements import retire_for_camera_transition
+                        retire_for_camera_transition(db,{'email':appliance['cloud_id'],'role':'appliance'},
+                            customer_id=job['customer_id'],appliance_id=appliance['id'],
+                            camera_id=camera_id,reason='camera_replaced')
                         db.execute(
                             "UPDATE cameras SET device_key=?,name=?,status='configured',local_recording_mode='event' WHERE id=?",
                             (job['device_key'],job['camera_name'],camera_id),
@@ -2262,6 +2274,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     candidate=next_number
                     if candidate is None:
                         raise RuntimeError('Camera provisioning has no reserved camera number.')
+                    if existing:
+                        from cloud_gateway_camera_entitlements import retire_for_camera_transition
+                        retire_for_camera_transition(db,{'email':appliance['cloud_id'],'role':'appliance'},
+                            customer_id=job['customer_id'],appliance_id=appliance['id'],
+                            camera_id=camera_id,reason='camera_replaced')
                     from camera_mapping import assign_camera_number
                     assign_camera_number(db,camera_id,candidate,appliance_id=appliance['id'],customer_id=job['customer_id'])
                 # A successful job must never be recorded without a valid

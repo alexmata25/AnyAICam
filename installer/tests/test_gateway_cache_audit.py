@@ -7,6 +7,18 @@ from tools.audit_windows_gateway_cache import audit, bounded_match, inventory, r
 
 
 class GatewayCacheAuditTests(unittest.TestCase):
+    def test_cache_inventory_rejects_ambiguous_or_unsafe_wheel_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); win = root / 'installer/windows'; win.mkdir(parents=True)
+            (win / 'requirements-windows.txt').write_text('')
+            (win / 'build.ps1').write_text("$pinned = [ordered]@{\n'a.zip' = '" + 'b' * 64 + "'\n}")
+            for name in ('requirements.txt','requirements-cpu.txt','requirements-push.txt'):
+                (root / name).write_text('')
+            digest = 'a' * 64
+            for lock in (f'{digest}  a.whl\n{digest}  A.whl\n', f'{digest}  C:outside.whl\n', ''):
+                (win / 'wheels.lock.sha256').write_text(lock)
+                with self.subTest(lock=lock), self.assertRaises(ValueError): audit(root, [])
+
     def test_package_normalization_and_cpu_versions(self):
         self.assertEqual(requirements('typing_extensions==4.16.0\n# comment'), {'typing-extensions': '4.16.0'})
         with tempfile.TemporaryDirectory() as folder:

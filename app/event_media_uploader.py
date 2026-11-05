@@ -454,6 +454,23 @@ def upload_motion_event_media(
         )
         return False
 
+    def gateway_handoff_authorized():
+        if current_edition() != "cloud_gateway":
+            return True
+        try:
+            if not _edition_upload_allowed():
+                return False
+            recording_upload._refresh_camera_map()
+            latest = recording_upload._camera_identity(camera_number)
+            return (isinstance(latest, dict) and latest.get("camera_id") == camera_id
+                    and _event_camera_authorized(camera_number, latest))
+        except Exception:
+            return False
+
+    if not gateway_handoff_authorized():
+        logger.warning("event_media.authorization_changed event_id=%s camera=%s", event_id, camera_number)
+        return False
+
     if recording_upload.boto3 is None:
         logger.warning(
             "event_media.boto3_missing event_id=%s",
@@ -486,6 +503,10 @@ def upload_motion_event_media(
 
     clip_key = base_key + ".mp4"
 
+    if not gateway_handoff_authorized():
+        logger.warning("event_media.authorization_changed event_id=%s camera=%s", event_id, camera_number)
+        return False
+
     client.upload_file(
         str(clip_path),
         session["bucket"],
@@ -496,6 +517,9 @@ def upload_motion_event_media(
     thumbnail_key = None
 
     if thumbnail_path is not None:
+        if not gateway_handoff_authorized():
+            logger.warning("event_media.authorization_changed event_id=%s camera=%s", event_id, camera_number)
+            return False
         thumbnail_key = base_key + ".jpg"
 
         try:

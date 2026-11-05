@@ -74,11 +74,10 @@ $vcRedist = Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor 'vc_redist
 if ($vcRedist.Status -ne 'Valid' -or $vcRedist.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { throw 'vc_redist.x64-14.44.35211.exe is not validly signed by Microsoft Corporation.' }
 $wheelRoot = Join-Path $vendor 'wheels'
 $lockedWheels = @()
-foreach ($line in Get-Content (Join-Path $PSScriptRoot 'wheels.lock.sha256')) {
-    $parts = $line -split '  ', 2
-    $wheel = Join-Path $wheelRoot $parts[1]
-    if (-not (Test-Path $wheel) -or (Get-FileHash -Algorithm SHA256 $wheel).Hash.ToLowerInvariant() -ne $parts[0]) { throw "Wheel checksum failed: $($parts[1])" }
-    $lockedWheels += $parts[1]
+foreach ($entry in @(Read-BuildWheelLock (Join-Path $PSScriptRoot 'wheels.lock.sha256'))) {
+    $wheel = Join-Path $wheelRoot $entry.Name
+    if (-not (Test-Path -LiteralPath $wheel -PathType Leaf) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $wheel).Hash.ToLowerInvariant() -ne $entry.Sha256) { throw "Wheel checksum failed: $($entry.Name)" }
+    $lockedWheels += $entry.Name
 }
 $vendorProblems = @(Get-VendorProblems $vendor @($pinned.Keys) $lockedWheels)
 if ($vendorProblems.Count) { throw ("vendor/ holds files that are not pinned (they would be packaged):`n  " + ($vendorProblems -join "`n  ")) }

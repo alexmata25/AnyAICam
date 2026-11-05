@@ -97,7 +97,7 @@ def _set_addon(addon: dict, status: str, reason: str | None) -> None:
     analytics_entitlements.apply_addon_state(addon, status=status, suspended_reason=reason)
 
 
-def _suspend(subscription_id: str, reason: str) -> int:
+def _suspend(subscription_id: str, reason: str, *, include_local: bool = True) -> int:
     changed = 0
     for plan in _plan_rows(subscription_id):
         if plan["status"] == "active":
@@ -112,6 +112,9 @@ def _suspend(subscription_id: str, reason: str) -> int:
         changed += per_camera_billing._suspend(subscription_id, reason)
     except Exception:
         pass  # retain compatibility with databases before billing v2
+    if include_local:
+        import local_gateway_remote_billing
+        changed += local_gateway_remote_billing.suspend_subscription(subscription_id, reason)
     if changed:
         logger.info("billing.suspended subscription=%s reason=%s rows=%s", subscription_id, reason, changed)
         from purchase_notifications import notify_service_suspended
@@ -119,7 +122,7 @@ def _suspend(subscription_id: str, reason: str) -> int:
     return changed
 
 
-def _restore(subscription_id: str, reasons: tuple[str, ...]) -> int:
+def _restore(subscription_id: str, reasons: tuple[str, ...], *, clear_local_failure: bool = False) -> int:
     changed = 0
     for plan in _plan_rows(subscription_id):
         if plan["status"] == "suspended" and plan.get("suspended_reason") in reasons:
@@ -134,6 +137,9 @@ def _restore(subscription_id: str, reasons: tuple[str, ...]) -> int:
         changed += per_camera_billing._restore(subscription_id, reasons)
     except Exception:
         pass
+    import local_gateway_remote_billing
+    changed += local_gateway_remote_billing.restore_subscription(
+        subscription_id, reasons, clear_failure=clear_local_failure)
     return changed
 
 
@@ -155,6 +161,8 @@ def mark_payment_failed(subscription_id: str, *, at=None) -> None:
         per_camera_billing._set_subscription_payment_failed(subscription_id, at)
     except Exception:
         pass
+    import local_gateway_remote_billing
+    local_gateway_remote_billing.set_payment_failed(subscription_id, stamp)
 
 
 def payment_recovered(subscription_id: str, reasons: tuple[str, ...] = RESTORED_BY_PAYMENT) -> int:
@@ -164,7 +172,7 @@ def payment_recovered(subscription_id: str, reasons: tuple[str, ...] = RESTORED_
             db.execute("UPDATE addon_subscriptions SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
         except Exception:
             pass
-    changed = _restore(subscription_id, reasons)
+    changed = _restore(subscription_id, reasons, clear_local_failure=True)
     try:
         import per_camera_billing
         changed += per_camera_billing._resume_paid(subscription_id)
@@ -181,7 +189,7 @@ def _has_refunded_rows(subscription_id: str) -> bool:
     if row("SELECT 1 FROM customer_entitlements WHERE stripe_subscription_id=? AND status='suspended' "
            "AND suspended_reason='refunded' AND product<>'vms_license'", (subscription_id,)):
         return True
-    for table in ("addon_subscriptions", "camera_plan_entitlements_v2"):
+    for table in ("addon_subscriptions", "camera_plan_entitlements_v2", "local_gateway_remote_subscriptions"):
         try:
             if row(f"SELECT 1 FROM {table} WHERE stripe_subscription_id=? AND status='suspended' AND suspended_reason='refunded'",
                    (subscription_id,)):
@@ -234,6 +242,12 @@ def sweep_grace(now: datetime | None = None, *, customer_id: str | None = None) 
                        f"AND payment_failed_at<=?{v2_scope}", (cutoff, *v2_args))
         for plan in v2_rows:
             changed += _suspend(str(plan["stripe_subscription_id"]), "payment_failed")
+        import local_gateway_remote_billing
+        if local_gateway_remote_billing._table_available():
+            for remote in rows("SELECT stripe_subscription_id FROM local_gateway_remote_subscriptions "
+                               "WHERE status='active' AND payment_failed_at IS NOT NULL "
+                               f"AND payment_failed_at<=?{scope}", (cutoff, *args)):
+                changed += _suspend(str(remote["stripe_subscription_id"]), "payment_failed")
         for addon in rows("SELECT * FROM addon_subscriptions WHERE status='active' AND payment_failed_at IS NOT NULL "
                           f"AND payment_failed_at<=?{scope}", (cutoff, *args)):
             _set_addon(addon, "suspended", "payment_failed")
@@ -713,11 +727,37 @@ def _reverse_purchase_locked(charge_id: str, intent: str, invoice_id: str, reaso
         accounts = stripe_state.stripe_customer_accounts(found["stripe_customer_id"])
         licences = _reverse_initial_licence(found["invoice_id"], subscription_id, intent, reason, first=True,
                                             customer_ids=accounts)
-        if _plan_rows(subscription_id) or _addon_rows(subscription_id) or row(
-                "SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (subscription_id,)):
-            return {"status": "suspended", "rows": _suspend(subscription_id, reason) + licences}
+        import local_gateway_remote_billing
+        has_local = (local_gateway_remote_billing._table_available() and
+                     row("SELECT appliance_id FROM local_gateway_remote_subscriptions WHERE stripe_subscription_id=?",
+                         (subscription_id,)))
+        plans, addons = _plan_rows(subscription_id), _addon_rows(subscription_id)
+        cameras = row("SELECT id FROM camera_plan_entitlements_v2 WHERE stripe_subscription_id=?", (subscription_id,))
+        local_current = bool(has_local)
+        if has_local:
+            # Only exclude Local Gateway when a different, current paid invoice
+            # has already been recorded locally and has no known reversal.
+            # Do not acquire new payment locks while holding the old payment's locks.
+            from urllib.parse import quote
+            current = stripe_state.current_subscription(subscription_id)
+            latest_id = stripe_state._id((current or {}).get("latest_invoice"))
+            if (current and current.get("id") == subscription_id and current.get("status") == "active"
+                    and stripe_state._id(current.get("customer")) == found["stripe_customer_id"]
+                    and latest_id and latest_id != found["invoice_id"]):
+                latest_payment = row("SELECT * FROM subscription_payments WHERE id=? AND stripe_subscription_id=?", (latest_id, subscription_id))
+                if (latest_payment and latest_payment.get("status") == "paid"
+                        and latest_payment.get("stripe_customer_id") == found["stripe_customer_id"]):
+                    latest_invoice = stripe_state.stripe_get(f"/v1/invoices/{quote(latest_id, safe='')}", "the current subscription invoice")
+                    if (latest_invoice.get("id") == latest_id and latest_invoice.get("status") == "paid"
+                            and not _is_reversed(str(latest_payment.get("stripe_charge_id") or ""),
+                                                 str(latest_payment.get("stripe_payment_intent_id") or ""), latest_id)):
+                        local_current = False
+        if plans or addons or cameras or local_current:
+            return {"status": "suspended", "rows": _suspend(subscription_id, reason, include_local=local_current) + licences}
         if licences:
             return {"status": "suspended", "rows": licences}
+        if has_local and not local_current:
+            return {"status": "ignored", "reason": "an earlier period; the current Local Gateway period is paid"}
         if intent and row("SELECT id FROM customer_entitlements WHERE stripe_payment_intent_id=? AND product='vms_license'", (intent,)):
             return {"status": "ignored", "reason": "already applied to the licence bought with this payment"}
         # Nothing granted from this invoice yet: the durable record above is applied when it is (2xx, not retried).

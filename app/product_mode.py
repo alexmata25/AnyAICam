@@ -94,6 +94,8 @@ STATE_FILE = Path(os.environ.get(
 # A received cancellation must stop this process's remote access even when
 # the state disk refuses the update. This is not a durable revocation proof.
 _GATEWAY_REMOTE_DENIED = False
+# A cached grant is insufficient after process restart; require a fresh authenticated sync.
+_LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = False
 _GATEWAY_MODE_APPLY_LOCK = threading.Lock()
 
 
@@ -131,6 +133,15 @@ def is_hybrid() -> bool:
     return current_mode() == "hybrid"
 
 
+def _local_gateway_remote_grant() -> bool:
+    """Only an authenticated, durably stored appliance-specific grant is valid."""
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        return isinstance(data, dict) and data.get("local_gateway_remote_access") is True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def remote_access_authorized() -> bool:
     """A Gateway's local licence/bootstrap/override is not a remote-service grant."""
     from gateway_edition import current_edition
@@ -138,6 +149,11 @@ def remote_access_authorized() -> bool:
         return True
     if _GATEWAY_REMOTE_DENIED:
         return False
+    if current_edition() == "local_gateway":
+        import local_gateway_remote_lease
+        if (not _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS or not _local_gateway_remote_grant()
+                or not local_gateway_remote_lease.allowed()):
+            return False
     try:
         return _read_persisted_mode() == "hybrid" and current_mode() == "hybrid"
     except (OSError, ValueError, TypeError, AttributeError):
@@ -164,11 +180,36 @@ def apply_configuration_mode(configuration: dict) -> bool:
     mode = str(configuration.get("product_mode") or "").strip().lower()
     if current_edition() == "full_vms":
         return persist_mode(mode)
+    if current_edition() == "local_gateway":
+        # No customer-wide product mode, local override or omitted field can
+        # issue a system-specific remote grant.
+        import local_gateway_remote_lease
+        global _GATEWAY_REMOTE_DENIED, _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS
+        with _GATEWAY_MODE_APPLY_LOCK:
+            granted = (configuration.get("local_gateway_remote_access") is True and
+                       local_gateway_remote_lease.accept(
+                           configuration.get("local_gateway_remote_lease"),
+                           configuration.get("_local_gateway_request_nonce")))
+            mode = "hybrid" if granted else "local"
+            if not granted:
+                local_gateway_remote_lease.clear()
+                _GATEWAY_REMOTE_DENIED = True
+                _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = False
+            try:
+                changed = persist_mode(mode, local_gateway_remote_access=granted)
+            except Exception:
+                local_gateway_remote_lease.clear()
+                _GATEWAY_REMOTE_DENIED = True
+                _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = False
+                raise
+            if granted:
+                _GATEWAY_REMOTE_DENIED = False
+                _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = True
+            return changed
     if "product_mode" not in configuration:
         return False  # omission cannot undo a previously received cancellation
     if mode not in VALID_MODES:
         mode = "local"  # no active remote plan; preserve the signed local licence
-    global _GATEWAY_REMOTE_DENIED
     with _GATEWAY_MODE_APPLY_LOCK:
         if mode == "local":
             _GATEWAY_REMOTE_DENIED = True
@@ -178,7 +219,7 @@ def apply_configuration_mode(configuration: dict) -> bool:
         return changed
 
 
-def persist_mode(mode: str) -> bool:
+def persist_mode(mode: str, *, local_gateway_remote_access: bool | None = None) -> bool:
     """Called by edge_camera_sync.py when the cloud's own
     GET /api/appliance/configuration response reports a product_mode
     different from what this appliance already has persisted -- e.g.
@@ -202,7 +243,8 @@ def persist_mode(mode: str) -> bool:
     if mode not in VALID_MODES:
         return False
     previous = _read_persisted_mode()
-    if previous == mode:
+    if previous == mode and (local_gateway_remote_access is None or
+                             _local_gateway_remote_grant() == local_gateway_remote_access):
         return False
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Readers include the live remote-access guard. Publish only complete,
@@ -212,7 +254,10 @@ def persist_mode(mode: str) -> bool:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"mode": mode}))
+            state = {"mode": mode}
+            if local_gateway_remote_access is not None:
+                state["local_gateway_remote_access"] = local_gateway_remote_access
+            handle.write(json.dumps(state))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, STATE_FILE)

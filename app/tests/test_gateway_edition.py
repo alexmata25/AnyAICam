@@ -22,6 +22,13 @@ class GatewayEditionTests(unittest.TestCase):
         state = patch.object(pm, 'STATE_FILE', Path(self.temp.name) / 'mode.json')
         state.start()
         self.addCleanup(state.stop)
+        # These mode tests isolate authorization transitions from lease
+        # cryptography, which has its own dedicated fixture coverage.
+        import local_gateway_remote_lease as lease
+        verifier = patch.object(lease, 'accept', return_value=True)
+        verifier.start(); self.addCleanup(verifier.stop)
+        validity = patch.object(lease, 'allowed', return_value=True)
+        validity.start(); self.addCleanup(validity.stop)
         denied = patch.object(pm, '_GATEWAY_REMOTE_DENIED', False)
         denied.start()
         self.addCleanup(denied.stop)
@@ -76,6 +83,15 @@ class GatewayEditionTests(unittest.TestCase):
             for kind in ('recording', 'live', 'backup'):
                 self.assertFalse(edition.video_transport_allowed(kind))
 
+    def test_cloud_video_page_reports_opt_in_without_promising_camera_access(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        self.assertIn('Event upload is disabled', edition.cloud_recording_page_html())
+        with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED': 'true'}):
+            page = edition.cloud_recording_page_html()
+            self.assertIn('Event upload is configured', page)
+            self.assertIn('each camera still needs an eligible plan and permission', page)
+            self.assertIn('Continuous recording backups and live video uploads are unavailable', page)
+
     def test_full_vms_preserves_explicit_video_flags(self):
         for flag in edition.VIDEO_FLAGS:
             for enabled in (True, False):
@@ -89,6 +105,10 @@ class GatewayEditionTests(unittest.TestCase):
         self.assertIn('uploads are disabled', edition.edition_notice_html())
         os.environ[edition.EDITION_ENV] = 'cloud_gateway'
         self.assertIn('eligible plan', edition.edition_notice_html())
+        self.assertIn('$9.99/month per camera', edition.edition_notice_html())
+        self.assertIn('Advanced analytics require separate authorization', edition.edition_notice_html())
+        with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED':'true'}):
+            self.assertIn('$9.99/month per camera', edition.edition_notice_html())
 
     def test_rendered_remote_status_tracks_configuration_without_expiring_local_licence(self):
         class VisibleText(HTMLParser):
@@ -107,7 +127,7 @@ class GatewayEditionTests(unittest.TestCase):
                     patch.object(edition, '_capacity_status', return_value=capacity):
                 pm.STATE_FILE.unlink(missing_ok=True)
                 self.assertIn('Remote access is unavailable', visible())
-                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                pm.apply_configuration_mode({'product_mode':'hybrid', 'local_gateway_remote_access':True})
                 accepted = visible()
                 self.assertIn('allowed by the last received cloud configuration', accepted)
                 self.assertIn('Subscription changes cannot be checked while offline', accepted)
@@ -120,7 +140,7 @@ class GatewayEditionTests(unittest.TestCase):
                 self.assertIn('2 camera slots', cancelled)
                 self.assertIn('Local recording, playback and Basic Motion notifications', cancelled)
                 self.assertIn('independently of remote access', cancelled)
-                pm.apply_configuration_mode({'product_mode':'hybrid'})
+                pm.apply_configuration_mode({'product_mode':'hybrid', 'local_gateway_remote_access':True})
                 self.assertIn('Remote access is allowed', visible())
                 with patch.dict(os.environ, {pm.PRODUCT_MODE_ENV:'local'}):
                     self.assertIn('Remote access is unavailable', visible())

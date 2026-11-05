@@ -1,4 +1,20 @@
 # Build tools only. No installation, PATH changes or tool execution here.
+function Read-BuildWheelLock([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Wheel lock is missing.' }
+    $entries = @(Get-Content -LiteralPath $Path)
+    if ($entries.Count -eq 0) { throw 'Wheel lock is empty.' }
+    $seen = @{}
+    $parsed = @()
+    foreach ($line in $entries) {
+        if ($line -cnotmatch '^([0-9a-f]{64})  ([A-Za-z0-9_+.-]+\.whl)$') { throw 'Wheel lock contains a malformed entry.' }
+        $digest = $Matches[1]; $name = $Matches[2]
+        if ($seen.ContainsKey($name)) { throw "Wheel lock contains a duplicate name: $name" }
+        $seen[$name] = $true
+        $parsed += [pscustomobject]@{ Name = $name; Sha256 = $digest }
+    }
+    return $parsed
+}
+
 function Resolve-BuildGit([string]$GitExe = '') {
     if ($GitExe) {
         if (-not (Test-Path -LiteralPath $GitExe -PathType Leaf)) { throw 'GitExe does not identify an existing executable.' }

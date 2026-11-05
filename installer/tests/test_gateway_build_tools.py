@@ -9,6 +9,32 @@ WIN = ROOT / 'installer/windows'
 
 
 class GatewayBuildToolsTests(unittest.TestCase):
+    def test_wheel_lock_rejects_empty_malformed_duplicate_and_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            lock = Path(folder) / 'wheels.lock.sha256'
+            script = r"""
+            $ErrorActionPreference='Stop'
+            . '%s'
+            $lock='%s'
+            $hash='a'*64
+            Set-Content -LiteralPath $lock -Value "$hash  valid-1.0-py3-none-any.whl" -Encoding ASCII
+            $items=@(Read-BuildWheelLock $lock)
+            if($items.Count -ne 1 -or $items[0].Name -ne 'valid-1.0-py3-none-any.whl') { throw 'valid lock refused' }
+            foreach($bad in @('', 'bad', "$hash  ../outside.whl", "$hash  C:\outside.whl", "$hash  pkg.whl`n$hash  PKG.whl")) {
+                Set-Content -LiteralPath $lock -Value $bad -Encoding ASCII
+                $refused=$false
+                try { [void]@(Read-BuildWheelLock $lock) } catch { $refused=$true }
+                if(-not $refused) { throw 'invalid wheel lock accepted' }
+            }
+            """ % (WIN / 'build-tools.ps1', lock)
+            result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def test_existing_wheel_lock_is_accepted_before_any_build(self):
+        script = ". '%s'; $entries=@(Read-BuildWheelLock '%s'); if($entries.Count -lt 1){throw 'empty lock'}" % (WIN / 'build-tools.ps1', WIN / 'wheels.lock.sha256')
+        result = subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],capture_output=True,text=True,timeout=30)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
     def test_compiler_metadata_refuses_wrong_patch_missing_metadata_and_non_executable(self):
         with tempfile.TemporaryDirectory() as folder:
             fake = Path(folder) / 'ISCC.exe'

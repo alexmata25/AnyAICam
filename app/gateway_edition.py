@@ -48,6 +48,8 @@ def event_camera_authorized(camera_number: int, identity: dict, provisioned: lis
     """Gateway uploads need the existing accepted camera licence as well as cloud eligibility."""
     if current_edition() == "full_vms":
         return True  # retain the existing Full VMS authorization path
+    if type(camera_number) is not int or camera_number <= 0 or not isinstance(identity, dict):
+        return False
     if not video_transport_allowed("event") or identity.get("cloud_recording_mode") != "motion":
         return False
     try:
@@ -101,7 +103,9 @@ def cloud_recording_page_html() -> str:
         return ""
     detail = ("Video stays on this computer. Cloud video uploads are disabled in Local Gateway."
               if current_edition() == "local_gateway" else
-              "Cloud Gateway supports authorized event clips and their JPEG thumbnails. Continuous recording backups and live video uploads are unavailable. Event upload stays disabled until explicitly configured and entitled.")
+              "Cloud Gateway supports authorized event clips and their JPEG thumbnails. Continuous recording backups and live video uploads are unavailable. "
+              + ("Event upload is configured; each camera still needs an eligible plan and permission."
+                 if video_transport_allowed("event") else "Event upload is disabled until explicitly configured and entitled."))
     return ('<header class="topbar"><h1>Cloud video</h1></header><section class="panel">'
             f'<p>{detail}</p><p>Local recording, playback and retention keep their existing settings.</p>'
             '<a href="/analytics">View events</a></section>')
@@ -121,6 +125,7 @@ def edition_notice_html() -> str:
     activation = (f"Camera licence: {quantity} camera slots. Accepted capacity remains available offline."
                   if licensed else "Camera licence required. Link this computer online once, then verify its accepted camera capacity.")
     if edition == "cloud_gateway":
+        message += " Cloud Gateway is $9.99/month per camera. Local recording, basic motion detection and notifications use your licensed system and permissions. Advanced analytics require separate authorization."
         message += (" Event upload is configured; each clip still requires camera authorization."
                     if video_transport_allowed("event") else " Event upload is currently disabled.")
     from product_mode import remote_access_authorized

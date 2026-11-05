@@ -31,6 +31,26 @@ class GatewayDetectionBoundaryTests(unittest.TestCase):
         self.assertFalse(any(result[flag] for flag in FLAGS.values()))
         self.assertTrue(self.identity['ppe_enabled'])  # cached input is not mutated
 
+    def test_cloud_edition_keeps_basic_motion_and_denies_unsigned_premium(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'cloud_gateway'}):
+            result = self.ns['_entitled_identity'](self.identity)
+            self.assertTrue(result['motion_enabled'])
+            self.assertEqual(result['local_recording_mode'], 'event')
+            self.assertFalse(any(result[flag] for flag in FLAGS.values()))
+
+    def test_cloud_premium_grant_is_camera_specific_and_rechecked(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'cloud_gateway'}):
+            self.grants.add('ppe')
+            allowed = self.ns['_entitled_identity'](self.identity)
+            self.assertTrue(allowed['ppe_enabled'])
+            self.assertFalse(allowed['smart_motion_enabled'])
+            self.assertFalse(self.ns['_entitled_identity'](
+                {**self.identity, 'camera_id': 'other'})['ppe_enabled'])
+            self.grants.clear()
+            revoked = self.ns['_entitled_identity'](self.identity)
+            self.assertFalse(revoked['ppe_enabled'])
+            self.assertTrue(revoked['motion_enabled'])
+
     def test_grants_are_camera_specific_and_independent_of_remote_subscription(self):
         self.grants.add('ppe')
         self.assertTrue(self.ns['_entitled_identity'](self.identity)['ppe_enabled'])

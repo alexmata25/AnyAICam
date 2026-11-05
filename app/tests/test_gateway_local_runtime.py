@@ -18,20 +18,79 @@ class GatewayLocalRuntimeTests(unittest.TestCase):
     def test_remote_expiry_does_not_remove_independent_signed_local_licence(self):
         for edition in ('local_gateway', 'cloud_gateway', 'full_vms'):
             with self.subTest(edition=edition), patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': edition}):
-                grant = {'camera_slot_quantity': 0, 'plan_camera_slots': 0, 'vms_license_capacity': 2}
+                grant = {'camera_slot_quantity': 0, 'plan_camera_slots': 0, 'vms_license_capacity': 2, 'purchased_vms_license_capacity': 2}
                 capacity = vms_capacity._record(grant, 'signed')
                 self.assertEqual(capacity['camera_slot_quantity'], 0 if edition == 'full_vms' else 2)
                 self.assertEqual(grant['camera_slot_quantity'], 0)  # signed document is never mutated
                 with patch.object(vms_capacity, 'load_capacity', return_value=capacity):
                     self.assertEqual(vms_capacity.licensed_camera_numbers([3, 1, 2]), [] if edition == 'full_vms' else [1, 2])
 
+    def test_local_licence_capacity_is_independent_of_remote_plan_quantity(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway'}):
+            for remote_slots in (0, 1, 8):
+                with self.subTest(remote_slots=remote_slots):
+                    grant = {'camera_slot_quantity': remote_slots, 'plan_camera_slots': remote_slots,
+                             'vms_license_capacity': 4, 'purchased_vms_license_capacity': 4}
+                    capacity = vms_capacity._record(grant, 'signed')
+                    with patch.object(vms_capacity, 'load_capacity', return_value=capacity):
+                        self.assertEqual(vms_capacity.licensed_camera_numbers([1, 2, 3, 4, 5]),
+                                         [1, 2, 3, 4])
+                    self.assertEqual(grant['plan_camera_slots'], remote_slots)
+
+    def test_signed_purchased_capacity_overrides_camera_plan_capacity(self):
+        with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway'}):
+            grant = {'camera_slot_quantity': 1, 'vms_license_capacity': 64,
+                     'purchased_vms_license_capacity': 4}
+            record = vms_capacity._record(grant, 'signed')
+            self.assertEqual(record['camera_slot_quantity'], 4)
+            for value in (None, True, -1, '4'):
+                with self.subTest(value=value):
+                    self.assertIsNone(vms_capacity._record(
+                        {**grant, 'purchased_vms_license_capacity': value}, 'signed'))
+            # Earlier snapshots cannot establish a separate purchase.
+            self.assertIsNone(vms_capacity._record(
+                {'camera_slot_quantity': 1, 'vms_license_capacity': 2}, 'signed'))
+
+    def test_purchased_licence_is_separate_from_subscription_quantity(self):
+        ns = {'VMS_LICENSE_PRODUCT': 'vms_license'}
+        load_functions('customer_entitlements.py', {'_purchased_vms_license_capacity'}, ns)
+        purchased = ns['_purchased_vms_license_capacity']
+        rows = [
+            {'product': 'vms_license', 'status': 'active', 'camera_slot_quantity': 4},
+            {'product': 'vms_license', 'status': 'cancelled', 'camera_slot_quantity': 64},
+            {'product': 'camera_slots_hybrid', 'status': 'active', 'camera_slot_quantity': 1},
+        ]
+        self.assertEqual(purchased(rows), 4)
+        rows[2]['camera_slot_quantity'] = 0
+        self.assertEqual(purchased(rows), 4)
+        rows[0]['status'] = 'cancelled'
+        self.assertEqual(purchased(rows), 0)
+
+    def test_appliance_provisioning_uses_purchased_licence_after_cancellation(self):
+        ns = {'MAX_CAMERA_SLOTS': 10000,
+              'usable_camera_capacity': lambda customer: 1,
+              '_purchased_vms_license_capacity': lambda rows: 4,
+              'get_entitlements_for_customer': lambda customer: []}
+        load_functions('customer_entitlements.py', {'usable_camera_capacity_for_appliance'}, ns)
+        appliance = {'customer_id': 'customer-1', 'gateway_edition': 'local_gateway'}
+        partner = SimpleNamespace(row=lambda sql, args: appliance)
+        with patch.dict(sys.modules, {'partner_db': partner}):
+            self.assertEqual(ns['usable_camera_capacity_for_appliance']('customer-1', 'appliance-1'), 4)
+            self.assertEqual(ns['usable_camera_capacity_for_appliance']('other', 'appliance-1'), 0)
+            appliance['gateway_edition'] = None
+            self.assertEqual(ns['usable_camera_capacity_for_appliance']('customer-1', 'full-vms'), 1)
+            appliance.pop('gateway_edition')  # existing pre-migration record
+            self.assertEqual(ns['usable_camera_capacity_for_appliance']('customer-1', 'full-vms'), 1)
+            appliance['gateway_edition'] = 'invalid'
+            self.assertEqual(ns['usable_camera_capacity_for_appliance']('customer-1', 'appliance-1'), 0)
+
     def test_no_unsigned_or_malformed_local_capacity_is_granted(self):
         with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway'}):
             for value in (True, -1, 10001, '4', None):
-                self.assertIsNone(vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': value}, 'signed'))
+                self.assertIsNone(vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': 4, 'purchased_vms_license_capacity': value}, 'signed'))
             self.assertEqual(vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': 4}, 'migrated')['camera_slot_quantity'], 0)
-            self.assertEqual(vms_capacity._record({'camera_slot_quantity': 1}, 'signed')['camera_slot_quantity'], 1)
-            self.assertEqual(vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': 0}, 'signed')['camera_slot_quantity'], 0)
+            self.assertIsNone(vms_capacity._record({'camera_slot_quantity': 1}, 'signed'))
+            self.assertEqual(vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': 0, 'purchased_vms_license_capacity': 0}, 'signed')['camera_slot_quantity'], 0)
 
     def test_rejected_accepted_store_does_not_fall_back_to_local_licence(self):
         with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway'}), \
@@ -48,7 +107,7 @@ class GatewayLocalRuntimeTests(unittest.TestCase):
             'CameraNotLicensedError': PermissionError, 'CameraNotConfiguredError': LookupError}
         load_functions('main.py', {'camera_url'}, ns)
         with patch.dict(os.environ, {'ANYAICAM_GATEWAY_EDITION': 'local_gateway'}):
-            capacity = vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': 1}, 'signed')
+            capacity = vms_capacity._record({'camera_slot_quantity': 0, 'vms_license_capacity': 1, 'purchased_vms_license_capacity': 1}, 'signed')
             with patch.object(vms_capacity, 'load_capacity', return_value=capacity):
                 self.assertEqual(ns['camera_url'](1), 'rtsp://test-camera/stream')
                 with self.assertRaises(PermissionError):

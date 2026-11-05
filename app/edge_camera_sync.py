@@ -131,12 +131,15 @@ def _control_plane_headers(appliance_id: str, credential: str) -> dict:
 def _control_plane_get(path: str, appliance_id: str, credential: str) -> dict | None:
     if not CLOUD_URL:
         return None
-    request = urllib.request.Request(
-        CLOUD_URL + path, headers=_control_plane_headers(appliance_id, credential), method="GET"
-    )
+    headers = _control_plane_headers(appliance_id, credential)
+    request = urllib.request.Request(CLOUD_URL + path, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read().decode() or "{}")
+            data = json.loads(response.read().decode() or "{}")
+            if path == "/api/appliance/configuration" and isinstance(data, dict):
+                # Local-only trusted context: never take this value from the response.
+                data["_local_gateway_request_nonce"] = headers["X-Request-Nonce"]
+            return data
     except urllib.error.HTTPError as error:
         logger.warning("edge_camera_sync.control_plane_http_error path=%s status=%s", path, error.code)
         return None

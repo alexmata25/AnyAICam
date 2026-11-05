@@ -9,7 +9,9 @@ from tools.audit_windows_gateway_prerequisites import audit, locked_wheels, pinn
 class PrerequisiteAuditTests(unittest.TestCase):
     def test_lock_rejects_traversal_duplicates_and_empty_input(self):
         pin = 'a' * 64
-        for value in ('', f'{pin}  ../outside.whl', f'{pin}  a.whl\n{pin}  a.whl', 'not-a-pin  a.whl'):
+        for value in ('', f'{pin}  ../outside.whl', f'{pin}  a.whl\n{pin}  a.whl',
+                      f'{pin}  a.whl\n{pin}  A.whl', f'{pin}  a.whl\n\n{pin}  b.whl',
+                      f'{pin}  C:outside.whl', 'not-a-pin  a.whl'):
             with self.assertRaises(ValueError):
                 locked_wheels(value)
         self.assertEqual(locked_wheels(f'{pin}  test.whl\n'), ['test.whl'])
