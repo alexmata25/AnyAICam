@@ -116,9 +116,29 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
     root's own S3 object is confirmed deleted."""
     candidates = []
     rows = list(db.execute("SELECT id, customer_id, s3_key, started_at, 'recording' AS kind FROM recordings WHERE status='available'").fetchall())
-    rows += list(db.execute("SELECT id, customer_id, s3_key, started_at, 'event_media' AS kind FROM detection_event_media WHERE source_media_id IS NULL").fetchall())
+    rows += list(db.execute("SELECT id, customer_id, camera_id, s3_key, started_at, 'event_media' AS kind FROM detection_event_media WHERE source_media_id IS NULL").fetchall())
+    # Cloud Gateway media (owner 2026-11-05) follows its own retention:
+    # the customer's 7/14/30 choice, else the 14-day default, never None.
+    # Unavailable -> those rows are skipped this tick (never deleted early).
+    gateway_cameras, gateway_retention = None, {}
+    try:
+        import cloud_gateway_retention
+        gateway_cameras = cloud_gateway_retention.cloud_gateway_camera_ids(db)
+    except Exception:
+        logger.exception("recording_retention.cloud_gateway_retention_unavailable")
     for row in rows:
-        if row["kind"] == "event_media":
+        if row["kind"] == "event_media" and (gateway_cameras is None or row["camera_id"] in gateway_cameras):
+            if gateway_cameras is None:
+                continue
+            customer_id = row["customer_id"]
+            if customer_id not in gateway_retention:
+                try:
+                    gateway_retention[customer_id] = cloud_gateway_retention.effective_retention_days(db, customer_id)
+                except Exception:
+                    logger.exception("recording_retention.cloud_gateway_retention_invalid customer_id=%s", customer_id)
+                    gateway_retention[customer_id] = None
+            retention_days = gateway_retention[customer_id]
+        elif row["kind"] == "event_media":
             retention_days = _event_media_retention_days(db, row["customer_id"])
         else:  # continuous recordings: the legacy plan, unchanged
             retention_days = _customer_retention_days(db, row["customer_id"])
@@ -129,7 +149,9 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
         except (TypeError, ValueError):
             continue  # unparseable timestamp -- never treated as expired
         if now - started_at > timedelta(days=retention_days):
-            candidates.append(dict(row))
+            candidate = dict(row)
+            candidate.pop("camera_id", None)  # used only for the Gateway lookup above
+            candidates.append(candidate)
     return candidates
 
 

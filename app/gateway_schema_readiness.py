@@ -27,16 +27,18 @@ COLUMNS = {
     'gateway_stripe_payment_links': {'kind','provider_id','customer_id','stripe_customer_id','stripe_subscription_id','created_at'},
     'gateway_stable_installation_claim_ids': {'claim_id','appliance_id','original_claim_id','created_at'},
     'gateway_claim_recovery_requests': {'request_id','appliance_id','customer_id','requested_by','status','created_at'},
+    'cloud_gateway_retention_settings': {'customer_id','retention_days','source','version','updated_at','updated_by'},
 }
 VERSIONS = ('20260910_appliance_claims','20261103_appliance_gateway_edition',
             '20261104_appliance_edition_provisioning_decisions',
             '20261105_internal_gateway_provisioning_authorizations',
             '20261106_one_current_completed_claim_per_appliance',
             '20261107_one_current_claim_session_per_device', '20261108_cloud_gateway_camera_entitlements',
-            '20261109_cloud_gateway_subscription_evidence','20261110_gateway_checkout_attempts','20261111_gateway_stable_installation_claim_ids')
+            '20261109_cloud_gateway_subscription_evidence','20261110_gateway_checkout_attempts','20261111_gateway_stable_installation_claim_ids',
+            '20261112_cloud_gateway_retention_settings')
 DEPENDENCIES = ((VERSIONS[0],VERSIONS[2]),(VERSIONS[1],VERSIONS[2]),
                 (VERSIONS[2],VERSIONS[3]),(VERSIONS[0],VERSIONS[4]),(VERSIONS[0],VERSIONS[5]),
-                (VERSIONS[2],VERSIONS[6]),(VERSIONS[6],VERSIONS[7]),(VERSIONS[7],VERSIONS[8]),(VERSIONS[8],VERSIONS[9]))
+                (VERSIONS[2],VERSIONS[6]),(VERSIONS[6],VERSIONS[7]),(VERSIONS[7],VERSIONS[8]),(VERSIONS[8],VERSIONS[9]),(VERSIONS[6],VERSIONS[10]))
 
 
 def _compact(value):
@@ -113,7 +115,8 @@ def inspect_gateway_schema(db, backend):
                                        (table == 'cloud_gateway_subscription_evidence' and column in {'quantity','amount_cents','interval_count','current_period_end','payment_verified','event_created'}) or
                                        (table in {'cloud_gateway_evidence_holds','cloud_gateway_webhook_correlation'} and column == 'event_created') or
                                        (table == 'cloud_gateway_refresh_leases' and column == 'lease_until') or
-                                       (table == 'gateway_checkout_attempts' and column in {'quantity','authorization_invalidated'})) else 'text'
+                                       (table == 'gateway_checkout_attempts' and column in {'quantity','authorization_invalidated'}) or
+                                       (table == 'cloud_gateway_retention_settings' and column in {'retention_days','version'})) else 'text'
                 if types[column] != wanted:
                     issues.append('Incompatible column type: '+table+'.'+column)
         for name in INDEXES:

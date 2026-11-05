@@ -18,12 +18,22 @@ live relay, event-media catalog) now require a trusted server-side edition.
   - the binding is the authorization basis, and no Full VMS Hybrid plan
     is required;
   - an explicitly `disabled` camera stays off;
-  - the customer must have an event retention the event-media sweep will
-    enforce (cloud-policy override, v2 plan or legacy plan, 7/14/30 days).
-    Without one the upload is refused, because the sweep would never
-    expire it;
-  - open owner decision: a default Cloud Gateway retention. Until then
-    an administrator sets the customer's cloud retention.
+  - retention (owner approval 2026-11-05, `cloud_gateway_retention.py`):
+    - 14 days by default, recorded and audited automatically on the
+      customer's first authorized upload;
+    - 7 or 30 days on request (customer owner or global administrator,
+      `PUT /api/cloud-gateway/retention`; versioned, and lowering needs
+      `confirm_reduction`);
+    - kept separate from every Full VMS retention source;
+    - the sweep expires Cloud Gateway camera clips by that value, even
+      after the binding ends; local recordings are never touched;
+    - the upload is refused (503) unless the retention sweep is
+      configured to enforce on the host
+      (`recording_retention_sweep.readiness()`);
+    - deployment: apply migration
+      `20261112_cloud_gateway_retention_settings` with the code. Enable
+      `ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED` and its delete-only
+      role before any Cloud Gateway upload is allowed.
 - returns 503 for a missing schema or any lookup error.
 - reads the edition with a plain connection. Only the Cloud Gateway path
   takes the customer lock (write transaction) needed by paid-binding

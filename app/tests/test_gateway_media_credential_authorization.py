@@ -94,6 +94,8 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
             patch.object(appliance_cloud, "LIVE_RELAY_AWS_REGION", "us-east-1"),
             patch.object(appliance_cloud, "boto3", fake_boto3),
             patch.dict("os.environ", {entitlements.CLOUD_GATEWAY_PRICE_ENV: PRICE}),
+            # The sweep is configured to enforce on this (synthetic) host.
+            patch("recording_retention_sweep.readiness", return_value={"ready": True, "missing": []}),
             # The verified-evidence store is synthetic here; every other check is real.
             patch.object(entitlements, "_current_verified_cloud_subscription",
                          side_effect=lambda db, customer, reference: (
@@ -287,15 +289,57 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("/events/", json.dumps(json.loads(_FakeSTS.calls[0]["Policy"])))
 
-    def test_paid_cloud_gateway_without_enforceable_retention_is_refused(self):
+    def _gateway_retention_row(self, customer="cust-1"):
+        with connection() as db:
+            row = db.execute("SELECT retention_days,source,version FROM cloud_gateway_retention_settings WHERE customer_id=?",
+                             (customer,)).fetchone()
+        return dict(row) if row else None
+
+    def test_new_cloud_gateway_customer_receives_the_14_day_default(self):
         self._edition("appl-1", "cloud_gateway")
         self._bind()
-        self._without_hybrid()  # nothing the retention sweep could expire the media by
+        self._without_hybrid()  # no Full VMS retention source at all
+        self.assertIsNone(self._gateway_retention_row())
         a, b = self._paid_ready()
         with a, b:
             response = self._request()
-        self.assertRefusedBeforeSts(response)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self._gateway_retention_row(), {"retention_days": 14, "source": "default", "version": 1})
+        with connection() as db:
+            audit = db.execute("SELECT actor_email,entity_id FROM audit_logs WHERE action='cloud_gateway.retention.default_applied'").fetchall()
+        self.assertEqual([tuple(row) for row in audit], [("system:cloud_gateway_default", "cust-1")])
+        with a, b:  # a second upload never re-applies or audits the default again
+            self.assertEqual(self._request().status_code, 200)
+        self.assertEqual(self._gateway_retention_row()["version"], 1)
+
+    def test_cloud_gateway_retention_ignores_the_full_vms_override(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        self._without_hybrid()
+        self._retention(30)  # a Full VMS (RDM) override is not a Cloud Gateway choice
+        a, b = self._paid_ready()
+        with a, b:
+            self.assertEqual(self._request().status_code, 200)
+        self.assertEqual(self._gateway_retention_row()["retention_days"], 14)
+
+    def test_cloud_gateway_upload_is_refused_when_the_sweep_does_not_enforce(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        a, b = self._paid_ready()
+        with a, b, patch("recording_retention_sweep.readiness",
+                                return_value={"ready": False, "missing": ["ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED=true"]}):
+            response = self._request()
+        self.assertRefusedBeforeSts(response, status=503)
         self.assertIn("retention", response.json()["detail"])
+        self.assertIsNone(self._gateway_retention_row())
+
+    def test_invalid_cloud_gateway_retention_fails_closed(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        a, b = self._paid_ready()
+        import cloud_gateway_retention
+        with a, b, patch.object(cloud_gateway_retention, "effective_retention_days", side_effect=RuntimeError("corrupt")):
+            self.assertRefusedBeforeSts(self._request(), status=503)
 
     def test_paid_cloud_gateway_camera_explicitly_disabled_is_refused(self):
         self._edition("appl-1", "cloud_gateway")

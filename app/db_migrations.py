@@ -1419,6 +1419,19 @@ CREATE TABLE IF NOT EXISTS gateway_claim_recovery_requests(
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_claim_one_pending_recovery
  ON gateway_claim_recovery_requests(appliance_id) WHERE status='pending_manual_verification';
 '''),
+    # Cloud Gateway event-clip retention (owner approval 2026-11-05): 14-day
+    # default, 7/30 options, separate from every Full VMS retention source.
+    # Additive; no rows are written here (cloud_gateway_retention.py).
+    ('20261112_cloud_gateway_retention_settings', '''
+CREATE TABLE IF NOT EXISTS cloud_gateway_retention_settings(
+ customer_id TEXT PRIMARY KEY,
+ retention_days INTEGER NOT NULL CHECK(retention_days IN (7,14,30)),
+ source TEXT NOT NULL CHECK(source IN ('default','customer_owner','administrator')),
+ version INTEGER NOT NULL CHECK(version>0),
+ updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
+ FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+'''),
     # Additive only: no backfill or automatic remote-service entitlement.
     # One current binding per appliance; replaced subscriptions are fenced by
     # their ID and every mutation must compare that ID within its transaction.

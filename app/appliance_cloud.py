@@ -353,8 +353,14 @@ def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: 
                                                       appliance_id=appliance['id'],camera_id=camera_id)
             if not isinstance(verified,dict) or verified.get('status')!='verified':
                 raise refused
-            # Never accept media the retention sweep would keep forever.
-            retention=recording_retention_sweep.event_media_retention_days(db,customer_id)
+            # Never accept media the retention sweep would keep forever: the
+            # sweep must be configured to enforce on this host, and the
+            # customer's Cloud Gateway retention (14-day default recorded
+            # here on first use, or their 7/14/30 choice) must be valid.
+            if not recording_retention_sweep.readiness().get('ready'):
+                raise HTTPException(status_code=503,detail='Cloud Gateway event retention is not enforced on this host.')
+            import cloud_gateway_retention
+            retention=cloud_gateway_retention.ensure_default(db,customer_id)
             if retention not in MOTION_RETENTION_DAYS:
                 raise HTTPException(status_code=403,detail='Cloud Gateway event retention is not configured for this customer.')
             return retention

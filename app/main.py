@@ -51634,6 +51634,9 @@ register_appliance_cloud_routes(app, page_shell, current_user)
 # before or after this line (no /customer/{...} wildcard exists
 # anywhere in this codebase).
 register_appliance_claim_routes(app, page_shell)
+# Cloud Gateway event-clip retention (14-day default, 7/30 options).
+from cloud_gateway_retention import register_cloud_gateway_retention_routes
+register_cloud_gateway_retention_routes(app)
 # Users & household (2026-10-01): owner-managed household members with
 # their own sign-in, single-use invitation links and per-person permissions.
 from household_users import register_household_routes
