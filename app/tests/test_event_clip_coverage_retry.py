@@ -27,7 +27,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "RECORDINGS_FOLDER", recordings)
     monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {
         "pre_roll_seconds": 5, "post_roll_seconds": 5, "merge_gap_seconds": 10, "max_event_seconds": 300})
-    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0])
+    monkeypatch.setattr(main, "_keyframe_times", lambda path, deadline=None: [0.0])
 
     async def no_wait(seconds):
         return None
@@ -39,7 +39,14 @@ def harness(tmp_path, monkeypatch):
         def __init__(self, returncode):
             self.returncode, self.stdout, self.stderr = returncode, b"", b""
 
+    state["ffprobe_runs"] = []
+
     def fake_run(command, **kwargs):
+        if command[0] == "ffprobe":               # the real keyframe lookup, in the tests that use it
+            state["ffprobe_runs"].append(command[-1])
+            completed = Completed(0)
+            completed.stdout = ""
+            return completed
         # Each build writes its own content (clip-1, clip-2, ...) so a test can tell which build was kept. A failed
         # build leaves a partial file, as ffmpeg -y does after truncating its output.
         state["calls"] += 1
@@ -327,3 +334,142 @@ def test_the_final_probe_gives_up_when_the_shared_ffprobe_slots_stay_busy_and_ke
     assert not main._event_recording_locks[1].locked()
     assert "event_recording.duration_probe_timeout" in caplog.text
     assert "event_recording.persisted" in caplog.text and "duration_seconds=None" in caplog.text
+
+
+# 2026-11-05, Codex FIX REQUIRED on 523b66e: the keyframe lookup for the cut point still ran through
+# asyncio.to_thread() under the per-camera lock, before the retry deadline starts: an unbounded wait in the thread
+# pool's queue, then an unbounded wait for a shared ffprobe slot.
+
+REAL_KEYFRAME_TIMES = main._keyframe_times
+
+
+def _record_keyframe_lookups(harness, monkeypatch):
+    harness["keyframe_calls"] = []
+
+    def keyframes(path, deadline=None):
+        harness["keyframe_calls"].append(path.name)
+        return [0.0, 4.0]                        # 4.0 s = 10:05:34, the keyframe just before the 10:05:35 start
+
+    monkeypatch.setattr(main, "_keyframe_times", keyframes)
+
+
+def _saved_clip_name():
+    (clip,) = (main.RECORDINGS_FOLDER / "camera1").glob("camera1_*.mkv")
+    return clip.name
+
+
+def test_the_keyframe_lookup_finds_the_cut_point_when_it_has_time(harness, caplog, monkeypatch):
+    _record_keyframe_lookups(harness, monkeypatch)
+    harness["durations"] = [16.0]
+    harness["last"] = 16.0
+    with caplog.at_level(logging.INFO):
+        _persist()
+    assert harness["keyframe_calls"] == [f"buf1_{T0:%Y-%m-%d_%H-%M-%S}.mkv"]
+    assert _saved_clip_name() == "camera1_2026-10-30_10-05-34.mkv"
+    assert "keyframe_probe_timeout" not in caplog.text
+
+
+def test_a_keyframe_lookup_queued_behind_a_busy_thread_pool_gives_up_and_cuts_at_the_segment_start(
+        harness, caplog, monkeypatch):
+    monkeypatch.setattr(main, "EVENT_CLIP_KEYFRAME_PROBE_SECONDS", 0.3, raising=False)
+    monkeypatch.setattr(main, "EVENT_BUFFER_COVERAGE_WAIT_SECONDS", 0.0)
+    _record_keyframe_lookups(harness, monkeypatch)
+    harness["durations"] = [20.0]
+    harness["last"] = 20.0
+    pool = ThreadPoolExecutor(max_workers=1)
+    build_started = []
+    harness["after_first"] = lambda: build_started.append(time.monotonic())
+
+    async def scenario():
+        asyncio.get_running_loop().set_default_executor(pool)
+        pool.submit(time.sleep, 2.0)             # the only pool thread is busy before persist starts
+        started = time.monotonic()
+        await main.persist_event_recording(1, T0 + timedelta(seconds=10), T0 + timedelta(seconds=15),
+                                           detector="basic_motion", trigger_id="t1")
+        return started
+
+    with caplog.at_level(logging.INFO):
+        started = asyncio.run(scenario())
+    assert harness["keyframe_calls"] == []       # the abandoned lookup never ran, not even after the queue cleared
+    assert _saved_clip_name() == "camera1_2026-10-30_10-05-30.mkv"   # cut at the segment start: early, not late
+    assert "event_recording.keyframe_probe_timeout" in caplog.text
+    assert "event_recording.persisted" in caplog.text
+    assert not main._event_recording_locks[1].locked()
+    # The first build (60 s bound) waited for the pool like any job; it ran once the 2 s of busy work finished.
+    assert build_started and build_started[0] - started < 2.0 + 1.0
+
+
+def test_the_keyframe_lookup_gives_up_when_the_shared_ffprobe_slots_stay_busy(harness, caplog, monkeypatch):
+    # The real lookup, with every appliance-wide ffprobe slot held elsewhere for 3 s.
+    monkeypatch.setattr(main, "EVENT_CLIP_KEYFRAME_PROBE_SECONDS", 0.3, raising=False)
+    monkeypatch.setattr(main, "_keyframe_times", REAL_KEYFRAME_TIMES)
+    harness["durations"] = [20.0]
+    harness["last"] = 20.0
+    held, release = 0, threading.Lock()
+
+    def release_all():
+        nonlocal held
+        with release:
+            for _ in range(held):
+                main._ffprobe_semaphore.release()
+            held = 0
+
+    while main._ffprobe_semaphore.acquire(blocking=False):
+        held += 1
+    timer = threading.Timer(3.0, release_all)    # so the uncorrected code finishes (late) instead of hanging
+    timer.start()
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.INFO):
+            _persist()
+        elapsed = time.monotonic() - started
+    finally:
+        timer.cancel()
+        release_all()
+    assert elapsed < 0.3 + 1.0
+    assert harness["ffprobe_runs"] == []         # no ffprobe was launched while the slots were busy
+    assert _saved_clip_name() == "camera1_2026-10-30_10-05-30.mkv"
+    assert _kept_clip() == b"clip-1"
+    assert "event_recording.keyframe_probe_timeout" in caplog.text
+    assert not main._event_recording_locks[1].locked()
+
+
+def test_the_keyframe_lookup_itself_is_bounded_and_returns_its_slot(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="0.000000\n4.000000,\nN/A\n", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    segment = tmp_path / "segment.mkv"
+    assert main._keyframe_times(segment, time.monotonic() + 5.0) == [0.0, 4.0]
+    assert 0 < calls[0] <= 5.0                   # ffprobe gets only the time left (at most its own 15 s)
+
+    def failing_run(command, **kwargs):
+        raise OSError("ffprobe missing")
+
+    monkeypatch.setattr(main.subprocess, "run", failing_run)
+    assert main._keyframe_times(segment, time.monotonic() + 5.0) == []   # a failure is "no keyframe information"
+
+    def hanging_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(main.subprocess, "run", hanging_run)
+    with pytest.raises(main._ProbeOutOfTime):
+        main._keyframe_times(segment, time.monotonic() + 5.0)
+    with pytest.raises(main._ProbeOutOfTime):  # a deadline already passed never waits at all
+        main._keyframe_times(segment, time.monotonic())
+
+    held = 0                                     # every slot taken above was given back
+    try:
+        while main._ffprobe_semaphore.acquire(blocking=False):
+            held += 1
+        assert held == main.FFPROBE_MAX_CONCURRENCY
+        started = time.monotonic()
+        with pytest.raises(main._ProbeOutOfTime):
+            main._keyframe_times(segment, time.monotonic() + 0.3)
+        assert time.monotonic() - started < 0.3 + 0.5
+    finally:
+        for _ in range(held):
+            main._ffprobe_semaphore.release()

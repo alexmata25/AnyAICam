@@ -17529,6 +17529,10 @@ EVENT_CLIP_DURATION_TOLERANCE_SECONDS = 1.5
 # How long the duration probe of a saved event recording may take, ffprobe slot wait included: it is only for the
 # event_recording.persisted / duration_mismatch log lines and runs under the per-camera lock.
 EVENT_CLIP_FINAL_PROBE_SECONDS = 15.0
+# How long the keyframe lookup for a recording's cut point may take, pool queue and ffprobe slot wait included: it
+# runs under the per-camera lock before the retry deadline starts. On timeout the cut starts at the segment's first
+# frame (always a keyframe), so the recording starts a little early but still covers the event.
+EVENT_CLIP_KEYFRAME_PROBE_SECONDS = 15.0
 EVENT_BUFFER_SUBFOLDER_NAME = "_event_buffer"
 LOCAL_RECORDING_MODE = "event"
 # (camera_number, stored value) pairs already logged as coerced to event,
@@ -17931,7 +17935,19 @@ async def persist_event_recording(
         from local_recording_policy import keyframe_cut, recording_name_time
         first_index = max((i for i, (start, _) in enumerate(sources) if start <= recording_start), default=0)
         sources = sources[first_index:]
-        keyframes = await asyncio.to_thread(_keyframe_times, sources[0][1])
+        # 2026-11-05 (Codex FIX REQUIRED on 523b66e): bounded like every other job under the lock, so a busy thread
+        # pool or ffprobe slot cannot hold the lock here before the retry deadline even starts.
+        keyframe_deadline = time.monotonic() + EVENT_CLIP_KEYFRAME_PROBE_SECONDS
+        try:
+            found, keyframes = await _run_before_deadline(_keyframe_times, keyframe_deadline, sources[0][1])
+        except _ProbeOutOfTime:
+            found, keyframes = False, None
+        if not found:
+            log.warning(
+                "event_recording.keyframe_probe_timeout camera=%s trigger_id=%s path=%s timeout_seconds=%.1f",
+                camera_number, trigger_id, sources[0][1], EVENT_CLIP_KEYFRAME_PROBE_SECONDS,
+            )
+            keyframes = []
         inpoint, true_start = keyframe_cut(recording_start, sources[0][0], keyframes)
         if _open_event_recordings[camera_number]["path"] is None:
             camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
@@ -145481,21 +145497,37 @@ def _row_to_recording_metadata(row: dict) -> dict:
     }
 
 
-def _keyframe_times(path: Path) -> list[float]:
+def _keyframe_times(path: Path, deadline: float) -> list[float]:
     """Keyframe times (seconds) of one Event-mode buffer segment, for
     persist_event_recording()'s cut point. Same appliance-wide ffprobe
     budget as every other probe; [] on any failure (the cut then starts at
-    the segment's own first frame, which is always a keyframe)."""
+    the segment's own first frame, which is always a keyframe).
+
+    2026-11-05 (Codex FIX REQUIRED on 523b66e): finished by `deadline`
+    (time.monotonic()), the wait for an ffprobe slot included, because it
+    runs under the per-camera lock; raises _ProbeOutOfTime when the time
+    runs out, as _probe_event_clip_seconds() does."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _ffprobe_semaphore.acquire(timeout=remaining):
+        raise _ProbeOutOfTime(str(path))
     try:
-        with _ffprobe_semaphore:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
-                 "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ProbeOutOfTime(str(path))
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+             "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=min(15.0, remaining), check=False,
+        )
         return sorted(float(item.strip().rstrip(",")) for item in probe.stdout.split() if item.strip().rstrip(",") not in ("", "N/A"))
-    except Exception:  # any probe failure: no keyframe information
+    except _ProbeOutOfTime:
+        raise
+    except subprocess.TimeoutExpired as exc:
+        raise _ProbeOutOfTime(str(path)) from exc
+    except Exception:  # any other probe failure: no keyframe information
         return []
+    finally:
+        _ffprobe_semaphore.release()
 
 
 def _probe_recording_duration_seconds(path: Path) -> float | None:
