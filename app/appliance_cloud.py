@@ -308,6 +308,67 @@ def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     return camera
 
 
+def _table_exists(db,name: str) -> bool:
+    from database_backend import backend
+    if backend()=='sqlite':
+        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone() is not None
+    return db.execute('SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?',(name,)).fetchone() is not None
+
+
+def _gateway_editions(db,appliance_id: str) -> set:
+    """Every Gateway edition the server has recorded for this appliance,
+    current or past. A device never supplies its own edition, so only these
+    server-side records count; none at all means a Full VMS appliance."""
+    appliance=db.execute('SELECT * FROM appliances WHERE id=?',(appliance_id,)).fetchone()
+    if appliance is None: raise LookupError('Appliance not found.')
+    editions={dict(appliance).get('gateway_edition')}-{None}
+    for table in ('appliance_edition_provisioning_decisions','internal_gateway_provisioning_authorizations'):
+        if _table_exists(db,table):
+            editions.update(item['edition'] for item in db.execute(f'SELECT edition FROM {table} WHERE appliance_id=?',(appliance_id,)).fetchall())
+    if _table_exists(db,'local_gateway_remote_subscriptions') and db.execute(
+            'SELECT 1 FROM local_gateway_remote_subscriptions WHERE appliance_id=?',(appliance_id,)).fetchone():
+        editions.add('local_gateway')
+    return editions
+
+
+def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: bool=False) -> None:
+    """Server-side Gateway check before any cloud media credential is issued.
+
+    Local Gateway never gets one, and no Gateway gets live relay. Cloud
+    Gateway event media needs the server-recorded cloud_gateway edition and
+    nothing else, plus one active binding for this exact camera that
+    verify_paid_binding() revalidates (edition evidence, current paid
+    subscription, audit chain, camera mapping and seat count). Full VMS
+    appliances (no Gateway record) return unchanged. Any error fails closed."""
+    import cloud_gateway_camera_entitlements as entitlements
+    from partner_db import transaction
+    try:
+        with transaction() as db:
+            editions=_gateway_editions(db,appliance['id'])
+            if not editions:
+                return
+            refused=HTTPException(status_code=403,detail='This Gateway camera is not entitled to cloud media.')
+            if live or editions!={'cloud_gateway'}:
+                raise refused
+            edition=db.execute('SELECT gateway_edition FROM appliances WHERE id=?',(appliance['id'],)).fetchone()
+            if not edition or edition['gateway_edition']!='cloud_gateway':
+                raise refused
+            customer_id=str(appliance.get('customer_id') or '')
+            bindings=db.execute("SELECT id FROM cloud_gateway_camera_entitlements WHERE camera_id=? AND customer_id=? AND appliance_id=? AND status='active'",
+                                (camera_id,customer_id,appliance['id'])).fetchall()
+            if len(bindings)!=1:
+                raise refused
+            verified=entitlements.verify_paid_binding(db,binding_id=bindings[0]['id'],customer_id=customer_id,
+                                                      appliance_id=appliance['id'],camera_id=camera_id)
+            if not isinstance(verified,dict) or verified.get('status')!='verified':
+                raise refused
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception('gateway_media.authorization_failed appliance_id=%s camera_id=%s',appliance.get('id'),camera_id)
+        raise HTTPException(status_code=503,detail='Cloud media authorization is unavailable.') from error
+
+
 def _queue_product_mode_restart(db,appliance: dict,new_mode: str) -> dict | None:
     """Called on every GET /api/appliance/configuration poll, inside the
     same connection already open for cloud_policy/storage_policy/
@@ -1191,6 +1252,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not LIVE_RELAY_ENABLED or not appliance.get('live_relay_pilot'):
             raise HTTPException(status_code=404,detail='Live relay is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
+        _require_gateway_media_authorization(appliance,camera_id,live=True)
         if not live_relay_camera_limiter.allow(camera_id):
             raise HTTPException(status_code=429,detail='Live relay request rate exceeded.')
         if boto3 is None or not LIVE_UPLOAD_ROLE_ARN or not LIVE_RELAY_S3_BUCKET or not LIVE_RELAY_AWS_REGION:
@@ -1272,6 +1334,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not (RECORDING_UPLOAD_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED or camera_id in RECORDING_UPLOAD_PILOT_CAMERAS):
             raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
+        # Gateway appliances: server-side edition and paid-camera checks before STS.
+        _require_gateway_media_authorization(appliance,camera_id)
         if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
             raise HTTPException(status_code=503,detail='Recording upload is not configured.')
         try:
@@ -1695,6 +1759,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         camera=_authorized_camera(appliance,camera_id)
         if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
+        _require_gateway_media_authorization(appliance,camera_id)
         safe=sanitize_appliance_payload(payload)
 
         local_event_id=str(local_event_id or '').strip()
@@ -1859,6 +1924,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         camera=_authorized_camera(appliance,camera_id)
         if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
+        _require_gateway_media_authorization(appliance,camera_id)
         safe=sanitize_appliance_payload(payload)
 
         local_event_id=str(local_event_id or '').strip()
@@ -2019,6 +2085,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         appliance=authenticate_appliance(request,limiter=None)
         if not LIVE_RELAY_ENABLED: raise HTTPException(status_code=404,detail='Live relay is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
+        _require_gateway_media_authorization(appliance,camera_id,live=True)
         if not live_relay_camera_limiter.allow(camera_id):
             raise HTTPException(status_code=429,detail='Live relay request rate exceeded.')
         safe=sanitize_appliance_payload(payload); segment_key=str(safe.get('segment_key','')).strip()
