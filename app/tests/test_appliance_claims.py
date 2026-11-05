@@ -446,11 +446,21 @@ def test_claim_page_redirects_unauthenticated_visitors_to_login(client, db_path)
 
 
 def test_claim_page_rejects_non_customer_owner_roles(client, db_path):
-    admin_cookie = partner_portal._token("admin@example.test", "administrator", None, None)
+    # A REAL administrator session (Linux 1.2.7.1 refuses session-less
+    # administrator tokens, which would only redirect to sign-in): the
+    # route itself must refuse an authenticated non-customer-owner role.
+    from authz_helpers import partner_session_cookie
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-x','P','approved','real','2026-01-01')")
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       ("admin-x", "partner-x", "admin@example.test", "Admin", "administrator", "x", 1, "2026-01-01"))
+        admin_cookie = partner_session_cookie("admin@example.test", "administrator")
 
-    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie})
+    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie}, follow_redirects=False)
 
-    assert response.status_code == 403
+    assert response.status_code == 403, response.text
+    assert "Customer owner permission required" in response.text
 
 
 def test_claim_page_renders_the_customers_own_sites(client, db_path):
