@@ -241,7 +241,7 @@ def test_extending_an_event_no_longer_drops_the_beginning_of_the_original(tmp_pa
         return type("Result", (), {"returncode": 0})()
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
-    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
+    monkeypatch.setattr(main, "_keyframe_times", lambda path, deadline=None: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
 
     t0 = datetime(2026, 1, 1, 12, 0, 0)
     buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
@@ -312,7 +312,7 @@ def test_event_recording_is_trimmed_to_the_requested_window_not_whole_segments(t
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
     # Keyframes every 4 s in each 30 s buffer segment.
-    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
+    monkeypatch.setattr(main, "_keyframe_times", lambda path, deadline=None: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
 
     t0 = datetime(2026, 1, 1, 12, 0, 0)
     buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
