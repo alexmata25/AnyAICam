@@ -389,7 +389,9 @@ def usable_camera_capacity_for_appliance(customer_id: str, appliance_id: str) ->
     if not appliance or appliance.get("customer_id") != customer_id:
         return 0
     edition = appliance.get("gateway_edition")
-    if edition is None:
+    # Camera capacity keeps the original plan rules for Full VMS, whether recorded
+    # explicitly or not yet backfilled (cloud media separately refuses NULL).
+    if edition is None or edition == "full_vms":
         return usable_camera_capacity(customer_id)
     if edition != "local_gateway":
         return usable_camera_capacity(customer_id) if edition == "cloud_gateway" else 0

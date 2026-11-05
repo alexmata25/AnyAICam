@@ -20,7 +20,7 @@ from partner_db import audit, authorize_appliance_tenant, connection, password_h
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy, recording_session_tags
-from event_media_policy import allows_event_media, effective_cloud_recording_mode, motion_event_policy
+from event_media_policy import allows_event_media, effective_cloud_recording_mode, motion_event_policy, valid_event_media_duration
 import product_mode
 import video_profile
 import runtime_paths
@@ -308,50 +308,41 @@ def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     return camera
 
 
-def _table_exists(db,name: str) -> bool:
-    from database_backend import backend
-    if backend()=='sqlite':
-        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone() is not None
-    return db.execute('SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?',(name,)).fetchone() is not None
+def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: bool=False):
+    """Server-side edition check before any cloud media credential or catalog write.
 
-
-def _gateway_editions(db,appliance_id: str) -> set:
-    """Every Gateway edition the server has recorded for this appliance,
-    current or past. A device never supplies its own edition, so only these
-    server-side records count; none at all means a Full VMS appliance."""
-    appliance=db.execute('SELECT * FROM appliances WHERE id=?',(appliance_id,)).fetchone()
-    if appliance is None: raise LookupError('Appliance not found.')
-    editions={dict(appliance).get('gateway_edition')}-{None}
-    for table in ('appliance_edition_provisioning_decisions','internal_gateway_provisioning_authorizations'):
-        if _table_exists(db,table):
-            editions.update(item['edition'] for item in db.execute(f'SELECT edition FROM {table} WHERE appliance_id=?',(appliance_id,)).fetchall())
-    if _table_exists(db,'local_gateway_remote_subscriptions') and db.execute(
-            'SELECT 1 FROM local_gateway_remote_subscriptions WHERE appliance_id=?',(appliance_id,)).fetchone():
-        editions.add('local_gateway')
-    return editions
-
-
-def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: bool=False) -> None:
-    """Server-side Gateway check before any cloud media credential is issued.
-
-    Local Gateway never gets one, and no Gateway gets live relay. Cloud
-    Gateway event media needs the server-recorded cloud_gateway edition and
-    nothing else, plus one active binding for this exact camera that
-    verify_paid_binding() revalidates (edition evidence, current paid
-    subscription, audit chain, camera mapping and seat count). Full VMS
-    appliances (no Gateway record) return unchanged. Any error fails closed."""
+    Returns 'full_vms' when the existing Full VMS plan rules apply, or the
+    Cloud Gateway camera's event retention days. Only server records count
+    (server_gateway_edition.edition_records); a device never supplies its
+    edition. An explicit full_vms marker with no Gateway evidence is Full VMS;
+    NULL, unknown or conflicting identity is refused. Local Gateway never
+    gets cloud media and no Gateway gets live relay. Cloud Gateway is
+    authorized by its own $9.99-per-camera entitlement, not a Full VMS plan:
+    the cloud_gateway marker, only cloud_gateway evidence, and one active
+    binding for this exact camera that verify_paid_binding() revalidates
+    (edition evidence, current paid subscription, audit chain, camera mapping
+    and seat count), plus a retention the event-media sweep will enforce. A
+    missing schema or any error fails closed (503)."""
     import cloud_gateway_camera_entitlements as entitlements
+    import recording_retention_sweep
+    from event_media_policy import MOTION_RETENTION_DAYS
     from partner_db import transaction
+    from server_gateway_edition import FULL_VMS, edition_records
     try:
+        # Read only: a Full VMS request never takes the write lock.
+        with connection() as db:
+            marker,editions,any_gateway=edition_records(db,appliance['id'])
+        if marker==FULL_VMS and not any_gateway:
+            return FULL_VMS
+        if marker is None or marker==FULL_VMS:
+            raise HTTPException(status_code=403,detail='Appliance edition is not verified for cloud media.')
+        refused=HTTPException(status_code=403,detail='This Gateway camera is not entitled to cloud media.')
+        if live or marker!='cloud_gateway' or editions-{'cloud_gateway'}:
+            raise refused
+        # Paid-binding verification takes the customer lock; re-read the edition under it.
         with transaction() as db:
-            editions=_gateway_editions(db,appliance['id'])
-            if not editions:
-                return
-            refused=HTTPException(status_code=403,detail='This Gateway camera is not entitled to cloud media.')
-            if live or editions!={'cloud_gateway'}:
-                raise refused
-            edition=db.execute('SELECT gateway_edition FROM appliances WHERE id=?',(appliance['id'],)).fetchone()
-            if not edition or edition['gateway_edition']!='cloud_gateway':
+            marker,editions,_=edition_records(db,appliance['id'])
+            if marker!='cloud_gateway' or editions-{'cloud_gateway'}:
                 raise refused
             customer_id=str(appliance.get('customer_id') or '')
             bindings=db.execute("SELECT id FROM cloud_gateway_camera_entitlements WHERE camera_id=? AND customer_id=? AND appliance_id=? AND status='active'",
@@ -362,11 +353,34 @@ def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: 
                                                       appliance_id=appliance['id'],camera_id=camera_id)
             if not isinstance(verified,dict) or verified.get('status')!='verified':
                 raise refused
+            # Never accept media the retention sweep would keep forever.
+            retention=recording_retention_sweep.event_media_retention_days(db,customer_id)
+            if retention not in MOTION_RETENTION_DAYS:
+                raise HTTPException(status_code=403,detail='Cloud Gateway event retention is not configured for this customer.')
+            return retention
     except HTTPException:
         raise
     except Exception as error:
         logger.exception('gateway_media.authorization_failed appliance_id=%s camera_id=%s',appliance.get('id'),camera_id)
         raise HTTPException(status_code=503,detail='Cloud media authorization is unavailable.') from error
+
+
+def _cloud_gateway_camera_modes(appliance: dict) -> dict | None:
+    """For a Cloud Gateway appliance: {camera_id: 'motion'} for each camera with
+    an active paid binding, else None (not a Cloud Gateway, or unknown). Only
+    what the edge is told to attempt; every upload is still verified above."""
+    from server_gateway_edition import edition_records
+    try:
+        with connection() as db:
+            marker,editions,_=edition_records(db,appliance['id'])
+            if marker!='cloud_gateway' or editions-{'cloud_gateway'}:
+                return None
+            bound=db.execute("SELECT camera_id FROM cloud_gateway_camera_entitlements WHERE appliance_id=? AND customer_id=? AND status='active'",
+                             (appliance['id'],str(appliance.get('customer_id') or ''))).fetchall()
+            return {item['camera_id']:'motion' for item in bound}
+    except Exception:
+        logger.exception('gateway_media.camera_modes_unavailable appliance_id=%s',appliance.get('id'))
+        return None
 
 
 def _queue_product_mode_restart(db,appliance: dict,new_mode: str) -> dict | None:
@@ -893,8 +907,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 rule_item['geometry']=[]
             rule_item['notifications_enabled']=bool(rule_item.get('notifications_enabled',1))
         _modes: dict={}
+        # Cloud Gateway cameras follow their own paid binding, not a Full VMS plan.
+        _cloud_gateway_modes=_cloud_gateway_camera_modes(appliance)
         for item in camera_items:
-            item['recording_mode']=_effective_camera_mode(appliance.get('customer_id'),item.get('recording_mode'),_modes)
+            if _cloud_gateway_modes is not None:
+                item['recording_mode']='disabled' if item.get('recording_mode')=='disabled' else _cloud_gateway_modes.get(item.get('id'),'disabled')
+            else:
+                item['recording_mode']=_effective_camera_mode(appliance.get('customer_id'),item.get('recording_mode'),_modes)
             # R-REC-1: event recording is the only local mode -- transmitted
             # literally, whatever (NULL/legacy) the column holds.
             item['local_recording_mode']='event'
@@ -1334,8 +1353,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not (RECORDING_UPLOAD_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED or camera_id in RECORDING_UPLOAD_PILOT_CAMERAS):
             raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
-        # Gateway appliances: server-side edition and paid-camera checks before STS.
-        _require_gateway_media_authorization(appliance,camera_id)
+        # Server-side edition and (Cloud Gateway) paid-camera checks before STS.
+        basis=_require_gateway_media_authorization(appliance,camera_id)
         if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
             raise HTTPException(status_code=503,detail='Recording upload is not configured.')
         try:
@@ -1349,11 +1368,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # for a camera whose plan includes cloud event protection -- no S3
         # write for a Local (or cancelled) plan, so nothing is uploaded that
         # the catalog would refuse and the retention sweep would never see.
-        if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
-            raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
-        with connection() as db:
-            if not motion_event_policy(db,camera.get('customer_id')):
+        # Cloud Gateway: its verified paid binding and retention (checked above)
+        # replace the Full VMS plan; an explicitly disabled camera stays off.
+        if basis=='full_vms':
+            if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
                 raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
+            with connection() as db:
+                if not motion_event_policy(db,camera.get('customer_id')):
+                    raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
+        elif camera.get('cloud_recording_mode')=='disabled':
+            raise HTTPException(status_code=403,detail='Camera is not entitled to cloud event media.')
         policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         session_name=recording_session_name(appliance['id'],camera_id)
         assume_args={'RoleArn':RECORDING_UPLOAD_ROLE_ARN,'RoleSessionName':session_name,'Policy':json.dumps(policy),'DurationSeconds':RECORDING_SESSION_DURATION_SECONDS}
@@ -1757,9 +1781,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
 
         camera=_authorized_camera(appliance,camera_id)
-        if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
+        basis=_require_gateway_media_authorization(appliance,camera_id)
+        # Cloud Gateway follows its paid binding (verified above), not a Full VMS plan.
+        if (camera.get('cloud_recording_mode')=='disabled' if basis!='full_vms'
+                else _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion'):
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
-        _require_gateway_media_authorization(appliance,camera_id)
         safe=sanitize_appliance_payload(payload)
 
         local_event_id=str(local_event_id or '').strip()
@@ -1837,7 +1863,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 duration=float(duration_seconds)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400,detail='duration_seconds is required.')
-            allowed, reason=allows_event_media(db,camera['customer_id'],camera_id,event_at,duration)
+            if basis=='full_vms':
+                allowed, reason=allows_event_media(db,camera['customer_id'],camera_id,event_at,duration)
+            else:
+                allowed, reason=(True,'') if valid_event_media_duration(duration) else (False,'Invalid event-media duration.')
             if not allowed: raise HTTPException(status_code=403,detail=reason)
 
             existing=db.execute(
@@ -1922,9 +1951,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
 
         camera=_authorized_camera(appliance,camera_id)
-        if _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion':
+        basis=_require_gateway_media_authorization(appliance,camera_id)
+        # Cloud Gateway follows its paid binding (verified above), not a Full VMS plan.
+        if (camera.get('cloud_recording_mode')=='disabled' if basis!='full_vms'
+                else _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion'):
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
-        _require_gateway_media_authorization(appliance,camera_id)
         safe=sanitize_appliance_payload(payload)
 
         local_event_id=str(local_event_id or '').strip()

@@ -91,6 +91,12 @@ def _event_media_retention_days(db, customer_id: str) -> int | None:
     return _customer_retention_days(db, customer_id)
 
 
+def event_media_retention_days(db, customer_id: str) -> int | None:
+    """Public form of the sweep's own event-media retention, so an upload is
+    authorized only for media this sweep will later expire."""
+    return _event_media_retention_days(db, customer_id)
+
+
 def _expired_candidates(db, now: datetime) -> list[dict]:
     """Every available recording whose customer has a real, on-file
     retention_days AND whose own started_at is older than that many

@@ -1341,6 +1341,12 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                 db.execute('INSERT INTO sites(id,customer_id,name,address,site_type,created_at) VALUES(?,?,?,?,?,?)',(site_id,customer_id,site_name,site_address,'Customer site',now))
             if not row('SELECT id FROM appliances WHERE id=?',(appliance_id,)):
                 db.execute('INSERT INTO appliances(id,customer_id,site_id,cloud_id,appliance_type,serial_number,software_version,last_check_in,online_status,ip_address,cpu,memory,disk,camera_capacity,activation_token_hash,activation_token_created_at,shipping_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(appliance_id,customer_id,site_id,cloud_id,'AnyAiCam mini PC','Pending','Not installed',None,'offline','Not connected',0,0,0,max(16,camera_count),password_hash(activation_token),now,'not_ordered',now))
+            # A self-service order is a Full VMS appliance: record that explicitly
+            # (also on a retry), and never overwrite another recorded edition.
+            from server_gateway_edition import FULL_VMS
+            db.execute('UPDATE appliances SET gateway_edition=? WHERE id=? AND customer_id=? AND gateway_edition IS NULL',(FULL_VMS,appliance_id,customer_id))
+            marked=db.execute('SELECT gateway_edition FROM appliances WHERE id=? AND customer_id=?',(appliance_id,customer_id)).fetchone()
+            if not marked or marked['gateway_edition']!=FULL_VMS: raise RuntimeError('Appliance edition binding failed')
             if not row('SELECT id FROM appliance_activation_tokens WHERE appliance_id=? AND used_at IS NULL AND revoked_at IS NULL',(appliance_id,)):
                 db.execute('INSERT INTO appliance_activation_tokens(id,appliance_id,token_hash,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?)',(secrets.token_hex(6),appliance_id,password_hash(activation_token),(datetime.now()+timedelta(hours=24)).isoformat(),now,identity.get('email','')))
             if (row('SELECT COUNT(*) AS n FROM cameras WHERE appliance_id=?',(appliance_id,)) or {'n':0})['n']==0:

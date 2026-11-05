@@ -13,7 +13,9 @@ from local_gateway_remote_billing import remote_access_for_appliance
 
 class ServerEditionTests(unittest.TestCase):
     def test_only_global_admin_can_assign_onboarding_edition(self):
-        self.assertIsNone(onboarding_edition({}, is_global_admin=False))
+        # A server-side order without a Gateway choice records Full VMS explicitly.
+        self.assertEqual(onboarding_edition({}, is_global_admin=False), "full_vms")
+        self.assertEqual(onboarding_edition({"gateway_edition": "full_vms"}, is_global_admin=False), "full_vms")
         self.assertEqual(onboarding_edition({"gateway_edition": "local_gateway"}, is_global_admin=True), "local_gateway")
         with self.assertRaises(PermissionError):
             onboarding_edition({"gateway_edition": "local_gateway"}, is_global_admin=False)

@@ -189,10 +189,14 @@ def effective_cloud_recording_mode(db, customer_id: str, explicit):
     return "motion" if motion_event_policy(db, customer_id) else "disabled"
 
 
+def valid_event_media_duration(duration_seconds: float) -> bool:
+    return 0 < duration_seconds <= _MAX_SINGLE_CLIP_SECONDS
+
+
 def allows_event_media(db, customer_id: str, camera_id: str, event_at: datetime, duration_seconds: float) -> tuple[bool, str]:
     policy = motion_event_policy(db, customer_id)
     if not policy:
         return False, "An active 7, 14, or 30-day motion recording plan is required."
-    if duration_seconds <= 0 or duration_seconds > _MAX_SINGLE_CLIP_SECONDS:
+    if not valid_event_media_duration(duration_seconds):
         return False, "Invalid event-media duration."
     return True, ""

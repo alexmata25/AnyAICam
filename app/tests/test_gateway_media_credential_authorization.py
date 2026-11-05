@@ -121,7 +121,9 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
 
     @staticmethod
     def _appliance(db, appliance_id, customer):
-        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,live_relay_pilot,created_at) VALUES(?,?,?,?,1,?)",
+        # Explicit, trusted Full VMS identity unless a test sets another edition.
+        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,live_relay_pilot,gateway_edition,created_at) "
+                   "VALUES(?,?,?,?,1,'full_vms',?)",
                    (appliance_id, customer, f"site-{customer}", f"AIC-{appliance_id.upper()}", NOW))
         db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)",
                    (f"cred-{appliance_id}", appliance_id, password_hash(f"secret-{appliance_id}"), NOW))
@@ -179,6 +181,44 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(_FakeSTS.calls), 1)
 
+    def test_unverified_edition_identity_is_refused_before_sts(self):
+        for marker in (None, "garbage", "FULL_VMS", ""):
+            self._edition("appl-1", marker)
+            with self.subTest(marker=marker):
+                self.assertRefusedBeforeSts(self._request())
+                self.assertRefusedBeforeSts(self._live())
+
+    def test_full_vms_marker_with_gateway_evidence_is_refused(self):
+        with connection() as db:
+            db.execute("INSERT INTO gateway_stable_installation_claim_ids(claim_id,appliance_id,original_claim_id,created_at) "
+                       "VALUES('stable-1','appl-1','orig-1',?)", (NOW,))
+        self.assertRefusedBeforeSts(self._request())
+
+    def test_missing_edition_column_or_evidence_table_fails_closed(self):
+        import server_gateway_edition
+        original = server_gateway_edition._table_exists
+        with patch.object(server_gateway_edition, "_table_exists",
+                          side_effect=lambda db, name: name != "gateway_checkout_attempts" and original(db, name)):
+            self.assertRefusedBeforeSts(self._request(), status=503)
+        with patch("server_gateway_edition.edition_records",
+                   side_effect=server_gateway_edition.EditionUnverifiable("Appliance edition column is missing.")):
+            self.assertRefusedBeforeSts(self._request(), status=503)
+
+    def test_appliance_table_without_edition_column_fails_closed(self):
+        import server_gateway_edition
+
+        class _Row(dict):
+            pass
+
+        class _Db:
+            def execute(self, sql, args=()):
+                if "FROM appliances" in sql:
+                    return type("_C", (), {"fetchone": lambda self: _Row(id="appl-1", customer_id="cust-1")})()
+                raise AssertionError("evidence must not be read without the column")
+
+        with self.assertRaises(server_gateway_edition.EditionUnverifiable):
+            server_gateway_edition.edition_records(_Db(), "appl-1")
+
     def test_full_vms_still_requires_cloud_event_protection(self):
         with connection() as db:
             db.execute("UPDATE camera_plan_entitlements_v2 SET status='cancelled' WHERE customer_id='cust-1'")
@@ -225,6 +265,79 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(_FakeSTS.calls), 1)
         self.assertIn("/events/", json.dumps(json.loads(_FakeSTS.calls[0]["Policy"])))
+
+    def _without_hybrid(self, customer="cust-1"):
+        with connection() as db:
+            db.execute("DELETE FROM camera_plan_entitlements_v2 WHERE customer_id=?", (customer,))
+
+    def _retention(self, days, customer="cust-1"):
+        with connection() as db:
+            db.execute("INSERT INTO customer_cloud_policy(customer_id,daily_cloud_seconds,retention_days,updated_at,updated_by) "
+                       "VALUES(?,NULL,?,?,'admin@example.test') ON CONFLICT(customer_id) DO UPDATE SET retention_days=excluded.retention_days",
+                       (customer, days, NOW))
+
+    def test_paid_cloud_gateway_needs_no_full_vms_hybrid_plan(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        self._without_hybrid()
+        self._retention(30)
+        a, b = self._paid_ready()
+        with a, b:
+            response = self._request()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("/events/", json.dumps(json.loads(_FakeSTS.calls[0]["Policy"])))
+
+    def test_paid_cloud_gateway_without_enforceable_retention_is_refused(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        self._without_hybrid()  # nothing the retention sweep could expire the media by
+        a, b = self._paid_ready()
+        with a, b:
+            response = self._request()
+        self.assertRefusedBeforeSts(response)
+        self.assertIn("retention", response.json()["detail"])
+
+    def test_paid_cloud_gateway_camera_explicitly_disabled_is_refused(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        with connection() as db:
+            db.execute("UPDATE cameras SET cloud_recording_mode='disabled' WHERE id='cam-1'")
+        a, b = self._paid_ready()
+        with a, b:
+            self.assertRefusedBeforeSts(self._request())
+
+    def test_cloud_gateway_configuration_advertises_motion_only_for_bound_cameras(self):
+        self._edition("appl-1", "cloud_gateway")
+        with connection() as db:
+            self._camera(db, "cam-3", "cust-1", "appl-1", 2)
+            self._camera(db, "cam-4", "cust-1", "appl-1", 3)
+            db.execute("UPDATE cameras SET cloud_recording_mode='disabled' WHERE id='cam-4'")
+        self._bind()
+        self._without_hybrid()
+        response = self.client.get("/api/appliance/configuration", headers=self._headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        modes = {item["id"]: item["recording_mode"] for item in response.json()["cameras"]}
+        self.assertEqual(modes, {"cam-1": "motion", "cam-3": "disabled", "cam-4": "disabled"})
+
+    def test_cloud_gateway_catalog_is_not_blocked_by_a_missing_full_vms_plan(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        self._without_hybrid()
+        self._retention(14)
+        key = "recordings/cust-1/site-cust-1/appl-1/cam-1/events/e-1.mp4"
+        a, b = self._paid_ready()
+        with a, b, patch.object(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True):
+            response = self.client.post("/api/appliance/analytics/cam-1/events/e-1/media", headers=self._headers(),
+                                        json={"s3_key": key, "started_at": NOW, "ended_at": NOW, "duration_seconds": 5})
+        self.assertNotIn(response.json().get("detail"), {"Camera is not entitled to motion event recording.",
+                                                         "An active 7, 14, or 30-day motion recording plan is required.",
+                                                         "This Gateway camera is not entitled to cloud media."})
+
+    def test_full_vms_never_takes_the_write_transaction(self):
+        import partner_db
+        with patch.object(partner_db, "transaction", side_effect=AssertionError("Full VMS must not lock")):
+            response = self._request()
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_paid_cloud_gateway_is_refused_while_billing_source_is_disabled(self):
         self._edition("appl-1", "cloud_gateway")
