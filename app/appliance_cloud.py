@@ -308,7 +308,7 @@ def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     return camera
 
 
-def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: bool=False):
+def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: bool=False,details: dict | None=None):
     """Server-side edition check before any cloud media credential or catalog write.
 
     Returns 'full_vms' when the existing Full VMS plan rules apply, or the
@@ -322,7 +322,13 @@ def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: 
     binding for this exact camera that verify_paid_binding() revalidates
     (edition evidence, current paid subscription, audit chain, camera mapping
     and seat count), plus a retention the event-media sweep will enforce. A
-    missing schema or any error fails closed (503)."""
+    missing schema or any error fails closed (503).
+
+    The sweep must be operationally ready, not merely configured: a worker
+    with a recent real deletion probe and a recent successful tick
+    (recording_retention_sweep.operational_readiness). When `details` is
+    given it receives the Cloud Gateway binding id, which the catalog
+    routes freeze onto the clip with its retention (capture time)."""
     import cloud_gateway_camera_entitlements as entitlements
     import recording_retention_sweep
     from event_media_policy import MOTION_RETENTION_DAYS
@@ -353,22 +359,37 @@ def _require_gateway_media_authorization(appliance: dict,camera_id: str,*,live: 
                                                       appliance_id=appliance['id'],camera_id=camera_id)
             if not isinstance(verified,dict) or verified.get('status')!='verified':
                 raise refused
-            # Never accept media the retention sweep would keep forever: the
-            # sweep must be configured to enforce on this host, and the
-            # customer's Cloud Gateway retention (14-day default recorded
-            # here on first use, or their 7/14/30 choice) must be valid.
-            if not recording_retention_sweep.readiness().get('ready'):
+            # Never accept media the retention sweep would keep forever: a
+            # sweep worker must be proven to delete (recent deletion probe
+            # and tick, recorded in the database), and the customer's Cloud
+            # Gateway retention (14-day default recorded here on first use,
+            # or their 7/14/30 choice) must be valid.
+            if not recording_retention_sweep.operational_readiness(db).get('ready'):
                 raise HTTPException(status_code=503,detail='Cloud Gateway event retention is not enforced on this host.')
             import cloud_gateway_retention
             retention=cloud_gateway_retention.ensure_default(db,customer_id)
             if retention not in MOTION_RETENTION_DAYS:
                 raise HTTPException(status_code=403,detail='Cloud Gateway event retention is not configured for this customer.')
+            if details is not None:
+                details['binding_id']=bindings[0]['id']
             return retention
     except HTTPException:
         raise
     except Exception as error:
         logger.exception('gateway_media.authorization_failed appliance_id=%s camera_id=%s',appliance.get('id'),camera_id)
         raise HTTPException(status_code=503,detail='Cloud media authorization is unavailable.') from error
+
+
+def _capture_retention(basis,details: dict) -> tuple:
+    """(retention_policy, retention_days, retention_basis_ref) frozen onto a
+    newly cataloged clip: the policy in force at capture time. Full VMS keeps
+    its existing plan chain; Cloud Gateway freezes the 7/14/30 days the guard
+    just verified and the paid binding that authorized the upload."""
+    if basis=='full_vms':
+        return 'full_vms_plan',None,None
+    if isinstance(basis,bool) or not isinstance(basis,int) or basis not in (7,14,30) or not details.get('binding_id'):
+        raise HTTPException(status_code=503,detail='Cloud media authorization is unavailable.')
+    return 'cloud_gateway',basis,str(details['binding_id'])
 
 
 def _cloud_gateway_camera_modes(appliance: dict) -> dict | None:
@@ -1787,11 +1808,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
 
         camera=_authorized_camera(appliance,camera_id)
-        basis=_require_gateway_media_authorization(appliance,camera_id)
+        authorization={}
+        basis=_require_gateway_media_authorization(appliance,camera_id,details=authorization)
         # Cloud Gateway follows its paid binding (verified above), not a Full VMS plan.
         if (camera.get('cloud_recording_mode')=='disabled' if basis!='full_vms'
                 else _effective_camera_mode(camera.get('customer_id'),camera.get('cloud_recording_mode')) != 'motion'):
             raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
+        retention_policy,retention_days,retention_basis_ref=_capture_retention(basis,authorization)
         safe=sanitize_appliance_payload(payload)
 
         local_event_id=str(local_event_id or '').strip()
@@ -1881,6 +1904,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             ).fetchone()
 
             if existing:
+                # Re-registration of the same event: the retention frozen
+                # when the row was first cataloged is never rewritten.
                 db.execute(
                     'UPDATE detection_event_media SET '
                     's3_key=?,thumbnail_s3_key=?,started_at=?,ended_at=?,'
@@ -1906,8 +1931,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 'INSERT INTO detection_event_media('
                 'id,detection_event_id,customer_id,camera_id,s3_key,'
                 'thumbnail_s3_key,started_at,ended_at,duration_seconds,'
-                'size_bytes,local_relative_path,created_at'
-                ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                'size_bytes,local_relative_path,created_at,'
+                'retention_policy,retention_days,retention_basis_ref,retention_recorded_at'
+                ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (
                     media_id,
                     event['id'],
@@ -1921,6 +1947,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     int(size_bytes) if size_bytes is not None else None,
                     local_relative_path,
                     now,
+                    retention_policy,
+                    retention_days,
+                    retention_basis_ref,
+                    now,
                 ),
             )
             set_media_status(db,event['id'],'available')
@@ -1930,7 +1960,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             'appliance.analytics_event_media_available',
             'detection_event_media',
             media_id,
-            {'camera_id':camera_id,'local_event_id':local_event_id,'s3_key':s3_key},
+            {'camera_id':camera_id,'local_event_id':local_event_id,'s3_key':s3_key,
+             'retention_policy':retention_policy,'retention_days':retention_days,'retention_basis_ref':retention_basis_ref},
         )
 
         return {'status':'accepted','media_id':media_id}
@@ -2022,7 +2053,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 raise HTTPException(status_code=403,detail='Claimed parent Motion event belongs to a different customer or site.')
 
             parent_media=db.execute(
-                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes,local_relative_path,source_media_id '
+                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes,local_relative_path,source_media_id,'
+                'retention_policy,retention_days,retention_basis_ref,retention_recorded_at '
                 'FROM detection_event_media WHERE detection_event_id=?',
                 (parent['id'],),
             ).fetchone()
@@ -2051,8 +2083,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     'INSERT INTO detection_event_media('
                     'id,detection_event_id,customer_id,camera_id,s3_key,'
                     'thumbnail_s3_key,started_at,ended_at,duration_seconds,'
-                    'size_bytes,local_relative_path,source_media_id,created_at'
-                    ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    'size_bytes,local_relative_path,source_media_id,created_at,'
+                    'retention_policy,retention_days,retention_basis_ref,retention_recorded_at'
+                    ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (
                         media_id,
                         child['id'],
@@ -2067,6 +2100,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         parent_media['local_relative_path'],
                         parent_media['id'],
                         now,
+                        # A shared row never expires on its own (the root's
+                        # deletion cascades); it mirrors the root's frozen
+                        # retention for audit only.
+                        parent_media['retention_policy'],
+                        parent_media['retention_days'],
+                        parent_media['retention_basis_ref'],
+                        parent_media['retention_recorded_at'],
                     ),
                 )
                 set_media_status(db,child['id'],'available')

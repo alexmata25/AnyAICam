@@ -16,18 +16,24 @@ reverse.
 
 Guarantees:
 - effective_retention_days() never returns None for a Cloud Gateway
-  customer, so media accepted from a Gateway camera always expires
-  (stored choice, else the 14-day default), even after the binding ends.
+  customer (stored choice, else the 14-day default).
 - The upload guard calls ensure_default() inside its own write
   transaction. The first authorized upload records the 14-day default
   (source 'default', audited), so the customer "receives" it
   automatically with no backfill.
+- Capture-time attribution (Codex review of 9ba528b): the catalog route
+  freezes the retention in force when a clip is accepted onto that
+  clip's own row (detection_event_media.retention_policy='cloud_gateway',
+  retention_days, retention_basis_ref = the paid binding). The sweep
+  reads only that frozen value, so a later change, an ended binding, a
+  camera reassignment or a subscription change never shortens (or
+  lengthens) a clip already stored, and Full VMS clips are never touched.
 - Only cloud S3 event media is affected. Local recordings on the
   appliance are never read, listed or deleted by this module or by the
   sweep; the edge keeps its own local retention independently.
-- Changes are versioned (optimistic concurrency), and lowering the
-  retention needs confirm_reduction=True, because the next sweep tick
-  deletes clips older than the new period.
+- Changes are versioned (optimistic concurrency) and apply to clips
+  captured after the change. Lowering still needs confirm_reduction=True,
+  because new clips are then kept for less time.
 
 Nothing here contacts AWS or Stripe."""
 from __future__ import annotations
@@ -65,15 +71,8 @@ def customer_has_cloud_gateway(db, customer_id: str) -> bool:
                       (customer_id,)).fetchone() is not None
 
 
-def cloud_gateway_camera_ids(db) -> set:
-    """Every camera that has ever held a Cloud Gateway binding. Its event
-    media follows Cloud Gateway retention in the sweep."""
-    return {row['camera_id'] for row in db.execute('SELECT DISTINCT camera_id FROM cloud_gateway_camera_entitlements').fetchall()}
-
-
 def _row(db, customer_id: str):
-    # A missing table raises here: the guard turns that into 503 and the
-    # sweep skips the row (never deletes early).
+    # A missing table raises here: the upload guard turns that into 503.
     row = db.execute(f'SELECT customer_id,retention_days,source,version,updated_at,updated_by FROM {TABLE} WHERE customer_id=?',
                      (customer_id,)).fetchone()
     return dict(row) if row else None
@@ -81,8 +80,7 @@ def _row(db, customer_id: str):
 
 def effective_retention_days(db, customer_id: str) -> int:
     """The stored choice, else the 14-day default. Never None. A corrupt
-    stored value raises; the sweep then skips (never deletes early) and
-    the upload guard refuses."""
+    stored value raises, and the upload guard refuses."""
     row = _row(db, customer_id)
     if row is None:
         return DEFAULT_RETENTION_DAYS
@@ -120,6 +118,7 @@ def describe(db, customer_id: str) -> dict:
         'options': list(RETENTION_OPTIONS),
         'default_retention_days': DEFAULT_RETENTION_DAYS,
         'applies_to': 'cloud_event_clips_only',
+        'change_applies_to': 'clips_captured_after_the_change',
     }
 
 
@@ -167,7 +166,8 @@ def set_retention(db, customer_id: str, retention_days, *, actor_email: str, act
         raise RetentionRefused(409, 'Retention changed since it was loaded; reload and try again.')
     previous = effective_retention_days(db, customer_id)
     if days < previous and confirm_reduction is not True:
-        raise RetentionRefused(409, f'Lowering retention from {previous} to {days} days deletes older cloud clips; confirm to continue.')
+        raise RetentionRefused(409, f'Lowering retention from {previous} to {days} days keeps new cloud clips for less time; '
+                              'clips already stored keep the retention they were captured with; confirm to continue.')
     source = 'administrator' if actor_role == 'administrator' else 'customer_owner'
     if row is None:
         db.execute(f'INSERT INTO {TABLE}(customer_id,retention_days,source,version,updated_at,updated_by) VALUES(?,?,?,?,?,?)',

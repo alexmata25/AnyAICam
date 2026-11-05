@@ -1,9 +1,14 @@
 """Cloud Gateway event-clip retention (owner approval 2026-11-05):
 - 14-day default, 7/30 options, validated and audited on the server;
-- the cleanup sweep enforces it on Cloud Gateway camera media only;
+- the cleanup sweep enforces the policy frozen on each clip at capture
+  time (Codex review of 9ba528b), never the camera's current binding;
+- historical clips without a recorded policy are held unless provably
+  Full VMS; Gateway lookup failures hold only those, with diagnostics;
+- the worker's readiness needs a real deletion probe and tick;
 - Full VMS retention and local recordings stay independent.
 
 No AWS, Stripe or network: the sweep's S3 delete is patched."""
+import logging
 import sys
 import tempfile
 import unittest
@@ -79,19 +84,37 @@ class CloudGatewayRetentionTests(unittest.TestCase):
                    "VALUES(?,?,?,?,?,?,'cloud_gateway','stripe',?,'v1',?,1,'audit-test',?,?)",
                    (f"binding-{camera_id}", customer, appliance_id, camera_id, number, f"urn:uuid:{camera_id}", f"sub-{customer}", status, T0, T0))
 
-    def _media(self, media_id, customer, camera_id, age_days):
+    _DEFAULT = object()
+
+    def _media(self, media_id, customer, camera_id, age_days, policy=_DEFAULT, days=_DEFAULT, created_at=None):
+        """A root clip. By default it carries the policy its camera's edition
+        records at capture: Cloud Gateway 14 days, or the Full VMS plan.
+        policy=None models a historical row cataloged before attribution."""
         started = (NOW - timedelta(days=age_days)).isoformat()
         appliance = {"cam-g": "appl-g", "cam-f": "appl-f", "cam-g2": "appl-g2", "cam-v": "appl-v"}[camera_id]
+        gateway = camera_id in ("cam-g", "cam-g2")
+        if policy is self._DEFAULT:
+            policy = "cloud_gateway" if gateway else "full_vms_plan"
+        if days is self._DEFAULT:
+            days = 14 if policy == "cloud_gateway" else None
         with connection() as db:
             db.execute("INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) "
                        "VALUES(?,?,?,?,?,?,'motion',?,?)", (f"ev-{media_id}", customer, f"site-{customer}", appliance, camera_id, media_id, started, started))
-            db.execute("INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,created_at) "
-                       "VALUES(?,?,?,?,?,?,?,?)", (media_id, f"ev-{media_id}", customer, camera_id, f"recordings/{customer}/{media_id}.mp4",
-                                                    started, started, started))
+            db.execute("INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,created_at,"
+                       "retention_policy,retention_days,retention_basis_ref,retention_recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (media_id, f"ev-{media_id}", customer, camera_id, f"recordings/{customer}/{media_id}.mp4",
+                        started, started, created_at or started, policy, days,
+                        f"binding-{camera_id}" if policy == "cloud_gateway" else None, None if policy is None else started))
 
-    def _candidates(self):
+    def _candidates(self, diagnostics=None):
         with connection() as db:
-            return sorted(row["id"] for row in sweep._expired_candidates(db, NOW) if row["kind"] == "event_media")
+            return sorted(row["id"] for row in sweep._expired_candidates(db, NOW, diagnostics) if row["kind"] == "event_media")
+
+    def _full_vms_override(self, customer, days):
+        with connection() as db:
+            db.execute("INSERT INTO customer_cloud_policy(customer_id,daily_cloud_seconds,retention_days,updated_at,updated_by) "
+                       "VALUES(?,NULL,?,?,'admin') ON CONFLICT(customer_id) DO UPDATE SET retention_days=excluded.retention_days",
+                       (customer, days, T0))
 
     def _set(self, customer, days, *, version, confirm=False, actor=("owner-1@example.test", "customer_owner")):
         with transaction() as db:
@@ -242,42 +265,139 @@ class CloudGatewayRetentionTests(unittest.TestCase):
         self.assertEqual(partner.status_code, 403, partner.text)
 
     # ------------------------------------------------------------ cleanup sweep
-    def test_sweep_enforces_the_14_day_default_without_any_setting(self):
+    def test_sweep_enforces_the_14_day_default_frozen_at_capture(self):
         self._media("g-15", "cust-1", "cam-g", 15)
         self._media("g-13", "cust-1", "cam-g", 13)
         self.assertEqual(self._candidates(), ["g-15"])
 
-    def test_sweep_enforces_the_selected_7_and_30_day_periods(self):
-        for age in (8, 20, 31):
-            self._media(f"g-{age}", "cust-1", "cam-g", age)
-        self._set("cust-1", 7, version=0, confirm=True)
-        self.assertEqual(self._candidates(), ["g-20", "g-31", "g-8"])
-        self._set("cust-1", 30, version=1)
-        self.assertEqual(self._candidates(), ["g-31"])
+    def test_each_clip_keeps_the_7_or_30_days_it_was_captured_with(self):
+        self._media("g7-8", "cust-1", "cam-g", 8, days=7)
+        self._media("g7-6", "cust-1", "cam-g", 6, days=7)
+        self._media("g30-20", "cust-1", "cam-g", 20, days=30)
+        self._media("g30-31", "cust-1", "cam-g", 31, days=30)
+        self.assertEqual(self._candidates(), ["g30-31", "g7-8"])
 
-    def test_media_of_an_ended_binding_still_expires(self):
-        self._media("g2-15", "cust-2", "cam-g2", 15)
+    def test_a_shorter_setting_never_deletes_clips_captured_under_a_longer_one(self):
+        self._media("g30-20", "cust-1", "cam-g", 20, days=30)
+        self._set("cust-1", 7, version=0, confirm=True)
+        self.assertEqual(self._candidates(), [])  # 20 days old, captured with 30: kept
+
+    def test_a_longer_setting_applies_to_new_clips_only(self):
+        self._set("cust-1", 7, version=0, confirm=True)
+        self._media("g7-8", "cust-1", "cam-g", 8, days=7)
+        self._set("cust-1", 30, version=1)
+        self._media("g30-8", "cust-1", "cam-g", 8, days=30)
+        self.assertEqual(self._candidates(), ["g7-8"])  # its own 7-day promise, not extended retroactively
+
+    def test_full_vms_to_gateway_transition_never_applies_gateway_retention_to_older_clips(self):
+        # cam-f was Full VMS: one attributed clip and one historical clip
+        # cataloged before the camera's first Cloud Gateway binding.
+        self._media("f-20", "cust-1", "cam-f", 20)
+        self._media("h-20", "cust-1", "cam-f", 20, policy=None, days=None)
+        with connection() as db:
+            db.execute("UPDATE appliances SET gateway_edition='cloud_gateway' WHERE id='appl-f'")
+            db.execute("INSERT INTO cloud_gateway_camera_entitlements(id,customer_id,appliance_id,camera_id,camera_number,device_key,edition,"
+                       "billing_source,billing_reference,billing_version,status,version,audit_reference,created_at,updated_at) "
+                       "VALUES('binding-cam-f','cust-1','appl-f','cam-f',2,'urn:uuid:cam-f','cloud_gateway','stripe','sub-cust-1','v1','active',1,"
+                       "'audit-test',?,?)", (NOW.isoformat(), NOW.isoformat()))
+        self._set("cust-1", 7, version=0, confirm=True)
+        # The Gateway 7 days never reaches them; no Full VMS retention: kept.
+        self.assertEqual(self._candidates(), [])
+        # They follow the Full VMS chain only.
+        self._full_vms_override("cust-1", 30)
+        self.assertEqual(self._candidates(), [])
+        self._full_vms_override("cust-1", 14)
+        self.assertEqual(self._candidates(), ["f-20", "h-20"])
+        # A clip cataloged on cam-f after the binding carries its own Gateway policy.
+        self._media("g-on-f", "cust-1", "cam-f", 8, policy="cloud_gateway", days=7)
+        self.assertIn("g-on-f", self._candidates())
+
+    def test_ended_binding_keeps_the_frozen_retention(self):
+        self._media("g2-15", "cust-2", "cam-g2", 15)  # cam-g2's binding is cancelled
+        self._media("g2-10", "cust-2", "cam-g2", 10)
         self.assertEqual(self._candidates(), ["g2-15"])
 
-    def test_full_vms_media_keeps_its_own_retention(self):
-        self._media("f-20", "cust-1", "cam-f", 20)  # same customer, Full VMS camera
-        self._media("v-20", "cust-fvms", "cam-v", 20)
-        self._set("cust-1", 7, version=0, confirm=True)
-        # No Full VMS retention source: never expired, exactly as before.
-        self.assertEqual(self._candidates(), [])
+    def test_reassignment_or_binding_removal_keeps_the_frozen_retention(self):
+        self._media("g-15", "cust-1", "cam-g", 15)
+        self._media("g30-20", "cust-1", "cam-g", 20, days=30)
         with connection() as db:
-            db.execute("INSERT INTO customer_cloud_policy(customer_id,daily_cloud_seconds,retention_days,updated_at,updated_by) "
-                       "VALUES('cust-1',NULL,30,?,'admin')", (T0,))
-        self._media("g-20", "cust-1", "cam-g", 20)
-        # The Full VMS override governs cam-f only; cam-g follows its 7 days.
-        self.assertEqual(self._candidates(), ["g-20"])
+            db.execute("UPDATE cameras SET customer_id='cust-2', site_id='site-cust-2' WHERE id='cam-g'")
+            db.execute("UPDATE cloud_gateway_camera_entitlements SET status='revoked', ended_reason='transfer' WHERE camera_id='cam-g'")
+        self._set("cust-2", 7, version=0, confirm=True)  # the new owner's choice never applies to old clips
+        self.assertEqual(self._candidates(), ["g-15"])
+        with connection() as db:
+            db.execute("DELETE FROM cloud_gateway_camera_entitlements WHERE camera_id='cam-g'")
+        self.assertEqual(self._candidates(), ["g-15"])
 
-    def test_unavailable_gateway_retention_never_deletes(self):
-        self._media("g-40", "cust-1", "cam-g", 40)
-        with patch.object(cgr, "effective_retention_days", side_effect=RuntimeError("corrupt")):
-            self.assertEqual(self._candidates(), [])
-        with patch.object(cgr, "cloud_gateway_camera_ids", side_effect=RuntimeError("missing table")):
-            self.assertEqual(self._candidates(), [])
+    def test_ambiguous_historical_clips_are_held(self):
+        # Cataloged on/after cam-g's first binding (T0) with no recorded policy.
+        self._media("amb-after", "cust-1", "cam-g", 40, policy=None, days=None, created_at="2026-11-02T00:00:00")
+        self._media("amb-equal", "cust-1", "cam-g", 40, policy=None, days=None, created_at=T0)
+        self._media("amb-badtime", "cust-1", "cam-g", 40, policy=None, days=None, created_at="not-a-time")
+        self._full_vms_override("cust-1", 7)
+        self._set("cust-1", 7, version=0, confirm=True)
+        diagnostics = sweep._new_diagnostics()
+        self.assertEqual(self._candidates(diagnostics), [])
+        self.assertEqual(diagnostics["held_historical_ambiguous"], 3)
+
+    def test_historical_clip_before_the_first_binding_follows_full_vms(self):
+        self._media("pre", "cust-1", "cam-g", 40, policy=None, days=None, created_at="2026-10-01T00:00:00")
+        self._media("never-bound", "cust-fvms", "cam-v", 40, policy=None, days=None)
+        diagnostics = sweep._new_diagnostics()
+        self.assertEqual(self._candidates(diagnostics), [])  # no Full VMS retention: kept, as before
+        self.assertEqual(diagnostics["held_no_retention"], 2)
+        self._full_vms_override("cust-1", 30)
+        self._full_vms_override("cust-fvms", 30)
+        self.assertEqual(self._candidates(), ["never-bound", "pre"])
+
+    def test_inconsistent_attribution_is_held_and_out_of_range_is_refused(self):
+        self._media("gw-nodays", "cust-1", "cam-g", 40, policy="cloud_gateway", days=None)
+        self._media("fv-days", "cust-1", "cam-f", 40, policy="full_vms_plan", days=7)
+        self._media("orphan-days", "cust-1", "cam-f", 40, policy=None, days=7)
+        self._full_vms_override("cust-1", 7)
+        diagnostics = sweep._new_diagnostics()
+        self.assertEqual(self._candidates(diagnostics), [])
+        self.assertEqual(diagnostics["held_invalid_attribution"], 3)
+        for policy, days in (("cloud_gateway", 21), ("other", None)):
+            with self.assertRaises(Exception):
+                self._media(f"bad-{policy}", "cust-1", "cam-g", 1, policy=policy, days=days)
+
+    def test_gateway_lookup_failure_holds_only_historical_clips(self):
+        self._media("g-15", "cust-1", "cam-g", 15)
+        self._media("f-20", "cust-1", "cam-f", 20)
+        self._media("hist", "cust-1", "cam-f", 20, policy=None, days=None)
+        self._full_vms_override("cust-1", 14)
+        diagnostics = sweep._new_diagnostics()
+        with patch.object(sweep, "_first_gateway_binding_times", side_effect=RuntimeError("missing table")):
+            self.assertEqual(self._candidates(diagnostics), ["f-20", "g-15"])
+        self.assertEqual(diagnostics["held_historical_lookup_unavailable"], 1)
+        self.assertIn("missing table", diagnostics["gateway_lookup_error"])
+
+    def test_attributed_clips_need_no_gateway_lookup(self):
+        self._media("g-15", "cust-1", "cam-g", 15)
+        self._media("f-20", "cust-1", "cam-f", 20)
+        self._full_vms_override("cust-1", 14)
+        with patch.object(sweep, "_first_gateway_binding_times", side_effect=AssertionError("not needed")):
+            self.assertEqual(self._candidates(), ["f-20", "g-15"])
+
+    def test_repeated_lookup_failures_are_reported_and_escalated(self):
+        self._media("hist", "cust-1", "cam-f", 20, policy=None, days=None)
+        sweep.recording_retention_sweep_state["gateway_lookup_failures_consecutive"] = 0
+        self.addCleanup(sweep.recording_retention_sweep_state.pop, "gateway_lookup_failures_consecutive", None)
+        with patch.object(sweep, "_first_gateway_binding_times", side_effect=RuntimeError("down")), \
+                patch.object(sweep, "_delete_recording_object", return_value=True):
+            with self.assertLogs(sweep.logger, level="WARNING") as first:
+                result = sweep.run_retention_sweep_tick(now=NOW)
+            self.assertEqual(sweep.recording_retention_sweep_state["last_diagnostics"]["held_historical_lookup_unavailable"], 1)
+            self.assertTrue(any("media_held" in line for line in first.output))
+            for _ in range(sweep.LOOKUP_FAILURE_ALERT_TICKS - 2):
+                sweep.run_retention_sweep_tick(now=NOW)
+            with self.assertLogs(sweep.logger, level="CRITICAL") as escalated:
+                sweep.run_retention_sweep_tick(now=NOW)
+        self.assertTrue(any("historical_media_expiry_blocked" in line for line in escalated.output))
+        self.assertEqual(sweep.recording_retention_sweep_state["gateway_lookup_failures_consecutive"], sweep.LOOKUP_FAILURE_ALERT_TICKS)
+        sweep.run_retention_sweep_tick(now=NOW)  # lookup works again: counter resets
+        self.assertEqual(sweep.recording_retention_sweep_state["gateway_lookup_failures_consecutive"], 0)
 
     def test_sweep_tick_deletes_expired_gateway_cloud_media(self):
         self._media("g-15", "cust-1", "cam-g", 15)
@@ -286,9 +406,78 @@ class CloudGatewayRetentionTests(unittest.TestCase):
         with patch.object(sweep, "_delete_recording_object", side_effect=lambda key: deleted_keys.append(key) or True):
             result = sweep.run_retention_sweep_tick(now=NOW)
         self.assertEqual(result["deleted"], 1)
+        self.assertEqual(sweep.recording_retention_sweep_state["last_diagnostics"]["attributed_cloud_gateway"], 2)
         self.assertEqual(deleted_keys, ["recordings/cust-1/g-15.mp4"])
         with connection() as db:
             self.assertEqual([r["id"] for r in db.execute("SELECT id FROM detection_event_media").fetchall()], ["g-1"])
+
+    # ------------------------------------------------------------ worker readiness
+    def _ready_config(self):
+        return patch.object(sweep, "readiness", return_value={"ready": True, "missing": []})
+
+    def test_configuration_alone_is_not_operational_readiness(self):
+        with self._ready_config(), connection() as db:
+            result = sweep.operational_readiness(db, NOW)
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("deletion probe" in item for item in result["missing"]))
+
+    def test_worker_probe_then_tick_makes_the_host_operational(self):
+        calls = []
+
+        class FakeS3:
+            def delete_object(self, Bucket, Key):
+                calls.append(Key)
+
+        with patch.object(sweep, "_lifecycle_s3", return_value=(FakeS3(), "bucket")):
+            probe_at = sweep.worker_iteration("host-1", None, now=NOW)
+        self.assertEqual(probe_at, NOW)
+        self.assertEqual(calls, ["recordings/_retention_probe/host-1.probe"])  # never a customer key
+        with self._ready_config(), connection() as db:
+            self.assertEqual(sweep.operational_readiness(db, NOW + timedelta(minutes=5)),
+                             {"ready": True, "missing": [], "worker_id": "host-1"})
+            # Stale tick or stale probe: not ready.
+            self.assertFalse(sweep.operational_readiness(db, NOW + sweep.tick_max_age() + timedelta(minutes=1))["ready"])
+            row = db.execute("SELECT diagnostics_json FROM recording_retention_sweep_health WHERE worker_id='host-1'").fetchone()
+        self.assertIn("attributed_cloud_gateway", row["diagnostics_json"])
+        with patch.object(sweep, "_lifecycle_s3", return_value=(FakeS3(), "bucket")):  # not due: no new probe
+            self.assertEqual(sweep.worker_iteration("host-1", probe_at, now=NOW + timedelta(hours=1)), probe_at)
+        self.assertEqual(len(calls), 1)
+
+    def test_failed_probe_never_sweeps_and_clears_readiness(self):
+        self._media("g-15", "cust-1", "cam-g", 15)
+
+        class DeniedS3:
+            def delete_object(self, Bucket, Key):
+                raise PermissionError("AccessDenied")
+
+        with patch.object(sweep, "_lifecycle_s3", return_value=(DeniedS3(), "bucket")), \
+                patch.object(sweep, "run_retention_sweep_tick", side_effect=AssertionError("must not sweep")), \
+                self.assertLogs(sweep.logger, level="ERROR"):
+            self.assertIsNone(sweep.worker_iteration("host-1", None, now=NOW))
+        with self._ready_config(), connection() as db:
+            self.assertFalse(sweep.operational_readiness(db, NOW)["ready"])
+            row = dict(db.execute("SELECT last_probe_ok_at,last_tick_ok_at,last_error FROM recording_retention_sweep_health").fetchone())
+        self.assertEqual((row["last_probe_ok_at"], row["last_tick_ok_at"]), (None, None))
+        self.assertIn("PermissionError", row["last_error"])
+        with patch.object(sweep, "_lifecycle_s3", return_value=None), self.assertLogs(sweep.logger, level="ERROR"):
+            self.assertIsNone(sweep.worker_iteration("host-1", None, now=NOW))
+
+    def test_missing_health_table_is_not_ready(self):
+        with connection() as db:
+            db.execute("DROP TABLE recording_retention_sweep_health")
+        with self._ready_config(), connection() as db, self.assertLogs(sweep.logger, level="ERROR"):
+            self.assertFalse(sweep.operational_readiness(db, NOW)["ready"])
+
+    def test_diagnostics_report_is_read_only(self):
+        self._media("g-15", "cust-1", "cam-g", 15)
+        self._media("amb", "cust-1", "cam-g", 40, policy=None, days=None, created_at="2026-11-02T00:00:00")
+        with patch.object(sweep, "_delete_recording_object", side_effect=AssertionError("no deletion")):
+            report = sweep.diagnostics_report(NOW)
+        self.assertEqual(report["would_delete"], 1)
+        self.assertEqual(report["classification"]["held_historical_ambiguous"], 1)
+        self.assertFalse(report["operational"]["ready"])
+        with connection() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) AS n FROM detection_event_media").fetchone()["n"], 2)
 
     # ------------------------------------------------------------ local recordings
     def test_local_recordings_are_independent(self):

@@ -32,7 +32,13 @@ from database_backend import override_target
 
 import appliance_cloud
 import cloud_gateway_camera_entitlements as entitlements
+import recording_retention_sweep
 from partner_db import connection, initialize_database, password_hash, transaction
+from recording_credentials import recording_s3_prefix
+
+# The real check, kept before setUp patches it to "a healthy worker exists".
+REAL_OPERATIONAL_READINESS = recording_retention_sweep.operational_readiness
+CONFIGURED = {"ready": True, "missing": []}
 
 NOW = "2026-11-04T00:00:00"
 PRICE = "price_synthetic_cloud_gateway"
@@ -94,8 +100,8 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
             patch.object(appliance_cloud, "LIVE_RELAY_AWS_REGION", "us-east-1"),
             patch.object(appliance_cloud, "boto3", fake_boto3),
             patch.dict("os.environ", {entitlements.CLOUD_GATEWAY_PRICE_ENV: PRICE}),
-            # The sweep is configured to enforce on this (synthetic) host.
-            patch("recording_retention_sweep.readiness", return_value={"ready": True, "missing": []}),
+            # A retention worker is proven to delete on this (synthetic) host.
+            patch("recording_retention_sweep.operational_readiness", return_value={"ready": True, "missing": [], "worker_id": "test"}),
             # The verified-evidence store is synthetic here; every other check is real.
             patch.object(entitlements, "_current_verified_cloud_subscription",
                          side_effect=lambda db, customer, reference: (
@@ -326,12 +332,117 @@ class GatewayMediaCredentialAuthorizationTests(unittest.TestCase):
         self._edition("appl-1", "cloud_gateway")
         self._bind()
         a, b = self._paid_ready()
-        with a, b, patch("recording_retention_sweep.readiness",
+        with a, b, patch("recording_retention_sweep.operational_readiness",
                                 return_value={"ready": False, "missing": ["ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED=true"]}):
             response = self._request()
         self.assertRefusedBeforeSts(response, status=503)
         self.assertIn("retention", response.json()["detail"])
         self.assertIsNone(self._gateway_retention_row())
+
+    # ------------------------------------------------ operational readiness
+    def _health(self, *, probe_age_hours, tick_age_minutes):
+        from datetime import timedelta
+        now = datetime.now()
+        with connection() as db:
+            db.execute("INSERT INTO recording_retention_sweep_health(worker_id,started_at,last_probe_ok_at,last_tick_ok_at,updated_at) "
+                       "VALUES('host-1',?,?,?,?)", (now.isoformat(), (now - timedelta(hours=probe_age_hours)).isoformat(),
+                                                    (now - timedelta(minutes=tick_age_minutes)).isoformat(), now.isoformat()))
+
+    def test_configuration_alone_does_not_authorize_cloud_gateway_uploads(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        a, b = self._paid_ready()
+        with a, b, patch("recording_retention_sweep.operational_readiness", new=REAL_OPERATIONAL_READINESS), \
+                patch("recording_retention_sweep.readiness", return_value=CONFIGURED):
+            response = self._request()
+        self.assertRefusedBeforeSts(response, status=503)
+        self.assertIsNone(self._gateway_retention_row())
+
+    def test_stale_deletion_probe_or_tick_refuses_cloud_gateway_uploads(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        a, b = self._paid_ready()
+        for probe_age, tick_age in ((30, 5), (1, 200)):  # probe older than 26 h; tick older than 2 intervals
+            with connection() as db:
+                db.execute("DELETE FROM recording_retention_sweep_health")
+            self._health(probe_age_hours=probe_age, tick_age_minutes=tick_age)
+            with a, b, patch("recording_retention_sweep.operational_readiness", new=REAL_OPERATIONAL_READINESS), \
+                    patch("recording_retention_sweep.readiness", return_value=CONFIGURED):
+                self.assertRefusedBeforeSts(self._request(), status=503)
+
+    def test_a_proven_retention_worker_authorizes_cloud_gateway_uploads(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        self._health(probe_age_hours=1, tick_age_minutes=5)
+        a, b = self._paid_ready()
+        with a, b, patch("recording_retention_sweep.operational_readiness", new=REAL_OPERATIONAL_READINESS), \
+                patch("recording_retention_sweep.readiness", return_value=CONFIGURED):
+            response = self._request()
+        self.assertEqual(response.status_code, 200, response.text)
+
+    # ------------------------------------------------ capture-time attribution
+    def _event(self, customer, appliance_id, camera_id, local_event_id):
+        with connection() as db:
+            db.execute("INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) "
+                       "VALUES(?,?,?,?,?,?,'motion',?,?)",
+                       (f"ev-{local_event_id}", customer, f"site-{customer}", appliance_id, camera_id, local_event_id, NOW, NOW))
+        return (recording_s3_prefix(customer, f"site-{customer}", appliance_id, camera_id)
+                + f"2026/11/04/events/motion_{local_event_id}.mp4")
+
+    def _catalog(self, camera_id, appliance_id, local_event_id, key):
+        return self.client.post(f"/api/appliance/analytics/{camera_id}/events/{local_event_id}/media", headers=self._headers(appliance_id),
+                                json={"s3_key": key, "started_at": NOW, "ended_at": NOW, "duration_seconds": 5})
+
+    def _attribution(self, local_event_id):
+        with connection() as db:
+            row = db.execute("SELECT retention_policy,retention_days,retention_basis_ref,retention_recorded_at FROM detection_event_media "
+                             "WHERE detection_event_id=?", (f"ev-{local_event_id}",)).fetchone()
+        return dict(row) if row else None
+
+    def test_cloud_gateway_clip_freezes_its_retention_and_binding_at_capture(self):
+        self._edition("appl-1", "cloud_gateway")
+        self._bind()
+        key = self._event("cust-1", "appl-1", "cam-1", "g-1")
+        a, b = self._paid_ready()
+        with a, b, patch.object(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True):
+            response = self._catalog("cam-1", "appl-1", "g-1", key)
+        self.assertEqual(response.status_code, 200, response.text)
+        with connection() as db:
+            binding_id = db.execute("SELECT id FROM cloud_gateway_camera_entitlements WHERE camera_id='cam-1'").fetchone()["id"]
+            details = json.loads(db.execute("SELECT details_json FROM audit_logs WHERE action='appliance.analytics_event_media_available'")
+                                 .fetchone()["details_json"])
+        frozen = self._attribution("g-1")
+        self.assertEqual((frozen["retention_policy"], frozen["retention_days"], frozen["retention_basis_ref"]),
+                         ("cloud_gateway", 14, binding_id))
+        self.assertTrue(frozen["retention_recorded_at"])
+        self.assertEqual((details["retention_policy"], details["retention_days"], details["retention_basis_ref"]),
+                         ("cloud_gateway", 14, binding_id))
+        # A later retention change and a re-registration never rewrite it.
+        import cloud_gateway_retention
+        with transaction() as db:
+            cloud_gateway_retention.set_retention(db, "cust-1", 30, actor_email="o@example.test", actor_role="customer_owner",
+                                                  expected_version=1)
+        with a, b, patch.object(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True):
+            self.assertEqual(self._catalog("cam-1", "appl-1", "g-1", key).json()["status"], "duplicate")
+        self.assertEqual(self._attribution("g-1"), frozen)
+
+    def test_full_vms_clip_records_the_full_vms_plan_policy(self):
+        key = self._event("cust-2", "appl-2", "cam-2", "f-1")
+        with patch.object(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True):
+            response = self._catalog("cam-2", "appl-2", "f-1", key)
+        self.assertEqual(response.status_code, 200, response.text)
+        frozen = self._attribution("f-1")
+        self.assertEqual((frozen["retention_policy"], frozen["retention_days"], frozen["retention_basis_ref"]),
+                         ("full_vms_plan", None, None))
+
+    def test_capture_retention_refuses_an_unverified_gateway_basis(self):
+        from fastapi import HTTPException
+        self.assertEqual(appliance_cloud._capture_retention("full_vms", {}), ("full_vms_plan", None, None))
+        self.assertEqual(appliance_cloud._capture_retention(7, {"binding_id": "b-1"}), ("cloud_gateway", 7, "b-1"))
+        for basis, details in ((14, {}), (21, {"binding_id": "b"}), (True, {"binding_id": "b"}), ("14", {"binding_id": "b"}), (None, {})):
+            with self.assertRaises(HTTPException) as caught:
+                appliance_cloud._capture_retention(basis, details)
+            self.assertEqual(caught.exception.status_code, 503)
 
     def test_invalid_cloud_gateway_retention_fails_closed(self):
         self._edition("appl-1", "cloud_gateway")

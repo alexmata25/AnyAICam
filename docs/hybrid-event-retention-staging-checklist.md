@@ -19,6 +19,34 @@ It prints `{"ready": true|false, "missing": [...]}` and exits 0 only when
 ready. The running worker logs `recording_retention.not_enforced
 missing=...` at startup on a cloud host that is not ready.
 
+`--check` is configuration only. Cloud Gateway uploads need operational
+evidence too (2026-11-05, Codex review of 9ba528b):
+
+```bash
+python -m recording_retention_sweep --diagnostics
+```
+
+It is read only: no deletion, and no AWS call from this command. It prints:
+- `operational`: ready only when a worker has recorded, in
+  `recording_retention_sweep_health`, a successful deletion probe in the
+  last 26 h and a successful tick within two intervals;
+- `workers`: each worker's last probe, tick, error and classification;
+- `would_delete` and `classification`: what the next tick would delete
+  or hold, and why (`held_historical_ambiguous`,
+  `held_historical_lookup_unavailable`, `held_invalid_attribution`,
+  `held_no_retention`, `held_bad_timestamp`).
+
+The deletion probe: at worker start and every 24 h, the worker assumes
+the lifecycle role and calls `DeleteObject` on
+`recordings/_retention_probe/<host>.probe`. Nothing is ever uploaded there,
+so no customer data is touched. S3 returns success only when the role,
+bucket, region and permission all work. A failed probe clears the
+readiness and the worker does not sweep until a later probe succeeds.
+If the bucket has versioning enabled, each probe leaves a delete marker
+under that prefix, and a "deleted" clip leaves noncurrent versions. A
+lifecycle rule for noncurrent versions is then required for retention to
+mean physical deletion; confirm it on the bucket.
+
 ## Required configuration
 
 | Item | Value | Notes |
@@ -41,7 +69,9 @@ missing=...` at startup on a cloud host that is not ready.
 ## S3 lifecycle failsafe (backstop, not the 14-day mechanism)
 
 A bucket rule cannot read per-customer retention, so it is only a backstop
-for a sweeper that is down for a long time. Recommended: expire
+for a sweeper that is down for a long time. Note that it would also remove
+historical clips the sweep holds as ambiguous, but never before the
+longest (30-day) option. Recommended: expire
 `recordings/` objects after **60 days** (longer than the longest 30-day
 retention option), as in docs/r5-recording-lifecycle-iam.md.
 

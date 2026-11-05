@@ -25,15 +25,40 @@ live relay, event-media catalog) now require a trusted server-side edition.
       `PUT /api/cloud-gateway/retention`; versioned, and lowering needs
       `confirm_reduction`);
     - kept separate from every Full VMS retention source;
-    - the sweep expires Cloud Gateway camera clips by that value, even
-      after the binding ends; local recordings are never touched;
-    - the upload is refused (503) unless the retention sweep is
-      configured to enforce on the host
-      (`recording_retention_sweep.readiness()`);
-    - deployment: apply migration
-      `20261112_cloud_gateway_retention_settings` with the code. Enable
-      `ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED` and its delete-only
-      role before any Cloud Gateway upload is allowed.
+    - capture-time attribution (Codex review of 9ba528b, migration
+      `20261113_event_media_retention_attribution`):
+      - each clip records, when cataloged, `retention_policy`
+        (`full_vms_plan` or `cloud_gateway`), the Gateway
+        `retention_days` in force, the paid binding id
+        (`retention_basis_ref`) and the time; the catalog audit row
+        carries the same values;
+      - the sweep reads only that record. A later retention change, an
+        ended or removed binding, a camera reassignment or a subscription
+        change never shortens (or lengthens) a stored clip. A change
+        applies to clips captured after it;
+      - Full VMS clips keep the existing Full VMS chain; Gateway
+        retention never reaches them, before or after a camera moves to
+        Cloud Gateway;
+      - historical clips (cataloged before the migration, no policy):
+        Full VMS only when cataloged strictly before the camera's first
+        Cloud Gateway binding, or the camera never had one. Anything else
+        is held, never deleted, and counted;
+      - a failed binding lookup holds only those historical clips;
+        attributed clips need no lookup and keep expiring. Held counts
+        are logged every tick, and after 3 consecutive lookup failures at
+        CRITICAL (`recording_retention.historical_media_expiry_blocked`);
+    - local recordings are never touched;
+    - the upload is refused (503) unless the retention worker is
+      operationally ready (`recording_retention_sweep.operational_readiness`):
+      configuration, plus a database health record showing a real
+      deletion probe in the last 26 hours and a successful tick within
+      two intervals. A flag alone is not enough;
+    - deployment: apply migrations
+      `20261112_cloud_gateway_retention_settings` and
+      `20261113_event_media_retention_attribution` with the code. Enable
+      the sweep and its delete-only role, and confirm
+      `python -m recording_retention_sweep --diagnostics` reports ready,
+      before any Cloud Gateway upload is allowed.
 - returns 503 for a missing schema or any lookup error.
 - reads the edition with a plain connection. Only the Cloud Gateway path
   takes the customer lock (write transaction) needed by paid-binding

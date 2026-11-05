@@ -1432,6 +1432,30 @@ CREATE TABLE IF NOT EXISTS cloud_gateway_retention_settings(
  FOREIGN KEY(customer_id) REFERENCES customers(id)
 );
 '''),
+    # Capture-time retention attribution (Codex review of 9ba528b): each
+    # event-media row records, when it is cataloged, which retention policy
+    # governs it -- 'full_vms_plan' (the existing Full VMS chain) or
+    # 'cloud_gateway' with the 7/14/30 days frozen at capture and the paid
+    # binding that authorized it. Later binding, subscription or camera
+    # changes never rewrite it. NULL = a historical row cataloged before
+    # this migration; the sweep classifies those conservatively and never
+    # deletes one it cannot attribute. Plus the retention worker's own
+    # operational health (a real deletion probe and tick, not a flag).
+    # Additive; no rows are written here.
+    ('20261113_event_media_retention_attribution', '''
+ALTER TABLE detection_event_media ADD COLUMN retention_policy TEXT CHECK(retention_policy IN ('full_vms_plan','cloud_gateway'));
+ALTER TABLE detection_event_media ADD COLUMN retention_days INTEGER CHECK(retention_days IN (7,14,30));
+ALTER TABLE detection_event_media ADD COLUMN retention_basis_ref TEXT;
+ALTER TABLE detection_event_media ADD COLUMN retention_recorded_at TEXT;
+CREATE TABLE IF NOT EXISTS recording_retention_sweep_health(
+ worker_id TEXT PRIMARY KEY,
+ started_at TEXT NOT NULL,
+ last_probe_ok_at TEXT, last_tick_ok_at TEXT,
+ last_error TEXT, last_error_at TEXT,
+ diagnostics_json TEXT,
+ updated_at TEXT NOT NULL
+);
+'''),
     # Additive only: no backfill or automatic remote-service entitlement.
     # One current binding per appliance; replaced subscriptions are fenced by
     # their ID and every mutation must compare that ID within its transaction.
