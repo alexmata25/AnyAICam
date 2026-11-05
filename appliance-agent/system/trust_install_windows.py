@@ -81,6 +81,7 @@ def _read(path: Path, limit: int):
     """The file's bytes, None when absent."""
     try:
         with path.open("rb") as stream:
+            base._refuse_second_name(stream)
             raw = stream.read(limit + 1)
     except FileNotFoundError:
         return None

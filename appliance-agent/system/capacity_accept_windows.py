@@ -91,9 +91,16 @@ def _windows_acl_problem(path: Path, root: Path, *, include_self: bool = True) -
         return f"{path} could not be checked ({type(error).__name__})"
 
 
+def _refuse_second_name(stream) -> None:
+    """Checked on the open handle: a path check before opening could be raced."""
+    if os.fstat(stream.fileno()).st_nlink != 1:
+        raise Reject("hard_linked_trust_file")
+
+
 def _json_file(path: Path, limit: int) -> dict:
     try:
         with path.open("rb") as stream:
+            _refuse_second_name(stream)
             raw = stream.read(limit + 1)
         if len(raw) > limit:
             raise Reject("file_too_large")
@@ -143,6 +150,11 @@ def _windows_lock(path: Path):
     class Lock:
         def __enter__(self):
             self.stream = path.open("a+b")
+            try:
+                _refuse_second_name(self.stream)
+            except Reject:
+                self.stream.close()
+                raise
             self.stream.seek(0)  # A byte past the end can be locked; reading a held one raises instead of waiting.
             msvcrt.locking(self.stream.fileno(), msvcrt.LK_LOCK, 1)
             return self
@@ -235,6 +247,7 @@ def _trust_context(policy, paths, *, keyset=None, registry=None, trust_state=Non
         trust_state = _json_file(state_path, MAX_TRUST_BYTES)
     if registry is None and registry_path is not None and registry_path.exists():
         with registry_path.open("rb") as stream:
+            _refuse_second_name(stream)
             data = stream.read(MAX_REGISTRY_BYTES + 1)
         if len(data) > MAX_REGISTRY_BYTES:
             raise Reject("file_too_large")

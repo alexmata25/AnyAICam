@@ -76,6 +76,8 @@ import logging
 import os
 import platform_paths
 import re
+import stat
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -538,6 +540,42 @@ def _flat_keyset() -> dict[str, str]:
         return {}
 
 
+class _UnsafeLicensingFile(OSError):
+    """A licensing file that is a link, or has a second name. Every reader already fails closed on OSError."""
+
+
+def _read_single_name(path: Path, limit: int) -> bytes:
+    """Up to limit + 1 bytes, proved safe on the open handle, so a swap after any earlier path check can't be read."""
+    if stat.S_ISLNK(os.lstat(path).st_mode):
+        raise _UnsafeLicensingFile("is a link")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) |
+                 getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise _UnsafeLicensingFile("not a single-name regular file")
+        return handle.read(limit + 1)
+
+
+def _write_single_name(path: Path, text: str) -> None:
+    """A unique exclusive temporary, then an atomic replace: nothing is ever written through a planted name."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name == "posix":
+            os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode) if path.exists() else 0o644)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _read_trust_file(path: Path) -> tuple[bytes | None, str]:
     """(bytes, "") / (None, "") when absent / (None, problem) when present but unsafe or unreadable."""
     if not os.path.lexists(path):
@@ -546,8 +584,7 @@ def _read_trust_file(path: Path) -> tuple[bytes | None, str]:
     if problem:
         return None, problem
     try:
-        with open(path, "rb") as handle:
-            data = handle.read(_MAX_TRUST_FILE_BYTES + 1)
+        data = _read_single_name(path, _MAX_TRUST_FILE_BYTES)
     except OSError as error:
         return None, type(error).__name__
     if len(data) > _MAX_TRUST_FILE_BYTES:
@@ -587,10 +624,11 @@ def _accepted_trust_generation() -> int:
     once a grant recorded generation >= 1, a missing registry is a rollback for every purpose, never legacy."""
     try:
         import vms_capacity
-        with open(vms_capacity.ACCEPTED_FILE, "rb") as handle:
-            data = json.loads(handle.read(512 * 1024 + 1))
+        data = json.loads(_read_single_name(vms_capacity.ACCEPTED_FILE, 512 * 1024))
         generation = data.get("trust_generation", 0) if isinstance(data, dict) else 0
         return generation if type(generation) is int and generation > 0 else 0
+    except _UnsafeLicensingFile:
+        return 1  # a second name on the accepted file must not turn a deleted registry into legacy mode
     except Exception:
         return 0
 
@@ -661,7 +699,7 @@ def _verify_trusted(document, verifier, *, purpose: str, for_new_grant: bool, **
 
 def _read_state() -> dict:
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(_read_single_name(STATE_FILE, _MAX_TRUST_FILE_BYTES))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -669,10 +707,7 @@ def _read_state() -> dict:
 
 def _write_state(state: dict) -> bool:
     try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temporary = STATE_FILE.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state), encoding="utf-8")
-        temporary.replace(STATE_FILE)
+        _write_single_name(STATE_FILE, json.dumps(state))
         return True
     except OSError as error:
         logger.warning("appliance_entitlements.persist_failed error=%s", type(error).__name__)
@@ -832,7 +867,19 @@ ANALYTICS_MAX_WINDOW = timedelta(hours=168)
 HIGH_WATER_PERSIST = timedelta(minutes=1)
 ANALYTICS_STATE_FILE = STATE_FILE.with_name("analytics_entitlements.json")
 _GRANT_CACHE_SECONDS = 10.0
-_grant_cache: dict = {"at": None, "mtime": None, "grants": None, "expires": None}
+_grant_cache: dict = {"at": None, "mtime": None, "trust": None, "grants": None, "expires": None}
+
+
+def _trust_fingerprint() -> tuple:
+    """Changes whenever a trust file does, so a revocation never waits for the grant cache."""
+    found = []
+    for path in (TRUST_ANCHOR_FILE, TRUST_REGISTRY_FILE, TRUST_STATE_FILE):
+        try:
+            info = os.lstat(path)
+            found.append((info.st_mtime_ns, info.st_size, info.st_ino))
+        except OSError:
+            found.append(None)
+    return tuple(found)
 
 
 def _state_key() -> bytes | None:
@@ -853,7 +900,7 @@ def _read_analytics_state() -> dict | None:
     if key is None:
         return None
     try:
-        data = json.loads(ANALYTICS_STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(_read_single_name(ANALYTICS_STATE_FILE, _MAX_TRUST_FILE_BYTES))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("grant"), dict) or not isinstance(data.get("high_water"), str):
@@ -870,11 +917,8 @@ def _write_analytics_state(grant, high_water: datetime) -> bool:
         return False
     stamp = high_water.astimezone(timezone.utc).isoformat()
     try:
-        ANALYTICS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temporary = ANALYTICS_STATE_FILE.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"grant": grant, "high_water": stamp, "mac": _state_mac(key, grant, stamp)}),
-                             encoding="utf-8")
-        temporary.replace(ANALYTICS_STATE_FILE)
+        _write_single_name(ANALYTICS_STATE_FILE,
+                           json.dumps({"grant": grant, "high_water": stamp, "mac": _state_mac(key, grant, stamp)}))
         return True
     except OSError as error:
         logger.warning("appliance_entitlements.analytics_persist_failed error=%s", type(error).__name__)
@@ -882,7 +926,7 @@ def _write_analytics_state(grant, high_water: datetime) -> bool:
 
 
 def clear_analytics() -> None:
-    _grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
+    _grant_cache.update({"at": None, "mtime": None, "trust": None, "grants": None, "expires": None})
     try:
         ANALYTICS_STATE_FILE.unlink()
     except OSError:
@@ -931,7 +975,7 @@ def verify_analytics(document, public_keys: dict[str, str], *, identity, now: da
 def store_analytics_grant(document, *, now: datetime | None = None) -> str:
     """Call ONLY with a successful, authenticated configuration response (edge_camera_sync). Returns the outcome."""
     now = now or datetime.now(timezone.utc)
-    _grant_cache.update({"at": None, "mtime": None, "grants": None, "expires": None})
+    _grant_cache.update({"at": None, "mtime": None, "trust": None, "grants": None, "expires": None})
     if document is None:
         clear_analytics()
         logger.warning("appliance_entitlements.analytics_cleared reason=absent_from_sync")
@@ -977,7 +1021,7 @@ def _grants_from_state(current: datetime) -> tuple[dict, datetime | None]:
 
 def camera_analytic_grants(now: datetime | None = None) -> dict[str, frozenset]:
     """{camera_id: frozenset(premium keys)} from a valid, unexpired, authenticated grant with a sane clock; else {}.
-    Never raises. Re-verified at most every _GRANT_CACHE_SECONDS (and whenever the state file changes); expiry is
+    Never raises. Re-verified at most every _GRANT_CACHE_SECONDS, and whenever the state or a trust file changes; expiry is
     re-checked on every call."""
     import time
     try:
@@ -987,7 +1031,8 @@ def camera_analytic_grants(now: datetime | None = None) -> dict[str, frozenset]:
             mtime = ANALYTICS_STATE_FILE.stat().st_mtime_ns
         except OSError:
             mtime = None
-        if (now is None and cached["grants"] is not None and cached["mtime"] == mtime
+        trust = _trust_fingerprint()
+        if (now is None and cached["grants"] is not None and cached["mtime"] == mtime and cached["trust"] == trust
                 and time.monotonic() - cached["at"] < _GRANT_CACHE_SECONDS
                 and cached["expires"] is not None and cached["expires"] > current):
             return cached["grants"]
@@ -997,7 +1042,7 @@ def camera_analytic_grants(now: datetime | None = None) -> dict[str, frozenset]:
                 mtime = ANALYTICS_STATE_FILE.stat().st_mtime_ns
             except OSError:
                 mtime = None
-            _grant_cache.update({"at": time.monotonic(), "mtime": mtime, "grants": grants, "expires": expires})
+            _grant_cache.update({"at": time.monotonic(), "mtime": mtime, "trust": trust, "grants": grants, "expires": expires})
         return grants
     except Exception:
         logger.exception("appliance_entitlements.analytics_check_failed")

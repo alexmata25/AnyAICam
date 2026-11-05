@@ -210,6 +210,11 @@ def _fallback_capacity() -> dict | None:
     import appliance_entitlements
     if not os.path.lexists(FALLBACK_FILE):
         return None
+    # Windows has no writer for this file, and it is unsigned, so once trust files exist it can't undo a revocation.
+    if os.name == "nt" and (os.path.lexists(appliance_entitlements.TRUST_REGISTRY_FILE) or
+                            os.path.lexists(appliance_entitlements.TRUST_STATE_FILE)):
+        logger.warning("vms_capacity.fallback_ignored problem=trust_installed")
+        return None
     problem = appliance_entitlements._anchor_file_problem(FALLBACK_FILE)
     if problem:
         logger.warning("vms_capacity.fallback_ignored problem=%s", problem)
