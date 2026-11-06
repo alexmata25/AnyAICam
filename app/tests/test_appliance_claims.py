@@ -53,6 +53,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from authz_helpers import make_partner_user, partner_session_cookie
 from claim_id import claim_id_for
 from database_backend import override_target
 
@@ -449,13 +450,10 @@ def test_claim_page_redirects_unauthenticated_visitors_to_login(client, db_path)
 def test_claim_page_rejects_non_customer_owner_roles(client, db_path):
     # A real administrator session, so the request reaches the page's own role
     # check. An administrator token with no session counts as signed out; the
-    # next test holds that case. Ported from Linux 169a7f0e (D-AUTHZ-2b): an
-    # administrator with no live global grant is refused earlier, so use a real,
-    # MFA-verified administrator (live global grant included). It must still be
-    # refused here: the page is for customer owners only.
-    from authz_helpers import global_admin_session_cookie
+    # next test holds that case.
     with override_target(sqlite_path=str(db_path)):
-        admin_cookie = global_admin_session_cookie()
+        make_partner_user("admin@example.test", "administrator")
+        admin_cookie = partner_session_cookie("admin@example.test", "administrator")
 
     response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie}, follow_redirects=False)
 
