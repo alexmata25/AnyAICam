@@ -230,7 +230,7 @@ def test_event_recording_is_cut_on_a_keyframe_and_labelled_with_its_true_start(t
         return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
-    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
+    monkeypatch.setattr(main, "_keyframe_times", lambda path, deadline=None: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
     buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
     buffer_folder.mkdir(parents=True)
     (buffer_folder / f"buf1_{T - timedelta(seconds=30):%Y-%m-%d_%H-%M-%S}.mkv").write_bytes(b"a")

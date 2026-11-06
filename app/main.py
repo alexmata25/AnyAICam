@@ -17528,6 +17528,13 @@ EVENT_BUFFER_MUXER_OPTIONS = "flush_packets=1:cluster_time_limit=1000"
 EVENT_BUFFER_COVERAGE_WAIT_SECONDS = 15.0
 EVENT_BUFFER_COVERAGE_RETRY_SECONDS = 2.0
 EVENT_CLIP_DURATION_TOLERANCE_SECONDS = 1.5
+# How long the duration probe of a saved event recording may take, ffprobe slot wait included: it is only for the
+# event_recording.persisted / duration_mismatch log lines and runs under the per-camera lock.
+EVENT_CLIP_FINAL_PROBE_SECONDS = 15.0
+# How long the keyframe lookup for a recording's cut point may take, pool queue and ffprobe slot wait included: it
+# runs under the per-camera lock before the retry deadline starts. On timeout the cut starts at the segment's first
+# frame (always a keyframe), so the recording starts a little early but still covers the event.
+EVENT_CLIP_KEYFRAME_PROBE_SECONDS = 15.0
 EVENT_BUFFER_SUBFOLDER_NAME = "_event_buffer"
 LOCAL_RECORDING_MODE = "event"
 # (camera_number, stored value) pairs already logged as coerced to event,
@@ -17752,6 +17759,50 @@ def _in_flight_event_windows(camera_number: int) -> list[tuple[datetime, datetim
     return windows
 
 
+async def _run_before_deadline(work, deadline: float, *args):
+    """Run work(*args, deadline) in the default thread pool, never past `deadline` (time.monotonic()).
+
+    2026-11-05 (Codex notes on 7b2f515): asyncio.to_thread() waits however long the job sits in the pool's queue, and
+    persist_event_recording() holds the per-camera lock meanwhile. Here the caller stops waiting at the deadline, and a
+    job that had not started by then is abandoned for good: the worker checks the deadline (and the abandonment) when
+    it starts, under one lock with the caller, so it either never runs or the caller waits for it. A job that did
+    start is bounded by `work` itself, which gets the same deadline. Returns (ran, result): (False, None) when the
+    deadline came first. Callers use `ran`, not the clock: asyncio may wake a timeout a clock tick early on Windows."""
+    guard = threading.Lock()
+    phase = {"value": "queued"}
+
+    def worker():
+        with guard:
+            if phase["value"] == "abandoned" or time.monotonic() >= deadline:
+                phase["value"] = "skipped"
+                return False, None
+            phase["value"] = "started"
+        return True, work(*args, deadline)
+
+    future = asyncio.get_running_loop().run_in_executor(None, worker)
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout=max(0.0, deadline - time.monotonic()))
+    except asyncio.TimeoutError:
+        with guard:
+            started = phase["value"] == "started"
+            if not started:
+                phase["value"] = "abandoned"
+        if started:
+            return await future
+        future.cancel()
+        return False, None
+
+
+def _run_event_clip_build(command: list[str], deadline: float) -> subprocess.CompletedProcess:
+    """One persist_event_recording() concat, killed at `deadline`; a timeout is a failed build, never an exception."""
+    try:
+        return subprocess.run(command, capture_output=True, check=False,
+                              timeout=max(0.001, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        # subprocess.run() has already killed ffmpeg: a failed attempt, not a hung lock.
+        return subprocess.CompletedProcess(command, returncode="timeout")
+
+
 async def persist_event_recording(
     camera_number: int,
     event_start: datetime,
@@ -17886,7 +17937,19 @@ async def persist_event_recording(
         from local_recording_policy import keyframe_cut, recording_name_time
         first_index = max((i for i, (start, _) in enumerate(sources) if start <= recording_start), default=0)
         sources = sources[first_index:]
-        keyframes = await asyncio.to_thread(_keyframe_times, sources[0][1])
+        # 2026-11-05 (Codex FIX REQUIRED on 523b66e): bounded like every other job under the lock, so a busy thread
+        # pool or ffprobe slot cannot hold the lock here before the retry deadline even starts.
+        keyframe_deadline = time.monotonic() + EVENT_CLIP_KEYFRAME_PROBE_SECONDS
+        try:
+            found, keyframes = await _run_before_deadline(_keyframe_times, keyframe_deadline, sources[0][1])
+        except _ProbeOutOfTime:
+            found, keyframes = False, None
+        if not found:
+            log.warning(
+                "event_recording.keyframe_probe_timeout camera=%s trigger_id=%s path=%s timeout_seconds=%.1f",
+                camera_number, trigger_id, sources[0][1], EVENT_CLIP_KEYFRAME_PROBE_SECONDS,
+            )
+            keyframes = []
         inpoint, true_start = keyframe_cut(recording_start, sources[0][0], keyframes)
         if _open_event_recordings[camera_number]["path"] is None:
             camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
@@ -17907,29 +17970,70 @@ async def persist_event_recording(
             # can trail real time by up to one GOP (Windows 1.3.4.1 Sandbox, signed e4c7bdc: a 19.1 s event came
             # out 13.9 s, short by about the simulated camera's 5.6 s GOP). Rebuild until the clip covers the
             # window (or the concat succeeds at all), bounded so a camera that stops sending cannot hold the lock.
+            # 2026-11-05 (Codex FAIL on 01a493c, then notes on 7b2f515): the deadline is real wall-clock time for the
+            # whole retry phase. The first build keeps the single build's own 60 s ffmpeg bound; a rebuild starts
+            # only before the deadline. Every build and probe goes through _run_before_deadline() with an absolute
+            # deadline, so neither a slow ffmpeg, a busy ffprobe slot nor a queue in the thread pool can hold the
+            # lock past it: the lock is held at most max(60 s, EVENT_BUFFER_COVERAGE_WAIT_SECONDS) here. Each
+            # attempt writes attempt_output; only a better clip replaces temp_output, so a later failed or shorter
+            # attempt never destroys the best clip so far.
+            attempt_output = destination.with_suffix(".attempt.mkv")
+            temp_output.unlink(missing_ok=True)      # never promote a temp file left by an earlier, interrupted run
             deadline = time.monotonic() + EVENT_BUFFER_COVERAGE_WAIT_SECONDS
+            kept = False
+            best_seconds = None
+            first_attempt = True
             while True:
-                result = await asyncio.to_thread(
-                    subprocess.run,
+                build_deadline = time.monotonic() + 60.0 if first_attempt else deadline
+                first_attempt = False
+                attempt_output.unlink(missing_ok=True)
+                ran, result = await _run_before_deadline(
+                    _run_event_clip_build, build_deadline,
                     ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
                      "-t", f"{duration_seconds:.3f}",
-                     "-c", "copy", str(temp_output)],
-                    capture_output=True, timeout=60, check=False,
+                     "-c", "copy", str(attempt_output)],
                 )
-                built = result.returncode == 0 and temp_output.exists()
-                built_seconds = await asyncio.to_thread(_probe_recording_duration_seconds, temp_output) if built else None
+                if not ran:
+                    result = subprocess.CompletedProcess([], returncode="not_started")
+                built = result.returncode == 0 and attempt_output.exists()
+                built_seconds = None
+                if built:
+                    try:
+                        built_seconds = (await _run_before_deadline(_probe_event_clip_seconds, deadline,
+                                                                    attempt_output))[1]
+                    except _ProbeOutOfTime:
+                        pass                     # unmeasured, and the deadline has passed: the loop stops below
                 # Retry only what is known to be incomplete: a failed concat, or a MEASURED clip that is short. An
                 # unmeasurable clip is kept as before (duration_mismatch below cannot judge it either).
                 short = built_seconds is not None and built_seconds < duration_seconds - EVENT_CLIP_DURATION_TOLERANCE_SECONDS
+                # Keep the first valid clip; after that only a MEASURED clip that is complete or longer replaces it
+                # (a clip kept so far is always measured and short, or the loop would have stopped).
+                if built and (not kept or (built_seconds is not None and (not short or built_seconds > best_seconds))):
+                    attempt_output.replace(temp_output)
+                    kept, best_seconds = True, built_seconds
                 if (built and not short) or time.monotonic() >= deadline:
                     break
-                await asyncio.sleep(EVENT_BUFFER_COVERAGE_RETRY_SECONDS)
-            if result.returncode == 0 and temp_output.exists():
+                await asyncio.sleep(min(EVENT_BUFFER_COVERAGE_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
+            if kept:
                 temp_output.replace(destination)
                 # Off the event loop -- same reason as
                 # _backfill_ai_event_linked_recording()'s own call: a real
                 # ffprobe waiting on the appliance-wide _ffprobe_semaphore.
-                duration = await asyncio.to_thread(_probe_recording_duration_seconds, destination)
+                # 2026-11-05: bounded like the attempt probes, since it runs under the per-camera lock. The clip is
+                # already saved; a probe that runs out of time only leaves its duration unknown, and says so.
+                probe_deadline = time.monotonic() + EVENT_CLIP_FINAL_PROBE_SECONDS
+                try:
+                    probed, duration = await _run_before_deadline(_probe_event_clip_seconds, probe_deadline,
+                                                                  destination)
+                except _ProbeOutOfTime:
+                    probed, duration = False, None
+                if not probed:
+                    log.warning(
+                        "event_recording.duration_probe_timeout camera=%s trigger_id=%s path=%s timeout_seconds=%.1f",
+                        camera_number, trigger_id, destination, EVENT_CLIP_FINAL_PROBE_SECONDS,
+                    )
                 log.info(
                     "event_recording.persisted camera=%s detector=%s trigger_id=%s "
                     "path=%s true_start=%s inpoint=%.3f duration_seconds=%s",
@@ -17952,6 +18056,7 @@ async def persist_event_recording(
         finally:
             list_file.unlink(missing_ok=True)
             destination.with_suffix(".tmp.mkv").unlink(missing_ok=True)
+            destination.with_suffix(".attempt.mkv").unlink(missing_ok=True)
 
 
 
@@ -145243,21 +145348,37 @@ def _row_to_recording_metadata(row: dict) -> dict:
     }
 
 
-def _keyframe_times(path: Path) -> list[float]:
+def _keyframe_times(path: Path, deadline: float) -> list[float]:
     """Keyframe times (seconds) of one Event-mode buffer segment, for
     persist_event_recording()'s cut point. Same appliance-wide ffprobe
     budget as every other probe; [] on any failure (the cut then starts at
-    the segment's own first frame, which is always a keyframe)."""
+    the segment's own first frame, which is always a keyframe).
+
+    2026-11-05 (Codex FIX REQUIRED on 523b66e): finished by `deadline`
+    (time.monotonic()), the wait for an ffprobe slot included, because it
+    runs under the per-camera lock; raises _ProbeOutOfTime when the time
+    runs out, as _probe_event_clip_seconds() does."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _ffprobe_semaphore.acquire(timeout=remaining):
+        raise _ProbeOutOfTime(str(path))
     try:
-        with _ffprobe_semaphore:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
-                 "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ProbeOutOfTime(str(path))
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+             "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=min(15.0, remaining), check=False,
+        )
         return sorted(float(item.strip().rstrip(",")) for item in probe.stdout.split() if item.strip().rstrip(",") not in ("", "N/A"))
-    except Exception:  # any probe failure: no keyframe information
+    except _ProbeOutOfTime:
+        raise
+    except subprocess.TimeoutExpired as exc:
+        raise _ProbeOutOfTime(str(path)) from exc
+    except Exception:  # any other probe failure: no keyframe information
         return []
+    finally:
+        _ffprobe_semaphore.release()
 
 
 def _probe_recording_duration_seconds(path: Path) -> float | None:
@@ -145311,6 +145432,38 @@ def _probe_recording_duration_seconds(path: Path) -> float | None:
         return duration
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
+
+
+class _ProbeOutOfTime(Exception):
+    """_probe_event_clip_seconds() reached its deadline: no ffprobe slot came free in time, or ffprobe was killed."""
+
+
+def _probe_event_clip_seconds(path: Path, deadline: float) -> float | None:
+    """ffprobe duration of a persist_event_recording() clip (a rebuild attempt or the saved recording), finished by
+    `deadline` (time.monotonic()) including the wait for the appliance-wide _ffprobe_semaphore (2026-11-05, Codex
+    FAIL on 01a493c: an unbounded probe could hold the per-camera lock). Same ffprobe invocation as
+    _probe_recording_duration_seconds(), but uncached: the attempt file is rewritten under the same name, so a cached
+    (path, mtime) entry could describe an earlier attempt. None when the probe fails, which the caller treats as
+    "unmeasurable"; raises _ProbeOutOfTime when the time runs out, so the caller can tell the two apart."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _ffprobe_semaphore.acquire(timeout=remaining):
+        raise _ProbeOutOfTime(str(path))
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ProbeOutOfTime(str(path))
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=min(15.0, remaining), check=False,
+        )
+        duration = float(probe.stdout.strip())
+    except subprocess.TimeoutExpired as exc:
+        raise _ProbeOutOfTime(str(path)) from exc
+    except (OSError, ValueError):
+        return None
+    finally:
+        _ffprobe_semaphore.release()
+    return duration if duration > 0 else None
 
 
 def _catalog_local_recordings_for_camera(camera_id: str, *, budget_seconds: float | None = PLAYBACK_CATALOG_BUDGET_SECONDS) -> int:
