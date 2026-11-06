@@ -9958,6 +9958,70 @@ def _users_file_writer(function):
     return serialized
 
 
+def _write_json_atomically(path: Path, data) -> None:
+    """Four-store remediation (owner 2026-11-06): a temporary file of this write's own, an atomic replace, and the
+    temporary file removed in finally, so two writes never share one <store>.json.tmp and a failed write leaves the
+    store exactly as it was. Callers hold the store's lock."""
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+# sessions.json: sign-in, sign-out, expiry and the cloud retirement step each read, change and save the whole file,
+# and every authenticated request reads it. All of them hold this lock, so a sign-in can never save a copy read before
+# a sign-out or a retirement purge and bring the removed session back. Lock order: _USERS_FILE_LOCK may be held when
+# this lock or _MOBILE_STORE_LOCK is taken (the retirement step), never the reverse; neither of those two is held while
+# taking another store lock.
+_SESSIONS_FILE_LOCK = threading.RLock()
+# mobile_devices.json and mobile_pairing_codes.json: one lock for both, because a claim spends a code and adds a
+# device in one transaction.
+_MOBILE_STORE_LOCK = threading.RLock()
+
+
+class SessionStoreUnreadable(RuntimeError):
+    """sessions.json exists but could not be read; a writer must not save over it."""
+
+
+def _read_sessions_file() -> dict | None:
+    """sessions.json as a dict, {} when there is no file, None when its content is not a JSON object.
+    An I/O error raises SessionStoreUnreadable."""
+    if not SESSIONS_FILE.exists():
+        return {}
+    try:
+        raw = SESSIONS_FILE.read_bytes()
+    except OSError as error:
+        raise SessionStoreUnreadable(f"sessions.json could not be read: {type(error).__name__}") from error
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:  # json.JSONDecodeError, UnicodeDecodeError
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_sessions_for_update() -> dict:
+    """For a sessions.json writer, under _SESSIONS_FILE_LOCK. It never hands back an empty store in place of one it
+    could not read. An I/O error raises SessionStoreUnreadable, so the write is refused and the file is left as it is.
+    Damaged content (not a JSON object) is moved aside, kept, logged and audited, and only then does the store start
+    empty: sessions in such a file can never sign anyone in (load_sessions reads it as empty), so this keeps the
+    fail-closed outcome without refusing every later sign-in."""
+    data = _read_sessions_file()
+    if data is not None:
+        return data
+    kept = SESSIONS_FILE.with_name(f"{SESSIONS_FILE.name}.unreadable-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}")
+    try:
+        SESSIONS_FILE.replace(kept)
+    except OSError as error:
+        raise SessionStoreUnreadable(f"damaged sessions.json could not be moved aside: {type(error).__name__}") from error
+    structured_log("security.sessions_store_unreadable", level="warning", kept_as=kept.name)
+    from admin_auth_policy import auth_audit
+    auth_audit("sessions.store_unreadable", actor_role="system", reason="damaged_sessions_json", entity_type="sessions_json",
+               details={"kept_as": kept.name})
+    return {}
+
+
 @_users_file_writer
 def load_users() -> list[dict]:
 
@@ -10528,52 +10592,13 @@ def retire_cloud_legacy_admins() -> dict:
 
 
 
-        sessions = load_sessions()
-
-
-
-
-
-
-
-
-        purge = [key for key, value in sessions.items() if isinstance(value, dict) and value.get("user_id") in retired_ids]
-
-
-
-
-
-
-
-
-        for key in purge:
-
-
-
-
-
-
-
-
-            sessions.pop(key, None)
-
-
-
-
-
-
-
-
-        if purge:
-
-
-
-
-
-
-
-
-            save_sessions(sessions)
+        with _SESSIONS_FILE_LOCK:  # under _USERS_FILE_LOCK here: the documented lock order
+            sessions = _load_sessions_for_update()
+            purge = [key for key, value in sessions.items() if isinstance(value, dict) and value.get("user_id") in retired_ids]
+            for key in purge:
+                sessions.pop(key, None)
+            if purge:
+                save_sessions(sessions)
 
 
 
@@ -10700,69 +10725,15 @@ def save_users(users: list[dict]) -> None:
 
 
 def load_user_invites() -> list[dict]:
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        if USER_INVITES_FILE.exists():
-
-
-
-
-
-
-
-
-            data = json.loads(USER_INVITES_FILE.read_text(encoding="utf-8"))
-
-
-
-
-
-
-
-
-            return data if isinstance(data, list) else []
-
-
-
-
-
-
-
-
-    except (OSError, json.JSONDecodeError):
-
-
-
-
-
-
-
-
-        pass
-
-
-
-
-
-
-
-
-    return []
+    # Four-store remediation: user_invites.json shares the users.json lock (acceptance changes both in one step).
+    with _USERS_FILE_LOCK:
+        try:
+            if USER_INVITES_FILE.exists():
+                data = json.loads(USER_INVITES_FILE.read_text(encoding="utf-8"))
+                return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            pass
+        return []
 
 
 
@@ -10790,33 +10761,8 @@ def load_user_invites() -> list[dict]:
 
 
 def save_user_invites(invites: list[dict]) -> None:
-
-
-
-
-
-
-
-
-    temporary = USER_INVITES_FILE.with_suffix(".json.tmp")
-
-
-
-
-
-
-
-
-    temporary.write_text(json.dumps(invites, indent=2), encoding="utf-8")
-
-
-
-
-
-
-
-
-    temporary.replace(USER_INVITES_FILE)
+    with _USERS_FILE_LOCK:
+        _write_json_atomically(USER_INVITES_FILE, invites)
 
 
 
@@ -10942,78 +10888,14 @@ def send_user_invitation_email(invite: dict, request: Request | None = None) -> 
     return False, "the email could not be sent. Check the email settings and use Resend."
 
 def load_sessions() -> dict:
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        if SESSIONS_FILE.exists():
-
-
-
-
-
-
-
-
-            data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-
-
-
-
-
-
-
-
-            if isinstance(data, dict):
-
-
-
-
-
-
-
-
-                return data
-
-
-
-
-
-
-
-
-    except (OSError, json.JSONDecodeError):
-
-
-
-
-
-
-
-
-        pass
-
-
-
-
-
-
-
-
-    return {}
+    # Readers hold the lock too, so a read never meets a replace in progress. An unreadable store still reads as
+    # "no sessions", which signs nobody in.
+    with _SESSIONS_FILE_LOCK:
+        try:
+            data = _read_sessions_file()
+        except SessionStoreUnreadable:
+            return {}
+        return data if data is not None else {}
 
 
 
@@ -11041,33 +10923,8 @@ def load_sessions() -> dict:
 
 
 def save_sessions(sessions: dict) -> None:
-
-
-
-
-
-
-
-
-    temporary = SESSIONS_FILE.with_suffix(".json.tmp")
-
-
-
-
-
-
-
-
-    temporary.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
-
-
-
-
-
-
-
-
-    temporary.replace(SESSIONS_FILE)
+    with _SESSIONS_FILE_LOCK:
+        _write_json_atomically(SESSIONS_FILE, sessions)
 
 
 
@@ -11095,95 +10952,16 @@ def save_sessions(sessions: dict) -> None:
 
 
 def create_session(user_id: str, remember_me: bool = False) -> str:
-
-
-
-
-
-
-
-
     session_id = secrets.token_urlsafe(32)
-
-
-
-
-
-
-
-
-    sessions = load_sessions()
-
-
-
-
-
-
-
-
     max_age = 30 * 24 * 3600 if remember_me else SESSION_MAX_AGE_SECONDS
-
-
-
-
-
-
-
-
-    sessions[session_id] = {
-
-
-
-
-
-
-
-
-        "user_id": user_id,
-
-
-
-
-
-
-
-
-        "created_at": datetime.now().isoformat(),
-
-
-
-
-
-
-
-
-        "expires_at": (datetime.now() + timedelta(seconds=max_age)).isoformat(),
-
-
-
-
-
-
-
-
-    }
-
-
-
-
-
-
-
-
-    save_sessions(sessions)
-
-
-
-
-
-
-
-
+    with _SESSIONS_FILE_LOCK:
+        sessions = _load_sessions_for_update()
+        sessions[session_id] = {
+            "user_id": user_id,
+            "created_at": datetime.now().isoformat(),
+            "expires_at": (datetime.now() + timedelta(seconds=max_age)).isoformat(),
+        }
+        save_sessions(sessions)
     return session_serializer.dumps({"session_id": session_id})
 
 
@@ -11212,105 +10990,18 @@ def create_session(user_id: str, remember_me: bool = False) -> str:
 
 
 def destroy_session(token: str | None) -> None:
-
-
-
-
-
-
-
-
     if not token:
-
-
-
-
-
-
-
-
         return
-
-
-
-
-
-
-
-
     try:
-
-
-
-
-
-
-
-
         payload = session_serializer.loads(token, max_age=30 * 24 * 3600)
-
-
-
-
-
-
-
-
     except (BadSignature, SignatureExpired):
-
-
-
-
-
-
-
-
         return
-
-
-
-
-
-
-
-
     session_id = payload.get("session_id")
-
-
-
-
-
-
-
-
-    sessions = load_sessions()
-
-
-
-
-
-
-
-
-    if session_id in sessions:
-
-
-
-
-
-
-
-
-        sessions.pop(session_id, None)
-
-
-
-
-
-
-
-
-        save_sessions(sessions)
+    with _SESSIONS_FILE_LOCK:
+        sessions = _load_sessions_for_update()
+        if session_id in sessions:
+            sessions.pop(session_id, None)
+            save_sessions(sessions)
 
 
 
@@ -11463,7 +11154,10 @@ def authenticated_user(request: Request) -> dict | None:
 
 
 
-            destroy_session(token)
+            try:
+                destroy_session(token)
+            except SessionStoreUnreadable:
+                pass  # the expired session is refused either way
 
 
 
@@ -16464,185 +16158,25 @@ def list_backups() -> list[dict]:
 
 
 def restore_configuration_backup(archive_path: Path) -> dict:
-
-
-
-
-
-
-
-
     restored: list[str] = []
-
-
-
-
-
-
-
-
     skipped: list[str] = []
-
-
-
-
-
-
-
-
     allowed = {path.name: path for path in CONFIG_BACKUP_FILES}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    with zipfile.ZipFile(archive_path, "r") as archive:
-
-
-
-
-
-
-
-
+    # Four-store remediation: the restore replaces users.json and user_invites.json whole, so it holds their lock;
+    # no read-modify-write can then save a pre-restore copy back over the restored file.
+    with _USERS_FILE_LOCK, zipfile.ZipFile(archive_path, "r") as archive:
         for member in archive.infolist():
-
-
-
-
-
-
-
-
             if member.is_dir() or not member.filename.startswith("config/"):
-
-
-
-
-
-
-
-
                 continue
-
-
-
-
-
-
-
-
             name = Path(member.filename).name
-
-
-
-
-
-
-
-
             target = allowed.get(name)
-
-
-
-
-
-
-
-
             if not target:
-
-
-
-
-
-
-
-
                 skipped.append(name)
-
-
-
-
-
-
-
-
                 continue
-
-
-
-
-
-
-
-
             payload = archive.read(member)
-
-
-
-
-
-
-
-
             temporary = target.with_suffix(target.suffix + ".restore")
-
-
-
-
-
-
-
-
             temporary.write_bytes(payload)
-
-
-
-
-
-
-
-
             temporary.replace(target)
-
-
-
-
-
-
-
-
             restored.append(name)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     return {"restored": restored, "skipped": skipped}
 
 
@@ -30992,23 +30526,8 @@ def build_support_bundle(user: dict) -> bytes:
 
 
 def load_mobile_devices() -> dict:
-
-
-
-
-
-
-
-
-    devices = load_json_file(MOBILE_DEVICES_FILE, {})
-
-
-
-
-
-
-
-
+    with _MOBILE_STORE_LOCK:
+        devices = load_json_file(MOBILE_DEVICES_FILE, {})
     return devices if isinstance(devices, dict) else {}
 
 
@@ -31037,15 +30556,8 @@ def load_mobile_devices() -> dict:
 
 
 def save_mobile_devices(devices: dict) -> None:
-
-
-
-
-
-
-
-
-    save_json_file(MOBILE_DEVICES_FILE, devices)
+    with _MOBILE_STORE_LOCK:
+        _write_json_atomically(MOBILE_DEVICES_FILE, devices)
 
 
 
@@ -31073,23 +30585,8 @@ def save_mobile_devices(devices: dict) -> None:
 
 
 def load_mobile_pairing_codes() -> dict:
-
-
-
-
-
-
-
-
-    codes = load_json_file(MOBILE_PAIRING_CODES_FILE, {})
-
-
-
-
-
-
-
-
+    with _MOBILE_STORE_LOCK:
+        codes = load_json_file(MOBILE_PAIRING_CODES_FILE, {})
     return codes if isinstance(codes, dict) else {}
 
 
@@ -31118,15 +30615,8 @@ def load_mobile_pairing_codes() -> dict:
 
 
 def save_mobile_pairing_codes(codes: dict) -> None:
-
-
-
-
-
-
-
-
-    save_json_file(MOBILE_PAIRING_CODES_FILE, codes)
+    with _MOBILE_STORE_LOCK:
+        _write_json_atomically(MOBILE_PAIRING_CODES_FILE, codes)
 
 
 
@@ -31308,158 +30798,23 @@ def _mobile_devices_identity(request: Request) -> dict:
 
 
 def create_mobile_pairing_code(user: dict, device_name: str) -> dict:
-
-
-
-
-
-
-
-
-    codes = cleanup_mobile_pairing_codes(load_mobile_pairing_codes())
-
-
-
-
-
-
-
-
-    code = f"{secrets.randbelow(1000000):06d}"
-
-
-
-
-
-
-
-
-    while code in codes:
-
-
-
-
-
-
-
-
+    with _MOBILE_STORE_LOCK:
+        codes = cleanup_mobile_pairing_codes(load_mobile_pairing_codes())
         code = f"{secrets.randbelow(1000000):06d}"
-
-
-
-
-
-
-
-
-    now = datetime.now()
-
-
-
-
-
-
-
-
-    record = {
-
-
-
-
-
-
-
-
-        "code": code,
-
-
-
-
-
-
-
-
-        "user_id": user.get("id"),
-
-
-
-
-
-
-
-
-        "user_email": user.get("email"),
-
-
-
-
-
-
-
-
-        "device_name": device_name.strip() or "Mobile device",
-
-
-
-
-
-
-
-
-        "created_at": now.isoformat(),
-
-
-
-
-
-
-
-
-        "expires_at": (now + timedelta(minutes=10)).isoformat(),
-
-
-
-
-
-
-
-
-        "claimed": False,
-
-
-
-
-
-
-
-
-    }
-
-
-
-
-
-
-
-
-    codes[code] = record
-
-
-
-
-
-
-
-
-    save_mobile_pairing_codes(codes)
-
-
-
-
-
-
-
-
+        while code in codes:
+            code = f"{secrets.randbelow(1000000):06d}"
+        now = datetime.now()
+        record = {
+            "code": code,
+            "user_id": user.get("id"),
+            "user_email": user.get("email"),
+            "device_name": device_name.strip() or "Mobile device",
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            "claimed": False,
+        }
+        codes[code] = record
+        save_mobile_pairing_codes(codes)
     return record
 
 
@@ -94862,374 +94217,48 @@ def create_mobile_pairing(
 
 
 @app.post("/api/mobile/pairing/claim")
-
-
-
-
-
-
-
-
 def claim_mobile_pairing(
-
-
-
-
-
-
-
-
     payload: MobilePairingClaimModel,
-
-
-
-
-
-
-
-
     request: Request,
-
-
-
-
-
-
-
-
 ) -> dict:
-
-
-
-
-
-
-
-
     code = payload.code.strip()
-
-
-
-
-
-
-
-
-    codes = cleanup_mobile_pairing_codes(load_mobile_pairing_codes())
-
-
-
-
-
-
-
-
-    record = codes.get(code)
-
-
-
-
-
-
-
-
-    if not record:
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=400, detail="Pairing code is invalid or expired.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    device_id = uuid.uuid4().hex
-
-
-
-
-
-
-
-
-    now = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    device = {
-
-
-
-
-
-
-
-
-        "id": device_id,
-
-
-
-
-
-
-
-
-        "user_id": record.get("user_id"),
-
-
-
-
-
-
-
-
-        "user_email": record.get("user_email"),
-
-
-
-
-
-
-
-
-        "device_name": payload.device_name.strip() or record.get("device_name") or "Mobile device",
-
-
-
-
-
-
-
-
-        "platform": payload.platform.strip().lower() or "web",
-
-
-
-
-
-
-
-
-        "push_subscription": payload.push_subscription,
-
-
-
-
-
-
-
-
-        "notifications_enabled": bool(payload.push_subscription),
-
-
-
-
-
-
-
-
-        "revoked": False,
-
-
-
-
-
-
-
-
-        "created_at": now,
-
-
-
-
-
-
-
-
-        "last_seen_at": now,
-
-
-
-
-
-
-
-
-        "paired_from_ip": request_device_context(request).get("ip_address", ""),
-
-
-
-
-
-
-
-
-        "user_agent": request.headers.get("user-agent", ""),
-
-
-
-
-
-
-
-
-    }
-
-
-
-
-
-
-
-
-    devices = load_mobile_devices()
-
-
-
-
-
-
-
-
-    devices[device_id] = device
-
-
-
-
-
-
-
-
-    save_mobile_devices(devices)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    record["claimed"] = True
-
-
-
-
-
-
-
-
-    record["claimed_at"] = now
-
-
-
-
-
-
-
-
-    record["device_id"] = device_id
-
-
-
-
-
-
-
-
-    codes[code] = record
-
-
-
-
-
-
-
-
-    save_mobile_pairing_codes(codes)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    paired_from_ip = request_device_context(request).get("ip_address", "")
+    user_agent = request.headers.get("user-agent", "")
+    # Four-store remediation: one claim at a time, so a single-use code can never pair two devices. The code is spent
+    # (and saved) before the device is added, so a failed device save leaves the code spent, never reusable.
+    with _MOBILE_STORE_LOCK:
+        codes = cleanup_mobile_pairing_codes(load_mobile_pairing_codes())
+        record = codes.get(code)
+        if not record:
+            raise HTTPException(status_code=400, detail="Pairing code is invalid or expired.")
+        device_id = uuid.uuid4().hex
+        now = datetime.now().isoformat()
+        device = {
+            "id": device_id,
+            "user_id": record.get("user_id"),
+            "user_email": record.get("user_email"),
+            "device_name": payload.device_name.strip() or record.get("device_name") or "Mobile device",
+            "platform": payload.platform.strip().lower() or "web",
+            "push_subscription": payload.push_subscription,
+            "notifications_enabled": bool(payload.push_subscription),
+            "revoked": False,
+            "created_at": now,
+            "last_seen_at": now,
+            "paired_from_ip": paired_from_ip,
+            "user_agent": user_agent,
+        }
+        record["claimed"] = True
+        record["claimed_at"] = now
+        record["device_id"] = device_id
+        codes[code] = record
+        save_mobile_pairing_codes(codes)
+        devices = load_mobile_devices()
+        devices[device_id] = device
+        save_mobile_devices(devices)
     return {
-
-
-
-
-
-
-
-
         "status": "complete",
-
-
-
-
-
-
-
-
         "device": device,
-
-
-
-
-
-
-
-
         "message": "Mobile device paired.",
-
-
-
-
-
-
-
-
     }
 
 
@@ -95258,212 +94287,30 @@ def claim_mobile_pairing(
 
 
 @app.put("/api/mobile/devices/{device_id}")
-
-
-
-
-
-
-
-
 def update_mobile_device(
-
-
-
-
-
-
-
-
     device_id: str,
-
-
-
-
-
-
-
-
     payload: MobileDeviceUpdateModel,
-
-
-
-
-
-
-
-
     request: Request,
-
-
-
-
-
-
-
-
 ) -> dict:
-
-
-
-
-
-
-
-
     user = _mobile_devices_identity(request)
-
-
-
-
-
-
-
-
-    devices = load_mobile_devices()
-
-
-
-
-
-
-
-
-    device = devices.get(device_id)
-
-
-
-
-
-
-
-
-    if not device:
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=404, detail="Mobile device not found.")
-
-
-
-
-
-
-
-
-    if not mobile_device_owner_matches(device, user):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=403, detail="You cannot manage this device.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    if payload.device_name is not None:
-
-
-
-
-
-
-
-
-        device["device_name"] = payload.device_name.strip() or device.get("device_name")
-
-
-
-
-
-
-
-
-    if payload.notifications_enabled is not None:
-
-
-
-
-
-
-
-
-        device["notifications_enabled"] = payload.notifications_enabled
-
-
-
-
-
-
-
-
-    if payload.revoked is not None:
-
-
-
-
-
-
-
-
-        device["revoked"] = payload.revoked
-
-
-
-
-
-
-
-
-    device["updated_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    devices[device_id] = device
-
-
-
-
-
-
-
-
-    save_mobile_devices(devices)
-
-
-
-
-
-
-
-
+    # Four-store remediation: from read to save under the mobile lock, so a heartbeat can never save back a copy read
+    # before this revoke.
+    with _MOBILE_STORE_LOCK:
+        devices = load_mobile_devices()
+        device = devices.get(device_id)
+        if not device:
+            raise HTTPException(status_code=404, detail="Mobile device not found.")
+        if not mobile_device_owner_matches(device, user):
+            raise HTTPException(status_code=403, detail="You cannot manage this device.")
+        if payload.device_name is not None:
+            device["device_name"] = payload.device_name.strip() or device.get("device_name")
+        if payload.notifications_enabled is not None:
+            device["notifications_enabled"] = payload.notifications_enabled
+        if payload.revoked is not None:
+            device["revoked"] = payload.revoked
+        device["updated_at"] = datetime.now().isoformat()
+        devices[device_id] = device
+        save_mobile_devices(devices)
     return {"status": "complete", "device": device, "message": "Mobile device updated."}
 
 
@@ -95492,95 +94339,17 @@ def update_mobile_device(
 
 
 @app.post("/api/mobile/devices/{device_id}/heartbeat")
-
-
-
-
-
-
-
-
 def mobile_device_heartbeat(device_id: str, request: Request) -> dict:
-
-
-
-
-
-
-
-
-    devices = load_mobile_devices()
-
-
-
-
-
-
-
-
-    device = devices.get(device_id)
-
-
-
-
-
-
-
-
-    if not device or device.get("revoked"):
-
-
-
-
-
-
-
-
-        raise HTTPException(status_code=404, detail="Active mobile device not found.")
-
-
-
-
-
-
-
-
-    device["last_seen_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    device["last_ip"] = request_device_context(request).get("ip_address", "")
-
-
-
-
-
-
-
-
-    devices[device_id] = device
-
-
-
-
-
-
-
-
-    save_mobile_devices(devices)
-
-
-
-
-
-
-
-
+    last_ip = request_device_context(request).get("ip_address", "")
+    with _MOBILE_STORE_LOCK:
+        devices = load_mobile_devices()
+        device = devices.get(device_id)
+        if not device or device.get("revoked"):
+            raise HTTPException(status_code=404, detail="Active mobile device not found.")
+        device["last_seen_at"] = datetime.now().isoformat()
+        device["last_ip"] = last_ip
+        devices[device_id] = device
+        save_mobile_devices(devices)
     return {"status": "complete", "server_time": datetime.now().isoformat()}
 
 
@@ -126601,167 +125370,24 @@ def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
 
 
 @app.get("/api/user-invites")
-
-
-
-
-
-
-
-
 def user_invites_api(request: Request) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
-    invites = load_user_invites()
-
-
-
-
-
-
-
-
-    now = datetime.now()
-
-
-
-
-
-
-
-
-    changed = False
-
-
-
-
-
-
-
-
-    for invite in invites:
-
-
-
-
-
-
-
-
-        if invite.get("status") == "pending":
-
-
-
-
-
-
-
-
-            try:
-
-
-
-
-
-
-
-
-                if datetime.fromisoformat(invite["expires_at"]) < now:
-
-
-
-
-
-
-
-
-                    invite["status"] = "expired"
-
-
-
-
-
-
-
-
-                    changed = True
-
-
-
-
-
-
-
-
-            except (KeyError, TypeError, ValueError):
-
-
-
-
-
-
-
-
-                pass
-
-
-
-
-
-
-
-
-    if changed:
-
-
-
-
-
-
-
-
-        save_user_invites(invites)
-
-
-
-
-
-
-
-
+    with _USERS_FILE_LOCK:
+        invites = load_user_invites()
+        now = datetime.now()
+        changed = False
+        for invite in invites:
+            if invite.get("status") == "pending":
+                try:
+                    if datetime.fromisoformat(invite["expires_at"]) < now:
+                        invite["status"] = "expired"
+                        changed = True
+                except (KeyError, TypeError, ValueError):
+                    pass
+        if changed:
+            save_user_invites(invites)
     return {"status": "complete", "invites": invites}
 
 
@@ -126790,437 +125416,54 @@ def user_invites_api(request: Request) -> dict:
 
 
 @app.post("/api/user-invites")
-
-
-
-
-
-
-
-
 def create_user_invite(request: Request, payload: UserInviteCreateModel) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
     if payload.role not in VALID_ROLES:
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Unsupported permission level."}
-
-
-
-
-
-
-
-
     email = payload.email.strip().lower()
-
-
-
-
-
-
-
-
-    users = load_users()
-
-
-
-
-
-
-
-
-    invites = load_user_invites()
-
-
-
-
-
-
-
-
-    if any(item.get("email", "").lower() == email for item in users):
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "That email already has an account."}
-
-
-
-
-
-
-
-
-    if any(item.get("email", "").lower() == email and item.get("status") == "pending" for item in invites):
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "A pending invitation already exists."}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    invite_id = uuid.uuid4().hex[:12]
-
-
-
-
-
-
-
-
-    token = session_serializer.dumps(
-
-
-
-
-
-
-
-
-        {"invite_id": invite_id, "email": email},
-
-
-
-
-
-
-
-
-        salt="anyaicam-user-invite",
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    invite = {
-
-
-
-
-
-
-
-
-        "id": invite_id,
-
-
-
-
-
-
-
-
-        "email": email,
-
-
-
-
-
-
-
-
-        "display_name": payload.display_name.strip(),
-
-
-
-
-
-
-
-
-        "role": "admin" if payload.super_admin else payload.role,
-
-
-
-
-
-
-
-
-        "super_admin": payload.super_admin,
-
-
-
-
-
-
-
-
-        "all_cameras": payload.all_cameras,
-
-
-
-
-
-
-
-
-        "camera_ids": [] if payload.all_cameras else sorted(set(payload.camera_ids)),
-
-
-
-
-
-
-
-
-        "status": "pending",
-
-
-
-
-
-
-
-
-        "created_at": datetime.now().isoformat(),
-
-
-
-
-
-
-
-
-        "expires_at": (datetime.now() + timedelta(days=7)).isoformat(),
-
-
-
-
-
-
-
-
-        "created_by": actor.get("id"),
-
-
-
-
-
-
-
-
-        "token": token,
-
-
-
-
-
-
-
-
-    }
-
-
-
-
-
-
-
-
-    invites.append(invite)
-
-
-
-
-
-
-
-
-    save_user_invites(invites)
-
-
-
-
-
-
-
-
+    # Four-store remediation: read to save under the users.json lock; the email is sent after the lock is released.
+    with _USERS_FILE_LOCK:
+        users = load_users()
+        invites = load_user_invites()
+        if any(item.get("email", "").lower() == email for item in users):
+            return {"status": "error", "message": "That email already has an account."}
+        if any(item.get("email", "").lower() == email and item.get("status") == "pending" for item in invites):
+            return {"status": "error", "message": "A pending invitation already exists."}
+        invite_id = uuid.uuid4().hex[:12]
+        token = session_serializer.dumps(
+            {"invite_id": invite_id, "email": email},
+            salt="anyaicam-user-invite",
+        )
+        invite = {
+            "id": invite_id,
+            "email": email,
+            "display_name": payload.display_name.strip(),
+            "role": "admin" if payload.super_admin else payload.role,
+            "super_admin": payload.super_admin,
+            "all_cameras": payload.all_cameras,
+            "camera_ids": [] if payload.all_cameras else sorted(set(payload.camera_ids)),
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "expires_at": (datetime.now() + timedelta(days=7)).isoformat(),
+            "created_by": actor.get("id"),
+            "token": token,
+        }
+        invites.append(invite)
+        save_user_invites(invites)
     email_ok, email_detail = send_user_invitation_email(invite, request)
-
-
-
-
-
-
-
-
     record_audit(
-
-
-
-
-
-
-
-
         request,
-
-
-
-
-
-
-
-
         "create",
-
-
-
-
-
-
-
-
         "user_invite",
-
-
-
-
-
-
-
-
         f"Invited {email}: {email_detail}",
-
-
-
-
-
-
-
-
         "success" if email_ok else "failed",
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
     return {
-
-
-
-
-
-
-
-
         "status": "complete",
-
-
-
-
-
-
-
-
         "message": email_detail if email_ok else f"Invitation saved, but email failed: {email_detail}",
-
-
-
-
-
-
-
-
         "invite": invite,
-
-
-
-
-
-
-
-
     }
 
 
@@ -127249,158 +125492,23 @@ def create_user_invite(request: Request, payload: UserInviteCreateModel) -> dict
 
 
 @app.post("/api/user-invites/{invite_id}/resend")
-
-
-
-
-
-
-
-
 def resend_user_invite(request: Request, invite_id: str) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
-    invites = load_user_invites()
-
-
-
-
-
-
-
-
-    invite = next((item for item in invites if item.get("id") == invite_id), None)
-
-
-
-
-
-
-
-
-    if not invite:
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "Invitation not found."}
-
-
-
-
-
-
-
-
-    invite["status"] = "pending"
-
-
-
-
-
-
-
-
-    invite["expires_at"] = (datetime.now() + timedelta(days=7)).isoformat()
-
-
-
-
-
-
-
-
-    invite["token"] = session_serializer.dumps(
-
-
-
-
-
-
-
-
-        {"invite_id": invite["id"], "email": invite["email"]},
-
-
-
-
-
-
-
-
-        salt="anyaicam-user-invite",
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    save_user_invites(invites)
-
-
-
-
-
-
-
-
+    with _USERS_FILE_LOCK:
+        invites = load_user_invites()
+        invite = next((item for item in invites if item.get("id") == invite_id), None)
+        if not invite:
+            return {"status": "error", "message": "Invitation not found."}
+        invite["status"] = "pending"
+        invite["expires_at"] = (datetime.now() + timedelta(days=7)).isoformat()
+        invite["token"] = session_serializer.dumps(
+            {"invite_id": invite["id"], "email": invite["email"]},
+            salt="anyaicam-user-invite",
+        )
+        save_user_invites(invites)
     ok, detail = send_user_invitation_email(invite, request)
-
-
-
-
-
-
-
-
     return {"status": "complete" if ok else "error", "message": detail}
 
 
@@ -127429,113 +125537,18 @@ def resend_user_invite(request: Request, invite_id: str) -> dict:
 
 
 @app.delete("/api/user-invites/{invite_id}")
-
-
-
-
-
-
-
-
 def cancel_user_invite(request: Request, invite_id: str) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
-    invites = load_user_invites()
-
-
-
-
-
-
-
-
-    invite = next((item for item in invites if item.get("id") == invite_id), None)
-
-
-
-
-
-
-
-
-    if not invite:
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "Invitation not found."}
-
-
-
-
-
-
-
-
-    invite["status"] = "cancelled"
-
-
-
-
-
-
-
-
-    invite["cancelled_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    save_user_invites(invites)
-
-
-
-
-
-
-
-
+    with _USERS_FILE_LOCK:
+        invites = load_user_invites()
+        invite = next((item for item in invites if item.get("id") == invite_id), None)
+        if not invite:
+            return {"status": "error", "message": "Invitation not found."}
+        invite["status"] = "cancelled"
+        invite["cancelled_at"] = datetime.now().isoformat()
+        save_user_invites(invites)
     return {"status": "complete", "message": "Invitation cancelled."}
 
 
