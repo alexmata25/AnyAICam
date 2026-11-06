@@ -292,15 +292,6 @@ def test_a_wrong_local_password_during_a_delegated_outage_is_counted(claimed, ba
     assert _stored()["failed_login_attempts"] == 1
 
 
-def test_a_wrong_local_password_refused_by_r2_is_counted(claimed, backend):
-    _cloud_admin("global", enrolled=True)
-    _local_admin(password=LOCAL_PASSWORD)
-    backend()
-    response = _login(claimed, "administrator", PASSWORD)  # the cloud password: R-2 refusal
-    assert response.status_code == 403 and _no_session(response)
-    assert _stored()["failed_login_attempts"] == 1
-
-
 def test_partner_and_technician_selections_never_touch_the_local_account(claimed, backend):
     _local_admin()
     backend()
@@ -348,3 +339,89 @@ def test_concurrent_strikes_on_both_routes_are_never_lost(claimed, monkeypatch):
         list(pool.map(lambda _: main._count_legacy_password_failure("local-owner"), range(40)))
     monkeypatch.setattr(main, "load_users", real_load)
     assert _stored()["failed_login_attempts"] == 40
+
+
+# ------------------------------------------------------------------ 6. Codex R1 revision review P2 (owner 2026-11-06)
+# A VALID cloud password, refused by R-2, is not a local password failure: it never uses the local administrator's
+# lockout budget. It is counted by the shared SQL limiter instead, so guesses through this route stay bounded, and
+# POST /login keeps local emergency recovery.
+
+
+def _sql_attempts(email=ADMIN):
+    with connection() as db:
+        row = db.execute("SELECT attempts FROM account_lockouts WHERE email=?", (email,)).fetchone()
+    return row["attempts"] if row else 0
+
+
+def test_a_valid_cloud_password_refused_by_r2_never_uses_the_local_lockout_budget(claimed, backend, tmp_path,
+                                                                                    monkeypatch):
+    import cloud_security
+    monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit_log.jsonl")
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=LOCAL_PASSWORD)
+    spy = backend()
+    limit = cloud_security.settings.login_attempt_limit
+    assert limit >= main.MAX_LOGIN_ATTEMPTS  # counted locally, these refusals would have locked the local account
+    for attempt in range(1, limit + 1):
+        response = _login(claimed, "administrator", PASSWORD)  # the cloud password: R-2 refusal
+        assert response.status_code == 403 and _no_session(response)
+        assert "verifiable MFA" in response.json()["detail"]
+        assert _sql_attempts() == attempt  # counted once per refusal by the shared limiter
+        assert _stored()["failed_login_attempts"] == 0 and not _stored()["locked_until"]
+    assert len(spy.calls) == limit
+    blocked = _login(claimed, "administrator", PASSWORD)  # the shared limiter now answers first
+    assert blocked.status_code == 429 and _no_session(blocked) and len(spy.calls) == limit
+    assert _stored()["failed_login_attempts"] == 0 and not _stored()["locked_until"]
+    assert _admin_sessions() == 0 and _pending_mfa() == 0
+    audit = [json.loads(line) for line in (tmp_path / "audit_log.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert sum("validated as this email's cloud identity" in entry.get("detail", "") for entry in audit) == limit
+    # Local emergency recovery is untouched: POST /login with the local password still signs in.
+    login = claimed.post("/login", data={"email": ADMIN, "password": LOCAL_PASSWORD, "next_url": "/"}, follow_redirects=False)
+    assert login.status_code == 303
+
+
+def test_a_password_valid_for_neither_identity_still_counts_a_local_strike(claimed, backend):
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=LOCAL_PASSWORD)
+    backend()
+    response = _login(claimed, "administrator", "wrong-for-both-1")
+    assert response.status_code in (401, 403) and _no_session(response)
+    assert _stored()["failed_login_attempts"] == 1
+    assert _sql_attempts() == 1  # the generic refusal's own SQL count, exactly once
+
+
+def test_wrong_passwords_for_both_identities_still_lock_the_local_account(claimed, backend, monkeypatch):
+    import cloud_security
+    monkeypatch.setattr(cloud_security, "record_login_failure", lambda email: None)  # local threshold on its own
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=LOCAL_PASSWORD)
+    backend()
+    for _ in range(main.MAX_LOGIN_ATTEMPTS):
+        assert _login(claimed, "administrator", "wrong-for-both-1").status_code in (401, 403)
+    assert _stored()["locked_until"] and _stored()["failed_login_attempts"] == 0
+    assert _login(claimed, "administrator", LOCAL_PASSWORD).status_code == 423
+
+
+def test_cloud_password_refusals_then_the_local_password_still_recovers_through_the_selector(claimed, backend):
+    # Below the shared limit, a dual-identity user who typed the cloud password can still recover locally here.
+    import cloud_security
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=LOCAL_PASSWORD)
+    spy = backend()
+    for _ in range(cloud_security.settings.login_attempt_limit - 1):
+        assert _login(claimed, "administrator", PASSWORD).status_code == 403
+    calls = len(spy.calls)
+    response = _login(claimed, "administrator", LOCAL_PASSWORD)
+    assert response.status_code == 303 and response.headers["location"] == "/admin-portal"
+    assert len(spy.calls) == calls  # the local shortcut: no cloud call
+    assert _stored()["failed_login_attempts"] == 0 and _sql_attempts() == 0  # success clears the shared limiter
+
+
+def test_a_wrong_local_password_during_an_outage_is_still_counted_locally(claimed, backend):
+    # The cloud never validated anything during an outage, so this stays a local password failure.
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=LOCAL_PASSWORD)
+    backend(unavailable=True)
+    response = _login(claimed, "administrator", PASSWORD)
+    assert response.status_code == 503 and _no_session(response)
+    assert _stored()["failed_login_attempts"] == 1

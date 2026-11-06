@@ -54,6 +54,11 @@ try { & (Join-Path $PSScriptRoot 'stop-stale-vms.ps1') -InstallRoot $installRoot
 # 1.3.4: one Job Object around the whole VMS (vms-job-limits.ps1): a CPU cap, an optional memory limit. Python and
 # its FFmpeg/MediaMTX/Tesseract children inherit it. Fail-open: without it the VMS still starts and records.
 try { . (Join-Path $PSScriptRoot 'vms-job-limits.ps1'); Write-Output (Set-AnyAiCamVmsJobLimits $settings) } catch { Write-Output "AnyAiCam VMS launcher: resource limits unavailable: $($_.Exception.Message)" }
+# 1.3.4.1 R1 (Codex revision review P1): exactly one VMS worker process. users.json and the VMS's other JSON stores
+# are serialized by in-process locks, and uvicorn would otherwise start one worker per WEB_CONCURRENCY (which the
+# vms.env loop above copies into the environment). The app's own readiness checks read the same variable.
+if ($settings['WEB_CONCURRENCY'] -and $settings['WEB_CONCURRENCY'] -ne '1') { Write-Output "AnyAiCam VMS launcher: WEB_CONCURRENCY=$($settings['WEB_CONCURRENCY']) in vms.env ignored; the VMS runs one worker." }
+$env:WEB_CONCURRENCY = '1'
 Set-Location (Join-Path $installRoot 'app')
-& (Join-Path $installRoot 'runtime\python\python.exe') -m uvicorn main:app --host $bindHost --port $port --proxy-headers
+& (Join-Path $installRoot 'runtime\python\python.exe') -m uvicorn main:app --host $bindHost --port $port --proxy-headers --workers 1
 exit $LASTEXITCODE

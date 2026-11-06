@@ -144,6 +144,7 @@ import subprocess
 
 import time
 import threading
+import functools
 
 
 
@@ -9939,6 +9940,25 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
 
 
 
+# Codex R1 revision review (P1, owner 2026-11-06): users.json has many writers -- sign-in strikes and successes on
+# POST /login and /api/portal-login, registration, invitation acceptance, approval, user create/update/delete, the
+# administrator password reset, the cloud retirement step and load_users()'s own migration/default writes. Each one
+# reads, changes and saves the file while holding this one lock, so no writer can save a stale list over another's
+# change. The lock is per process: the Windows service runs exactly one worker (service-launcher.ps1, --workers 1).
+_USERS_FILE_LOCK = threading.RLock()
+
+
+def _users_file_writer(function):
+    """Runs a users.json read-modify-write route or step under _USERS_FILE_LOCK, from its first read to its last
+    save. Only for synchronous functions with no network calls (FastAPI runs them on its thread pool)."""
+    @functools.wraps(function)
+    def serialized(*args, **kwargs):
+        with _USERS_FILE_LOCK:
+            return function(*args, **kwargs)
+    return serialized
+
+
+@_users_file_writer
 def load_users() -> list[dict]:
 
 
@@ -10164,6 +10184,7 @@ def load_users() -> list[dict]:
 
 
 
+@_users_file_writer
 def retire_cloud_legacy_admins() -> dict:
 
 
@@ -10634,33 +10655,15 @@ def retire_cloud_legacy_admins() -> dict:
 
 
 def save_users(users: list[dict]) -> None:
-
-
-
-
-
-
-
-
-    temporary = USERS_FILE.with_suffix(".json.tmp")
-
-
-
-
-
-
-
-
-    temporary.write_text(json.dumps(users, indent=2), encoding="utf-8")
-
-
-
-
-
-
-
-
-    temporary.replace(USERS_FILE)
+    # Codex R1 revision review (P1): under the shared users.json lock, and through a temporary file of its own, so
+    # two writes can never write into, or replace users.json from, one shared users.json.tmp.
+    with _USERS_FILE_LOCK:
+        temporary = USERS_FILE.with_name(f"{USERS_FILE.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+        try:
+            temporary.write_text(json.dumps(users, indent=2), encoding="utf-8")
+            temporary.replace(USERS_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 
@@ -45839,9 +45842,10 @@ PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
 
 
 # Codex R1 re-review (2026-11-06): POST /login and POST /api/portal-login read, count and clear the users.json account
-# lock through the helpers below. Each change is a read-modify-write of the CURRENT users file under one process-wide
-# lock, so concurrent sign-ins on either route can no longer lose a strike or overwrite a newer lock with a stale list.
-_LEGACY_LOCK_STATE = threading.RLock()
+# lock through the helpers below. Each change is a read-modify-write of the CURRENT users file under the users.json
+# lock every writer shares (_USERS_FILE_LOCK), so concurrent sign-ins and account changes can no longer lose a strike
+# or overwrite each other with a stale list.
+_LEGACY_LOCK_STATE = _USERS_FILE_LOCK
 
 
 def _legacy_lock_active(locked_until) -> datetime | None:
@@ -45907,6 +45911,18 @@ def _record_legacy_login_failure(user: dict) -> None:
         role=user.get("role", "unknown"), action="login", resource="session",
         detail="Invalid password (local account; entry point: blue portal login).", device="Web browser",
         outcome="denied",
+    ).model_dump(mode="json"))
+
+
+def _record_legacy_delegated_refusal(user: dict) -> None:
+    """Audit row for a refused /api/portal-login whose password was not this local administrator's but validated as
+    the same email's cloud identity (Codex R1 revision review, P2): not counted toward the local lockout."""
+    append_audit_entry(AuditEntryModel(
+        user_id=user.get("id", "unknown"), user_name=user.get("display_name", user.get("email", "")),
+        role=user.get("role", "unknown"), action="login", resource="session",
+        detail="Local password not used: the password validated as this email's cloud identity, which was refused "
+               "(entry point: blue portal login). Counted by the shared sign-in limiter, not the local lockout.",
+        device="Web browser", outcome="denied",
     ).model_dump(mode="json"))
 
 
@@ -47419,7 +47435,11 @@ def register_submit(
 
 
 
-    users = load_users()
+    # Codex R1 revision review (P1): the users.json read-modify-write below holds the shared users.json lock. This
+    # public route hashes the password first, so it never holds that lock for a bcrypt hash.
+    password_hash = hash_password(password)
+    with _USERS_FILE_LOCK:
+        users = load_users()
 
 
 
@@ -47428,7 +47448,7 @@ def register_submit(
 
 
 
-    existing = next(
+        existing = next(
 
 
 
@@ -47437,7 +47457,7 @@ def register_submit(
 
 
 
-        (
+            (
 
 
 
@@ -47446,7 +47466,7 @@ def register_submit(
 
 
 
-            item for item in users
+                item for item in users
 
 
 
@@ -47455,7 +47475,7 @@ def register_submit(
 
 
 
-            if item.get("email", "").strip().lower() == normalized_email
+                if item.get("email", "").strip().lower() == normalized_email
 
 
 
@@ -47464,7 +47484,7 @@ def register_submit(
 
 
 
-        ),
+            ),
 
 
 
@@ -47473,115 +47493,7 @@ def register_submit(
 
 
 
-        None,
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    if existing:
-
-
-
-
-
-
-
-
-        if existing.get("invitation_status") == "pending":
-
-
-
-
-
-
-
-
-            return HTMLResponse(
-
-
-
-
-
-
-
-
-                register_page_html(
-
-
-
-
-
-
-
-
-                    message="That account request is already pending approval."
-
-
-
-
-
-
-
-
-                ),
-
-
-
-
-
-
-
-
-                status_code=200,
-
-
-
-
-
-
-
-
-            )
-
-
-
-
-
-
-
-
-        return HTMLResponse(
-
-
-
-
-
-
-
-
-            register_page_html("That email is already registered."),
-
-
-
-
-
-
-
-
-            status_code=409,
+            None,
 
 
 
@@ -47599,6 +47511,7 @@ def register_submit(
 
 
 
+        if existing:
 
 
 
@@ -47607,8 +47520,8 @@ def register_submit(
 
 
 
+            if existing.get("invitation_status") == "pending":
 
-    payload = UserModel(
 
 
 
@@ -47616,8 +47529,8 @@ def register_submit(
 
 
 
+                return HTMLResponse(
 
-        display_name=normalized_name,
 
 
 
@@ -47625,8 +47538,8 @@ def register_submit(
 
 
 
+                    register_page_html(
 
-        email=normalized_email,
 
 
 
@@ -47634,8 +47547,8 @@ def register_submit(
 
 
 
+                        message="That account request is already pending approval."
 
-        role=normalized_role,
 
 
 
@@ -47643,8 +47556,8 @@ def register_submit(
 
 
 
+                    ),
 
-        enabled=False,
 
 
 
@@ -47652,8 +47565,8 @@ def register_submit(
 
 
 
+                    status_code=200,
 
-        super_admin=False,
 
 
 
@@ -47661,8 +47574,8 @@ def register_submit(
 
 
 
+                )
 
-        site_ids=["home"],
 
 
 
@@ -47670,8 +47583,8 @@ def register_submit(
 
 
 
+            return HTMLResponse(
 
-        camera_ids=[],
 
 
 
@@ -47679,8 +47592,8 @@ def register_submit(
 
 
 
+                register_page_html("That email is already registered."),
 
-        password_hash=hash_password(password),
 
 
 
@@ -47688,8 +47601,8 @@ def register_submit(
 
 
 
+                status_code=409,
 
-        invitation_status="pending",
 
 
 
@@ -47697,8 +47610,8 @@ def register_submit(
 
 
 
+            )
 
-    ).model_dump(mode="json")
 
 
 
@@ -47707,7 +47620,6 @@ def register_submit(
 
 
 
-    payload["requested_at"] = datetime.now().isoformat()
 
 
 
@@ -47716,7 +47628,7 @@ def register_submit(
 
 
 
-    users.append(payload)
+        payload = UserModel(
 
 
 
@@ -47725,7 +47637,115 @@ def register_submit(
 
 
 
-    save_users(users)
+            display_name=normalized_name,
+
+
+
+
+
+
+
+
+            email=normalized_email,
+
+
+
+
+
+
+
+
+            role=normalized_role,
+
+
+
+
+
+
+
+
+            enabled=False,
+
+
+
+
+
+
+
+
+            super_admin=False,
+
+
+
+
+
+
+
+
+            site_ids=["home"],
+
+
+
+
+
+
+
+
+            camera_ids=[],
+
+
+
+
+
+
+
+
+            password_hash=password_hash,
+
+
+
+
+
+
+
+
+            invitation_status="pending",
+
+
+
+
+
+
+
+
+        ).model_dump(mode="json")
+
+
+
+
+
+
+
+
+        payload["requested_at"] = datetime.now().isoformat()
+
+
+
+
+
+
+
+
+        users.append(payload)
+
+
+
+
+
+
+
+
+        save_users(users)
 
 
 
@@ -48861,15 +48881,25 @@ def portal_login_submit(request: Request, payload: dict):
     before picking one, instead of only ever consulting one (see
     resolve_portal_login()'s own docstring for why that mattered)."""
     # Codex R1 re-review (2026-11-06): a wrong password for an eligible local administrator (users.json, see below)
-    # counts as one users.json strike whenever this request ends without a session -- the generic 401, a 403
-    # (including the R-2 delegated-administrator refusal) and the 503 of a delegated outage alike -- through the same
-    # serialized helper POST /login uses. A request that establishes any session never counts a strike.
+    # counts as one users.json strike whenever this request ends without a session -- the generic 401, a 403 and the
+    # 503 of a delegated outage alike -- through the same serialized helper POST /login uses. A request that
+    # establishes any session never counts a strike.
+    # Codex R1 revision review (P2, owner 2026-11-06): when the password was instead a VALID cloud credential for
+    # this email (the delegated check accepted it) and the request is then refused -- Samsung R-2's MFA refusal, or a
+    # portal the identity isn't authorized for -- it is not a local password failure: the local administrator's
+    # lockout budget is untouched. That refusal counts once against the shared SQL sign-in limiter instead, which
+    # still bounds guesses at the local password through this route (429). POST /login keeps local recovery.
     refusal: dict = {}
     try:
         return _portal_login(request, payload, refusal)
-    except HTTPException:
+    except HTTPException as error:
         if refusal.get("legacy_user") is not None:
             _record_legacy_login_failure(refusal["legacy_user"])
+        elif refusal.get("delegated_legacy_user") is not None and error.status_code != 401:
+            # The 401 refusals after a valid delegated credential already count against the SQL limiter themselves.
+            from cloud_security import record_login_failure
+            record_login_failure(refusal["email"])
+            _record_legacy_delegated_refusal(refusal["delegated_legacy_user"])
         raise
 
 
@@ -48881,6 +48911,7 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
     selected_portal = payload.get("portal") or None
     if selected_portal not in PORTAL_SELECTOR_OPTIONS:
         selected_portal = None
+    refusal["email"] = email
 
     from cloud_security import clear_login_failures, login_blocked, record_login_failure
 
@@ -49043,6 +49074,12 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
                        entity_id=str((partner_user or {}).get("id") or ""))
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         partner_administrator_scope = _live_scope
+
+    # A delegated (or, off an appliance, partner_db) identity validated with this password, so a wrong users.json
+    # password was a dual-identity user's other credential, not a local guess (Codex R1 revision review, P2):
+    # portal_login_submit() keeps it off the local lockout budget if the request is refused.
+    if partner_role is not None and refusal.get("legacy_user") is not None:
+        refusal["delegated_legacy_user"] = refusal.pop("legacy_user")
 
     # Off an appliance, a locked eligible local account is reported as locked (not a generic refusal) when no other
     # identity validated. Its wrong-password strike is counted by portal_login_submit() on any refusal.
@@ -126161,6 +126198,7 @@ def accept_invite_page(token: str = "") -> HTMLResponse:
 
 
 
+@_users_file_writer
 def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
 
 
@@ -127529,6 +127567,7 @@ def cancel_user_invite(request: Request, invite_id: str) -> dict:
 
 
 
+@_users_file_writer
 def approve_business_user(request: Request, user_id: str) -> dict:
 
 
@@ -128078,6 +128117,7 @@ def users_api(request: Request) -> dict:
 
 
 
+@_users_file_writer
 def create_user(request: Request, new_user: UserCreateModel) -> dict:
 
 
@@ -128430,6 +128470,7 @@ def removes_last_user_manager(users: list[dict], target: dict | None, changes: d
 
 
 
+@_users_file_writer
 def update_user(request: Request, user_id: str, update: UserUpdateModel) -> dict:
 
 
@@ -128666,6 +128707,7 @@ def update_user(request: Request, user_id: str, update: UserUpdateModel) -> dict
 
 
 
+@_users_file_writer
 def change_user_password(
 
 
@@ -128864,6 +128906,7 @@ def change_user_password(
 
 
 
+@_users_file_writer
 def delete_user(request: Request, user_id: str) -> dict:
 
 
