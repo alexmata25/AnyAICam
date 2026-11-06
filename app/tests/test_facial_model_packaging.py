@@ -15,6 +15,7 @@ import pytest
 
 import facial_embedding_sync
 import facial_engine_onnx as fe
+import platform_paths
 
 ROOT = Path(__file__).resolve().parents[2]
 MODELS = [
@@ -24,10 +25,21 @@ MODELS = [
 ]
 
 
+# The Linux images' baked model folder. fe.BAKED_MODEL_DIR is this path on
+# Linux and %ProgramData%/AnyAiCam/models/aac on Windows (platform_paths.native_path),
+# while the Dockerfiles always build Linux images.
+IMAGE_BAKED_MODEL_DIR = "/opt/anyaicam-aac-models"
+
+
+def test_the_engine_uses_the_image_folder_on_linux_and_programdata_on_windows():
+    assert fe.BAKED_MODEL_DIR == Path(platform_paths.native_path(IMAGE_BAKED_MODEL_DIR, "models", "aac"))
+    assert platform_paths.native_path(IMAGE_BAKED_MODEL_DIR, "models", "aac", windows=False) == IMAGE_BAKED_MODEL_DIR
+
+
 @pytest.mark.parametrize("dockerfile", ["Dockerfile", "Dockerfile.production"])
 def test_every_image_bakes_exactly_the_pinned_models_outside_app(dockerfile):
     text = (ROOT / dockerfile).read_text(encoding="utf-8")
-    baked = fe.BAKED_MODEL_DIR.as_posix()
+    baked = IMAGE_BAKED_MODEL_DIR
     assert not baked.startswith("/app")  # /app is bind-mounted on a real appliance
     for url, filename, sha256 in MODELS:
         assert f'-o {baked}/{filename} "{url}"' in text, (dockerfile, filename)
