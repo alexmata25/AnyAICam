@@ -194,9 +194,23 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
             with connection() as db:
                 return db.execute("SELECT COUNT(*) AS n FROM pending_mfa_logins WHERE lower(email)=?", (OPERATOR_EMAIL,)).fetchone()["n"]
 
+    def _all_sessions():
+        # Codex 2026-11-06: every session row of the operator, any role, with its revocation state -- a refusal must
+        # change none of them, not only the administrator rows.
+        with _db(db_path):
+            with connection() as db:
+                return [tuple(row) for row in db.execute(
+                    "SELECT id,role,revoked_at FROM user_sessions WHERE lower(email)=? ORDER BY id", (OPERATOR_EMAIL,))]
+
+    def _sets_no_cookie(response):
+        # No Set-Cookie header for either session cookie (an unrelated CSRF cookie would carry no authority).
+        names = (partner_portal.SESSION_COOKIE + "=", main.SESSION_COOKIE_NAME + "=")
+        return not any(value.strip().startswith(names) for value in response.headers.get_list("set-cookie"))
+
     # Cloud credentials ALONE: the operator has no local users.json identity on this appliance.
     assert not any(u.get("email", "").lower() == OPERATOR_EMAIL for u in main.load_users())
     admin_sessions_before = _sessions("administrator")  # step 3's scaffolding session only
+    all_sessions_before = _all_sessions()
     pending_mfa_before = _pending_mfa()
     admin_login = client.post(
         "/api/portal-login",
@@ -206,13 +220,12 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     assert admin_login.status_code == 403, admin_login.text[:200]
     assert partner_portal.SESSION_COOKIE not in admin_login.cookies
     assert main.SESSION_COOKIE_NAME not in admin_login.cookies
+    # The refusal sets no session cookie, so nothing from it can open the Admin Portal (session replay is covered by
+    # test_windows_1341_r2_claimed_appliance_admin_policy.py).
+    assert _sets_no_cookie(admin_login)
     assert _sessions("administrator") == admin_sessions_before
+    assert _all_sessions() == all_sessions_before
     assert _pending_mfa() == pending_mfa_before
-
-    # Nothing from the refused sign-in opens the Admin Portal (the client holds no cookie from it).
-    client.cookies.clear()
-    refused_portal = client.get("/admin-portal", follow_redirects=False)
-    assert not (refused_portal.status_code == 200 and '<p class="eyebrow">Access control</p>' not in refused_portal.text)
 
     # ---- "no local duplicate account is created" ----
     assert not any(u.get("email", "").lower() == OPERATOR_EMAIL for u in main.load_users())
@@ -262,6 +275,8 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
 
     # R-2 still holds after the revocation: the kept Administrator grant does not turn cloud credentials into
     # claimed-appliance administration -- a fresh sign-in is refused the same way and mints no session.
+    all_sessions_before_again = _all_sessions()
+    pending_mfa_before_again = _pending_mfa()
     admin_again = client.post(
         "/api/portal-login",
         json={"email": OPERATOR_EMAIL, "password": OPERATOR_PASSWORD, "portal": "administrator"},
@@ -270,4 +285,7 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     assert admin_again.status_code == 403, admin_again.text[:200]
     assert partner_portal.SESSION_COOKIE not in admin_again.cookies
     assert main.SESSION_COOKIE_NAME not in admin_again.cookies
+    assert _sets_no_cookie(admin_again)
     assert _sessions("administrator") == admin_sessions_before
+    assert _all_sessions() == all_sessions_before_again
+    assert _pending_mfa() == pending_mfa_before_again

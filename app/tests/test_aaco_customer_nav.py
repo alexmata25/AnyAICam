@@ -112,8 +112,14 @@ def test_an_administrator_cannot_open_the_customer_workspace(client):
     # recognise), so the administrator here is a REAL one -- live global grant,
     # MFA-verified bound session -- and must still be refused by the customer gate.
     from authz_helpers import global_admin_session_cookie
-    response = _get(client, "/aaco", global_admin_session_cookie("admin@example.test"))
-    assert response.status_code in (401, 403) or "Customer" in response.text
+    # Codex 2026-11-06 (P3): pin the denial itself -- a successful page that merely contains "Customer" must fail.
+    response = client.get("/aaco", cookies={partner_portal.SESSION_COOKIE: global_admin_session_cookie("admin@example.test")},
+                          follow_redirects=False)
+    if response.status_code == 303:
+        assert response.headers["location"].startswith("/customer-login.html")
+    else:
+        assert response.status_code in (401, 403), response.status_code
+    assert 'id="aaco-command-form"' not in response.text  # the workspace never rendered
 
 
 # ------------------------------------------------------------ 5: floating Ask AACO unchanged
