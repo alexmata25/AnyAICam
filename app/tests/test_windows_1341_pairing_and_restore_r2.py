@@ -156,6 +156,25 @@ def test_failed_claims_are_also_limited_per_client_address(client):
     assert _claim(client, fifth, _wrong(admin_code)).status_code == 429  # its first attempt, from the same address
 
 
+def test_a_rotated_forwarded_for_header_does_not_reset_the_address_limit(client):
+    # The per-address count is the connection's verified address (request.client.host), never the raw
+    # X-Forwarded-For header, which any client can set to a new value on every request.
+    accounts = [f"viewer-{n}" for n in range(5)]
+    main.save_users([dict(ADMIN)] + [_user(uid) for uid in accounts])
+    admin_code = _new_code(client, _cookies("admin-1"))
+    per_account = main.PAIRING_CLAIM_MAX_FAILURES
+    spoofed = iter(f"203.0.113.{n}" for n in range(1, 200))
+
+    def claim(cookies):
+        return client.post("/api/mobile/pairing/claim", cookies=cookies, headers={"X-Forwarded-For": next(spoofed)},
+                           json={"code": _wrong(admin_code), "device_name": "Phone"})
+    for uid in accounts[:4]:
+        cookies = _cookies(uid)
+        assert [claim(cookies).status_code for _ in range(per_account)] == [400] * per_account
+    assert not [key for key in main._pairing_claim_failures if key.startswith("address:203.0.113.")]
+    assert claim(_cookies(accounts[4])).status_code == 429
+
+
 # ------------------------------------------------------------------- live-code cap and superseding
 
 def test_a_new_code_supersedes_the_accounts_earlier_code(client):

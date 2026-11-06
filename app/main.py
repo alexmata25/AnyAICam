@@ -94362,7 +94362,11 @@ def claim_mobile_pairing(
     code = payload.code.strip()
     paired_from_ip = request_device_context(request).get("ip_address", "")
     user_agent = request.headers.get("user-agent", "")
-    limits = _pairing_claim_limits(account_id, paired_from_ip)
+    # The per-address limit counts the connection's verified address. request_device_context() reads the raw
+    # X-Forwarded-For header, which any client can set; request.client.host is rewritten from that header by uvicorn
+    # --proxy-headers only when the connection comes from FORWARDED_ALLOW_IPS (loopback by default, i.e. the local
+    # reverse proxy), so rotating the header cannot reset this count.
+    limits = _pairing_claim_limits(account_id, request.client.host if request.client else "")
     # Four-store remediation: one claim at a time, so a single-use code can never pair two devices. The code is spent
     # (and saved) before the device is added, so a failed device save leaves the code spent, never reusable. A code
     # pairs only for the account that created it; any other account gets the same answer as a wrong code, and the
