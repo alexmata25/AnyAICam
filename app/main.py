@@ -37566,15 +37566,29 @@ async def store_motion_event(
         # here so a Continuous-mode camera's existing behavior has zero
         # new code in its path beyond this one cheap, backgrounded
         # check.
-        if (await asyncio.to_thread(_local_recording_settings, camera_number))["mode"] == "event":
-            event_recording_task = asyncio.create_task(
-                persist_event_recording(
-                    camera_number, start_time, end_time,
-                    detector="basic_motion", trigger_id=event_id,
-                )
+        # Codex 2026-11-06 (P2): a failure here must not escape store_motion_event -- that skipped the alert rule and
+        # Smart Motion below and could restart the camera's motion worker. The mode is always "event" (R-REC-1), so a
+        # settings lookup failure still schedules the recording; a scheduling failure is logged, never raised.
+        try:
+            recording_mode = (await asyncio.to_thread(_local_recording_settings, camera_number))["mode"]
+        except Exception as error:
+            structured_log("event_recording.mode_lookup_failed", level="warning", camera_number=camera_number,
+                           trigger_id=event_id, error=type(error).__name__)
+            recording_mode = LOCAL_RECORDING_MODE
+        if recording_mode == "event":
+            recording = persist_event_recording(
+                camera_number, start_time, end_time,
+                detector="basic_motion", trigger_id=event_id,
             )
-            clip_tasks.add(event_recording_task)
-            event_recording_task.add_done_callback(clip_tasks.discard)
+            try:
+                event_recording_task = asyncio.create_task(recording)
+            except Exception as error:
+                recording.close()
+                structured_log("event_recording.schedule_failed", level="error", camera_number=camera_number,
+                               trigger_id=event_id, error=type(error).__name__)
+            else:
+                clip_tasks.add(event_recording_task)
+                event_recording_task.add_done_callback(clip_tasks.discard)
 
 
 
