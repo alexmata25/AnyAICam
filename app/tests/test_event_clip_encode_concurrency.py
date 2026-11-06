@@ -250,10 +250,14 @@ def test_semaphore_releases_after_cancellation(monkeypatch, _isolated_clip_paths
         # semaphore and start "encoding" before cancelling mid-flight. Wait
         # for that to actually happen (bounded) -- a fixed number of loop
         # ticks was not always enough and made this test intermittent.
+        # _REAL_SLEEP, not asyncio.sleep: the autouse _fast_preroll_wait
+        # patches asyncio.sleep module-wide to sleep(0), which made this a
+        # 200-yield loop with no real time bound; run alone on Windows it
+        # ended before the worker threads (shortlist, probe, settings) did.
         for _ in range(200):
             if counter["active"] == 1:
                 break
-            await asyncio.sleep(0.01)
+            await _REAL_SLEEP(0.01)
         assert counter["active"] == 1, "expected the encode to have started before cancellation"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
