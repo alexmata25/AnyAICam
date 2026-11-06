@@ -113,6 +113,7 @@ class SetupSectionCompileTests(unittest.TestCase):
                 '#define AppName "AnyAiCam VMS"\n#define AppVersion "1.3.2"\n#define ReleaseVersion "1.2.7"\n'
                 f'#define SourceCommit "{COMMIT}"\n#define ShortCommit Copy(SourceCommit, 1, 7)\n'
                 '#define KeysetSha256 "2389a655fb3e5ed91e8a4a9216f9c45b97feb3847571b0536384b8305979af7c"\n'
+                '#define RegistrySha256 "0000000000000000000000000000000000000000000000000000000000000000"\n'  # required since LIC-W1 66de7c9
                 "[Setup]" + SETUP.replace("OutputDir=output", "OutputDir=out") + "\n"
                 f'[Files]\nSource: "{guard}"; Flags: dontcopy\n[Code]' + code, encoding="utf-8")
             result = subprocess.run([str(ISCC), "/O-", "/Q", str(wrapper)], capture_output=True, text=True, cwd=folder, timeout=120)
