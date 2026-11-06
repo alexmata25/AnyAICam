@@ -144,8 +144,10 @@ def test_duplicate_legacy_and_partner_identity_takes_the_partner_path(cloud):
 
 
 def test_resolve_portal_login_never_selects_the_legacy_system_on_the_cloud():
+    # cloud_profile=True: the cloud rule this test names (L-3). On an appliance the b8 selection stands (owner
+    # 2026-10-28; test_portal_login_selector.py).
     decision = main.resolve_portal_login(selected_portal="administrator", legacy_role="administrator", partner_role="administrator",
-                                         partner_administrator_scope="global")
+                                         partner_administrator_scope="global", cloud_profile=True)
     assert decision["system"] == "partner" and decision["destination"] == "/admin-portal"
 
 

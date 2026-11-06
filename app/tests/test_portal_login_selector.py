@@ -13,6 +13,8 @@ Portal from that page at all. resolve_portal_login() fixes this by
 deciding between BOTH systems' validated results instead of only ever
 consulting one.
 """
+import pytest
+
 import main
 
 
@@ -72,6 +74,24 @@ def test_same_email_both_identities_selecting_administrator_routes_to_legacy_adm
     decision = main.resolve_portal_login(selected_portal="administrator", legacy_role="administrator", partner_role="administrator")
     assert decision["system"] == "legacy"
     assert decision["destination"] == "/admin-portal"
+
+
+# Owner 2026-10-28: the two appliance cases above keep the b8 selection; the cloud keeps the stricter 1.2.7.1 rule
+# (GREEN-MFA-ACCEPTANCE-SPEC.md L-3): the legacy users.json administrator is never selected there.
+@pytest.mark.parametrize("scope,destination", [("global", "/admin-portal"), (None, "/partner?tab=customers")])
+def test_on_the_cloud_the_partner_administrator_wins_and_legacy_is_never_selected(scope, destination):
+    for selected in ("administrator", None):
+        decision = main.resolve_portal_login(selected_portal=selected, legacy_role="administrator", partner_role="administrator",
+                                             partner_administrator_scope=scope, cloud_profile=True)
+        assert decision["system"] == "partner" and decision["role"] == "administrator"
+        assert decision["destination"] == destination
+
+
+def test_on_the_cloud_a_legacy_only_administrator_is_not_selectable():
+    for selected in ("administrator", None):
+        decision = main.resolve_portal_login(selected_portal=selected, legacy_role="administrator", partner_role=None,
+                                             cloud_profile=True)
+        assert decision["system"] is None and decision["destination"] is None
 
 
 def test_same_email_both_identities_selecting_partner_is_rejected_when_only_administrator_available_on_partner_side():
