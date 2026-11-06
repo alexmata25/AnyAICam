@@ -25,7 +25,11 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 
+from claim_id import display_cloud_id
 from database_backend import override_target
+
+
+RYZEN_UUID = "637AD320-DAAA-436E-89C9-70A84F4F54A9"  # the older appliance's cloud_id (a device UUID)
 
 
 @pytest.fixture()
@@ -379,7 +383,10 @@ def test_customer_account_without_appliance_id_groups_by_appliance_never_merges(
     # Both appliances' own cloud_id headings must appear, clearly attributing
     # each group -- proof the two appliances' cameras were never merged into
     # one indistinguishable list.
-    assert "637AD320-DAAA-436E-89C9-70A84F4F54A9" in response.text
+    # Windows 1.3.4.1 Patch 8 (UUID audit): a UUID cloud_id is the device UUID, so the
+    # heading shows its Claim ID (claim_id.display_cloud_id) and never the UUID itself.
+    assert display_cloud_id(RYZEN_UUID) in response.text
+    assert RYZEN_UUID.lower() not in response.text.lower()
     assert "AIC-C90CF0C9" in response.text
     # The account-wide entitlement total is unaffected by grouping.
     assert "6 of 8 camera" in response.text
@@ -439,7 +446,10 @@ def test_customer_live_without_appliance_id_groups_tiles_by_appliance_never_merg
     assert "Ryzen Camera 1" in response.text
     for n in range(1, 6):
         assert f">Camera {n}<" in response.text
-    assert "637AD320-DAAA-436E-89C9-70A84F4F54A9" in response.text
+    # Windows 1.3.4.1 Patch 8 (UUID audit): a UUID cloud_id is the device UUID, so the
+    # heading shows its Claim ID (claim_id.display_cloud_id) and never the UUID itself.
+    assert display_cloud_id(RYZEN_UUID) in response.text
+    assert RYZEN_UUID.lower() not in response.text.lower()
     assert "AIC-C90CF0C9" in response.text
 
 
