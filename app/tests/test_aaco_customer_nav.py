@@ -8,6 +8,7 @@ AACO off (aaco_settings). It reuses the existing /aaco workspace; the
 floating button is unchanged.
 """
 import re
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -116,7 +117,9 @@ def test_an_administrator_cannot_open_the_customer_workspace(client):
     response = client.get("/aaco", cookies={partner_portal.SESSION_COOKIE: global_admin_session_cookie("admin@example.test")},
                           follow_redirects=False)
     if response.status_code == 303:
-        assert response.headers["location"].startswith("/customer-login.html")
+        # Codex R1 re-review: the exact sign-in page, not any path that merely starts with it.
+        location = urlsplit(response.headers["location"])
+        assert (location.scheme, location.netloc, location.path) == ("", "", "/customer-login.html"), response.headers["location"]
     else:
         assert response.status_code in (401, 403), response.status_code
     assert 'id="aaco-command-form"' not in response.text  # the workspace never rendered
