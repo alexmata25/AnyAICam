@@ -78,10 +78,14 @@ def _legacy_admin_session():
     grants come from the cloud grant system, never from being admin@local."""
     # The acting Admin Portal session must be a live platform administrator
     # (2026-10-02); a real platform account, never the local admin@local.
-    main.save_users([{"id": "bootstrap-admin", "email": "platform-admin@anyaicam.test", "role": "administrator", "enabled": True, "camera_ids": []}])
+    # Windows 1.3.4.1 (ce0c768, 13415ef): identity grants are managed only from a
+    # real, MFA-verified Partner Portal session of that platform administrator;
+    # a legacy users.json session is refused (test_identity_grant_management.py).
+    # The returned token is a partner_portal.SESSION_COOKIE value.
+    from authz_helpers import partner_session_cookie
     from global_admin_helper import make_live_global_admin
     make_live_global_admin("platform-admin@anyaicam.test")
-    return main.create_session("bootstrap-admin")
+    return partner_session_cookie("platform-admin@anyaicam.test", "administrator", mfa_state="verified", auth_source="mfa")
 
 
 def test_full_samsung_readiness_chain_via_real_apis(env):
@@ -100,18 +104,18 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     admin_grant = client.post(
         "/api/operations/identity-grants",
         json={"email": OPERATOR_EMAIL, "role": "administrator", "scope_type": "global"},
-        cookies={main.SESSION_COOKIE_NAME: admin_token},
+        cookies={partner_portal.SESSION_COOKIE: admin_token},
     )
     assert admin_grant.status_code == 200
     partner_grant = client.post(
         "/api/operations/identity-grants",
         json={"email": OPERATOR_EMAIL, "role": "partner_owner", "scope_type": "partner", "scope_id": "anyaicam-primary"},
-        cookies={main.SESSION_COOKIE_NAME: admin_token},
+        cookies={partner_portal.SESSION_COOKIE: admin_token},
     )
     assert partner_grant.status_code == 200
     partner_grant_id = partner_grant.json()["grant_id"]
 
-    grants_list = client.get("/api/operations/identity-grants", cookies={main.SESSION_COOKIE_NAME: admin_token}).json()["grants"]
+    grants_list = client.get("/api/operations/identity-grants", cookies={partner_portal.SESSION_COOKIE: admin_token}).json()["grants"]
     assert {g["role"] for g in grants_list if g["email"] == OPERATOR_EMAIL} == {"administrator", "partner_owner"}
 
     # ---- Step 3: mock cloud creates customer/site/appliance + activation token, via the real onboarding API, authenticated as the operator's DIRECT partner_db identity ----
@@ -209,7 +213,7 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     partner_session_id = next(row["id"] for row in sessions if row["role"] == "partner_owner")
 
     # ---- Step 10: revoke the Partner grant ----
-    revoke = client.post(f"/api/operations/identity-grants/{partner_grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: admin_token})
+    revoke = client.post(f"/api/operations/identity-grants/{partner_grant_id}/revoke", cookies={partner_portal.SESSION_COOKIE: admin_token})
     assert revoke.status_code == 200
 
     # ---- Step 11: next heartbeat invalidates Partner authorization while Administrator remains valid ----
