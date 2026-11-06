@@ -134,13 +134,13 @@ def test_a_sign_out_is_never_undone_by_concurrent_sign_ins(client, slow_reads):
 
 
 def test_a_damaged_session_store_is_kept_and_audited_never_silently_overwritten(client):
-    main.save_users([dict(ADMIN)])
+    main.save_users([dict(ADMIN), _user("signer")])  # ADMIN has no password: the sign-in is the viewer's
     damaged = b'{"half-written": '
     main.SESSIONS_FILE.write_bytes(damaged)
     # A damaged store signs nobody in.
     assert main.load_sessions() == {}
 
-    response = _fresh().post("/login", data={"email": "admin@example.test", "password": PASSWORD, "next_url": "/"},
+    response = _fresh().post("/login", data={"email": "signer@example.test", "password": PASSWORD, "next_url": "/"},
                              follow_redirects=False)
     assert response.status_code == 303, response.text[:300]
     kept = list(main.SESSIONS_FILE.parent.glob("sessions.json.unreadable-*"))
@@ -153,7 +153,7 @@ def test_a_damaged_session_store_is_kept_and_audited_never_silently_overwritten(
 
 
 def test_an_unreadable_session_store_refuses_the_write_and_is_left_unchanged(client, monkeypatch):
-    main.save_users([dict(ADMIN), _user("viewer-1")])
+    main.save_users([dict(ADMIN), _user("viewer-1"), _user("signer")])  # ADMIN has no password: the viewer signs in
     existing = main.create_session("viewer-1")
     before = main.SESSIONS_FILE.read_bytes()
     real_read = Path.read_bytes
@@ -166,7 +166,7 @@ def test_an_unreadable_session_store_refuses_the_write_and_is_left_unchanged(cli
 
     with pytest.raises(main.SessionStoreUnreadable):
         main.create_session("admin-1")
-    sign_in = _fresh().post("/login", data={"email": "admin@example.test", "password": PASSWORD, "next_url": "/"},
+    sign_in = _fresh().post("/login", data={"email": "signer@example.test", "password": PASSWORD, "next_url": "/"},
                             follow_redirects=False)
     sign_out = _fresh().post("/logout", cookies={main.SESSION_COOKIE_NAME: existing}, follow_redirects=False)
     assert sign_in.status_code == 500 and main.SESSION_COOKIE_NAME not in sign_in.cookies
@@ -306,6 +306,9 @@ def test_invitation_routes_keep_their_authorization(client, quiet_email):
 def test_the_configuration_restore_holds_the_users_lock(client, monkeypatch, tmp_path):
     assert tmp_path in main.RESTORE_STAGING_FOLDER.parents  # redirected by isolate_recordings, never the shared root
     main.RESTORE_STAGING_FOLDER.mkdir(parents=True, exist_ok=True)
+    # CONFIG_BACKUP_FILES is a list built at import, so isolate_recordings and the fixture's path patches never reach
+    # it: point the two restore targets this test checks at the fixture's files.
+    monkeypatch.setattr(main, "CONFIG_BACKUP_FILES", [main.USERS_FILE, main.USER_INVITES_FILE])
     main.save_users([dict(ADMIN)])
     cookies = {main.SESSION_COOKIE_NAME: main.create_session("admin-1")}
     restored_users = [dict(ADMIN), _user("restored-1")]
