@@ -41066,6 +41066,65 @@ async def _finalize_ai_activity(camera_number: int, activity, thumbnail_url: str
 
 
 
+# Codex R1 re-review (2026-11-06; owner-approved R1 scope): scheduling an Event-mode recording or its linked-recording
+# backfill is optional media work and must never interrupt the event path that triggers it. Event persistence, the
+# people-counting state save, alarm talk-down and the remaining plates/crossings of the same scan run whether or not
+# the media could be scheduled. Used by the LPR scan (worker thread: run_coroutine_threadsafe onto the AI media loop),
+# the people counting worker and the customer analytics rule worker (both on the main loop: create_task, retained in
+# clip_tasks until done so shutdown still drains them; cancellation is left untouched).
+def event_recording_mode(camera_number: int, *, source: str, trigger_id: str | None = None) -> str:
+    """The camera's local recording mode, resolved once per event or batch. A lookup failure is logged and falls back to
+    LOCAL_RECORDING_MODE ("event" on Windows, R-REC-1) instead of escaping into the event path."""
+    try:
+        return _local_recording_settings(camera_number)["mode"]
+    except Exception as error:
+        structured_log("event_recording.mode_lookup_failed", level="warning", camera_number=camera_number,
+                       source=source, trigger_id=trigger_id, error=type(error).__name__)
+        return LOCAL_RECORDING_MODE
+
+
+def _report_event_media_failure(label: str, what: str):
+    """Done-callback: a scheduled recording or backfill that later fails is reported, never left unobserved."""
+    def done(future) -> None:
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is not None:
+            print(f"{label}: {what} failed: {type(error).__name__}: {error}")
+    return done
+
+
+def submit_event_media_threadsafe(coroutine, loop, *, label: str, what: str) -> bool:
+    """From a worker thread, schedules coroutine on loop. Any failure closes the coroutine, is logged and returns False."""
+    try:
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+    except Exception as error:
+        coroutine.close()
+        structured_log("event_recording.schedule_failed", level="error", source=label, task=what, error=type(error).__name__)
+        print(f"{label}: could not schedule {what}: {error}")
+        return False
+    observe = getattr(future, "add_done_callback", None)  # a concurrent.futures.Future from the real scheduler
+    if observe is not None:
+        observe(_report_event_media_failure(label, what))
+    return True
+
+
+def schedule_event_media_task(coroutine, *, label: str, what: str) -> asyncio.Task | None:
+    """On the running loop, schedules coroutine as a task retained in clip_tasks until it finishes. Any scheduling
+    failure closes the coroutine, is logged and returns None."""
+    try:
+        task = asyncio.create_task(coroutine)
+    except Exception as error:
+        coroutine.close()
+        structured_log("event_recording.schedule_failed", level="error", source=label, task=what, error=type(error).__name__)
+        print(f"{label}: could not schedule {what}: {error}")
+        return None
+    clip_tasks.add(task)
+    task.add_done_callback(clip_tasks.discard)
+    task.add_done_callback(_report_event_media_failure(label, what))
+    return task
+
+
 def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
     """The independent LPR pass (see lpr.scan_frame): runs on every AI
     detection pass for an LPR camera, whether or not that pass saved a
@@ -41174,14 +41233,15 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
         # event window"), so the plate event triggers the recording itself
         # -- exactly what save_yolo_events() does for its events -- and the
         # linked-recording backfill that points it at the finished clip.
-        if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    persist_event_recording(camera_number, event_start, moment, detector="lpr", trigger_id=event_id),
-                    _ai_event_media_loop,
-                )
-            except RuntimeError as error:
-                print(f"LPR event {event_id}: could not schedule Event-mode recording persist: {error}")
+        # Codex R1 re-review: the mode is resolved once per plate and neither the lookup nor either submission can stop
+        # this plate's event from being appended or the remaining plates of the scan (see event_recording_mode()).
+        media_loop = _ai_event_media_loop
+        in_event_mode = media_loop is not None and event_recording_mode(camera_number, source="lpr", trigger_id=event_id) == "event"
+        if in_event_mode:
+            submit_event_media_threadsafe(
+                persist_event_recording(camera_number, event_start, moment, detector="lpr", trigger_id=event_id),
+                media_loop, label=f"LPR event {event_id}", what="Event-mode recording persist",
+            )
         media_owner = _analytics_media_owner(camera_number, event_id, moment, event_start)
         event_media_sharing.link(plate_event, media_owner)
         append_analytics_event(plate_event)
@@ -41189,14 +41249,11 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             _schedule_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url, event_start)
         elif media_owner:
             event_media_sharing.attach_child(media_owner, event_id, camera_number)
-        if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    _backfill_ai_event_linked_recording(camera_number, [event_id], moment),
-                    _ai_event_media_loop,
-                )
-            except RuntimeError as error:
-                print(f"LPR event {event_id}: could not schedule linked_recording backfill: {error}")
+        if in_event_mode:
+            submit_event_media_threadsafe(
+                _backfill_ai_event_linked_recording(camera_number, [event_id], moment),
+                media_loop, label=f"LPR event {event_id}", what="linked_recording backfill",
+            )
         events.append(plate_event)
     return events
 
@@ -41495,12 +41552,18 @@ async def people_counting_worker(camera_number: int) -> None:
                         # asyncio.create_task() is correct here, no cross-
                         # thread scheduling needed.
                         event_ids = []
-                        if _local_recording_settings(camera_number)["mode"] == "event":
-                            asyncio.create_task(
+                        # Codex R1 re-review: resolved once per batch; neither the lookup nor scheduling can skip the
+                        # crossing rows or the counter-state save below after the counter has advanced.
+                        recording_trigger = uuid.uuid4().hex[:12]
+                        in_event_mode = event_recording_mode(camera_number, source="people_counting",
+                                                             trigger_id=recording_trigger) == "event"
+                        if in_event_mode:
+                            schedule_event_media_task(
                                 persist_event_recording(
                                     camera_number, now, now,
-                                    detector="people_counting", trigger_id=uuid.uuid4().hex[:12],
-                                )
+                                    detector="people_counting", trigger_id=recording_trigger,
+                                ),
+                                label=f"Camera {camera_number} People Counting", what="Event-mode recording persist",
                             )
                         # Resolved once per batch and off the event loop
                         # (2026-09-24): linked_recording_for() runs real
@@ -41539,8 +41602,11 @@ async def people_counting_worker(camera_number: int) -> None:
                             elif media_owner:
                                 event_media_sharing.attach_child(media_owner, record["id"], camera_number)
                             event_ids.append(record["id"])
-                        if event_ids and _local_recording_settings(camera_number)["mode"] == "event":
-                            asyncio.create_task(_backfill_ai_event_linked_recording(camera_number, event_ids, now))
+                        if event_ids and in_event_mode:
+                            schedule_event_media_task(
+                                _backfill_ai_event_linked_recording(camera_number, event_ids, now),
+                                label=f"Camera {camera_number} People Counting", what="linked_recording backfill",
+                            )
                         await asyncio.to_thread(_people_counting_state_save, camera_number, counter)
             else:
                 # Not (or no longer) entitled+configured -- drop any

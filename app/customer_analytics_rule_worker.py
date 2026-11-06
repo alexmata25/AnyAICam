@@ -396,22 +396,33 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
                             # asyncio.create_task() in main.py's own startup
                             # wiring), so a plain asyncio.create_task() here is
                             # correct, no cross-thread scheduling needed.
-                            from main import _local_recording_settings, persist_event_recording, _backfill_ai_event_linked_recording
+                            # Codex R1 re-review (2026-11-06): neither the mode lookup nor scheduling the recording or
+                            # its backfill can skip persisting the fired rule events or the alarm talk-down after rule
+                            # evaluation has advanced (main.event_recording_mode / schedule_event_media_task).
+                            from main import (_backfill_ai_event_linked_recording, event_recording_mode,
+                                              persist_event_recording, schedule_event_media_task)
 
-                            in_event_mode = _local_recording_settings(camera_number)["mode"] == "event"
+                            recording_trigger = uuid.uuid4().hex[:12]
+                            in_event_mode = event_recording_mode(camera_number, source="customer_analytics_rule",
+                                                                 trigger_id=recording_trigger) == "event"
+                            label = f"Camera {camera_number} customer analytics rule"
                             if in_event_mode:
-                                asyncio.create_task(
+                                schedule_event_media_task(
                                     persist_event_recording(
                                         camera_number, now, now,
-                                        detector="customer_analytics_rule", trigger_id=uuid.uuid4().hex[:12],
-                                    )
+                                        detector="customer_analytics_rule", trigger_id=recording_trigger,
+                                    ),
+                                    label=label, what="Event-mode recording persist",
                                 )
                             event_ids = [
                                 persist_rule_event(camera_number, event, now, thumbnail_url)["id"]
                                 for event in fired
                             ]
                             if in_event_mode and event_ids:
-                                asyncio.create_task(_backfill_ai_event_linked_recording(camera_number, event_ids, now))
+                                schedule_event_media_task(
+                                    _backfill_ai_event_linked_recording(camera_number, event_ids, now),
+                                    label=label, what="linked_recording backfill",
+                                )
                             speak_alarm_talkdowns(camera_id, fired, event_ids)
         except asyncio.CancelledError:
             raise
