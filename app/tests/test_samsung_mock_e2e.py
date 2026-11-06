@@ -2,8 +2,9 @@
 chain works through the SAME real APIs a real appliance and a real
 admin browser would use -- no test-only direct-database shortcuts for
 any of the actual business actions (bootstrap, granting, onboarding,
-activation, manifest fetch, delegated login, revocation, heartbeat
-reconciliation). Session tokens are minted via partner_portal._token()/
+activation, manifest fetch, portal login, revocation, heartbeat
+reconciliation). On Windows 1.3.4.1 the Administrator selection is refused
+on the claimed appliance (owner policy R-2); the Partner selection works. Session tokens are minted via partner_portal._token()/
 main.create_session() only to *establish* an already-authenticated
 caller for the next real API call -- the same scaffolding technique
 used throughout this session's other integration tests, never a
@@ -60,6 +61,12 @@ def env(tmp_path, monkeypatch):
         monkeypatch.setattr(pricing_config, "load_pricing", lambda: percentage_config)
         appliance_identity.reset_cloud_identity_backend_for_tests()
         with TestClient(main.app) as test_client:
+            # Windows 1.3.4.1: as the comment above says, these are for the db init only. Left set, the edge
+            # default_users() seeds the LOCAL users.json administrator from the same email and password, so the
+            # operator would hold a local identity too and step 7 would test the legacy/partner selector
+            # (PORTAL-LOGIN-SELECTOR-FOR-CODEX-20261106.md) instead of cloud credentials alone.
+            monkeypatch.delenv("ANYAICAM_ADMIN_EMAIL", raising=False)
+            monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
             yield test_client, db_path
     appliance_identity.reset_cloud_identity_backend_for_tests()
     monkeypatch.delenv("ANYAICAM_ADMIN_EMAIL", raising=False)
@@ -171,22 +178,41 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     verify_manifest(manifest, expected_cloud_id=cloud_id, public_keys=keys)  # does not raise -- real Ed25519 verification
     pre_revoke_manifest_version = manifest["manifest_version"]
 
-    # ---- Step 7/8: amata@anyaicam.com signs in through the blue Portal login, selecting Administrator ----
+    # ---- Step 7/8: amata@anyaicam.com tries the blue Portal login, selecting Administrator ----
+    # Windows 1.3.4.1 owner policy R-2 (approved 2026-10-29, test_windows_1341_r2_claimed_appliance_admin_policy.py):
+    # on a CLAIMED appliance, cloud credentials alone never grant administration -- not even with the live global
+    # Administrator grant from step 2. Until the appliance-local grant + MFA path exists, the sign-in is refused, mints
+    # no session of either kind, opens no MFA challenge, and the Admin Portal stays closed.
+    def _sessions(role):
+        with _db(db_path):
+            with connection() as db:
+                return [row["id"] for row in db.execute(
+                    "SELECT id FROM user_sessions WHERE lower(email)=? AND role=? ORDER BY created_at ASC", (OPERATOR_EMAIL, role))]
+
+    def _pending_mfa():
+        with _db(db_path):
+            with connection() as db:
+                return db.execute("SELECT COUNT(*) AS n FROM pending_mfa_logins WHERE lower(email)=?", (OPERATOR_EMAIL,)).fetchone()["n"]
+
+    # Cloud credentials ALONE: the operator has no local users.json identity on this appliance.
+    assert not any(u.get("email", "").lower() == OPERATOR_EMAIL for u in main.load_users())
+    admin_sessions_before = _sessions("administrator")  # step 3's scaffolding session only
+    pending_mfa_before = _pending_mfa()
     admin_login = client.post(
         "/api/portal-login",
         json={"email": OPERATOR_EMAIL, "password": OPERATOR_PASSWORD, "portal": "administrator"},
         follow_redirects=False,
     )
-    assert admin_login.status_code == 303
-    assert admin_login.headers["location"] == "/admin-portal"  # the fix under test -- not /partner?tab=customers
-    assert partner_portal.SESSION_COOKIE in admin_login.cookies
-    admin_session_cookie = admin_login.cookies[partner_portal.SESSION_COOKIE]
+    assert admin_login.status_code == 403, admin_login.text[:200]
+    assert partner_portal.SESSION_COOKIE not in admin_login.cookies
+    assert main.SESSION_COOKIE_NAME not in admin_login.cookies
+    assert _sessions("administrator") == admin_sessions_before
+    assert _pending_mfa() == pending_mfa_before
 
-    # The Admin Portal itself must accept this cloud-delegated session --
-    # cloud_administrator_bridge()/current_user() re-verifying the live
-    # global grant, not just routing/destination.
-    admin_portal_page = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie})
-    assert admin_portal_page.status_code == 200
+    # Nothing from the refused sign-in opens the Admin Portal (the client holds no cookie from it).
+    client.cookies.clear()
+    refused_portal = client.get("/admin-portal", follow_redirects=False)
+    assert not (refused_portal.status_code == 200 and '<p class="eyebrow">Access control</p>' not in refused_portal.text)
 
     # ---- "no local duplicate account is created" ----
     assert not any(u.get("email", "").lower() == OPERATOR_EMAIL for u in main.load_users())
@@ -201,22 +227,17 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     assert partner_login.headers["location"] == "/partner?tab=customers"
     partner_session_cookie = partner_login.cookies[partner_portal.SESSION_COOKIE]
 
-    with _db(db_path):
-        with connection() as db:
-            sessions = db.execute("SELECT id,role FROM user_sessions WHERE email=? ORDER BY created_at ASC", (OPERATOR_EMAIL,)).fetchall()
-    roles_seen = {row["role"] for row in sessions}
-    assert roles_seen == {"administrator", "partner_owner"}
-    # The Administrator session is the one the sign-in above created (step 3's scaffolding session is a separate,
-    # earlier administrator row since 1.2.7.1, so "first administrator row" would no longer name it).
     from authz_helpers import session_row
-    admin_session_id = session_row(admin_session_cookie)["id"]
-    partner_session_id = next(row["id"] for row in sessions if row["role"] == "partner_owner")
+    partner_session_id = session_row(partner_session_cookie)["id"]
+    assert _sessions("partner_owner") == [partner_session_id]
+    # The only Administrator session row is still step 3's scaffolding one: the refused sign-in added none.
+    assert _sessions("administrator") == admin_sessions_before
 
     # ---- Step 10: revoke the Partner grant ----
     revoke = client.post(f"/api/operations/identity-grants/{partner_grant_id}/revoke", cookies={partner_portal.SESSION_COOKIE: admin_token})
     assert revoke.status_code == 200
 
-    # ---- Step 11: next heartbeat invalidates Partner authorization while Administrator remains valid ----
+    # ---- Step 11: next heartbeat invalidates Partner authorization; the Administrator GRANT is untouched ----
     heartbeat = client.post(
         "/api/appliance/heartbeat",
         json={"uptime_seconds": 5000, "cpu": 5, "memory": 10, "camera_count": 5, "cached_manifest_version": pre_revoke_manifest_version},
@@ -229,21 +250,24 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     with _db(db_path):
         with connection() as db:
             partner_session_row = db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (partner_session_id,)).fetchone()
-            admin_session_row = db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (admin_session_id,)).fetchone()
+            scaffold_admin_rows = [db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (sid,)).fetchone()
+                                   for sid in admin_sessions_before]
+            admin_grant_rows = db.execute(
+                "SELECT revoked_at FROM identity_grants WHERE user_id=? AND role='administrator'", (operator_user_id,)).fetchall()
     assert partner_session_row["revoked_at"] is not None  # Partner authorization invalidated
     # 1.2.7.1 (D-AUTHZ-1 residual, appliance_identity.bump_authorization_version): any grant revoke moves the account's
-    # authorization_version and ends EVERY open session it holds at once, the Administrator one included.
-    assert admin_session_row["revoked_at"] is not None
-    assert client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie},
-                      follow_redirects=False).status_code != 200
+    # authorization_version and ends EVERY open session it holds at once -- here step 3's Administrator session.
+    assert scaffold_admin_rows and all(row["revoked_at"] is not None for row in scaffold_admin_rows)
+    assert admin_grant_rows and all(row["revoked_at"] is None for row in admin_grant_rows)  # Administrator grant kept
 
-    # The Administrator GRANT is untouched by the Partner-only revocation: a fresh sign-in still reaches the real
-    # Admin Portal.
+    # R-2 still holds after the revocation: the kept Administrator grant does not turn cloud credentials into
+    # claimed-appliance administration -- a fresh sign-in is refused the same way and mints no session.
     admin_again = client.post(
         "/api/portal-login",
         json={"email": OPERATOR_EMAIL, "password": OPERATOR_PASSWORD, "portal": "administrator"},
         follow_redirects=False,
     )
-    assert admin_again.status_code == 303 and admin_again.headers["location"] == "/admin-portal"
-    still_works = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_again.cookies[partner_portal.SESSION_COOKIE]})
-    assert still_works.status_code == 200
+    assert admin_again.status_code == 403, admin_again.text[:200]
+    assert partner_portal.SESSION_COOKIE not in admin_again.cookies
+    assert main.SESSION_COOKIE_NAME not in admin_again.cookies
+    assert _sessions("administrator") == admin_sessions_before
