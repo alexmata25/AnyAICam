@@ -10022,11 +10022,12 @@ class SessionStoreUnreadable(RuntimeError):
 
 def _read_sessions_file() -> dict | None:
     """sessions.json as a dict, {} when there is no file, None when its content is not a JSON object.
-    An I/O error raises SessionStoreUnreadable."""
-    if not SESSIONS_FILE.exists():
-        return {}
+    Any other I/O error raises SessionStoreUnreadable -- including one from finding out whether the file exists (P3 N2:
+    Path.exists() lets a PermissionError from a broken ACL escape as a bare OSError), so there is no separate check."""
     try:
         raw = SESSIONS_FILE.read_bytes()
+    except FileNotFoundError:
+        return {}
     except OSError as error:
         raise SessionStoreUnreadable(f"sessions.json could not be read: {type(error).__name__}") from error
     try:
@@ -10041,10 +10042,12 @@ def _load_sessions_for_update() -> dict:
     could not read. An I/O error raises SessionStoreUnreadable, so the write is refused and the file is left as it is.
     Damaged content (not a JSON object) is moved aside, kept, logged and audited, and only then does the store start
     empty: sessions in such a file can never sign anyone in (load_sessions reads it as empty), so this keeps the
-    fail-closed outcome without refusing every later sign-in."""
+    fail-closed outcome without refusing every later sign-in. The session epoch is advanced before the move, so the
+    kept file's sessions stay refused even if it is repaired and put back."""
     data = _read_sessions_file()
     if data is not None:
         return data
+    _advance_session_epoch("damaged_sessions_json")
     kept = SESSIONS_FILE.with_name(f"{SESSIONS_FILE.name}.unreadable-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}")
     try:
         SESSIONS_FILE.replace(kept)
@@ -10055,6 +10058,54 @@ def _load_sessions_for_update() -> dict:
     auth_audit("sessions.store_unreadable", actor_role="system", reason="damaged_sessions_json", entity_type="sessions_json",
                details={"kept_as": kept.name})
     return {}
+
+
+# Session epoch (P3 N1-A, owner 2026-11-06). Each session records the epoch it was created in, and authenticated_user
+# accepts a session only from the current epoch. A new random epoch is written to sessions_epoch.json (beside
+# sessions.json) whenever a damaged sessions.json is moved aside, before the move, so a kept file -- or any copy of
+# sessions.json from before that moment -- can never sign anyone in again, even after it is repaired and put back. A
+# store that has never been quarantined has no epoch file and its sessions carry none, so an upgrade signs nobody out.
+# All of this runs under _SESSIONS_FILE_LOCK.
+def _session_epoch_file() -> Path:
+    return SESSIONS_FILE.with_name("sessions_epoch.json")
+
+
+def _advance_session_epoch(reason: str) -> str:
+    epoch = secrets.token_hex(16)
+    try:
+        _write_json_atomically(_session_epoch_file(), {"epoch": epoch, "started_at": datetime.now().isoformat(), "reason": reason})
+    except OSError as error:
+        raise SessionStoreUnreadable(f"sessions_epoch.json could not be written: {type(error).__name__}") from error
+    structured_log("security.sessions_epoch_advanced", level="warning", reason=reason)
+    from admin_auth_policy import auth_audit
+    auth_audit("sessions.epoch_advanced", actor_role="system", reason=reason, entity_type="sessions_json")
+    return epoch
+
+
+def _read_session_epoch() -> str | None:
+    """The current epoch, None when there has never been one. An I/O error raises SessionStoreUnreadable. A damaged
+    epoch file is replaced by a new epoch: every earlier session is refused and people sign in again (fail closed)."""
+    try:
+        raw = _session_epoch_file().read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SessionStoreUnreadable(f"sessions_epoch.json could not be read: {type(error).__name__}") from error
+    try:
+        epoch = json.loads(raw.decode("utf-8")).get("epoch")
+    except (ValueError, AttributeError):
+        epoch = None
+    if isinstance(epoch, str) and epoch:
+        return epoch
+    return _advance_session_epoch("damaged_epoch_file")
+
+
+def _session_in_current_epoch(session: dict) -> bool:
+    with _SESSIONS_FILE_LOCK:
+        try:
+            return session.get("epoch") == _read_session_epoch()
+        except SessionStoreUnreadable:
+            return False  # the epoch cannot be checked, so no session is accepted
 
 
 @_users_file_writer
@@ -10991,11 +11042,15 @@ def create_session(user_id: str, remember_me: bool = False) -> str:
     max_age = 30 * 24 * 3600 if remember_me else SESSION_MAX_AGE_SECONDS
     with _SESSIONS_FILE_LOCK:
         sessions = _load_sessions_for_update()
-        sessions[session_id] = {
+        session = {
             "user_id": user_id,
             "created_at": datetime.now().isoformat(),
             "expires_at": (datetime.now() + timedelta(seconds=max_age)).isoformat(),
         }
+        epoch = _read_session_epoch()  # after the load, which may have started a new epoch
+        if epoch:
+            session["epoch"] = epoch
+        sessions[session_id] = session
         save_sessions(sessions)
     return session_serializer.dumps({"session_id": session_id})
 
@@ -11145,6 +11200,8 @@ def authenticated_user(request: Request) -> dict | None:
 
 
     session = load_sessions().get(session_id)
+    if session and not (isinstance(session, dict) and _session_in_current_epoch(session)):
+        session = None  # created before the last session-store quarantine (P3 N1-A): never valid again
 
 
 
@@ -125121,375 +125178,48 @@ def accept_invite_page(token: str = "") -> HTMLResponse:
 
 
 @app.post("/api/user-invites/accept")
-
-
-
-
-
-
-
-
-@_users_file_writer
 def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
-
-
-
-
-
-
-
-
     try:
-
-
-
-
-
-
-
-
         token_payload = session_serializer.loads(
-
-
-
-
-
-
-
-
             payload.token,
-
-
-
-
-
-
-
-
             salt="anyaicam-user-invite",
-
-
-
-
-
-
-
-
             max_age=7 * 24 * 3600,
-
-
-
-
-
-
-
-
         )
-
-
-
-
-
-
-
-
     except (BadSignature, SignatureExpired):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Invitation expired or invalid."}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     invite_id = token_payload.get("invite_id")
-
-
-
-
-
-
-
-
-    invites = load_user_invites()
-
-
-
-
-
-
-
-
-    invite = next(
-
-
-
-
-
-
-
-
-        (item for item in invites if item.get("id") == invite_id and item.get("status") == "pending"),
-
-
-
-
-
-
-
-
-        None,
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    if not invite:
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "Invitation is no longer available."}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    users = load_users()
-
-
-
-
-
-
-
-
-    if any(item.get("email", "").lower() == invite["email"].lower() for item in users):
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "An account already exists for this email."}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    users.append(
-
-
-
-
-
-
-
-
-        UserModel(
-
-
-
-
-
-
-
-
-            display_name=payload.display_name,
-
-
-
-
-
-
-
-
-            email=invite["email"],
-
-
-
-
-
-
-
-
-            role=invite["role"],
-
-
-
-
-
-
-
-
-            enabled=True,
-
-
-
-
-
-
-
-
-            super_admin=invite.get("super_admin", False),
-
-
-
-
-
-
-
-
-            site_ids=["home"],
-
-
-
-
-
-
-
-
-            camera_ids=[] if invite.get("all_cameras") else invite.get("camera_ids", []),
-
-
-
-
-
-
-
-
-            password_hash=hash_password(payload.password),
-
-
-
-
-
-
-
-
-            invitation_status="active",
-
-
-
-
-
-
-
-
-        ).model_dump(mode="json")
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    save_users(users)
-
-
-
-
-
-
-
-
-    invite["status"] = "accepted"
-
-
-
-
-
-
-
-
-    invite["accepted_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    save_user_invites(invites)
-
-
-
-
-
-
-
-
+    # P3 N3-A (owner 2026-11-06): the bcrypt hash (about 0.25 s) is computed before the users.json lock is taken, so
+    # the lock is held only from read to save. Every request's authentication reads users.json under the same lock on
+    # the event-loop thread, so a hash inside it stalled the whole server.
+    password_hash = hash_password(payload.password)
+    with _USERS_FILE_LOCK:
+        invites = load_user_invites()
+        invite = next(
+            (item for item in invites if item.get("id") == invite_id and item.get("status") == "pending"),
+            None,
+        )
+        if not invite:
+            return {"status": "error", "message": "Invitation is no longer available."}
+        users = load_users()
+        if any(item.get("email", "").lower() == invite["email"].lower() for item in users):
+            return {"status": "error", "message": "An account already exists for this email."}
+        users.append(
+            UserModel(
+                display_name=payload.display_name,
+                email=invite["email"],
+                role=invite["role"],
+                enabled=True,
+                super_admin=invite.get("super_admin", False),
+                site_ids=["home"],
+                camera_ids=[] if invite.get("all_cameras") else invite.get("camera_ids", []),
+                password_hash=password_hash,
+                invitation_status="active",
+            ).model_dump(mode="json")
+        )
+        save_users(users)
+        invite["status"] = "accepted"
+        invite["accepted_at"] = datetime.now().isoformat()
+        save_user_invites(invites)
     return {"status": "complete", "message": "Account created. You can now sign in."}
 
 
@@ -126284,303 +126014,43 @@ def users_api(request: Request) -> dict:
 
 
 @app.post("/api/users")
-
-
-
-
-
-
-
-
-@_users_file_writer
 def create_user(request: Request, new_user: UserCreateModel) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         record_audit(request, "create", "user", "Permission denied", "denied")
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
     if new_user.role not in VALID_ROLES:
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Unsupported role."}
-
-
-
-
-
-
-
-
-    users = load_users()
-
-
-
-
-
-
-
-
-    if any(
-
-
-
-
-
-
-
-
-        item.get("email", "").lower() == new_user.email.lower()
-
-
-
-
-
-
-
-
-        and new_user.email
-
-
-
-
-
-
-
-
-        for item in users
-
-
-
-
-
-
-
-
-    ):
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "That email is already in use."}
-
-
-
-
-
-
-
-
-    payload = UserModel(
-
-
-
-
-
-
-
-
-        display_name=new_user.display_name,
-
-
-
-
-
-
-
-
-        email=new_user.email.strip().lower(),
-
-
-
-
-
-
-
-
-        role=new_user.role,
-
-
-
-
-
-
-
-
-        enabled=new_user.enabled,
-
-
-
-
-
-
-
-
-        super_admin=new_user.super_admin,
-
-
-
-
-
-
-
-
-        site_ids=new_user.site_ids,
-
-
-
-
-
-
-
-
-        camera_ids=new_user.camera_ids,
-
-
-
-
-
-
-
-
-        password_hash=hash_password(new_user.password),
-
-
-
-
-
-
-
-
-    ).model_dump(mode="json")
-
-
-
-
-
-
-
-
-    users.append(payload)
-
-
-
-
-
-
-
-
-    save_users(users)
-
-
-
-
-
-
-
-
-    record_audit(
-
-
-
-
-
-
-
-
-        request,
-
-
-
-
-
-
-
-
-        "create",
-
-
-
-
-
-
-
-
-        f"user:{payload['id']}",
-
-
-
-
-
-
-
-
-        f"Created {new_user.display_name} with role {new_user.role}.",
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
+    # P3 N3-A (owner 2026-11-06): the bcrypt hash (about 0.25 s) is computed before the users.json lock is taken, so
+    # the lock is held only from read to save. Every request's authentication reads users.json under the same lock on
+    # the event-loop thread, so a hash inside it stalled the whole server.
+    password_hash = hash_password(new_user.password)
+    with _USERS_FILE_LOCK:
+        users = load_users()
+        if any(
+            item.get("email", "").lower() == new_user.email.lower()
+            and new_user.email
+            for item in users
+        ):
+            return {"status": "error", "message": "That email is already in use."}
+        payload = UserModel(
+            display_name=new_user.display_name,
+            email=new_user.email.strip().lower(),
+            role=new_user.role,
+            enabled=new_user.enabled,
+            super_admin=new_user.super_admin,
+            site_ids=new_user.site_ids,
+            camera_ids=new_user.camera_ids,
+            password_hash=password_hash,
+        ).model_dump(mode="json")
+        users.append(payload)
+        save_users(users)
+        record_audit(
+            request,
+            "create",
+            f"user:{payload['id']}",
+            f"Created {new_user.display_name} with role {new_user.role}.",
+        )
     return {"status": "complete", "message": "User created.", "user": {key: value for key, value in payload.items() if key != "password_hash"}}
 
 
@@ -126874,177 +126344,29 @@ def update_user(request: Request, user_id: str, update: UserUpdateModel) -> dict
 
 
 @app.put("/api/users/{user_id}/password")
-
-
-
-
-
-
-
-
-@_users_file_writer
 def change_user_password(
-
-
-
-
-
-
-
-
     request: Request,
-
-
-
-
-
-
-
-
     user_id: str,
-
-
-
-
-
-
-
-
     change: PasswordChangeModel,
-
-
-
-
-
-
-
-
 ) -> dict:
-
-
-
-
-
-
-
-
     actor = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(actor, "manage_users"):
-
-
-
-
-
-
-
-
         record_audit(request, "update_password", f"user:{user_id}", "Permission denied", "denied")
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
-    users = load_users()
-
-
-
-
-
-
-
-
-    target = next((item for item in users if item.get("id") == user_id), None)
-
-
-
-
-
-
-
-
-    if not target:
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "User not found."}
-
-
-
-
-
-
-
-
-    target["password_hash"] = hash_password(change.password)
-
-
-
-
-
-
-
-
-    target["failed_login_attempts"] = 0
-
-
-
-
-
-
-
-
-    target["locked_until"] = None
-
-
-
-
-
-
-
-
-    save_users(users)
-
-
-
-
-
-
-
-
-    record_audit(request, "update_password", f"user:{user_id}", "Password reset by administrator.")
-
-
-
-
-
-
-
-
+    # P3 N3-A (owner 2026-11-06): the bcrypt hash (about 0.25 s) is computed before the users.json lock is taken, so
+    # the lock is held only from read to save. Every request's authentication reads users.json under the same lock on
+    # the event-loop thread, so a hash inside it stalled the whole server.
+    password_hash = hash_password(change.password)
+    with _USERS_FILE_LOCK:
+        users = load_users()
+        target = next((item for item in users if item.get("id") == user_id), None)
+        if not target:
+            return {"status": "error", "message": "User not found."}
+        target["password_hash"] = password_hash
+        target["failed_login_attempts"] = 0
+        target["locked_until"] = None
+        save_users(users)
+        record_audit(request, "update_password", f"user:{user_id}", "Password reset by administrator.")
     return {"status": "complete", "message": "Password updated."}
 
 
