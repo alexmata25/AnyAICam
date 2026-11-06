@@ -645,24 +645,55 @@ def _accepted_trust_generation() -> int:
             return generation
         # A zero/missing generation is compatible only with the actual legacy accepted-state shape, not an arbitrary
         # object such as {} that could silently erase the anti-rollback marker.
-        legacy = (
-            data.get("schema") == 2 and
-            _bound_identity(data.get("identity")) is not None and
-            isinstance(data.get("snapshot"), dict) and
-            isinstance(data["snapshot"].get("signature"), dict) and
-            isinstance(data["snapshot"]["signature"].get("key_id"), str) and
-            isinstance(data.get("accepted_key"), str) and
-            isinstance(data.get("high_water"), dict) and
-            isinstance(data["high_water"].get("issued_at"), str) and
-            isinstance(data["high_water"].get("digest"), str) and
-            isinstance(data.get("accepted_at"), str) and
-            data.get("source") == "cloud" and
-            ("trust_generation" not in data or generation == 0)
-        )
-        return 0 if legacy else 1
+        return 0 if _legacy_accepted_shape(data) else 1
     except Exception:
         # Presence was established above whenever possible; if the check/read itself fails, do not enter legacy mode.
         return 1
+
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _legacy_accepted_shape(data: dict) -> bool:
+    """True only for an accepted record capacity_accept._state_record() could have written without a registry floor:
+    schema 2 with a bound identity, a signed snapshot, a 32-byte accepted key, a real high-water mark and acceptance
+    time from the cloud, and EITHER the historical omission of both signer and trust_generation OR both present with
+    an exact integer zero and a signer that matches the snapshot's key id and the accepted key. Codex 2026-11-06 (P2):
+    False, 0.0, a missing generation beside signer metadata, and placeholder strings are not zero. Other additive keys
+    (transition_id, ...) are tolerated: they carry no trust."""
+    if type(data.get("schema")) is not int or data["schema"] != 2 or data.get("source") != "cloud":
+        return False
+    if _bound_identity(data.get("identity")) is None:
+        return False
+    snapshot = data.get("snapshot")
+    signature = snapshot.get("signature") if isinstance(snapshot, dict) else None
+    key_id = signature.get("key_id") if isinstance(signature, dict) else None
+    if not isinstance(key_id, str) or not _KEY_ID_PATTERN.match(key_id):
+        return False
+    try:
+        accepted_key = _trust_base64.b64decode(data.get("accepted_key"), validate=True)
+    except (TypeError, ValueError):
+        return False
+    if len(accepted_key) != 32:
+        return False
+    high_water = data.get("high_water")
+    if (not isinstance(high_water, dict) or _parse_time(high_water.get("issued_at")) is None or
+            not isinstance(high_water.get("digest"), str) or not _HEX64.match(high_water["digest"])):
+        return False
+    accepted_at = data.get("accepted_at")
+    try:
+        datetime.fromisoformat(accepted_at)
+    except (TypeError, ValueError):
+        return False
+    has_signer, has_generation = "signer" in data, "trust_generation" in data
+    if not has_signer and not has_generation:
+        return True  # the historical (pre option A) record
+    if not (has_signer and has_generation):
+        return False
+    generation, signer = data["trust_generation"], data["signer"]
+    return (type(generation) is int and generation == 0 and isinstance(signer, dict) and
+            set(signer) == {"key_id", "public_key_sha256"} and signer["key_id"] == key_id and
+            signer["public_key_sha256"] == _trust_hashlib.sha256(accepted_key).hexdigest())
 
 
 def _trusted_keys() -> dict[str, str]:
@@ -903,9 +934,19 @@ _grant_cache: dict = {"at": None, "mtime": None, "trust": None, "grants": None, 
 
 
 def _trust_fingerprint() -> tuple:
-    """Changes whenever a trust file does, so a revocation never waits for the grant cache."""
+    """Changes whenever a trust file does, so a revocation never waits for the grant cache. The accepted capacity record
+    is included: it carries the rollback floor (_accepted_trust_generation), so a change to it must not leave cached
+    grants usable until the TTL runs out (Codex 2026-11-06, P2)."""
     found = []
-    for path in (TRUST_ANCHOR_FILE, TRUST_REGISTRY_FILE, TRUST_STATE_FILE):
+    try:
+        import vms_capacity
+        accepted_file = vms_capacity.ACCEPTED_FILE
+    except Exception:
+        accepted_file = None
+    for path in (TRUST_ANCHOR_FILE, TRUST_REGISTRY_FILE, TRUST_STATE_FILE, accepted_file):
+        if path is None:
+            found.append("accepted_file_unavailable")
+            continue
         try:
             info = os.lstat(path)
             # Link count is part of the identity: adding a hard link does not necessarily alter mtime, size, or inode,
