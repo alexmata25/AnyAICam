@@ -45772,6 +45772,33 @@ def portal_destination_for_user(user: dict | None) -> str:
 PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
 
 
+def _legacy_lock_time(user: dict) -> datetime | None:
+    """The users.json account's active lock, read exactly as POST /login reads it (an unparsable value is no lock)."""
+    locked_until = user.get("locked_until")
+    if not locked_until:
+        return None
+    try:
+        lock_time = datetime.fromisoformat(locked_until)
+    except (TypeError, ValueError):
+        return None
+    return lock_time if lock_time > datetime.now() else None
+
+
+def _record_legacy_login_failure(users: list[dict], user: dict) -> None:
+    """A wrong users.json password at /api/portal-login, counted exactly as POST /login counts one."""
+    user["failed_login_attempts"] = int(user.get("failed_login_attempts", 0)) + 1
+    if user["failed_login_attempts"] >= MAX_LOGIN_ATTEMPTS:
+        user["locked_until"] = (datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
+        user["failed_login_attempts"] = 0
+    save_users(users)
+    append_audit_entry(AuditEntryModel(
+        user_id=user.get("id", "unknown"), user_name=user.get("display_name", user.get("email", "")),
+        role=user.get("role", "unknown"), action="login", resource="session",
+        detail="Invalid password (local account; entry point: blue portal login).", device="Web browser",
+        outcome="denied",
+    ).model_dump(mode="json"))
+
+
 def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None, partner_administrator_scope: str | None = None, cloud_profile: bool = False) -> dict:
     """Pure decision for POST /api/portal-login -- the blue Portal login
     page's own selector (Administrator/Partner/Technician), added
@@ -45828,11 +45855,14 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
         available.append("technician")
 
     def _for_administrator() -> dict:
+        # Owner 2026-10-28: on an appliance the b8 selection stays -- the local (legacy) administrator wins when
+        # both validate (E-1/E-2 local emergency sign-in). On the cloud legacy_role was cleared above, so the
+        # partner administrator is the only candidate there.
+        if not cloud_profile and legacy_role in ADMIN_PORTAL_ROLES:
+            return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
         if partner_role == "administrator":
             destination = "/admin-portal" if partner_administrator_scope == "global" else "/partner?tab=customers"
             return {"system": "partner", "role": "administrator", "destination": destination}
-        if legacy_role in ADMIN_PORTAL_ROLES:
-            return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
         return {"system": None, "role": None, "destination": None}
 
     from customer_policy import role_destination  # partner_db's own role vocabulary/destinations -- portal_destination_for_user() above answers the *legacy* system's, a different mapping
@@ -45861,8 +45891,9 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
     # once collapse into the *same* "administrator" bucket entry (they're
     # still two different sessions/destinations), so len(available)==1
     # alone isn't enough to prove there's only one real identity here.
-    # 1.2.7.1: no longer ambiguous -- the partner administrator wins (L-3).
-    if len(available) == 1:
+    # Never ambiguous on the cloud (legacy_role cleared above, L-3); on an appliance the b8 rule stands.
+    administrator_ambiguous = bool(legacy_role in ADMIN_PORTAL_ROLES) and partner_role == "administrator"
+    if len(available) == 1 and not administrator_ambiguous:
         result = resolvers[available[0]]()
         result["available"] = available
         return result
@@ -48817,13 +48848,23 @@ def portal_login_submit(request: Request, payload: dict):
     legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
     legacy_role: str | None = None
     legacy_admin_on_cloud = False
+    # Codex 2026-11-06 (P1): the users.json lockout that POST /login enforces applies here too. A locked local account
+    # is never verified (and its lock fields are never cleared by a sign-in here); a wrong local password counts toward
+    # the same MAX_LOGIN_ATTEMPTS / LOCKOUT_MINUTES as /login when no other identity validated (below).
+    legacy_locked_until: datetime | None = None
+    legacy_password_failed = False
     if cloud:
         from admin_auth_policy import legacy_user_is_admin_capable
         legacy_admin_on_cloud = bool(legacy_user and legacy_user_is_admin_capable(legacy_user))
-    elif legacy_user and legacy_user.get("enabled", True) and verify_password(password, legacy_user.get("password_hash", "")):
-        candidate_role = str(legacy_user.get("role") or "").strip().lower()
-        if candidate_role in ADMIN_PORTAL_ROLES:
-            legacy_role = candidate_role
+    elif legacy_user and legacy_user.get("enabled", True):
+        legacy_locked_until = _legacy_lock_time(legacy_user)
+        if legacy_locked_until is None:
+            if verify_password(password, legacy_user.get("password_hash", "")):
+                candidate_role = str(legacy_user.get("role") or "").strip().lower()
+                if candidate_role in ADMIN_PORTAL_ROLES:
+                    legacy_role = candidate_role
+            else:
+                legacy_password_failed = True
 
     # Partner/Administrator/Technician password verification delegates to
     # the cloud-identity contract (appliance_identity.py) once this
@@ -48858,7 +48899,17 @@ def portal_login_submit(request: Request, payload: dict):
             own_appliance.get("appliance_id"), display_cloud_id(own_appliance.get("cloud_id")), RUNTIME_ROLE,
         )
         own_appliance = None
-    if own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS:
+    # Codex 2026-11-06 (P1), on an activated appliance:
+    # - no (valid) selection: the delegated contract checks one portal bucket, so without a selection a cloud identity
+    #   can't be seen at all and a dual-identity account would look local-only. Never guess (owner 2026-10-28):
+    #   refuse, with no session and no cloud call. The local emergency /login is unchanged.
+    # - Administrator selected and the LOCAL administrator validated: that local identity wins on an appliance (owner
+    #   2026-10-28, resolve_portal_login), so the cloud is not consulted and an upstream outage can't block local
+    #   recovery. A cloud credential never reaches this shortcut: it needs the users.json password.
+    if own_appliance and selected_portal is None and not cloud:
+        raise HTTPException(status_code=403, detail="Choose Administrator, Partner or Technician from the Portal selector, or use local emergency recovery sign-in.")
+    if (own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS
+            and not (selected_portal == "administrator" and legacy_role and not cloud)):
         from appliance_identity import CloudIdentityUnavailable, ManifestError, get_cloud_identity_backend, verify_assertion
 
         backend = get_cloud_identity_backend()
@@ -48937,6 +48988,15 @@ def portal_login_submit(request: Request, payload: dict):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         partner_administrator_scope = _live_scope
 
+    # The local account's own lockout, as POST /login applies it (Codex 2026-11-06, P1): only when no other identity
+    # validated, so another system's successful sign-in never locks the local account, and a locked local account is
+    # reported as locked instead of falling through to a generic refusal.
+    if partner_role is None and selected_portal in {None, "administrator"}:
+        if legacy_locked_until is not None:
+            raise HTTPException(status_code=423, detail=f"Account locked until {legacy_locked_until.strftime('%Y-%m-%d %H:%M')}.")
+        if legacy_password_failed:
+            _record_legacy_login_failure(users, legacy_user)
+
     decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role, partner_administrator_scope=partner_administrator_scope,
                                     cloud_profile=cloud)
 
@@ -48970,7 +49030,9 @@ def portal_login_submit(request: Request, payload: dict):
         token = create_session(legacy_user["id"], False)
         append_audit_entry(AuditEntryModel(
             user_id=legacy_user["id"], user_name=legacy_user.get("display_name", email), role=legacy_user.get("role", "viewer"),
-            action="login", resource="session", detail="Signed in via the blue portal login's Administrator selector.",
+            # Labelled as the local emergency recovery sign-in it is (Codex 2026-11-06), keeping the entry point.
+            action="login", resource="session",
+            detail="Local emergency recovery sign-in (users.json); entry point: blue portal login, Administrator selector.",
             device=request.headers.get("user-agent", "Web browser")[:160], outcome="success",
         ).model_dump(mode="json"))
         response = RedirectResponse(decision["destination"], status_code=303)
