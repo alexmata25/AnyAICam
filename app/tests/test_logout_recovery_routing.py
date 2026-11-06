@@ -43,7 +43,14 @@ def test_customer_logout_never_lands_on_the_recovery_sign_in(http_client, db_pat
     # The same click again (double click, second tab, back button): the
     # session is already gone, and it still must not reach /login.
     again = http_client.post(path, cookies={partner_portal.SESSION_COOKIE: token}, headers=_csrf_headers(http_client))
-    assert again.status_code == 303 and again.headers["location"] == "/customer-login.html"
+    # Linux 1.2.7.1: sign-out reads the signed cookie's own claims
+    # (partner_portal._raw_identity) so a session that no longer authorizes
+    # anything -- e.g. the L-2(a) enrollment-only session, which may call only
+    # enroll/confirm "and logout" (GREEN-MFA-ACCEPTANCE-SPEC.md §2 L-2, §5 S-3) --
+    # is still revoked by its holder. A repeated customer sign-out therefore
+    # still resolves to the customer sign-out landing (signed_out=1); never /login.
+    assert again.status_code == 303 and again.headers["location"] == main.CUSTOMER_LOGOUT_DESTINATION
+    assert not again.headers["location"].startswith("/login")
     customer_login = http_client.get("/customer-login.html")
     assert customer_login.status_code == 200 and RECOVERY not in customer_login.text
 
@@ -95,7 +102,11 @@ def test_an_expired_session_cookie_is_treated_as_signed_out_not_sent_to_recovery
     page = http_client.get("/customer-account", cookies={partner_portal.SESSION_COOKIE: token})
     assert page.status_code == 303 and page.headers["location"].startswith("/customer-login.html")
     logout = http_client.post("/partner-logout", cookies={partner_portal.SESSION_COOKIE: token})
-    assert logout.status_code == 303 and logout.headers["location"] == "/customer-login.html"
+    # Linux 1.2.7.1 (spec §2 L-2(a) "and logout", §5 S-3): sign-out uses the signed
+    # cookie's own claims, so the expired customer session is routed to the customer
+    # sign-out landing -- still the customer sign-in page, never /login.
+    assert logout.status_code == 303 and logout.headers["location"] == main.CUSTOMER_LOGOUT_DESTINATION
+    assert logout.headers["location"].startswith("/customer-login.html")
 
 
 @pytest.mark.parametrize("path", ["/partner-logout", "/logout"])
