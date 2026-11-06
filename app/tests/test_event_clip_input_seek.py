@@ -31,12 +31,18 @@ def _profile(width, height):
     return video_profile.build({"streams": [{"uri": "rtsp://cam/main", "role": "main", "width": width, "height": height, "codec": "H265"}]})
 
 
+def _native(posix_path):
+    """How clip_encode renders a path in a command: str(Path), the host's own form (backslashes on Windows). The
+    command-shape tests compare against that, so they check the command shape on every host, not the separator."""
+    return str(Path(posix_path))
+
+
 # ---------------------------------------------------------------- command shape
 
 def test_single_covering_file_is_read_directly_with_input_seek():
     cmd = clip_encode.event_clip_command([Path("/r/camera1_a.mkv")], Path("/c/.e.txt"), 47.25, 10.0, Path("/c/.e.mp4"),
                                          _profile(3840, 2160), mode="optimized", scale="profile", threads=2)
-    assert cmd.index("-ss") < cmd.index("-i") and cmd[cmd.index("-i") + 1] == "/r/camera1_a.mkv"
+    assert cmd.index("-ss") < cmd.index("-i") and cmd[cmd.index("-i") + 1] == _native("/r/camera1_a.mkv")
     assert "concat" not in cmd
     assert cmd[cmd.index("-ss") + 1] == "47.250" and cmd[cmd.index("-t") + 1] == "10.000"
     vf = cmd[cmd.index("-vf") + 1]
@@ -44,24 +50,24 @@ def test_single_covering_file_is_read_directly_with_input_seek():
     assert cmd[cmd.index("-c:v") + 1] == "libx264" and "+faststart" in cmd
     assert cmd.count("-threads") == 2 and cmd[cmd.index("-threads") + 1] == "2"   # decoder and encoder
     assert cmd[cmd.index("-maxrate") + 1] == f"{_profile(3840, 2160).clip_max_kbps}k"
-    assert cmd[-1] == "/c/.e.mp4"
+    assert cmd[-1] == _native("/c/.e.mp4")
 
 
 def test_multi_file_window_uses_concat_with_input_seek():
     cmd = clip_encode.event_clip_command([Path("/r/a.mkv"), Path("/r/b.mkv")], Path("/c/.e.txt"), 295.0, 10.0,
                                          Path("/c/.e.mp4"), _profile(2592, 1944), mode="optimized", scale="profile", threads=2)
     assert cmd.index("-f") < cmd.index("-ss") < cmd.index("-i")
-    assert cmd[cmd.index("-i") + 1] == "/c/.e.txt" and "concat" in cmd
+    assert cmd[cmd.index("-i") + 1] == _native("/c/.e.txt") and "concat" in cmd
 
 
 def test_legacy_mode_is_the_previous_command_exactly():
-    old = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "/c/.e.txt", "-ss", "12.5", "-t", "10.0",
+    old = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", _native("/c/.e.txt"), "-ss", "12.5", "-t", "10.0",
            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "96k",
-           "-movflags", "+faststart", "/c/.e.mp4"]
+           "-movflags", "+faststart", _native("/c/.e.mp4")]
     assert clip_encode.event_clip_command([Path("/r/a.mkv")], Path("/c/.e.txt"), 12.5, 10.0, Path("/c/.e.mp4"),
                                           _profile(3840, 2160), mode="legacy") == old
-    old_manual = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "/c/.j.txt", "-ss", "3", "-t", "60.0", "-an",
-                  "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart", "/c/out.mp4"]
+    old_manual = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", _native("/c/.j.txt"), "-ss", "3", "-t", "60.0", "-an",
+                  "-c:v", "libx264", "-preset", "veryfast", "-movflags", "+faststart", _native("/c/out.mp4")]
     assert clip_encode.manual_clip_command([Path("/r/a.mkv")], Path("/c/.j.txt"), 3, 60.0, Path("/c/out.mp4"),
                                            None, mode="legacy") == old_manual
 
