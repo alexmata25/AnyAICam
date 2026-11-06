@@ -6,7 +6,18 @@ compared against authorization_version and stays signed in."""
 from database_backend import override_target
 from partner_db import connection
 
-from test_admin_access_lockout import ADMIN_PASSWORD, _login, _seed_admin, client, db_path  # noqa: F401 (fixtures)
+from test_admin_access_lockout import ADMIN_EMAIL, ADMIN_PASSWORD, _seed_admin, client, db_path  # noqa: F401 (fixtures)
+
+
+def _sign_in_admin(client, db_path):
+    """Windows 1.3.4.1 (13415ef): /api/partner-login refuses administrators on
+    every profile, so the administrator holds a real, MFA-verified session, as
+    the Admin Portal sign-in creates it (D-AUTHZ-2b / ce0c768)."""
+    import partner_portal
+    from authz_helpers import partner_session_cookie
+    with override_target(sqlite_path=str(db_path)):
+        token = partner_session_cookie(ADMIN_EMAIL, "administrator", mfa_state="verified", auth_source="mfa")
+    client.cookies.set(partner_portal.SESSION_COOKIE, token)
 
 
 def _version(db_path, user_id="u-owner"):
@@ -17,7 +28,7 @@ def _version(db_path, user_id="u-owner"):
 
 def test_a_voluntary_password_change_bumps_the_authorization_version(client, db_path):
     _seed_admin(db_path)
-    _login(client)
+    _sign_in_admin(client, db_path)
     before = _version(db_path)
     ok = client.post("/api/partner/activate-account",
                      json={"password": "rotated-admin-pass-77", "current_password": ADMIN_PASSWORD, "accept_terms": True})
@@ -29,7 +40,7 @@ def test_a_voluntary_password_change_bumps_the_authorization_version(client, db_
 
 def test_a_refused_change_does_not_bump_it(client, db_path):
     _seed_admin(db_path)
-    _login(client)
+    _sign_in_admin(client, db_path)
     before = _version(db_path)
     refused = client.post("/api/partner/activate-account",
                           json={"password": "hijacker-password-99", "current_password": "wrong", "accept_terms": True})

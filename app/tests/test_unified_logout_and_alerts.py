@@ -30,6 +30,22 @@ PARTNER = partner_portal.SESSION_COOKIE
 LEGACY = main.SESSION_COOKIE_NAME
 
 
+def _customer_session(email, role, customer_id="cust-1"):
+    """Linux 1.2.7.1 (D-AUTHZ-1 residual, spec §5 S-2): a session authorizes only
+    while its user_sessions row names a live partner_users account and that
+    account's current authorization_version. _seed_partner_session() writes a
+    row with no account and no version (still fine for sign-out, which reads the
+    cookie's own claims), so the tests that need a signed-in customer PAGE use
+    a real account + bound session, as a customer sign-in creates it."""
+    from authz_helpers import make_partner_user, partner_session_cookie
+    from partner_db import connection
+    with connection() as db:
+        exists = db.execute("SELECT 1 FROM partner_users WHERE lower(email)=?", (email.lower(),)).fetchone()
+    if not exists:
+        make_partner_user(email, role, customer_id=customer_id)
+    return partner_session_cookie(email, role)
+
+
 def _cleared(response, name):
     return any(header.startswith(f"{name}=") and ("Max-Age=0" in header or "expires=" in header.lower())
                for header in response.headers.get_list("set-cookie"))
@@ -71,15 +87,13 @@ def test_a_browser_holding_both_sessions_loses_both(http_client, db_path, path):
 def test_switching_from_a_household_member_to_the_owner(http_client, db_path):
     """Friends & Family's 'switch account' and the customer Sign out both go
     through the shared sign-out; the next account starts clean."""
-    viewer = _seed_partner_session(db_path, email="maria@example.test", role="customer_viewer", customer_id="cust-1")
+    # 1.2.7.1: real accounts with bound sessions (see _customer_session).
+    viewer = _customer_session("maria@example.test", "customer_viewer")
+    assert partner_portal._identity(type("R", (), {"cookies": {PARTNER: viewer}})())["email"] == "maria@example.test"
     out = http_client.post("/partner-logout", cookies={PARTNER: viewer})
     assert out.headers["location"] == main.CUSTOMER_LOGOUT_DESTINATION
     assert http_client.get("/customer-account", cookies={PARTNER: viewer}).status_code in (303, 401, 403)
-    conn = sqlite3.connect(db_path)
-    conn.execute("INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at) "
-                 "VALUES('sess-2',NULL,'owner@example.test','customer_owner','Web browser','cookie','2026-01-01','2026-01-01','2099-01-01')")
-    conn.commit(); conn.close()
-    owner = partner_portal._token("owner@example.test", "customer_owner", None, "cust-1", "sess-2")
+    owner = _customer_session("owner@example.test", "customer_owner")
     assert partner_portal._identity(type("R", (), {"cookies": {PARTNER: owner}})())["email"] == "owner@example.test"
 
 
@@ -87,7 +101,7 @@ def test_switching_from_a_household_member_to_the_owner(http_client, db_path):
 
 @pytest.mark.parametrize("role,label", [("customer_owner", "Account owner"), ("customer_viewer", "Household member")])
 def test_the_phone_layout_has_log_out_and_shows_who_is_signed_in(http_client, db_path, role, label):
-    token = _seed_partner_session(db_path, email=f"{role}@example.test", role=role, customer_id="cust-1")
+    token = _customer_session(f"{role}@example.test", role)  # 1.2.7.1: a real bound session
     page = http_client.get("/dashboard", cookies={PARTNER: token})
     assert page.status_code == 200
     html = page.text
@@ -104,7 +118,7 @@ def test_the_phone_layout_has_log_out_and_shows_who_is_signed_in(http_client, db
 
 
 def test_signed_in_pages_are_never_cached_and_public_pages_are_unaffected(http_client, db_path):
-    token = _seed_partner_session(db_path, email="owner@example.test", role="customer_owner", customer_id="cust-1")
+    token = _customer_session("owner@example.test", "customer_owner")  # 1.2.7.1: a real bound session
     page = http_client.get("/dashboard", cookies={PARTNER: token})
     assert page.headers["cache-control"] == "private, no-store" and page.headers["cdn-cache-control"] == "no-store"
     public = http_client.get("/customer-login.html")
@@ -115,8 +129,9 @@ def test_after_log_out_back_cannot_reload_the_signed_in_page(http_client, db_pat
     """Back/Forward: the page was served no-store (never stored in history),
     the sign-out tells the browser to drop its cache, and re-requesting it
     with the old cookie is refused."""
-    token = _seed_partner_session(db_path, email="owner@example.test", role="customer_owner", customer_id="cust-1")
+    token = _customer_session("owner@example.test", "customer_owner")  # 1.2.7.1: a real bound session
     before = http_client.get("/dashboard", cookies={PARTNER: token})
+    assert before.status_code == 200
     assert "no-store" in before.headers["cache-control"]
     out = http_client.post("/logout", cookies={PARTNER: token})
     assert out.headers.get("clear-site-data") == '"cache"' and out.headers.get("cache-control") == "no-store"

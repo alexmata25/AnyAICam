@@ -31,6 +31,12 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
         self.master={"master":True,"email":"master@example.test","partner_id":None}
     def tearDown(self):
         self.client.close(); self.users_patch.stop(); self.settings_patch.stop(); self.db_override.__exit__(None,None,None); self.env_patch.stop(); self.temp.cleanup()
+    def admin_cookie(self):
+        # 1.2.7.1 (D-AUTHZ-2b): the master administrator's cookie must name a live user_sessions row bound to the
+        # account's current authorization_version (partner_portal._evaluate refuses a session-less one, 'no_session');
+        # a real, MFA-verified session with the same partner-a claim the older session-less token carried.
+        from authz_helpers import partner_session_cookie
+        return partner_session_cookie("master@example.test","administrator",partner_id="partner-a")
     def rows(self,sql,args=()):
         db=sqlite3.connect(self.db_path); db.row_factory=sqlite3.Row
         try:return [dict(x) for x in db.execute(sql,args).fetchall()]
@@ -70,13 +76,13 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
         user,reason=authenticate_detailed("new@example.test","correct-horse-battery-staple"); self.assertIsNone(user); self.assertEqual(reason,"invalid")
     def test_master_visibility_excludes_password_hash(self):
         self.pending()
-        cookie=partner_portal._token("master@example.test","administrator","partner-a",None,None)
+        cookie=self.admin_cookie()
         r=self.client.get("/api/customer-registration-requests",cookies={partner_portal.SESSION_COOKIE:cookie})
         self.assertEqual(r.status_code,200); self.assertEqual(len(r.json()["requests"]),1); self.assertNotIn("password_hash",r.json()["requests"][0])
     def test_approval_api_requires_auth_and_uses_existing_csrf_model(self):
         item=self.pending(); self.assertEqual(self.client.get("/api/customer-registration-requests").status_code,401)
         token=sign("csrf",28800); self.client.cookies.set("anyaicam_csrf",token)
-        self.client.cookies.set(partner_portal.SESSION_COOKIE,partner_portal._token("master@example.test","administrator","partner-a",None,None))
+        self.client.cookies.set(partner_portal.SESSION_COOKIE,self.admin_cookie())
         response=self.client.post(f"/api/customer-registration-requests/{item['id']}/approve",json={"partner_id":"partner-a"},headers={"X-CSRF-Token":token})
         self.assertEqual(response.status_code,200); self.assertEqual(response.json()["status"],"complete")
     def test_tenant_isolation_and_cross_tenant_denial(self):
@@ -146,7 +152,7 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
     # pending request correctly.
     def test_administrator_can_load_the_registration_requests_page(self):
         item=self.pending()
-        self.client.cookies.set(partner_portal.SESSION_COOKIE,partner_portal._token("master@example.test","administrator","partner-a",None,None))
+        self.client.cookies.set(partner_portal.SESSION_COOKIE,self.admin_cookie())
         page=self.client.get("/customer-registration-requests")
         self.assertEqual(page.status_code,200)
         self.assertIn("Registration requests",page.text)

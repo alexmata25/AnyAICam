@@ -78,10 +78,14 @@ def _legacy_admin_session():
     grants come from the cloud grant system, never from being admin@local."""
     # The acting Admin Portal session must be a live platform administrator
     # (2026-10-02); a real platform account, never the local admin@local.
-    main.save_users([{"id": "bootstrap-admin", "email": "platform-admin@anyaicam.test", "role": "administrator", "enabled": True, "camera_ids": []}])
+    # Windows 1.3.4.1 (ce0c768, 13415ef): identity grants are managed only from a
+    # real, MFA-verified Partner Portal session of that platform administrator;
+    # a legacy users.json session is refused (test_identity_grant_management.py).
+    # The returned token is a partner_portal.SESSION_COOKIE value.
+    from authz_helpers import partner_session_cookie
     from global_admin_helper import make_live_global_admin
     make_live_global_admin("platform-admin@anyaicam.test")
-    return main.create_session("bootstrap-admin")
+    return partner_session_cookie("platform-admin@anyaicam.test", "administrator", mfa_state="verified", auth_source="mfa")
 
 
 def test_full_samsung_readiness_chain_via_real_apis(env):
@@ -100,22 +104,25 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     admin_grant = client.post(
         "/api/operations/identity-grants",
         json={"email": OPERATOR_EMAIL, "role": "administrator", "scope_type": "global"},
-        cookies={main.SESSION_COOKIE_NAME: admin_token},
+        cookies={partner_portal.SESSION_COOKIE: admin_token},
     )
     assert admin_grant.status_code == 200
     partner_grant = client.post(
         "/api/operations/identity-grants",
         json={"email": OPERATOR_EMAIL, "role": "partner_owner", "scope_type": "partner", "scope_id": "anyaicam-primary"},
-        cookies={main.SESSION_COOKIE_NAME: admin_token},
+        cookies={partner_portal.SESSION_COOKIE: admin_token},
     )
     assert partner_grant.status_code == 200
     partner_grant_id = partner_grant.json()["grant_id"]
 
-    grants_list = client.get("/api/operations/identity-grants", cookies={main.SESSION_COOKIE_NAME: admin_token}).json()["grants"]
+    grants_list = client.get("/api/operations/identity-grants", cookies={partner_portal.SESSION_COOKIE: admin_token}).json()["grants"]
     assert {g["role"] for g in grants_list if g["email"] == OPERATOR_EMAIL} == {"administrator", "partner_owner"}
 
     # ---- Step 3: mock cloud creates customer/site/appliance + activation token, via the real onboarding API, authenticated as the operator's DIRECT partner_db identity ----
-    operator_direct_token = partner_portal._token(OPERATOR_EMAIL, "administrator", "anyaicam-primary", None, None)
+    # 1.2.7.1 (D-AUTHZ-2b): an administrator cookie must name a live user_sessions row bound to the account's current
+    # authorization_version (partner_portal._evaluate refuses a session-less one, 'no_session') -- a real session.
+    from authz_helpers import partner_session_cookie as _bound_session_cookie
+    operator_direct_token = _bound_session_cookie(OPERATOR_EMAIL, "administrator", partner_id="anyaicam-primary")
     onboard = client.post(
         "/api/partner/customers/onboard",
         json={
@@ -199,11 +206,14 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
             sessions = db.execute("SELECT id,role FROM user_sessions WHERE email=? ORDER BY created_at ASC", (OPERATOR_EMAIL,)).fetchall()
     roles_seen = {row["role"] for row in sessions}
     assert roles_seen == {"administrator", "partner_owner"}
-    admin_session_id = next(row["id"] for row in sessions if row["role"] == "administrator")
+    # The Administrator session is the one the sign-in above created (step 3's scaffolding session is a separate,
+    # earlier administrator row since 1.2.7.1, so "first administrator row" would no longer name it).
+    from authz_helpers import session_row
+    admin_session_id = session_row(admin_session_cookie)["id"]
     partner_session_id = next(row["id"] for row in sessions if row["role"] == "partner_owner")
 
     # ---- Step 10: revoke the Partner grant ----
-    revoke = client.post(f"/api/operations/identity-grants/{partner_grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: admin_token})
+    revoke = client.post(f"/api/operations/identity-grants/{partner_grant_id}/revoke", cookies={partner_portal.SESSION_COOKIE: admin_token})
     assert revoke.status_code == 200
 
     # ---- Step 11: next heartbeat invalidates Partner authorization while Administrator remains valid ----
@@ -221,9 +231,19 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
             partner_session_row = db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (partner_session_id,)).fetchone()
             admin_session_row = db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (admin_session_id,)).fetchone()
     assert partner_session_row["revoked_at"] is not None  # Partner authorization invalidated
-    assert admin_session_row["revoked_at"] is None         # Administrator remains valid
+    # 1.2.7.1 (D-AUTHZ-1 residual, appliance_identity.bump_authorization_version): any grant revoke moves the account's
+    # authorization_version and ends EVERY open session it holds at once, the Administrator one included.
+    assert admin_session_row["revoked_at"] is not None
+    assert client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie},
+                      follow_redirects=False).status_code != 200
 
-    # The Administrator session cookie must still work against the real
-    # Admin Portal after the Partner-only revocation.
-    still_works = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie})
+    # The Administrator GRANT is untouched by the Partner-only revocation: a fresh sign-in still reaches the real
+    # Admin Portal.
+    admin_again = client.post(
+        "/api/portal-login",
+        json={"email": OPERATOR_EMAIL, "password": OPERATOR_PASSWORD, "portal": "administrator"},
+        follow_redirects=False,
+    )
+    assert admin_again.status_code == 303 and admin_again.headers["location"] == "/admin-portal"
+    still_works = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_again.cookies[partner_portal.SESSION_COOKIE]})
     assert still_works.status_code == 200

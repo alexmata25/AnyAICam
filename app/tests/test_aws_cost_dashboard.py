@@ -16,6 +16,7 @@ import main
 import partner_portal
 from database_backend import override_target
 from partner_db import connection, initialize_database, password_hash
+from authz_helpers import partner_session_cookie
 
 
 @pytest.fixture()
@@ -87,7 +88,12 @@ def _cookies(email="owner@example.test", scope="global"):
             (user_id, "partner-cost", email, "Owner", "administrator", password_hash("test-password-123"), 1, now),
         )
         appliance_identity.create_grant(db, user_id=user_id, role="administrator", scope_type=scope, scope_id=None if scope == "global" else "partner-cost", granted_by="test")
-    return {partner_portal.SESSION_COOKIE: partner_portal._token(email, "administrator", None, None, None)}
+    # Administrator routes require a persisted, current-version, MFA-verified
+    # session. Keep this test fixture aligned with the production auth policy;
+    # a bare signed cookie is intentionally refused.
+    return {partner_portal.SESSION_COOKIE: partner_session_cookie(
+        email, "administrator", partner_id="partner-cost", mfa_state="verified"
+    )}
 
 
 def _seed_customer_and_camera(camera_count=1):
@@ -394,7 +400,7 @@ def test_active_local_plan_does_not_report_hybrid_retention_from_stale_camera_mo
     assert context == {"recording_mode": "Local", "retention_days": None}
 
 
-def test_inventory_manifest_rejects_shards_outside_inventory_data_prefix(monkeypatch):
+def test_inventory_manifest_rejects_shards_outside_inventory_data_prefix(client, monkeypatch):
     import aws_cost_snapshot_collector as collector
     monkeypatch.setenv("ANYAICAM_RECORDING_S3_BUCKET", "recordings-bucket")
     manifest_bytes = json.dumps({

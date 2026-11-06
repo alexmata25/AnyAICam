@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+import partner_portal
 from database_backend import override_target
 from partner_db import connection, initialize_database, password_hash
 
@@ -25,10 +26,14 @@ def http_client(tmp_path, monkeypatch):
 
 
 def _admin_session():
-    main.save_users([{"id": "admin-1", "email": "admin@example.test", "role": "administrator", "enabled": True, "camera_ids": []}])
+    """Windows 1.3.4.1 (ce0c768, 13415ef): identity grants are managed only by a
+    live global administrator holding a real, MFA-verified Partner Portal
+    session; a legacy users.json session no longer reaches these routes. The
+    returned token is the Partner Portal session cookie (partner_portal.SESSION_COOKIE)."""
+    from authz_helpers import partner_session_cookie
     from global_admin_helper import make_live_global_admin
     make_live_global_admin("admin@example.test")  # identity grants require a live global administrator (2026-10-02)
-    return main.create_session("admin-1")
+    return partner_session_cookie("admin@example.test", "administrator", mfa_state="verified", auth_source="mfa")
 
 
 def _viewer_session():
@@ -84,6 +89,23 @@ def test_grant_page_denies_a_non_admin_with_an_honest_page_not_a_redirect(http_c
     assert "identity grants" in response.text.lower() or "permission" in response.text.lower()
 
 
+def test_a_legacy_admin_session_cannot_create_a_grant_windows_1341(http_client):
+    """What the older fixture used: a users.json administrator session. On
+    Windows 1.3.4.1 it is refused (403) and nothing is written."""
+    client, db_path = http_client
+    _seed_operator(db_path)
+    main.save_users([{"id": "admin-1", "email": "admin@example.test", "role": "administrator", "enabled": True, "camera_ids": []}])
+    from global_admin_helper import make_live_global_admin
+    make_live_global_admin("admin@example.test")
+    legacy = main.create_session("admin-1")
+    response = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"},
+                           cookies={main.SESSION_COOKIE_NAME: legacy})
+    assert response.status_code == 403
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            assert db.execute("SELECT COUNT(*) FROM identity_grants WHERE user_id='u-op'").fetchone()[0] == 0
+
+
 # =============================================================== creating a grant
 
 
@@ -95,7 +117,7 @@ def test_admin_can_grant_an_existing_operator_administrator_access(http_client):
     response = client.post(
         "/api/operations/identity-grants",
         json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"},
-        cookies={main.SESSION_COOKIE_NAME: token},
+        cookies={partner_portal.SESSION_COOKIE: token},
     )
     assert response.status_code == 200
     assert response.json()["status"] == "granted"
@@ -112,7 +134,7 @@ def test_granting_bumps_authorization_version(http_client):
     _seed_operator(db_path)
     token = _admin_session()
 
-    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token})
+    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token})
 
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -127,7 +149,7 @@ def test_granting_an_email_with_no_existing_account_is_rejected_not_silently_cre
     response = client.post(
         "/api/operations/identity-grants",
         json={"email": "nobody@example.com", "role": "administrator", "scope_type": "global"},
-        cookies={main.SESSION_COOKIE_NAME: token},
+        cookies={partner_portal.SESSION_COOKIE: token},
     )
     assert response.status_code == 404
     with override_target(sqlite_path=str(db_path)):
@@ -143,7 +165,7 @@ def test_an_invalid_role_scope_combination_is_rejected(http_client):
     response = client.post(
         "/api/operations/identity-grants",
         json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "appliance", "scope_id": "AIC-1"},
-        cookies={main.SESSION_COOKIE_NAME: token},
+        cookies={partner_portal.SESSION_COOKIE: token},
     )
     assert response.status_code == 400
 
@@ -156,7 +178,7 @@ def test_an_unknown_role_is_rejected(http_client):
     response = client.post(
         "/api/operations/identity-grants",
         json={"email": "amata@anyaicam.com", "role": "superuser", "scope_type": "global"},
-        cookies={main.SESSION_COOKIE_NAME: token},
+        cookies={partner_portal.SESSION_COOKIE: token},
     )
     assert response.status_code == 400
 
@@ -167,7 +189,7 @@ def test_grant_creation_is_audited(http_client, tmp_path, monkeypatch):
     _seed_operator(db_path)
     token = _admin_session()
 
-    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token})
+    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token})
 
     entries = main.load_audit_entries()
     assert any(e.get("action") == "grant" and "amata@anyaicam.com" in e.get("detail", "") for e in entries)
@@ -179,9 +201,9 @@ def test_grant_revocation_is_audited(http_client, tmp_path, monkeypatch):
     _seed_operator(db_path)
     _seed_second_global_admin(db_path)
     token = _admin_session()
-    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token}).json()["grant_id"]
+    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token}).json()["grant_id"]
 
-    client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: token})
+    client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={partner_portal.SESSION_COOKIE: token})
 
     entries = main.load_audit_entries()
     assert any(e.get("action") == "revoke" and grant_id in e.get("detail", "") for e in entries)
@@ -194,9 +216,9 @@ def test_grant_list_shows_active_and_revoked_grants(http_client):
     client, db_path = http_client
     _seed_operator(db_path)
     token = _admin_session()
-    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token})
+    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token})
 
-    response = client.get("/api/operations/identity-grants", cookies={main.SESSION_COOKIE_NAME: token})
+    response = client.get("/api/operations/identity-grants", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 200
     grants = [g for g in response.json()["grants"] if g["email"] == "amata@anyaicam.com"]  # the acting admin's own grant aside
     assert len(grants) == 1
@@ -207,9 +229,9 @@ def test_grant_management_page_renders_current_grants(http_client):
     client, db_path = http_client
     _seed_operator(db_path)
     token = _admin_session()
-    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token})
+    client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token})
 
-    response = client.get("/operations/identity-grants", cookies={main.SESSION_COOKIE_NAME: token})
+    response = client.get("/operations/identity-grants", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 200
     assert "amata@anyaicam.com" in response.text
     assert "Administrator" in response.text
@@ -223,9 +245,9 @@ def test_admin_can_revoke_a_grant(http_client):
     _seed_operator(db_path)
     _seed_second_global_admin(db_path)
     token = _admin_session()
-    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token}).json()["grant_id"]
+    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token}).json()["grant_id"]
 
-    response = client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: token})
+    response = client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 200
     assert response.json()["status"] == "revoked"
 
@@ -240,9 +262,9 @@ def test_revoking_bumps_authorization_version_again(http_client):
     _seed_operator(db_path)
     _seed_second_global_admin(db_path)
     token = _admin_session()
-    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token}).json()["grant_id"]
+    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: token}).json()["grant_id"]
 
-    client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: token})
+    client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={partner_portal.SESSION_COOKIE: token})
 
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -253,7 +275,7 @@ def test_revoking_bumps_authorization_version_again(http_client):
 def test_revoking_an_unknown_grant_is_a_404(http_client):
     client, db_path = http_client
     token = _admin_session()
-    response = client.post("/api/operations/identity-grants/does-not-exist/revoke", cookies={main.SESSION_COOKIE_NAME: token})
+    response = client.post("/api/operations/identity-grants/does-not-exist/revoke", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 404
 
 
@@ -261,7 +283,7 @@ def test_revoking_requires_admin_access(http_client):
     client, db_path = http_client
     _seed_operator(db_path)
     admin_token = _admin_session()
-    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: admin_token}).json()["grant_id"]
+    grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={partner_portal.SESSION_COOKIE: admin_token}).json()["grant_id"]
 
     viewer_token = _viewer_session()
     response = client.post(f"/api/operations/identity-grants/{grant_id}/revoke", cookies={main.SESSION_COOKIE_NAME: viewer_token})
