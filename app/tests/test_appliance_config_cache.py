@@ -22,7 +22,10 @@ with override_target(sqlite_path="/tmp/test_appliance_config_cache_import.db"):
     import webrtc_publisher
     from partner_db import initialize_database
 
-CAMERA = {"id": "cam-1", "name": "Front Door", "camera_number": 1, "status": "configured", "site_id": "site-1", "recording_mode": "event"}
+# "recording_mode" is the configuration's alias of cameras.cloud_recording_mode (appliance_cloud.appliance_configuration).
+# R-REC-1 (1.2.7.1, CORRECTIVE-1.2.7.1.md): the edge keeps only 'motion' (event media) or 'disabled' and maps any other
+# value to None (recording_uploader._edge_cloud_recording_mode), so the fixture carries a real cloud value.
+CAMERA = {"id": "cam-1", "name": "Front Door", "camera_number": 1, "status": "configured", "site_id": "site-1", "recording_mode": "motion"}
 CONFIG = {
     "cameras": [CAMERA],
     "storage_policy": {"reserved_free_percent": 12, "warning_free_percent": 20, "local_retention_days": 14},
@@ -140,7 +143,7 @@ def test_readers_build_the_same_state_from_the_cache_as_from_a_fetch(monkeypatch
     cache.publish(CONFIG)
     recording_uploader._refresh_camera_map()
     identity = recording_uploader._camera_identity(1)
-    assert identity["camera_id"] == "cam-1" and identity["cloud_recording_mode"] == "event"
+    assert identity["camera_id"] == "cam-1" and identity["cloud_recording_mode"] == "motion"
 
     _counting_fetch(monkeypatch, local_storage_manager, {"cameras": []})
     assert local_storage_manager._local_storage_policy()["reserved_free_percent"] == 12
