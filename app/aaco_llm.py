@@ -360,8 +360,10 @@ class LlamaCppInterpreter:
         self._load()
         using_shared_executor = self._executor is None
         executor = self._executor if self._executor is not None else _get_process_executor()
-        future = executor.submit(self._infer_fn, self.model_path, _SYSTEM_PROMPT, text, self.max_tokens)
         try:
+            # submit() itself raises BrokenProcessPool once a crash has marked the pool broken (Codex 2026-11-06):
+            # it must reach the same recovery as a crash seen through result().
+            future = executor.submit(self._infer_fn, self.model_path, _SYSTEM_PROMPT, text, self.max_tokens)
             return future.result(timeout=self.timeout_seconds)
         except concurrent.futures.TimeoutError as error:
             raise InterpreterUnavailable(f"Local AACO language model inference exceeded the {self.timeout_seconds}s timeout.") from error
