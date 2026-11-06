@@ -61,6 +61,12 @@ def env(tmp_path, monkeypatch):
         monkeypatch.setattr(pricing_config, "load_pricing", lambda: percentage_config)
         appliance_identity.reset_cloud_identity_backend_for_tests()
         with TestClient(main.app) as test_client:
+            # Windows 1.3.4.1: as the comment above says, these are for the db init only. Left set, the edge
+            # default_users() seeds the LOCAL users.json administrator from the same email and password, so the
+            # operator would hold a local identity too and step 7 would test the legacy/partner selector
+            # (PORTAL-LOGIN-SELECTOR-FOR-CODEX-20261106.md) instead of cloud credentials alone.
+            monkeypatch.delenv("ANYAICAM_ADMIN_EMAIL", raising=False)
+            monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
             yield test_client, db_path
     appliance_identity.reset_cloud_identity_backend_for_tests()
     monkeypatch.delenv("ANYAICAM_ADMIN_EMAIL", raising=False)
@@ -188,6 +194,8 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
             with connection() as db:
                 return db.execute("SELECT COUNT(*) AS n FROM pending_mfa_logins WHERE lower(email)=?", (OPERATOR_EMAIL,)).fetchone()["n"]
 
+    # Cloud credentials ALONE: the operator has no local users.json identity on this appliance.
+    assert not any(u.get("email", "").lower() == OPERATOR_EMAIL for u in main.load_users())
     admin_sessions_before = _sessions("administrator")  # step 3's scaffolding session only
     pending_mfa_before = _pending_mfa()
     admin_login = client.post(
