@@ -264,7 +264,10 @@ class ZeroTerminalOnboardingTests(unittest.TestCase):
         self.run_agent(1)  # the appliance opens its claim on its own
         status, code = self.click_link()
         self.assertEqual(status, 303)
-        self.assertRegex(code, r'^[0-9A-F]{8}$')
+        # Windows 1.3.4.1 Patches 5-11: an agent that asks gets a 60-bit code, 12
+        # Crockford base32 characters (appliance_claims.LABEL_ALPHABET / LABEL_LENGTH);
+        # only agents shipped before then keep the 8-character code.
+        self.assertRegex(code, r'^[0-9A-HJKMNP-TV-Z]{12}$')
         self.assertEqual(self.customer_confirms(code), 200)
         self.run_agent()
         self.assert_enrolled()
