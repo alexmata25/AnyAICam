@@ -156,28 +156,195 @@ def test_a_local_password_that_differs_is_not_a_local_identity(claimed, backend)
 # ------------------------------------------------------------------ 4. users.json lockout parity with POST /login
 
 
-def test_a_locked_local_account_is_refused_and_its_lock_is_kept(claimed, backend):
+def _stored(user_id="local-owner"):
+    return next(user for user in main.load_users() if user["id"] == user_id)
+
+
+def _sql_lock(email=ADMIN, minutes=10):
+    """Seeds the shared SQL sign-in limiter's own lock directly (independent of the users.json lock)."""
+    from datetime import datetime, timedelta
+    with connection() as db:
+        db.execute("INSERT INTO account_lockouts(email,attempts,locked_until,last_attempt_at) VALUES(?,?,?,?) "
+                   "ON CONFLICT(email) DO UPDATE SET locked_until=excluded.locked_until",
+                   (email, 5, (datetime.now() + timedelta(minutes=minutes)).isoformat(), datetime.now().isoformat()))
+
+
+def _pending_mfa():
+    with connection() as db:
+        return db.execute("SELECT COUNT(*) AS n FROM pending_mfa_logins WHERE lower(email)=?", (ADMIN,)).fetchone()["n"]
+
+
+def test_a_locked_local_account_is_refused_before_any_cloud_call_and_its_lock_is_kept(claimed, backend):
+    # Codex R1 re-review: an explicit Administrator attempt on a locked eligible local account is answered 423 after
+    # the SQL gate, before delegation, so neither a delegated denial nor an outage can mask the lock.
     from datetime import datetime, timedelta
     until = (datetime.now() + timedelta(minutes=10)).isoformat()
-    _local_admin(locked_until=until, failed_login_attempts=0)
-    spy = backend()
-    response = _login(claimed, "administrator", LOCAL_PASSWORD)
-    assert response.status_code == 423 and _no_session(response)
-    stored = next(user for user in main.load_users() if user["id"] == "local-owner")
-    assert stored["locked_until"] == until
-    assert len(spy.calls) == 1  # the cloud identity (absent here) was still checked; no local session either way
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=PASSWORD, locked_until=until, failed_login_attempts=0)
+    for unavailable in (False, True):
+        spy = backend(unavailable)
+        response = _login(claimed, "administrator", PASSWORD)
+        assert response.status_code == 423 and _no_session(response)
+        assert spy.calls == []
+        assert _stored()["locked_until"] == until and _stored()["failed_login_attempts"] == 0
+    assert _admin_sessions() == 0 and _pending_mfa() == 0
 
 
-def test_wrong_local_passwords_lock_the_local_account_as_login_does(claimed, backend):
+def test_wrong_local_passwords_lock_the_local_account_as_login_does(claimed, backend, monkeypatch):
+    # The users.json threshold on its own: the SQL limiter is held clear so it cannot answer first.
+    import cloud_security
+    monkeypatch.setattr(cloud_security, "record_login_failure", lambda email: None)
     _local_admin()
     backend()
-    for _ in range(main.MAX_LOGIN_ATTEMPTS):
-        assert _login(claimed, "administrator", "wrong-password-1").status_code in (401, 403)
-    stored = next(user for user in main.load_users() if user["id"] == "local-owner")
-    assert stored["locked_until"]
+    for strike in range(1, main.MAX_LOGIN_ATTEMPTS):
+        assert _login(claimed, "administrator", "wrong-password-1").status_code in (401, 403)  # no identity: refused
+        assert _stored()["failed_login_attempts"] == strike and not _stored()["locked_until"]
+    assert _login(claimed, "administrator", "wrong-password-1").status_code in (401, 403)
+    assert _stored()["locked_until"] and _stored()["failed_login_attempts"] == 0
     locked = _login(claimed, "administrator", LOCAL_PASSWORD)
-    # 423 from the local lock, or 429 when the shared SQL login limiter (same failures) answers first; never a session.
-    assert locked.status_code in (423, 429) and _no_session(locked)
+    assert locked.status_code == 423 and _no_session(locked)
     # ... and POST /login sees the very same lock.
     login = claimed.post("/login", data={"email": ADMIN, "password": LOCAL_PASSWORD, "next_url": "/"}, follow_redirects=False)
     assert login.status_code == 423
+
+
+def test_the_sql_limiter_threshold_alone_answers_429_without_touching_the_local_account(claimed, backend):
+    # The SQL limiter on its own: it counts this route's refusals and then answers 429 first, with no local strike.
+    _local_admin(email="someone-else@local.test")
+    _cloud_admin("global", enrolled=True)
+    backend()
+    import cloud_security
+    for _ in range(cloud_security.settings.login_attempt_limit):
+        assert _login(claimed, "administrator", "wrong-password-1").status_code in (401, 403)
+    blocked = _login(claimed, "administrator", PASSWORD)
+    assert blocked.status_code == 429 and _no_session(blocked)
+    assert _stored()["failed_login_attempts"] == 0 and not _stored()["locked_until"]
+
+
+# ------------------------------------------------------------------ 5. Codex R1 re-review: precedence and eligibility
+
+
+@pytest.mark.parametrize("sql_locked,local_locked,expected", [(True, False, 429), (False, True, 423), (True, True, 429)])
+def test_lock_precedence_is_deterministic(claimed, backend, sql_locked, local_locked, expected):
+    from datetime import datetime, timedelta
+    until = (datetime.now() + timedelta(minutes=10)).isoformat() if local_locked else None
+    _local_admin(locked_until=until, failed_login_attempts=0)
+    if sql_locked:
+        _sql_lock()
+    spy = backend()
+    before = _stored()
+    response = _login(claimed, "administrator", LOCAL_PASSWORD)
+    assert response.status_code == expected and _no_session(response)
+    assert spy.calls == [] and _admin_sessions() == 0 and _pending_mfa() == 0
+    assert _stored() == before  # neither lock nor counter changed by a refused attempt
+
+
+@pytest.mark.parametrize("portal", [..., None, "", "owner"])
+@pytest.mark.parametrize("identities", ["local_only", "dual"])
+def test_the_selection_is_refused_before_any_password_check_or_lock_change(claimed, backend, monkeypatch, portal,
+                                                                          identities):
+    from datetime import datetime, timedelta
+    if identities == "dual":
+        _cloud_admin("global", enrolled=True)
+    _local_admin(password=PASSWORD, failed_login_attempts=2,
+                 locked_until=(datetime.now() + timedelta(minutes=10)).isoformat())
+    checks = []
+    real_verify = main.verify_password
+    monkeypatch.setattr(main, "verify_password", lambda *args: checks.append(args) or real_verify(*args))
+    spy = backend()
+    users_before = main.USERS_FILE.read_bytes()
+    response = _login(claimed, portal, PASSWORD)
+    assert response.status_code == 403 and "portal selector" in response.json()["detail"].lower()
+    assert _no_session(response) and checks == [] and spy.calls == []
+    assert main.USERS_FILE.read_bytes() == users_before
+    assert _admin_sessions() == 0 and _pending_mfa() == 0
+
+
+@pytest.mark.parametrize("role", ["viewer", "operator", "customer_owner"])
+def test_an_ineligible_local_account_is_never_verified_counted_or_locked_here(claimed, backend, monkeypatch, role):
+    import cloud_security
+    monkeypatch.setattr(cloud_security, "record_login_failure", lambda email: None)
+    _local_admin(role=role)
+    backend()
+    for _ in range(main.MAX_LOGIN_ATTEMPTS + 1):
+        assert _login(claimed, "administrator", "wrong-password-1").status_code in (401, 403)
+    assert _stored()["failed_login_attempts"] == 0 and not _stored()["locked_until"]
+    # its own correct password still works at POST /login
+    login = claimed.post("/login", data={"email": ADMIN, "password": LOCAL_PASSWORD, "next_url": "/"}, follow_redirects=False)
+    assert login.status_code == 303
+
+
+def test_an_ineligible_locked_local_account_is_not_reported_locked_here(claimed, backend):
+    from datetime import datetime, timedelta
+    until = (datetime.now() + timedelta(minutes=10)).isoformat()
+    _local_admin(role="viewer", locked_until=until)
+    backend()
+    response = _login(claimed, "administrator", LOCAL_PASSWORD)
+    assert response.status_code in (401, 403) and _no_session(response)
+    assert _stored()["locked_until"] == until
+
+
+def test_a_wrong_local_password_during_a_delegated_outage_is_counted(claimed, backend):
+    _local_admin()
+    backend(unavailable=True)
+    response = _login(claimed, "administrator", "wrong-password-1")
+    assert response.status_code == 503 and _no_session(response)
+    assert _stored()["failed_login_attempts"] == 1
+
+
+def test_a_wrong_local_password_refused_by_r2_is_counted(claimed, backend):
+    _cloud_admin("global", enrolled=True)
+    _local_admin(password=LOCAL_PASSWORD)
+    backend()
+    response = _login(claimed, "administrator", PASSWORD)  # the cloud password: R-2 refusal
+    assert response.status_code == 403 and _no_session(response)
+    assert _stored()["failed_login_attempts"] == 1
+
+
+def test_partner_and_technician_selections_never_touch_the_local_account(claimed, backend):
+    _local_admin()
+    backend()
+    for portal in ("partner", "technician"):
+        assert _no_session(_login(claimed, portal, "wrong-password-1"))
+    assert _stored()["failed_login_attempts"] == 0 and not _stored()["locked_until"]
+
+
+@pytest.mark.parametrize("offset", ["+00:00", "-06:00", "+09:30"])
+def test_an_offset_aware_lock_is_honoured_by_both_routes_without_an_error(claimed, backend, offset):
+    from datetime import datetime, timedelta, timezone
+    zone = timezone(timedelta(hours=int(offset[:3]), minutes=int(offset[0] + offset[4:])))
+    _local_admin(locked_until=(datetime.now(zone) + timedelta(minutes=10)).isoformat())
+    backend()
+    assert _login(claimed, "administrator", LOCAL_PASSWORD).status_code == 423
+    login = claimed.post("/login", data={"email": ADMIN, "password": LOCAL_PASSWORD, "next_url": "/"}, follow_redirects=False)
+    assert login.status_code == 423
+    _local_admin(locked_until=(datetime.now(zone) - timedelta(minutes=1)).isoformat())  # expired: no lock
+    response = _login(claimed, "administrator", LOCAL_PASSWORD)
+    assert response.status_code == 303 and response.headers["location"] == "/admin-portal"
+    assert _stored()["locked_until"] is None and _stored()["failed_login_attempts"] == 0
+
+
+def test_a_naive_lock_keeps_its_local_wall_clock_meaning():
+    from datetime import datetime, timedelta
+    assert main._legacy_lock_active((datetime.now() + timedelta(minutes=5)).isoformat()) is not None
+    assert main._legacy_lock_active((datetime.now() - timedelta(minutes=5)).isoformat()) is None
+    assert main._legacy_lock_time({"locked_until": "not-a-time"}) is None
+
+
+def test_concurrent_strikes_on_both_routes_are_never_lost(claimed, monkeypatch):
+    # The shared helper serializes users.json read-modify-write, so N concurrent strikes leave exactly N.
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(main, "MAX_LOGIN_ATTEMPTS", 1000)
+    _local_admin()
+    real_load = main.load_users
+
+    def slow_load():
+        users = real_load()
+        import time
+        time.sleep(0.005)  # widen the read-modify-write window an unserialized writer would lose increments in
+        return users
+    monkeypatch.setattr(main, "load_users", slow_load)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: main._count_legacy_password_failure("local-owner"), range(40)))
+    monkeypatch.setattr(main, "load_users", real_load)
+    assert _stored()["failed_login_attempts"] == 40
