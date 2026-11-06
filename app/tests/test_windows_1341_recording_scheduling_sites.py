@@ -31,6 +31,12 @@ def _lookup_fails(camera_number):
     raise RuntimeError("settings store unavailable")
 
 
+@pytest.fixture(autouse=True)
+def _lpr_pipeline_reset():
+    yield
+    main.lpr.reset_pipeline_state()  # no confirmed-plate state leaks into later tests
+
+
 @pytest.fixture()
 def structured(monkeypatch):
     events = []
@@ -42,6 +48,10 @@ def structured(monkeypatch):
 
 
 def _two_plates(monkeypatch, tmp_path):
+    # Same LPR state setup as test_lpr_independent_cadence.py's autouse _state fixture.
+    monkeypatch.setattr(main.lpr, "LPR_ENABLED", True)
+    monkeypatch.setattr(main.lpr, "is_camera_enabled", lambda camera: True)
+    main.lpr.reset_pipeline_state()
     events = []
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
     monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda n: {"lpr_enabled": True})
