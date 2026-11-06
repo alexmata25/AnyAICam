@@ -35,6 +35,7 @@ ADMIN = {"id": "admin-1", "display_name": "Admin One", "email": "admin@example.t
 def _isolated_recordings(tmp_path, monkeypatch):
     # Never read or write the shared recordings root (C:\app\recordings).
     from recordings_isolation import isolate_recordings
+    monkeypatch.setattr(main, "_pairing_claim_failures", {})  # claim-limit counters live in the process
     return isolate_recordings(monkeypatch, tmp_path)
 
 
@@ -189,7 +190,9 @@ def test_one_pairing_code_claimed_at_once_pairs_exactly_one_device(client, slow_
     code = main.create_mobile_pairing_code(dict(ADMIN), "Phone")["code"]
     with ThreadPoolExecutor(max_workers=8) as pool:
         responses = list(pool.map(lambda n: _pair(_fresh(), cookies, code, f"Phone {n}"), range(8)))
-    assert sorted(response.status_code for response in responses) == [200] + [400] * 7
+    # The first claim to take the lock wins; the seven replays are refused, and from the sixth failed claim on the
+    # account is at its claim limit (Codex four-store review r2), so those answer 429 instead of 400.
+    assert sorted(response.status_code for response in responses) == [200] + [400] * 5 + [429] * 2
     assert len(main.load_mobile_devices()) == 1
     assert code not in main.cleanup_mobile_pairing_codes(main.load_mobile_pairing_codes())
 

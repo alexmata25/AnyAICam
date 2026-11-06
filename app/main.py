@@ -9979,6 +9979,41 @@ _SESSIONS_FILE_LOCK = threading.RLock()
 # mobile_devices.json and mobile_pairing_codes.json: one lock for both, because a claim spends a code and adds a
 # device in one transaction.
 _MOBILE_STORE_LOCK = threading.RLock()
+# Pairing claims and codes (Codex four-store review, FIX REQUIRED; owner 2026-11-06). A code pairs a device only for the
+# account that created it. Failed claims are counted per account and per client address inside a sliding window; at the
+# limit every claim is refused (429), even with a correct code, until the window has passed. Each account has at most
+# one live code (a new one supersedes the old), and the appliance at most MOBILE_PAIRING_MAX_ACTIVE_CODES. The counters
+# live in this process under _MOBILE_STORE_LOCK (the Windows service runs one worker) and reset on restart.
+PAIRING_CLAIM_MAX_FAILURES = 5
+PAIRING_CLAIM_MAX_FAILURES_PER_ADDRESS = 20
+PAIRING_CLAIM_WINDOW_SECONDS = 600
+MOBILE_PAIRING_MAX_ACTIVE_CODES = 50
+_pairing_claim_failures: dict[str, list[float]] = {}
+
+
+def _pairing_claim_limits(account_id: str, address: str) -> list[tuple[str, int]]:
+    limits = [(f"account:{account_id}", PAIRING_CLAIM_MAX_FAILURES)]
+    if address:
+        limits.append((f"address:{address}", PAIRING_CLAIM_MAX_FAILURES_PER_ADDRESS))
+    return limits
+
+
+def _pairing_claim_blocked(limits: list[tuple[str, int]], now: float) -> bool:
+    """Under _MOBILE_STORE_LOCK. Drops failures older than the window, then reports whether any key is at its limit."""
+    blocked = False
+    for key, limit in limits:
+        recent = [moment for moment in _pairing_claim_failures.get(key, []) if now - moment < PAIRING_CLAIM_WINDOW_SECONDS]
+        if recent:
+            _pairing_claim_failures[key] = recent
+        else:
+            _pairing_claim_failures.pop(key, None)
+        blocked = blocked or len(recent) >= limit
+    return blocked
+
+
+def _record_pairing_claim_failure(limits: list[tuple[str, int]], now: float) -> None:
+    for key, _limit in limits:
+        _pairing_claim_failures.setdefault(key, []).append(now)
 
 
 class SessionStoreUnreadable(RuntimeError):
@@ -16157,13 +16192,54 @@ def list_backups() -> list[dict]:
 
 
 
+class ConfigurationRestoreInvalid(ValueError):
+    """The configuration archive failed validation; nothing was replaced."""
+
+
+class ConfigurationRestoreRollbackFailed(OSError):
+    """A restore failed part-way and at least one file could not be put back; its pre-restore copy is kept."""
+
+
+CONFIGURATION_RESTORE_MAX_BYTES = 200 * 1024 * 1024
+
+
+def _validate_configuration_member(name: str, payload: bytes) -> None:
+    """Every restorable file is JSON or JSON Lines; users.json and user_invites.json must hold lists of records."""
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ConfigurationRestoreInvalid(f"{name} is not UTF-8 text.") from error
+    if name.endswith(".jsonl"):
+        for number, line in enumerate(text.splitlines(), start=1):
+            if line.strip():
+                try:
+                    json.loads(line)
+                except ValueError as error:
+                    raise ConfigurationRestoreInvalid(f"{name} line {number} is not valid JSON.") from error
+        return
+    try:
+        data = json.loads(text)
+    except ValueError as error:
+        raise ConfigurationRestoreInvalid(f"{name} is not valid JSON.") from error
+    if name in {USERS_FILE.name, USER_INVITES_FILE.name}:
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ConfigurationRestoreInvalid(f"{name} must hold a list of records.")
+    if name == USERS_FILE.name and not all(isinstance(item.get("id"), str) and isinstance(item.get("email"), str) for item in data):
+        raise ConfigurationRestoreInvalid(f"{name} holds a user without an id or email.")
+
+
 def restore_configuration_backup(archive_path: Path) -> dict:
-    restored: list[str] = []
-    skipped: list[str] = []
+    """All or nothing (Codex four-store review, FIX REQUIRED; owner 2026-11-06). Phase 1 reads and validates every
+    restorable member (CRC, size, UTF-8, JSON, users/invites shape, no duplicates) and refuses the whole archive on any
+    problem, before anything is written. Phase 2, under the users.json lock, writes every new file beside its target,
+    keeps a copy of every current file, and only then swaps them in. If a swap fails, the files already swapped are put
+    back from their copies (files that did not exist are removed) and the error is raised; a file that cannot be put
+    back keeps its copy on disk and the error says which."""
     allowed = {path.name: path for path in CONFIG_BACKUP_FILES}
-    # Four-store remediation: the restore replaces users.json and user_invites.json whole, so it holds their lock;
-    # no read-modify-write can then save a pre-restore copy back over the restored file.
-    with _USERS_FILE_LOCK, zipfile.ZipFile(archive_path, "r") as archive:
+    staged: dict[Path, bytes] = {}
+    skipped: list[str] = []
+    total = 0
+    with zipfile.ZipFile(archive_path, "r") as archive:
         for member in archive.infolist():
             if member.is_dir() or not member.filename.startswith("config/"):
                 continue
@@ -16172,12 +16248,64 @@ def restore_configuration_backup(archive_path: Path) -> dict:
             if not target:
                 skipped.append(name)
                 continue
-            payload = archive.read(member)
-            temporary = target.with_suffix(target.suffix + ".restore")
-            temporary.write_bytes(payload)
-            temporary.replace(target)
-            restored.append(name)
-    return {"restored": restored, "skipped": skipped}
+            if target in staged:
+                raise ConfigurationRestoreInvalid(f"The archive holds {name} more than once.")
+            total += member.file_size
+            if total > CONFIGURATION_RESTORE_MAX_BYTES:
+                raise ConfigurationRestoreInvalid("The configuration files in the archive are larger than 200 MB.")
+            try:
+                payload = archive.read(member)
+            except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as error:
+                raise ConfigurationRestoreInvalid(f"{name} could not be read from the archive: {error}") from error
+            _validate_configuration_member(name, payload)
+            staged[target] = payload
+    # The swap replaces users.json and user_invites.json whole, so it holds their lock: no read-modify-write can then
+    # save a pre-restore copy back over a restored file.
+    token = f"{os.getpid()}.{secrets.token_hex(6)}"
+    written: dict[Path, Path] = {}
+    kept: dict[Path, Path | None] = {}
+    replaced: list[Path] = []
+    stranded: list[Path] = []
+    with _USERS_FILE_LOCK:
+        try:
+            for target, payload in staged.items():
+                temporary = target.with_name(f"{target.name}.{token}.restore")
+                temporary.write_bytes(payload)
+                written[target] = temporary
+            for target in staged:
+                if target.exists():
+                    copy = target.with_name(f"{target.name}.{token}.rollback")
+                    shutil.copy2(target, copy)
+                    kept[target] = copy
+                else:
+                    kept[target] = None
+            for target, temporary in written.items():
+                temporary.replace(target)
+                replaced.append(target)
+        except OSError as error:
+            for target in reversed(replaced):
+                copy = kept.get(target)
+                try:
+                    if copy is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        copy.replace(target)
+                except OSError:
+                    stranded.append(target)
+            structured_log("configuration_restore.rolled_back", level="error", error=type(error).__name__,
+                           rolled_back=[path.name for path in replaced if path not in stranded],
+                           not_rolled_back=[path.name for path in stranded])
+            if stranded:
+                raise ConfigurationRestoreRollbackFailed(
+                    f"Restore failed ({error}) and could not put back "
+                    + ", ".join(f"{path.name} (pre-restore copy kept as {kept[path].name})" if kept.get(path)
+                                else f"{path.name} (it did not exist before the restore)" for path in stranded)
+                ) from error
+            raise
+        finally:
+            for path in list(written.values()) + [copy for target, copy in kept.items() if copy and target not in stranded]:
+                path.unlink(missing_ok=True)
+    return {"restored": [target.name for target in staged], "skipped": skipped}
 
 
 
@@ -30800,6 +30928,11 @@ def _mobile_devices_identity(request: Request) -> dict:
 def create_mobile_pairing_code(user: dict, device_name: str) -> dict:
     with _MOBILE_STORE_LOCK:
         codes = cleanup_mobile_pairing_codes(load_mobile_pairing_codes())
+        # A new code supersedes this account's earlier live codes, so each account has at most one.
+        for superseded in [key for key, item in codes.items() if item.get("user_id") == user.get("id")]:
+            codes.pop(superseded, None)
+        if len(codes) >= MOBILE_PAIRING_MAX_ACTIVE_CODES:
+            raise HTTPException(status_code=429, detail="Too many pairing codes are active on this appliance. Try again in a few minutes.")
         code = f"{secrets.randbelow(1000000):06d}"
         while code in codes:
             code = f"{secrets.randbelow(1000000):06d}"
@@ -52905,6 +53038,9 @@ async def restore_backup_api(request: Request, backup_file: UploadFile = File(..
 
 
 
+    except ConfigurationRestoreInvalid as error:
+        record_audit(request, "restore", "configuration", f"Refused, nothing changed: {error}", "failed")
+        return {"status": "error", "message": f"Restore refused, nothing was changed: {error}"}
     except (OSError, zipfile.BadZipFile) as error:
 
 
@@ -94221,16 +94357,33 @@ def claim_mobile_pairing(
     payload: MobilePairingClaimModel,
     request: Request,
 ) -> dict:
+    identity = _mobile_devices_identity(request)
+    account_id = str(identity.get("id") or "")
     code = payload.code.strip()
     paired_from_ip = request_device_context(request).get("ip_address", "")
     user_agent = request.headers.get("user-agent", "")
+    limits = _pairing_claim_limits(account_id, paired_from_ip)
     # Four-store remediation: one claim at a time, so a single-use code can never pair two devices. The code is spent
-    # (and saved) before the device is added, so a failed device save leaves the code spent, never reusable.
+    # (and saved) before the device is added, so a failed device save leaves the code spent, never reusable. A code
+    # pairs only for the account that created it; any other account gets the same answer as a wrong code, and the
+    # attempt counts towards that account's and that address's claim limit.
     with _MOBILE_STORE_LOCK:
+        moment = time.monotonic()
+        if _pairing_claim_blocked(limits, moment):
+            from admin_auth_policy import auth_audit
+            auth_audit("mobile_pairing.claim_limited", actor_email=identity.get("email"), actor_role=str(identity.get("role") or ""),
+                       reason="too_many_failed_claims", entity_type="mobile_pairing", entity_id=account_id)
+            raise HTTPException(status_code=429, detail="Too many pairing attempts. Wait 10 minutes, then create a new code.")
         codes = cleanup_mobile_pairing_codes(load_mobile_pairing_codes())
         record = codes.get(code)
-        if not record:
+        if not record or not account_id or record.get("user_id") != identity.get("id"):
+            _record_pairing_claim_failure(limits, moment)
+            if record:
+                from admin_auth_policy import auth_audit
+                auth_audit("mobile_pairing.claim_refused", actor_email=identity.get("email"), actor_role=str(identity.get("role") or ""),
+                           reason="code_belongs_to_another_account", entity_type="mobile_pairing", entity_id=account_id)
             raise HTTPException(status_code=400, detail="Pairing code is invalid or expired.")
+        _pairing_claim_failures.pop(f"account:{account_id}", None)
         device_id = uuid.uuid4().hex
         now = datetime.now().isoformat()
         device = {
@@ -94413,7 +94566,7 @@ def mobile_pair_page(request: Request) -> str:
 
 
 
-      <p>Enter the six-digit pairing code shown in AnyAiCam on your trusted computer.</p>
+      <p>Enter the six-digit pairing code shown in AnyAiCam on your trusted computer. Sign in on this device with the same account that created the code.</p>
 
 
 
