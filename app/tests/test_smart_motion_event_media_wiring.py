@@ -387,15 +387,15 @@ def test_smart_motion_scheduling_failure_does_not_prevent_smart_motion_event_cre
     monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
 
     real_create_task = asyncio.create_task
-    call_count = {"n": 0}
 
     def selective_create_task(coro, *args, **kwargs):
-        call_count["n"] += 1
-        # The base Motion event's own clip task is always scheduled
-        # first (inside the motion_event_lock block); the Smart Motion
-        # one is scheduled second, only once classify_motion() returns
-        # truthy -- matching store_motion_event()'s real, fixed order.
-        if call_count["n"] == 2:
+        # Fail the Smart Motion media task specifically, picked by its
+        # coroutine name rather than by call order: R-REC-1 (1.2.7.1,
+        # CORRECTIVE-1.2.7.1.md) makes every camera event-mode, so
+        # store_motion_event() now also schedules persist_event_recording()
+        # between the base clip task and the Smart Motion one (on b8 this
+        # camera read back as continuous and that task was never created).
+        if getattr(coro, "__name__", "") == "build_and_upload_smart_motion_media":
             coro.close()
             raise RuntimeError("simulated scheduling failure")
         return real_create_task(coro, *args, **kwargs)

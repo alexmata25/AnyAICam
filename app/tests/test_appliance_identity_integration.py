@@ -345,11 +345,18 @@ def test_heartbeat_creates_the_audit_entry_only_for_a_genuinely_affected_session
             manifest = appliance_identity.build_manifest(db, cloud_id="AIC-1")
             live_identity = next(i for i in manifest["identities"] if i["user_id"] == "u1")
             stale_version = live_identity["authorization_version"]
+            appliance_identity.revoke_grant(db, grant_id=grant_id)
+            # 1.2.7.1 D-AUTHZ-1 residual (CORRECTIVE-1.2.7.1.md): revoke_grant() ->
+            # bump_authorization_version() now revokes the user's open sessions at
+            # once, so a session that existed before the revoke never reaches the
+            # heartbeat. The stale session (bound to the pre-revoke version) is
+            # therefore written after the revoke -- the identical row state the
+            # heartbeat reconciliation saw on b8 -- so this still proves that the
+            # genuinely-affected session, and only it, is revoked and audited there.
             db.execute(
                 "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 ("sess-hb-2", "u1", "tech@example.com", "technician", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", stale_version),
             )
-            appliance_identity.revoke_grant(db, grant_id=grant_id)
             db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-3','Unrelated Partner','approved','real','2026-08-27T00:00:00')")
             db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-3','partner-3','Unrelated Customer','cust3@example.test','active','real','2026-08-27T00:00:00')")
             db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) VALUES('u-cust3','partner-3','other-customer@example.test','Customer Owner','customer_owner',?,1,'cust-3','2026-08-27T00:00:00')", (password_hash("Sup3rSecret!"),))

@@ -172,6 +172,11 @@ def test_unrelated_customer_with_no_events_sees_empty_list_not_none(monkeypatch,
         conn.execute("PRAGMA foreign_keys=ON")
         _seed_real_proof_event(conn)
         _seed_tenant(conn, "cust-empty", "site-empty", "appl-empty", "AIC-EMPTY")
+        # 1.2.7.1: commit before the product reads. R-REC-1 (CORRECTIVE-1.2.7.1.md) runs
+        # db_migrations.enforce_event_only_recording() (an UPDATE, so a write lock) on the
+        # first connection() of this target; an open uncommitted seed transaction here
+        # would make it fail "database is locked" -- test hygiene, not product behaviour.
+        conn.commit()
 
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-empty"))
         result = main._customer_detection_events(object())
@@ -248,6 +253,11 @@ def test_route_unrelated_customer_gets_empty_list_and_mock_data_false(monkeypatc
         conn.execute("PRAGMA foreign_keys=ON")
         _seed_real_proof_event(conn)
         _seed_tenant(conn, "cust-empty", "site-empty", "appl-empty", "AIC-EMPTY")
+        # 1.2.7.1: commit before the product reads. R-REC-1 (CORRECTIVE-1.2.7.1.md) runs
+        # db_migrations.enforce_event_only_recording() (an UPDATE, so a write lock) on the
+        # first connection() of this target; an open uncommitted seed transaction here
+        # would make it fail "database is locked" -- test hygiene, not product behaviour.
+        conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-empty"))
         response = main.analytics_event_search(object())
     assert response == {"events": [], "mock_data": False}  # real empty, never masquerading as mock
@@ -310,6 +320,11 @@ def test_summary_unrelated_customer_is_all_zero_not_mock(monkeypatch, db_path):
         conn.execute("PRAGMA foreign_keys=ON")
         _seed_real_proof_event(conn)
         _seed_tenant(conn, "cust-empty", "site-empty", "appl-empty", "AIC-EMPTY")
+        # 1.2.7.1: commit before the product reads. R-REC-1 (CORRECTIVE-1.2.7.1.md) runs
+        # db_migrations.enforce_event_only_recording() (an UPDATE, so a write lock) on the
+        # first connection() of this target; an open uncommitted seed transaction here
+        # would make it fail "database is locked" -- test hygiene, not product behaviour.
+        conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-empty"))
         summary = main.analytics_summary_api(object())
     assert summary["mock_data"] is False
