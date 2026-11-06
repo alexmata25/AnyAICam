@@ -258,6 +258,7 @@ class PascalCompileTests(unittest.TestCase):
             wrapper.write_text(
                 '#define AppVersion "1.3.2"\n#define ReleaseVersion "1.2.7"\n#define SourceCommit "0000000000000000000000000000000000000000"\n'
                 '#define KeysetSha256 "2389a655fb3e5ed91e8a4a9216f9c45b97feb3847571b0536384b8305979af7c"\n'
+                '#define RegistrySha256 "0000000000000000000000000000000000000000000000000000000000000000"\n'  # required since LIC-W1 66de7c9
                 "[Setup]\nAppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}\nAppName=AnyAiCam VMS compile check\n"
                 "AppVersion={#AppVersion}\nDefaultDirName={autopf}\\AnyAiCamCompileCheck\nPrivilegesRequired=admin\n"
                 "ArchitecturesInstallIn64BitMode=x64compatible\nOutputDir=out\n"
