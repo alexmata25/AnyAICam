@@ -47435,8 +47435,8 @@ def register_submit(
 
 
 
-    # Codex R1 revision review (P1): the users.json read-modify-write below holds the shared users.json lock. This
-    # public route hashes the password first, so it never holds that lock for a bcrypt hash.
+    # Codex R1 revision review (P1): the users.json read-modify-write below holds the shared users.json lock. The
+    # password is hashed first, so this route never holds that lock for a bcrypt hash.
     password_hash = hash_password(password)
     with _USERS_FILE_LOCK:
         users = load_users()
@@ -49105,6 +49105,19 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
             detail = f"This email has more than one portal available ({options}). Choose one from the Portal selector."
         raise HTTPException(status_code=403, detail=detail)
 
+    # A partner_users administrator's two refusals -- R-2's delegated administrator without verifiable MFA, and an
+    # identity not eligible for local MFA -- come BEFORE the shared sign-in limiter is cleared below (Codex R1
+    # revision review, P2): a refused request never resets it, so the guesses it counts stay bounded.
+    if decision["system"] == "partner" and decision["role"] == "administrator":
+        if own_appliance or (partner_user or {}).get("auth_source") == "cloud_assertion":
+            from admin_auth_policy import auth_audit
+            auth_audit("login.denied", actor_email=email, actor_role="administrator", reason="delegated_admin_mfa_unverified",
+                       entity_id=str((partner_user or {}).get("id") or ""))
+            raise HTTPException(status_code=403, detail="Administrator sign-in is unavailable until this identity provider supplies verifiable MFA.")
+        if not partner_user or not partner_user.get("id"):
+            record_login_failure(email)
+            raise HTTPException(status_code=401, detail="Administrator identity is not eligible for local MFA.")
+
     # L-10 (1.2.7.1): on the cloud an administrator's failed sign-ins are only
     # cleared once the MFA step succeeds (platform_owner mfa/verify), so wrong
     # codes count toward the same lockout as wrong passwords.
@@ -49135,14 +49148,6 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
     # emergency login above remains a separate, unchanged authentication path.
     destination = "/change-password" if partner_user and partner_user.get("must_change_password") else decision["destination"]
     if decision["system"] == "partner" and decision["role"] == "administrator":
-        if own_appliance or (partner_user or {}).get("auth_source") == "cloud_assertion":
-            from admin_auth_policy import auth_audit
-            auth_audit("login.denied", actor_email=email, actor_role="administrator", reason="delegated_admin_mfa_unverified",
-                       entity_id=str((partner_user or {}).get("id") or ""))
-            raise HTTPException(status_code=403, detail="Administrator sign-in is unavailable until this identity provider supplies verifiable MFA.")
-        if not partner_user or not partner_user.get("id"):
-            record_login_failure(email)
-            raise HTTPException(status_code=401, detail="Administrator identity is not eligible for local MFA.")
         from platform_owner import begin_admin_login
         return begin_admin_login(request, user=partner_user, email=email, role="administrator", destination=destination)
 

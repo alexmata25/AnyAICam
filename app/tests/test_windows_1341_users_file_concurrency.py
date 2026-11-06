@@ -103,7 +103,7 @@ def test_every_writer_route_running_at_once_loses_no_change(client, slow_reads):
         + [lambda n=n: client.post("/api/user-invites/accept", json={
             "token": invite_token(n), "display_name": f"Invitee {n}", "password": "invitee-password-1"})
            for n in range(3)]
-        + [lambda n=n: client.post("/register", data={
+        + [lambda n=n: client.post("/register", cookies=cookies, data={
             "display_name": f"Registrant {n}", "email": f"registrant-{n}@example.test",
             "password": "registrant-password-1", "requested_role": "customer_owner"},
             follow_redirects=False) for n in range(3)]
@@ -188,7 +188,10 @@ def test_every_users_json_writer_in_main_holds_the_shared_lock():
 
 
 def test_registration_hashes_the_password_outside_the_users_lock(client, monkeypatch):
-    # The public /register route must never hold the shared users.json lock for a bcrypt hash.
+    # /register must never hold the shared users.json lock for a bcrypt hash. (It is behind the authentication
+    # middleware on this build: an unauthenticated POST is sent to sign-in, so a session is used here.)
+    main.save_users([dict(MANAGER)])
+    cookies = {main.SESSION_COOKIE_NAME: main.create_session("admin-1")}
     held = []
     real_hash = main.hash_password
 
@@ -196,7 +199,7 @@ def test_registration_hashes_the_password_outside_the_users_lock(client, monkeyp
         held.append(main._USERS_FILE_LOCK._is_owned())
         return real_hash(password)
     monkeypatch.setattr(main, "hash_password", spy)
-    response = client.post("/register", data={"display_name": "Registrant", "email": "registrant@example.test",
+    response = client.post("/register", cookies=cookies, data={"display_name": "Registrant", "email": "registrant@example.test",
                                               "password": "registrant-password-1", "requested_role": "customer_owner"},
                            follow_redirects=False)
     assert response.status_code == 200, response.text[:300]

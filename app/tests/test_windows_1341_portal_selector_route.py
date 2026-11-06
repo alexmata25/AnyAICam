@@ -425,3 +425,17 @@ def test_a_wrong_local_password_during_an_outage_is_still_counted_locally(claime
     response = _login(claimed, "administrator", PASSWORD)
     assert response.status_code == 503 and _no_session(response)
     assert _stored()["failed_login_attempts"] == 1
+
+
+def test_an_r2_refusal_never_resets_the_shared_limiter(claimed, backend):
+    # Before: the R-2 refusal came after clear_login_failures(), so every refused cloud sign-in reset the count of
+    # earlier wrong passwords. A refused request now leaves the shared limiter as it found it (cloud-only account).
+    _cloud_admin("global", enrolled=True)
+    _local_admin(email="someone-else@local.test")
+    backend()
+    for _ in range(3):
+        assert _login(claimed, "administrator", "wrong-password-1").status_code in (401, 403)
+    assert _sql_attempts() == 3
+    response = _login(claimed, "administrator", PASSWORD)  # valid cloud credentials alone: R-2 refusal
+    assert response.status_code == 403 and "verifiable MFA" in response.json()["detail"]
+    assert _sql_attempts() == 3
