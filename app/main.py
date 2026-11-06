@@ -45758,25 +45758,70 @@ def portal_destination_for_user(user: dict | None) -> str:
 PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
 
 
+# Codex R1 re-review (2026-11-06): POST /login and POST /api/portal-login read, count and clear the users.json account
+# lock through the helpers below. Each change is a read-modify-write of the CURRENT users file under one process-wide
+# lock, so concurrent sign-ins on either route can no longer lose a strike or overwrite a newer lock with a stale list.
+_LEGACY_LOCK_STATE = threading.RLock()
+
+
+def _legacy_lock_active(locked_until) -> datetime | None:
+    """A users.json locked_until value that is still in force, else None. A naive value keeps its meaning (local wall
+    clock, the only form POST /login has ever written); an offset-aware one is compared against an aware clock instead
+    of raising. Raises TypeError/ValueError for an unparsable value; each caller keeps its own handling of that."""
+    lock_time = datetime.fromisoformat(locked_until)
+    now = datetime.now(lock_time.tzinfo) if lock_time.tzinfo is not None else datetime.now()
+    return lock_time if lock_time > now else None
+
+
 def _legacy_lock_time(user: dict) -> datetime | None:
-    """The users.json account's active lock, read exactly as POST /login reads it (an unparsable value is no lock)."""
+    """The users.json account's active lock, read as POST /login reads it (an unparsable value is no lock)."""
     locked_until = user.get("locked_until")
     if not locked_until:
         return None
     try:
-        lock_time = datetime.fromisoformat(locked_until)
+        return _legacy_lock_active(locked_until)
     except (TypeError, ValueError):
         return None
-    return lock_time if lock_time > datetime.now() else None
 
 
-def _record_legacy_login_failure(users: list[dict], user: dict) -> None:
+def _update_legacy_user(user_id: str, change) -> dict | None:
+    """Applies change(user) to the current users.json record with this id and saves it, serialized across routes."""
+    if not user_id:
+        return None
+    with _LEGACY_LOCK_STATE:
+        users = load_users()
+        current = next((item for item in users if item.get("id") == user_id), None)
+        if current is None:
+            return None
+        change(current)
+        save_users(users)
+        return current
+
+
+def _count_legacy_password_failure(user_id: str) -> dict | None:
+    """One wrong users.json password: MAX_LOGIN_ATTEMPTS strikes lock the account for LOCKOUT_MINUTES (POST /login's rule)."""
+    def strike(current: dict) -> None:
+        if current.get("locked_until") and _legacy_lock_time(current) is None:
+            current["locked_until"] = None  # expired or unparsable, as POST /login has always dropped it
+        current["failed_login_attempts"] = int(current.get("failed_login_attempts") or 0) + 1
+        if current["failed_login_attempts"] >= MAX_LOGIN_ATTEMPTS:
+            current["locked_until"] = (datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
+            current["failed_login_attempts"] = 0
+    return _update_legacy_user(user_id, strike)
+
+
+def _record_legacy_sign_in(user_id: str) -> dict | None:
+    """A successful users.json sign-in clears the strikes and the lock and stamps last_login."""
+    def signed_in(current: dict) -> None:
+        current["failed_login_attempts"] = 0
+        current["locked_until"] = None
+        current["last_login"] = datetime.now().isoformat()
+    return _update_legacy_user(user_id, signed_in)
+
+
+def _record_legacy_login_failure(user: dict) -> None:
     """A wrong users.json password at /api/portal-login, counted exactly as POST /login counts one."""
-    user["failed_login_attempts"] = int(user.get("failed_login_attempts", 0)) + 1
-    if user["failed_login_attempts"] >= MAX_LOGIN_ATTEMPTS:
-        user["locked_until"] = (datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
-        user["failed_login_attempts"] = 0
-    save_users(users)
+    _count_legacy_password_failure(user.get("id"))
     append_audit_entry(AuditEntryModel(
         user_id=user.get("id", "unknown"), user_name=user.get("display_name", user.get("email", "")),
         role=user.get("role", "unknown"), action="login", resource="session",
@@ -48167,7 +48212,7 @@ def login_submit(
 
 
 
-            lock_time = datetime.fromisoformat(locked_until)
+            lock_time = _legacy_lock_active(locked_until)  # shared parser: naive and offset-aware values (Codex R1)
 
 
 
@@ -48176,7 +48221,7 @@ def login_submit(
 
 
 
-            if lock_time > datetime.now():
+            if lock_time is not None:
 
 
 
@@ -48284,61 +48329,8 @@ def login_submit(
 
 
 
-        user["failed_login_attempts"] = int(user.get("failed_login_attempts", 0)) + 1
-
-
-
-
-
-
-
-
-        if user["failed_login_attempts"] >= MAX_LOGIN_ATTEMPTS:
-
-
-
-
-
-
-
-
-            user["locked_until"] = (
-
-
-
-
-
-
-
-
-                datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)
-
-
-
-
-
-
-
-
-            ).isoformat()
-
-
-
-
-
-
-
-
-            user["failed_login_attempts"] = 0
-
-
-
-
-
-
-
-
-        save_users(users)
+        # Counted on the current users file under the shared lock (Codex R1 re-review), as /api/portal-login counts.
+        _count_legacy_password_failure(user.get("id"))
 
 
 
@@ -48473,34 +48465,7 @@ def login_submit(
 
 
 
-    user["failed_login_attempts"] = 0
-
-
-
-
-
-
-
-
-    user["locked_until"] = None
-
-
-
-
-
-
-
-
-    user["last_login"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    save_users(users)
+    _record_legacy_sign_in(user["id"])  # serialized read-modify-write (Codex R1 re-review)
 
 
 
@@ -48815,6 +48780,22 @@ def portal_login_submit(request: Request, payload: dict):
     a new way -- this only adds the missing step of consulting both
     before picking one, instead of only ever consulting one (see
     resolve_portal_login()'s own docstring for why that mattered)."""
+    # Codex R1 re-review (2026-11-06): a wrong password for an eligible local administrator (users.json, see below)
+    # counts as one users.json strike whenever this request ends without a session -- the generic 401, a 403
+    # (including the R-2 delegated-administrator refusal) and the 503 of a delegated outage alike -- through the same
+    # serialized helper POST /login uses. A request that establishes any session never counts a strike.
+    refusal: dict = {}
+    try:
+        return _portal_login(request, payload, refusal)
+    except HTTPException:
+        if refusal.get("legacy_user") is not None:
+            _record_legacy_login_failure(refusal["legacy_user"])
+        raise
+
+
+def _portal_login(request: Request, payload: dict, refusal: dict):
+    """portal_login_submit()'s decision. Sets refusal["legacy_user"] when an eligible local administrator's password
+    was wrong, so the route counts that strike if the request is refused."""
     email = str(payload.get("email", "")).strip().lower()
     password = str(payload.get("password", ""))
     selected_portal = payload.get("portal") or None
@@ -48823,6 +48804,8 @@ def portal_login_submit(request: Request, payload: dict):
 
     from cloud_security import clear_login_failures, login_blocked, record_login_failure
 
+    # The shared SQL sign-in limiter always answers first: with it and a users.json lock both active the answer is 429
+    # (Codex R1 re-review, deterministic precedence).
     if login_blocked(email):
         raise HTTPException(status_code=429, detail="Account is temporarily locked after repeated sign-in failures. Try again later or reset your password.")
 
@@ -48830,27 +48813,6 @@ def portal_login_submit(request: Request, payload: dict):
     # administrator is never checked here (L-3/L-4) -- only noted, so a
     # legacy-only administrator gets the generic refusal and an audit row.
     cloud = _legacy_cloud_profile()
-    users = load_users()
-    legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
-    legacy_role: str | None = None
-    legacy_admin_on_cloud = False
-    # Codex 2026-11-06 (P1): the users.json lockout that POST /login enforces applies here too. A locked local account
-    # is never verified (and its lock fields are never cleared by a sign-in here); a wrong local password counts toward
-    # the same MAX_LOGIN_ATTEMPTS / LOCKOUT_MINUTES as /login when no other identity validated (below).
-    legacy_locked_until: datetime | None = None
-    legacy_password_failed = False
-    if cloud:
-        from admin_auth_policy import legacy_user_is_admin_capable
-        legacy_admin_on_cloud = bool(legacy_user and legacy_user_is_admin_capable(legacy_user))
-    elif legacy_user and legacy_user.get("enabled", True):
-        legacy_locked_until = _legacy_lock_time(legacy_user)
-        if legacy_locked_until is None:
-            if verify_password(password, legacy_user.get("password_hash", "")):
-                candidate_role = str(legacy_user.get("role") or "").strip().lower()
-                if candidate_role in ADMIN_PORTAL_ROLES:
-                    legacy_role = candidate_role
-            else:
-                legacy_password_failed = True
 
     # Partner/Administrator/Technician password verification delegates to
     # the cloud-identity contract (appliance_identity.py) once this
@@ -48885,15 +48847,43 @@ def portal_login_submit(request: Request, payload: dict):
             own_appliance.get("appliance_id"), display_cloud_id(own_appliance.get("cloud_id")), RUNTIME_ROLE,
         )
         own_appliance = None
-    # Codex 2026-11-06 (P1), on an activated appliance:
+    # Codex 2026-11-06 (P1) and R1 re-review; owner 2026-11-06 (valid selection required on a claimed appliance):
     # - no (valid) selection: the delegated contract checks one portal bucket, so without a selection a cloud identity
     #   can't be seen at all and a dual-identity account would look local-only. Never guess (owner 2026-10-28):
-    #   refuse, with no session and no cloud call. The local emergency /login is unchanged.
+    #   refuse right after the SQL limiter -- before any users.json read, password check or lock change -- with no
+    #   session and no cloud call. The local emergency /login is unchanged.
     # - Administrator selected and the LOCAL administrator validated: that local identity wins on an appliance (owner
     #   2026-10-28, resolve_portal_login), so the cloud is not consulted and an upstream outage can't block local
     #   recovery. A cloud credential never reaches this shortcut: it needs the users.json password.
     if own_appliance and selected_portal is None and not cloud:
         raise HTTPException(status_code=403, detail="Choose Administrator, Partner or Technician from the Portal selector, or use local emergency recovery sign-in.")
+
+    users = load_users()
+    legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
+    legacy_role: str | None = None
+    legacy_admin_on_cloud = False
+    # The users.json lockout of POST /login (Codex 2026-11-06 P1, R1 re-review) applies only to an ELIGIBLE local
+    # account -- enabled, an Admin Portal role, on the Administrator (or, off an appliance, no) selection -- the only
+    # case this route can sign a users.json account in. Any other users.json account is neither verified, counted nor
+    # reported as locked here, so this route can't lock a non-administrator out of /login. On an appliance an
+    # explicit Administrator attempt on a locked eligible account is answered 423 here, before any cloud call, so a
+    # delegated denial or outage can't mask the lock; off an appliance the lock is reported only when no other
+    # identity validates (below), as before. A locked account is never verified and its lock is never cleared here.
+    legacy_locked_until: datetime | None = None
+    if cloud:
+        from admin_auth_policy import legacy_user_is_admin_capable
+        legacy_admin_on_cloud = bool(legacy_user and legacy_user_is_admin_capable(legacy_user))
+    elif (legacy_user and legacy_user.get("enabled", True) and selected_portal in {None, "administrator"}
+          and str(legacy_user.get("role") or "").strip().lower() in ADMIN_PORTAL_ROLES):
+        legacy_locked_until = _legacy_lock_time(legacy_user)
+        if legacy_locked_until is not None:
+            if own_appliance:
+                raise HTTPException(status_code=423, detail=f"Account locked until {legacy_locked_until.strftime('%Y-%m-%d %H:%M')}.")
+        elif verify_password(password, legacy_user.get("password_hash", "")):
+            legacy_role = str(legacy_user.get("role") or "").strip().lower()
+        else:
+            refusal["legacy_user"] = legacy_user
+
     if (own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS
             and not (selected_portal == "administrator" and legacy_role and not cloud)):
         from appliance_identity import CloudIdentityUnavailable, ManifestError, get_cloud_identity_backend, verify_assertion
@@ -48974,14 +48964,10 @@ def portal_login_submit(request: Request, payload: dict):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         partner_administrator_scope = _live_scope
 
-    # The local account's own lockout, as POST /login applies it (Codex 2026-11-06, P1): only when no other identity
-    # validated, so another system's successful sign-in never locks the local account, and a locked local account is
-    # reported as locked instead of falling through to a generic refusal.
-    if partner_role is None and selected_portal in {None, "administrator"}:
-        if legacy_locked_until is not None:
-            raise HTTPException(status_code=423, detail=f"Account locked until {legacy_locked_until.strftime('%Y-%m-%d %H:%M')}.")
-        if legacy_password_failed:
-            _record_legacy_login_failure(users, legacy_user)
+    # Off an appliance, a locked eligible local account is reported as locked (not a generic refusal) when no other
+    # identity validated. Its wrong-password strike is counted by portal_login_submit() on any refusal.
+    if legacy_locked_until is not None and partner_role is None:
+        raise HTTPException(status_code=423, detail=f"Account locked until {legacy_locked_until.strftime('%Y-%m-%d %H:%M')}.")
 
     decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role, partner_administrator_scope=partner_administrator_scope,
                                     cloud_profile=cloud)
@@ -49009,10 +48995,7 @@ def portal_login_submit(request: Request, payload: dict):
         clear_login_failures(email)
 
     if decision["system"] == "legacy":
-        legacy_user["failed_login_attempts"] = 0
-        legacy_user["locked_until"] = None
-        legacy_user["last_login"] = datetime.now().isoformat()
-        save_users(users)
+        _record_legacy_sign_in(legacy_user["id"])  # serialized with POST /login (Codex R1 re-review)
         token = create_session(legacy_user["id"], False)
         append_audit_entry(AuditEntryModel(
             user_id=legacy_user["id"], user_name=legacy_user.get("display_name", email), role=legacy_user.get("role", "viewer"),
