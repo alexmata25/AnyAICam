@@ -115,7 +115,10 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     assert {g["role"] for g in grants_list if g["email"] == OPERATOR_EMAIL} == {"administrator", "partner_owner"}
 
     # ---- Step 3: mock cloud creates customer/site/appliance + activation token, via the real onboarding API, authenticated as the operator's DIRECT partner_db identity ----
-    operator_direct_token = partner_portal._token(OPERATOR_EMAIL, "administrator", "anyaicam-primary", None, None)
+    # 1.2.7.1 (D-AUTHZ-2b): an administrator cookie must name a live user_sessions row bound to the account's current
+    # authorization_version (partner_portal._evaluate refuses a session-less one, 'no_session') -- a real session.
+    from authz_helpers import partner_session_cookie as _bound_session_cookie
+    operator_direct_token = _bound_session_cookie(OPERATOR_EMAIL, "administrator", partner_id="anyaicam-primary")
     onboard = client.post(
         "/api/partner/customers/onboard",
         json={
@@ -199,7 +202,10 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
             sessions = db.execute("SELECT id,role FROM user_sessions WHERE email=? ORDER BY created_at ASC", (OPERATOR_EMAIL,)).fetchall()
     roles_seen = {row["role"] for row in sessions}
     assert roles_seen == {"administrator", "partner_owner"}
-    admin_session_id = next(row["id"] for row in sessions if row["role"] == "administrator")
+    # The Administrator session is the one the sign-in above created (step 3's scaffolding session is a separate,
+    # earlier administrator row since 1.2.7.1, so "first administrator row" would no longer name it).
+    from authz_helpers import session_row
+    admin_session_id = session_row(admin_session_cookie)["id"]
     partner_session_id = next(row["id"] for row in sessions if row["role"] == "partner_owner")
 
     # ---- Step 10: revoke the Partner grant ----
@@ -221,9 +227,19 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
             partner_session_row = db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (partner_session_id,)).fetchone()
             admin_session_row = db.execute("SELECT revoked_at FROM user_sessions WHERE id=?", (admin_session_id,)).fetchone()
     assert partner_session_row["revoked_at"] is not None  # Partner authorization invalidated
-    assert admin_session_row["revoked_at"] is None         # Administrator remains valid
+    # 1.2.7.1 (D-AUTHZ-1 residual, appliance_identity.bump_authorization_version): any grant revoke moves the account's
+    # authorization_version and ends EVERY open session it holds at once, the Administrator one included.
+    assert admin_session_row["revoked_at"] is not None
+    assert client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie},
+                      follow_redirects=False).status_code != 200
 
-    # The Administrator session cookie must still work against the real
-    # Admin Portal after the Partner-only revocation.
-    still_works = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie})
+    # The Administrator GRANT is untouched by the Partner-only revocation: a fresh sign-in still reaches the real
+    # Admin Portal.
+    admin_again = client.post(
+        "/api/portal-login",
+        json={"email": OPERATOR_EMAIL, "password": OPERATOR_PASSWORD, "portal": "administrator"},
+        follow_redirects=False,
+    )
+    assert admin_again.status_code == 303 and admin_again.headers["location"] == "/admin-portal"
+    still_works = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_again.cookies[partner_portal.SESSION_COOKIE]})
     assert still_works.status_code == 200

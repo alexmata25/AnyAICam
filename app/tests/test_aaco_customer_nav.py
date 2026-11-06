@@ -107,7 +107,12 @@ def test_signed_out_aaco_requires_customer_sign_in(client, monkeypatch):
 
 
 def test_an_administrator_cannot_open_the_customer_workspace(client):
-    response = _get(client, "/aaco", _admin_cookie())
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-2): a session-less administrator token is refused
+    # before the route (and was bounced to a sign-in page this assertion does not
+    # recognise), so the administrator here is a REAL one -- live global grant,
+    # MFA-verified bound session -- and must still be refused by the customer gate.
+    from authz_helpers import global_admin_session_cookie
+    response = _get(client, "/aaco", global_admin_session_cookie("admin@example.test"))
     assert response.status_code in (401, 403) or "Customer" in response.text
 
 

@@ -68,7 +68,11 @@ def _owner_cookie(customer_id):
 
 
 def _admin_cookie():
-    return partner_portal._token("admin@example.test", "administrator")
+    # Linux 1.2.7.1 (D-AUTHZ-2b, S-2): an administrator cookie must name a live,
+    # version-bound (MFA-verified) session of a live global administrator -- a
+    # session-less administrator token is refused ('no_session').
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie("admin@example.test")
 
 
 def _seed_five_cameras(conn, customer_id="cust-1"):

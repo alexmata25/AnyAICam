@@ -274,8 +274,13 @@ def _seed_customer_user(db_path):
                  "VALUES('user-1','partner-1','owner@example.test','Owner','customer_owner',?,1,'cust-1',?)",
                  (password_hash(OLD_PASSWORD), NOW))
     expires = (datetime.now() + timedelta(days=1)).isoformat()
+    # Linux 1.2.7.1 (D-AUTHZ-1 residual, spec S-2): a session row records the
+    # account's authorization_version at sign-in (establish_partner_session always
+    # writes it; the 20261025 migration backfills pre-upgrade rows), and a row with
+    # none is refused -- so the seeded sessions carry it, as a real sign-in's would.
     for session_id in ("sess-current", "sess-other"):
-        conn.execute("INSERT INTO user_sessions(id,user_id,email,role,session_type,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO user_sessions(id,user_id,email,role,session_type,created_at,expires_at,authorization_version_at_login,auth_source) "
+                     "VALUES(?,?,?,?,?,?,?,(SELECT authorization_version FROM partner_users WHERE id='user-1'),'password')",
                      (session_id, "user-1", "owner@example.test", "customer_owner", "browser", NOW, expires))
     conn.commit()
 

@@ -76,7 +76,10 @@ def client(db_path):
 
 
 def _admin_cookie():
-    return partner_portal._token("admin@example.test", "administrator")
+    # 1.2.7.1 D-AUTHZ-2b (CORRECTIVE-1.2.7.1.md): an administrator cookie must name a live,
+    # MFA-verified session bound to the account (u-admin, live global grant, seeded above).
+    from authz_helpers import global_admin_session_cookie
+    return global_admin_session_cookie("admin@example.test")
 
 
 def _customer_owner_cookie(customer_id="cust-1"):
