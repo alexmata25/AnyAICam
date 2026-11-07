@@ -11037,7 +11037,10 @@ def save_sessions(sessions: dict) -> None:
 
 
 
-def create_session(user_id: str, remember_me: bool = False) -> str:
+def create_session(user_id: str, remember_me: bool = False, authenticated_at: float | None = None) -> str:
+    """authenticated_at is when the sign-in began, before it read users.json. A password reset by an administrator
+    records its own moment on the account, and authenticated_user refuses any session that began before it, so a
+    sign-in already checking the old password when the reset lands can't keep a session either."""
     session_id = secrets.token_urlsafe(32)
     max_age = 30 * 24 * 3600 if remember_me else SESSION_MAX_AGE_SECONDS
     with _SESSIONS_FILE_LOCK:
@@ -11046,6 +11049,7 @@ def create_session(user_id: str, remember_me: bool = False) -> str:
             "user_id": user_id,
             "created_at": datetime.now().isoformat(),
             "expires_at": (datetime.now() + timedelta(seconds=max_age)).isoformat(),
+            "authenticated_at": time.time() if authenticated_at is None else authenticated_at,
         }
         epoch = _read_session_epoch()  # after the load, which may have started a new epoch
         if epoch:
@@ -11053,6 +11057,40 @@ def create_session(user_id: str, remember_me: bool = False) -> str:
         sessions[session_id] = session
         save_sessions(sessions)
     return session_serializer.dumps({"session_id": session_id})
+
+
+def _session_survives_password_reset(session: dict, user: dict) -> bool:
+    """False for a session that began before the account's last password reset by an administrator
+    (users.json sessions_valid_after, a time.time() value). Accounts never reset carry no such field."""
+    cutoff = user.get("sessions_valid_after")
+    if cutoff is None:
+        return True
+    try:
+        moment = session.get("authenticated_at")
+        moment = float(moment) if moment is not None else datetime.fromisoformat(str(session.get("created_at"))).timestamp()
+        return moment > float(cutoff)
+    except (TypeError, ValueError):
+        return False  # the session's age can't be established, so it is refused
+
+
+def _sign_out_user_sessions(user_id: str, reason: str) -> int:
+    """Removes the account's sessions from sessions.json. Called under _USERS_FILE_LOCK after users.json records
+    sessions_valid_after (lock order users -> sessions). That field is what refuses the sessions, so a sessions.json
+    that can't be updated, or an older copy put back later, still can't sign the account in."""
+    try:
+        with _SESSIONS_FILE_LOCK:
+            sessions = _load_sessions_for_update()
+            purge = [key for key, value in sessions.items() if isinstance(value, dict) and value.get("user_id") == user_id]
+            for key in purge:
+                sessions.pop(key, None)
+            if purge:
+                save_sessions(sessions)
+    except OSError as error:  # SessionStoreUnreadable is an OSError
+        structured_log("security.user_sessions_sign_out_incomplete", level="warning", reason=reason,
+                       error=type(error).__name__)
+        return 0
+    structured_log("security.user_sessions_signed_out", reason=reason, count=len(purge))
+    return len(purge)
 
 
 
@@ -11375,6 +11413,8 @@ def authenticated_user(request: Request) -> dict | None:
 
 
 
+    if user and session and not _session_survives_password_reset(session, user):
+        return None  # began before an administrator reset this account's password
     if user and _legacy_cloud_profile():
 
 
@@ -16285,13 +16325,30 @@ def _validate_configuration_member(name: str, payload: bytes) -> None:
         raise ConfigurationRestoreInvalid(f"{name} holds a user without an id or email.")
 
 
+def _remove_restore_leftovers(paths: list[Path]) -> list[str]:
+    """Removes each temporary file on its own; returns the names that could not be removed (and logs them)."""
+    left = []
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            left.append(path.name)
+    if left:
+        structured_log("configuration_restore.cleanup_incomplete", level="warning", leftover=left)
+    return left
+
+
 def restore_configuration_backup(archive_path: Path) -> dict:
     """All or nothing (Codex four-store review, FIX REQUIRED; owner 2026-11-06). Phase 1 reads and validates every
     restorable member (CRC, size, UTF-8, JSON, users/invites shape, no duplicates) and refuses the whole archive on any
     problem, before anything is written. Phase 2, under the users.json lock, writes every new file beside its target,
     keeps a copy of every current file, and only then swaps them in. If a swap fails, the files already swapped are put
     back from their copies (files that did not exist are removed) and the error is raised; a file that cannot be put
-    back keeps its copy on disk and the error says which."""
+    back keeps its copy on disk and the error says which.
+    r4 (Codex a0a74ea review, finding 2): each temporary file is tracked before it is written, so a partial write is
+    cleaned up too; each is removed on its own, and a removal failure never replaces the restore's own result or
+    error: a committed restore is still reported as restored (with result["leftover"]), and a failed one keeps its
+    error, with any leftovers added to it."""
     allowed = {path.name: path for path in CONFIG_BACKUP_FILES}
     staged: dict[Path, bytes] = {}
     skipped: list[str] = []
@@ -16316,8 +16373,9 @@ def restore_configuration_backup(archive_path: Path) -> dict:
                 raise ConfigurationRestoreInvalid(f"{name} could not be read from the archive: {error}") from error
             _validate_configuration_member(name, payload)
             staged[target] = payload
-    # The swap replaces users.json and user_invites.json whole, so it holds their lock: no read-modify-write can then
-    # save a pre-restore copy back over a restored file.
+    # Phase 2 holds the users.json lock from the first staging write to the last cleanup, because the swap replaces
+    # users.json and user_invites.json whole: no read-modify-write can then save a pre-restore copy back over a
+    # restored file.
     token = f"{os.getpid()}.{secrets.token_hex(6)}"
     written: dict[Path, Path] = {}
     kept: dict[Path, Path | None] = {}
@@ -16327,13 +16385,13 @@ def restore_configuration_backup(archive_path: Path) -> dict:
         try:
             for target, payload in staged.items():
                 temporary = target.with_name(f"{target.name}.{token}.restore")
+                written[target] = temporary  # tracked before the write, so a partial file is removed too
                 temporary.write_bytes(payload)
-                written[target] = temporary
             for target in staged:
                 if target.exists():
                     copy = target.with_name(f"{target.name}.{token}.rollback")
+                    kept[target] = copy  # tracked before the copy, for the same reason
                     shutil.copy2(target, copy)
-                    kept[target] = copy
                 else:
                     kept[target] = None
             for target, temporary in written.items():
@@ -16352,17 +16410,29 @@ def restore_configuration_backup(archive_path: Path) -> dict:
             structured_log("configuration_restore.rolled_back", level="error", error=type(error).__name__,
                            rolled_back=[path.name for path in replaced if path not in stranded],
                            not_rolled_back=[path.name for path in stranded])
+            leftover = _remove_restore_leftovers(
+                list(written.values()) + [copy for target, copy in kept.items() if copy and target not in stranded])
+            also = f"; temporary files left behind: {', '.join(leftover)}" if leftover else ""
             if stranded:
                 raise ConfigurationRestoreRollbackFailed(
                     f"Restore failed ({error}) and could not put back "
                     + ", ".join(f"{path.name} (pre-restore copy kept as {kept[path].name})" if kept.get(path)
                                 else f"{path.name} (it did not exist before the restore)" for path in stranded)
+                    + also
                 ) from error
+            if leftover:
+                raise OSError(f"{error}{also}") from error
             raise
-        finally:
-            for path in list(written.values()) + [copy for target, copy in kept.items() if copy and target not in stranded]:
-                path.unlink(missing_ok=True)
-    return {"restored": [target.name for target in staged], "skipped": skipped}
+        except BaseException:
+            # Not a filesystem error (for example an interruption): nothing is rolled back here, so the pre-restore
+            # copies are kept whenever a file was already swapped in.
+            _remove_restore_leftovers(list(written.values()) + ([] if replaced else [copy for copy in kept.values() if copy]))
+            raise
+        leftover = _remove_restore_leftovers(list(written.values()) + [copy for copy in kept.values() if copy])
+    result = {"restored": [target.name for target in staged], "skipped": skipped}
+    if leftover:
+        result["leftover"] = leftover  # the restore is committed; these are only temporary copies beside the files
+    return result
 
 
 
@@ -32689,86 +32759,14 @@ def sha256_file(path: Path) -> tuple[str, int]:
 
 
 def request_device_context(request: Request) -> dict:
-
-
-
-
-
-
-
-
-    forwarded_for = request.headers.get("x-forwarded-for", "")
-
-
-
-
-
-
-
-
-    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else ""
-
-
-
-
-
-
-
-
-    if not client_ip and request.client:
-
-
-
-
-
-
-
-
-        client_ip = request.client.host
-
-
-
-
-
-
-
-
+    # The recorded address is the connection's verified address (owner 2026-11-06, after the Codex a0a74ea review):
+    # uvicorn --proxy-headers rewrites request.client.host from X-Forwarded-For only for a connection from
+    # FORWARDED_ALLOW_IPS (loopback by default), so a client can't write an arbitrary address into the audit fields
+    # (paired_from_ip, last_ip, the evidence ledger's ip_address). The raw header is never trusted here.
     return {
-
-
-
-
-
-
-
-
-        "ip_address": client_ip,
-
-
-
-
-
-
-
-
+        "ip_address": request.client.host if request.client else "",
         "user_agent": request.headers.get("user-agent", ""),
-
-
-
-
-
-
-
-
         "host": request.headers.get("host", ""),
-
-
-
-
-
-
-
-
     }
 
 
@@ -47578,6 +47576,7 @@ def login_submit(
 
 
 
+    authenticated_at = time.time()  # before users.json is read: see create_session
     users = load_users()
 
 
@@ -48128,7 +48127,7 @@ def login_submit(
 
 
 
-    token = create_session(user["id"], remember_me == "true")
+    token = create_session(user["id"], remember_me == "true", authenticated_at=authenticated_at)
 
 
 
@@ -48514,6 +48513,7 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
     if own_appliance and selected_portal is None and not cloud:
         raise HTTPException(status_code=403, detail="Choose Administrator, Partner or Technician from the Portal selector, or use local emergency recovery sign-in.")
 
+    authenticated_at = time.time()  # before users.json is read: see create_session
     users = load_users()
     legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
     legacy_role: str | None = None
@@ -48671,7 +48671,7 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
 
     if decision["system"] == "legacy":
         _record_legacy_sign_in(legacy_user["id"])  # serialized with POST /login (Codex R1 re-review)
-        token = create_session(legacy_user["id"], False)
+        token = create_session(legacy_user["id"], False, authenticated_at=authenticated_at)
         append_audit_entry(AuditEntryModel(
             user_id=legacy_user["id"], user_name=legacy_user.get("display_name", email), role=legacy_user.get("role", "viewer"),
             # Labelled as the local emergency recovery sign-in it is (Codex 2026-11-06), keeping the entry point.
@@ -94444,7 +94444,8 @@ def claim_mobile_pairing(
                 auth_audit("mobile_pairing.claim_refused", actor_email=identity.get("email"), actor_role=str(identity.get("role") or ""),
                            reason="code_belongs_to_another_account", entity_type="mobile_pairing", entity_id=account_id)
             raise HTTPException(status_code=400, detail="Pairing code is invalid or expired.")
-        _pairing_claim_failures.pop(f"account:{account_id}", None)
+        # A successful claim does not clear this account's earlier failures (Codex a0a74ea review, finding 4; owner
+        # 2026-11-06): they keep counting until they leave the 10-minute window.
         device_id = uuid.uuid4().hex
         now = datetime.now().isoformat()
         device = {
@@ -125188,6 +125189,9 @@ def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
     except (BadSignature, SignatureExpired):
         return {"status": "error", "message": "Invitation expired or invalid."}
     invite_id = token_payload.get("invite_id")
+    refusal = _invite_acceptance_refusal(invite_id)  # spent, cancelled or duplicate: refused before the hash
+    if refusal:
+        return refusal
     # P3 N3-A (owner 2026-11-06): the bcrypt hash (about 0.25 s) is computed before the users.json lock is taken, so
     # the lock is held only from read to save. Every request's authentication reads users.json under the same lock on
     # the event-loop thread, so a hash inside it stalled the whole server.
@@ -126013,6 +126017,39 @@ def users_api(request: Request) -> dict:
 
 
 
+# Read-only checks before a password hash (Codex a0a74ea review, findings 1 and 3; owner 2026-11-06). A request that is
+# going to be refused anyway is refused before the bcrypt hash (about 0.25 s), so a spent invitation or a duplicate
+# can't be used to make the server hash repeatedly. Each check is repeated under _USERS_FILE_LOCK before the write.
+def _actor_still_authorized(request: Request, actor: dict, permission: str = "manage_users") -> bool:
+    """Under _USERS_FILE_LOCK, just before the write: the request's identity is resolved again from its session and
+    the current users.json (or the cloud grant), so an administrator disabled, removed or demoted while the password
+    was being hashed can't complete the write."""
+    fresh = current_user(request)
+    return fresh.get("id") == actor.get("id") and has_permission(fresh, permission)
+
+
+def _user_email_in_use(email: str) -> bool:
+    if not email:
+        return False
+    with _USERS_FILE_LOCK:
+        return any(item.get("email", "").lower() == email.lower() for item in load_users())
+
+
+def _user_exists(user_id: str) -> bool:
+    with _USERS_FILE_LOCK:
+        return any(item.get("id") == user_id for item in load_users())
+
+
+def _invite_acceptance_refusal(invite_id) -> dict | None:
+    with _USERS_FILE_LOCK:
+        invite = next((item for item in load_user_invites() if item.get("id") == invite_id and item.get("status") == "pending"), None)
+        if not invite:
+            return {"status": "error", "message": "Invitation is no longer available."}
+        if any(item.get("email", "").lower() == str(invite.get("email", "")).lower() for item in load_users()):
+            return {"status": "error", "message": "An account already exists for this email."}
+    return None
+
+
 @app.post("/api/users")
 def create_user(request: Request, new_user: UserCreateModel) -> dict:
     actor = current_user(request)
@@ -126021,11 +126058,16 @@ def create_user(request: Request, new_user: UserCreateModel) -> dict:
         return {"status": "error", "message": "Administrator permission required."}
     if new_user.role not in VALID_ROLES:
         return {"status": "error", "message": "Unsupported role."}
+    if _user_email_in_use(new_user.email):  # refused before the hash
+        return {"status": "error", "message": "That email is already in use."}
     # P3 N3-A (owner 2026-11-06): the bcrypt hash (about 0.25 s) is computed before the users.json lock is taken, so
     # the lock is held only from read to save. Every request's authentication reads users.json under the same lock on
     # the event-loop thread, so a hash inside it stalled the whole server.
     password_hash = hash_password(new_user.password)
     with _USERS_FILE_LOCK:
+        if not _actor_still_authorized(request, actor):
+            record_audit(request, "create", "user", "Permission denied", "denied")
+            return {"status": "error", "message": "Administrator permission required."}
         users = load_users()
         if any(
             item.get("email", "").lower() == new_user.email.lower()
@@ -126353,11 +126395,16 @@ def change_user_password(
     if not has_permission(actor, "manage_users"):
         record_audit(request, "update_password", f"user:{user_id}", "Permission denied", "denied")
         return {"status": "error", "message": "Administrator permission required."}
+    if not _user_exists(user_id):  # refused before the hash
+        return {"status": "error", "message": "User not found."}
     # P3 N3-A (owner 2026-11-06): the bcrypt hash (about 0.25 s) is computed before the users.json lock is taken, so
     # the lock is held only from read to save. Every request's authentication reads users.json under the same lock on
     # the event-loop thread, so a hash inside it stalled the whole server.
     password_hash = hash_password(change.password)
     with _USERS_FILE_LOCK:
+        if not _actor_still_authorized(request, actor):
+            record_audit(request, "update_password", f"user:{user_id}", "Permission denied", "denied")
+            return {"status": "error", "message": "Administrator permission required."}
         users = load_users()
         target = next((item for item in users if item.get("id") == user_id), None)
         if not target:
@@ -126365,7 +126412,11 @@ def change_user_password(
         target["password_hash"] = password_hash
         target["failed_login_attempts"] = 0
         target["locked_until"] = None
+        # Owner 2026-11-06: the reset signs the account out everywhere. Every session that began before this moment
+        # is refused (authenticated_user); other accounts' sessions are untouched.
+        target["sessions_valid_after"] = time.time()
         save_users(users)
+        _sign_out_user_sessions(user_id, reason="password_reset_by_administrator")
         record_audit(request, "update_password", f"user:{user_id}", "Password reset by administrator.")
     return {"status": "complete", "message": "Password updated."}
 
