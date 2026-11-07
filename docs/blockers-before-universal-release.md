@@ -242,3 +242,21 @@ Nothing was left half-committed by either attempt.
 **Explicitly not done:** no camera settings, networking, credentials,
 or firmware were changed; no third resubmission was requested; no
 camera row was manually created.
+
+## Windows VMS 1.3.4.1: an older session file can revive signed-out sessions
+
+**Found:** 2026-11-07, Codex read-only review of Windows candidate a0a74ea (Part B items 1 and 2, Medium).
+
+**Problem:** putting back an older `sessions.json` revives sessions signed out normally since that copy, and deleting
+`sessions_epoch.json` with an old session record put back revives sessions from before the first quarantine. Both need
+write access to the VMS data folder.
+
+**Interim (owner 2026-11-06, Option A, test candidate only):** documented trust boundary and an operator step to
+invalidate all sessions after restoring an older data-folder backup:
+`docs/WINDOWS-1341-SESSION-FILE-TRUST-BOUNDARY.md`.
+
+**Not fixed by:** the password-reset revocation in the same candidate (it covers only sessions that began before an
+administrator's password reset).
+
+**Must be resolved before customer deployment.** Options B and C are in the owner proposal of 2026-11-07; neither is
+implemented.
