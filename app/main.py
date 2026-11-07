@@ -11040,9 +11040,6 @@ def save_sessions(sessions: dict) -> None:
 # create_session() without a session_generation argument (Codex 72fbe7c review, finding 1): only an omitted argument
 # reads the account's counter now. Any value passed, None included, is the caller's snapshot and is stored as it is.
 _NO_SESSION_SNAPSHOT = object()
-# Codex 72fbe7c review, finding 2: a damaged counter is never restarted at a small value an earlier session may carry.
-# It moves to a fresh random value at or above 2**62, which counting up from 0 never reaches.
-_SESSION_GENERATION_RECOVERY_FLOOR = 2 ** 62
 
 
 def create_session(user_id: str, remember_me: bool = False, session_generation=_NO_SESSION_SNAPSHOT) -> str:
@@ -11080,11 +11077,12 @@ def _session_generation_value(value) -> int | None:
     return value
 
 
-def _next_session_generation(user: dict) -> int:
+def _next_session_generation(user: dict) -> int | None:
+    """The account's session counter after a password reset, or None when the stored counter is damaged. A damaged
+    counter is never replaced: no new value can be shown never to match a session issued before the damage, so the
+    reset is refused instead (Codex 5b628f3 review, owner 2026-11-07)."""
     current = _session_generation_value(user.get("session_generation", 0))
-    if current is None:  # damaged: a fresh value, never one an earlier session may carry (see the floor above)
-        return _SESSION_GENERATION_RECOVERY_FLOOR + secrets.randbelow(_SESSION_GENERATION_RECOVERY_FLOOR)
-    return current + 1
+    return None if current is None else current + 1
 
 
 def _session_survives_password_reset(session: dict, user: dict) -> bool:
@@ -125997,13 +125995,22 @@ def change_user_password(
         target = next((item for item in users if item.get("id") == user_id), None)
         if not target:
             return {"status": "error", "message": "User not found."}
+        next_generation = _next_session_generation(target)
+        if next_generation is None:
+            # Owner 2026-11-07 (Codex 5b628f3 review): a damaged session counter fails closed. Nothing is written, so
+            # the password, the account record and sessions.json stay as they are, and every session of the account
+            # stays refused (authenticated_user) until users.json is repaired.
+            record_audit(request, "update_password", f"user:{user_id}",
+                         "Refused: the account's session counter in users.json is damaged.", "failed", actor=authorized)
+            return {"status": "error", "message": "Password not changed: this account's stored session record is "
+                    "damaged and must be repaired first."}
         target["password_hash"] = password_hash
         target["failed_login_attempts"] = 0
         target["locked_until"] = None
         # Owner 2026-11-07 (Codex 20b3a35 review, finding 1): the reset signs the account out everywhere by advancing
         # its session counter; every session carrying an earlier counter is refused (authenticated_user). Other
         # accounts' sessions are untouched.
-        target["session_generation"] = _next_session_generation(target)
+        target["session_generation"] = next_generation
         target.pop("sessions_valid_after", None)  # the r4 test candidate's clock cutoff, replaced by the counter
         save_users(users)
         removed = _sign_out_user_sessions(user_id, reason="password_reset_by_administrator")

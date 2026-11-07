@@ -7,8 +7,9 @@ lands picked up the reset's new counter and kept a working session. Now only an 
 any value passed, null included, is stored as it is and refused.
 
 Finding 2 (Medium), before: a reset on an account whose counter was damaged restarted it at 1, which could match an
-earlier generation-1 session still in sessions.json (a failed purge) or put back from an older copy. Now a damaged
-counter moves to a fresh value that no earlier session carries.
+earlier generation-1 session still in sessions.json (a failed purge) or put back from an older copy. r6 moved a
+damaged counter to a random value; since r7 (Codex 5b628f3 review, owner 2026-11-07) the reset is refused instead and
+the counter stays damaged, so no earlier session works (test_windows_1341_codex_5b628f3_fixes_r7.py).
 """
 import ast
 import json
@@ -110,7 +111,7 @@ def test_an_explicit_null_snapshot_is_stored_as_it_is_and_refused(client):
 
 def test_a_sign_in_on_a_null_counter_account_mid_check_when_the_reset_lands_gets_no_working_session(client, monkeypatch):
     # Codex 72fbe7c finding 1: the account's counter is null, the sign-in has checked the old password against that
-    # read, the reset repairs the counter, then the sign-in creates its session.
+    # read, the reset lands, then the sign-in creates its session. Since r7 the reset on a null counter is refused.
     main.save_users([dict(ADMIN), _user("viewer-1", session_generation=None)])
     admin = _cookies("admin-1")
     real_verify = main.verify_password
@@ -123,12 +124,12 @@ def test_a_sign_in_on_a_null_counter_account_mid_check_when_the_reset_lands_gets
         return matched
     monkeypatch.setattr(main, "verify_password", verify_then_reset)
     late = _sign_in("viewer-1@example.test", PASSWORD)
-    assert resets == [{"status": "complete", "message": "Password updated."}]
+    assert [reset["status"] for reset in resets] == ["error"]
     assert late.status_code == 303
     assert _signed_in_as(late.cookies[main.SESSION_COOKIE_NAME]) is None
     monkeypatch.setattr(main, "verify_password", real_verify)
-    fresh = _sign_in("viewer-1@example.test", NEW_PASSWORDS[0])
-    assert fresh.status_code == 303 and _signed_in_as(fresh.cookies[main.SESSION_COOKIE_NAME]) == "viewer-1"
+    assert _account("viewer-1")["session_generation"] is None
+    assert _sign_in("viewer-1@example.test", NEW_PASSWORDS[0]).status_code == 401
 
 
 def test_an_omitted_snapshot_still_takes_the_counter_as_it_is_now(client):
@@ -181,18 +182,14 @@ def test_a_reset_on_a_damaged_counter_never_revives_an_earlier_session_from_a_re
     admin = _cookies("admin-1")
     generation_one, other, kept_copy = _issued_generations(client, admin)
     _damage("viewer-1", damaged)
-    assert _reset(client, "viewer-1", NEW_PASSWORDS[2], admin)["status"] == "complete"
-    recovered = _account("viewer-1")["session_generation"]
-    assert main._session_generation_value(recovered) is not None and recovered not in (0, 1, 2)
+    assert _reset(client, "viewer-1", NEW_PASSWORDS[2], admin)["status"] == "error"  # r7: refused, nothing changes
+    assert _account("viewer-1")["session_generation"] == damaged
     main.SESSIONS_FILE.write_bytes(kept_copy)  # an older sessions.json put back, holding the generation-1 session
     assert _signed_in_as(generation_one) is None
     assert _signed_in_as(other) == "viewer-2"  # another account's session is untouched
-    # The account works again from the recovered counter, and the next reset still refuses what came before.
-    signed_in = _sign_in("viewer-1@example.test", NEW_PASSWORDS[2])
-    assert signed_in.status_code == 303 and _signed_in_as(signed_in.cookies[main.SESSION_COOKIE_NAME]) == "viewer-1"
-    assert _reset(client, "viewer-1", NEW_PASSWORDS[3], admin)["status"] == "complete"
-    assert _account("viewer-1")["session_generation"] == recovered + 1
-    assert _signed_in_as(signed_in.cookies[main.SESSION_COOKIE_NAME]) is None
+    assert _sign_in("viewer-1@example.test", NEW_PASSWORDS[2]).status_code == 401  # the password was not changed
+    still = _sign_in("viewer-1@example.test", NEW_PASSWORDS[1])
+    assert still.status_code == 303 and _signed_in_as(still.cookies[main.SESSION_COOKIE_NAME]) is None
 
 
 @pytest.mark.parametrize("damaged", DAMAGED, ids=DAMAGED_IDS)
@@ -206,7 +203,8 @@ def test_a_reset_on_a_damaged_counter_never_revives_an_earlier_session_left_by_a
         raise main.SessionStoreUnreadable("sessions.json could not be read: PermissionError")
     with monkeypatch.context() as during:
         during.setattr(main, "_load_sessions_for_update", unreadable)
-        assert _reset(client, "viewer-1", NEW_PASSWORDS[2], admin)["status"] == "complete"
+        assert _reset(client, "viewer-1", NEW_PASSWORDS[2], admin)["status"] == "error"  # r7: refused before any write
+    assert _account("viewer-1")["session_generation"] == damaged
     stored = json.loads(main.SESSIONS_FILE.read_text(encoding="utf-8"))
     assert stored[main.session_serializer.loads(generation_one)["session_id"]]["session_generation"] == 1  # still there
     assert _signed_in_as(generation_one) is None

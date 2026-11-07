@@ -202,15 +202,16 @@ def test_an_account_reset_under_the_r4_clock_cutoff_refuses_its_r4_sessions_only
 
 
 @pytest.mark.parametrize("damaged", ["1", -1, True, None, 1.5], ids=["text", "negative", "bool", "null", "float"])
-def test_a_damaged_session_counter_refuses_every_session_until_a_reset(client, damaged):
+def test_a_damaged_session_counter_refuses_every_session_and_every_reset(client, damaged):
+    # r7 (Codex 5b628f3 review, owner 2026-11-07): the reset fails closed instead of replacing the counter.
     main.save_users([dict(ADMIN), _user("viewer-1", session_generation=damaged)])
     assert _signed_in_as(main.create_session("viewer-1")) is None
     assert _sign_in("viewer-1@example.test").status_code == 303  # the password still matches; no session works
-    assert _reset(client, "viewer-1", NEW_PASSWORDS[0], _cookies("admin-1"))["status"] == "complete"
-    recovered = _account("viewer-1")["session_generation"]  # never 1: Codex 72fbe7c finding 2
-    assert main._session_generation_value(recovered) is not None and recovered not in (0, 1)
-    signed_in = _sign_in("viewer-1@example.test", NEW_PASSWORDS[0])
-    assert _signed_in_as(signed_in.cookies[main.SESSION_COOKIE_NAME]) == "viewer-1"
+    assert _reset(client, "viewer-1", NEW_PASSWORDS[0], _cookies("admin-1"))["status"] == "error"
+    assert _account("viewer-1")["session_generation"] == damaged
+    assert _sign_in("viewer-1@example.test", NEW_PASSWORDS[0]).status_code == 401
+    signed_in = _sign_in("viewer-1@example.test")
+    assert _signed_in_as(signed_in.cookies[main.SESSION_COOKIE_NAME]) is None
 
 
 # ---------------------------------------------------------------- finding 2 a session-store failure during the sign-out
