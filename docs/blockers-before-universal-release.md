@@ -256,8 +256,12 @@ invalidate all VMS sessions after restoring an older data-folder backup (deletin
 is stopped; this does not affect the separately stored Partner Portal sessions):
 `docs/WINDOWS-1341-SESSION-FILE-TRUST-BOUNDARY.md`.
 
-**Not fixed by:** the password-reset revocation (candidate r5 per-account session counter, not yet verified; it covers
-only sessions from before an administrator's password reset).
+**Not fixed by:** the password-reset revocation (candidates r5 to r8 per-account session counter, not yet verified;
+it covers only sessions from before an administrator's password reset).
+
+**Related limitation (owner 2026-11-07 r8):** an account whose session counter is damaged can't have its password
+reset and has no working VMS session until it is recovered. Recovery is for authorized support only (no manual
+`users.json` edit, no chosen replacement counter); a recovery design needs separate owner approval.
 
 **Must be resolved before customer deployment.** Options B and C are in the owner proposal of 2026-11-07; neither is
 implemented.

@@ -21,12 +21,25 @@ Both need write access to the data folder.
 - A disabled account is refused, whatever `sessions.json` says.
 
 ## Not yet verified: sessions after a password reset
-- Candidate r5 records an administrator's password reset as a per-account session counter in `users.json`, and a
-  VMS session is accepted only while it carries the account's current counter. It is meant to refuse every earlier
+- Candidates r5 to r8 record an administrator's password reset as a per-account session counter in `users.json`,
+  and a VMS session is accepted only while it carries the account's current counter. It is meant to refuse every earlier
   session, even if an older `sessions.json` is put back. It replaces the r4 time-based cutoff, which the Codex
   review of 20b3a35 found could fail if the clock stepped backward.
 - This protection is **not** established until its focused tests and an independent review pass. Even then it does
   **not** close items 1 and 2: a normal sign-out is still undone by an older `sessions.json`.
+
+## Damaged session counter: authorized recovery only
+- Since candidate r7, an administrator's password reset is refused when the account's session counter in
+  `users.json` is damaged (not a whole number of zero or more). Nothing is changed: not the password, not the
+  account record, not `sessions.json`, and since r8 no automatic update of a legacy account in `users.json` either.
+  The refusal is recorded in the audit log as a failed password change by that administrator.
+- Until the account is recovered, none of its VMS sessions are accepted and its password can't be reset. Other
+  accounts are not affected.
+- **Recovery is for authorized AnyAiCam support only. Escalate to them.** Do not edit `users.json` by hand, and do
+  not choose a replacement counter value: a value that matches an earlier session of the account would make that
+  session valid again.
+- No recovery procedure is approved yet. A recovery design needs separate owner approval; until then this is a
+  known limitation of the test candidate.
 
 ## Trust boundary
 - **Anyone who can write the VMS data folder is trusted with sign-in state.** Such a writer can already edit

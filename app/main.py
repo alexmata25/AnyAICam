@@ -9670,6 +9670,14 @@ def default_users() -> list[dict]:
 
 
 
+# Codex 935756f review (owner 2026-11-07 r8): while set, load_users() applies the legacy migration in memory only and
+# writes nothing (no migrated list, no defaults for a missing file). It is set for the whole of an administrator's
+# password-reset request (password_reset_read_only_users_middleware), so a reset refused for a damaged session counter
+# leaves users.json byte-identical; a reset that goes ahead saves the migrated list with its own change.
+_USERS_LOAD_READ_ONLY: ContextVar[bool] = ContextVar("users_load_read_only", default=False)
+_PASSWORD_RESET_PATH = re.compile(r"/api/users/[^/]+/password")
+
+
 def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
 
 
@@ -10181,7 +10189,7 @@ def load_users() -> list[dict]:
 
 
 
-                if changed:
+                if changed and not _USERS_LOAD_READ_ONLY.get():
 
 
 
@@ -10281,6 +10289,8 @@ def load_users() -> list[dict]:
 
 
     users = legacy_tombstone_users() if cloud else default_users()
+    if _USERS_LOAD_READ_ONLY.get():
+        return users
 
 
 
@@ -44828,6 +44838,20 @@ async def authentication_middleware(request: Request, call_next):
     if RUNTIME_ROLE == "cloud":
         return RedirectResponse(f"/partner.html?next={next_url}", status_code=303)
     return RedirectResponse(f"/login?next={next_url}", status_code=303)
+
+
+
+@app.middleware("http")
+async def password_reset_read_only_users_middleware(request: Request, call_next):
+    # Declared after authentication_middleware, so it wraps it: the request's own authentication loads users.json
+    # read-only as well (see _USERS_LOAD_READ_ONLY).
+    if request.method != "PUT" or not _PASSWORD_RESET_PATH.fullmatch(request.url.path):
+        return await call_next(request)
+    token = _USERS_LOAD_READ_ONLY.set(True)
+    try:
+        return await call_next(request)
+    finally:
+        _USERS_LOAD_READ_ONLY.reset(token)
 
 
 
@@ -125999,11 +126023,12 @@ def change_user_password(
         if next_generation is None:
             # Owner 2026-11-07 (Codex 5b628f3 review): a damaged session counter fails closed. Nothing is written, so
             # the password, the account record and sessions.json stay as they are, and every session of the account
-            # stays refused (authenticated_user) until users.json is repaired.
+            # stays refused (authenticated_user). Recovery is for authorized support only (owner 2026-11-07 r8). Every
+            # users.json load in this request was read-only (_USERS_LOAD_READ_ONLY), so no migration was saved either.
             record_audit(request, "update_password", f"user:{user_id}",
                          "Refused: the account's session counter in users.json is damaged.", "failed", actor=authorized)
             return {"status": "error", "message": "Password not changed: this account's stored session record is "
-                    "damaged and must be repaired first."}
+                    "damaged. Contact authorized support to recover the account."}
         target["password_hash"] = password_hash
         target["failed_login_attempts"] = 0
         target["locked_until"] = None
