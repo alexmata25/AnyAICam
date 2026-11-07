@@ -9675,7 +9675,10 @@ def default_users() -> list[dict]:
 # password-reset request (password_reset_read_only_users_middleware), so a reset refused for a damaged session counter
 # leaves users.json byte-identical; a reset that goes ahead saves the migrated list with its own change.
 _USERS_LOAD_READ_ONLY: ContextVar[bool] = ContextVar("users_load_read_only", default=False)
-_PASSWORD_RESET_PATH = re.compile(r"/api/users/[^/]+/password")
+# Codex abf368b review (owner 2026-11-07 r9): trailing slashes too. The router (redirect_slashes) answers a PUT to
+# .../password/ (any number of trailing slashes) with 307 to the canonical route after the middleware has already run
+# that request's authentication, so those forms are classified as the reset as well.
+_PASSWORD_RESET_PATH = re.compile(r"/api/users/[^/]+/password/*")
 
 
 def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
