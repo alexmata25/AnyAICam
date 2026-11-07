@@ -170,7 +170,6 @@ def _assert_refused_without_any_write(client, monkeypatch, target, users_before_
     result = _reset(client, target, NEW_PASSWORDS[0], admin)
 
     assert result["status"] == "error" and "not changed" in result["message"]
-    assert "authorized support" in result["message"]
     assert main.USERS_FILE.read_bytes() == users_before  # no migration, no password, no counter, no lockout change
     assert main.SESSIONS_FILE.read_bytes() == sessions_before
     assert saves == [] and sign_outs == []
@@ -178,6 +177,7 @@ def _assert_refused_without_any_write(client, monkeypatch, target, users_before_
     assert [(entry["action"], entry["resource"], entry["outcome"], entry["user_id"]) for entry in entries] == [
         ("update_password", f"user:{target}", "failed", "admin-1")]
     assert NEW_PASSWORDS[0] not in json.dumps(entries)
+    assert "authorized support" in result["message"]  # checked last: the file checks above are the reproduction
     return admin
 
 
