@@ -11037,10 +11037,15 @@ def save_sessions(sessions: dict) -> None:
 
 
 
-def create_session(user_id: str, remember_me: bool = False, authenticated_at: float | None = None) -> str:
-    """authenticated_at is when the sign-in began, before it read users.json. A password reset by an administrator
-    records its own moment on the account, and authenticated_user refuses any session that began before it, so a
-    sign-in already checking the old password when the reset lands can't keep a session either."""
+def create_session(user_id: str, remember_me: bool = False, session_generation=None) -> str:
+    """session_generation is the account's session counter (users.json) from the same read the sign-in checked the
+    password against. A password reset by an administrator advances the counter, and authenticated_user accepts a
+    session only while it carries the current one, so a sign-in already checking the old password when the reset
+    lands can't keep a session either, whatever the clock does. A caller with no such read (None) gets the counter
+    as it is now, read before the sessions lock is taken (lock order users -> sessions)."""
+    if session_generation is None:
+        account = next((item for item in load_users() if item.get("id") == user_id), None)
+        session_generation = (account or {}).get("session_generation", 0)
     session_id = secrets.token_urlsafe(32)
     max_age = 30 * 24 * 3600 if remember_me else SESSION_MAX_AGE_SECONDS
     with _SESSIONS_FILE_LOCK:
@@ -11049,7 +11054,7 @@ def create_session(user_id: str, remember_me: bool = False, authenticated_at: fl
             "user_id": user_id,
             "created_at": datetime.now().isoformat(),
             "expires_at": (datetime.now() + timedelta(seconds=max_age)).isoformat(),
-            "authenticated_at": time.time() if authenticated_at is None else authenticated_at,
+            "session_generation": session_generation,
         }
         epoch = _read_session_epoch()  # after the load, which may have started a new epoch
         if epoch:
@@ -11059,24 +11064,38 @@ def create_session(user_id: str, remember_me: bool = False, authenticated_at: fl
     return session_serializer.dumps({"session_id": session_id})
 
 
+def _session_generation_value(value) -> int | None:
+    """A session counter as stored: a non-negative integer, otherwise None (refused)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _next_session_generation(user: dict) -> int:
+    current = _session_generation_value(user.get("session_generation", 0))
+    return (current if current is not None else 0) + 1
+
+
 def _session_survives_password_reset(session: dict, user: dict) -> bool:
-    """False for a session that began before the account's last password reset by an administrator
-    (users.json sessions_valid_after, a time.time() value). Accounts never reset carry no such field."""
-    cutoff = user.get("sessions_valid_after")
-    if cutoff is None:
-        return True
-    try:
-        moment = session.get("authenticated_at")
-        moment = float(moment) if moment is not None else datetime.fromisoformat(str(session.get("created_at"))).timestamp()
-        return moment > float(cutoff)
-    except (TypeError, ValueError):
-        return False  # the session's age can't be established, so it is refused
+    """True while the session carries the account's current session counter (users.json session_generation, advanced
+    by every password reset by an administrator). No clock is compared (Codex 20b3a35 review, finding 1).
+    Missing on either side means 0, so accounts never reset, and sessions written before the counter existed, keep
+    working until the account's first reset. A stored value that is not a non-negative integer refuses the session."""
+    current = _session_generation_value(user.get("session_generation", 0))
+    if current is None:
+        return False
+    if "session_generation" not in session and "sessions_valid_after" in user:
+        return False  # the account was reset under the r4 test candidate's clock cutoff, before the counter existed
+    return _session_generation_value(session.get("session_generation", 0)) == current
 
 
-def _sign_out_user_sessions(user_id: str, reason: str) -> int:
-    """Removes the account's sessions from sessions.json. Called under _USERS_FILE_LOCK after users.json records
-    sessions_valid_after (lock order users -> sessions). That field is what refuses the sessions, so a sessions.json
-    that can't be updated, or an older copy put back later, still can't sign the account in."""
+def _sign_out_user_sessions(user_id: str, reason: str) -> int | None:
+    """Removes the account's sessions from sessions.json; returns how many, or None when the store couldn't be
+    updated. Called under _USERS_FILE_LOCK after users.json records the new session counter (lock order users ->
+    sessions). The counter is what refuses the sessions, so a sessions.json that can't be updated, or an older copy
+    put back later, still can't sign the account in. Any failure here is logged and reported to the caller, never
+    raised: the reset is already committed (Codex 20b3a35 review, finding 2; SessionStoreUnreadable is a
+    RuntimeError, and a quarantine can fail as well)."""
     try:
         with _SESSIONS_FILE_LOCK:
             sessions = _load_sessions_for_update()
@@ -11085,10 +11104,10 @@ def _sign_out_user_sessions(user_id: str, reason: str) -> int:
                 sessions.pop(key, None)
             if purge:
                 save_sessions(sessions)
-    except OSError as error:  # SessionStoreUnreadable is an OSError
+    except Exception as error:
         structured_log("security.user_sessions_sign_out_incomplete", level="warning", reason=reason,
                        error=type(error).__name__)
-        return 0
+        return None
     structured_log("security.user_sessions_signed_out", reason=reason, count=len(purge))
     return len(purge)
 
@@ -12021,194 +12040,30 @@ def append_audit_log(action: str, *, user: dict, details: dict | None = None) ->
 
 
 def record_audit(
-
-
-
-
-
-
-
-
     request: Request,
-
-
-
-
-
-
-
-
     action: str,
-
-
-
-
-
-
-
-
     resource: str,
-
-
-
-
-
-
-
-
     detail: str = "",
-
-
-
-
-
-
-
-
     outcome: str = "success",
-
-
-
-
-
-
-
-
+    actor: dict | None = None,
 ) -> None:
-
-
-
-
-
-
-
-
-    user = current_user(request)
-
-
-
-
-
-
-
-
+    # actor: the identity already resolved for this request. An administrator resetting their own password signs
+    # their own session out before the entry is written, so the reset passes the administrator it resolved under the
+    # lock instead of resolving the request again (Codex 20b3a35 review, finding 4).
+    user = actor if actor is not None else current_user(request)
     entry = AuditEntryModel(
-
-
-
-
-
-
-
-
         user_id=user.get("id", "unknown"),
-
-
-
-
-
-
-
-
         user_name=user.get("display_name", "Unknown user"),
-
-
-
-
-
-
-
-
         role=user.get("role", "viewer"),
-
-
-
-
-
-
-
-
         action=action,
-
-
-
-
-
-
-
-
         resource=resource,
-
-
-
-
-
-
-
-
         detail=detail,
-
-
-
-
-
-
-
-
         device=request.headers.get("user-agent", "Web browser")[:160],
-
-
-
-
-
-
-
-
         outcome=outcome,
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
     try:
-
-
-
-
-
-
-
-
         append_audit_entry(entry.model_dump(mode="json"))
-
-
-
-
-
-
-
-
     except OSError:
-
-
-
-
-
-
-
-
         pass
 
 
@@ -47576,7 +47431,7 @@ def login_submit(
 
 
 
-    authenticated_at = time.time()  # before users.json is read: see create_session
+
     users = load_users()
 
 
@@ -48127,7 +47982,7 @@ def login_submit(
 
 
 
-    token = create_session(user["id"], remember_me == "true", authenticated_at=authenticated_at)
+    token = create_session(user["id"], remember_me == "true", session_generation=user.get("session_generation", 0))
 
 
 
@@ -48513,7 +48368,7 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
     if own_appliance and selected_portal is None and not cloud:
         raise HTTPException(status_code=403, detail="Choose Administrator, Partner or Technician from the Portal selector, or use local emergency recovery sign-in.")
 
-    authenticated_at = time.time()  # before users.json is read: see create_session
+
     users = load_users()
     legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
     legacy_role: str | None = None
@@ -48671,7 +48526,7 @@ def _portal_login(request: Request, payload: dict, refusal: dict):
 
     if decision["system"] == "legacy":
         _record_legacy_sign_in(legacy_user["id"])  # serialized with POST /login (Codex R1 re-review)
-        token = create_session(legacy_user["id"], False, authenticated_at=authenticated_at)
+        token = create_session(legacy_user["id"], False, session_generation=legacy_user.get("session_generation", 0))
         append_audit_entry(AuditEntryModel(
             user_id=legacy_user["id"], user_name=legacy_user.get("display_name", email), role=legacy_user.get("role", "viewer"),
             # Labelled as the local emergency recovery sign-in it is (Codex 2026-11-06), keeping the entry point.
@@ -52916,332 +52771,53 @@ def download_backup(request: Request, backup_name: str):
 
 
 @app.post("/api/operations/restore")
-
-
-
-
-
-
-
-
 async def restore_backup_api(request: Request, backup_file: UploadFile = File(...)) -> dict:
-
-
-
-
-
-
-
-
     user = current_user(request)
-
-
-
-
-
-
-
-
     if not has_permission(user, "manage_users"):
-
-
-
-
-
-
-
-
         record_audit(request, "restore", "configuration", "Permission denied", "denied")
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Administrator permission required."}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     safe_name = Path(backup_file.filename or "restore.zip").name
-
-
-
-
-
-
-
-
     if not safe_name.lower().endswith(".zip"):
-
-
-
-
-
-
-
-
         return {"status": "error", "message": "Restore file must be a ZIP archive."}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     destination = RESTORE_STAGING_FOLDER / f"{uuid.uuid4().hex}_{safe_name}"
-
-
-
-
-
-
-
-
     try:
+        response = await _restore_uploaded_archive(request, backup_file, destination)
+    except BaseException:
+        _remove_restore_leftovers([destination])  # logs a failed removal; the original exception propagates
+        raise
+    # The uploaded archive is removed once the outcome is settled (Codex 20b3a35 review, finding 3; owner
+    # 2026-11-07): a failed removal is logged and reported beside the result, never instead of it.
+    left = _remove_restore_leftovers([destination])
+    if left:
+        response["archive_left_behind"] = left
+    return response
 
 
-
-
-
-
-
-
+async def _restore_uploaded_archive(request: Request, backup_file: UploadFile, destination: Path) -> dict:
+    try:
         payload = await backup_file.read()
-
-
-
-
-
-
-
-
         if not payload or len(payload) > 100 * 1024 * 1024:
-
-
-
-
-
-
-
-
             return {"status": "error", "message": "Restore archive is empty or larger than 100 MB."}
-
-
-
-
-
-
-
-
         destination.write_bytes(payload)
-
-
-
-
-
-
-
-
         if not zipfile.is_zipfile(destination):
-
-
-
-
-
-
-
-
             return {"status": "error", "message": "Restore archive is not a valid ZIP file."}
-
-
-
-
-
-
-
-
         result = restore_configuration_backup(destination)
-
-
-
-
-
-
-
-
     except ConfigurationRestoreInvalid as error:
         record_audit(request, "restore", "configuration", f"Refused, nothing changed: {error}", "failed")
         return {"status": "error", "message": f"Restore refused, nothing was changed: {error}"}
     except (OSError, zipfile.BadZipFile) as error:
-
-
-
-
-
-
-
-
         record_audit(request, "restore", "configuration", str(error), "failed")
-
-
-
-
-
-
-
-
         return {"status": "error", "message": f"Restore failed: {error}"}
-
-
-
-
-
-
-
-
-    finally:
-
-
-
-
-
-
-
-
-        destination.unlink(missing_ok=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     record_audit(
-
-
-
-
-
-
-
-
         request,
-
-
-
-
-
-
-
-
         "restore",
-
-
-
-
-
-
-
-
         "configuration",
-
-
-
-
-
-
-
-
         f"Restored files: {', '.join(result['restored']) or 'none'}",
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
     return {
-
-
-
-
-
-
-
-
         "status": "complete",
-
-
-
-
-
-
-
-
         "message": "Configuration restored. Restart the container to reload all settings.",
-
-
-
-
-
-
-
-
         **result,
-
-
-
-
-
-
-
-
     }
 
 
@@ -126020,12 +125596,12 @@ def users_api(request: Request) -> dict:
 # Read-only checks before a password hash (Codex a0a74ea review, findings 1 and 3; owner 2026-11-06). A request that is
 # going to be refused anyway is refused before the bcrypt hash (about 0.25 s), so a spent invitation or a duplicate
 # can't be used to make the server hash repeatedly. Each check is repeated under _USERS_FILE_LOCK before the write.
-def _actor_still_authorized(request: Request, actor: dict, permission: str = "manage_users") -> bool:
+def _actor_still_authorized(request: Request, actor: dict, permission: str = "manage_users") -> dict | None:
     """Under _USERS_FILE_LOCK, just before the write: the request's identity is resolved again from its session and
     the current users.json (or the cloud grant), so an administrator disabled, removed or demoted while the password
-    was being hashed can't complete the write."""
+    was being hashed can't complete the write. Returns that identity (for the audit entry), or None."""
     fresh = current_user(request)
-    return fresh.get("id") == actor.get("id") and has_permission(fresh, permission)
+    return fresh if fresh.get("id") == actor.get("id") and has_permission(fresh, permission) else None
 
 
 def _user_email_in_use(email: str) -> bool:
@@ -126402,7 +125978,8 @@ def change_user_password(
     # the event-loop thread, so a hash inside it stalled the whole server.
     password_hash = hash_password(change.password)
     with _USERS_FILE_LOCK:
-        if not _actor_still_authorized(request, actor):
+        authorized = _actor_still_authorized(request, actor)
+        if not authorized:
             record_audit(request, "update_password", f"user:{user_id}", "Permission denied", "denied")
             return {"status": "error", "message": "Administrator permission required."}
         users = load_users()
@@ -126412,12 +125989,17 @@ def change_user_password(
         target["password_hash"] = password_hash
         target["failed_login_attempts"] = 0
         target["locked_until"] = None
-        # Owner 2026-11-06: the reset signs the account out everywhere. Every session that began before this moment
-        # is refused (authenticated_user); other accounts' sessions are untouched.
-        target["sessions_valid_after"] = time.time()
+        # Owner 2026-11-07 (Codex 20b3a35 review, finding 1): the reset signs the account out everywhere by advancing
+        # its session counter; every session carrying an earlier counter is refused (authenticated_user). Other
+        # accounts' sessions are untouched.
+        target["session_generation"] = _next_session_generation(target)
+        target.pop("sessions_valid_after", None)  # the r4 test candidate's clock cutoff, replaced by the counter
         save_users(users)
-        _sign_out_user_sessions(user_id, reason="password_reset_by_administrator")
-        record_audit(request, "update_password", f"user:{user_id}", "Password reset by administrator.")
+        removed = _sign_out_user_sessions(user_id, reason="password_reset_by_administrator")
+        detail = "Password reset by administrator."
+        if removed is None:
+            detail += " Earlier sessions are refused, but sessions.json could not be cleaned up (see the service log)."
+        record_audit(request, "update_password", f"user:{user_id}", detail, actor=authorized)
     return {"status": "complete", "message": "Password updated."}
 
 

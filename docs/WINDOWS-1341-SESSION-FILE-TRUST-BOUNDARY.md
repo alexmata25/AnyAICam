@@ -4,7 +4,9 @@
 the current test candidate only; it is not a fix.
 
 ## What the session files are
-- `sessions.json` (in the VMS data folder, beside `users.json`) holds every signed-in browser session.
+- `sessions.json` (in the VMS data folder, beside `users.json`) holds every VMS sign-in session: the VMS sign-in
+  page and the administrator sign-in of a local account. Partner Portal sessions are stored separately, in the
+  portal database; nothing on this page applies to them.
 - `sessions_epoch.json` holds the current session epoch. A new epoch is written whenever a damaged `sessions.json` is
   quarantined, and only sessions from the current epoch are accepted.
 
@@ -17,9 +19,14 @@ Both need write access to the data folder.
 
 ## What is already refused
 - A disabled account is refused, whatever `sessions.json` says.
-- After an administrator resets an account's password, every session that began before the reset is refused. That is
-  recorded on the account in `users.json`, so it holds even if an older `sessions.json` is put back. This does **not**
-  close items 1 and 2: a normal sign-out is still undone by an older `sessions.json`.
+
+## Not yet verified: sessions after a password reset
+- Candidate r5 records an administrator's password reset as a per-account session counter in `users.json`, and a
+  VMS session is accepted only while it carries the account's current counter. It is meant to refuse every earlier
+  session, even if an older `sessions.json` is put back. It replaces the r4 time-based cutoff, which the Codex
+  review of 20b3a35 found could fail if the clock stepped backward.
+- This protection is **not** established until its focused tests and an independent review pass. Even then it does
+  **not** close items 1 and 2: a normal sign-out is still undone by an older `sessions.json`.
 
 ## Trust boundary
 - **Anyone who can write the VMS data folder is trusted with sign-in state.** Such a writer can already edit
@@ -33,7 +40,10 @@ After any file-level restore of the VMS data folder (copying an older `sessions.
 **invalidate every session before users return**:
 1. Stop the AnyAiCam VMS service.
 2. Delete `sessions.json` from the data folder. Leave `sessions_epoch.json` in place.
-3. Start the service. Every user signs in again; no earlier session is accepted.
+3. Start the service. Every user signs in to the VMS again; no earlier VMS session is accepted.
+
+This step does not sign anyone out of the Partner Portal, whose sessions are stored separately. No procedure for
+them is part of Option A.
 
 Never put back `sessions.json` or `sessions_epoch.json` on their own.
 

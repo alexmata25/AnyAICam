@@ -252,11 +252,12 @@ camera row was manually created.
 write access to the VMS data folder.
 
 **Interim (owner 2026-11-06, Option A, test candidate only):** documented trust boundary and an operator step to
-invalidate all sessions after restoring an older data-folder backup:
+invalidate all VMS sessions after restoring an older data-folder backup (deleting `sessions.json` while the service
+is stopped; this does not affect the separately stored Partner Portal sessions):
 `docs/WINDOWS-1341-SESSION-FILE-TRUST-BOUNDARY.md`.
 
-**Not fixed by:** the password-reset revocation in the same candidate (it covers only sessions that began before an
-administrator's password reset).
+**Not fixed by:** the password-reset revocation (candidate r5 per-account session counter, not yet verified; it covers
+only sessions from before an administrator's password reset).
 
 **Must be resolved before customer deployment.** Options B and C are in the owner proposal of 2026-11-07; neither is
 implemented.

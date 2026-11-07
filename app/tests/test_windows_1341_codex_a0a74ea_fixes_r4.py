@@ -295,20 +295,20 @@ def test_a_password_reset_signs_the_user_out_everywhere_and_nobody_else(client):
 def test_a_sign_in_already_under_way_when_the_reset_lands_gets_no_session(client):
     main.save_users([dict(ADMIN), _user("viewer-1")])
     admin = _cookies("admin-1")
-    began = time.time()  # the sign-in has read users.json and is checking the old password
+    snapshot = _account("viewer-1")  # the sign-in has read users.json and is checking the old password
     assert client.put("/api/users/viewer-1/password", cookies=admin, json={"password": NEW_PASSWORD}).json()["status"] == "complete"
-    late = main.create_session("viewer-1", authenticated_at=began)
+    late = main.create_session("viewer-1", session_generation=snapshot.get("session_generation", 0))
     assert _signed_in_as(late) is None
     assert _signed_in_as(main.create_session("viewer-1")) == "viewer-1"  # a sign-in that began after the reset
 
 
-def test_a_session_record_without_a_sign_in_time_is_judged_by_its_creation_time(client):
+def test_a_session_record_from_before_the_session_counter_is_refused_after_a_reset(client):
     main.save_users([dict(ADMIN), _user("viewer-1"), _user("viewer-2")])
     old = main.create_session("viewer-1")
     untouched = main.create_session("viewer-2")
     stored = json.loads(main.SESSIONS_FILE.read_text(encoding="utf-8"))
-    for value in stored.values():  # records written before r4 have no authenticated_at
-        value.pop("authenticated_at")
+    for value in stored.values():  # records written before r5 have no session_generation
+        value.pop("session_generation")
     main.SESSIONS_FILE.write_text(json.dumps(stored), encoding="utf-8")
     assert _signed_in_as(old) == "viewer-1" and _signed_in_as(untouched) == "viewer-2"  # no reset: unchanged
     kept_copy = main.SESSIONS_FILE.read_bytes()
