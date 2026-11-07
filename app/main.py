@@ -11037,13 +11037,22 @@ def save_sessions(sessions: dict) -> None:
 
 
 
-def create_session(user_id: str, remember_me: bool = False, session_generation=None) -> str:
+# create_session() without a session_generation argument (Codex 72fbe7c review, finding 1): only an omitted argument
+# reads the account's counter now. Any value passed, None included, is the caller's snapshot and is stored as it is.
+_NO_SESSION_SNAPSHOT = object()
+# Codex 72fbe7c review, finding 2: a damaged counter is never restarted at a small value an earlier session may carry.
+# It moves to a fresh random value at or above 2**62, which counting up from 0 never reaches.
+_SESSION_GENERATION_RECOVERY_FLOOR = 2 ** 62
+
+
+def create_session(user_id: str, remember_me: bool = False, session_generation=_NO_SESSION_SNAPSHOT) -> str:
     """session_generation is the account's session counter (users.json) from the same read the sign-in checked the
     password against. A password reset by an administrator advances the counter, and authenticated_user accepts a
     session only while it carries the current one, so a sign-in already checking the old password when the reset
-    lands can't keep a session either, whatever the clock does. A caller with no such read (None) gets the counter
-    as it is now, read before the sessions lock is taken (lock order users -> sessions)."""
-    if session_generation is None:
+    lands can't keep a session either, whatever the clock does. A caller with no such read (argument omitted) gets the counter
+    as it is now, read before the sessions lock is taken (lock order users -> sessions). A value passed, None
+    included, is never re-read: a damaged snapshot is stored as it is and refused."""
+    if session_generation is _NO_SESSION_SNAPSHOT:
         account = next((item for item in load_users() if item.get("id") == user_id), None)
         session_generation = (account or {}).get("session_generation", 0)
     session_id = secrets.token_urlsafe(32)
@@ -11073,7 +11082,9 @@ def _session_generation_value(value) -> int | None:
 
 def _next_session_generation(user: dict) -> int:
     current = _session_generation_value(user.get("session_generation", 0))
-    return (current if current is not None else 0) + 1
+    if current is None:  # damaged: a fresh value, never one an earlier session may carry (see the floor above)
+        return _SESSION_GENERATION_RECOVERY_FLOOR + secrets.randbelow(_SESSION_GENERATION_RECOVERY_FLOOR)
+    return current + 1
 
 
 def _session_survives_password_reset(session: dict, user: dict) -> bool:

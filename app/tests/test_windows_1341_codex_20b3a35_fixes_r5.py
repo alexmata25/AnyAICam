@@ -207,7 +207,8 @@ def test_a_damaged_session_counter_refuses_every_session_until_a_reset(client, d
     assert _signed_in_as(main.create_session("viewer-1")) is None
     assert _sign_in("viewer-1@example.test").status_code == 303  # the password still matches; no session works
     assert _reset(client, "viewer-1", NEW_PASSWORDS[0], _cookies("admin-1"))["status"] == "complete"
-    assert _account("viewer-1")["session_generation"] == 1
+    recovered = _account("viewer-1")["session_generation"]  # never 1: Codex 72fbe7c finding 2
+    assert main._session_generation_value(recovered) is not None and recovered not in (0, 1)
     signed_in = _sign_in("viewer-1@example.test", NEW_PASSWORDS[0])
     assert _signed_in_as(signed_in.cookies[main.SESSION_COOKIE_NAME]) == "viewer-1"
 
