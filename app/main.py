@@ -9690,6 +9690,7 @@ from starlette.routing import Match
 from urllib.parse import unquote
 
 _PASSWORD_RESET_REDIRECT_HOPS = 20  # httpx and browsers follow at most 20 redirects
+_PASSWORD_RESET_REDIRECT_PATHS = 64  # distinct redirect targets followed before the fail-safe applies
 
 
 def _router_outcome(scope: dict) -> tuple[str, object]:
@@ -9713,13 +9714,15 @@ def _router_outcome(scope: dict) -> tuple[str, object]:
     return "none", None
 
 
-def _remove_dot_segments(path: str) -> str:
-    """RFC 3986 section 5.2.4, which clients apply to a redirect target before requesting it."""
+def _remove_dot_segments(path: str, encoded_dots: bool = False) -> str:
+    """RFC 3986 section 5.2.4, which clients apply to a redirect target before requesting it. With encoded_dots, a
+    segment spelled with %2E counts as a dot segment too, as browsers (the WHATWG URL standard) treat it."""
     segments = path.split("/")[1:]
     output: list[str] = []
     for index, segment in enumerate(segments):
-        if segment in (".", ".."):
-            if segment == ".." and output:
+        dots = segment.lower().replace("%2e", ".") if encoded_dots else segment
+        if dots in (".", ".."):
+            if dots == ".." and output:
                 output.pop()
             if index == len(segments) - 1:
                 output.append("")
@@ -9729,14 +9732,30 @@ def _remove_dot_segments(path: str) -> str:
 
 
 def _request_reaches_password_reset(scope: dict) -> bool:
+    # Codex e506dc1 review (owner 2026-11-08 r11): clients differ in how they resend a redirect Location. Browsers and
+    # httpx remove dot segments (browsers also spelled %2E), but a client may resend it as supplied (curl
+    # --path-as-is), so /api/users/./password reaches the reset for ".". Every interpretation is followed, and the
+    # request is classified as the reset if any of them reaches it (conservative: such a request only redirects).
+    paths, seen = [scope["path"]], set()
     for _ in range(_PASSWORD_RESET_REDIRECT_HOPS):
-        outcome, value = _router_outcome(scope)
-        if outcome == "route":
-            return getattr(value, "endpoint", None) is change_user_password
-        if outcome != "redirect":
+        targets = []
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            if len(seen) > _PASSWORD_RESET_REDIRECT_PATHS:
+                return True  # more targets than are worth following: treated as the reset
+            outcome, value = _router_outcome(dict(scope, path=path))
+            if outcome == "route" and getattr(value, "endpoint", None) is change_user_password:
+                return True
+            if outcome == "redirect":
+                # The client requests the Location again (307 keeps the method); the server decodes its path once.
+                location = urlsplit(value).path
+                targets += [unquote(location), unquote(_remove_dot_segments(location)),
+                            unquote(_remove_dot_segments(location, encoded_dots=True))]
+        if not targets:
             return False
-        # The client requests the Location again (307 keeps the method); the server decodes its path once.
-        scope = dict(scope, path=unquote(_remove_dot_segments(urlsplit(value).path)))
+        paths = targets
     return True  # more redirects than any client follows: treated as the reset, so its loads stay read-only
 
 
