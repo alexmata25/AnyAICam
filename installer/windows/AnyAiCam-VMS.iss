@@ -14,6 +14,16 @@
 #ifndef ReleaseVersion
   #define ReleaseVersion AppVersion
 #endif
+#ifndef BuildOutputDir
+  #define BuildOutputDir "output"
+#endif
+#ifdef InternalTestOnly
+  #define InternalTestLabel " INTERNAL TEST - DO NOT SHIP"
+  #define InternalTestFilenameSuffix "-INTERNAL-TEST-DO-NOT-SHIP"
+#else
+  #define InternalTestLabel ""
+  #define InternalTestFilenameSuffix ""
+#endif
 #define ShortCommit Copy(SourceCommit, 1, 7)
 #ifndef KeysetSha256
   #error KeysetSha256 is required: build with build.ps1 -EntitlementKeyset ... -EntitlementKeysetSha256 ...
@@ -27,12 +37,12 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 ; What the customer reads: the wizard title, Apps & Features / uninstall name, the setup file's Product version.
 ; DisplayVersion stays AppVersion (the downgrade guard reads it); the build ID is the full source commit.
-AppVerName={#AppName} {#ReleaseVersion}
-UninstallDisplayName={#AppName} {#ReleaseVersion}
+AppVerName={#AppName} {#ReleaseVersion}{#InternalTestLabel}
+UninstallDisplayName={#AppName} {#ReleaseVersion}{#InternalTestLabel}
 VersionInfoProductName={#AppName}
 VersionInfoProductTextVersion={#ReleaseVersion}
 VersionInfoTextVersion={#AppVersion}
-VersionInfoDescription={#AppName} {#ReleaseVersion} setup (Windows setup {#AppVersion}, build {#SourceCommit})
+VersionInfoDescription={#AppName} {#ReleaseVersion}{#InternalTestLabel} setup (Windows setup {#AppVersion}, build {#SourceCommit})
 VersionInfoCompany=AnyAiCam
 AppPublisher=AnyAiCam
 DefaultDirName={autopf}\AnyAiCam
@@ -40,8 +50,8 @@ DefaultGroupName=AnyAiCam
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
-OutputDir=output
-OutputBaseFilename=AnyAiCam-VMS-Setup-{#AppVersion}-{#ShortCommit}
+OutputDir={#BuildOutputDir}
+OutputBaseFilename=AnyAiCam-VMS-Setup-{#AppVersion}-{#ShortCommit}{#InternalTestFilenameSuffix}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -50,7 +60,7 @@ CloseApplications=no
 #ifdef EnableSigning
 SignTool=AnyAiCamSign
 SignedUninstaller=yes
-SignedUninstallerDir=output\signed-uninstallers
+SignedUninstallerDir={#BuildOutputDir}\signed-uninstallers
 #endif
 [Dirs]
 Name: "{commonappdata}\AnyAiCam"; Flags: uninsneveruninstall
@@ -88,9 +98,9 @@ Source: "stop-app-processes.ps1"; Flags: dontcopy
 Source: "stop-app-processes.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; Run from {tmp} by InitializeSetup before anything is installed (downgrade / unknown-version guard).
 Source: "install-version-guard.ps1"; Flags: dontcopy
-Source: "output\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "{#BuildOutputDir}\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 ; LIC-W1: the entitlement trust registry (build.ps1). Also extracted early by TrustRegistryProblem.
-Source: "output\entitlement-trust-registry.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "{#BuildOutputDir}\entitlement-trust-registry.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
@@ -116,7 +126,10 @@ Source: "cloud-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 ; runtime-catalog.ps1); Smart App Control blocks them without it.
 Source: "runtime-catalog.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "publisher-pin.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
-Source: "output\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "{#BuildOutputDir}\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall
+#ifdef InternalTestOnly
+Source: "internal-test-marker.txt"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 Source: "open-claim-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
 Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall

@@ -115,6 +115,6 @@ def test_install_and_build_use_the_pin():
     assert "Get-AnyAiCamPublisherProblem $signature" in catalog
     assert catalog.index("Get-AnyAiCamPublisherProblem $signature") < catalog.index("CryptCATAdminAddCatalog($admin")
     build = (ROOT / "installer" / "windows" / "build.ps1").read_text(encoding="utf-8-sig")
-    assert build.count("Get-AnyAiCamPublisherProblem") == 2 and "if ($AzureSign) {" in build
+    assert build.count("Get-AnyAiCamPublisherProblem") == 2 and "if ($azureSigning) {" in build
     iss = (ROOT / "installer" / "windows" / "AnyAiCam-VMS.iss").read_text(encoding="utf-8-sig")
     assert 'Source: "publisher-pin.ps1"; DestDir: "{app}\\installer"' in iss

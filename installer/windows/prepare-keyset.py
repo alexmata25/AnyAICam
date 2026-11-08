@@ -12,11 +12,11 @@ active; and the keyset must be exactly the registry's projection, which is what 
 A rotation build keeps the old key for verification: its id goes in <retired-key-ids>, comma-separated, and each one
 named must be pinned and retired in the registry. Without that a retired key stops the build, so the key the cloud is
 signing with can't become unusable for new grants by accident. A revoked key is never allowed: it isn't in the projection.
-A signed build also requires a production registry: "production" as the seventh argument. Synthetic registries are for
-unsigned test builds only.
+A production-signed build requires the production registry. The distinct internal-test Azure signing mode requires a
+synthetic registry. Synthetic registry material is never accepted by production signing mode.
 
 Usage: prepare-keyset.py <keyset.json> <expected-sha256> <output.json>
-                         <registry.json> <expected-registry-sha256> <registry-output.json> <production|any>
+                         <registry.json> <expected-registry-sha256> <registry-output.json> <production|any|internal-test>
                          [<retired-key-ids>]
 """
 import base64
@@ -36,6 +36,9 @@ def check_registry_covers_keyset(canonical, registry_bytes, projection, required
     if required_environment == "production" and registry["environment"] != "production":
         raise SystemExit(f"--entitlement-trust-registry is for environment {registry['environment']!r}; "
                          "a signed build needs the production registry.")
+    if required_environment == "internal-test" and registry["environment"] != "synthetic":
+        raise SystemExit(f"--entitlement-trust-registry is for environment {registry['environment']!r}; "
+                         "internal-test signing requires a synthetic registry.")
     pinned = json.loads(canonical)["keys"]
     for key_id in retired:
         if key_id not in pinned:
@@ -56,9 +59,10 @@ def check_registry_covers_keyset(canonical, registry_bytes, projection, required
 
 
 def main(argv):
-    if len(argv) not in (7, 8) or argv[6] not in ("production", "any"):
+    if len(argv) not in (7, 8) or argv[6] not in ("production", "any", "internal-test"):
         raise SystemExit("usage: prepare-keyset.py <keyset.json> <expected-sha256> <output.json> "
-                         "<registry.json> <expected-registry-sha256> <registry-output.json> <production|any> "
+                         "<registry.json> <expected-registry-sha256> <registry-output.json> "
+                         "<production|any|internal-test> "
                          "[<retired-key-ids>]")
     source, expected, output, registry_source, registry_expected, registry_output, environment = argv[:7]
     retired = tuple(argv[7].split(",")) if len(argv) == 8 else ()
