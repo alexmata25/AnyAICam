@@ -9690,7 +9690,7 @@ from starlette.routing import Match
 from urllib.parse import unquote
 
 _PASSWORD_RESET_REDIRECT_HOPS = 20  # httpx and browsers follow at most 20 redirects
-_PASSWORD_RESET_REDIRECT_PATHS = 64  # distinct redirect targets followed before the fail-safe applies
+_PASSWORD_RESET_REDIRECT_PATHS = 64  # redirect targets followed in all before the fail-safe applies
 
 
 def _router_outcome(scope: dict) -> tuple[str, object]:
@@ -9736,14 +9736,13 @@ def _request_reaches_password_reset(scope: dict) -> bool:
     # httpx remove dot segments (browsers also spelled %2E), but a client may resend it as supplied (curl
     # --path-as-is), so /api/users/./password reaches the reset for ".". Every interpretation is followed, and the
     # request is classified as the reset if any of them reaches it (conservative: such a request only redirects).
-    paths, seen = [scope["path"]], set()
+    # A redirect cycle runs to the hop limit and is treated as the reset, as in r10.
+    paths, followed = [scope["path"]], 0
     for _ in range(_PASSWORD_RESET_REDIRECT_HOPS):
         targets = []
         for path in paths:
-            if path in seen:
-                continue
-            seen.add(path)
-            if len(seen) > _PASSWORD_RESET_REDIRECT_PATHS:
+            followed += 1
+            if followed > _PASSWORD_RESET_REDIRECT_PATHS:
                 return True  # more targets than are worth following: treated as the reset
             outcome, value = _router_outcome(dict(scope, path=path))
             if outcome == "route" and getattr(value, "endpoint", None) is change_user_password:
@@ -9755,7 +9754,7 @@ def _request_reaches_password_reset(scope: dict) -> bool:
                             unquote(_remove_dot_segments(location, encoded_dots=True))]
         if not targets:
             return False
-        paths = targets
+        paths = list(dict.fromkeys(targets))  # each distinct target once per hop
     return True  # more redirects than any client follows: treated as the reset, so its loads stay read-only
 
 
