@@ -148,7 +148,10 @@ def _snapshot():
     ("/api/users/a/b/password", False),
 ])
 def test_the_reset_path_classification_covers_every_form_the_router_redirects(path, expected):
-    assert bool(main._PASSWORD_RESET_PATH.fullmatch(path)) is expected
+    # r10: the classification is the router's own decision (main._request_reaches_password_reset), same cases.
+    scope = {"type": "http", "method": "PUT", "path": path, "root_path": "", "query_string": b"", "scheme": "http",
+             "server": ("testserver", 80), "headers": [(b"host", b"testserver")]}
+    assert main._request_reaches_password_reset(scope) is expected
 
 
 @pytest.mark.parametrize("slash", SLASHES, ids=SLASH_IDS)

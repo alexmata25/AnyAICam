@@ -9678,7 +9678,66 @@ _USERS_LOAD_READ_ONLY: ContextVar[bool] = ContextVar("users_load_read_only", def
 # Codex abf368b review (owner 2026-11-07 r9): trailing slashes too. The router (redirect_slashes) answers a PUT to
 # .../password/ (any number of trailing slashes) with 307 to the canonical route after the middleware has already run
 # that request's authentication, so those forms are classified as the reset as well.
-_PASSWORD_RESET_PATH = re.compile(r"/api/users/[^/]+/password/*")
+# Codex 9873afc review (owner 2026-11-07 r10): the classification is the router's own decision. A regex over
+# request.url.path missed resets: Starlette rebuilds that URL from the decoded path and parses it again, so an encoded
+# "?" or "#" in the account id (%3F, %23) cut it short, and .../password/%23extra (no route) was classified. Now a
+# request is the reset when the router (same routes, order and matching, on the decoded path) would run
+# change_user_password for it, directly or at the end of the slash redirects it answers with, followed the way a
+# client requests the Location again. These mirror Router.app of the pinned Starlette 0.41.3.
+from starlette._utils import get_route_path
+from starlette.datastructures import URL
+from starlette.routing import Match
+from urllib.parse import unquote
+
+_PASSWORD_RESET_REDIRECT_HOPS = 20  # httpx and browsers follow at most 20 redirects
+
+
+def _router_outcome(scope: dict) -> tuple[str, object]:
+    """What the router does with this request: ("route", route) for the route it runs, ("partial", route) for a
+    method mismatch (405), ("redirect", location) for its slash redirect, or ("none", None) (404)."""
+    partial = None
+    for route in app.router.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            return "route", route
+        if match == Match.PARTIAL and partial is None:
+            partial = route
+    if partial is not None:
+        return "partial", partial
+    route_path = get_route_path(scope)
+    if scope["type"] == "http" and app.router.redirect_slashes and route_path != "/":
+        redirect_scope = dict(scope)
+        redirect_scope["path"] = scope["path"].rstrip("/") if route_path.endswith("/") else scope["path"] + "/"
+        if any(route.matches(redirect_scope)[0] != Match.NONE for route in app.router.routes):
+            return "redirect", RedirectResponse(url=str(URL(scope=redirect_scope))).headers["location"]
+    return "none", None
+
+
+def _remove_dot_segments(path: str) -> str:
+    """RFC 3986 section 5.2.4, which clients apply to a redirect target before requesting it."""
+    segments = path.split("/")[1:]
+    output: list[str] = []
+    for index, segment in enumerate(segments):
+        if segment in (".", ".."):
+            if segment == ".." and output:
+                output.pop()
+            if index == len(segments) - 1:
+                output.append("")
+        else:
+            output.append(segment)
+    return "/" + "/".join(output)
+
+
+def _request_reaches_password_reset(scope: dict) -> bool:
+    for _ in range(_PASSWORD_RESET_REDIRECT_HOPS):
+        outcome, value = _router_outcome(scope)
+        if outcome == "route":
+            return getattr(value, "endpoint", None) is change_user_password
+        if outcome != "redirect":
+            return False
+        # The client requests the Location again (307 keeps the method); the server decodes its path once.
+        scope = dict(scope, path=unquote(_remove_dot_segments(urlsplit(value).path)))
+    return True  # more redirects than any client follows: treated as the reset, so its loads stay read-only
 
 
 def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
@@ -44848,7 +44907,7 @@ async def authentication_middleware(request: Request, call_next):
 async def password_reset_read_only_users_middleware(request: Request, call_next):
     # Declared after authentication_middleware, so it wraps it: the request's own authentication loads users.json
     # read-only as well (see _USERS_LOAD_READ_ONLY).
-    if request.method != "PUT" or not _PASSWORD_RESET_PATH.fullmatch(request.url.path):
+    if request.method != "PUT" or not _request_reaches_password_reset(request.scope):
         return await call_next(request)
     token = _USERS_LOAD_READ_ONLY.set(True)
     try:
