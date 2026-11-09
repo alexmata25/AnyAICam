@@ -37,11 +37,13 @@ Check 'short temporary staging path accepts the same long-named DLL' ($shortMemb
 Check 'long catalog or CDF path is also rejected' (Is-Rejected { Assert-MakeCatPathLengths ($path260) $cdfPath @() })
 
 $buildText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'build.ps1') -Raw
+$catalogStageGuard = [regex]::Match($buildText, 'if\s*\(Test-Path\s+-LiteralPath\s+\$catalogStage\)\s*\{\s*throw\s+''Final runtime catalog stage already exists; refusing to overwrite it\.''\s*\}')
 $exportAt = $buildText.IndexOf('Export-NativeFiles $catalogWorkStage', [StringComparison]::Ordinal)
 $makeCatAt = $buildText.IndexOf('New-RuntimeCatalog $catalogWorkStage', [StringComparison]::Ordinal)
 $moveAt = $buildText.IndexOf('Move-Item -LiteralPath $catalogWorkStage -Destination $catalogStage', [StringComparison]::Ordinal)
 Check 'build catalogs from unique temp stage then moves it into package output' ($exportAt -ge 0 -and $makeCatAt -gt $exportAt -and $moveAt -gt $makeCatAt -and $buildText.Contains("Join-Path `$catalogTempRoot ('AnyAiCamCatalog-'"))
-Check 'existing temp stages are rejected rather than removed' ((Get-Content -LiteralPath $scriptPath -Raw).Contains('Runtime catalog stage already exists; refusing to overwrite it'))
+Check 'existing final runtime stage is rejected before export or catalog generation' ($catalogStageGuard.Success -and $catalogStageGuard.Index -lt $exportAt -and $catalogStageGuard.Index -lt $makeCatAt)
+Check 'existing temporary stages are rejected rather than removed' ((Get-Content -LiteralPath $scriptPath -Raw).Contains('Runtime catalog stage already exists; refusing to overwrite it'))
 
 Write-Output ("Runtime catalog path tests: " + $script:passed + ' passed, ' + $script:failed + ' failed')
 if ($script:failed -ne 0) { exit 1 }
