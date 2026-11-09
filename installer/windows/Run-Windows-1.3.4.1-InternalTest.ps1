@@ -47,7 +47,8 @@ if (-not (Test-Path -LiteralPath $EvidenceParent -PathType Container)) {
 }
 $RunStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
 $RunId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
-$EvidenceDir = Join-Path $EvidenceParent ("Windows-1.3.4.1-711ab21-" + $RunStamp + "-" + $RunId)
+$commitPrefix = $ExpectedCommit.Substring(0, 7)
+$EvidenceDir = Join-Path $EvidenceParent ("Windows-1.3.4.1-" + $commitPrefix + "-" + $RunStamp + "-" + $RunId)
 if (Test-Path -LiteralPath $EvidenceDir) { throw 'Evidence directory collision; stop without retry.' }
 New-Item -ItemType Directory -Path $EvidenceDir -ErrorAction Stop | Out-Null
 $ReportPath = Join-Path $EvidenceDir 'run-report.json'
@@ -390,7 +391,8 @@ if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|\\)\.\.(\\|$)' -
     if (-not $?) { throw 'The guarded build script reported failure; do not retry automatically.' }
 
     . (Join-Path $Repo 'installer\windows\publisher-pin.ps1')
-    $setupPath = Join-Path $OutputDir 'AnyAiCam-VMS-Setup-1.3.4.1-711ab21-INTERNAL-TEST-DO-NOT-SHIP.exe'
+    $expectedSetupName = 'AnyAiCam-VMS-Setup-1.3.4.1-' + $commitPrefix + '-INTERNAL-TEST-DO-NOT-SHIP.exe'
+    $setupPath = Join-Path $OutputDir $expectedSetupName
     $catalogPath = Join-Path $OutputDir 'AnyAiCamRuntime.cat'
     $uninstallerPaths = @(Get-ChildItem -LiteralPath (Join-Path $OutputDir 'signed-uninstallers') -Filter '*.exe' -File | Select-Object -ExpandProperty FullName)
     if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) { throw 'Expected internal-test installer is missing.' }
