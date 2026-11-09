@@ -137,33 +137,34 @@ $makeCat = if ($env:ANYAICAM_MAKECAT_PATH) { $env:ANYAICAM_MAKECAT_PATH } else {
 try {
     [void](Export-NativeFiles $catalogWorkStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
     $catalogued = New-RuntimeCatalog $catalogWorkStage $catalog $makeCat
+    Write-Output "Runtime catalog: $catalogued native files."
+    if ($Sign) { & $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog }
+    if ($azureSigning) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog }
+    if ($Sign -or $AzureSign -or $InternalTestAzureSign) {
+        if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
+        if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
+        if ($azureSigning) {
+            $catalogSignature = Get-AuthenticodeSignature -LiteralPath $catalog
+            $publisherProblem = Get-AnyAiCamPublisherProblem $catalogSignature $catalog
+            if ($publisherProblem) { throw "Publisher pin failed for the runtime catalog: $publisherProblem" }
+            # Offline installs (2026-10-20): the catalog must CARRY its issuing CA, not rely on this PC's certificate cache.
+            $issuer = $catalogSignature.SignerCertificate.Issuer
+            if (-not (@(Get-AnyAiCamEmbeddedCertificates $catalog) | Where-Object { $_.Subject -eq $issuer })) { throw "The runtime catalog does not embed its issuing CA ($issuer); it would be refused offline." }
+        }
+        & $signTool verify /pa $catalog | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
+        # SignTool applies classic path handling to member operands. Verify every
+        # catalogued file while it still has the guarded short temporary path.
+        $verifiedNativeFiles = Test-RuntimeCatalogFiles $catalogWorkStage $catalog $signTool
+        if ($verifiedNativeFiles -ne $catalogued) { throw "Runtime catalog coverage mismatch: catalogued=$catalogued verified=$verifiedNativeFiles" }
+        Write-Output 'Runtime catalog signed and verified.'
+    }
     Move-Item -LiteralPath $catalogWorkStage -Destination $catalogStage -ErrorAction Stop
 } catch {
     if (Test-Path -LiteralPath $catalogWorkStage -PathType Container) {
         Write-Output ("Runtime catalog work stage preserved for diagnosis: " + $catalogWorkStage)
     }
     throw
-}
-Write-Output "Runtime catalog: $catalogued native files."
-if ($Sign) { & $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog }
-if ($azureSigning) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog }
-if ($Sign -or $AzureSign -or $InternalTestAzureSign) {
-    if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
-    if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
-    if ($azureSigning) {
-        $catalogSignature = Get-AuthenticodeSignature -LiteralPath $catalog
-        $publisherProblem = Get-AnyAiCamPublisherProblem $catalogSignature $catalog
-        if ($publisherProblem) { throw "Publisher pin failed for the runtime catalog: $publisherProblem" }
-        # Offline installs (2026-10-20): the catalog must CARRY its issuing CA, not rely on this PC's certificate cache.
-        $issuer = $catalogSignature.SignerCertificate.Issuer
-        if (-not (@(Get-AnyAiCamEmbeddedCertificates $catalog) | Where-Object { $_.Subject -eq $issuer })) { throw "The runtime catalog does not embed its issuing CA ($issuer); it would be refused offline." }
-    }
-    & $signTool verify /pa $catalog | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
-    # Every catalogued file must verify against it.
-    $verifiedNativeFiles = Test-RuntimeCatalogFiles $catalogStage $catalog $signTool
-    if ($verifiedNativeFiles -ne $catalogued) { throw "Runtime catalog coverage mismatch: catalogued=$catalogued verified=$verifiedNativeFiles" }
-    Write-Output 'Runtime catalog signed and verified.'
 }
 # The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
 # public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
