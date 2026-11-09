@@ -102,7 +102,17 @@ if ($azureSigning) {
     $metadata = if ($env:ANYAICAM_AZURE_SIGNING_METADATA) { $env:ANYAICAM_AZURE_SIGNING_METADATA } else { 'C:\AnyAiCamSigning\metadata.json' }
     $timestampUrl = if ($env:ANYAICAM_TIMESTAMP_URL) { $env:ANYAICAM_TIMESTAMP_URL } else { 'http://timestamp.acs.microsoft.com' }
     foreach ($path in @($signTool, $dlib, $metadata)) { if (-not (Test-Path -LiteralPath $path)) { throw "Azure signing dependency not found: $path" } }
-    $signCommand = '$q' + $signTool + '$q sign /fd SHA256 /tr $q' + $timestampUrl + '$q /td SHA256 /dlib $q' + $dlib + '$q /dmdf $q' + $metadata + '$q $f'
+    if ($InternalTestAzureSign) {
+        # Inno Setup signs the uninstaller on the fly and removes its temporary
+        # uninstaller after compilation. Capture a separately verified copy from
+        # the signing callback so post-build verification can inspect the exact
+        # signed bytes without treating the transient .tmp as a cache artifact.
+        $powershell = Join-Path $PSHOME 'powershell.exe'
+        $uninstallerSigner = Join-Path $PSScriptRoot 'internal-test-signing.ps1'
+        $signCommand = '$q' + $powershell + '$q -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $q' + $uninstallerSigner + '$q -SignToolPath $q' + $signTool + '$q -DlibPath $q' + $dlib + '$q -MetadataPath $q' + $metadata + '$q -TimestampUrl $q' + $timestampUrl + '$q -UninstallerCacheDir $q' + (Join-Path $outputDir 'signed-uninstallers') + '$q -TargetPath $f'
+    } else {
+        $signCommand = '$q' + $signTool + '$q sign /fd SHA256 /tr $q' + $timestampUrl + '$q /td SHA256 /dlib $q' + $dlib + '$q /dmdf $q' + $metadata + '$q $f'
+    }
     $compilerArguments += '/DEnableSigning=1'
     $compilerArguments += '/SAnyAiCamSign=' + $signCommand
 }
@@ -208,9 +218,11 @@ if ($Sign -or $AzureSign -or $InternalTestAzureSign) {
     $setup = Get-Item -LiteralPath $setupPath
     # Inno Setup stores the signed uninstaller under SignedUninstallerDir; the installed unins000.exe is also
     # checked during the separately authorized Sandbox acceptance.
-    $signedUninstallers = @(Get-ChildItem (Join-Path $outputDir 'signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)
-    if ($InternalTestAzureSign -and $signedUninstallers.Count -lt 1) {
-        throw 'Internal-test signing produced no cached signed uninstaller to verify.'
+    $uninstallerCacheDir = Join-Path $outputDir 'signed-uninstallers'
+    $cacheEntries = @(Get-ChildItem -LiteralPath $uninstallerCacheDir -Force -ErrorAction Stop)
+    $signedUninstallers = @($cacheEntries | Where-Object { -not $_.PSIsContainer -and $_.Extension -ieq '.exe' })
+    if ($InternalTestAzureSign -and ($cacheEntries.Count -ne 1 -or $signedUninstallers.Count -ne 1 -or $signedUninstallers[0].Name -ne 'AnyAiCamSignedUninstaller.exe' -or (($cacheEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))) {
+        throw 'Internal-test signing did not retain exactly one verified signed uninstaller cache artifact.'
     }
     foreach ($file in @($setup) + $signedUninstallers) {
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
