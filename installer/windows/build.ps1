@@ -127,9 +127,23 @@ try {
 $catalog = Join-Path $outputDir 'AnyAiCamRuntime.cat'
 $nativeArchives = @($lockedWheels | ForEach-Object { Join-Path $wheelRoot $_ }) + @('python-3.12.10-embed-amd64.zip', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip', 'tesseract-5.5.2-win64-anyaicam.zip' | ForEach-Object { Join-Path $vendor $_ })
 $catalogStage = Join-Path $outputDir 'runtime-catalog'
-[void](Export-NativeFiles $catalogStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
+$catalogTempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+if (-not (Test-Path -LiteralPath $catalogTempRoot -PathType Container)) { throw 'A usable temporary directory is required for the short-path runtime catalog stage.' }
+if ([IO.Path]::GetPathRoot($catalogTempRoot) -ine [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($outputDir))) { throw 'Runtime catalog temp staging must be on the same volume as the isolated output.' }
+$catalogWorkStage = Join-Path $catalogTempRoot ('AnyAiCamCatalog-' + [Guid]::NewGuid().ToString('N').Substring(0, 10))
+if (Test-Path -LiteralPath $catalogWorkStage) { throw 'Runtime catalog temp-stage collision; preserve and stop without retry.' }
 $makeCat = if ($env:ANYAICAM_MAKECAT_PATH) { $env:ANYAICAM_MAKECAT_PATH } else { 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makecat.exe' }
-$catalogued = New-RuntimeCatalog $catalogStage $catalog $makeCat
+try {
+    [void](Export-NativeFiles $catalogWorkStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
+    $catalogued = New-RuntimeCatalog $catalogWorkStage $catalog $makeCat
+    if (Test-Path -LiteralPath $catalogStage) { throw 'Final runtime catalog stage already exists; refusing to overwrite it.' }
+    Move-Item -LiteralPath $catalogWorkStage -Destination $catalogStage -ErrorAction Stop
+} catch {
+    if (Test-Path -LiteralPath $catalogWorkStage -PathType Container) {
+        Write-Output ("Runtime catalog work stage preserved for diagnosis: " + $catalogWorkStage)
+    }
+    throw
+}
 Write-Output "Runtime catalog: $catalogued native files."
 if ($Sign) { & $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog }
 if ($azureSigning) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog }

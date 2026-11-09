@@ -30,7 +30,7 @@ $NativeExtensions = @('.pyd', '.dll', '.exe')
 # same hashes.
 function Export-NativeFiles([string]$Stage, [string[]]$Archives, [string[]]$Files) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    if (Test-Path -LiteralPath $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force }
+    if (Test-Path -LiteralPath $Stage) { throw "Runtime catalog stage already exists; refusing to overwrite it: $Stage" }
     New-Item -ItemType Directory -Path $Stage | Out-Null
     $count = 0; $index = 0
     foreach ($archive in $Archives) {
@@ -54,6 +54,16 @@ function Export-NativeFiles([string]$Stage, [string[]]$Archives, [string[]]$File
     return $count
 }
 
+# MakeCat resolves member files through classic Win32 paths. Keep this check
+# explicit so a future deep build root fails before MakeCat with a clear cause.
+function Assert-MakeCatPathLengths([string]$CatalogPath, [string]$CdfPath, [string[]]$MemberPaths) {
+    foreach ($path in @($CatalogPath, $CdfPath) + @($MemberPaths)) {
+        if ($path.Length -ge 260) {
+            throw "MakeCat input path is $($path.Length) characters; it must be shorter than MAX_PATH (260): $path"
+        }
+    }
+}
+
 # One catalog (SHA-256, Authenticode hashes of PE files) of every file under
 # $Stage, written to $CatalogPath with makecat.exe (Windows SDK).
 function New-RuntimeCatalog([string]$Stage, [string]$CatalogPath, [string]$MakeCat) {
@@ -61,6 +71,7 @@ function New-RuntimeCatalog([string]$Stage, [string]$CatalogPath, [string]$MakeC
     $files = @(Get-ChildItem -LiteralPath $Stage -Recurse -File)
     if (-not $files.Count) { throw 'No native files to catalog.' }
     $cdf = [IO.Path]::ChangeExtension($CatalogPath, '.cdf')
+    Assert-MakeCatPathLengths $CatalogPath $cdf @($files | ForEach-Object { $_.FullName })
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[CatalogHeader]'); $lines.Add("Name=$CatalogPath"); $lines.Add('ResultDir=')
     $lines.Add('PublicVersion=0x0000001'); $lines.Add('EncodingType=0x00010001'); $lines.Add('CatalogVersion=2'); $lines.Add('HashAlgorithms=SHA256')
