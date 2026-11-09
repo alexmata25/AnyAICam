@@ -1,11 +1,18 @@
 #Requires -Version 5.1
 # One-shot, owner-authorized internal-test build only.
 # This script does not change source/configuration, and it refuses any non-approved inputs.
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string]$ExpectedCommit
+)
+
 $ErrorActionPreference = 'Stop'
 
 $Repo = 'C:\Users\Alejandro Mata\.codex\worktrees\windows-1341-codex1-candidate\windows1341-fdddbe7-internal-signing'
 $ExpectedBranch = 'codex/windows-vms-1341-candidate-20261109'
-$ExpectedCommit = '711ab212b2dd6869e5efd5bb6c15bc0f0555df75'
+$ExpectedCommit = $ExpectedCommit.ToLowerInvariant()
 $BaseCommit = 'fdddbe7f2b4ee4b25c69dff05a9b576eb3b47824'
 $InputDir = 'C:\Users\Alejandro Mata\anyaicam-release-windows\candidates\1.3.4.1-fdddbe7-release-1.2.7-UNSIGNED-SYNTHETIC-KEYSET-DO-NOT-SHIP\build-output'
 $ExpectedKeysetHash = '629ac8e4545a9c324a21d6b0f08098ebc1c814bcc29e9a6f46fff992357c8b49'
