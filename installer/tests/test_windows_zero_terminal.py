@@ -195,7 +195,12 @@ class InstallerLinkTests(unittest.TestCase):
 
     def test_every_finish_page_entry_runs_as_the_original_user(self):
         entries = [line for line in self.run.splitlines() if line.startswith("Filename:")]
-        self.assertEqual(len(entries), 2)
+        # The customer build has the link and the VMS page; the isolated direct-test build only its own local page.
+        direct, normal = self.run.split("#else", 1)
+        self.assertEqual(len([line for line in normal.splitlines() if line.startswith("Filename:")]), 2)
+        self.assertEqual([line for line in direct.splitlines() if line.startswith("Filename:")],
+                         ['Filename: "http://127.0.0.1:18767"; Description: "Open AnyAiCam VMS Direct Test"; '
+                          'Flags: postinstall shellexec runasoriginaluser skipifsilent unchecked'])
         for entry in entries:
             flags = re.search(r'Flags: ([^;]+)', entry).group(1).split()
             self.assertIn("postinstall", flags)

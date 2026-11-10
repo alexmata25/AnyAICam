@@ -162,8 +162,12 @@ class CatalogWiringTests(unittest.TestCase):
         # Other arguments (the entitlement keyset, the product mode) follow it since Windows steps 2 and 5.
         self.assertIn("-RuntimeCatalog \"' + ExpandConstant('{tmp}\\AnyAiCamRuntime.cat') + '\" ", iss)
         uninstall = iss.split("[UninstallRun]", 1)[1].split("[UninstallDelete]", 1)[0]
-        self.assertIn('runtime-catalog.ps1"" -Remove"', uninstall)
-        self.assertLess(uninstall.index('AnyAiCamVMS.exe"; Parameters: "uninstall"'), uninstall.index("runtime-catalog.ps1"))
+        # Each build removes its catalog only after its own service is uninstalled (f9b9a57 adds the direct-test branch).
+        direct, normal = uninstall.split("#else", 1)
+        self.assertIn('runtime-catalog.ps1"" -Remove"', normal)
+        self.assertLess(normal.index('AnyAiCamVMS.exe"; Parameters: "uninstall"'), normal.index("runtime-catalog.ps1"))
+        self.assertIn('runtime-catalog.ps1"" -Remove -DirectTest"', direct)
+        self.assertLess(direct.index('AnyAiCamVMSDirectTest.exe"; Parameters: "uninstall"'), direct.index("runtime-catalog.ps1"))
         runtime = read("install-runtime.ps1")
         register = runtime.index("Install-RuntimeCatalog $RuntimeCatalog")
         for later in ("Expand-Archive -LiteralPath $PythonArchive", "& $python $GetPipScript", "runtime-preflight.py"):
