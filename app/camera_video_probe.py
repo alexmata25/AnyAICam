@@ -101,6 +101,9 @@ def ffprobe_stream(url: str, timeout: float = PROBE_TIMEOUT_SECONDS, run: Callab
     args = ["ffprobe", "-v", "error"]
     if str(url).lower().startswith(("rtsp://", "rtsps://")):
         args += ["-rtsp_transport", "tcp"]
+        if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+            import direct_test_profile
+            args += direct_test_profile.rtsp_input_options()
     args += ["-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
              "-of", "json", str(url)]
     try:

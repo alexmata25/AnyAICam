@@ -21,6 +21,10 @@ def document(program_data, run_id):
         "data_root": str(profile.expected_data_root(program_data, run_id)),
         "service_name": profile._SERVICE_NAME,
         "http_port": profile._HTTP_PORT,
+        "approved_camera_network": "192.168.50.0/24",
+        "camera_interface_address": "192.168.50.10",
+        "camera_interface_network": "192.168.50.0/24",
+        "camera_interface_alias": "Ethernet",
     }
 
 
@@ -35,6 +39,7 @@ def test_profile_resolves_only_its_run_specific_programdata_root(tmp_path, run_i
     lambda d, p: d.update(data_root=str(p / "Elsewhere" / "AnyAiCam-Test" / d["run_id"])),
     lambda d, p: d.update(service_name="AnyAiCamVMS"),
     lambda d, p: d.update(http_port=8000),
+    lambda d, p: d.update(camera_interface_alias=""),
     lambda d, p: d.update(unexpected="value"),
 ])
 def test_profile_rejects_production_paths_and_unexpected_values(tmp_path, run_id, mutate):
@@ -49,6 +54,60 @@ def test_profile_rejects_production_paths_and_unexpected_values(tmp_path, run_id
 def test_profile_rejects_bad_run_identifiers(tmp_path, run_id):
     with pytest.raises(profile.TestProfileError):
         profile.expected_data_root(tmp_path / "ProgramData", run_id)
+
+
+@pytest.mark.parametrize(("network", "interface", "attached"), [
+    ("0.0.0.0/0", "192.168.50.10", "192.168.50.0/24"),
+    ("8.8.8.0/24", "8.8.8.10", "8.8.8.0/24"),
+    ("192.168.50.0/23", "192.168.50.10", "192.168.50.0/23"),
+    ("192.168.51.0/24", "192.168.50.10", "192.168.50.0/24"),
+    ("192.168.50.0/24", "192.168.51.10", "192.168.50.0/24"),
+    ("192.168.50.0/24", "192.168.50.10", "192.168.51.0/24"),
+    ("192.168.50.1/24", "192.168.50.10", "192.168.50.0/24"),
+])
+def test_profile_rejects_unbounded_non_private_or_unattached_camera_network(network, interface, attached, tmp_path, run_id):
+    doc = document(tmp_path / "ProgramData", run_id)
+    doc["approved_camera_network"] = network
+    doc["camera_interface_address"] = interface
+    doc["camera_interface_network"] = attached
+    with pytest.raises(profile.TestProfileError, match="camera network"):
+        profile.validate_profile_document(doc, program_data=tmp_path / "ProgramData")
+
+
+@pytest.mark.parametrize("requested", [
+    "192.168.50.0/24",
+    "192.168.50.64/26",
+])
+def test_camera_scan_accepts_only_networks_inside_the_pinned_subnet(requested):
+    assert str(profile.validate_camera_scan_network(
+        requested, "192.168.50.0/24", "192.168.50.10", "192.168.50.0/24"
+    )) == requested
+
+
+@pytest.mark.parametrize("requested", [
+    "192.168.51.0/24",
+    "192.168.0.0/16",
+    "8.8.8.0/24",
+    "192.168.50.1/24",
+])
+def test_camera_scan_rejects_networks_outside_pinned_subnet(requested):
+    with pytest.raises(profile.TestProfileError, match="camera scan"):
+        profile.validate_camera_scan_network(
+            requested, "192.168.50.0/24", "192.168.50.10", "192.168.50.0/24"
+        )
+
+
+def test_rtsp_input_source_binding_is_test_only_and_fail_closed(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_INTERNAL_TEST_BUILD", raising=False)
+    assert profile.rtsp_input_options() == []
+    monkeypatch.setenv("ANYAICAM_INTERNAL_TEST_BUILD", "1")
+    monkeypatch.setenv("ANYAICAM_DIRECT_TEST_CAMERA_NETWORK", "192.168.50.0/24")
+    monkeypatch.setenv("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS", "192.168.50.10")
+    monkeypatch.setenv("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_NETWORK", "192.168.50.0/24")
+    assert profile.rtsp_input_options() == ["-localaddr", "192.168.50.10"]
+    monkeypatch.setenv("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS", "192.168.51.10")
+    with pytest.raises(profile.TestProfileError, match="interface is unavailable"):
+        profile.rtsp_input_options()
 
 
 def test_profile_rejects_junction_or_symlink_in_test_root_chain(tmp_path, run_id, monkeypatch):

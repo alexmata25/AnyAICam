@@ -49,7 +49,7 @@ _ENDPOINT_UUID_PATTERN = re.compile(r"uuid:([0-9a-fA-F-]{36})")
 _XADDRS_PATTERN = re.compile(r"<d:XAddrs>(.*?)</d:XAddrs>", re.DOTALL)
 
 
-def default_send_probe(timeout: float = WS_DISCOVERY_TIMEOUT_SECONDS) -> list[str]:
+def default_send_probe(timeout: float = WS_DISCOVERY_TIMEOUT_SECONDS, *, interface_address: str | None = None) -> list[str]:
     """Sends one WS-Discovery Probe over UDP multicast and collects
     whatever responses arrive within `timeout` seconds. Returns raw XML
     response bodies -- parsing is a separate, independently testable step
@@ -59,6 +59,13 @@ def default_send_probe(timeout: float = WS_DISCOVERY_TIMEOUT_SECONDS) -> list[st
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if interface_address:
+            # Bind the multicast egress interface to the profile-verified
+            # local address instead of relying on a default route. Bind the
+            # receive socket to that address too so replies arriving through a
+            # VPN or secondary NIC cannot be consumed by this discovery pass.
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface_address))
+            sock.bind((interface_address, 0))
         sock.settimeout(timeout)
         sock.sendto(message.encode("utf-8"), WS_DISCOVERY_ADDRESS)
         while True:
@@ -72,9 +79,11 @@ def default_send_probe(timeout: float = WS_DISCOVERY_TIMEOUT_SECONDS) -> list[st
     return responses
 
 
-def default_tcp_probe(host: str, port: int, timeout: float = TCP_CONNECT_TIMEOUT_SECONDS) -> bool:
+def default_tcp_probe(host: str, port: int, timeout: float = TCP_CONNECT_TIMEOUT_SECONDS,
+                      source_address: str | None = None) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        source = (source_address, 0) if source_address else None
+        with socket.create_connection((host, port), timeout=timeout, source_address=source):
             return True
     except OSError:
         return False
@@ -109,14 +118,24 @@ def probe(
     send_probe: Callable[[], list[str]] = default_send_probe,
     tcp_probe: Callable[[str, int, float], bool] = default_tcp_probe,
     allowed_network: Optional[str] = None,
+    interface_address: Optional[str] = None,
+    interface_network: Optional[str] = None,
 ) -> list[dict]:
     """Runs one discovery pass and returns a de-duplicated (by device_key)
     list of {device_key, ip_address, onvif_endpoint, rtsp_reachable,
     onvif_reachable}. No credentials are read, sent, or guessed -- see the
     module docstring."""
     network = ipaddress.ip_network(allowed_network, strict=False) if allowed_network else None
+    if interface_address is not None:
+        interface = ipaddress.ip_address(interface_address)
+        attached = ipaddress.ip_network(interface_network, strict=True) if interface_network else None
+        if (network is None or attached is None or interface.version != network.version or
+                attached.version != network.version or interface not in attached or not network.subnet_of(attached)):
+            raise ValueError("the ONVIF interface and camera network must match the verified attached interface")
     seen: dict[str, dict] = {}
-    for xml_text in send_probe():
+    responses = (default_send_probe(interface_address=interface_address)
+                 if send_probe is default_send_probe else send_probe())
+    for xml_text in responses:
         parsed = parse_probe_response(xml_text)
         if not parsed or parsed["device_key"] in seen:
             continue
@@ -128,8 +147,13 @@ def probe(
             continue  # never trust/return a response claiming a public IP
         if network and address not in network:
             continue
-        rtsp_reachable = any(tcp_probe(parsed["ip_address"], port, TCP_CONNECT_TIMEOUT_SECONDS) for port in RTSP_PORTS)
-        onvif_reachable = any(tcp_probe(parsed["ip_address"], port, TCP_CONNECT_TIMEOUT_SECONDS) for port in ONVIF_HTTP_PORTS)
+        def probe_port(port: int) -> bool:
+            if tcp_probe is default_tcp_probe:
+                return tcp_probe(parsed["ip_address"], port, TCP_CONNECT_TIMEOUT_SECONDS,
+                                 source_address=interface_address)
+            return tcp_probe(parsed["ip_address"], port, TCP_CONNECT_TIMEOUT_SECONDS)
+        rtsp_reachable = any(probe_port(port) for port in RTSP_PORTS)
+        onvif_reachable = any(probe_port(port) for port in ONVIF_HTTP_PORTS)
         seen[parsed["device_key"]] = {
             "device_key": parsed["device_key"],
             "ip_address": parsed["ip_address"],

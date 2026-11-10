@@ -17,7 +17,9 @@ from pathlib import Path
 PROFILE_NAME = "direct-test-profile.json"
 PROFILE_SCHEMA = 1
 TEST_ROOT_NAME = "AnyAiCam-Test"
-_PROFILE_KEYS = frozenset(("schema", "run_id", "data_root", "service_name", "http_port"))
+_PROFILE_KEYS = frozenset(("schema", "run_id", "data_root", "service_name", "http_port",
+                           "approved_camera_network", "camera_interface_address", "camera_interface_network",
+                           "camera_interface_alias"))
 _RUN_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _SERVICE_NAME = "AnyAiCamVmsDirectTest"
 _HTTP_PORT = 18767
@@ -64,6 +66,63 @@ def expected_data_root(program_data: Path, run_id: str) -> Path:
     return Path(program_data) / TEST_ROOT_NAME / run_id
 
 
+def validate_camera_network(network_value: object, interface_value: object, interface_network_value: object) -> tuple[str, str, str]:
+    """Accept one bounded RFC1918 camera subnet bound to a local interface."""
+    import ipaddress
+
+    if not isinstance(network_value, str) or not isinstance(interface_value, str) or not isinstance(interface_network_value, str):
+        raise TestProfileError("approved camera network or interface is missing")
+    try:
+        network = ipaddress.ip_network(network_value, strict=True)
+        interface = ipaddress.ip_address(interface_value)
+        interface_network = ipaddress.ip_network(interface_network_value, strict=True)
+    except ValueError as exc:
+        raise TestProfileError("approved camera network or interface is malformed") from exc
+    rfc1918 = tuple(ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    if (network.version != 4 or interface.version != 4 or interface_network.version != 4 or network.prefixlen < 24 or
+            not any(network.subnet_of(allowed) for allowed in rfc1918) or
+            not network.subnet_of(interface_network) or interface not in interface_network or
+            not any(interface_network.subnet_of(allowed) for allowed in rfc1918)):
+        raise TestProfileError("camera network must be bounded RFC1918 space attached to the recorded local interface")
+    return str(network), str(interface), str(interface_network)
+
+
+def validate_camera_scan_network(requested_value: object, network_value: object,
+                                 interface_value: object, interface_network_value: object):
+    """Require a camera scan to stay within the pinned subnet/interface."""
+    import ipaddress
+
+    approved_text, interface_text, attached_text = validate_camera_network(
+        network_value, interface_value, interface_network_value
+    )
+    if not isinstance(requested_value, str):
+        raise TestProfileError("camera scan network is missing")
+    try:
+        requested = ipaddress.ip_network(requested_value, strict=True)
+        approved = ipaddress.ip_network(approved_text, strict=True)
+    except ValueError as exc:
+        raise TestProfileError("camera scan network is malformed or noncanonical") from exc
+    if (requested.version != 4 or not requested.is_private or
+            not requested.subnet_of(approved)):
+        raise TestProfileError("camera scan must be contained within the approved camera subnet")
+    return requested
+
+
+def rtsp_input_options() -> list[str]:
+    """Bind direct-test FFmpeg/FFprobe RTSP inputs to the selected NIC IP."""
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") != "1":
+        return []
+    try:
+        _, interface, _ = validate_camera_network(
+            os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_NETWORK"),
+            os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS"),
+            os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_NETWORK"),
+        )
+    except TestProfileError as exc:
+        raise TestProfileError("camera interface is unavailable for RTSP input") from exc
+    return ["-localaddr", interface]
+
+
 def validate_profile_document(document: object, *, program_data: Path) -> Path:
     if not isinstance(document, dict) or set(document) != _PROFILE_KEYS:
         raise TestProfileError("unexpected test-profile fields")
@@ -76,6 +135,12 @@ def validate_profile_document(document: object, *, program_data: Path) -> Path:
         raise TestProfileError("test data root does not match the run-bound ProgramData path")
     if document.get("service_name") != _SERVICE_NAME or type(document.get("http_port")) is not int or document["http_port"] != _HTTP_PORT:
         raise TestProfileError("test service or port differs from the reviewed profile")
+    validate_camera_network(document.get("approved_camera_network"), document.get("camera_interface_address"),
+                            document.get("camera_interface_network"))
+    interface_alias = document.get("camera_interface_alias")
+    if (not isinstance(interface_alias, str) or not interface_alias or len(interface_alias) > 128 or
+            any(ord(char) < 32 for char in interface_alias)):
+        raise TestProfileError("camera interface alias is missing or malformed")
     production = Path(program_data) / "AnyAiCam"
     if _canonical(expected) == _canonical(production):
         raise TestProfileError("production data root is forbidden in test mode")

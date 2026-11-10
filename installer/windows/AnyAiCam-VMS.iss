@@ -2,6 +2,9 @@
   #ifndef TestRunId
     #error TestRunId is required for DirectDellTestCandidate builds.
   #endif
+  #ifndef TestCameraNetwork
+    #error TestCameraNetwork must pin the approved, attached RFC1918 camera subnet.
+  #endif
   #ifndef TestApplianceIdentitySha256
     #error Pinned synthetic test appliance identity is required for DirectDellTestCandidate builds.
   #endif
@@ -121,6 +124,7 @@ Source: "AnyAiCamVMSDirectTest.xml"; DestDir: "{app}\service"; Flags: ignorevers
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMSDirectTest.exe"; Flags: ignoreversion
 Source: "prepare-direct-test-profile.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "firewall-direct-test.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "direct-test-firewall-policy.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "verify-direct-test-licensing.py"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "direct-test-install-guard.ps1"; Flags: dontcopy
 Source: "{#BuildOutputDir}\direct-test-appliance-identity.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
@@ -224,7 +228,7 @@ Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: post
 Filename: "{app}\service\AnyAiCamVMSDirectTest.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVmsDirectTest"
 Filename: "{app}\service\AnyAiCamVMSDirectTest.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamVmsDirectTest"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\stop-app-processes.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopDirectTestFolderProcesses"
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\firewall-direct-test.ps1"" -Remove -InstallRoot ""{app}"" -RunId ""{#TestRunId}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDirectTestEgressRules"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\firewall-direct-test.ps1"" -Remove -InstallRoot ""{app}"" -RunId ""{#TestRunId}"" -CameraNetwork ""{#TestCameraNetwork}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDirectTestEgressRules"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\runtime-catalog.ps1"" -Remove -DirectTest"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDirectTestRuntimeCatalog"
 #else
 Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamAgent"
@@ -658,10 +662,10 @@ begin
   try
 #ifdef DirectDellTestCandidate
     ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer\prepare-direct-test-profile.ps1" -InstallRoot "{app}" -RunId "{#TestRunId}"'),
+      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer\prepare-direct-test-profile.ps1" -InstallRoot "{app}" -RunId "{#TestRunId}" -ApprovedCameraNetwork "{#TestCameraNetwork}"'),
       'Preparing isolated direct-test data and service profile...');
     ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer\install-runtime.ps1" -InstallRoot "{app}" -DataRoot "{commonappdata}\AnyAiCam-Test\{#TestRunId}" -SourceCommit "{#SourceCommit}" -PythonArchive "{tmp}\python-3.12.10-embed-amd64.zip" -GetPipScript "{tmp}\get-pip.py" -WheelRoot "{tmp}\wheels" -FFmpegArchive "{tmp}\ffmpeg-8.1.2-essentials_build.zip" -MediaMtxArchive "{tmp}\mediamtx_v1.21.0_windows_amd64.zip" -TesseractArchive "{tmp}\tesseract-5.5.2-win64-anyaicam.zip" -SttModelArchive "{tmp}\vosk-model-small-en-us-0.15.zip" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "" -RuntimeCatalog "{tmp}\{#RuntimeCatalogFileName}" -EntitlementKeyset "{tmp}\entitlement-signing-public-keys.json" -EntitlementKeysetSha256 "{#KeysetSha256}" -EntitlementTrustRegistry "{tmp}\entitlement-trust-registry.json" -EntitlementTrustRegistrySha256 "{#RegistrySha256}" -ProductMode local -DirectTest -TestRunId "{#TestRunId}" -TestApplianceIdentity "{tmp}\direct-test-appliance-identity.json" -TestApplianceIdentitySha256 "{#TestApplianceIdentitySha256}" -TestAcceptedCapacity "{tmp}\direct-test-accepted-capacity.json" -TestAcceptedCapacitySha256 "{#TestAcceptedCapacitySha256}" -TestFeatureEntitlements "{tmp}\direct-test-feature-entitlements.json" -TestFeatureEntitlementsSha256 "{#TestFeatureEntitlementsSha256}"'),
+      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer\install-runtime.ps1" -InstallRoot "{app}" -DataRoot "{commonappdata}\AnyAiCam-Test\{#TestRunId}" -SourceCommit "{#SourceCommit}" -PythonArchive "{tmp}\python-3.12.10-embed-amd64.zip" -GetPipScript "{tmp}\get-pip.py" -WheelRoot "{tmp}\wheels" -FFmpegArchive "{tmp}\ffmpeg-8.1.2-essentials_build.zip" -MediaMtxArchive "{tmp}\mediamtx_v1.21.0_windows_amd64.zip" -TesseractArchive "{tmp}\tesseract-5.5.2-win64-anyaicam.zip" -SttModelArchive "{tmp}\vosk-model-small-en-us-0.15.zip" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "" -RuntimeCatalog "{tmp}\{#RuntimeCatalogFileName}" -EntitlementKeyset "{tmp}\entitlement-signing-public-keys.json" -EntitlementKeysetSha256 "{#KeysetSha256}" -EntitlementTrustRegistry "{tmp}\entitlement-trust-registry.json" -EntitlementTrustRegistrySha256 "{#RegistrySha256}" -ProductMode local -DirectTest -TestRunId "{#TestRunId}" -TestCameraNetwork "{#TestCameraNetwork}" -TestApplianceIdentity "{tmp}\direct-test-appliance-identity.json" -TestApplianceIdentitySha256 "{#TestApplianceIdentitySha256}" -TestAcceptedCapacity "{tmp}\direct-test-accepted-capacity.json" -TestAcceptedCapacitySha256 "{#TestAcceptedCapacitySha256}" -TestFeatureEntitlements "{tmp}\direct-test-feature-entitlements.json" -TestFeatureEntitlementsSha256 "{#TestFeatureEntitlementsSha256}"'),
       'Installing isolated VMS runtime and synthetic offline licensing fixtures...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMSDirectTest.exe'), 'install', 'Installing isolated AnyAiCam VMS service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMSDirectTest.exe'), 'start', 'Starting isolated AnyAiCam VMS service...');

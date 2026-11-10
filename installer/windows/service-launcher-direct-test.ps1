@@ -9,7 +9,24 @@ if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw 'DIRECT_T
 if ((Get-Item -LiteralPath $profilePath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'DIRECT_TEST_PROFILE_REPARSE' }
 $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
 if ($profile.schema -ne 1 -or $profile.run_id -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -or
-    $profile.service_name -cne 'AnyAiCamVmsDirectTest' -or $profile.http_port -ne 18767) { throw 'DIRECT_TEST_PROFILE_INVALID' }
+    $profile.service_name -cne 'AnyAiCamVmsDirectTest' -or $profile.http_port -ne 18767 -or
+    $profile.approved_camera_network -notmatch '^(10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[0-1])\.(?:[0-9]{1,3}\.)[0-9]{1,3}|192\.168\.(?:[0-9]{1,3}\.)[0-9]{1,3})/(2[4-9]|3[0-2])$' -or
+    $profile.camera_interface_address -notmatch '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' -or
+    $profile.camera_interface_network -notmatch '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.).+/(1[0-9]|2[0-9]|3[0-2])$' -or
+    -not $profile.camera_interface_alias -or $profile.camera_interface_alias.Length -gt 128 -or $profile.camera_interface_alias -match '[\x00-\x1f]') { throw 'DIRECT_TEST_PROFILE_INVALID' }
+$interfaceAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+    $_.AddressState -eq 'Preferred' -and $_.IPAddress -eq $profile.camera_interface_address -and
+    $_.InterfaceAlias -eq $profile.camera_interface_alias
+})
+$activeAdapter = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
+    $_.InterfaceAlias -eq $profile.camera_interface_alias -and $_.Status -eq 'Up'
+})
+if ($interfaceAddresses.Count -ne 1 -or $activeAdapter.Count -ne 1) { throw 'DIRECT_TEST_CAMERA_INTERFACE_NO_LONGER_ACTIVE' }
+. (Join-Path $installRoot 'installer\direct-test-firewall-policy.ps1')
+$upAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' })
+$upInterfaceAliases = @($upAdapters | ForEach-Object { [string]$_.InterfaceAlias } | Sort-Object -Unique)
+$ipInterfaces = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $upInterfaceAliases -contains $_.InterfaceAlias })
+Assert-DirectTestStrongHostSend -InterfaceAlias ([string]$profile.camera_interface_alias) -InterfaceRows $ipInterfaces -ActiveInterfaceAliases $upInterfaceAliases
 $expectedRoot = Join-Path (Join-Path $env:ProgramData 'AnyAiCam-Test') $profile.run_id
 $normalize = { param($p) [IO.Path]::GetFullPath([string]$p).TrimEnd('\') }
 if ((& $normalize $profile.data_root) -ine (& $normalize $expectedRoot)) { throw 'DIRECT_TEST_ROOT_MISMATCH' }
@@ -38,6 +55,9 @@ $env:ANYAICAM_STATIC_FOLDER = Join-Path $installRoot 'app\static'
 $env:ANYAICAM_BIND_HOST = '127.0.0.1'
 $env:ANYAICAM_HTTP_PORT = '18767'
 $env:ANYAICAM_PUBLIC_URL = 'http://127.0.0.1:18767'
+$env:ANYAICAM_DIRECT_TEST_CAMERA_NETWORK = [string]$profile.approved_camera_network
+$env:ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS = [string]$profile.camera_interface_address
+$env:ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_NETWORK = [string]$profile.camera_interface_network
 $env:ANYAICAM_VMS_LOCAL_URL = 'http://127.0.0.1:18767'
 $env:ANYAICAM_VMS_LOCAL_HEALTH_URL = 'http://127.0.0.1:18767/health'
 $env:PYTHONUNBUFFERED = '1'
@@ -66,6 +86,7 @@ $env:ANYAICAM_PRODUCT_MODE = 'local'
 $env:ANYAICAM_PRODUCT_MODE_BOOTSTRAP = 'local'
 $env:ANYAICAM_CLOUD_URL = ''
 $env:ANYAICAM_PORTAL_URL = ''
+$env:ANYAICAM_CLOUD_UPLOAD_ENABLED = 'false'
 $env:ANYAICAM_ANALYTICS_SYNC_ENABLED = 'false'
 $env:ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED = 'false'
 $env:ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED = 'false'
@@ -73,6 +94,23 @@ $env:ANYAICAM_LIVE_RELAY_ENABLED = 'false'
 $env:ANYAICAM_RECORDING_UPLOAD_ENABLED = 'false'
 $env:ANYAICAM_LIVE_P2P_ENABLED = 'false'
 $env:ANYAICAM_PRODUCT_MODE_SELF_RESTART = 'false'
+# Do not inherit an operator or machine proxy into the isolated service.
+# Local camera connections use their approved LAN addresses directly; cloud
+# endpoints are disabled above and public Internet destinations are blocked
+# by the per-executable test firewall rules.
+foreach ($proxyName in @('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','http_proxy','https_proxy','all_proxy','no_proxy')) {
+    Remove-Item -LiteralPath ("Env:" + $proxyName) -ErrorAction SilentlyContinue
+}
+# Do not inherit credentials, profiles, endpoint overrides, or metadata-service
+# lookups from a host-level AWS configuration into the test service.
+Get-ChildItem Env: | Where-Object { $_.Name -match '^AWS_' } | ForEach-Object {
+    Remove-Item -LiteralPath ("Env:" + $_.Name) -ErrorAction SilentlyContinue
+}
+$env:AWS_SHARED_CREDENTIALS_FILE = Join-Path $config 'aws-credentials-disabled'
+$env:AWS_CONFIG_FILE = Join-Path $config 'aws-config-disabled'
+$env:AWS_PROFILE = '__direct_test_no_profile__'
+$env:AWS_DEFAULT_PROFILE = '__direct_test_no_profile__'
+$env:AWS_EC2_METADATA_DISABLED = 'true'
 $env:ANYAICAM_TURN_URL = ''
 $env:ANYAICAM_TURN_USERNAME = ''
 $env:ANYAICAM_TURN_CREDENTIAL = ''

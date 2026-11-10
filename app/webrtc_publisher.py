@@ -667,6 +667,13 @@ P2P_TRANSCODE_MAX_CAMERAS = max(0, int(os.environ.get("ANYAICAM_LIVE_P2P_TRANSCO
 P2P_SOURCE_RECHECK_SECONDS = float(camera_capabilities.REPROBE_SECONDS)
 
 
+def _direct_test_rtsp_input_options() -> list[str]:
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") != "1":
+        return []
+    import direct_test_profile
+    return direct_test_profile.rtsp_input_options()
+
+
 def transcode_command(source_url: str) -> str:
     """The runOnDemand command MediaMTX starts when the first WebRTC viewer
     asks for a transcoded path and stops runOnDemandCloseAfter after the last
@@ -678,7 +685,7 @@ def transcode_command(source_url: str) -> str:
     import shlex
     video_filter = f"scale=w=min(iw\\,{P2P_TRANSCODE_MAX_WIDTH}):h=-2,fps={P2P_TRANSCODE_FPS}"
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-i", source_url,
+            "-rtsp_transport", "tcp", *_direct_test_rtsp_input_options(), "-i", source_url,
             "-an", "-vf", video_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
             "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-bf", "0", "-g", str(P2P_TRANSCODE_FPS * 2),
@@ -703,7 +710,7 @@ def _probe_video_codec(url: str) -> str | None:
     opened or has no video. Never logs or returns the (credentialed) URL."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
+            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp", *_direct_test_rtsp_input_options(), "-select_streams", "v:0",
              "-show_entries", "stream=codec_type,codec_name,width,height", "-of", "json", url],
             capture_output=True, text=True, timeout=P2P_SUBSTREAM_PROBE_TIMEOUT_SECONDS, check=False,
         )

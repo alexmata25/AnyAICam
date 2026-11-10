@@ -93,6 +93,9 @@ def substream_command(url: str) -> list[str]:
     args = ["ffmpeg", "-loglevel", "error"]
     if url.lower().startswith(("rtsp://", "rtsps://")):
         args += ["-rtsp_transport", "tcp"]
+        if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+            import direct_test_profile
+            args += direct_test_profile.rtsp_input_options()
     return args + [
         "-fflags", "nobuffer", "-i", url, "-an", "-vf", MOTION_FRAME_FILTER,
         "-f", "rawvideo", "pipe:1",

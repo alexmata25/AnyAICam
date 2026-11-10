@@ -21,6 +21,7 @@ param(
     [switch]$InternalTestAzureSign,
     [switch]$DirectDellTestCandidate,
     [string]$TestRunId = '',
+    [string]$TestCameraNetwork = '',
     [string]$TestApplianceIdentity = '',
     [string]$TestApplianceIdentitySha256 = '',
     [string]$TestAcceptedCapacity = '',
@@ -36,6 +37,21 @@ if (($Sign -and $AzureSign) -or ($Sign -and $InternalTestAzureSign) -or ($AzureS
 if ($DirectDellTestCandidate) {
     if (-not $InternalTestAzureSign) { throw 'DirectDellTestCandidate requires -InternalTestAzureSign and a synthetic trust registry.' }
     if ($TestRunId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { throw 'Direct test candidate requires a UUIDv4 TestRunId.' }
+    $networkParts = $TestCameraNetwork.Split('/')
+    if ($networkParts.Count -ne 2 -or $networkParts[1] -notmatch '^(2[4-9]|3[0-2])$') { throw 'Direct test candidate requires one approved /24 to /32 camera network.' }
+    try { $cameraAddress = [Net.IPAddress]::Parse($networkParts[0]) } catch { throw 'Direct test camera network address is invalid.' }
+    if ($cameraAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { throw 'Direct test camera network must be IPv4.' }
+    $octets = $networkParts[0].Split('.')
+    if ($octets.Count -ne 4 -or @($octets | Where-Object { $_ -notmatch '^(0|[1-9][0-9]{0,2})$' -or [int]$_ -gt 255 }).Count) { throw 'Direct test camera network address is not canonical IPv4.' }
+    $addressBytes = $cameraAddress.GetAddressBytes()
+    $addressValue = ([long]$addressBytes[0] -shl 24) -bor ([long]$addressBytes[1] -shl 16) -bor ([long]$addressBytes[2] -shl 8) -bor [long]$addressBytes[3]
+    $prefixLength = [int]$networkParts[1]
+    $mask = [long]4294967295 -band ([long]4294967295 -shl (32 - $prefixLength))
+    if (($addressValue -band $mask) -ne $addressValue) { throw 'Direct test camera network must use its canonical network address.' }
+    $rfc1918 = ($addressBytes[0] -eq 10) -or
+        ($addressBytes[0] -eq 172 -and $addressBytes[1] -ge 16 -and $addressBytes[1] -le 31) -or
+        ($addressBytes[0] -eq 192 -and $addressBytes[1] -eq 168)
+    if (-not $rfc1918) { throw 'Direct test camera network must be within RFC1918 private address space.' }
     $fixtures = @(
         @{ Path = $TestApplianceIdentity; Hash = $TestApplianceIdentitySha256 },
         @{ Path = $TestAcceptedCapacity; Hash = $TestAcceptedCapacitySha256 },
@@ -45,7 +61,7 @@ if ($DirectDellTestCandidate) {
         if (-not $fixture.Path -or $fixture.Hash -notmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $fixture.Path -PathType Leaf)) { throw 'Direct test candidate requires both pinned synthetic licensing fixtures.' }
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $fixture.Path).Hash.ToLowerInvariant() -cne $fixture.Hash) { throw 'A pinned synthetic licensing fixture hash does not match.' }
     }
-} elseif ($TestRunId -or $TestApplianceIdentity -or $TestApplianceIdentitySha256 -or $TestAcceptedCapacity -or $TestAcceptedCapacitySha256 -or $TestFeatureEntitlements -or $TestFeatureEntitlementsSha256) {
+} elseif ($TestRunId -or $TestCameraNetwork -or $TestApplianceIdentity -or $TestApplianceIdentitySha256 -or $TestAcceptedCapacity -or $TestAcceptedCapacitySha256 -or $TestFeatureEntitlements -or $TestFeatureEntitlementsSha256) {
     throw 'Synthetic licensing inputs are accepted only with -DirectDellTestCandidate.'
 }
 $azureSigning = $AzureSign -or $InternalTestAzureSign
@@ -266,6 +282,7 @@ if ($InternalTestAzureSign) { $compilerArguments += '/DInternalTestOnly=1' }
 if ($DirectDellTestCandidate) {
     $compilerArguments += '/DDirectDellTestCandidate=1'
     $compilerArguments += "/DTestRunId=$TestRunId"
+    $compilerArguments += "/DTestCameraNetwork=$TestCameraNetwork"
     $compilerArguments += "/DTestApplianceIdentitySha256=$TestApplianceIdentitySha256"
     $compilerArguments += "/DTestAcceptedCapacitySha256=$TestAcceptedCapacitySha256"
     $compilerArguments += "/DTestAcceptedCapacitySha256=$TestAcceptedCapacitySha256"

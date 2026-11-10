@@ -33,6 +33,7 @@ param(
     [string]$ProductMode = '',
     [switch]$DirectTest,
     [string]$TestRunId = '',
+    [string]$TestCameraNetwork = '',
     [string]$TestApplianceIdentity = '',
     [string]$TestApplianceIdentitySha256 = '',
     [string]$TestAcceptedCapacity = '',
@@ -47,7 +48,8 @@ if ($DirectTest) {
     if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw 'DIRECT_TEST_PROFILE_MISSING' }
     $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
     $expectedRoot = Join-Path (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'AnyAiCam-Test') $TestRunId
-    if ($profile.run_id -cne $TestRunId -or [IO.Path]::GetFullPath([string]$profile.data_root) -ine [IO.Path]::GetFullPath($expectedRoot) -or
+    if ($profile.run_id -cne $TestRunId -or $profile.approved_camera_network -cne $TestCameraNetwork -or
+        [IO.Path]::GetFullPath([string]$profile.data_root) -ine [IO.Path]::GetFullPath($expectedRoot) -or
         [IO.Path]::GetFullPath($DataRoot) -ine [IO.Path]::GetFullPath($expectedRoot) -or
         $profile.service_name -cne 'AnyAiCamVmsDirectTest' -or $profile.http_port -ne 18767) { throw 'DIRECT_TEST_PROFILE_MISMATCH' }
     # Python trust helpers resolve their trust location from platform_paths at process startup.
@@ -355,7 +357,14 @@ if ($DirectTest) {
     $values['ANYAICAM_PRODUCT_MODE_BOOTSTRAP'] = 'local'
     $values['ANYAICAM_AGENT_MODE'] = 'disabled'
     $values['ANYAICAM_PORTAL_URL'] = ''
+    $values['ANYAICAM_CLOUD_URL'] = ''
+    $values['ANYAICAM_CLOUD_UPLOAD_ENABLED'] = 'false'
+    $values['ANYAICAM_RECORDING_UPLOAD_ENABLED'] = 'false'
+    $values['ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED'] = 'false'
     $values['ANYAICAM_ANALYTICS_SYNC_ENABLED'] = 'false'
+    $values['ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED'] = 'false'
+    $values['ANYAICAM_LIVE_RELAY_ENABLED'] = 'false'
+    $values['ANYAICAM_LIVE_P2P_ENABLED'] = 'false'
     $values['ANYAICAM_ENV'] = 'local'
     $values['ANYAICAM_BIND_HOST'] = '127.0.0.1'
     $values['ANYAICAM_HTTP_PORT'] = '18767'
@@ -415,6 +424,6 @@ if (-not $DirectTest) {
 } else {
     # Explicit per-image outbound block is installed before the service exists.
     # Only this candidate's executables and exact run-scoped rule group are touched.
-    & (Join-Path $InstallRoot 'installer\firewall-direct-test.ps1') -Apply -InstallRoot $InstallRoot -RunId $TestRunId
+    & (Join-Path $InstallRoot 'installer\firewall-direct-test.ps1') -Apply -InstallRoot $InstallRoot -RunId $TestRunId -CameraNetwork $TestCameraNetwork
     if (-not $?) { throw 'DIRECT_TEST_EGRESS_POLICY_FAILED' }
 }
