@@ -25,8 +25,12 @@ function Get-PackagedRepoFolders([string]$IssPath) {
         $excludes = @()
         if ($line -match 'Excludes:\s*"([^"]*)"') {
             foreach ($pattern in ($Matches[1] -split ',')) {
-                # Only "<folder name>\*" is understood; anything else must be
-                # handled here before the .iss may use it.
+                # A plain file name (direct_test_profile.py, 2026-11-10) only
+                # leaves that file out; it never excuses an ignored file, so
+                # it is not recorded.
+                if ($pattern.Trim() -match '^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$') { continue }
+                # Otherwise only "<folder name>\*" is understood; anything else
+                # must be handled here before the .iss may use it.
                 if ($pattern.Trim() -notmatch '^([A-Za-z0-9_.-]+)\\\*$') { throw "source-integrity.ps1 does not understand the Excludes pattern '$pattern' in $IssPath" }
                 $excludes += $Matches[1]
             }

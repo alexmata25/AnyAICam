@@ -88,7 +88,9 @@ def test_internal_signing_is_default_off_and_output_and_labels_are_isolated():
     assert 'OutputDir={#BuildOutputDir}' in iss
     assert 'OutputBaseFilename=AnyAiCam-VMS-Setup-{#AppVersion}-{#ShortCommit}{#InternalTestFilenameSuffix}' in iss
     assert 'SignedUninstallerDir={#BuildOutputDir}\\signed-uninstallers' in iss
-    assert 'Source: "{#BuildOutputDir}\\AnyAiCamRuntime.cat"' in iss
+    # f9b9a57: the catalog name is a define (the direct-test build has its own catalog), still under BuildOutputDir.
+    assert 'Source: "{#BuildOutputDir}\\{#RuntimeCatalogFileName}"' in iss
+    assert '#define RuntimeCatalogFileName "AnyAiCamRuntime.cat"' in iss
     assert 'Source: "internal-test-marker.txt"; DestDir: "{app}"' in iss
     assert "Start-Transcript -LiteralPath $internalTranscript" in build
     assert "build-evidence.json" in build and "SHA256SUMS" in build
@@ -104,4 +106,7 @@ def test_internal_and_production_signing_guards_remain_separate():
     assert "if ($Sign -and $signature.SignerCertificate.Thumbprint -ne $thumbprint)" in build
     assert "Get-AnyAiCamPublisherProblem" in build
     assert "if ($Sign -or $AzureSign -or $InternalTestAzureSign)" in build
-    assert "if ($InternalTestAzureSign -and $signedUninstallers.Count -lt 1)" in build
+    # 0c12c4c: exactly one signed uninstaller cache artifact, by name, not a reparse point (stricter than "at least one").
+    assert ("if ($InternalTestAzureSign -and ($cacheEntries.Count -ne 1 -or $signedUninstallers.Count -ne 1 -or "
+            "$signedUninstallers[0].Name -ne 'AnyAiCamSignedUninstaller.exe' -or "
+            "(($cacheEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)))") in build

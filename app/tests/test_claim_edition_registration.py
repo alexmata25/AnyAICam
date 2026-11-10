@@ -39,8 +39,8 @@ def _entitlement(product, quantity, *, stripe=True, status="active"):
 
 def _appliance_order(*, intent="pi_test_1", status="paid"):
     with connection() as con:
-        con.execute("INSERT INTO hardware_orders(id,customer_id,sku,product_name,stripe_price_id,stripe_payment_intent_id,quantity,amount_cents,currency,status,created_at) "
-                    "VALUES('order-1','cust-1','AIC-APPLIANCE-MINI','Appliance','price_test',?,1,10000,'usd',?,?)", (intent, status, NOW))
+        con.execute("INSERT INTO hardware_orders(id,customer_id,sku,product_name,stripe_price_id,stripe_payment_intent_id,quantity,amount_cents,currency,status,created_at,updated_at) "
+                    "VALUES('order-1','cust-1','AIC-APPLIANCE-MINI','Appliance','price_test',?,1,10000,'usd',?,?,?)", (intent, status, NOW, NOW))
 
 
 def _marker():
@@ -102,6 +102,16 @@ def test_a_plan_without_a_licence_is_not_enough(db):
 def test_an_unrecorded_or_reversed_appliance_payment_is_not_a_licence(db, intent, status):
     _entitlement("camera_slots_local", 4)
     _appliance_order(intent=intent, status=status)
+    assert registration.register_claimed_appliance_edition("appl-1") == "unpaid"
+    assert _marker() is None
+
+
+@pytest.mark.parametrize("reason", ["refunded", "disputed"])
+def test_a_paid_order_whose_payment_was_reversed_is_not_a_licence(db, reason):
+    import billing_status
+    _entitlement("camera_slots_local", 4)
+    _appliance_order()  # still 'paid' locally; the reversal is recorded against its payment intent
+    billing_status.record_reversal("ch_test_1", "pi_test_1", "", reason)
     assert registration.register_claimed_appliance_edition("appl-1") == "unpaid"
     assert _marker() is None
 

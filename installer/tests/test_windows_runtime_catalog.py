@@ -141,11 +141,13 @@ class CatalogWiringTests(unittest.TestCase):
         build = read("build.ps1")
         steps = [build.index(s) for s in (
             "Get-VendorProblems $vendor @($pinned.Keys) $lockedWheels",
-            "Export-NativeFiles $catalogStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe')",
-            "New-RuntimeCatalog $catalogStage $catalog $makeCat",
+            # f9b9a57: staged under a short temporary path, then moved to the output's runtime-catalog folder.
+            "Export-NativeFiles $catalogWorkStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe')",
+            "New-RuntimeCatalog $catalogWorkStage $catalog $makeCat",
             "& $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog",
             "(Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid'",
-            "Test-RuntimeCatalogFiles $catalogStage $catalog $signTool",
+            "Test-RuntimeCatalogFiles $catalogWorkStage $catalog $signTool",
+            "Move-Item -LiteralPath $catalogWorkStage -Destination $catalogStage",
             "& $iscc @compilerArguments")]
         self.assertEqual(steps, sorted(steps))
         self.assertIn("& $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog", build)
@@ -154,7 +156,8 @@ class CatalogWiringTests(unittest.TestCase):
 
     def test_setup_ships_registers_first_and_removes_on_uninstall(self):
         iss = read("AnyAiCam-VMS.iss")
-        self.assertIn('Source: "{#BuildOutputDir}\\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall', iss)
+        self.assertIn('Source: "{#BuildOutputDir}\\{#RuntimeCatalogFileName}"; DestDir: "{tmp}"; Flags: deleteafterinstall', iss)
+        self.assertIn('#define RuntimeCatalogFileName "AnyAiCamRuntime.cat"', iss)
         self.assertIn('Source: "runtime-catalog.ps1"; DestDir: "{app}\\installer"; Flags: ignoreversion', iss)
         # Other arguments (the entitlement keyset, the product mode) follow it since Windows steps 2 and 5.
         self.assertIn("-RuntimeCatalog \"' + ExpandConstant('{tmp}\\AnyAiCamRuntime.cat') + '\" ", iss)

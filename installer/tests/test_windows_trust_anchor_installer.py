@@ -187,7 +187,9 @@ def test_a_refused_registry_stops_setup_before_the_services_stop():
 
 def test_setup_continues_past_the_early_check_only_on_exit_0():
     iss = _text("AnyAiCam-VMS.iss")
-    problem = iss[iss.index("function TrustRegistryProblem"):iss.index("function PrepareToInstall")]
+    # TrustRegistryProblem alone: the unified .iss defines GatewayEditionProblem before PrepareToInstall (2026-11-10).
+    start = iss.index("function TrustRegistryProblem")
+    problem = iss[start:iss.index("\nfunction ", start + 1)]
     body = problem[problem.index("begin"):]
     assert body.index("Result := 'Setup could not confirm") < body.index("try")  # refuses unless proven otherwise
     assert body.count("Result := ''") == 2

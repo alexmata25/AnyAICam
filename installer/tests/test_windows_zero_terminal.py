@@ -155,7 +155,10 @@ class BuildIntegrityTests(unittest.TestCase):
 
     def test_an_excludes_pattern_it_does_not_understand_stops_the_build(self):
         iss = self.repo / "installer/windows/AnyAiCam-VMS.iss"
-        iss.write_text(iss.read_text(encoding="utf-8").replace('Excludes: "tests\\*,__pycache__\\*"', 'Excludes: "*.pyc"'), encoding="utf-8")
+        original = iss.read_text(encoding="utf-8")
+        changed = original.replace('Excludes: "tests\\*,', 'Excludes: "*.pyc,')
+        self.assertNotEqual(changed, original)
+        iss.write_text(changed, encoding="utf-8")
         result = ps(f". {quote(self.repo / 'installer/windows/source-integrity.ps1')}; Get-PackagedSourceProblems {quote(self.repo)} {quote(iss)}")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not understand the Excludes pattern", result.stdout + result.stderr)
