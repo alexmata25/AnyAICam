@@ -175,7 +175,7 @@ def test_a_plan_checkout_opened_before_the_licence_reversal_and_paid_after_it_ca
     assert activated is True  # the running plan stays manageable in My subscription (change, cancel)
     capacity = _capacity(db_path, customer_id)
     assert capacity["plan_camera_slots"] == 5 and capacity["vms_license_required"] is True
-    assert _signed(db_path, customer_id) == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0}
+    assert _signed(db_path, customer_id) == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0, "purchased_vms_license_capacity": 0}
     summary = _summary(db_path, customer_id)
     assert (summary["kind"], summary["status"], summary["cameras"]) == ("one_time_vms_license", "suspended", 0)
     # A second plan beside the running one is refused as before.

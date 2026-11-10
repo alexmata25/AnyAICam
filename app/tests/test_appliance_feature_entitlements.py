@@ -151,6 +151,7 @@ def test_signed_camera_capacity_fields_are_clamped_to_edge_supported_maximum(app
     assert snapshot["camera_capacity"] == {
         "camera_slot_quantity": 10_000, "plan_camera_slots": 10_000,
         "vms_license_capacity": 10_000,
+        "purchased_vms_license_capacity": 0,
     }
     assert appliance_entitlements.verify(snapshot, appliance_entitlements._trusted_keys(),
                                          identity=EDGE_IDENTITY) is None

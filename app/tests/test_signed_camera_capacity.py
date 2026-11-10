@@ -103,7 +103,7 @@ def _fallback(quantity=5, **changes):
 def test_the_cloud_signs_the_licensed_camera_limit_in_the_entitlement_snapshot(licensed, edge_db):
     _sync(edge_db)
     snapshot = _signed_snapshot()
-    assert snapshot["camera_capacity"] == {"camera_slot_quantity": 3, "plan_camera_slots": 3, "vms_license_capacity": 64}
+    assert snapshot["camera_capacity"] == {"camera_slot_quantity": 3, "plan_camera_slots": 3, "vms_license_capacity": 64, "purchased_vms_license_capacity": 0}
     assert snapshot["type"] == "anyaicam.feature_entitlements" and snapshot["version"] == 1  # 1.2.4 ignores the field
     assert appliance_entitlements.verify(snapshot, appliance_entitlements._trusted_keys(),
                                          identity=appliance_entitlements._local_identity()) is None

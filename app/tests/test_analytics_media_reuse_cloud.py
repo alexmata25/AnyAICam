@@ -40,7 +40,7 @@ def _seed(db):
     for n in ("1", "2"):
         db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)", (f"cust-{n}", "partner-1", f"Customer {n}", f"c{n}@example.test", "active", "real", NOW))
         db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (f"site-{n}", f"cust-{n}", "Site", NOW))
-        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", (f"appl-{n}", f"cust-{n}", f"site-{n}", f"AIC-TEST-{n}", NOW))
+        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,gateway_edition,created_at) VALUES(?,?,?,?,'full_vms',?)", (f"appl-{n}", f"cust-{n}", f"site-{n}", f"AIC-TEST-{n}", NOW))
         db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", (f"cred-{n}", f"appl-{n}", password_hash(f"credential-{n}" if n == "2" else "credential"), NOW))
         db.execute("INSERT INTO plans(id,customer_id,recording_mode,retention_days,created_at) VALUES(?,?,?,?,?)", (f"plan-{n}", f"cust-{n}", "motion", 7, NOW))
     for camera, n, number in (("cam-1", "1", 1), ("cam-2", "1", 2), ("cam-3", "2", 1)):

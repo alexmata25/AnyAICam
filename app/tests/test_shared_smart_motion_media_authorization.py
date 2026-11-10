@@ -48,7 +48,7 @@ def _seed(db):
     db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-1", "Partner", "approved", "real", now))
     db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)", ("cust-1", "partner-1", "Customer", "customer@example.test", "active", "real", now))
     db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", ("site-1", "cust-1", "Site", now))
-    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", ("appl-1", "cust-1", "site-1", "AIC-TEST-1", now))
+    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,gateway_edition,created_at) VALUES(?,?,?,?,'full_vms',?)", ("appl-1", "cust-1", "site-1", "AIC-TEST-1", now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", ("cred-1", "appl-1", password_hash("credential"), now))
     db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,cloud_recording_mode,created_at) VALUES(?,?,?,?,?,?,?)", ("cam-1", "cust-1", "site-1", "appl-1", "Driveway", "motion", now))
     db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,cloud_recording_mode,created_at) VALUES(?,?,?,?,?,?,?)", ("cam-2", "cust-1", "site-1", "appl-1", "Backyard", "motion", now))
@@ -56,7 +56,7 @@ def _seed(db):
 
     db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)", ("cust-2", "partner-1", "Other Customer", "other@example.test", "active", "real", now))
     db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", ("site-2", "cust-2", "Site 2", now))
-    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", ("appl-2", "cust-2", "site-2", "AIC-TEST-2", now))
+    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,gateway_edition,created_at) VALUES(?,?,?,?,'full_vms',?)", ("appl-2", "cust-2", "site-2", "AIC-TEST-2", now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", ("cred-2", "appl-2", password_hash("credential-2"), now))
     db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,cloud_recording_mode,created_at) VALUES(?,?,?,?,?,?,?)", ("cam-3", "cust-2", "site-2", "appl-2", "Front Door", "motion", now))
     db.execute("INSERT INTO plans(id,customer_id,recording_mode,retention_days,created_at) VALUES(?,?,?,?,?)", ("plan-2", "cust-2", "motion", 7, now))

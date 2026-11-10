@@ -66,7 +66,7 @@ def _identity(**changes):
 def test_every_cloud_snapshot_is_accepted_by_the_helper(cloud, edge_db, slots, plan, license):
     snapshot = _issue(cloud, edge_db, slots=slots, plan=plan, license=license)
     body, issued_at, digest = helper._validate_snapshot(snapshot, cloud["keys"], _identity(), verifier=_verify)
-    assert body["camera_capacity"] == {"camera_slot_quantity": slots, "plan_camera_slots": plan, "vms_license_capacity": license}
+    assert body["camera_capacity"] == {"camera_slot_quantity": slots, "plan_camera_slots": plan, "vms_license_capacity": license, "purchased_vms_license_capacity": 0}
     assert body["type"] == helper.SNAPSHOT_TYPE and body["version"] == helper.SNAPSHOT_VERSION
     assert set(body) == {"type", "version", "appliance_id", "cloud_id", "customer_id", "features",
                          "camera_capacity", "issued_at", "expires_at"}
@@ -80,6 +80,7 @@ def test_cloud_capacity_above_edge_bound_is_clamped_before_signing(cloud, edge_d
         "camera_slot_quantity": 3,
         "plan_camera_slots": 10_000,
         "vms_license_capacity": 64,
+        "purchased_vms_license_capacity": 0,
     }
     body, _, _ = helper._validate_snapshot(snapshot, cloud["keys"], _identity(), verifier=_verify)
     assert body["camera_capacity"]["plan_camera_slots"] <= helper.MAX_CAMERA_SLOTS

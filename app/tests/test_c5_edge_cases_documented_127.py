@@ -220,7 +220,7 @@ def test_1_advanced_analytics_add_on_is_refused_with_zero_camera_capacity(shop, 
     assert len(shop[1]) == before  # no Stripe call
     assert _active_analytics(db_path, customer_id) == ([], [])
     assert _entitled(db_path, customer_id) == REVERSED_RUNNING
-    assert _signed(db_path, customer_id) == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0}
+    assert _signed(db_path, customer_id) == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0, "purchased_vms_license_capacity": 0}
 
 
 @BUILDERS
@@ -499,7 +499,7 @@ def test_5_reversed_appliance_without_a_licence_row_gives_no_plan_capacity(shop,
         assert per_camera_billing.own_pc_licence_reversed("cust-apn") is False
     assert _predicates(db_path, "cust-apn") == (True, True)
     assert _entitled(db_path, "cust-apn") == REVERSED_RUNNING
-    assert _signed(db_path, "cust-apn") == {"camera_slot_quantity": 0, "plan_camera_slots": 6, "vms_license_capacity": 0}
+    assert _signed(db_path, "cust-apn") == {"camera_slot_quantity": 0, "plan_camera_slots": 6, "vms_license_capacity": 0, "purchased_vms_license_capacity": 0}
     _exec(db_path, "UPDATE camera_plan_entitlements_v2 SET status='cancelled',camera_quantity=0 WHERE customer_id='cust-apn'")
     assert _entitled(db_path, "cust-apn") == (True, False, 0, 0, 0)
 
@@ -545,6 +545,6 @@ def test_6_signed_snapshot_of_the_reversed_running_plan_account(shop, db_path, s
     customer_id, *_ = _reversed_running(shop, db_path, stripe, builder, "c5e-snap@example.test")
     with override_target(sqlite_path=str(db_path)):
         snapshot = feature_entitlements.appliance_snapshot({"id": "appl-c5e", "cloud_id": "cloud-c5e", "customer_id": customer_id})
-    assert snapshot["camera_capacity"] == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0}
+    assert snapshot["camera_capacity"] == {"camera_slot_quantity": 0, "plan_camera_slots": 5, "vms_license_capacity": 0, "purchased_vms_license_capacity": 0}
     assert snapshot["features"] == {"talk_down": True, "voice_call": False}
     assert snapshot["signature"]

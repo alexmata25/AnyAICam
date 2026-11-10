@@ -52,7 +52,7 @@ def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
     db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)",
                (customer_id, "partner-1", "Test Customer", f"{customer_id}@example.test", "active", "real", now))
     db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (site_id, customer_id, "Test Site", now))
-    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,live_relay_pilot,created_at) VALUES(?,?,?,?,?,?)",
+    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,live_relay_pilot,gateway_edition,created_at) VALUES(?,?,?,?,?,'full_vms',?)",
                (appliance_id, customer_id, site_id, cloud_id, 1, now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)",
                (f"cred-{appliance_id}", appliance_id, password_hash(credential), now))
@@ -209,7 +209,7 @@ def test_live_relay_endpoints_still_require_valid_camera_ownership(client, db_pa
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1")
-            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,live_relay_pilot,created_at) VALUES('appl-other','cust-1','site-1','AIC-OTHER',1,'2026-09-13T00:00:00')")
+            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,live_relay_pilot,gateway_edition,created_at) VALUES('appl-other','cust-1','site-1','AIC-OTHER',1,'full_vms','2026-09-13T00:00:00')")
             db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES('cred-other','appl-other',?,?)",
                        (password_hash("other-credential"), "2026-09-13T00:00:00"))
 
