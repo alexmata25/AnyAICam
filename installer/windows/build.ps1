@@ -17,13 +17,61 @@ param(
     [string]$PythonExe = '',
     [string]$GitExe = '',
     [switch]$Sign,
-    [switch]$AzureSign
+    [switch]$AzureSign,
+    # Explicit, isolated Azure-signed internal test mode. Never enabled by default.
+    [switch]$InternalTestAzureSign,
+    [switch]$DirectDellTestCandidate,
+    [string]$TestRunId = '',
+    [string]$TestCameraNetwork = '',
+    [string]$TestApplianceIdentity = '',
+    [string]$TestApplianceIdentitySha256 = '',
+    [string]$TestAcceptedCapacity = '',
+    [string]$TestAcceptedCapacitySha256 = '',
+    [string]$TestFeatureEntitlements = '',
+    [string]$TestFeatureEntitlementsSha256 = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-tools.ps1')
 $GitExe = Resolve-BuildGit $GitExe
 . (Join-Path $PSScriptRoot 'publisher-pin.ps1')
-if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
+if (($Sign -and $AzureSign) -or ($Sign -and $InternalTestAzureSign) -or ($AzureSign -and $InternalTestAzureSign)) {
+    throw 'Choose exactly one signing mode.'
+}
+if ($DirectDellTestCandidate) {
+    if (-not $InternalTestAzureSign) { throw 'DirectDellTestCandidate requires -InternalTestAzureSign and a synthetic trust registry.' }
+    if ($TestRunId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { throw 'Direct test candidate requires a UUIDv4 TestRunId.' }
+    $networkParts = $TestCameraNetwork.Split('/')
+    if ($networkParts.Count -ne 2 -or $networkParts[1] -notmatch '^(2[4-9]|3[0-2])$') { throw 'Direct test candidate requires one approved /24 to /32 camera network.' }
+    try { $cameraAddress = [Net.IPAddress]::Parse($networkParts[0]) } catch { throw 'Direct test camera network address is invalid.' }
+    if ($cameraAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { throw 'Direct test camera network must be IPv4.' }
+    $octets = $networkParts[0].Split('.')
+    if ($octets.Count -ne 4 -or @($octets | Where-Object { $_ -notmatch '^(0|[1-9][0-9]{0,2})$' -or [int]$_ -gt 255 }).Count) { throw 'Direct test camera network address is not canonical IPv4.' }
+    $addressBytes = $cameraAddress.GetAddressBytes()
+    $addressValue = ([long]$addressBytes[0] -shl 24) -bor ([long]$addressBytes[1] -shl 16) -bor ([long]$addressBytes[2] -shl 8) -bor [long]$addressBytes[3]
+    $prefixLength = [int]$networkParts[1]
+    $mask = [long]4294967295 -band ([long]4294967295 -shl (32 - $prefixLength))
+    if (($addressValue -band $mask) -ne $addressValue) { throw 'Direct test camera network must use its canonical network address.' }
+    $rfc1918 = ($addressBytes[0] -eq 10) -or
+        ($addressBytes[0] -eq 172 -and $addressBytes[1] -ge 16 -and $addressBytes[1] -le 31) -or
+        ($addressBytes[0] -eq 192 -and $addressBytes[1] -eq 168)
+    if (-not $rfc1918) { throw 'Direct test camera network must be within RFC1918 private address space.' }
+    $fixtures = @(
+        @{ Path = $TestApplianceIdentity; Hash = $TestApplianceIdentitySha256 },
+        @{ Path = $TestAcceptedCapacity; Hash = $TestAcceptedCapacitySha256 },
+        @{ Path = $TestFeatureEntitlements; Hash = $TestFeatureEntitlementsSha256 }
+    )
+    foreach ($fixture in $fixtures) {
+        if (-not $fixture.Path -or $fixture.Hash -notmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $fixture.Path -PathType Leaf)) { throw 'Direct test candidate requires both pinned synthetic licensing fixtures.' }
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $fixture.Path).Hash.ToLowerInvariant() -cne $fixture.Hash) { throw 'A pinned synthetic licensing fixture hash does not match.' }
+    }
+} elseif ($TestRunId -or $TestCameraNetwork -or $TestApplianceIdentity -or $TestApplianceIdentitySha256 -or $TestAcceptedCapacity -or $TestAcceptedCapacitySha256 -or $TestFeatureEntitlements -or $TestFeatureEntitlementsSha256) {
+    throw 'Synthetic licensing inputs are accepted only with -DirectDellTestCandidate.'
+}
+$azureSigning = $AzureSign -or $InternalTestAzureSign
+$outputName = if ($InternalTestAzureSign) { 'output-internal-test' } else { 'output' }
+$outputDir = Join-Path $PSScriptRoot $outputName
+# Internal evidence is never reused or overwritten. This check is before any generated output is written.
+if ($InternalTestAzureSign -and (Test-Path -LiteralPath $outputDir)) { throw "Internal-test output already exists; choose a new isolated source clone: $outputDir" }
 # Three or four decimal parts (1.3.2, or a hotfix 1.3.2.1): exactly what install-version-guard.ps1 accepts.
 if ($Version -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2,3}$') { throw "Version must look like 1.3.2 or 1.3.2.1 (got '$Version')." }
 if ($ReleaseVersion -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$') { throw "ReleaseVersion must look like 1.2.7 (got '$ReleaseVersion')." }
@@ -39,29 +87,6 @@ if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not read the source
 . (Join-Path $PSScriptRoot 'source-integrity.ps1')
 $sourceProblems = @(Get-PackagedSourceProblems $repo (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss') -GitExe $GitExe)
 if ($sourceProblems.Count) { throw ("The packaged sources are not exactly commit $sourceCommit; build only from a committed tree:`n  " + ($sourceProblems -join "`n  ")) }
-# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
-# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
-if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
-if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementTrustRegistrySha256 must be a 64-character lowercase SHA-256.' }
-$keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
-$registryOut = Join-Path $PSScriptRoot 'output\entitlement-trust-registry.json'
-# A signed setup is a release candidate: only a production registry. Synthetic registries are for unsigned test builds.
-$registryEnvironment = if ($Sign -or $AzureSign) { 'production' } else { 'any' }
-# A rotation build names the keys kept for verification only. Passed only when there are some: PowerShell 5.1 drops an
-# empty argument. prepare-keyset.py stops the build on a retired key not named here.
-$retiredKeyArgument = @()
-if ($EntitlementRetiredKeyIds.Count) { $retiredKeyArgument = @($EntitlementRetiredKeyIds -join ',') }
-if ($PythonExe) {
-    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
-    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
-    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
-} else {
-    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
-}
-if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset or trust registry was refused; nothing was built.' }
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $registryOut).Hash.ToLowerInvariant() -ne $EntitlementTrustRegistrySha256) { throw 'The prepared entitlement trust registry does not match its pinned SHA-256.' }
 # Every vendored input is pinned by SHA-256 (DEPENDENCIES.md), not just present.
 $vendor = Join-Path $PSScriptRoot 'vendor'
 $pinned = [ordered]@{
@@ -112,13 +137,23 @@ if ($Sign) {
     $compilerArguments += '/DEnableSigning=1'
     $compilerArguments += '/SAnyAiCamSign=' + $signCommand
 }
-if ($AzureSign) {
+if ($azureSigning) {
     $signTool = if ($env:ANYAICAM_SIGNTOOL_PATH) { $env:ANYAICAM_SIGNTOOL_PATH } else { 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe' }
     $dlib = if ($env:ANYAICAM_AZURE_SIGNING_DLIB) { $env:ANYAICAM_AZURE_SIGNING_DLIB } else { Join-Path $env:LOCALAPPDATA 'Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll' }
     $metadata = if ($env:ANYAICAM_AZURE_SIGNING_METADATA) { $env:ANYAICAM_AZURE_SIGNING_METADATA } else { 'C:\AnyAiCamSigning\metadata.json' }
     $timestampUrl = if ($env:ANYAICAM_TIMESTAMP_URL) { $env:ANYAICAM_TIMESTAMP_URL } else { 'http://timestamp.acs.microsoft.com' }
     foreach ($path in @($signTool, $dlib, $metadata)) { if (-not (Test-Path -LiteralPath $path)) { throw "Azure signing dependency not found: $path" } }
-    $signCommand = '$q' + $signTool + '$q sign /fd SHA256 /tr $q' + $timestampUrl + '$q /td SHA256 /dlib $q' + $dlib + '$q /dmdf $q' + $metadata + '$q $f'
+    if ($InternalTestAzureSign) {
+        # Inno Setup signs the uninstaller on the fly and removes its temporary
+        # uninstaller after compilation. Capture a separately verified copy from
+        # the signing callback so post-build verification can inspect the exact
+        # signed bytes without treating the transient .tmp as a cache artifact.
+        $powershell = Join-Path $PSHOME 'powershell.exe'
+        $uninstallerSigner = Join-Path $PSScriptRoot 'internal-test-signing.ps1'
+        $signCommand = '$q' + $powershell + '$q -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $q' + $uninstallerSigner + '$q -SignToolPath $q' + $signTool + '$q -DlibPath $q' + $dlib + '$q -MetadataPath $q' + $metadata + '$q -TimestampUrl $q' + $timestampUrl + '$q -UninstallerCacheDir $q' + (Join-Path $outputDir 'signed-uninstallers') + '$q -TargetPath $f'
+    } else {
+        $signCommand = '$q' + $signTool + '$q sign /fd SHA256 /tr $q' + $timestampUrl + '$q /td SHA256 /dlib $q' + $dlib + '$q /dmdf $q' + $metadata + '$q $f'
+    }
     $compilerArguments += '/DEnableSigning=1'
     $compilerArguments += '/SAnyAiCamSign=' + $signCommand
 }
@@ -127,57 +162,157 @@ if ($AzureSign) {
 # catalog of their hashes, signed with the same certificate, is registered by
 # the setup. Built from exactly the pinned inputs verified above.
 . (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
-$outputDir = Join-Path $PSScriptRoot 'output'
-New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-$catalog = Join-Path $outputDir 'AnyAiCamRuntime.cat'
+if ($InternalTestAzureSign) {
+    # The directory was verified absent at entry. Creating it here gives the catalog stage a private destination;
+    # prepare-keyset.py later writes the two pinned inputs into this same newly-created directory.
+    New-Item -ItemType Directory -Path $outputDir -ErrorAction Stop | Out-Null
+    $outputItem = Get-Item -LiteralPath $outputDir -Force
+    if (($outputItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Internal-test output cannot be a reparse point.' }
+} else { New-Item -ItemType Directory -Force -Path $outputDir | Out-Null }
+$internalTranscript = $null
+if ($InternalTestAzureSign) {
+    $internalTranscript = Join-Path $outputDir 'build-transcript.log'
+    Start-Transcript -LiteralPath $internalTranscript -Force | Out-Null
+}
+try {
+$catalogName = if ($DirectDellTestCandidate) { 'AnyAiCamVmsDirectTestRuntime.cat' } else { 'AnyAiCamRuntime.cat' }
+$catalog = Join-Path $outputDir $catalogName
 $nativeArchives = @($lockedWheels | ForEach-Object { Join-Path $wheelRoot $_ }) + @('python-3.12.10-embed-amd64.zip', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip', 'tesseract-5.5.2-win64-anyaicam.zip' | ForEach-Object { Join-Path $vendor $_ })
 $catalogStage = Join-Path $outputDir 'runtime-catalog'
-[void](Export-NativeFiles $catalogStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
+if (Test-Path -LiteralPath $catalogStage) { throw 'Final runtime catalog stage already exists; refusing to overwrite it.' }
+$catalogTempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+if (-not (Test-Path -LiteralPath $catalogTempRoot -PathType Container)) { throw 'A usable temporary directory is required for the short-path runtime catalog stage.' }
+if ([IO.Path]::GetPathRoot($catalogTempRoot) -ine [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($outputDir))) { throw 'Runtime catalog temp staging must be on the same volume as the isolated output.' }
+$catalogWorkStage = Join-Path $catalogTempRoot ('AnyAiCamCatalog-' + [Guid]::NewGuid().ToString('N').Substring(0, 10))
+if (Test-Path -LiteralPath $catalogWorkStage) { throw 'Runtime catalog temp-stage collision; preserve and stop without retry.' }
 $makeCat = if ($env:ANYAICAM_MAKECAT_PATH) { $env:ANYAICAM_MAKECAT_PATH } else { 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makecat.exe' }
-$catalogued = New-RuntimeCatalog $catalogStage $catalog $makeCat
-Write-Output "Runtime catalog: $catalogued native files."
-if ($Sign) { & $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog }
-if ($AzureSign) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog }
-if ($Sign -or $AzureSign) {
-    if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
-    if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
-    if ($AzureSign) {
-        $catalogSignature = Get-AuthenticodeSignature -LiteralPath $catalog
-        $publisherProblem = Get-AnyAiCamPublisherProblem $catalogSignature $catalog
-        if ($publisherProblem) { throw "Publisher pin failed for the runtime catalog: $publisherProblem" }
-        # Offline installs (2026-10-20): the catalog must CARRY its issuing CA, not rely on this PC's certificate cache.
-        $issuer = $catalogSignature.SignerCertificate.Issuer
-        if (-not (@(Get-AnyAiCamEmbeddedCertificates $catalog) | Where-Object { $_.Subject -eq $issuer })) { throw "The runtime catalog does not embed its issuing CA ($issuer); it would be refused offline." }
+try {
+    [void](Export-NativeFiles $catalogWorkStage $nativeArchives @(Join-Path $vendor 'WinSW-x64.exe'))
+    $catalogued = New-RuntimeCatalog $catalogWorkStage $catalog $makeCat
+    Write-Output "Runtime catalog: $catalogued native files."
+    if ($Sign) { & $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 $catalog }
+    if ($azureSigning) { & $signTool sign /fd SHA256 /tr $timestampUrl /td SHA256 /dlib $dlib /dmdf $metadata $catalog }
+    if ($Sign -or $AzureSign -or $InternalTestAzureSign) {
+        if ($LASTEXITCODE -ne 0) { throw "Signing the runtime catalog failed with exit code $LASTEXITCODE" }
+        if ((Get-AuthenticodeSignature -LiteralPath $catalog).Status -ne 'Valid') { throw 'The runtime catalog signature is not valid.' }
+        if ($azureSigning) {
+            $catalogSignature = Get-AuthenticodeSignature -LiteralPath $catalog
+            $publisherProblem = Get-AnyAiCamPublisherProblem $catalogSignature $catalog
+            if ($publisherProblem) { throw "Publisher pin failed for the runtime catalog: $publisherProblem" }
+            # Offline installs (2026-10-20): the catalog must CARRY its issuing CA, not rely on this PC's certificate cache.
+            $issuer = $catalogSignature.SignerCertificate.Issuer
+            if (-not (@(Get-AnyAiCamEmbeddedCertificates $catalog) | Where-Object { $_.Subject -eq $issuer })) { throw "The runtime catalog does not embed its issuing CA ($issuer); it would be refused offline." }
+        }
+        & $signTool verify /pa $catalog | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
+        # SignTool applies classic path handling to member operands. Verify every
+        # catalogued file while it still has the guarded short temporary path.
+        $verifiedNativeFiles = Test-RuntimeCatalogFiles $catalogWorkStage $catalog $signTool
+        if ($verifiedNativeFiles -ne $catalogued) { throw "Runtime catalog coverage mismatch: catalogued=$catalogued verified=$verifiedNativeFiles" }
+        Write-Output 'Runtime catalog signed and verified.'
     }
-    & $signTool verify /pa $catalog | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'SignTool verification of the runtime catalog failed.' }
-    # Every catalogued file must verify against it.
-    $verifiedNativeFiles = Test-RuntimeCatalogFiles $catalogStage $catalog $signTool
-    if ($verifiedNativeFiles -ne $catalogued) { throw "Runtime catalog coverage mismatch: catalogued=$catalogued verified=$verifiedNativeFiles" }
-    Write-Output 'Runtime catalog signed and verified.'
+    Move-Item -LiteralPath $catalogWorkStage -Destination $catalogStage -ErrorAction Stop
+} catch {
+    if (Test-Path -LiteralPath $catalogWorkStage -PathType Container) {
+        Write-Output ("Runtime catalog work stage preserved for diagnosis: " + $catalogWorkStage)
+    }
+    throw
+}
+# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
+# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
+if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
+if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementTrustRegistrySha256 must be a 64-character lowercase SHA-256.' }
+$keysetOut = Join-Path $outputDir 'entitlement-signing-public-keys.json'
+$registryOut = Join-Path $outputDir 'entitlement-trust-registry.json'
+# Existing signed modes require the production registry. The separate internal mode is bound to synthetic registry inputs.
+$registryEnvironment = if ($InternalTestAzureSign) { 'internal-test' } elseif ($Sign -or $AzureSign) { 'production' } else { 'any' }
+# A rotation build names the keys kept for verification only. Passed only when there are some: PowerShell 5.1 drops an
+# empty argument. prepare-keyset.py stops the build on a retired key not named here.
+$retiredKeyArgument = @()
+if ($EntitlementRetiredKeyIds.Count) { $retiredKeyArgument = @($EntitlementRetiredKeyIds -join ',') }
+if ($PythonExe) {
+    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
+    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
+    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
+} else {
+    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
+}
+if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset or trust registry was refused; nothing was built.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $registryOut).Hash.ToLowerInvariant() -ne $EntitlementTrustRegistrySha256) { throw 'The prepared entitlement trust registry does not match its pinned SHA-256.' }
+if ($DirectDellTestCandidate) {
+    $registryDocument = Get-Content -LiteralPath $EntitlementTrustRegistry -Raw | ConvertFrom-Json
+    if ($registryDocument.environment -cne 'synthetic') { throw 'Direct test build requires a synthetic entitlement trust registry.' }
+    $identityDocument = Get-Content -LiteralPath $TestApplianceIdentity -Raw | ConvertFrom-Json
+    foreach ($field in @('appliance_id','cloud_id','customer_id','site_id','partner_id')) {
+        if ([string]$identityDocument.$field -notmatch '^TEST-[A-Za-z0-9-]{1,80}$') { throw "Synthetic identity field $field is not test-scoped." }
+    }
+    if ([string]$identityDocument.credential -notmatch '^test-[A-Za-z0-9._-]{8,160}$') { throw 'Synthetic identity credential is not test-scoped.' }
+    $capacityDocument = Get-Content -LiteralPath $TestAcceptedCapacity -Raw | ConvertFrom-Json
+    $capacitySnapshot = $capacityDocument.snapshot
+    $capacityKeyId = [string]$capacitySnapshot.signature.key_id
+    try { $acceptedPublicKey = [Convert]::FromBase64String([string]$capacityDocument.accepted_key) } catch { throw 'Synthetic accepted capacity does not carry its matching public-key binding.' }
+    if ($capacityDocument.schema -notin @(1,2) -or $capacityDocument.identity.appliance_id -cne $identityDocument.appliance_id -or
+        $capacityDocument.identity.cloud_id -cne $identityDocument.cloud_id -or $capacityDocument.identity.customer_id -cne $identityDocument.customer_id -or
+        $acceptedPublicKey.Length -ne 32 -or $capacityDocument.signer.key_id -cne $capacityKeyId -or $capacityDocument.trust_generation -lt 1 -or
+        -not $capacityDocument.high_water.issued_at -or $capacityDocument.high_water.digest -notmatch '^[0-9a-f]{64}$' -or
+        $capacitySnapshot.type -cne 'anyaicam.feature_entitlements' -or [int]$capacitySnapshot.camera_capacity.camera_slot_quantity -lt 1 -or -not $registryDocument.keys.$capacityKeyId -or
+        $registryDocument.keys.$capacityKeyId.environment -cne 'synthetic' -or $registryDocument.keys.$capacityKeyId.state -cne 'active') {
+        throw 'Synthetic accepted camera-capacity fixture identity or signer does not match the synthetic trust registry.'
+    }
+    $grantDocument = Get-Content -LiteralPath $TestFeatureEntitlements -Raw | ConvertFrom-Json
+    $snapshot = if ($grantDocument.snapshot) { $grantDocument.snapshot } else { $grantDocument }
+    $keyId = [string]$snapshot.signature.key_id
+    if ($snapshot.type -cne 'anyaicam.feature_entitlements' -or $snapshot.appliance_id -cne $identityDocument.appliance_id -or
+        $snapshot.cloud_id -cne $identityDocument.cloud_id -or $snapshot.customer_id -cne $identityDocument.customer_id -or
+        $snapshot.appliance_id -notmatch '^TEST-' -or -not $snapshot.features -or -not $registryDocument.keys.$keyId -or
+        $registryDocument.keys.$keyId.environment -cne 'synthetic' -or $registryDocument.keys.$keyId.state -cne 'active') {
+        throw 'Synthetic entitlement fixture identity or signer does not match the synthetic trust registry.'
+    }
+    Copy-Item -LiteralPath $TestApplianceIdentity -Destination (Join-Path $outputDir 'direct-test-appliance-identity.json')
+    Copy-Item -LiteralPath $TestAcceptedCapacity -Destination (Join-Path $outputDir 'direct-test-accepted-capacity.json')
+    Copy-Item -LiteralPath $TestFeatureEntitlements -Destination (Join-Path $outputDir 'direct-test-feature-entitlements.json')
 }
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
 $compilerArguments += "/DRegistrySha256=$EntitlementTrustRegistrySha256"
 $compilerArguments += "/DAppVersion=$Version"
 $compilerArguments += "/DReleaseVersion=$ReleaseVersion"
 $compilerArguments += "/DSourceCommit=$sourceCommit"
+$compilerArguments += "/DBuildOutputDir=$outputName"
+if ($InternalTestAzureSign) { $compilerArguments += '/DInternalTestOnly=1' }
+if ($DirectDellTestCandidate) {
+    $compilerArguments += '/DDirectDellTestCandidate=1'
+    $compilerArguments += "/DTestRunId=$TestRunId"
+    $compilerArguments += "/DTestCameraNetwork=$TestCameraNetwork"
+    $compilerArguments += "/DTestApplianceIdentitySha256=$TestApplianceIdentitySha256"
+    $compilerArguments += "/DTestAcceptedCapacitySha256=$TestAcceptedCapacitySha256"
+    $compilerArguments += "/DTestAcceptedCapacitySha256=$TestAcceptedCapacitySha256"
+    $compilerArguments += "/DTestFeatureEntitlementsSha256=$TestFeatureEntitlementsSha256"
+}
 $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 . (Join-Path $PSScriptRoot 'installer-size.ps1')
-$setupPath = Join-Path $PSScriptRoot ('output\AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + '.exe')
+$setupSuffix = if ($InternalTestAzureSign) { '-INTERNAL-TEST-DO-NOT-SHIP' } else { '' }
+$setupPath = Join-Path $outputDir ('AnyAiCam-VMS-Setup-' + $Version + '-' + $sourceCommit.Substring(0, 7) + $setupSuffix + '.exe')
 $setupBytes = Assert-InstallerSize $setupPath
 Write-Output "Installer size accepted: $setupBytes bytes (limit 750000000)."
-if ($Sign -or $AzureSign) {
+if ($Sign -or $AzureSign -or $InternalTestAzureSign) {
     $setup = Get-Item -LiteralPath $setupPath
-    # (Inno Setup 7 keeps no signed-uninstaller cache; the installed
-    # unins000.exe is verified by the Windows Sandbox validation.)
-    $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)
+    # Inno Setup stores the signed uninstaller under SignedUninstallerDir; the installed unins000.exe is also
+    # checked during the separately authorized Sandbox acceptance.
+    $uninstallerCacheDir = Join-Path $outputDir 'signed-uninstallers'
+    $cacheEntries = @(Get-ChildItem -LiteralPath $uninstallerCacheDir -Force -ErrorAction Stop)
+    $signedUninstallers = @($cacheEntries | Where-Object { -not $_.PSIsContainer -and $_.Extension -ieq '.exe' })
+    if ($InternalTestAzureSign -and ($cacheEntries.Count -ne 1 -or $signedUninstallers.Count -ne 1 -or $signedUninstallers[0].Name -ne 'AnyAiCamSignedUninstaller.exe' -or (($cacheEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0))) {
+        throw 'Internal-test signing did not retain exactly one verified signed uninstaller cache artifact.'
+    }
     foreach ($file in @($setup) + $signedUninstallers) {
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
         if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed: $($file.FullName)" }
         if ($Sign -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) { throw "Signer certificate mismatch: $($file.FullName)" }
-        if ($AzureSign) {
+        if ($azureSigning) {
             $publisherProblem = Get-AnyAiCamPublisherProblem $signature $file.FullName
             if ($publisherProblem) { throw "Publisher pin failed for $($file.FullName): $publisherProblem" }
             $issuer = $signature.SignerCertificate.Issuer
@@ -187,4 +322,45 @@ if ($Sign -or $AzureSign) {
         if ($LASTEXITCODE -ne 0) { throw "SignTool verification failed: $($file.FullName)" }
     }
     Write-Output "Verified Authenticode signatures on setup and $($signedUninstallers.Count) cached uninstaller(s)."
+}
+if ($InternalTestAzureSign) {
+    # Close the transcript before hashing it. Any failure before here retains the partial transcript in finally.
+    Stop-Transcript | Out-Null
+    $internalTranscript = $null
+    $branchName = (& git -C $repo branch --show-current).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $branchName) { throw 'Could not record the source branch in the internal evidence manifest.' }
+    $records = @(Get-ChildItem -LiteralPath $outputDir -Recurse -File | Sort-Object FullName | ForEach-Object {
+        $signatureStatus = 'NotApplicable'
+        $relativePath = $_.FullName.Substring($outputDir.Length + 1)
+        if ($relativePath -like 'runtime-catalog\*') { $signatureStatus = 'CatalogCoverageVerified' }
+        elseif ($_.Extension -in @('.exe', '.cat')) { $signatureStatus = [string](Get-AuthenticodeSignature -LiteralPath $_.FullName).Status }
+        [ordered]@{ path = $relativePath; size = $_.Length;
+                    sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant();
+                    authenticode = $signatureStatus }
+    })
+    $evidence = [ordered]@{
+        schema_version = 1
+        result = 'INTERNAL_TEST_BUILD_VERIFIED'
+        signing_mode = 'Azure Artifact Signing; internal-test-only'
+        source_branch = $branchName
+        source_commit = $sourceCommit
+        windows_setup_version = $Version
+        vms_release_version = $ReleaseVersion
+        trust_registry_mode = 'synthetic'
+        runtime_catalog_native_files = $catalogued
+        publisher_subject = $AnyAiCamPublisherSubject
+        artifacts = $records
+    }
+    $manifestPath = Join-Path $outputDir 'build-evidence.json'
+    [IO.File]::WriteAllText($manifestPath, ($evidence | ConvertTo-Json -Depth 8) + "`n", (New-Object Text.UTF8Encoding $false))
+    $sumLines = @(Get-ChildItem -LiteralPath $outputDir -Recurse -File | Where-Object { $_.Name -ne 'SHA256SUMS' } |
+        Sort-Object FullName | ForEach-Object {
+            $relative = $_.FullName.Substring($outputDir.Length + 1) -replace '\\', '/'
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant() + '  ' + $relative
+        })
+    [IO.File]::WriteAllLines((Join-Path $outputDir 'SHA256SUMS'), $sumLines, (New-Object Text.UTF8Encoding $false))
+    Write-Output 'Internal-test build evidence manifest and SHA256SUMS written.'
+}
+} finally {
+    if ($internalTranscript) { try { Stop-Transcript | Out-Null } catch { } }
 }

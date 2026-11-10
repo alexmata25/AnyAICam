@@ -165,14 +165,14 @@ def test_build_requires_the_keyset_and_its_pin_and_hands_both_to_setup():
     assert build.index("prepare-keyset.py") < build.index("& $iscc")
     iss = _text("AnyAiCam-VMS.iss")
     assert "#error KeysetSha256 is required" in iss
-    assert 'Source: "output\\entitlement-signing-public-keys.json"; DestDir: "{tmp}"' in iss
+    assert 'Source: "{#BuildOutputDir}\\entitlement-signing-public-keys.json"; DestDir: "{tmp}"' in iss
     assert '-EntitlementKeysetSha256 "{#KeysetSha256}"' in iss
     assert "[Parameter(Mandatory=$true)][string]$EntitlementTrustRegistry," in build
     assert "[Parameter(Mandatory=$true)][string]$EntitlementTrustRegistrySha256," in build
     assert '/DRegistrySha256=$EntitlementTrustRegistrySha256' in build
     assert build.count("$registryEnvironment @retiredKeyArgument") == 2
     assert "#error RegistrySha256 is required" in iss
-    assert 'Source: "output\\entitlement-trust-registry.json"; DestDir: "{tmp}"' in iss
+    assert 'Source: "{#BuildOutputDir}\\entitlement-trust-registry.json"; DestDir: "{tmp}"' in iss
     assert '-EntitlementTrustRegistrySha256 "{#RegistrySha256}"' in iss
 
 

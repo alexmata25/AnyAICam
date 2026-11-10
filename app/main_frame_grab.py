@@ -50,6 +50,9 @@ def grab_command(url: str) -> list[str]:
     args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
     if url.lower().startswith(("rtsp://", "rtsps://")):
         args += ["-rtsp_transport", "tcp"]
+        if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+            import direct_test_profile
+            args += direct_test_profile.rtsp_input_options()
     # BMP: no compression work for a frame that is decoded straight back.
     return args + ["-i", url, "-an", "-sn", "-dn", "-frames:v", "1", "-f", "image2pipe", "-c:v", "bmp", "pipe:1"]
 

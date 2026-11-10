@@ -337,8 +337,13 @@ def default_verify_stream(url: str, timeout: float = VERIFY_TIMEOUT_SECONDS) -> 
     """The credentialed check: ffprobe the stream and require a video stream.
     `url` carries credentials, exactly as the recording ffmpeg's own argv
     does; it is never logged or returned."""
+    rtsp_source_options = []
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+        import direct_test_profile
+        rtsp_source_options = direct_test_profile.rtsp_input_options()
     command = [
         "ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-timeout", str(int(timeout * 1_000_000)),
+        *rtsp_source_options,
         "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "json", url,
     ]
     try:

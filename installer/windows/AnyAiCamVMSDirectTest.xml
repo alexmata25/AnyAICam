@@ -1,0 +1,12 @@
+<service>
+  <id>AnyAiCamVmsDirectTest</id>
+  <name>AnyAiCam VMS Direct Test (isolated)</name>
+  <description>Run-scoped AnyAiCam VMS acceptance service</description>
+  <executable>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</executable>
+  <arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%BASE%\service-launcher-direct-test.ps1"</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <startmode>Manual</startmode>
+  <stoptimeout>60 sec</stoptimeout>
+  <logpath>%BASE%\service-logs</logpath>
+  <log mode="roll-by-size-time"><sizeThreshold>10240</sizeThreshold><pattern>yyyyMMdd</pattern></log>
+</service>

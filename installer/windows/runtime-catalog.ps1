@@ -18,9 +18,9 @@
 #   Build (build.ps1):   New-RuntimeCatalog
 #   Setup (install-runtime.ps1):  Install-RuntimeCatalog (signature checked first)
 #   Uninstall:           runtime-catalog.ps1 -Remove
-param([switch]$Remove)
+param([switch]$Remove, [switch]$DirectTest)
 
-$CatalogBaseName = 'AnyAiCamRuntime.cat'
+$CatalogBaseName = if ($DirectTest) { 'AnyAiCamVmsDirectTestRuntime.cat' } else { 'AnyAiCamRuntime.cat' }
 $NativeExtensions = @('.pyd', '.dll', '.exe')
 
 # ------------------------------------------------------------ build time
@@ -30,7 +30,7 @@ $NativeExtensions = @('.pyd', '.dll', '.exe')
 # same hashes.
 function Export-NativeFiles([string]$Stage, [string[]]$Archives, [string[]]$Files) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    if (Test-Path -LiteralPath $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force }
+    if (Test-Path -LiteralPath $Stage) { throw "Runtime catalog stage already exists; refusing to overwrite it: $Stage" }
     New-Item -ItemType Directory -Path $Stage | Out-Null
     $count = 0; $index = 0
     foreach ($archive in $Archives) {
@@ -54,6 +54,16 @@ function Export-NativeFiles([string]$Stage, [string[]]$Archives, [string[]]$File
     return $count
 }
 
+# MakeCat resolves member files through classic Win32 paths. Keep this check
+# explicit so a future deep build root fails before MakeCat with a clear cause.
+function Assert-MakeCatPathLengths([string]$CatalogPath, [string]$CdfPath, [string[]]$MemberPaths) {
+    foreach ($path in @($CatalogPath, $CdfPath) + @($MemberPaths)) {
+        if ($path.Length -ge 260) {
+            throw "MakeCat input path is $($path.Length) characters; it must be shorter than MAX_PATH (260): $path"
+        }
+    }
+}
+
 # One catalog (SHA-256, Authenticode hashes of PE files) of every file under
 # $Stage, written to $CatalogPath with makecat.exe (Windows SDK).
 function New-RuntimeCatalog([string]$Stage, [string]$CatalogPath, [string]$MakeCat) {
@@ -61,6 +71,7 @@ function New-RuntimeCatalog([string]$Stage, [string]$CatalogPath, [string]$MakeC
     $files = @(Get-ChildItem -LiteralPath $Stage -Recurse -File)
     if (-not $files.Count) { throw 'No native files to catalog.' }
     $cdf = [IO.Path]::ChangeExtension($CatalogPath, '.cdf')
+    Assert-MakeCatPathLengths $CatalogPath $cdf @($files | ForEach-Object { $_.FullName })
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[CatalogHeader]'); $lines.Add("Name=$CatalogPath"); $lines.Add('ResultDir=')
     $lines.Add('PublicVersion=0x0000001'); $lines.Add('EncodingType=0x00010001'); $lines.Add('CatalogVersion=2'); $lines.Add('HashAlgorithms=SHA256')
@@ -142,6 +153,7 @@ function Get-InstalledCatalogPath {
 # a valid Authenticode signature; returns a one-line result for the setup log.
 function Install-RuntimeCatalog([string]$CatalogPath) {
     if (-not (Test-Path -LiteralPath $CatalogPath)) { throw "Runtime catalog not found: $CatalogPath" }
+    if ([IO.Path]::GetFileName($CatalogPath) -cne $CatalogBaseName) { throw "Runtime catalog identity mismatch; expected $CatalogBaseName." }
     $signature = Get-AuthenticodeSignature -LiteralPath $CatalogPath
     if ($signature.Status -ne 'Valid') { return "AnyAiCam runtime catalog not registered: it is not validly signed ($($signature.Status)); Smart App Control will block the runtime." }
     # Codex 2026-10-17: a valid signature from any OTHER publisher must not be trusted (publisher-pin.ps1).
@@ -167,5 +179,5 @@ function Remove-RuntimeCatalog {
     return 'AnyAiCam runtime catalog removed.'
 }
 
-# Run from the uninstaller: -Remove. Dot-sourced by build.ps1, install-runtime.ps1 and the tests.
+# Run from the uninstaller: -Remove [-DirectTest]. Dot-sourced by build.ps1, install-runtime.ps1 and the tests.
 if ($MyInvocation.InvocationName -ne '.' -and $Remove) { Remove-RuntimeCatalog }

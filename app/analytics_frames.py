@@ -122,6 +122,9 @@ def reader_command(url: str, fps: float, width: int, height: int, flags: str = N
         # Same input options as the motion reader's substream command. (No
         # nobuffer for a file: it drops the packets read while probing.)
         args += ["-rtsp_transport", "tcp", "-fflags", "nobuffer"]
+        if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+            import direct_test_profile
+            args += direct_test_profile.rtsp_input_options()
     return args + [
         "-i", url,
         "-an", "-sn", "-dn",

@@ -16921,13 +16921,20 @@ def live_video_args(camera_number: int | None = None) -> list[str]:
             "-g", "56", "-keyint_min", "28", "-sc_threshold", "0", *scale_and_rate]
 
 
+def _direct_test_rtsp_input_options() -> list[str]:
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") != "1":
+        return []
+    import direct_test_profile
+    return direct_test_profile.rtsp_input_options()
+
+
 async def probe_camera_video_codec(url: str, timeout: float = LIVE_VIDEO_COPY_PROBE_TIMEOUT_SECONDS) -> str | None:
     """The camera's video codec name (e.g. "h264"), or None. Asynchronous (the
     event loop and the shared executor are never blocked); ffprobe's stderr is
     discarded, so the URL -- credentials included -- is never logged."""
     args = ["ffprobe", "-v", "error"]
     if url.lower().startswith(("rtsp://", "rtsps://")):
-        args += ["-rtsp_transport", "tcp"]
+        args += ["-rtsp_transport", "tcp", *_direct_test_rtsp_input_options()]
     args += ["-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", "-i", url]
     try:
         process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
@@ -17073,7 +17080,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number),
+        "ffmpeg", "-rtsp_transport", "tcp", *_direct_test_rtsp_input_options(), "-i", camera_url(camera_number),
 
 
 
@@ -17204,7 +17211,7 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 
 
 
-        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number),
+        "ffmpeg", "-rtsp_transport", "tcp", *_direct_test_rtsp_input_options(), "-i", camera_url(camera_number),
 
 
 
@@ -17376,7 +17383,7 @@ def start_event_recording_buffer(camera_number: int) -> subprocess.Popen:
     camera_folder.mkdir(parents=True, exist_ok=True)
     output_pattern = str(camera_folder / f"buf{camera_number}_%Y-%m-%d_%H-%M-%S.mkv")
     command = [
-        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number),
+        "ffmpeg", "-rtsp_transport", "tcp", *_direct_test_rtsp_input_options(), "-i", camera_url(camera_number),
         "-map", "0:v:0", "-map", "0:a:0?",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
         "-f", "segment", "-segment_time", str(EVENT_BUFFER_SEGMENT_SECONDS),
@@ -36052,7 +36059,7 @@ async def create_motion_thumbnail(
     # substream instead (same field of view, 640 px wide). Never logged.
     if live_hls_demand.on_demand() and not live_hls_demand.playlist_fresh(manifest):
         substream_url = await asyncio.to_thread(motion_substream_url, camera_number)
-        thumbnail_input = ["-rtsp_transport", "tcp", "-i", substream_url] if substream_url else None
+        thumbnail_input = ["-rtsp_transport", "tcp", *_direct_test_rtsp_input_options(), "-i", substream_url] if substream_url else None
         thumbnail_from_substream = bool(substream_url)
     if thumbnail_input:
         try:
@@ -155459,18 +155466,36 @@ def v110_validate_network(network: str):
             status_code=400,
             detail=f"Discovery is limited to {V110_MAX_HOSTS} addresses.",
         )
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+        import direct_test_profile
+        approved_value = os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_NETWORK", "")
+        interface_value = os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS", "")
+        interface_network_value = os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_NETWORK", "")
+        try:
+            parsed = direct_test_profile.validate_camera_scan_network(
+                network, approved_value, interface_value, interface_network_value
+            )
+        except direct_test_profile.TestProfileError as exc:
+            raise HTTPException(status_code=403, detail="Discovery is restricted to the approved local camera network.") from exc
     return parsed
 
 
-def v110_probe_host(host: str, ports: list[int]) -> dict | None:
+def v110_probe_host(host: str, ports: list[int], source_address: str | None = None) -> dict | None:
     import socket
     open_ports = []
     for port in ports:
         if port not in V110_ALLOWED_PORTS:
             continue
         try:
-            with socket.create_connection((host, port), timeout=V110_CONNECT_TIMEOUT):
-                open_ports.append(port)
+            if source_address:
+                import onvif_discovery
+                if onvif_discovery.default_tcp_probe(
+                    host, port, V110_CONNECT_TIMEOUT, source_address=source_address
+                ):
+                    open_ports.append(port)
+            else:
+                with socket.create_connection((host, port), timeout=V110_CONNECT_TIMEOUT):
+                    open_ports.append(port)
         except OSError:
             continue
     if not open_ports:
@@ -155509,11 +155534,26 @@ def v110_scan(payload: V110DiscoveryModel, request: Request) -> dict:
     if not ports:
         raise HTTPException(status_code=400, detail="No allowed discovery ports selected.")
 
+    source_address = (os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS")
+                      if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1" else None)
     devices = []
     for host in network.hosts():
-        result = v110_probe_host(str(host), ports)
+        result = v110_probe_host(str(host), ports, source_address=source_address)
         if result:
             devices.append(result)
+
+    onvif_devices = None
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+        # In the test-only profile, the existing customer-facing discovery
+        # action also performs real WS-Discovery on the one approved subnet.
+        # The helper filters every ProbeMatch back to this subnet and selects
+        # its interface explicitly; production route behavior is unchanged.
+        import onvif_discovery
+        onvif_devices = onvif_discovery.probe(
+            allowed_network=str(network),
+            interface_address=os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS", ""),
+            interface_network=os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_NETWORK", ""),
+        )
 
     record = {
         "id": uuid.uuid4().hex[:16],
@@ -155527,6 +155567,8 @@ def v110_scan(payload: V110DiscoveryModel, request: Request) -> dict:
         "credential_data_stored": False,
         "authentication_attempted": False,
     }
+    if onvif_devices is not None:
+        record["onvif_devices"] = onvif_devices
     records = _v110_load(V110_DISCOVERY_FILE, [])
     records.append(record)
     _v110_save(V110_DISCOVERY_FILE, records[-500:])
@@ -155751,7 +155793,74 @@ def v111_check_rate_limit(device_ip: str) -> None:
     V111_LAST_ATTEMPT[device_ip] = now
 
 
-def v111_http_verify(device_ip: str, username: str, password: str) -> dict:
+def _v111_direct_test_source_address(device_ip: str) -> str | None:
+    """Validate a credentialed probe target and return the pinned test NIC IP."""
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") != "1":
+        return None
+    import direct_test_profile
+
+    source_address = os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_ADDRESS", "")
+    try:
+        direct_test_profile.validate_camera_scan_network(
+            f"{device_ip}/32",
+            os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_NETWORK", ""),
+            source_address,
+            os.environ.get("ANYAICAM_DIRECT_TEST_CAMERA_INTERFACE_NETWORK", ""),
+        )
+    except direct_test_profile.TestProfileError as exc:
+        raise ValueError("camera verification target is outside the pinned test network") from exc
+    return source_address
+
+
+def _v111_source_bound_connection_types(source_address: str, context=None):
+    """Create HTTP(S) connection classes pinned to the selected camera NIC."""
+    import http.client
+
+    source = (source_address, 0)
+
+    class SourceBoundHTTPConnection(http.client.HTTPConnection):
+        def __init__(self, host, **kwargs):
+            kwargs["source_address"] = source
+            super().__init__(host, **kwargs)
+
+    class SourceBoundHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, host, **kwargs):
+            kwargs["source_address"] = source
+            kwargs["context"] = context
+            super().__init__(host, **kwargs)
+
+    return SourceBoundHTTPConnection, SourceBoundHTTPSConnection
+
+
+def _v111_source_bound_opener(source_address: str, context=None):
+    """Build an HTTP(S) opener whose sockets bind to the direct-test camera NIC."""
+    import urllib.request
+
+    SourceBoundHTTPConnection, SourceBoundHTTPSConnection = _v111_source_bound_connection_types(
+        source_address, context
+    )
+
+    class SourceBoundHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            return self.do_open(SourceBoundHTTPConnection, request)
+
+    class SourceBoundHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, request):
+            return self.do_open(SourceBoundHTTPSConnection, request, context=context)
+
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, message, headers, new_url):
+            return None
+
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        SourceBoundHTTPHandler(),
+        SourceBoundHTTPSHandler(context=context),
+        NoRedirectHandler(),
+    )
+
+
+def v111_http_verify(device_ip: str, username: str, password: str, source_address: str | None = None) -> dict:
     import base64
     import ssl
     import urllib.error
@@ -155766,6 +155875,7 @@ def v111_http_verify(device_ip: str, username: str, password: str) -> dict:
         "Accept": "application/xml,text/xml,text/html,*/*",
     }
     context = ssl._create_unverified_context()
+    opener = _v111_source_bound_opener(source_address, context) if source_address else None
     attempts = []
 
     for scheme, port in (("http", 80), ("https", 443)):
@@ -155773,11 +155883,10 @@ def v111_http_verify(device_ip: str, username: str, password: str) -> dict:
             url = f"{scheme}://{device_ip}:{port}{path}"
             request = urllib.request.Request(url, headers=headers, method="GET")
             try:
-                with urllib.request.urlopen(
-                    request,
-                    timeout=3,
-                    context=context if scheme == "https" else None,
-                ) as response:
+                response_context = opener.open(request, timeout=3) if opener else urllib.request.urlopen(
+                    request, timeout=3, context=context if scheme == "https" else None,
+                )
+                with response_context as response:
                     body = response.read(4096)
                     attempts.append({
                         "scheme": scheme,
@@ -155818,7 +155927,7 @@ def v111_http_verify(device_ip: str, username: str, password: str) -> dict:
     }
 
 
-def v111_rtsp_verify(device_ip: str, username: str, password: str) -> dict:
+def v111_rtsp_verify(device_ip: str, username: str, password: str, source_address: str | None = None) -> dict:
     import base64
     import socket
 
@@ -155833,7 +155942,8 @@ def v111_rtsp_verify(device_ip: str, username: str, password: str) -> dict:
     ).encode("ascii", errors="ignore")
 
     try:
-        with socket.create_connection((device_ip, 554), timeout=3) as connection:
+        source = (source_address, 0) if source_address else None
+        with socket.create_connection((device_ip, 554), timeout=3, source_address=source) as connection:
             connection.sendall(request)
             response = connection.recv(4096).decode("latin-1", errors="replace")
         first_line = response.splitlines()[0] if response else ""
@@ -155862,7 +155972,7 @@ def v111_rtsp_verify(device_ip: str, username: str, password: str) -> dict:
         }
 
 
-def v111_onvif_verify(device_ip: str, username: str, password: str) -> dict:
+def v111_onvif_verify(device_ip: str, username: str, password: str, source_address: str | None = None) -> dict:
     import base64
     import urllib.error
     import urllib.request
@@ -155887,7 +155997,9 @@ def v111_onvif_verify(device_ip: str, username: str, password: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=3) as response:
+        opener = _v111_source_bound_opener(source_address) if source_address else None
+        response_context = opener.open(request, timeout=3) if opener else urllib.request.urlopen(request, timeout=3)
+        with response_context as response:
             body = response.read(8192)
             return {
                 "supported": response.status == 200,
@@ -155931,6 +156043,11 @@ def v111_verify_camera(payload: V111VerifyModel, request: Request) -> dict:
             detail="Only private local-network device addresses are allowed.",
         )
 
+    try:
+        camera_source_address = _v111_direct_test_source_address(str(selected_ip))
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Camera verification is restricted to the approved local camera network.") from exc
+
     session = V110_CREDENTIAL_SESSIONS.get(payload.session_token)
     if not session:
         raise HTTPException(
@@ -155949,17 +156066,17 @@ def v111_verify_camera(payload: V111VerifyModel, request: Request) -> dict:
 
     results = {
         "http": (
-            v111_http_verify(str(selected_ip), username, password)
+            v111_http_verify(str(selected_ip), username, password, source_address=camera_source_address)
             if payload.test_http
             else {"skipped": True}
         ),
         "rtsp": (
-            v111_rtsp_verify(str(selected_ip), username, password)
+            v111_rtsp_verify(str(selected_ip), username, password, source_address=camera_source_address)
             if payload.test_rtsp
             else {"skipped": True}
         ),
         "onvif": (
-            v111_onvif_verify(str(selected_ip), username, password)
+            v111_onvif_verify(str(selected_ip), username, password, source_address=camera_source_address)
             if payload.test_onvif
             else {"skipped": True}
         ),
