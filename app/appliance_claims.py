@@ -1057,6 +1057,10 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             except ActivationConflict as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
         audit({'email': display_cloud_id(cloud_id), 'role': 'appliance'}, 'appliance_claim.completed', 'appliance', appliance_id)
+        # Owner 2026-11-10: the claim records no edition. Full VMS is recorded only from the customer's verified paid
+        # entitlements (claim_edition_registration); otherwise the edition stays unrecorded and cloud media refused.
+        import claim_edition_registration
+        claim_edition_registration.register_claimed_appliance_edition(appliance_id)
         logger.info('Claim completed appliance_id=%s', appliance_id)
         return {
             'appliance_id': appliance_id,

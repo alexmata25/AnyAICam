@@ -838,6 +838,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
         appliance=authenticate_appliance(request)
+        # Owner 2026-11-10: a claimed appliance whose edition is still unrecorded gets Full VMS recorded once its
+        # customer holds verified paid Full VMS entitlements (claim_edition_registration). Never fails the poll.
+        if appliance.get('activated_via')=='claim' and 'gateway_edition' in appliance and appliance['gateway_edition'] is None:
+            import claim_edition_registration
+            claim_edition_registration.register_claimed_appliance_edition(appliance['id'])
         # A transfer/re-enrollment transition is valid only for the exact
         # identity currently stored on this appliance row. If ownership has
         # moved again (or the metadata is malformed), do not let snapshot
