@@ -24,7 +24,7 @@ class ClaimSessionRaceTests(unittest.TestCase):
             path = str(Path(directory) / 'synthetic.db')
             db = sqlite3.connect(path)
             db.executescript('''CREATE TABLE appliances(id TEXT,cloud_id TEXT);
-                CREATE TABLE appliance_claims(id TEXT,device_id TEXT,claim_session_id TEXT UNIQUE,claim_code_hash TEXT,status TEXT,expires_at TEXT,created_at TEXT,device_secret_hash TEXT,label_verifier_hash TEXT,revoked_at TEXT,proof_expires_at TEXT,claim_proof_encrypted TEXT,claim_proof_plaintext TEXT);
+                CREATE TABLE appliance_claims(id TEXT,device_id TEXT,claim_session_id TEXT UNIQUE,claim_code_hash TEXT,status TEXT,expires_at TEXT,created_at TEXT,device_secret_hash TEXT,label_verifier_hash TEXT,revoked_at TEXT,proof_expires_at TEXT,claim_proof_encrypted TEXT,claim_proof_plaintext TEXT,claim_public_id TEXT);
                 CREATE UNIQUE INDEX idx_claim_one_live_session_per_device ON appliance_claims(LOWER(device_id)) WHERE status IN ('pending','claimed') AND revoked_at IS NULL;''')
             db.close()
             @contextmanager
@@ -49,7 +49,8 @@ class ClaimSessionRaceTests(unittest.TestCase):
                 '_normalize_device_id':lambda v:v.lower(),'_device_secret':lambda payload:payload['secret'],
                 '_label_verifier_from':lambda payload:None,'_clear_label_requested':lambda payload:False,
                 '_possesses':lambda claim,secret:claim['device_secret_hash']=='h'+secret,'password_hash':lambda value:'h'+value,
-                '_find_pending_claim_for_device':initially_none,'_generate_claim_code':lambda:secrets.token_hex(4),
+                '_find_pending_claim_for_device':initially_none,'_generate_claim_code':lambda long_code=False:secrets.token_hex(4),
+                'claim_id_for':lambda device_id:'synthetic-claim-id',
                 '_now':datetime.now,'timedelta':timedelta,'CLAIM_SESSION_TTL_MINUTES':15,'secrets':secrets,
                 '_seconds_until':lambda value:900,'connection':connection,'row':row,'logger':SimpleNamespace(info=lambda *a:None)}
             exec(compile(textwrap.dedent(begin),'claim_begin','exec',flags=__import__('__future__').annotations.compiler_flag),ns)
