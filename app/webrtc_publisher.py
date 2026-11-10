@@ -339,13 +339,15 @@ def render_mediamtx_config(windows: bool = None) -> str:
     without this process ever restarting). Pure string building, no I/O --
     kept separate from _write_mediamtx_config() so it's directly testable
     without a filesystem."""
+    direct_test = os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1"
+    udp_address = "127.0.0.1:8189" if direct_test else ":8189"
     lines = [
         "logLevel: info",
         "api: yes",
         "apiAddress: 127.0.0.1:9997",
         "webrtc: yes",
         "webrtcAddress: 127.0.0.1:8889",
-        "webrtcLocalUDPAddress: :8189",
+        f"webrtcLocalUDPAddress: {udp_address}",
         # Loopback-only RTSP, TCP only, used solely by the on-demand H.265 ->
         # H.264 transcoder to publish into its path (no UDP RTP/RTCP ports).
         "rtsp: yes",
@@ -362,10 +364,10 @@ def render_mediamtx_config(windows: bool = None) -> str:
     # older MediaMTX might reject.
     if (os.name == "nt") if windows is None else windows:
         lines.append("moq: no")
-    hosts = advertised_hosts()
+    hosts = [] if direct_test else advertised_hosts()
     if hosts:
         lines.append("webrtcAdditionalHosts: [" + ", ".join(_yaml_quote(h) for h in hosts) + "]")
-    ice_servers = _ice_server_entries()
+    ice_servers = [] if direct_test else _ice_server_entries()
     if ice_servers:
         lines.append("webrtcICEServers2:")
         for entry in ice_servers:

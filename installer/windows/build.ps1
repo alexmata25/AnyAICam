@@ -18,12 +18,35 @@ param(
     [switch]$Sign,
     [switch]$AzureSign,
     # Explicit, isolated Azure-signed internal test mode. Never enabled by default.
-    [switch]$InternalTestAzureSign
+    [switch]$InternalTestAzureSign,
+    [switch]$DirectDellTestCandidate,
+    [string]$TestRunId = '',
+    [string]$TestApplianceIdentity = '',
+    [string]$TestApplianceIdentitySha256 = '',
+    [string]$TestAcceptedCapacity = '',
+    [string]$TestAcceptedCapacitySha256 = '',
+    [string]$TestFeatureEntitlements = '',
+    [string]$TestFeatureEntitlementsSha256 = ''
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'publisher-pin.ps1')
 if (($Sign -and $AzureSign) -or ($Sign -and $InternalTestAzureSign) -or ($AzureSign -and $InternalTestAzureSign)) {
     throw 'Choose exactly one signing mode.'
+}
+if ($DirectDellTestCandidate) {
+    if (-not $InternalTestAzureSign) { throw 'DirectDellTestCandidate requires -InternalTestAzureSign and a synthetic trust registry.' }
+    if ($TestRunId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { throw 'Direct test candidate requires a UUIDv4 TestRunId.' }
+    $fixtures = @(
+        @{ Path = $TestApplianceIdentity; Hash = $TestApplianceIdentitySha256 },
+        @{ Path = $TestAcceptedCapacity; Hash = $TestAcceptedCapacitySha256 },
+        @{ Path = $TestFeatureEntitlements; Hash = $TestFeatureEntitlementsSha256 }
+    )
+    foreach ($fixture in $fixtures) {
+        if (-not $fixture.Path -or $fixture.Hash -notmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $fixture.Path -PathType Leaf)) { throw 'Direct test candidate requires both pinned synthetic licensing fixtures.' }
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $fixture.Path).Hash.ToLowerInvariant() -cne $fixture.Hash) { throw 'A pinned synthetic licensing fixture hash does not match.' }
+    }
+} elseif ($TestRunId -or $TestApplianceIdentity -or $TestApplianceIdentitySha256 -or $TestAcceptedCapacity -or $TestAcceptedCapacitySha256 -or $TestFeatureEntitlements -or $TestFeatureEntitlementsSha256) {
+    throw 'Synthetic licensing inputs are accepted only with -DirectDellTestCandidate.'
 }
 $azureSigning = $AzureSign -or $InternalTestAzureSign
 $outputName = if ($InternalTestAzureSign) { 'output-internal-test' } else { 'output' }
@@ -134,7 +157,8 @@ if ($InternalTestAzureSign) {
     Start-Transcript -LiteralPath $internalTranscript -Force | Out-Null
 }
 try {
-$catalog = Join-Path $outputDir 'AnyAiCamRuntime.cat'
+$catalogName = if ($DirectDellTestCandidate) { 'AnyAiCamVmsDirectTestRuntime.cat' } else { 'AnyAiCamRuntime.cat' }
+$catalog = Join-Path $outputDir $catalogName
 $nativeArchives = @($lockedWheels | ForEach-Object { Join-Path $wheelRoot $_ }) + @('python-3.12.10-embed-amd64.zip', 'ffmpeg-8.1.2-essentials_build.zip', 'mediamtx_v1.21.0_windows_amd64.zip', 'tesseract-5.5.2-win64-anyaicam.zip' | ForEach-Object { Join-Path $vendor $_ })
 $catalogStage = Join-Path $outputDir 'runtime-catalog'
 if (Test-Path -LiteralPath $catalogStage) { throw 'Final runtime catalog stage already exists; refusing to overwrite it.' }
@@ -199,6 +223,39 @@ if ($PythonExe) {
 if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset or trust registry was refused; nothing was built.' }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $registryOut).Hash.ToLowerInvariant() -ne $EntitlementTrustRegistrySha256) { throw 'The prepared entitlement trust registry does not match its pinned SHA-256.' }
+if ($DirectDellTestCandidate) {
+    $registryDocument = Get-Content -LiteralPath $EntitlementTrustRegistry -Raw | ConvertFrom-Json
+    if ($registryDocument.environment -cne 'synthetic') { throw 'Direct test build requires a synthetic entitlement trust registry.' }
+    $identityDocument = Get-Content -LiteralPath $TestApplianceIdentity -Raw | ConvertFrom-Json
+    foreach ($field in @('appliance_id','cloud_id','customer_id','site_id','partner_id')) {
+        if ([string]$identityDocument.$field -notmatch '^TEST-[A-Za-z0-9-]{1,80}$') { throw "Synthetic identity field $field is not test-scoped." }
+    }
+    if ([string]$identityDocument.credential -notmatch '^test-[A-Za-z0-9._-]{8,160}$') { throw 'Synthetic identity credential is not test-scoped.' }
+    $capacityDocument = Get-Content -LiteralPath $TestAcceptedCapacity -Raw | ConvertFrom-Json
+    $capacitySnapshot = $capacityDocument.snapshot
+    $capacityKeyId = [string]$capacitySnapshot.signature.key_id
+    try { $acceptedPublicKey = [Convert]::FromBase64String([string]$capacityDocument.accepted_key) } catch { throw 'Synthetic accepted capacity does not carry its matching public-key binding.' }
+    if ($capacityDocument.schema -notin @(1,2) -or $capacityDocument.identity.appliance_id -cne $identityDocument.appliance_id -or
+        $capacityDocument.identity.cloud_id -cne $identityDocument.cloud_id -or $capacityDocument.identity.customer_id -cne $identityDocument.customer_id -or
+        $acceptedPublicKey.Length -ne 32 -or $capacityDocument.signer.key_id -cne $capacityKeyId -or $capacityDocument.trust_generation -lt 1 -or
+        -not $capacityDocument.high_water.issued_at -or $capacityDocument.high_water.digest -notmatch '^[0-9a-f]{64}$' -or
+        $capacitySnapshot.type -cne 'anyaicam.feature_entitlements' -or [int]$capacitySnapshot.camera_capacity.camera_slot_quantity -lt 1 -or -not $registryDocument.keys.$capacityKeyId -or
+        $registryDocument.keys.$capacityKeyId.environment -cne 'synthetic' -or $registryDocument.keys.$capacityKeyId.state -cne 'active') {
+        throw 'Synthetic accepted camera-capacity fixture identity or signer does not match the synthetic trust registry.'
+    }
+    $grantDocument = Get-Content -LiteralPath $TestFeatureEntitlements -Raw | ConvertFrom-Json
+    $snapshot = if ($grantDocument.snapshot) { $grantDocument.snapshot } else { $grantDocument }
+    $keyId = [string]$snapshot.signature.key_id
+    if ($snapshot.type -cne 'anyaicam.feature_entitlements' -or $snapshot.appliance_id -cne $identityDocument.appliance_id -or
+        $snapshot.cloud_id -cne $identityDocument.cloud_id -or $snapshot.customer_id -cne $identityDocument.customer_id -or
+        $snapshot.appliance_id -notmatch '^TEST-' -or -not $snapshot.features -or -not $registryDocument.keys.$keyId -or
+        $registryDocument.keys.$keyId.environment -cne 'synthetic' -or $registryDocument.keys.$keyId.state -cne 'active') {
+        throw 'Synthetic entitlement fixture identity or signer does not match the synthetic trust registry.'
+    }
+    Copy-Item -LiteralPath $TestApplianceIdentity -Destination (Join-Path $outputDir 'direct-test-appliance-identity.json')
+    Copy-Item -LiteralPath $TestAcceptedCapacity -Destination (Join-Path $outputDir 'direct-test-accepted-capacity.json')
+    Copy-Item -LiteralPath $TestFeatureEntitlements -Destination (Join-Path $outputDir 'direct-test-feature-entitlements.json')
+}
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
 $compilerArguments += "/DRegistrySha256=$EntitlementTrustRegistrySha256"
 $compilerArguments += "/DAppVersion=$Version"
@@ -206,6 +263,14 @@ $compilerArguments += "/DReleaseVersion=$ReleaseVersion"
 $compilerArguments += "/DSourceCommit=$sourceCommit"
 $compilerArguments += "/DBuildOutputDir=$outputName"
 if ($InternalTestAzureSign) { $compilerArguments += '/DInternalTestOnly=1' }
+if ($DirectDellTestCandidate) {
+    $compilerArguments += '/DDirectDellTestCandidate=1'
+    $compilerArguments += "/DTestRunId=$TestRunId"
+    $compilerArguments += "/DTestApplianceIdentitySha256=$TestApplianceIdentitySha256"
+    $compilerArguments += "/DTestAcceptedCapacitySha256=$TestAcceptedCapacitySha256"
+    $compilerArguments += "/DTestAcceptedCapacitySha256=$TestAcceptedCapacitySha256"
+    $compilerArguments += "/DTestFeatureEntitlementsSha256=$TestFeatureEntitlementsSha256"
+}
 $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }

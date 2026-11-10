@@ -46,8 +46,22 @@ def _windows_program_data() -> Path:
     return Path(r"C:\ProgramData")
 
 
+def _windows_data_root(module_file: str = __file__) -> Path:
+    """Production root by default; the separately packaged direct-test profile is opt-in and fail-closed."""
+    if os.environ.get("ANYAICAM_INTERNAL_TEST_BUILD") == "1":
+        try:
+            from direct_test_profile import resolve_from_app_module
+        except Exception as exc:
+            raise RuntimeError("internal test build has no valid isolated data-root resolver") from exc
+        selected = resolve_from_app_module(module_file)
+        if selected is None:
+            raise RuntimeError("internal test data-root selection unexpectedly fell back")
+        return selected
+    return _windows_program_data() / "AnyAiCam"
+
+
 if WINDOWS:
-    _ROOT = _windows_program_data() / "AnyAiCam"
+    _ROOT = _windows_data_root()
     UPDATE_DIR = _ROOT / "update"
     CONFIG_DIR = _ROOT / "config"  # the Windows data root is %ProgramData%\AnyAiCam itself (AnyAiCam-VMS.iss)
     MODELS_DIR = _ROOT / "models"

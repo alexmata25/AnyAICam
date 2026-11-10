@@ -1,0 +1,7 @@
+# Direct Dell test data backup and restore plan
+
+This plan covers only the future test-only root `%ProgramData%\AnyAiCam-Test\<run-id>`. It does not authorize or perform a backup of the retained production `%ProgramData%\AnyAiCam` tree.
+
+Before a separately authorized installation, use an administrator-controlled destination encrypted at rest (BitLocker-protected volume or an approved encrypted archive) with recovery material held separately by the owner. Do not place recovery material on the Dell beside the backup. Stop only the isolated test service, make a complete metadata-preserving backup of the run root, record a sorted relative-path SHA-256 manifest, then restore into a new disposable test root and compare every file hash and security descriptor before resuming. Restore validation must not target the production root.
+
+The fixture script `Test-DirectTestBackupTooling.ps1` uses only a unique disposable NTFS directory beneath this acceptance folder. It checks ordinary copy/restore hashes and probes `robocopy /B /COPYALL` without accessing any existing AnyAiCam data. Backup/restore privileges are reported from the current token. A failed backup-mode privilege probe is evidence that this account cannot make a protected backup; it is not grounds to grant itself privileges. The encrypted destination, encryption-key custodian, and administrator execution identity still require confirmation before a real ProgramData backup is made.

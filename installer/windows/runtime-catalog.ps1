@@ -18,9 +18,9 @@
 #   Build (build.ps1):   New-RuntimeCatalog
 #   Setup (install-runtime.ps1):  Install-RuntimeCatalog (signature checked first)
 #   Uninstall:           runtime-catalog.ps1 -Remove
-param([switch]$Remove)
+param([switch]$Remove, [switch]$DirectTest)
 
-$CatalogBaseName = 'AnyAiCamRuntime.cat'
+$CatalogBaseName = if ($DirectTest) { 'AnyAiCamVmsDirectTestRuntime.cat' } else { 'AnyAiCamRuntime.cat' }
 $NativeExtensions = @('.pyd', '.dll', '.exe')
 
 # ------------------------------------------------------------ build time
@@ -153,6 +153,7 @@ function Get-InstalledCatalogPath {
 # a valid Authenticode signature; returns a one-line result for the setup log.
 function Install-RuntimeCatalog([string]$CatalogPath) {
     if (-not (Test-Path -LiteralPath $CatalogPath)) { throw "Runtime catalog not found: $CatalogPath" }
+    if ([IO.Path]::GetFileName($CatalogPath) -cne $CatalogBaseName) { throw "Runtime catalog identity mismatch; expected $CatalogBaseName." }
     $signature = Get-AuthenticodeSignature -LiteralPath $CatalogPath
     if ($signature.Status -ne 'Valid') { return "AnyAiCam runtime catalog not registered: it is not validly signed ($($signature.Status)); Smart App Control will block the runtime." }
     # Codex 2026-10-17: a valid signature from any OTHER publisher must not be trusted (publisher-pin.ps1).
@@ -178,5 +179,5 @@ function Remove-RuntimeCatalog {
     return 'AnyAiCam runtime catalog removed.'
 }
 
-# Run from the uninstaller: -Remove. Dot-sourced by build.ps1, install-runtime.ps1 and the tests.
+# Run from the uninstaller: -Remove [-DirectTest]. Dot-sourced by build.ps1, install-runtime.ps1 and the tests.
 if ($MyInvocation.InvocationName -ne '.' -and $Remove) { Remove-RuntimeCatalog }

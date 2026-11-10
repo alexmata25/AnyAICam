@@ -1,4 +1,22 @@
-#define AppName "AnyAiCam VMS"
+#ifdef DirectDellTestCandidate
+  #ifndef TestRunId
+    #error TestRunId is required for DirectDellTestCandidate builds.
+  #endif
+  #ifndef TestApplianceIdentitySha256
+    #error Pinned synthetic test appliance identity is required for DirectDellTestCandidate builds.
+  #endif
+  #ifndef TestFeatureEntitlementsSha256
+    #error Pinned synthetic test entitlement is required for DirectDellTestCandidate builds.
+  #endif
+  #ifndef TestAcceptedCapacitySha256
+    #error Pinned synthetic offline camera-capacity state is required for DirectDellTestCandidate builds.
+  #endif
+  #define AppName "AnyAiCam VMS Direct Test"
+  #define RuntimeCatalogFileName "AnyAiCamVmsDirectTestRuntime.cat"
+#else
+  #define AppName "AnyAiCam VMS"
+  #define RuntimeCatalogFileName "AnyAiCamRuntime.cat"
+#endif
 ; 2026-10-07: version and source commit come from build.ps1
 ; (/DAppVersion=... /DSourceCommit=...), never a stale literal. A bare ISCC
 ; run without them produces an obviously unusable "0.0.0-unset" setup name.
@@ -32,7 +50,11 @@
   #error RegistrySha256 is required: build with build.ps1 -EntitlementTrustRegistry ... -EntitlementTrustRegistrySha256 ...
 #endif
 [Setup]
+#ifdef DirectDellTestCandidate
+AppId={{6F41915D-8950-4E6B-9787-8A8060DBE51C}
+#else
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
+#endif
 AppName={#AppName}
 AppVersion={#AppVersion}
 ; What the customer reads: the wizard title, Apps & Features / uninstall name, the setup file's Product version.
@@ -45,8 +67,14 @@ VersionInfoTextVersion={#AppVersion}
 VersionInfoDescription={#AppName} {#ReleaseVersion}{#InternalTestLabel} setup (Windows setup {#AppVersion}, build {#SourceCommit})
 VersionInfoCompany=AnyAiCam
 AppPublisher=AnyAiCam
+#ifdef DirectDellTestCandidate
+DefaultDirName={autopf}\AnyAiCam VMS Direct Test
+DefaultGroupName=AnyAiCam VMS Direct Test
+DisableDirPage=yes
+#else
 DefaultDirName={autopf}\AnyAiCam
 DefaultGroupName=AnyAiCam
+#endif
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
@@ -62,6 +90,7 @@ SignTool=AnyAiCamSign
 SignedUninstaller=yes
 SignedUninstallerDir={#BuildOutputDir}\signed-uninstallers
 #endif
+#ifndef DirectDellTestCandidate
 [Dirs]
 Name: "{commonappdata}\AnyAiCam"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\config"; Flags: uninsneveruninstall
@@ -74,6 +103,7 @@ Name: "{commonappdata}\AnyAiCam\mediamtx"; Flags: uninsneveruninstall
 ; rest of the data, so a reinstall stays linked. (2026-10-08: no label folder;
 ; the permanent claim code is retired, cloud-link.ps1.)
 Name: "{commonappdata}\AnyAiCam\agent"; Flags: uninsneveruninstall
+#endif
 [InstallDelete]
 ; An upgrade replaces the program code completely, so modules removed from the
 ; VMS never linger next to the new ones. Data lives in {commonappdata}\AnyAiCam.
@@ -83,55 +113,64 @@ Type: filesandordirs; Name: "{app}\agent"
 ; removes that release's "Show AnyAiCam claim code" shortcut.
 Type: files; Name: "{group}\Show AnyAiCam claim code.lnk"
 [Files]
-Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*,direct_test_profile.py"; Flags: ignoreversion recursesubdirs createallsubdirs
+#ifdef DirectDellTestCandidate
+Source: "..\..\app\direct_test_profile.py"; DestDir: "{app}\app"; Flags: ignoreversion
+Source: "service-launcher-direct-test.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "AnyAiCamVMSDirectTest.xml"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMSDirectTest.exe"; Flags: ignoreversion
+Source: "prepare-direct-test-profile.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "firewall-direct-test.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "verify-direct-test-licensing.py"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "direct-test-install-guard.ps1"; Flags: dontcopy
+Source: "{#BuildOutputDir}\direct-test-appliance-identity.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "{#BuildOutputDir}\direct-test-accepted-capacity.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "{#BuildOutputDir}\direct-test-feature-entitlements.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
+#endif
 Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
-Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
-Source: "stop-stale-vms.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
-; 1.3.4: the VMS Job Object (CPU cap, optional memory limit) the launcher applies before starting Python.
-Source: "vms-job-limits.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "python-launchers.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "data-root-guard.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
-; Stops processes still running from {app} after the services are removed (PrepareToInstall from {tmp}; the
-; uninstaller from {app}\installer).
 Source: "stop-app-processes.ps1"; Flags: dontcopy
 Source: "stop-app-processes.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
-; Run from {tmp} by InitializeSetup before anything is installed (downgrade / unknown-version guard).
 Source: "install-version-guard.ps1"; Flags: dontcopy
 Source: "{#BuildOutputDir}\entitlement-signing-public-keys.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
-; LIC-W1: the entitlement trust registry (build.ps1). Also extracted early by TrustRegistryProblem.
 Source: "{#BuildOutputDir}\entitlement-trust-registry.json"; DestDir: "{tmp}"; Flags: deleteafterinstall
-Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "runtime-preflight.py"; DestDir: "{app}\installer"; Flags: ignoreversion
-Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
-; Cloud agent (2026-10-07): the same appliance agent as the Linux appliance,
-; run on the bundled Python as the AnyAiCamAgent service.
+#ifndef DirectDellTestCandidate
 Source: "..\..\appliance-agent\anyaicam_agent\*"; DestDir: "{app}\agent\anyaicam_agent"; Excludes: "__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "agent-main.py"; DestDir: "{app}\agent"; Flags: ignoreversion
-; Windows step 4 (signed capacity acceptance, Codex 07e934a ported): the Windows helper reuses the Linux helper's pure
-; signed-format / identity / expiry / replay policy; vms_capacity.apply_sync() runs it from {app}\agent\system.
+#else
+Source: "..\..\appliance-agent\anyaicam_agent\updater\release_checks.py"; DestDir: "{app}\agent\anyaicam_agent\updater"; Flags: ignoreversion
+#endif
 Source: "..\..\appliance-agent\system\capacity_accept.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
 Source: "..\..\appliance-agent\system\capacity_accept_windows.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
 Source: "..\..\appliance-agent\system\trust_install_windows.py"; DestDir: "{app}\agent\system"; Flags: ignoreversion
-; LIC-W1: run from {tmp} by TrustRegistryProblem on the installed Python, before the services stop.
 Source: "..\..\appliance-agent\system\trust_install_windows.py"; Flags: dontcopy
 Source: "..\..\appliance-agent\system\capacity_accept_windows.py"; Flags: dontcopy
 Source: "..\..\appliance-agent\system\capacity_accept.py"; Flags: dontcopy
 Source: "..\..\app\platform_paths.py"; Flags: dontcopy
+Source: "runtime-catalog.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "publisher-pin.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
+Source: "{#BuildOutputDir}\{#RuntimeCatalogFileName}"; DestDir: "{tmp}"; Flags: deleteafterinstall
+#ifdef InternalTestOnly
+Source: "internal-test-marker.txt"; DestDir: "{app}"; Flags: ignoreversion
+#endif
+#ifndef DirectDellTestCandidate
+Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "stop-stale-vms.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "vms-job-limits.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
+Source: "firewall.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "agent-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "AnyAiCamAgent.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamAgent.exe"; Flags: ignoreversion
 Source: "cloud-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
-; 2026-10-08: the signed catalog of the runtime's native files (build.ps1,
-; runtime-catalog.ps1); Smart App Control blocks them without it.
-Source: "runtime-catalog.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
-Source: "publisher-pin.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
-Source: "{#BuildOutputDir}\AnyAiCamRuntime.cat"; DestDir: "{tmp}"; Flags: deleteafterinstall
-#ifdef InternalTestOnly
-Source: "internal-test-marker.txt"; DestDir: "{app}"; Flags: ignoreversion
-#endif
 Source: "open-claim-link.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
+#else
+Source: "vms-job-limits.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
+#endif
 Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\get-pip.py"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\wheels\*"; DestDir: "{tmp}\wheels"; Flags: deleteafterinstall recursesubdirs createallsubdirs
@@ -150,8 +189,13 @@ Source: "notices\opencv-ffmpeg-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ig
 ; Microsoft Visual C++ 2015-2022 runtime (x64): torch/cv2 DLLs need it and a
 ; clean Windows does not have it. Installed before the Python runtime; left in
 ; place on uninstall (a shared system component other programs may use).
+#ifndef DirectDellTestCandidate
 Source: "vendor\vc_redist.x64-14.44.35211.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+#endif
 [Icons]
+#ifdef DirectDellTestCandidate
+Name: "{group}\Open AnyAiCam VMS Direct Test"; Filename: "http://127.0.0.1:18767"
+#else
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 ; 2026-10-08: asks the agent for a fresh, one-time account link and opens it
@@ -159,7 +203,11 @@ Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 ; (open-claim-link.ps1 elevates; the agent's request folder is
 ; Administrators-only).
 Name: "{group}\Link this computer to AnyAiCam"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\installer\open-claim-link.ps1"""
+#endif
 [Run]
+#ifdef DirectDellTestCandidate
+Filename: "http://127.0.0.1:18767"; Description: "Open AnyAiCam VMS Direct Test"; Flags: postinstall shellexec runasoriginaluser skipifsilent unchecked
+#else
 ; The claim page with a fresh one-time code in the URL fragment (never sent to
 ; a server; /claim moves it into the tab and out of the address bar); the setup
 ; asked the agent for it at the end of the install (RequestAccountLink).
@@ -170,7 +218,15 @@ Name: "{group}\Link this computer to AnyAiCam"; Filename: "{sys}\WindowsPowerShe
 ; skipped in a silent install.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command ""Start-Process -FilePath '{code:ClaimLink}'"""; Description: "Link this computer to my AnyAiCam account"; Flags: postinstall runasoriginaluser runhidden nowait dontlogparameters skipifsilent; Check: HasClaimLink
 Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: postinstall shellexec runasoriginaluser skipifsilent unchecked
+#endif
 [UninstallRun]
+#ifdef DirectDellTestCandidate
+Filename: "{app}\service\AnyAiCamVMSDirectTest.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVmsDirectTest"
+Filename: "{app}\service\AnyAiCamVMSDirectTest.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamVmsDirectTest"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\stop-app-processes.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopDirectTestFolderProcesses"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\firewall-direct-test.ps1"" -Remove -InstallRoot ""{app}"" -RunId ""{#TestRunId}"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDirectTestEgressRules"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\runtime-catalog.ps1"" -Remove -DirectTest"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDirectTestRuntimeCatalog"
+#else
 Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamAgent"
 Filename: "{app}\service\AnyAiCamAgent.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamAgent"
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stopwait"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVMS"
@@ -180,6 +236,7 @@ Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "uninstall"; Flags: runhi
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\stop-app-processes.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamFolderProcesses"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\firewall.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAnyAiCamFirewall"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\runtime-catalog.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAnyAiCamRuntimeCatalog"
+#endif
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -206,6 +263,23 @@ const
   VersionGuardDowngrade = 10;
   VersionGuardUnknownInstalled = 11;
 
+#ifdef DirectDellTestCandidate
+function DirectTestVcRuntimeReady(): Boolean;
+var
+  Installed: Cardinal;
+  Version: String;
+begin
+  Result := False;
+  Installed := 0;
+  Version := '';
+  if not RegQueryDWordValue(HKLM64, 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64', 'Installed', Installed) then exit;
+  if Installed <> 1 then exit;
+  if not RegQueryStringValue(HKLM64, 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64', 'Version', Version) then exit;
+  if (Length(Version) > 0) and (Version[1] = 'v') then Delete(Version, 1, 1);
+  Result := CompareVersion(Version, '14.44.35211.0') >= 0;
+end;
+#endif
+
 function InitializeSetup(): Boolean;
 var
   ResultCode, I: Integer;
@@ -213,6 +287,24 @@ var
   Allowed: Boolean;
   Message: String;
 begin
+#ifdef DirectDellTestCandidate
+  Result := False;
+  if not DirectTestVcRuntimeReady then begin
+    Log('Direct test install refused: the required Microsoft VC++ runtime is not already installed; the test profile does not install shared system prerequisites.');
+    if not WizardSilent() then MsgBox('The Microsoft Visual C++ runtime must already be installed before the isolated test candidate can be used.', mbError, MB_OK);
+    exit;
+  end;
+  ExtractTemporaryFile('direct-test-install-guard.ps1');
+  ResultCode := -1;
+  if ExecAndCaptureOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\direct-test-install-guard.ps1') +
+      '" -InstallRoot "' + ExpandConstant('{app}') + '" -RunId "{#TestRunId}"', '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode, Output) and (ResultCode = 0) then
+    for I := 0 to GetArrayLength(Output.StdOut) - 1 do
+      if Output.StdOut[I] = 'DIRECT_TEST_GUARD_OK' then Result := True;
+  if not Result then Log('Direct test install refused: isolated install preflight did not pass.');
+  exit;
+#else
   Result := False;
   ResultCode := -1;
   Allowed := False;
@@ -252,10 +344,14 @@ begin
   end;
   if not WizardSilent() then
     MsgBox(Message, mbError, MB_OK);
+#endif
 end;
 
 procedure InitializeWizard;
 begin
+#ifdef DirectDellTestCandidate
+  exit;
+#else
   // Supported first-time activation (1.3.2, Codex FAIL on ef93b503): cameras run only after this PC is linked to an
   // AnyAiCam account ONCE, online (the cloud's first signed camera capacity). After that the accepted capacity has no
   // expiry, so Local cameras, recording and live view keep working without internet. Never claim fully offline
@@ -269,22 +365,31 @@ begin
   ProductModePage.Add('Local: cameras, recording and live view stay on this computer (link once online to activate)');
   ProductModePage.Add('Hybrid: adds Cloud Video Backup and remote features (needs an AnyAiCam plan)');
   ProductModePage.SelectedValueIndex := 0;
+#endif
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
+#ifdef DirectDellTestCandidate
+  Result := False;
+#else
   Result := (PageID = ProductModePage.ID) and (ExistingInstall() or (ExpandConstant('{param:ProductMode|}') <> ''));
+#endif
 end;
 
 // What install-runtime.ps1 receives. A silent NEW install without /ProductMode= passes nothing, so it is refused
 // there -- the same rule as the Linux unattended install (never a silent default).
 function ProductModeChoice(): String;
 begin
+#ifdef DirectDellTestCandidate
+  Result := 'local';
+#else
   Result := Lowercase(ExpandConstant('{param:ProductMode|}'));
   if (Result = '') and not ExistingInstall() and not WizardSilent() then
   begin
     if ProductModePage.SelectedValueIndex = 1 then Result := 'hybrid' else Result := 'local';
   end;
+#endif
 end;
 
 var VcRuntimeNeedsRestart: Boolean;
@@ -415,8 +520,22 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
+  Output: TExecOutput;
   ServiceExecutable: String;
 begin
+#ifdef DirectDellTestCandidate
+  ExtractTemporaryFile('direct-test-install-guard.ps1');
+  ResultCode := -1;
+  if ExecAndCaptureOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\direct-test-install-guard.ps1') +
+      '" -InstallRoot "' + ExpandConstant('{app}') + '" -RunId "{#TestRunId}"', '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode, Output) and (ResultCode = 0) then begin
+    Result := '';
+    exit;
+  end;
+  Result := 'The isolated AnyAiCam test profile is not safe to install. No existing VMS services were stopped.';
+  exit;
+#else
   Result := ProductModeProblem();
   if Result <> '' then begin
     Log('Install refused before any change: ' + Result);
@@ -456,6 +575,7 @@ begin
       '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\stop-app-processes.ps1') +
       '" -InstallRoot "' + ExpandConstant('{app}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode, nil);
   end;
+#endif
 end;
 
 // Inno Setup reports a failure raised during ssPostInstall to the user but
@@ -536,6 +656,16 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   try
+#ifdef DirectDellTestCandidate
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer\prepare-direct-test-profile.ps1" -InstallRoot "{app}" -RunId "{#TestRunId}"'),
+      'Preparing isolated direct-test data and service profile...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer\install-runtime.ps1" -InstallRoot "{app}" -DataRoot "{commonappdata}\AnyAiCam-Test\{#TestRunId}" -SourceCommit "{#SourceCommit}" -PythonArchive "{tmp}\python-3.12.10-embed-amd64.zip" -GetPipScript "{tmp}\get-pip.py" -WheelRoot "{tmp}\wheels" -FFmpegArchive "{tmp}\ffmpeg-8.1.2-essentials_build.zip" -MediaMtxArchive "{tmp}\mediamtx_v1.21.0_windows_amd64.zip" -TesseractArchive "{tmp}\tesseract-5.5.2-win64-anyaicam.zip" -SttModelArchive "{tmp}\vosk-model-small-en-us-0.15.zip" -AppVersion "{#AppVersion}" -ReleaseVersion "{#ReleaseVersion}" -PortalUrl "" -RuntimeCatalog "{tmp}\{#RuntimeCatalogFileName}" -EntitlementKeyset "{tmp}\entitlement-signing-public-keys.json" -EntitlementKeysetSha256 "{#KeysetSha256}" -EntitlementTrustRegistry "{tmp}\entitlement-trust-registry.json" -EntitlementTrustRegistrySha256 "{#RegistrySha256}" -ProductMode local -DirectTest -TestRunId "{#TestRunId}" -TestApplianceIdentity "{tmp}\direct-test-appliance-identity.json" -TestApplianceIdentitySha256 "{#TestApplianceIdentitySha256}" -TestAcceptedCapacity "{tmp}\direct-test-accepted-capacity.json" -TestAcceptedCapacitySha256 "{#TestAcceptedCapacitySha256}" -TestFeatureEntitlements "{tmp}\direct-test-feature-entitlements.json" -TestFeatureEntitlementsSha256 "{#TestFeatureEntitlementsSha256}"'),
+      'Installing isolated VMS runtime and synthetic offline licensing fixtures...');
+    ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMSDirectTest.exe'), 'install', 'Installing isolated AnyAiCam VMS service...');
+    ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMSDirectTest.exe'), 'start', 'Starting isolated AnyAiCam VMS service...');
+#else
     // Order matters: VC++ runtime, then the Python runtime and its preflight
     // (install-runtime.ps1), and only then the service.
     InstallVcRuntime;
@@ -548,6 +678,7 @@ begin
     // asks for no link (and opens no claim).
     if not WizardSilent then
       RequestAccountLink;
+#endif
   except
     PostInstallFailed := True;
     Log('AnyAiCam setup failed; exit code will be ' + IntToStr(PostInstallFailedExitCode) + ': ' + GetExceptionMessage);
@@ -587,6 +718,9 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+#ifdef DirectDellTestCandidate
+  exit;
+#else
   if (CurPageID <> wpFinished) or PostInstallFailed then Exit;
   if IsLinked or (AccountLinkStatus = 'linked') then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
@@ -603,4 +737,5 @@ begin
       'Your cameras start once this computer is linked to your AnyAiCam account (needed once, with an internet ' +
       'connection). When this PC is online: Start menu > AnyAiCam > Link this computer to AnyAiCam (needs an ' +
       'administrator of this PC). After this first link, Local mode keeps recording without internet.';
+#endif
 end;

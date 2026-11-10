@@ -30,10 +30,40 @@ param(
     [Parameter(Mandatory=$true)][string]$EntitlementTrustRegistrySha256,
     # Requirement 9 (1.2.7): Local or Hybrid, chosen in Setup (or /ProductMode= for a silent install). Empty on an
     # upgrade, which keeps the saved mode. Mirrors installer/03-product-mode.sh.
-    [string]$ProductMode = ''
+    [string]$ProductMode = '',
+    [switch]$DirectTest,
+    [string]$TestRunId = '',
+    [string]$TestApplianceIdentity = '',
+    [string]$TestApplianceIdentitySha256 = '',
+    [string]$TestAcceptedCapacity = '',
+    [string]$TestAcceptedCapacitySha256 = '',
+    [string]$TestFeatureEntitlements = '',
+    [string]$TestFeatureEntitlementsSha256 = ''
 )
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'runtime-catalog.ps1')
+if ($DirectTest) {
+    if ($TestRunId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { throw 'DIRECT_TEST_RUN_ID_INVALID' }
+    $profilePath = Join-Path $InstallRoot 'direct-test-profile.json'
+    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw 'DIRECT_TEST_PROFILE_MISSING' }
+    $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+    $expectedRoot = Join-Path (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'AnyAiCam-Test') $TestRunId
+    if ($profile.run_id -cne $TestRunId -or [IO.Path]::GetFullPath([string]$profile.data_root) -ine [IO.Path]::GetFullPath($expectedRoot) -or
+        [IO.Path]::GetFullPath($DataRoot) -ine [IO.Path]::GetFullPath($expectedRoot) -or
+        $profile.service_name -cne 'AnyAiCamVmsDirectTest' -or $profile.http_port -ne 18767) { throw 'DIRECT_TEST_PROFILE_MISMATCH' }
+    # Python trust helpers resolve their trust location from platform_paths at process startup.
+    # Bind that resolver to the protected profile before any helper is invoked.
+    $env:ANYAICAM_INTERNAL_TEST_BUILD = '1'
+    $env:ANYAICAM_TEST_RUN_ID = $TestRunId
+    if (($TestApplianceIdentity -and $TestApplianceIdentitySha256 -notmatch '^[0-9a-f]{64}$') -or
+        (-not $TestApplianceIdentity -and $TestApplianceIdentitySha256)) { throw 'DIRECT_TEST_IDENTITY_PIN_INVALID' }
+    if (($TestFeatureEntitlements -and $TestFeatureEntitlementsSha256 -notmatch '^[0-9a-f]{64}$') -or
+        (-not $TestFeatureEntitlements -and $TestFeatureEntitlementsSha256)) { throw 'DIRECT_TEST_ENTITLEMENT_PIN_INVALID' }
+    if (($TestAcceptedCapacity -and $TestAcceptedCapacitySha256 -notmatch '^[0-9a-f]{64}$') -or
+        (-not $TestAcceptedCapacity -and $TestAcceptedCapacitySha256)) { throw 'DIRECT_TEST_CAPACITY_PIN_INVALID' }
+} elseif ($TestRunId -or $TestApplianceIdentity -or $TestApplianceIdentitySha256 -or $TestAcceptedCapacity -or $TestAcceptedCapacitySha256 -or $TestFeatureEntitlements -or $TestFeatureEntitlementsSha256) {
+    throw 'DIRECT_TEST_ARGUMENTS_REQUIRE_DIRECT_TEST_MODE'
+}
+. (Join-Path $PSScriptRoot 'runtime-catalog.ps1') -DirectTest:$DirectTest
 Install-RuntimeCatalog $RuntimeCatalog
 $pythonRoot = Join-Path $InstallRoot 'runtime\python'
 $python = Join-Path $pythonRoot 'python.exe'
@@ -64,8 +94,10 @@ Write-Output "Removed $removedPythonLaunchers pip-generated Python Scripts EXE l
 & $python (Join-Path $InstallRoot 'installer\runtime-preflight.py')
 if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam runtime preflight failed: the bundled Python cannot load the VMS packages.' }
 # The cloud agent (2026-10-07) must load too, before its service exists.
-& $python -c "import sys; sys.path.insert(0, sys.argv[1]); import anyaicam_agent.service, anyaicam_agent.windows; print('AnyAiCam agent preflight passed')" (Join-Path $InstallRoot 'agent')
-if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam agent preflight failed: the bundled Python cannot load the cloud agent.' }
+if (-not $DirectTest) {
+    & $python -c "import sys; sys.path.insert(0, sys.argv[1]); import anyaicam_agent.service, anyaicam_agent.windows; print('AnyAiCam agent preflight passed')" (Join-Path $InstallRoot 'agent')
+    if ($LASTEXITCODE -ne 0) { throw 'AnyAiCam agent preflight failed: the bundled Python cannot load the cloud agent.' }
+}
 
 $ffmpegRoot = Join-Path $InstallRoot 'runtime\tools\ffmpeg'
 # 1.3.4.1: FFmpeg's GPL licence sits beside bin\ in the archive, so the copy below never reached it. An upgrade over a
@@ -217,6 +249,17 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $EntitlementKeyset).Hash.ToLowe
 # an administrator creates is owned by that user, so the walk that repaired this folder above runs again. Both services
 # are stopped here, so nothing reads these files before their owner is right.
 if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'The pinned entitlement trust registry SHA-256 is malformed.' }
+if ($DirectTest) {
+    $testRegistry = Get-Content -LiteralPath $EntitlementTrustRegistry -Raw | ConvertFrom-Json
+    $testKeyset = Get-Content -LiteralPath $EntitlementKeyset -Raw | ConvertFrom-Json
+    if ($testRegistry.environment -cne 'synthetic' -or -not $testRegistry.keys -or -not $testKeyset.keys) { throw 'DIRECT_TEST_SYNTHETIC_TRUST_REQUIRED' }
+    foreach ($key in $testRegistry.keys.PSObject.Properties) {
+        if ($key.Value.environment -cne 'synthetic') { throw 'DIRECT_TEST_NON_SYNTHETIC_TRUST_KEY_REFUSED' }
+    }
+    foreach ($key in $testKeyset.keys.PSObject.Properties) {
+        if (-not $testRegistry.keys.($key.Name) -or $testRegistry.keys.($key.Name).environment -cne 'synthetic') { throw 'DIRECT_TEST_KEYSET_REGISTRY_MISMATCH' }
+    }
+}
 & $python (Join-Path $InstallRoot 'agent\system\trust_install_windows.py') $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $EntitlementKeyset
 if ($LASTEXITCODE -ne 0) { throw "The entitlement trust registry was not installed (exit $LASTEXITCODE); the setup log has the reason." }
 Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $updateRoot -Force)
@@ -277,10 +320,10 @@ foreach ($analyticsFlag in @('ANYAICAM_LPR_ENABLED', 'PEOPLE_COUNTING_ENABLED', 
     if (-not $values.Contains($analyticsFlag)) { $values[$analyticsFlag] = 'true' }
 }
 $values['ANYAICAM_RUNTIME_ROLE'] = 'edge'
-$values['ANYAICAM_ENV'] = 'production'
+$values['ANYAICAM_ENV'] = $(if ($DirectTest) { 'local' } else { 'production' })
 $values['ANYAICAM_FORCE_HTTPS'] = 'false'
 $values['ANYAICAM_SECURE_COOKIES'] = 'false'
-$values['ANYAICAM_PUBLIC_URL'] = 'http://127.0.0.1:8000'
+$values['ANYAICAM_PUBLIC_URL'] = $(if ($DirectTest) { 'http://127.0.0.1:18767' } else { 'http://127.0.0.1:8000' })
 $values['ANYAICAM_VMS_COMMIT'] = $SourceCommit
 $values['ANYAICAM_BUILD_ID'] = $SourceCommit
 # Local / Hybrid (Requirement 9): the same rules as Linux installer/03-product-mode.sh. A new installation records
@@ -305,13 +348,73 @@ $values['ANYAICAM_VERSION'] = $ReleaseVersion
 # The Windows setup's own version, which install-version-guard.ps1 reads first (it survives an uninstall with the data).
 # 1.3.0 / 1.3.1 had no such line; their ANYAICAM_VERSION was the setup version, the guard's fallback.
 $values['ANYAICAM_WINDOWS_SETUP_VERSION'] = $AppVersion
+if ($DirectTest) {
+    if ($PortalUrl) { throw 'DIRECT_TEST_PORTAL_URL_FORBIDDEN' }
+    if (-not $TestApplianceIdentity -or -not $TestAcceptedCapacity -or -not $TestFeatureEntitlements) { throw 'DIRECT_TEST_SYNTHETIC_LICENSE_FIXTURES_REQUIRED' }
+    $values['ANYAICAM_PRODUCT_MODE'] = 'local'
+    $values['ANYAICAM_PRODUCT_MODE_BOOTSTRAP'] = 'local'
+    $values['ANYAICAM_AGENT_MODE'] = 'disabled'
+    $values['ANYAICAM_PORTAL_URL'] = ''
+    $values['ANYAICAM_ANALYTICS_SYNC_ENABLED'] = 'false'
+    $values['ANYAICAM_ENV'] = 'local'
+    $values['ANYAICAM_BIND_HOST'] = '127.0.0.1'
+    $values['ANYAICAM_HTTP_PORT'] = '18767'
+    if ($TestApplianceIdentity) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $TestApplianceIdentity).Hash.ToLowerInvariant() -cne $TestApplianceIdentitySha256) { throw 'DIRECT_TEST_IDENTITY_HASH_MISMATCH' }
+        $identity = Get-Content -LiteralPath $TestApplianceIdentity -Raw | ConvertFrom-Json
+        if ($identity.appliance_id -notmatch '^TEST-[A-Za-z0-9-]{1,80}$' -or $identity.cloud_id -notmatch '^TEST-[A-Za-z0-9-]{1,80}$' -or
+            $identity.customer_id -notmatch '^TEST-[A-Za-z0-9-]{1,80}$' -or $identity.site_id -notmatch '^TEST-[A-Za-z0-9-]{1,80}$' -or
+            $identity.partner_id -notmatch '^TEST-[A-Za-z0-9-]{1,80}$' -or $identity.credential -notmatch '^test-[A-Za-z0-9._-]{8,160}$') { throw 'DIRECT_TEST_IDENTITY_NOT_SYNTHETIC' }
+        Copy-Item -LiteralPath $TestApplianceIdentity -Destination (Join-Path $DataRoot 'config\appliance_identity.json') -Force
+    }
+    if ($TestFeatureEntitlements) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $TestFeatureEntitlements).Hash.ToLowerInvariant() -cne $TestFeatureEntitlementsSha256) { throw 'DIRECT_TEST_ENTITLEMENT_HASH_MISMATCH' }
+        $grant = Get-Content -LiteralPath $TestFeatureEntitlements -Raw | ConvertFrom-Json
+        $snapshot = if ($grant.snapshot) { $grant.snapshot } else { $grant }
+        $registry = Get-Content -LiteralPath $EntitlementTrustRegistry -Raw | ConvertFrom-Json
+        $signatureKey = [string]$snapshot.signature.key_id
+        if ($snapshot.type -cne 'anyaicam.feature_entitlements' -or $snapshot.appliance_id -notmatch '^TEST-' -or
+            $snapshot.cloud_id -notmatch '^TEST-' -or $snapshot.customer_id -notmatch '^TEST-' -or
+            $registry.environment -cne 'synthetic' -or -not $registry.keys.$signatureKey -or $registry.keys.$signatureKey.state -cne 'active' -or
+            $registry.keys.$signatureKey.environment -cne 'synthetic') { throw 'DIRECT_TEST_ENTITLEMENT_TRUST_REFUSED' }
+        Copy-Item -LiteralPath $TestFeatureEntitlements -Destination (Join-Path $DataRoot 'config\feature_entitlements.json') -Force
+    }
+    if ($TestAcceptedCapacity) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $TestAcceptedCapacity).Hash.ToLowerInvariant() -cne $TestAcceptedCapacitySha256) { throw 'DIRECT_TEST_CAPACITY_HASH_MISMATCH' }
+        $accepted = Get-Content -LiteralPath $TestAcceptedCapacity -Raw | ConvertFrom-Json
+        $snapshot = $accepted.snapshot
+        $keyId = [string]$snapshot.signature.key_id
+        $key = $registry.keys.$keyId
+        if ($accepted.schema -ne 2 -or $accepted.trust_generation -lt 1 -or $accepted.identity.appliance_id -cne $identity.appliance_id -or
+            $accepted.identity.cloud_id -cne $identity.cloud_id -or $accepted.identity.customer_id -cne $identity.customer_id -or
+            $snapshot.type -cne 'anyaicam.feature_entitlements' -or $snapshot.appliance_id -cne $identity.appliance_id -or
+            -not $snapshot.camera_capacity -or [int]$snapshot.camera_capacity.camera_slot_quantity -lt 1 -or
+            -not $key -or $key.environment -cne 'synthetic' -or $key.state -cne 'active' -or
+            $accepted.signer.key_id -cne $keyId -or $accepted.accepted_key -cne $key.public_key) { throw 'DIRECT_TEST_CAPACITY_TRUST_REFUSED' }
+        if ($accepted.high_water.digest -notmatch '^[0-9a-f]{64}$' -or -not $accepted.high_water.issued_at -or -not $accepted.accepted_at) { throw 'DIRECT_TEST_CAPACITY_STATE_INCOMPLETE' }
+        $acceptedCapacityTarget = Join-Path $updateRoot 'vms_capacity_accepted.json'
+        Copy-Item -LiteralPath $TestAcceptedCapacity -Destination $acceptedCapacityTarget -Force
+        Set-AnyAiCamEntryAcl (Get-Item -LiteralPath $acceptedCapacityTarget -Force)
+        Assert-AnyAiCamTrustFolderHasNoHardLinks $updateRoot
+    }
+    & $python (Join-Path $InstallRoot 'installer\verify-direct-test-licensing.py') `
+        (Join-Path $DataRoot 'config\appliance_identity.json') `
+        (Join-Path $DataRoot 'config\feature_entitlements.json') `
+        (Join-Path $updateRoot 'vms_capacity_accepted.json') `
+        $EntitlementTrustRegistry (Join-Path $InstallRoot 'app') (Join-Path $InstallRoot 'agent\system')
+    if ($LASTEXITCODE -ne 0) { throw 'DIRECT_TEST_LICENSE_CRYPTOGRAPHIC_VERIFICATION_FAILED' }
+}
 $content = @('# Managed by the AnyAiCam Windows installer. Persistent across repair and uninstall.')
 $content += $values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
 [IO.File]::WriteAllLines($environmentFile, $content, [Text.UTF8Encoding]::new($false))
 
-# Cloud linking (2026-10-07): appliance identity, claim code, cloud portal
-# and installed release for the agent service (see cloud-link.ps1).
-& (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -ReleaseVersion $ReleaseVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
-
-# Local-network access to the VMS and live view (see firewall.ps1).
-& (Join-Path $InstallRoot 'installer\firewall.ps1') -Apply -InstallRoot $InstallRoot
+if (-not $DirectTest) {
+    # Production account linking and inbound firewall behavior remain the existing production path.
+    & (Join-Path $InstallRoot 'installer\cloud-link.ps1') -DataRoot $DataRoot -AppVersion $AppVersion -ReleaseVersion $ReleaseVersion -SourceCommit $SourceCommit -PortalUrl $PortalUrl
+    & (Join-Path $InstallRoot 'installer\firewall.ps1') -Apply -InstallRoot $InstallRoot
+} else {
+    # Explicit per-image outbound block is installed before the service exists.
+    # Only this candidate's executables and exact run-scoped rule group are touched.
+    & (Join-Path $InstallRoot 'installer\firewall-direct-test.ps1') -Apply -InstallRoot $InstallRoot -RunId $TestRunId
+    if (-not $?) { throw 'DIRECT_TEST_EGRESS_POLICY_FAILED' }
+}
