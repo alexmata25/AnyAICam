@@ -47,6 +47,9 @@ class LauncherRunTests(unittest.TestCase):
         self.install = self.tmp / "Program Files" / "AnyAiCam"
         (self.install / "service").mkdir(parents=True)
         (self.install / "app").mkdir()
+        # The setup installs gateway-edition.ps1 to {app}\installer; the launcher dot-sources it first.
+        (self.install / "installer").mkdir()
+        shutil.copy(WIN / "gateway-edition.ps1", self.install / "installer" / "gateway-edition.ps1")
         self.program_data = self.tmp / "ProgramData"
         (self.program_data / "AnyAiCam" / "config").mkdir(parents=True)
 
