@@ -1,0 +1,200 @@
+{
+  "recorded_at_utc": "2026-11-02T18:15:13.646724+00:00",
+  "machine": "AlexDellServer",
+  "checkout": "C:\\AnyAiCam-Gateway-Dev",
+  "kind": "presence_only",
+  "build_readiness": "NOT_VALIDATED",
+  "missing_dependencies": [
+    "inno_setup_7",
+    "vendor_inputs",
+    "wheels"
+  ],
+  "checks": {
+    "inno_setup_7": {
+      "path": "C:\\Users\\Administrator\\AppData\\Local\\Programs\\Inno Setup 7\\ISCC.exe",
+      "present": false
+    },
+    "git_on_path": {
+      "present": false
+    },
+    "build_git": {
+      "path": "C:\\Program Files\\Git\\cmd\\git.exe",
+      "present": true,
+      "resolution": "installed_fallback"
+    },
+    "makecat": {
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\makecat.exe",
+      "present": true
+    },
+    "signtool": {
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\signtool.exe",
+      "present": true
+    },
+    "build_python": {
+      "provided": false,
+      "present": false,
+      "version_verified": false
+    },
+    "approved_public_keyset": {
+      "provided": false,
+      "present": false,
+      "pin_verified": false
+    },
+    "signing_modes": {
+      "selected": "not_selected",
+      "azure": {
+        "dlib_present": false,
+        "metadata_present": false,
+        "identity_verified": false
+      },
+      "certificate": {
+        "signtool_path_configured": false,
+        "certificate_configured": false,
+        "timestamp_configured": false,
+        "certificate_store_inspected": false
+      }
+    },
+    "vendor_inputs": {
+      "required_count": 8,
+      "missing": [
+        "python-3.12.10-embed-amd64.zip",
+        "get-pip.py",
+        "WinSW-x64.exe",
+        "ffmpeg-8.1.2-essentials_build.zip",
+        "mediamtx_v1.21.0_windows_amd64.zip",
+        "vc_redist.x64-14.44.35211.exe",
+        "vosk-model-small-en-us-0.15.zip",
+        "tesseract-5.5.2-win64-anyaicam.zip"
+      ],
+      "hashes_verified": false
+    },
+    "wheels": {
+      "required_count": 108,
+      "missing": [
+        "aiohappyeyeballs-2.7.1-py3-none-any.whl",
+        "aiohttp-3.14.4-cp312-cp312-win_amd64.whl",
+        "aiosignal-1.4.0-py3-none-any.whl",
+        "annotated_types-0.8.0-py3-none-any.whl",
+        "anyio-4.15.1-py3-none-any.whl",
+        "attrs-26.1.0-py3-none-any.whl",
+        "bcrypt-4.0.1-cp36-abi3-win_amd64.whl",
+        "boto3-1.35.81-py3-none-any.whl",
+        "botocore-1.35.99-py3-none-any.whl",
+        "cachecontrol-0.14.4-py3-none-any.whl",
+        "certifi-2026.7.22-py3-none-any.whl",
+        "cffi-2.1.1-cp312-cp312-win_amd64.whl",
+        "charset_normalizer-3.5.2-cp312-cp312-win_amd64.whl",
+        "click-8.5.0-py3-none-any.whl",
+        "colorama-0.4.6-py2.py3-none-any.whl",
+        "coloredlogs-15.0.1-py2.py3-none-any.whl",
+        "contourpy-1.3.3-cp312-cp312-win_amd64.whl",
+        "cryptography-44.0.0-cp39-abi3-win_amd64.whl",
+        "cycler-0.12.1-py3-none-any.whl",
+        "fastapi-0.115.6-py3-none-any.whl",
+        "filelock-3.32.3-py3-none-any.whl",
+        "firebase_admin-7.7.0-py3-none-any.whl",
+        "flatbuffers-25.12.19-py2.py3-none-any.whl",
+        "fonttools-4.66.1-cp312-cp312-win_amd64.whl",
+        "frozenlist-1.8.0-cp312-cp312-win_amd64.whl",
+        "fsspec-2026.7.0-py3-none-any.whl",
+        "googleapis_common_protos-1.75.5-py3-none-any.whl",
+        "google_api_core-2.41.0-py3-none-any.whl",
+        "google_auth-2.60.0-py3-none-any.whl",
+        "google_cloud_core-2.8.0-py3-none-any.whl",
+        "google_cloud_firestore-2.34.0-py3-none-any.whl",
+        "google_cloud_storage-3.16.0-py3-none-any.whl",
+        "google_crc32c-1.9.0-cp312-cp312-win_amd64.whl",
+        "google_resumable_media-2.11.0-py3-none-any.whl",
+        "grpcio-1.84.0-cp312-cp312-win_amd64.whl",
+        "grpcio_status-1.84.0-py3-none-any.whl",
+        "h11-0.16.0-py3-none-any.whl",
+        "h2-4.4.1-py3-none-any.whl",
+        "hpack-4.2.0-py3-none-any.whl",
+        "httpcore-1.0.9-py3-none-any.whl",
+        "httpx-0.28.1-py3-none-any.whl",
+        "http_ece-1.2.1-py2.py3-none-any.whl",
+        "humanfriendly-10.0-py2.py3-none-any.whl",
+        "hyperframe-6.1.0-py3-none-any.whl",
+        "idna-3.20-py3-none-any.whl",
+        "itsdangerous-2.2.0-py3-none-any.whl",
+        "jinja2-3.1.6-py3-none-any.whl",
+        "jmespath-1.1.0-py3-none-any.whl",
+        "kiwisolver-1.5.1-cp312-cp312-win_amd64.whl",
+        "markupsafe-3.0.3-cp312-cp312-win_amd64.whl",
+        "matplotlib-3.11.2-cp312-cp312-win_amd64.whl",
+        "mpmath-1.3.0-py3-none-any.whl",
+        "msgpack-1.2.3-cp312-cp312-win_amd64.whl",
+        "multidict-6.9.1-cp312-cp312-win_amd64.whl",
+        "networkx-3.6.1-py3-none-any.whl",
+        "numpy-1.26.4-cp312-cp312-win_amd64.whl",
+        "onnxruntime-1.19.2-cp312-cp312-win_amd64.whl",
+        "opencv_python-4.10.0.84-cp37-abi3-win_amd64.whl",
+        "opentelemetry_api-1.45.1-py3-none-any.whl",
+        "packaging-26.3-py3-none-any.whl",
+        "pandas-3.0.6-cp312-cp312-win_amd64.whl",
+        "passlib-1.7.4-py2.py3-none-any.whl",
+        "pillow-12.3.0-cp312-cp312-win_amd64.whl",
+        "pip-26.2.1-py3-none-any.whl",
+        "propcache-0.5.4-cp312-cp312-win_amd64.whl",
+        "protobuf-7.36.2-cp310-abi3-win_amd64.whl",
+        "proto_plus-1.29.0-py3-none-any.whl",
+        "psutil-7.2.2-cp37-abi3-win_amd64.whl",
+        "psycopg-3.2.3-py3-none-any.whl",
+        "psycopg_binary-3.2.3-cp312-cp312-win_amd64.whl",
+        "pyasn1-0.6.4-py3-none-any.whl",
+        "pyasn1_modules-0.4.2-py3-none-any.whl",
+        "pycparser-3.0-py3-none-any.whl",
+        "pydantic-2.13.5-py3-none-any.whl",
+        "pydantic_core-2.46.5-cp312-cp312-win_amd64.whl",
+        "pyjwt-2.15.1-py3-none-any.whl",
+        "pyparsing-3.3.3-py3-none-any.whl",
+        "pyreadline3-3.5.6-py3-none-any.whl",
+        "pyserial-3.5-py2.py3-none-any.whl",
+        "pytesseract-0.3.13-py3-none-any.whl",
+        "python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+        "python_multipart-0.0.20-py3-none-any.whl",
+        "pywebpush-2.0.3-py3-none-any.whl",
+        "pyyaml-6.0.3-cp312-cp312-win_amd64.whl",
+        "py_cpuinfo-9.0.0-py3-none-any.whl",
+        "py_vapid-1.9.2-py3-none-any.whl",
+        "requests-2.34.2-py3-none-any.whl",
+        "s3transfer-0.10.4-py3-none-any.whl",
+        "scipy-1.17.1-cp312-cp312-win_amd64.whl",
+        "seaborn-0.13.2-py3-none-any.whl",
+        "setuptools-78.1.0-py3-none-any.whl",
+        "six-1.17.0-py2.py3-none-any.whl",
+        "srt-3.5.3-py3-none-any.whl",
+        "starlette-0.41.3-py3-none-any.whl",
+        "sympy-1.13.1-py3-none-any.whl",
+        "torch-2.5.1+cpu-cp312-cp312-win_amd64.whl",
+        "torchvision-0.20.1+cpu-cp312-cp312-win_amd64.whl",
+        "tqdm-4.70.1-py3-none-any.whl",
+        "typing_extensions-4.16.0-py3-none-any.whl",
+        "typing_inspection-0.4.4-py3-none-any.whl",
+        "tzdata-2026.5-py2.py3-none-any.whl",
+        "ultralytics-8.3.40-py3-none-any.whl",
+        "ultralytics_thop-2.2.2-py3-none-any.whl",
+        "urllib3-2.8.0-py3-none-any.whl",
+        "uvicorn-0.34.0-py3-none-any.whl",
+        "vosk-0.3.45-py3-none-win_amd64.whl",
+        "websockets-14.1-cp312-cp312-win_amd64.whl",
+        "yarl-1.25.1-cp312-cp312-win_amd64.whl"
+      ],
+      "hashes_verified": false
+    }
+  },
+  "remaining_gates": [
+    "Approved setup and release versions",
+    "Verified build interpreter version",
+    "Approved public keyset and independently pinned hash",
+    "All vendor/wheel hashes and signatures",
+    "Packaged source integrity and signing configuration",
+    "Licence/distribution review from DEPENDENCIES.md",
+    "Separate resource-window approval; no build or VM operation has run"
+  ],
+  "r430_resource_window": {
+    "current_ram": "not_measured",
+    "running_vms": "not_queried",
+    "approval_requested": false
+  }
+}

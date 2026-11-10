@@ -91,12 +91,105 @@ def _event_media_retention_days(db, customer_id: str) -> int | None:
     return _customer_retention_days(db, customer_id)
 
 
-def _expired_candidates(db, now: datetime) -> list[dict]:
+def event_media_retention_days(db, customer_id: str) -> int | None:
+    """Public form of the sweep's own event-media retention, so an upload is
+    authorized only for media this sweep will later expire."""
+    return _event_media_retention_days(db, customer_id)
+
+
+FULL_VMS_POLICY = "full_vms_plan"
+CLOUD_GATEWAY_POLICY = "cloud_gateway"
+GATEWAY_RETENTION_OPTIONS = (7, 14, 30)
+# Consecutive ticks whose Cloud Gateway binding lookup failed before the
+# sweep raises its log level to CRITICAL (historical rows are held).
+LOOKUP_FAILURE_ALERT_TICKS = 3
+
+
+def _parse_time(value):
+    try:
+        return datetime.fromisoformat(str(value)) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_gateway_binding_times(db) -> dict:
+    """{camera_id: earliest Cloud Gateway binding created_at} over every
+    binding row, any status. Raises if the lookup is unavailable."""
+    rows = db.execute("SELECT camera_id, MIN(created_at) AS first_at FROM cloud_gateway_camera_entitlements GROUP BY camera_id").fetchall()
+    return {row["camera_id"]: row["first_at"] for row in rows}
+
+
+def _new_diagnostics() -> dict:
+    return {
+        "attributed_full_vms": 0, "attributed_cloud_gateway": 0,
+        "historical_full_vms": 0,
+        # Held = never deleted this tick, with the reason:
+        "held_historical_ambiguous": 0,  # cataloged on/after the camera's first Gateway binding
+        "held_historical_lookup_unavailable": 0,  # binding lookup failed
+        "held_invalid_attribution": 0,  # inconsistent or out-of-range stored policy
+        "held_no_retention": 0,  # Full VMS customer with no retention on file
+        "held_bad_timestamp": 0,
+        "gateway_lookup_error": None,
+    }
+
+
+def _media_retention_days(db, row, first_binding, full_vms_cache, diagnostics):
+    """The retention that governs one ROOT event-media row, or None to keep
+    it. Decided by the policy recorded on the row when it was cataloged
+    (capture time) -- never by the camera's current binding, edition or
+    subscription, and never by a later Gateway retention change:
+    - 'cloud_gateway': the 7/14/30 days frozen on the row;
+    - 'full_vms_plan': the existing Full VMS chain, exactly as before;
+    - NULL (cataloged before attribution existed): Full VMS only when the
+      server recorded it strictly before the camera's first Cloud Gateway
+      binding (or the camera never had one). Anything else -- on/after a
+      binding, unparseable times, or the lookup unavailable -- is held.
+    """
+    policy, stored_days = row["retention_policy"], row["retention_days"]
+    if policy == CLOUD_GATEWAY_POLICY:
+        if isinstance(stored_days, bool) or not isinstance(stored_days, int) or stored_days not in GATEWAY_RETENTION_OPTIONS:
+            diagnostics["held_invalid_attribution"] += 1
+            return None
+        diagnostics["attributed_cloud_gateway"] += 1
+        return stored_days
+    if policy == FULL_VMS_POLICY:
+        if stored_days is not None:
+            diagnostics["held_invalid_attribution"] += 1
+            return None
+        diagnostics["attributed_full_vms"] += 1
+    elif policy is None and stored_days is None:
+        if first_binding is None:
+            diagnostics["held_historical_lookup_unavailable"] += 1
+            return None
+        first_at = first_binding.get(row["camera_id"])
+        if first_at is not None:
+            cataloged, bound = _parse_time(row["created_at"]), _parse_time(first_at)
+            if cataloged is None or bound is None or not cataloged < bound:
+                diagnostics["held_historical_ambiguous"] += 1
+                return None
+        diagnostics["historical_full_vms"] += 1
+    else:
+        diagnostics["held_invalid_attribution"] += 1
+        return None
+    customer_id = row["customer_id"]
+    if customer_id not in full_vms_cache:
+        full_vms_cache[customer_id] = _event_media_retention_days(db, customer_id)
+    if full_vms_cache[customer_id] is None:
+        diagnostics["held_no_retention"] += 1
+    return full_vms_cache[customer_id]
+
+
+def _expired_candidates(db, now: datetime, diagnostics: dict | None = None) -> list[dict]:
     """Every available recording whose customer has a real, on-file
     retention_days AND whose own started_at is older than that many
     days. Computed per-row in Python -- retention_days varies per
     customer, not expressible as a single static SQL WHERE clause --
     rather than a per-plan-tier UNION query.
+
+    event_media rows follow the policy recorded at capture time (see
+    _media_retention_days). The Cloud Gateway binding lookup is needed
+    only for historical, unattributed rows: if it fails, only those rows
+    are held; attributed Full VMS and Cloud Gateway rows keep expiring.
 
     event_media candidates are restricted to ROOT rows only
     (source_media_id IS NULL) -- see db_migrations.py's own comment on
@@ -108,12 +201,22 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
     -- see run_retention_sweep_tick() below, which deletes every row
     sharing a deleted root's own id in the SAME pass, only after that
     root's own S3 object is confirmed deleted."""
+    diagnostics = _new_diagnostics() if diagnostics is None else diagnostics
     candidates = []
-    rows = list(db.execute("SELECT id, customer_id, s3_key, started_at, 'recording' AS kind FROM recordings WHERE status='available'").fetchall())
-    rows += list(db.execute("SELECT id, customer_id, s3_key, started_at, 'event_media' AS kind FROM detection_event_media WHERE source_media_id IS NULL").fetchall())
-    for row in rows:
+    recordings = db.execute("SELECT id, customer_id, s3_key, started_at, 'recording' AS kind FROM recordings WHERE status='available'").fetchall()
+    media = db.execute("SELECT id, customer_id, camera_id, s3_key, started_at, created_at, retention_policy, retention_days, "
+                       "'event_media' AS kind FROM detection_event_media WHERE source_media_id IS NULL").fetchall()
+    first_binding = None
+    if any(row["retention_policy"] is None for row in media):
+        try:
+            first_binding = _first_gateway_binding_times(db)
+        except Exception as error:
+            diagnostics["gateway_lookup_error"] = f"{type(error).__name__}: {error}"[:300]
+            logger.exception("recording_retention.gateway_binding_lookup_failed")
+    full_vms_cache: dict = {}
+    for row in list(recordings) + list(media):
         if row["kind"] == "event_media":
-            retention_days = _event_media_retention_days(db, row["customer_id"])
+            retention_days = _media_retention_days(db, row, first_binding, full_vms_cache, diagnostics)
         else:  # continuous recordings: the legacy plan, unchanged
             retention_days = _customer_retention_days(db, row["customer_id"])
         if retention_days is None:
@@ -121,44 +224,171 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
         try:
             started_at = datetime.fromisoformat(row["started_at"])
         except (TypeError, ValueError):
+            diagnostics["held_bad_timestamp"] += 1
             continue  # unparseable timestamp -- never treated as expired
         if now - started_at > timedelta(days=retention_days):
-            candidates.append(dict(row))
+            candidates.append({key: row[key] for key in ("id", "customer_id", "s3_key", "started_at", "kind")})
     return candidates
+
+
+def _lifecycle_s3():
+    """(s3 client, bucket) through the dedicated delete-only STS role, or
+    None when unconfigured -- see docs/r5-recording-lifecycle-iam.md."""
+    role_arn = os.environ.get("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN", "").strip()
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
+    if not role_arn or not bucket or not region:
+        return None
+    try:
+        import boto3
+    except ImportError:
+        return None
+    sts = boto3.client("sts", region_name=region)
+    assumed = sts.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName=f"recording-lifecycle-{secrets.token_hex(6)}",
+        DurationSeconds=900,
+    )
+    creds = assumed["Credentials"]
+    s3 = boto3.client(
+        "s3", region_name=region,
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+    return s3, bucket
 
 
 def _delete_recording_object(s3_key: str) -> bool:
     """Deletes one S3 object via a dedicated, delete-only STS role.
     Fails closed (returns False, deletes nothing) whenever
     unconfigured -- see docs/r5-recording-lifecycle-iam.md."""
-    role_arn = os.environ.get("ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN", "").strip()
-    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
-    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
-    if not role_arn or not bucket or not region:
-        return False
     try:
-        import boto3
-    except ImportError:
-        return False
-    try:
-        sts = boto3.client("sts", region_name=region)
-        assumed = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=f"recording-lifecycle-{secrets.token_hex(6)}",
-            DurationSeconds=900,
-        )
-        creds = assumed["Credentials"]
-        s3 = boto3.client(
-            "s3", region_name=region,
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-        )
+        client = _lifecycle_s3()
+        if client is None:
+            return False
+        s3, bucket = client
         s3.delete_object(Bucket=bucket, Key=s3_key)
         return True
     except Exception:
         logger.exception("recording_retention.delete_failed")
         return False
+
+
+# ---------------------------------------------------------------- health
+# A configuration flag is not evidence that deletion works (Codex review
+# of 9ba528b). The worker records, in the database, a deletion probe that
+# really assumed the lifecycle role and called DeleteObject, and each
+# successful tick. Upload guards read that record, so every web process
+# sees the same evidence.
+HEALTH_TABLE = "recording_retention_sweep_health"
+PROBE_PREFIX = "recordings/_retention_probe/"
+PROBE_MAX_AGE = timedelta(hours=26)
+PROBE_INTERVAL = timedelta(hours=24)
+
+
+def worker_id() -> str:
+    import re
+    import socket
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", socket.gethostname())[:64] or "unknown-host"
+
+
+def probe_key(worker: str) -> str:
+    """A key under the recordings/ prefix the delete-only policy covers.
+    Nothing is ever uploaded there, so the probe deletes no customer data;
+    S3 answers DeleteObject on an absent key with success only when the
+    role, bucket, region and permission all work."""
+    return f"{PROBE_PREFIX}{worker}.probe"
+
+
+def run_deletion_probe(worker: str) -> tuple:
+    try:
+        client = _lifecycle_s3()
+        if client is None:
+            return False, "lifecycle role, bucket or region not configured"
+        s3, bucket = client
+        s3.delete_object(Bucket=bucket, Key=probe_key(worker))
+        return True, None
+    except Exception as error:
+        logger.exception("recording_retention.deletion_probe_failed")
+        return False, f"deletion probe failed: {type(error).__name__}"
+
+
+def tick_max_age() -> timedelta:
+    return timedelta(seconds=2 * RETENTION_SWEEP_INTERVAL_SECONDS + 600)
+
+
+def record_health(worker: str, *, now: datetime | None = None, started: bool = False, probe_ok: bool | None = None,
+                  tick_ok: bool | None = None, error: str | None = None, diagnostics: dict | None = None) -> None:
+    """Best effort: a failure here is logged, never raised into the worker."""
+    import json
+    stamp = (now or datetime.now()).isoformat()
+    try:
+        from partner_db import transaction
+        with transaction() as db:
+            row = db.execute(f"SELECT worker_id FROM {HEALTH_TABLE} WHERE worker_id=?", (worker,)).fetchone()
+            if row is None or started:
+                db.execute(f"DELETE FROM {HEALTH_TABLE} WHERE worker_id=?", (worker,))
+                db.execute(f"INSERT INTO {HEALTH_TABLE}(worker_id,started_at,updated_at) VALUES(?,?,?)", (worker, stamp, stamp))
+            if probe_ok is True:
+                db.execute(f"UPDATE {HEALTH_TABLE} SET last_probe_ok_at=? WHERE worker_id=?", (stamp, worker))
+            elif probe_ok is False:
+                db.execute(f"UPDATE {HEALTH_TABLE} SET last_probe_ok_at=NULL WHERE worker_id=?", (worker,))
+            if tick_ok is True:
+                db.execute(f"UPDATE {HEALTH_TABLE} SET last_tick_ok_at=? WHERE worker_id=?", (stamp, worker))
+            if error is not None:
+                db.execute(f"UPDATE {HEALTH_TABLE} SET last_error=?,last_error_at=? WHERE worker_id=?", (error[:300], stamp, worker))
+            if diagnostics is not None:
+                db.execute(f"UPDATE {HEALTH_TABLE} SET diagnostics_json=? WHERE worker_id=?",
+                           (json.dumps(diagnostics, sort_keys=True, default=str), worker))
+            db.execute(f"UPDATE {HEALTH_TABLE} SET updated_at=? WHERE worker_id=?", (stamp, worker))
+    except Exception:
+        logger.exception("recording_retention.health_record_failed")
+
+
+def operational_readiness(db, now: datetime | None = None) -> dict:
+    """Configuration (readiness()) AND evidence that a worker is really
+    deleting: some worker with a successful deletion probe within
+    PROBE_MAX_AGE and a successful tick within tick_max_age(). Read only;
+    no AWS call. Any error means not ready."""
+    now = now or datetime.now()
+    result = readiness()
+    missing = list(result["missing"])
+    try:
+        rows = db.execute(f"SELECT worker_id,last_probe_ok_at,last_tick_ok_at FROM {HEALTH_TABLE}").fetchall()
+    except Exception:
+        logger.exception("recording_retention.health_unavailable")
+        rows = None
+    healthy = None
+    if rows is None:
+        missing.append("retention worker health record unavailable")
+    else:
+        for row in rows:
+            probe, tick = _parse_time(row["last_probe_ok_at"]), _parse_time(row["last_tick_ok_at"])
+            if probe and tick and timedelta(0) <= now - probe <= PROBE_MAX_AGE and timedelta(0) <= now - tick <= tick_max_age():
+                healthy = row["worker_id"]
+                break
+        if healthy is None:
+            missing.append("a retention worker with a successful deletion probe (last 26 h) and sweep tick "
+                           f"(last {int(tick_max_age().total_seconds() // 60)} min)")
+    return {"ready": not missing, "missing": missing, "worker_id": healthy}
+
+
+def _report(diagnostics: dict) -> None:
+    """Monitoring: held rows and lookup failures are never silent."""
+    state = recording_retention_sweep_state
+    if diagnostics.get("gateway_lookup_error"):
+        state["gateway_lookup_failures_consecutive"] = state.get("gateway_lookup_failures_consecutive", 0) + 1
+    else:
+        state["gateway_lookup_failures_consecutive"] = 0
+    state["last_diagnostics"] = diagnostics
+    held = {key: value for key, value in diagnostics.items() if key.startswith("held_") and value}
+    failures = state["gateway_lookup_failures_consecutive"]
+    if failures >= LOOKUP_FAILURE_ALERT_TICKS:
+        logger.critical("recording_retention.historical_media_expiry_blocked consecutive_lookup_failures=%s held=%s error=%s",
+                        failures, held, diagnostics.get("gateway_lookup_error"))
+    elif held:
+        logger.warning("recording_retention.media_held held=%s lookup_error=%s", held, diagnostics.get("gateway_lookup_error"))
 
 
 def run_retention_sweep_tick(now: datetime | None = None) -> dict:
@@ -168,10 +398,12 @@ def run_retention_sweep_tick(now: datetime | None = None) -> dict:
     existing per-item transaction granularity (see
     live_relay_idle_sweep.py's own run_idle_sweep_tick())."""
     now = now or datetime.now()
+    diagnostics = _new_diagnostics()
     with connection() as db:
-        candidates = _expired_candidates(db, now)
+        candidates = _expired_candidates(db, now, diagnostics)
 
     deleted = 0
+    delete_failures = 0
     for candidate in candidates:
         if not _delete_recording_object(candidate["s3_key"]):
             # S3 deletion not confirmed -- leave every DB record (this
@@ -179,6 +411,7 @@ def run_retention_sweep_tick(now: datetime | None = None) -> dict:
             # completely untouched. The next tick retries from the same
             # state; a database record must never be removed ahead of
             # its own confirmed physical deletion.
+            delete_failures += 1
             continue
         with connection() as db:
             table = "recordings" if candidate["kind"] == "recording" else "detection_event_media"
@@ -198,15 +431,19 @@ def run_retention_sweep_tick(now: datetime | None = None) -> dict:
             "recording_retention.deleted recording_id=%s customer_id=%s",
             candidate["id"], candidate["customer_id"],
         )
+    diagnostics["delete_failures"] = delete_failures
     recording_retention_sweep_state["last_deleted_count"] = deleted
-    return {"checked": len(candidates), "deleted": deleted}
+    _report(diagnostics)
+    return {"checked": len(candidates), "deleted": deleted}  # diagnostics: state["last_diagnostics"]
 
 
 def readiness() -> dict:
-    """Whether this host is configured to actually enforce cloud retention
-    (Hybrid's 14-day event retention included) -- configuration only, no
-    AWS call. Everything listed in "missing" must be set on the cloud host;
-    see docs/hybrid-event-retention-staging-checklist.md."""
+    """Whether this host is CONFIGURED to enforce cloud retention (Hybrid's
+    14-day event retention included) -- configuration only, no AWS call.
+    Configuration alone does not prove deletion works; Cloud Gateway
+    uploads require operational_readiness(). Everything listed in
+    "missing" must be set on the cloud host; see
+    docs/hybrid-event-retention-staging-checklist.md."""
     import re
     missing = []
     if RUNTIME_ROLE not in {"cloud", "combined"}:
@@ -227,6 +464,32 @@ def readiness() -> dict:
     return {"ready": not missing, "missing": missing}
 
 
+def worker_iteration(worker: str, last_probe_at: datetime | None, now: datetime | None = None) -> datetime | None:
+    """One worker step (synchronous, testable): re-probe when due, then
+    sweep only after a successful probe. Returns the last probe time."""
+    now = now or datetime.now()
+    if last_probe_at is None or now - last_probe_at >= PROBE_INTERVAL:
+        ok, error = run_deletion_probe(worker)
+        record_health(worker, now=now, probe_ok=ok, error=error)
+        if not ok:
+            recording_retention_sweep_state["last_error"] = error
+            logger.error("recording_retention.not_enforced reason=%s", error)
+            return None
+        last_probe_at = now
+    try:
+        run_retention_sweep_tick(now)
+    except Exception as error:
+        message = f"{type(error).__name__}: {error}"[:300]
+        recording_retention_sweep_state["last_error"] = message
+        record_health(worker, now=now, error=message)
+        logger.warning("recording_retention.worker_iteration_failed error=%s", message)
+        return last_probe_at
+    recording_retention_sweep_state["last_tick_at"] = now.isoformat()
+    recording_retention_sweep_state["last_error"] = None
+    record_health(worker, now=now, tick_ok=True, diagnostics=recording_retention_sweep_state.get("last_diagnostics"))
+    return last_probe_at
+
+
 async def recording_retention_sweep_worker() -> None:
     ready = readiness()
     recording_retention_sweep_state["readiness"] = ready
@@ -238,13 +501,14 @@ async def recording_retention_sweep_worker() -> None:
         recording_retention_sweep_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)
+    worker = worker_id()
+    await asyncio.to_thread(record_health, worker, started=True)
     recording_retention_sweep_state["worker_status"] = "running"
-    logger.info("recording_retention.worker_started")
+    logger.info("recording_retention.worker_started worker_id=%s", worker)
+    last_probe_at = None
     while True:
         try:
-            await asyncio.to_thread(run_retention_sweep_tick)
-            recording_retention_sweep_state["last_tick_at"] = datetime.now().isoformat()
-            recording_retention_sweep_state["last_error"] = None
+            last_probe_at = await asyncio.to_thread(worker_iteration, worker, last_probe_at)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -253,13 +517,40 @@ async def recording_retention_sweep_worker() -> None:
         await asyncio.sleep(RETENTION_SWEEP_INTERVAL_SECONDS)
 
 
+def diagnostics_report(now: datetime | None = None) -> dict:
+    """Read-only operator view: configuration, worker health records and
+    what the next sweep would hold (no deletion, no AWS call)."""
+    import json
+    now = now or datetime.now()
+    with connection() as db:
+        report = {"operational": operational_readiness(db, now)}
+        try:
+            report["workers"] = [dict(row) for row in db.execute(f"SELECT * FROM {HEALTH_TABLE}").fetchall()]
+            for worker in report["workers"]:
+                raw = worker.pop("diagnostics_json", None)
+                if raw:
+                    worker["diagnostics"] = json.loads(raw)
+        except Exception as error:
+            report["workers"] = f"unavailable: {type(error).__name__}"
+        diagnostics = _new_diagnostics()
+        report["would_delete"] = len(_expired_candidates(db, now, diagnostics))
+        report["classification"] = diagnostics
+    return report
+
+
 if __name__ == "__main__":
-    # Staging/production check, no AWS call: python -m recording_retention_sweep --check
+    # Staging/production checks, no AWS call:
+    #   python -m recording_retention_sweep --check        configuration only
+    #   python -m recording_retention_sweep --diagnostics  health + held rows
     import json
     import sys
     if sys.argv[1:] == ["--check"]:
         result = readiness()
         print(json.dumps(result, indent=2))
         raise SystemExit(0 if result["ready"] else 1)
-    print("usage: python -m recording_retention_sweep --check")
+    if sys.argv[1:] == ["--diagnostics"]:
+        result = diagnostics_report()
+        print(json.dumps(result, indent=2, default=str))
+        raise SystemExit(0 if result["operational"]["ready"] else 1)
+    print("usage: python -m recording_retention_sweep --check | --diagnostics")
     raise SystemExit(2)

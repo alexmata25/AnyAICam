@@ -131,12 +131,15 @@ def _control_plane_headers(appliance_id: str, credential: str) -> dict:
 def _control_plane_get(path: str, appliance_id: str, credential: str) -> dict | None:
     if not CLOUD_URL:
         return None
-    request = urllib.request.Request(
-        CLOUD_URL + path, headers=_control_plane_headers(appliance_id, credential), method="GET"
-    )
+    headers = _control_plane_headers(appliance_id, credential)
+    request = urllib.request.Request(CLOUD_URL + path, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read().decode() or "{}")
+            data = json.loads(response.read().decode() or "{}")
+            if path == "/api/appliance/configuration" and isinstance(data, dict):
+                # Local-only trusted context: never take this value from the response.
+                data["_local_gateway_request_nonce"] = headers["X-Request-Nonce"]
+            return data
     except urllib.error.HTTPError as error:
         logger.warning("edge_camera_sync.control_plane_http_error path=%s status=%s", path, error.code)
         return None
@@ -408,7 +411,7 @@ def sync_provisioned_cameras() -> dict:
     # for the caller that this process needs a restart to pick up the
     # new mode's flag defaults (see product_mode.resolve_cloud_flag()),
     # since every governed flag is still read once at import time.
-    restart_required = product_mode.persist_mode(str(response.get("product_mode") or ""))
+    restart_required = product_mode.apply_configuration_mode(response)
     # Licensed camera capacity (2026-10-01, vms_capacity.py): camera plan AND
     # VMS license, kept so it keeps applying offline. Since 2026-10-09 only a
     # capacity inside the cloud-signed snapshot is accepted (the unsigned

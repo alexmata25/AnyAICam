@@ -15,6 +15,16 @@ $b = Get-Content -Raw -LiteralPath $Before | ConvertFrom-Json
 $a = Get-Content -Raw -LiteralPath $After | ConvertFrom-Json
 $result = New-AcceptanceResult "A6-lifecycle-$($Step.ToLowerInvariant())" $Step
 if (-not $OutputPath) { $OutputPath = [IO.Path]::ChangeExtension($After, ".compare-$($Step.ToLowerInvariant()).json") }
+foreach ($field in 'computer', 'install_root', 'data_root') {
+    if ([string]::IsNullOrWhiteSpace([string]$b.$field) -or [string]::IsNullOrWhiteSpace([string]$a.$field)) {
+        $final = Complete-AcceptanceResult $result $OutputPath 'snapshot target identity is incomplete; take new snapshots with the current collector'
+        "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+    }
+    if ([string]$b.$field -ine [string]$a.$field) {
+        $final = Complete-AcceptanceResult $result $OutputPath "snapshots describe different targets ($field)"
+        "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+    }
+}
 if (-not $b.data.readable -or -not $a.data.readable) {
     $final = Complete-AcceptanceResult $result $OutputPath 'a snapshot could not read the data folder (take snapshots elevated)'
     "A6 BLOCKED: $($final.blocked_reason)"; exit 2
@@ -22,10 +32,35 @@ if (-not $b.data.readable -or -not $a.data.readable) {
 function Props($o) { if ($null -eq $o) { return @{} }; $h = @{}; foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value }; return $h }
 function Check([string]$Name, [bool]$Passed, [string]$Detail = '') { Add-AcceptanceCheck $result $Name $Passed $Detail }
 
+# The collector uses this sentinel for existing files it cannot hash. Never
+# mistake matching sentinels, or a truthy sentinel, for installed-file evidence.
+$unreadable = $false
+if ($Step -eq 'Repair') {
+    $beforeScripts = Props $b.scripts; $afterScripts = Props $a.scripts
+    $unreadable = @($beforeScripts.Values + $afterScripts.Values | Where-Object { $_ -eq 'unreadable' }).Count -gt 0
+    $unreadable = $unreadable -or $b.tesseract_manifest -eq 'unreadable'
+}
+if ($Step -in @('Upgrade', 'Repair')) {
+    $unreadable = $unreadable -or $a.tesseract_manifest -eq 'unreadable' -or $a.runtime_catalog -eq 'unreadable'
+}
+if ($unreadable) {
+    $final = Complete-AcceptanceResult $result $OutputPath 'a required installed file could not be hashed (take new snapshots with sufficient access)'
+    "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+}
+
 # Customer data must survive every step, uninstall included (the .iss marks ProgramData folders uninsneveruninstall).
 $bi = Props $b.data.identity_sha256; $ai = Props $a.data.identity_sha256
+if (@($bi.Values + $ai.Values | Where-Object { $_ -eq 'unreadable' }).Count -gt 0) {
+    $final = Complete-AcceptanceResult $result $OutputPath 'an identity file could not be hashed (take snapshots elevated and resolve file access)'
+    "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+}
 foreach ($k in $bi.Keys) { Check "identity file unchanged: $k" ($ai[$k] -eq $bi[$k]) "" }
+if ($null -eq $b.data.recordings.bytes -or $null -eq $a.data.recordings.bytes) {
+    $final = Complete-AcceptanceResult $result $OutputPath 'recording byte totals are missing; take new snapshots with the current collector'
+    "A6 BLOCKED: $($final.blocked_reason)"; exit 2
+}
 Check 'recordings kept (count not lower)' ($a.data.recordings.count -ge $b.data.recordings.count) "$($b.data.recordings.count) -> $($a.data.recordings.count)"
+Check 'recordings kept (bytes not lower)' ($a.data.recordings.bytes -ge $b.data.recordings.bytes) "$($b.data.recordings.bytes) -> $($a.data.recordings.bytes)"
 Check 'database kept' ($null -eq $b.data.database -or $null -ne $a.data.database) ''
 $missingKeys = @($b.data.vms_env_keys | Where-Object { @($a.data.vms_env_keys) -notcontains $_ })
 Check 'vms.env keeps every key' ($null -eq $b.data.vms_env_keys -or $missingKeys.Count -eq 0) "missing: $($missingKeys -join ', ')"

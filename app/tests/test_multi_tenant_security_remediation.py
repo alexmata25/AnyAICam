@@ -166,6 +166,17 @@ def _cookie(email, role, partner_id=None, customer_id=None):
     return {partner_portal.SESSION_COOKIE: partner_portal._token(email, role, partner_id, customer_id, session_id)}
 
 
+def _global_admin_cookie(db_path):
+    """A REAL, MFA-verified session for the seeded global administrator.
+    Linux 1.2.7.1 refuses session-less administrator tokens (see conftest.py),
+    so the positive cross-tenant tests must sign in this way to exercise the
+    identity_grants global-scope check rather than the session refusal."""
+    from authz_helpers import partner_session_cookie
+    with _db(db_path):
+        token = partner_session_cookie("global-admin@example.test", "administrator")
+    return {partner_portal.SESSION_COOKIE: token}
+
+
 def _seed_two_tenants(conn):
     # 'anyaicam-primary' is this codebase's own established single-
     # tenant fallback partner_id (identity.get('partner_id') or
@@ -274,7 +285,7 @@ def test_invite_global_administrator_can_invite_across_tenants(client, db_path):
     response = client.post(
         "/api/partner/users/invite",
         json={"role": "customer_owner", "email": "support-created@example.test", "customer_id": "cust-b"},
-        cookies=_cookie("global-admin@example.test", "administrator", None),
+        cookies=_global_admin_cookie(db_path),
     )
     assert response.status_code == 200, response.text
 
@@ -356,7 +367,7 @@ def test_queue_command_global_administrator_succeeds_across_tenants(client, db_p
     response = client.post(
         "/api/partner/appliances/appl-b/commands",
         json={"command": "run_diagnostics", "confirmed": True},
-        cookies=_cookie("global-admin@example.test", "administrator", None),
+        cookies=_global_admin_cookie(db_path),
     )
     assert response.status_code == 200, response.text
 
@@ -451,7 +462,7 @@ def test_activation_token_global_administrator_succeeds_across_tenants(client, d
         with connection() as db:
             _seed_two_tenants(db)
 
-    response = client.post("/api/partner/appliances/appl-b/activation-token", cookies=_cookie("global-admin@example.test", "administrator", None))
+    response = client.post("/api/partner/appliances/appl-b/activation-token", cookies=_global_admin_cookie(db_path))
     assert response.status_code == 200, response.text
 
 
@@ -539,7 +550,7 @@ def test_change_plan_global_administrator_succeeds_across_tenants(client, db_pat
         with connection() as db:
             _seed_two_tenants(db)
 
-    response = client.put("/api/partner/customers/cust-b/plan", json=_quote_payload(), cookies=_cookie("global-admin@example.test", "administrator", None))
+    response = client.put("/api/partner/customers/cust-b/plan", json=_quote_payload(), cookies=_global_admin_cookie(db_path))
     assert response.status_code == 200, response.text
 
 

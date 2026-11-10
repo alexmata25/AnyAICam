@@ -21,6 +21,9 @@ if (Test-Path -LiteralPath $environmentFile) {
     }
 }
 
+# Validate before folders, stale-process cleanup or job limits are touched.
+. (Join-Path $installRoot 'installer\gateway-edition.ps1')
+Assert-GatewayRuntimeConfiguration $env:ANYAICAM_GATEWAY_EDITION $env:ANYAICAM_RUNTIME_ROLE
 $env:ANYAICAM_STATIC_FOLDER = Join-Path $installRoot 'app\static'
 $env:ANYAICAM_RECORDINGS_FOLDER = Join-Path $dataRoot 'recordings'
 $env:ANYAICAM_HLS_FOLDER = Join-Path $dataRoot 'hls'

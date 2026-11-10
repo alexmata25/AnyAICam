@@ -1286,7 +1286,8 @@ CLOUDFRONT_URL = os.environ.get("ANYAICAM_CLOUDFRONT_URL", "").strip().rstrip("/
 
 
 
-CLOUD_UPLOAD_ENABLED = os.environ.get("ANYAICAM_CLOUD_UPLOAD_ENABLED", "false").lower() == "true"
+from gateway_edition import video_transport_allowed as _edition_video_transport_allowed
+CLOUD_UPLOAD_ENABLED = os.environ.get("ANYAICAM_CLOUD_UPLOAD_ENABLED", "false").lower() == "true" and _edition_video_transport_allowed("backup")
 
 
 
@@ -14035,6 +14036,8 @@ def cloud_recording_s3_key(path: Path, camera_number: int | None) -> str:
 
 
 def enqueue_cloud_upload(path: Path, camera_number: int | None = None) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise PermissionError("This edition does not allow recording backup queues")
 
 
 
@@ -14647,6 +14650,9 @@ def scan_recordings_for_cloud_upload() -> int:
 
 
 def upload_cloud_recording_job(job: dict) -> dict:
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("backup"):
+        raise PermissionError("This edition does not allow cloud recording backup")
 
 
 
@@ -22384,165 +22390,30 @@ def update_license_from_stripe_subscription(
 
 
 def record_stripe_webhook_event(event: dict) -> bool:
-
-
-
-
-
-
-
-
+    """Serialize the legacy JSON log across webhook workers; never erase corrupt history."""
     event_id = str(event.get("id") or "")
-
-
-
-
-
-
-
-
     if not event_id:
-
-
-
-
-
-
-
-
         return False
-
-
-
-
-
-
-
-
-    events = load_payment_webhook_events()
-
-
-
-
-
-
-
-
-    if event_id in events:
-
-
-
-
-
-
-
-
-        return False
-
-
-
-
-
-
-
-
-    events[event_id] = {
-
-
-
-
-
-
-
-
-        "id": event_id,
-
-
-
-
-
-
-
-
-        "type": event.get("type"),
-
-
-
-
-
-
-
-
-        "created": event.get("created"),
-
-
-
-
-
-
-
-
-        "received_at": datetime.now().isoformat(),
-
-
-
-
-
-
-
-
-        "livemode": bool(event.get("livemode")),
-
-
-
-
-
-
-
-
-    }
-
-
-
-
-
-
-
-
-    save_payment_webhook_events(events)
-
-
-
-
-
-
-
-
-    return True
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    from partner_db import transaction
+    from billing_status import lock_payment
+    # This lock is held only for the JSON update, before any payment locks or
+    # provisioning steps, so it does not change payment-lock acquisition order.
+    with transaction() as db:
+        lock_payment(db, ["webhook-event-log"])
+        if PAYMENT_WEBHOOK_EVENTS_FILE.exists():
+            events = json.loads(PAYMENT_WEBHOOK_EVENTS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(events, dict):
+                raise ValueError("Stripe webhook event log is not an object")
+        else:
+            events = {}
+        if event_id in events:
+            return False
+        events[event_id] = {
+            "id": event_id, "type": event.get("type"), "created": event.get("created"),
+            "received_at": datetime.now().isoformat(), "livemode": bool(event.get("livemode")),
+        }
+        save_payment_webhook_events(events)
+        return True
 
 
 def process_stripe_webhook_event(event: dict) -> None:
@@ -35998,6 +35869,11 @@ def append_in_app_alert(alert: dict) -> None:
 
 
 
+    try:
+        from gateway_notifications import publish_local_motion
+        publish_local_motion(alert)
+    except Exception as error:
+        structured_log("gateway.local_notification_failed", error_type=type(error).__name__)
     dispatch_external_notifications(alert)
 
 
@@ -39396,6 +39272,9 @@ def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime,
 
 
 def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms" and not effective_analytics(recording_uploader._camera_identity(camera_number), camera_number):
+        return []  # revoked/expired inference must not create thumbnails or events
 
 
 
@@ -41186,6 +41065,12 @@ def effective_analytics(identity, camera_number: int, flags=AI_DETECTOR_ANALYTIC
     """The analytics actually active on this camera: camera flag AND appliance-wide switch. Never raises."""
     if not identity:
         return []
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms":
+        try:
+            identity = recording_uploader._entitled_identity(identity)
+        except Exception:
+            return []
     active = []
     for flag in flags:
         try:
@@ -42709,6 +42594,18 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # Both hard-coded readiness stops remain false until isolated acceptance.
+    import cloud_gateway_subscription_refresh
+    import cloud_gateway_subscription_evidence
+    import cloud_gateway_camera_entitlements
+    cloud_gateway_refresh_task = (
+        asyncio.create_task(cloud_gateway_subscription_refresh.refresh_worker())
+        if RUNTIME_ROLE in {"cloud", "combined"}
+        and cloud_gateway_subscription_refresh.REFRESH_WORKER_READY
+        and cloud_gateway_subscription_evidence.WEBHOOK_PRODUCER_READY
+        and cloud_gateway_camera_entitlements.CLOUD_GATEWAY_BILLING_SOURCE_READY
+        else None
+    )
     # Daily read-only AWS cost snapshot collection (aws_cost_collection_scheduler.py):
     # cloud runtime only (never edge/combined appliances) and only with both
     # ANYAICAM_COST_SNAPSHOT_COLLECTOR_ENABLED and ANYAICAM_COST_DASHBOARD_AWS_READ_ENABLED
@@ -43597,6 +43494,9 @@ async def maintenance_mode_middleware(request: Request, call_next):
     # Health and readiness endpoints use this middleware too. Keep filesystem
     # latency off the ASGI event loop so a slow recordings/config mount cannot
     # stall every request.
+    from product_mode import gateway_tunnel_request_denied
+    if request.client and gateway_tunnel_request_denied(request.client.host):
+        return JSONResponse(status_code=403, content={"detail": "Remote access is not active for this Gateway."})
     state = await asyncio.to_thread(load_maintenance_state)
 
 
@@ -50764,6 +50664,8 @@ def _aaco_enabled_for(user) -> bool:
 
 
 def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
+    from gateway_edition import edition_notice_html
+    content = edition_notice_html() + content
 
 
 
@@ -51485,6 +51387,10 @@ from customer_billing import register_customer_billing_routes
 register_customer_billing_routes(app)
 from per_camera_billing import register_routes as register_per_camera_billing_routes
 register_per_camera_billing_routes(app)
+
+# Disabled by default until verified-webhook and entitlement integration passes acceptance.
+from local_gateway_remote_billing import register_routes as register_local_gateway_remote_routes
+register_local_gateway_remote_routes(app)
 from order_funnel import register_order_funnel_routes
 register_order_funnel_routes(app)
 from build_orders import register_build_order_routes
@@ -51575,6 +51481,9 @@ register_appliance_cloud_routes(app, page_shell, current_user)
 # before or after this line (no /customer/{...} wildcard exists
 # anywhere in this codebase).
 register_appliance_claim_routes(app, page_shell)
+# Cloud Gateway event-clip retention (14-day default, 7/30 options).
+from cloud_gateway_retention import register_cloud_gateway_retention_routes
+register_cloud_gateway_retention_routes(app)
 # Users & household (2026-10-01): owner-managed household members with
 # their own sign-in, single-use invitation links and per-person permissions.
 from household_users import register_household_routes
@@ -57721,10 +57630,10 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
 
     Scoping mirrors _customer_detection_events() exactly: customer_owner
     sees every notification for their own customer_id; customer_viewer
-    is restricted to cameras they hold can_playback=1 on (reusing that
-    existing permission, same smallest-change reasoning), and never
-    sees a camera-less system alert (no camera to check permission
-    against). camera_number optionally narrows to one camera -- used by
+    sees their own rows for can_alerts-granted cameras, or all cameras
+    when their stored access mode is 'all' and no permission rows exist,
+    matching fanout_appliance_event. Viewers never see camera-less system
+    alerts. camera_number optionally narrows to one camera -- used by
     the focused Live View's own Smart Alerts panel, resolved server-side
     from the authenticated identity's own fleet, never trusted from a
     request parameter."""
@@ -57779,7 +57688,7 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
             ).fetchall()
         else:
             user = db.execute(
-                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                'SELECT id,camera_access_mode FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
                 (identity.get("email", ""), identity.get("customer_id")),
             ).fetchone()
             if not user:
@@ -57802,11 +57711,18 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
             # and every other viewer's, not just their own -- because
             # fanout_appliance_event() inserts one independent row per
             # recipient. Both close the same class of gap this phase's
-            # own audit exists to find.
+            # own audit exists to find. Match fanout_appliance_event's
+            # existing all-mode exception only when the viewer has NO
+            # explicit permission rows. Once rows exist, can_alerts decides;
+            # an explicit denial cannot be bypassed by the all-mode setting.
             rows = db.execute(
-                select + 'JOIN customer_camera_permissions p ON p.camera_id = n.camera_id AND p.user_id = ? AND p.can_alerts = 1 '
-                f'WHERE n.customer_id = ? {camera_filter}{inbox_filter}AND n.user_id = ? ORDER BY n.timestamp DESC LIMIT ?',
-                (user["id"], *params, user["id"], limit),
+                select + f'WHERE n.customer_id = ? {camera_filter}{inbox_filter}AND n.user_id = ? '
+                'AND n.camera_id IS NOT NULL AND ('
+                'EXISTS (SELECT 1 FROM customer_camera_permissions p '
+                'WHERE p.camera_id=n.camera_id AND p.user_id=? AND p.can_alerts=1) '
+                "OR (?='all' AND NOT EXISTS (SELECT 1 FROM customer_camera_permissions p WHERE p.user_id=?))) "
+                'ORDER BY n.timestamp DESC LIMIT ?',
+                (*params, user["id"], user["id"], user["camera_access_mode"] or 'selected', user["id"], limit),
             ).fetchall()
     return [
         {
@@ -116398,6 +116314,15 @@ async def stripe_webhook(request: Request) -> dict:
     event_id = str(event.get("id") or "")
     if not event_id:
         raise HTTPException(status_code=400, detail="Webhook event has no id.")
+    # Persist a step-table marker before adding a new event to the legacy JSON
+    # log. Otherwise a crash between that log write and the first step claim
+    # makes the redelivery indistinguishable from a pre-step-tracking event.
+    # Events already present without step rows retain their legacy behavior.
+    if event_id not in load_payment_webhook_events():
+        marker = "__dispatch_seen_marker_v1"
+        marker_claim, marker_attempt = _claim_stripe_webhook_step(event_id, marker, return_attempt=True)
+        if marker_claim == "claimed":
+            _finish_stripe_webhook_step(event_id, marker, "completed", attempt=marker_attempt)
     is_new_event = record_stripe_webhook_event(event)
     if not is_new_event and not _stripe_webhook_has_step_rows(event_id):
         # Recorded by the handler that predates per-step tracking, which
@@ -116407,15 +116332,15 @@ async def stripe_webhook(request: Request) -> dict:
 
     outcomes: dict[str, str] = {}
     for step_name, run_step in _stripe_webhook_steps():
-        claim = _claim_stripe_webhook_step(event_id, step_name)
+        claim, attempt = _claim_stripe_webhook_step(event_id, step_name, return_attempt=True)
         if claim != "claimed":
             outcomes[step_name] = claim
             continue
         try:
             run_step(event)
         except Exception as error:
-            _finish_stripe_webhook_step(event_id, step_name, "failed", error=str(error)[:500])
-            outcomes[step_name] = "failed"
+            finished = _finish_stripe_webhook_step(event_id, step_name, "failed", error=str(error)[:500], attempt=attempt)
+            outcomes[step_name] = "failed" if finished else "busy"
             structured_log(
                 "provisioning.webhook_step_failed",
                 level="error",
@@ -116424,8 +116349,8 @@ async def stripe_webhook(request: Request) -> dict:
                 step=step_name,
             )
             continue
-        _finish_stripe_webhook_step(event_id, step_name, "completed")
-        outcomes[step_name] = "completed"
+        finished = _finish_stripe_webhook_step(event_id, step_name, "completed", attempt=attempt)
+        outcomes[step_name] = "completed" if finished else "busy"
 
     # Best-effort and already idempotent per (event, notification type) --
     # never the reason Stripe retries.
@@ -116555,6 +116480,18 @@ def _stripe_webhook_steps() -> list:
         # Grace after failed payments, refunds and disputes (2026-10-02).
         from billing_status import sync_from_stripe_event
         sync_from_stripe_event(event)
+    def local_gateway_remote(event):
+        # Dispatched only after the existing webhook verifies the signature.
+        from local_gateway_remote_billing import sync_from_verified_webhook
+        sync_from_verified_webhook(event)
+    def gateway_checkout_attempts(event):
+        from gateway_checkout_webhook import sync_from_verified_webhook
+        sync_from_verified_webhook(event)
+    def cloud_gateway_billing(event):
+        # This step is inside the existing signature-verified dispatcher;
+        # Cloud Gateway activation remains hard-disabled pending acceptance.
+        from cloud_gateway_subscription_evidence import sync_from_verified_webhook
+        sync_from_verified_webhook(event)
     def storage_trials(event):
         # 30-day free storage trial (2026-10-15): trial records follow Stripe,
         # and a new trial subscription is set to end at the trial end.
@@ -116575,6 +116512,9 @@ def _stripe_webhook_steps() -> list:
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),
         ("billing_status", billing),
+        ("gateway_checkout_attempts", gateway_checkout_attempts),
+        ("cloud_gateway_billing", cloud_gateway_billing),
+        ("local_gateway_remote", local_gateway_remote),
         ("storage_trials", storage_trials),
         ("checkout_sessions", checkout_sessions),
     ]
@@ -116586,7 +116526,7 @@ def _stripe_webhook_has_step_rows(event_id: str) -> bool:
         return db.execute("SELECT 1 FROM stripe_webhook_steps WHERE event_id=? LIMIT 1", (event_id,)).fetchone() is not None
 
 
-def _claim_stripe_webhook_step(event_id: str, step: str) -> str:
+def _claim_stripe_webhook_step(event_id: str, step: str, *, return_attempt: bool = False):
     """'claimed' -- this delivery runs the step (new, previously failed, or
     stale); 'already_completed'; or 'busy' -- another delivery is running
     it right now. Atomic via the (event_id, step) primary key."""
@@ -116603,20 +116543,26 @@ def _claim_stripe_webhook_step(event_id: str, step: str) -> str:
             (event_id, step, now.isoformat(), stale_before),
         ).rowcount
         if claimed:
+            if return_attempt:
+                attempt = db.execute("SELECT attempts FROM stripe_webhook_steps WHERE event_id=? AND step=?", (event_id, step)).fetchone()["attempts"]
+                return "claimed", attempt
             return "claimed"
         existing = db.execute(
             "SELECT status FROM stripe_webhook_steps WHERE event_id=? AND step=?", (event_id, step),
         ).fetchone()
-    return "already_completed" if existing and existing["status"] == "completed" else "busy"
+    state = "already_completed" if existing and existing["status"] == "completed" else "busy"
+    return (state, None) if return_attempt else state
 
 
-def _finish_stripe_webhook_step(event_id: str, step: str, status: str, *, error: str | None = None) -> None:
+def _finish_stripe_webhook_step(event_id: str, step: str, status: str, *, error: str | None = None, attempt: int | None = None) -> bool:
     from partner_db import connection
     with connection() as db:
-        db.execute(
-            "UPDATE stripe_webhook_steps SET status=?,last_error=?,updated_at=? WHERE event_id=? AND step=?",
-            (status, error, datetime.now().isoformat(), event_id, step),
-        )
+        query = "UPDATE stripe_webhook_steps SET status=?,last_error=?,updated_at=? WHERE event_id=? AND step=?"
+        args = (status, error, datetime.now().isoformat(), event_id, step)
+        if attempt is not None:
+            query += " AND status='running' AND attempts=?"
+            args += (attempt,)
+        return bool(db.execute(query, args).rowcount)
 
 
 @app.get("/payment-setup", response_class=HTMLResponse)
@@ -121282,6 +121228,8 @@ def cloud_recording_api(request: Request) -> dict:
 
 
 def cloud_recording_scan(request: Request) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise HTTPException(status_code=403, detail="Recording backup uploads are unavailable in this edition.")
 
 
 
@@ -121372,6 +121320,8 @@ def cloud_recording_scan(request: Request) -> dict:
 
 
 def cloud_recording_queue_file(payload: CloudUploadQueueModel, request: Request) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise HTTPException(status_code=403, detail="Recording backup uploads are unavailable in this edition.")
 
 
 
@@ -121525,6 +121475,8 @@ def cloud_recording_queue_file(payload: CloudUploadQueueModel, request: Request)
 
 
 def cloud_recording_retry(payload: CloudUploadRetryModel, request: Request) -> dict:
+    if not _edition_video_transport_allowed("backup"):
+        raise HTTPException(status_code=403, detail="Recording backup uploads are unavailable in this edition.")
 
 
 
@@ -121704,6 +121656,9 @@ def cloud_recording_page(request: Request) -> str:
 
 
 
+    if not _edition_video_transport_allowed("backup"):
+        from gateway_edition import cloud_recording_page_html
+        return page_shell("Cloud video", "cloud-recording", cloud_recording_page_html())
     content = """<header class="topbar"><div><p class="eyebrow">Amazon S3</p><h1>Cloud recording</h1></div></header>
 
 
@@ -124055,6 +124010,15 @@ def _customer_alert_text(notification: dict) -> tuple[str, str]:
     return title, message
 
 
+def _customer_notification_playback_href(notification: dict) -> str | None:
+    if notification.get("event_id") and notification.get("has_event_clip"):
+        return _customer_event_playback_href(notification.get("camera_id"), notification.get("timestamp"), notification.get("event_id"), True)
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms" and notification.get("camera_id") and notification.get("timestamp"):
+        return _customer_event_playback_href(notification["camera_id"], notification["timestamp"])
+    return None
+
+
 def _render_customer_alerts(request: Request) -> str:
     """Smart Alerts: the customer's attention inbox (smart_alerts.py) --
     grouped, filterable, with actions on each card and active INTRUSION
@@ -124084,11 +124048,7 @@ def _render_customer_alerts(request: Request) -> str:
             }
 
     def clip_href(notification: dict):
-        if notification.get("event_id") and notification.get("has_event_clip"):
-            return _customer_event_playback_href(
-                notification.get("camera_id"), notification.get("timestamp"), notification.get("event_id"), True,
-            )
-        return None
+        return _customer_notification_playback_href(notification)
 
     content, scripts = smart_alerts.render_inbox(
         groups, view=view, tz=APPLIANCE_TIMEZONE, alert_text=_customer_alert_text,
@@ -143452,6 +143412,10 @@ def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
         ).fetchone()
     if not row:
         return None
+    from gateway_edition import current_edition
+    if current_edition() != "full_vms" and row["camera_number"] is not None:
+        if _customer_local_recording_path(row["s3_key"], row["camera_number"]) is not None:
+            return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
     cloud_url = _presigned_recording_url(row["s3_key"])
     if cloud_url:
         return cloud_url
@@ -143919,6 +143883,9 @@ def customer_event_media_download(camera_id: str, event_id: str, request: Reques
 
 @app.get("/api/appliance/media-fetch")
 def appliance_media_fetch_endpoint(path: str, expires: int, token: str):
+    from product_mode import remote_access_authorized
+    if not remote_access_authorized():
+        raise HTTPException(status_code=403, detail="Remote access is not active for this Gateway.")
     """The appliance-side half of customer_event_media_direct()'s
     authenticated fetch (2026-09-19) -- runs identically whether this
     process is the cloud portal or a real edge appliance, but is only

@@ -1475,6 +1475,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
                           "else{const s=document.querySelector('#v2-activating p');if(s)s.textContent='Activation is taking longer than usual. Refresh this page in a minute, or contact AnyAiCam support if your plan does not appear.'}")
     else:
         scripts_focus += "try{sessionStorage.removeItem('v2ActivationTries')}catch(e){}"
+    import local_gateway_customer_ui
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     {payment_alert}{activating}{setup_next}{picker if not activated else ""}
     <section class="panel"><h2>Current plan</h2><p id="v2-plan-summary">{plan_summary}</p>{current_html}{trial_note}{billing_note}{action_html}</section>
@@ -1483,6 +1484,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     <section class="panel" style="margin-top:14px" id="v2-addons"><h2>Add-ons</h2>{addons}<p id="subscription-addon-message" class="health-detail"></p></section>
     {_relay_panel(is_owner, activated)}
     {license_panels}
+    {local_gateway_customer_ui.panel_html()}
     {picker if activated else ""}{change}'''
     scripts = f'''<script>
     const v2Plans={json.dumps(plan_menu)};
@@ -1504,7 +1506,7 @@ def customer_portal_page(identity: dict, entitlement: dict | None, selection: di
     document.querySelectorAll('time[data-local-date]').forEach(t=>{{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {{dateStyle:'medium'}})}});
     {scripts_focus}
     </script>'''
-    return main.page_shell("My subscription", "subscription-portal", content, scripts)
+    return main.page_shell("My subscription", "subscription-portal", content, scripts + local_gateway_customer_ui.panel_script())
 
 
 def _matches(subscription: dict, plan_key: str, quantity: int) -> bool:

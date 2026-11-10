@@ -512,7 +512,8 @@ def _entitled_identity(identity: dict | None) -> dict | None:
     read, so an expiring offline snapshot or a revocation stops processing at the next pipeline pass. Non-premium
     fields (camera id, site, recording mode) are never touched: basic motion, recording, live view and playback do
     not depend on it. Fails closed (premium off) if the check itself fails."""
-    if identity is None or RUNTIME_ROLE != "edge":
+    from gateway_edition import current_edition
+    if identity is None or (RUNTIME_ROLE != "edge" and current_edition() == "full_vms"):
         return identity
     import copy
     gated = copy.copy(identity)
@@ -611,7 +612,12 @@ def _session_expires_soon(session: dict) -> bool:
     return remaining <= SESSION_RENEW_MARGIN_SECONDS
 
 
-def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
+def _ensure_session(camera_number: int, camera_id: str, *, force_refresh: bool = False) -> dict | None:
+    if force_refresh:
+        # Gateway clips must recheck the current server entitlement, even if
+        # an earlier STS session remains valid after a plan cancellation.
+        _sessions.pop(camera_number, None)
+        _clients.pop(camera_number, None)
     session = _sessions.get(camera_number)
     if session and not _session_expires_soon(session):
         return session
@@ -653,6 +659,9 @@ def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
         # install never had AWS_REGION in its environment.
         "region": response["region"].strip() if isinstance(response.get("region"), str) and response["region"].strip() else None,
     }
+    if force_refresh and _session_expires_soon(session):
+        _invalid("expired_or_invalid_expiration")
+        return None
     _sessions[camera_number] = session
     # A freshly (re-)issued session invalidates whatever S3 client was
     # built from the previous one -- that client has the old credentials
@@ -1256,6 +1265,9 @@ def _upload_recording(
     started_at: datetime,
     camera_number: int,
 ) -> str:
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("recording"):
+        raise PermissionError("This edition does not allow recording uploads")
     # client is caller-provided (one per session, reused across every file
     # in a scan -- see _ensure_client()) rather than constructed here per
     # file. Caller guarantees it is not None before calling this.
@@ -1476,7 +1488,8 @@ async def recording_upload_worker() -> None:
     # mirrors (appliance_cloud.py) -- RECORDING_UPLOAD_ENABLED=false
     # still means every non-pilot camera is skipped by the per-camera
     # scope check in the loop below, unchanged.
-    if RUNTIME_ROLE not in {"edge", "combined"} or not (RECORDING_UPLOAD_ENABLED or RECORDING_UPLOAD_CAMERA_SCOPE):
+    from gateway_edition import video_transport_allowed
+    if not video_transport_allowed("recording") or RUNTIME_ROLE not in {"edge", "combined"} or not (RECORDING_UPLOAD_ENABLED or RECORDING_UPLOAD_CAMERA_SCOPE):
         recording_upload_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)

@@ -15,27 +15,53 @@ param(
     # Optional explicit build interpreter. This avoids relying on a machine-wide
     # Python Launcher registration when the approved interpreter is per-user.
     [string]$PythonExe = '',
+    [string]$GitExe = '',
     [switch]$Sign,
     [switch]$AzureSign
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-tools.ps1')
+$GitExe = Resolve-BuildGit $GitExe
 . (Join-Path $PSScriptRoot 'publisher-pin.ps1')
 if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
 # Three or four decimal parts (1.3.2, or a hotfix 1.3.2.1): exactly what install-version-guard.ps1 accepts.
 if ($Version -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2,3}$') { throw "Version must look like 1.3.2 or 1.3.2.1 (got '$Version')." }
 if ($ReleaseVersion -notmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}$') { throw "ReleaseVersion must look like 1.2.7 (got '$ReleaseVersion')." }
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
-if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+Assert-BuildInnoCompiler $iscc
 # The setup is built from a clean, committed tree: its name and the
 # ANYAICAM_BUILD_ID it installs both carry this exact commit.
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
-$sourceCommit = (& git -C $repo rev-parse HEAD).Trim()
+$sourceCommit = (& $GitExe -C $repo rev-parse HEAD).Trim()
 if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Could not read the source commit.' }
 # Every packaged repository folder (read from the .iss, so appliance-agent
 # is included) must be exactly the commit: see source-integrity.ps1.
 . (Join-Path $PSScriptRoot 'source-integrity.ps1')
-$sourceProblems = @(Get-PackagedSourceProblems $repo (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss'))
+$sourceProblems = @(Get-PackagedSourceProblems $repo (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss') -GitExe $GitExe)
 if ($sourceProblems.Count) { throw ("The packaged sources are not exactly commit $sourceCommit; build only from a committed tree:`n  " + ($sourceProblems -join "`n  ")) }
+# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
+# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
+if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
+if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementTrustRegistrySha256 must be a 64-character lowercase SHA-256.' }
+$keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
+$registryOut = Join-Path $PSScriptRoot 'output\entitlement-trust-registry.json'
+# A signed setup is a release candidate: only a production registry. Synthetic registries are for unsigned test builds.
+$registryEnvironment = if ($Sign -or $AzureSign) { 'production' } else { 'any' }
+# A rotation build names the keys kept for verification only. Passed only when there are some: PowerShell 5.1 drops an
+# empty argument. prepare-keyset.py stops the build on a retired key not named here.
+$retiredKeyArgument = @()
+if ($EntitlementRetiredKeyIds.Count) { $retiredKeyArgument = @($EntitlementRetiredKeyIds -join ',') }
+if ($PythonExe) {
+    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
+    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
+    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
+} else {
+    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
+}
+if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset or trust registry was refused; nothing was built.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $registryOut).Hash.ToLowerInvariant() -ne $EntitlementTrustRegistrySha256) { throw 'The prepared entitlement trust registry does not match its pinned SHA-256.' }
 # Every vendored input is pinned by SHA-256 (DEPENDENCIES.md), not just present.
 $vendor = Join-Path $PSScriptRoot 'vendor'
 $pinned = [ordered]@{
@@ -62,11 +88,10 @@ $vcRedist = Get-AuthenticodeSignature -LiteralPath (Join-Path $vendor 'vc_redist
 if ($vcRedist.Status -ne 'Valid' -or $vcRedist.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') { throw 'vc_redist.x64-14.44.35211.exe is not validly signed by Microsoft Corporation.' }
 $wheelRoot = Join-Path $vendor 'wheels'
 $lockedWheels = @()
-foreach ($line in Get-Content (Join-Path $PSScriptRoot 'wheels.lock.sha256')) {
-    $parts = $line -split '  ', 2
-    $wheel = Join-Path $wheelRoot $parts[1]
-    if (-not (Test-Path $wheel) -or (Get-FileHash -Algorithm SHA256 $wheel).Hash.ToLowerInvariant() -ne $parts[0]) { throw "Wheel checksum failed: $($parts[1])" }
-    $lockedWheels += $parts[1]
+foreach ($entry in @(Read-BuildWheelLock (Join-Path $PSScriptRoot 'wheels.lock.sha256'))) {
+    $wheel = Join-Path $wheelRoot $entry.Name
+    if (-not (Test-Path -LiteralPath $wheel -PathType Leaf) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $wheel).Hash.ToLowerInvariant() -ne $entry.Sha256) { throw "Wheel checksum failed: $($entry.Name)" }
+    $lockedWheels += $entry.Name
 }
 $vendorProblems = @(Get-VendorProblems $vendor @($pinned.Keys) $lockedWheels)
 if ($vendorProblems.Count) { throw ("vendor/ holds files that are not pinned (they would be packaged):`n  " + ($vendorProblems -join "`n  ")) }
@@ -131,29 +156,6 @@ if ($Sign -or $AzureSign) {
     if ($verifiedNativeFiles -ne $catalogued) { throw "Runtime catalog coverage mismatch: catalogued=$catalogued verified=$verifiedNativeFiles" }
     Write-Output 'Runtime catalog signed and verified.'
 }
-# The same validation as the Linux release build (installer/build_release_installer.read_entitlement_signing_keys):
-# public keys only, well-formed Ed25519, canonical bytes hashing to the pinned SHA-256.
-if ($EntitlementKeysetSha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementKeysetSha256 must be a 64-character lowercase SHA-256.' }
-if ($EntitlementTrustRegistrySha256 -notmatch '^[0-9a-f]{64}$') { throw 'EntitlementTrustRegistrySha256 must be a 64-character lowercase SHA-256.' }
-$keysetOut = Join-Path $PSScriptRoot 'output\entitlement-signing-public-keys.json'
-$registryOut = Join-Path $PSScriptRoot 'output\entitlement-trust-registry.json'
-# A signed setup is a release candidate: only a production registry. Synthetic registries are for unsigned test builds.
-$registryEnvironment = if ($Sign -or $AzureSign) { 'production' } else { 'any' }
-# A rotation build names the keys kept for verification only. Passed only when there are some: PowerShell 5.1 drops an
-# empty argument. prepare-keyset.py stops the build on a retired key not named here.
-$retiredKeyArgument = @()
-if ($EntitlementRetiredKeyIds.Count) { $retiredKeyArgument = @($EntitlementRetiredKeyIds -join ',') }
-if ($PythonExe) {
-    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) { throw "PythonExe does not exist: $PythonExe" }
-    $pythonVersion = (& $PythonExe --version 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne 'Python 3.12.10') { throw "PythonExe must be the verified Python 3.12.10 interpreter (reported '$pythonVersion')." }
-    & $PythonExe (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
-} else {
-    & py -3.11 (Join-Path $PSScriptRoot 'prepare-keyset.py') $EntitlementKeyset $EntitlementKeysetSha256 $keysetOut $EntitlementTrustRegistry $EntitlementTrustRegistrySha256 $registryOut $registryEnvironment @retiredKeyArgument
-}
-if ($LASTEXITCODE -ne 0) { throw 'The entitlement keyset or trust registry was refused; nothing was built.' }
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $keysetOut).Hash.ToLowerInvariant() -ne $EntitlementKeysetSha256) { throw 'The prepared entitlement keyset does not match its pinned SHA-256.' }
-if ((Get-FileHash -Algorithm SHA256 -LiteralPath $registryOut).Hash.ToLowerInvariant() -ne $EntitlementTrustRegistrySha256) { throw 'The prepared entitlement trust registry does not match its pinned SHA-256.' }
 $compilerArguments += "/DKeysetSha256=$EntitlementKeysetSha256"
 $compilerArguments += "/DRegistrySha256=$EntitlementTrustRegistrySha256"
 $compilerArguments += "/DAppVersion=$Version"

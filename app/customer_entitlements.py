@@ -330,6 +330,20 @@ def appliance_includes_vms_license(customer_id: str) -> bool:
     return False
 
 
+def _purchased_vms_license_capacity(entitlements: list[dict]) -> int:
+    """Return the independently purchased, active VMS licence capacity.
+
+    A subscription's camera quantity is not evidence of a separate purchase.
+    The caller supplies the customer's entitlements; inactive licences grant
+    nothing.  Other licence sources are resolved by vms_license_capacity.
+    """
+    return max(
+        (int(item["camera_slot_quantity"] or 0) for item in entitlements
+         if item["status"] == "active" and item["product"] == VMS_LICENSE_PRODUCT),
+        default=0,
+    )
+
+
 def vms_license_capacity(customer_id: str) -> int:
     """Camera capacity of this customer's VMS software license: a purchased
     (DIY) license, or -- for an appliance customer -- the capacity of their
@@ -343,7 +357,7 @@ def vms_license_capacity(customer_id: str) -> int:
     except Exception:
         pass  # pre-v2 database: preserve the fixed-capacity path
     entitlements = [e for e in get_entitlements_for_customer(customer_id) if e["status"] == "active"]
-    purchased = max((int(e["camera_slot_quantity"] or 0) for e in entitlements if e["product"] == VMS_LICENSE_PRODUCT), default=0)
+    purchased = _purchased_vms_license_capacity(entitlements)
     included = 0
     if appliance_includes_vms_license(customer_id):
         included = max((int(e["camera_slot_quantity"] or 0) for e in entitlements
@@ -361,6 +375,29 @@ def usable_camera_capacity(customer_id: str) -> int:
     installer and no license gets 0. Claiming an appliance is deliberately
     NOT gated by this -- only provisioning and operating cameras are."""
     return max(0, min(MAX_CAMERA_SLOTS, total_camera_slots(customer_id), vms_license_capacity(customer_id)))
+
+
+def usable_camera_capacity_for_appliance(customer_id: str, appliance_id: str) -> int:
+    """Resolve purchased capacity for an appliance bound to Local Gateway.
+
+    An inactive remote subscription still identifies the edition and never
+    removes the purchased licence. Existing unbound/Full VMS customers use
+    their original camera-plan rules.
+    """
+    from partner_db import row
+    # SELECT * also supports old schemas, where the column does not yet exist.
+    appliance = row("SELECT * FROM appliances WHERE id=?", (appliance_id,))
+    if not appliance or appliance.get("customer_id") != customer_id:
+        return 0
+    edition = appliance.get("gateway_edition")
+    # Camera capacity keeps the original plan rules for Full VMS, whether recorded
+    # explicitly or not yet backfilled (cloud media separately refuses NULL).
+    if edition is None or edition == "full_vms":
+        return usable_camera_capacity(customer_id)
+    if edition != "local_gateway":
+        return usable_camera_capacity(customer_id) if edition == "cloud_gateway" else 0
+    purchased = _purchased_vms_license_capacity(get_entitlements_for_customer(customer_id))
+    return min(MAX_CAMERA_SLOTS, max(0, purchased))
 
 
 def capacity_breakdown(customer_id: str) -> dict:

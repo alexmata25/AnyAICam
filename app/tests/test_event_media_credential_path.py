@@ -43,7 +43,7 @@ def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
     db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)",
                (customer_id, "partner-1", "Test Customer", f"{customer_id}@example.test", "active", "real", now))
     db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (site_id, customer_id, "Test Site", now))
-    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)",
+    db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at,gateway_edition) VALUES(?,?,?,?,?,'full_vms')",
                (appliance_id, customer_id, site_id, cloud_id, now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)",
                (f"cred-{appliance_id}", appliance_id, password_hash(credential), now))
@@ -60,7 +60,7 @@ def _seed(db, *, appliance_id, cloud_id, credential, camera_id, camera_number=1,
             "partner_monthly,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (f"plan-{customer_id}", customer_id, "2mp", legacy_plan, 30, 2, 50.0, 25.0, "active", now))
     if other_appliance:
-        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-other',?,?,?,?)",
+        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at,gateway_edition) VALUES('appl-other',?,?,?,?,'full_vms')",
                    (customer_id, site_id, "AIC-OTHER", now))
         db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES('cred-other','appl-other',?,?)",
                    (password_hash("other-credential"), now))

@@ -27,7 +27,9 @@ Resolution order for the mode itself (current_mode()):
    -> Hybrid) or a subscription cancellation (Hybrid -> Local) apply
    automatically the next time this appliance polls its configuration,
    with no manual re-flagging.
-3. "" (unset/legacy) -- no mode has ever been configured for this
+3. Installer bootstrap choice, then ANYAICAM_GATEWAY_EDITION's default
+   (local_gateway -> local, cloud_gateway -> hybrid).
+4. "" (unset/legacy, including the default full_vms edition) -- no mode has ever been configured for this
    appliance. Every governed flag then falls back to its own
    pre-product-mode literal default (see resolve_cloud_flag()'s
    legacy_default), so an appliance that has never opted into product
@@ -63,6 +65,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -88,12 +91,21 @@ STATE_FILE = Path(os.environ.get(
     str(_CONFIG_DIR / "product_mode.json"),
 ))
 
+# A received cancellation must stop this process's remote access even when
+# the state disk refuses the update. This is not a durable revocation proof.
+_GATEWAY_REMOTE_DENIED = False
+# A cached grant is insufficient after process restart; require a fresh authenticated sync.
+_LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = False
+_GATEWAY_MODE_APPLY_LOCK = threading.Lock()
+
 
 def _read_persisted_mode() -> str:
     try:
         data = json.loads(STATE_FILE.read_text())
     except (OSError, ValueError):
         return ""
+    if not isinstance(data, dict):
+        return ""  # a corrupt cache must not prevent configuration recovery
     mode = str(data.get("mode") or "").strip().lower()
     return mode if mode in VALID_MODES else ""
 
@@ -107,7 +119,10 @@ def current_mode() -> str:
     if persisted in VALID_MODES:  # what the cloud last said
         return persisted
     bootstrap = os.environ.get(BOOTSTRAP_MODE_ENV, "").strip().lower()
-    return bootstrap if bootstrap in VALID_MODES else persisted
+    if bootstrap in VALID_MODES:
+        return bootstrap
+    from gateway_edition import default_product_mode
+    return default_product_mode()
 
 
 def is_local() -> bool:
@@ -118,7 +133,93 @@ def is_hybrid() -> bool:
     return current_mode() == "hybrid"
 
 
-def persist_mode(mode: str) -> bool:
+def _local_gateway_remote_grant() -> bool:
+    """Only an authenticated, durably stored appliance-specific grant is valid."""
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        return isinstance(data, dict) and data.get("local_gateway_remote_access") is True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def remote_access_authorized() -> bool:
+    """A Gateway's local licence/bootstrap/override is not a remote-service grant."""
+    from gateway_edition import current_edition
+    if current_edition() == "full_vms":
+        return True
+    if _GATEWAY_REMOTE_DENIED:
+        return False
+    if current_edition() == "local_gateway":
+        import local_gateway_remote_lease
+        if (not _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS or not _local_gateway_remote_grant()
+                or not local_gateway_remote_lease.allowed()):
+            return False
+    try:
+        return _read_persisted_mode() == "hybrid" and current_mode() == "hybrid"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def gateway_tunnel_request_denied(peer_host: str) -> bool:
+    """Revoke the existing WireGuard proxy without disabling LAN media routes."""
+    import ipaddress
+    try:
+        peer = ipaddress.ip_address(peer_host)
+        gateway = ipaddress.ip_address(os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_ADDRESS", "10.70.0.1").strip())
+    except ValueError:
+        return False
+    # Dual-stack ASGI servers can expose an IPv4 peer as ::ffff:a.b.c.d.
+    peer = getattr(peer, "ipv4_mapped", None) or peer
+    gateway = getattr(gateway, "ipv4_mapped", None) or gateway
+    return peer == gateway and not remote_access_authorized()
+
+
+def apply_configuration_mode(configuration: dict) -> bool:
+    """Consume the existing authenticated configuration, including explicit cancellation."""
+    from gateway_edition import current_edition
+    mode = str(configuration.get("product_mode") or "").strip().lower()
+    if current_edition() == "full_vms":
+        return persist_mode(mode)
+    if current_edition() == "local_gateway":
+        # No customer-wide product mode, local override or omitted field can
+        # issue a system-specific remote grant.
+        import local_gateway_remote_lease
+        global _GATEWAY_REMOTE_DENIED, _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS
+        with _GATEWAY_MODE_APPLY_LOCK:
+            granted = (configuration.get("local_gateway_remote_access") is True and
+                       local_gateway_remote_lease.accept(
+                           configuration.get("local_gateway_remote_lease"),
+                           configuration.get("_local_gateway_request_nonce")))
+            mode = "hybrid" if granted else "local"
+            if not granted:
+                local_gateway_remote_lease.clear()
+                _GATEWAY_REMOTE_DENIED = True
+                _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = False
+            try:
+                changed = persist_mode(mode, local_gateway_remote_access=granted)
+            except Exception:
+                local_gateway_remote_lease.clear()
+                _GATEWAY_REMOTE_DENIED = True
+                _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = False
+                raise
+            if granted:
+                _GATEWAY_REMOTE_DENIED = False
+                _LOCAL_GATEWAY_VERIFIED_THIS_PROCESS = True
+            return changed
+    if "product_mode" not in configuration:
+        return False  # omission cannot undo a previously received cancellation
+    if mode not in VALID_MODES:
+        mode = "local"  # no active remote plan; preserve the signed local licence
+    with _GATEWAY_MODE_APPLY_LOCK:
+        if mode == "local":
+            _GATEWAY_REMOTE_DENIED = True
+        changed = persist_mode(mode)  # failure retains the process-local denial
+        if mode == "hybrid":
+            _GATEWAY_REMOTE_DENIED = False  # only a durable explicit grant reopens access
+        return changed
+
+
+def persist_mode(mode: str, *, local_gateway_remote_access: bool | None = None) -> bool:
     """Called by edge_camera_sync.py when the cloud's own
     GET /api/appliance/configuration response reports a product_mode
     different from what this appliance already has persisted -- e.g.
@@ -142,10 +243,29 @@ def persist_mode(mode: str) -> bool:
     if mode not in VALID_MODES:
         return False
     previous = _read_persisted_mode()
-    if previous == mode:
+    if previous == mode and (local_gateway_remote_access is None or
+                             _local_gateway_remote_grant() == local_gateway_remote_access):
         return False
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"mode": mode}))
+    # Readers include the live remote-access guard. Publish only complete,
+    # flushed state; a failed write must not destroy the last accepted mode.
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=STATE_FILE.name + ".", suffix=".tmp", dir=STATE_FILE.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            state = {"mode": mode}
+            if local_gateway_remote_access is not None:
+                state["local_gateway_remote_access"] = local_gateway_remote_access
+            handle.write(json.dumps(state))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, STATE_FILE)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
     logger.warning(
         "product_mode.changed previous=%s new=%s restart_required=true",
         previous or "unset", mode,
@@ -173,6 +293,12 @@ def resolve_cloud_flag(env_var: str, *, legacy_default: bool = False) -> bool:
 
 
 def _resolve(env_var: str, legacy_default: bool) -> bool:
+    if env_var == "ANYAICAM_LIVE_P2P_ENABLED" and not remote_access_authorized():
+        return False
+    from gateway_edition import VIDEO_FLAGS, video_transport_allowed
+    if env_var in VIDEO_FLAGS and not video_transport_allowed(VIDEO_FLAGS[env_var]):
+        return False
+    # Explicit flags retain precedence within the edition's transport boundary.
     raw = os.environ.get(env_var)
     if raw is not None and raw.strip() != "":
         return raw.strip().lower() == "true"

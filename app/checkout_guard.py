@@ -146,6 +146,10 @@ def _fingerprint(fields: list) -> str:
     return hashlib.sha256(json.dumps(sorted((str(k), str(v)) for k, v in fields)).encode()).hexdigest()
 
 
+def _gateway_purchase(purchase: str) -> bool:
+    return purchase == 'cloud_gateway' or (isinstance(purchase, str) and purchase.startswith('local_gateway_remote:'))
+
+
 def _claim(customer_id: str, purchase: str, price_id: str, quantity: int, fingerprint: str) -> dict | None:
     """The claim row if this request took it, else None."""
     now = int(time.time())
@@ -158,9 +162,9 @@ def _claim(customer_id: str, purchase: str, price_id: str, quantity: int, finger
             "quantity=excluded.quantity,fingerprint=excluded.fingerprint,session_id=NULL,checkout_url=NULL,status='creating',"
             "expires_at=excluded.expires_at,created_at=excluded.created_at,updated_at=excluded.updated_at "
             "WHERE checkout_pending.status IN ('completed','expired','abandoned') "
-            "OR (checkout_pending.expires_at<? AND checkout_pending.status<>'paid')",
+            "OR (checkout_pending.expires_at<? AND checkout_pending.status<>'paid' AND ?=0)",
             (customer_id, purchase, token, price_id, quantity, fingerprint, now + CHECKOUT_SESSION_SECONDS, _now_iso(), _now_iso(),
-             now - CLOCK_SKEW_SECONDS)).rowcount
+             now - CLOCK_SKEW_SECONDS, int(_gateway_purchase(purchase)))).rowcount
     current = _pending(customer_id, purchase)
     return current if taken and current and current["token"] == token else None
 
@@ -181,18 +185,22 @@ def _take_over(existing: dict, price_id: str, quantity: int, fingerprint: str) -
         return None  # already paid (or Stripe unreachable): the open one stands
     now = int(time.time())
     token = uuid.uuid4().hex
+    gateway = _gateway_purchase(existing['purchase'])
+    guard = " AND status='open' AND session_id=?" if gateway else ""
     with connection() as db:
         swapped = db.execute(
             "UPDATE checkout_pending SET token=?,price_id=?,quantity=?,fingerprint=?,session_id=NULL,checkout_url=NULL,status='creating',"
-            "expires_at=?,created_at=?,updated_at=? WHERE customer_id=? AND purchase=? AND token=?",
+            "expires_at=?,created_at=?,updated_at=? WHERE customer_id=? AND purchase=? AND token=?" + guard,
             (token, price_id, quantity, fingerprint, now + CHECKOUT_SESSION_SECONDS, _now_iso(), _now_iso(),
-             existing["customer_id"], existing["purchase"], existing["token"])).rowcount
+             existing["customer_id"], existing["purchase"], existing["token"]) + ((existing['session_id'],) if gateway else ())).rowcount
     return _pending(existing["customer_id"], existing["purchase"]) if swapped else None
 
 
 def _retake_stalled(existing: dict, price_id: str, quantity: int, fingerprint: str) -> dict | None:
     """A "creating" attempt no longer in flight (its answer was lost) gives
     way to a different checkout: a new token, so a new Idempotency-Key."""
+    if _gateway_purchase(existing.get('purchase')):
+        return None  # A lost response can hide a payable session; reconcile first.
     try:
         stalled = (datetime.now() - datetime.fromisoformat(str(existing.get("updated_at") or ""))).total_seconds() >= IN_FLIGHT_SECONDS
     except ValueError:
@@ -266,6 +274,12 @@ def _provisioned(event_id: str, session: dict | None = None) -> bool:
     required = PROVISIONING_STEPS
     if ((session or {}).get("metadata") or {}).get("anyaicam_billing_version") == "2":
         required = (*required, "camera_plan_v2_entitlements")
+    if ((session or {}).get("metadata") or {}).get("anyaicam_product") == "local_gateway_remote":
+        required = (*required, "local_gateway_remote")
+    if ((session or {}).get("metadata") or {}).get("anyaicam_product") == "cloud_gateway":
+        required = (*required, "cloud_gateway_billing")
+    if ((session or {}).get("metadata") or {}).get("anyaicam_gateway_attempt"):
+        required = (*required, "gateway_checkout_attempts")
     if ((session or {}).get("metadata") or {}).get("anyaicam_build_order"):
         required = (*required, "build_orders")  # Build Your System orders (build_orders.py)
     return all(step in done for step in required)

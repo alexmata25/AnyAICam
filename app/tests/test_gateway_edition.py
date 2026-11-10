@@ -1,0 +1,157 @@
+"""Small isolated tests: no VMS import, workers, database or network."""
+import os
+import sys
+import tempfile
+import unittest
+from html.parser import HTMLParser
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import gateway_edition as edition
+import product_mode as pm
+
+
+class GatewayEditionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        state = patch.object(pm, 'STATE_FILE', Path(self.temp.name) / 'mode.json')
+        state.start()
+        self.addCleanup(state.stop)
+        # These mode tests isolate authorization transitions from lease
+        # cryptography, which has its own dedicated fixture coverage.
+        import local_gateway_remote_lease as lease
+        verifier = patch.object(lease, 'accept', return_value=True)
+        verifier.start(); self.addCleanup(verifier.stop)
+        validity = patch.object(lease, 'allowed', return_value=True)
+        validity.start(); self.addCleanup(validity.stop)
+        denied = patch.object(pm, '_GATEWAY_REMOTE_DENIED', False)
+        denied.start()
+        self.addCleanup(denied.stop)
+        capacity = patch.object(edition, '_capacity_status', return_value={'state': 'fail_closed'})
+        capacity.start()
+        self.addCleanup(capacity.stop)
+
+    def test_full_vms_preserves_legacy_default(self):
+        self.assertEqual(edition.current_edition(), 'full_vms')
+        self.assertEqual(pm.current_mode(), '')
+        self.assertFalse(pm._resolve('TEST_CLOUD_FLAG', False))
+        self.assertTrue(pm._resolve('TEST_CLOUD_FLAG', True))
+
+    def test_gateway_defaults_and_explicit_flag_override(self):
+        for name, mode, enabled in [('local_gateway', 'local', False), ('cloud_gateway', 'hybrid', True)]:
+            with self.subTest(edition=name):
+                os.environ[edition.EDITION_ENV] = name
+                self.assertEqual(pm.current_mode(), mode)
+                self.assertEqual(pm._resolve('TEST_CLOUD_FLAG', False), enabled)
+                with patch.dict(os.environ, {'TEST_CLOUD_FLAG': str(not enabled).lower()}):
+                    self.assertEqual(pm._resolve('TEST_CLOUD_FLAG', False), not enabled)
+
+    def test_existing_configuration_precedence(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        os.environ[pm.BOOTSTRAP_MODE_ENV] = 'local'
+        self.assertEqual(pm.current_mode(), 'local')
+        pm.persist_mode('hybrid')
+        self.assertEqual(pm.current_mode(), 'hybrid')
+        os.environ[pm.PRODUCT_MODE_ENV] = 'local'
+        self.assertEqual(pm.current_mode(), 'local')
+
+    def test_invalid_selection_is_rejected(self):
+        os.environ[edition.EDITION_ENV] = 'cluod_gateway'
+        with self.assertRaises(ValueError):
+            pm.current_mode()
+
+    def test_local_gateway_blocks_video_even_with_hybrid_and_explicit_flags(self):
+        os.environ[edition.EDITION_ENV] = 'local_gateway'
+        os.environ[pm.PRODUCT_MODE_ENV] = 'hybrid'
+        for flag, kind in edition.VIDEO_FLAGS.items():
+            with patch.dict(os.environ, {flag: 'true'}):
+                self.assertFalse(pm._resolve(flag, True))
+                self.assertFalse(edition.video_transport_allowed(kind))
+        # Non-video functions retain the existing mode/override rules.
+        self.assertTrue(pm._resolve('ANYAICAM_ANALYTICS_SYNC_ENABLED', False))
+
+    def test_cloud_gateway_requires_explicit_event_opt_in(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        self.assertFalse(pm._resolve('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED', True))
+        with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED': 'true'}):
+            self.assertTrue(pm._resolve('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED', False))
+            for kind in ('recording', 'live', 'backup'):
+                self.assertFalse(edition.video_transport_allowed(kind))
+
+    def test_cloud_video_page_reports_opt_in_without_promising_camera_access(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        self.assertIn('Event upload is disabled', edition.cloud_recording_page_html())
+        with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED': 'true'}):
+            page = edition.cloud_recording_page_html()
+            self.assertIn('Event upload is configured', page)
+            self.assertIn('each camera still needs an eligible plan and permission', page)
+            self.assertIn('Continuous recording backups and live video uploads are unavailable', page)
+
+    def test_full_vms_preserves_explicit_video_flags(self):
+        for flag in edition.VIDEO_FLAGS:
+            for enabled in (True, False):
+                with patch.dict(os.environ, {flag: str(enabled).lower()}):
+                    self.assertEqual(pm._resolve(flag, not enabled), enabled)
+
+    def test_gateway_notice_and_full_vms_ui(self):
+        self.assertEqual(edition.edition_notice_html(), '')
+        os.environ[edition.EDITION_ENV] = 'local_gateway'
+        self.assertIn('Local Gateway', edition.edition_notice_html())
+        self.assertIn('uploads are disabled', edition.edition_notice_html())
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        self.assertIn('eligible plan', edition.edition_notice_html())
+        self.assertIn('$9.99/month per camera', edition.edition_notice_html())
+        self.assertIn('Advanced analytics require separate authorization', edition.edition_notice_html())
+        with patch.dict(os.environ, {'ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED':'true'}):
+            self.assertIn('$9.99/month per camera', edition.edition_notice_html())
+
+    def test_rendered_remote_status_tracks_configuration_without_expiring_local_licence(self):
+        class VisibleText(HTMLParser):
+            def __init__(self, markup):
+                super().__init__()
+                self.parts = []
+                self.feed(markup)
+            def handle_data(self, data):
+                self.parts.append(data)
+        def visible():
+            return ' '.join(VisibleText(edition.edition_notice_html()).parts)
+        capacity = {'state':'licensed', 'camera_slot_quantity':2}
+        for name in ('local_gateway', 'cloud_gateway'):
+            with self.subTest(edition=name), patch.dict(os.environ, {
+                    edition.EDITION_ENV:name, pm.PRODUCT_MODE_ENV:'hybrid'}), \
+                    patch.object(edition, '_capacity_status', return_value=capacity):
+                pm.STATE_FILE.unlink(missing_ok=True)
+                self.assertIn('Remote access is unavailable', visible())
+                pm.apply_configuration_mode({'product_mode':'hybrid', 'local_gateway_remote_access':True})
+                accepted = visible()
+                self.assertIn('allowed by the last received cloud configuration', accepted)
+                self.assertIn('Subscription changes cannot be checked while offline', accepted)
+                # Reading the cached grant does not invent a remote expiry date.
+                self.assertEqual(visible(), accepted)
+                pm.apply_configuration_mode({'product_mode':''})
+                cancelled = visible()
+                self.assertIn('Remote access is unavailable', cancelled)
+                self.assertNotIn('Remote access is allowed', cancelled)
+                self.assertIn('2 camera slots', cancelled)
+                self.assertIn('Local recording, playback and Basic Motion notifications', cancelled)
+                self.assertIn('independently of remote access', cancelled)
+                pm.apply_configuration_mode({'product_mode':'hybrid', 'local_gateway_remote_access':True})
+                self.assertIn('Remote access is allowed', visible())
+                with patch.dict(os.environ, {pm.PRODUCT_MODE_ENV:'local'}):
+                    self.assertIn('Remote access is unavailable', visible())
+
+    def test_unlicensed_gateway_notice_does_not_promise_local_continuity(self):
+        os.environ[edition.EDITION_ENV] = 'cloud_gateway'
+        markup = edition.edition_notice_html()
+        self.assertIn('Camera licence required', markup)
+        self.assertNotIn('independently of remote access', markup)
+        self.assertIn('Remote access is unavailable', markup)
+
+
+if __name__ == '__main__':
+    unittest.main()

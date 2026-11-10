@@ -213,6 +213,12 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         from appliance_identity import has_global_administrator_grant
         with connection() as db:
             is_global_admin=has_global_administrator_grant(db,email=identity.get('email',''))
+        # Only the global provisioning authority can select the edition, and
+        # only for newly created appliance rows. A device never supplies it.
+        from server_gateway_edition import onboarding_edition
+        try: gateway_edition=onboarding_edition(payload, is_global_admin=is_global_admin)
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        except ValueError as error: raise HTTPException(status_code=400,detail=str(error)) from error
         if is_global_admin and str(payload.get('partner_id') or '').strip():
             partner_id=str(payload['partner_id']).strip()
         else:
@@ -251,6 +257,9 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 cloud_id=provisioning['cloud_id']; activation=provisioning['activation_token']; appliance_id=provisioning['appliance_id']
                 activation_tokens.append({'site':site_data.get('name','Site'),'cloud_id':cloud_id,'activation_token':activation,'provisioning_qr_payload':provisioning['provisioning_qr_payload']})
                 db.execute('INSERT INTO appliances(id,customer_id,site_id,cloud_id,appliance_type,serial_number,software_version,last_check_in,online_status,ip_address,cpu,memory,disk,camera_capacity,activation_token_hash,activation_token_created_at,shipping_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(appliance_id,customer_id,site_id,cloud_id,payload.get('appliance_type','AnyAiCam mini PC'),payload.get('serial_number','Pending'),'Not installed',None,'offline','Not connected',0,0,0,max(16,quote['quantity']),password_hash(activation),now,'not_ordered',now))
+                if gateway_edition is not None:
+                    updated=db.execute('UPDATE appliances SET gateway_edition=? WHERE id=? AND customer_id=? AND gateway_edition IS NULL',(gateway_edition,appliance_id,customer_id))
+                    if updated.rowcount != 1: raise RuntimeError('Appliance edition binding failed')
                 db.execute('INSERT INTO appliance_activation_tokens(id,appliance_id,token_hash,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?)',(secrets.token_hex(6),appliance_id,password_hash(activation),(datetime.now()+timedelta(hours=24)).isoformat(),now,identity['email']))
                 created_sites.append({'id':site_id,'name':site_data.get('name','Site'),'appliance_id':appliance_id})
             primary_site=created_sites[0]
@@ -1333,6 +1342,12 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                 db.execute('INSERT INTO sites(id,customer_id,name,address,site_type,created_at) VALUES(?,?,?,?,?,?)',(site_id,customer_id,site_name,site_address,'Customer site',now))
             if not row('SELECT id FROM appliances WHERE id=?',(appliance_id,)):
                 db.execute('INSERT INTO appliances(id,customer_id,site_id,cloud_id,appliance_type,serial_number,software_version,last_check_in,online_status,ip_address,cpu,memory,disk,camera_capacity,activation_token_hash,activation_token_created_at,shipping_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(appliance_id,customer_id,site_id,cloud_id,'AnyAiCam mini PC','Pending','Not installed',None,'offline','Not connected',0,0,0,max(16,camera_count),password_hash(activation_token),now,'not_ordered',now))
+            # A self-service order is a Full VMS appliance: record that explicitly
+            # (also on a retry), and never overwrite another recorded edition.
+            from server_gateway_edition import FULL_VMS
+            db.execute('UPDATE appliances SET gateway_edition=? WHERE id=? AND customer_id=? AND gateway_edition IS NULL',(FULL_VMS,appliance_id,customer_id))
+            marked=db.execute('SELECT gateway_edition FROM appliances WHERE id=? AND customer_id=?',(appliance_id,customer_id)).fetchone()
+            if not marked or marked['gateway_edition']!=FULL_VMS: raise RuntimeError('Appliance edition binding failed')
             if not row('SELECT id FROM appliance_activation_tokens WHERE appliance_id=? AND used_at IS NULL AND revoked_at IS NULL',(appliance_id,)):
                 db.execute('INSERT INTO appliance_activation_tokens(id,appliance_id,token_hash,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?)',(secrets.token_hex(6),appliance_id,password_hash(activation_token),(datetime.now()+timedelta(hours=24)).isoformat(),now,identity.get('email','')))
             if (row('SELECT COUNT(*) AS n FROM cameras WHERE appliance_id=?',(appliance_id,)) or {'n':0})['n']==0:
@@ -1550,7 +1565,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # license must both cover a new camera -- see customer_entitlements.
         # usable_camera_capacity(). Claiming an appliance is not gated; this is.
         from customer_entitlements import (CAMERA_ADD_PENDING_SECONDS, CAMERA_ADD_PENDING_STATES,
-                                           capacity_refusal, capacity_refusal_code, usable_camera_capacity)
+                                           capacity_refusal, capacity_refusal_code, usable_camera_capacity_for_appliance)
         from database_backend import lock_customer_camera_capacity
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
@@ -1563,7 +1578,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             already_known_device=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',
                                             (identity['customer_id'],device_key)).fetchone()
             if not already_known_device:
-                slot_limit=usable_camera_capacity(identity['customer_id'])
+                slot_limit=usable_camera_capacity_for_appliance(identity['customer_id'], appliance_id)
                 configured=db.execute('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',
                                       (identity['customer_id'],)).fetchone()['n']
                 cutoff=(datetime.now()-timedelta(seconds=CAMERA_ADD_PENDING_SECONDS)).isoformat()
@@ -1810,10 +1825,12 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
         camera=row('SELECT id, camera_number, appliance_id FROM cameras WHERE id=? AND customer_id=?',(camera_id,identity['customer_id']))
         if not camera: raise HTTPException(status_code=404,detail='Camera not found.')
-        from database_backend import lock_customer_camera_capacity
+        from database_backend import lock_customer_camera_capacity, backend
         from customer_analytics_panel import remove_entitlement
+        from partner_db import transaction
+        from cloud_gateway_camera_entitlements import retire_for_camera_removal
         released=[]
-        with connection() as db:
+        with transaction() as db:
             # CAM-R1 (2026-10-20): the camera's analytics seats are released with
             # its slot, under the same customer lock the seat checks use. Before
             # this a removed camera kept its active assignments, and because
@@ -1822,6 +1839,15 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             # analytic to a replacement camera could switch it off everywhere.
             if not lock_customer_camera_capacity(db,identity['customer_id']):
                 raise HTTPException(status_code=404,detail='Camera not found.')
+            # Recheck ownership under the same transaction as retirement and
+            # removal; PostgreSQL locks the camera row against reassignment.
+            locked = db.execute('SELECT id,camera_number,appliance_id FROM cameras WHERE id=? AND customer_id=?' +
+                                (' FOR UPDATE' if backend() == 'postgresql' else ''),
+                                (camera_id,identity['customer_id'])).fetchone()
+            if not locked: raise HTTPException(status_code=404,detail='Camera not found.')
+            camera = dict(locked)
+            retire_for_camera_removal(db,identity,customer_id=identity['customer_id'],
+                                      appliance_id=camera.get('appliance_id'),camera_id=camera_id)
             now=datetime.now().isoformat()
             for assignment in db.execute("SELECT analytic_key FROM camera_analytics_entitlements WHERE camera_id=? AND status='active'",(camera_id,)).fetchall():
                 remove_entitlement(db,camera_id,assignment['analytic_key'],now=now,customer_lock_held=True)
@@ -1836,9 +1862,9 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
             # former_camera_number (2026-10-08): the appliance stores this
             # camera's local recordings under its number (camera{n}), so the
             # number is kept and never given to another camera on the appliance.
-            db.execute("UPDATE cameras SET former_camera_number=COALESCE(?,former_camera_number),device_key=NULL,camera_number=NULL,status='removed' WHERE id=?",
-                       (camera.get('camera_number'),camera_id))
-        audit(identity,'camera.removed','camera',camera_id,{'released_analytics':sorted(released)} if released else None)
+            db.execute("UPDATE cameras SET former_camera_number=COALESCE(?,former_camera_number),device_key=NULL,camera_number=NULL,status='removed' WHERE id=? AND customer_id=?",
+                       (camera.get('camera_number'),camera_id,identity['customer_id']))
+            audit(identity,'camera.removed','camera',camera_id,{'released_analytics':sorted(released)} if released else None)
         # Billing is never touched here: the plan's camera quantity stays as
         # bought; only this camera's place in it is freed (2026-10-08).
         from customer_entitlements import camera_capacity_status
@@ -1977,6 +2003,8 @@ def render_partner_workspace(request: Request, shell: Callable):
         appliances=rows('SELECT a.* FROM appliances a ORDER BY a.created_at DESC')
     else:
         appliances=rows('SELECT a.* FROM appliances a JOIN customers c ON c.id=a.customer_id WHERE c.partner_id=? ORDER BY a.created_at DESC',(partner_id,))
+    from local_gateway_admin_ui import verification_queue
+    gateway_verification = verification_queue(appliances, customers, is_global_admin=is_global and identity.get('role') == 'administrator', query=rows)
     adapter_rows=''.join(f'''<article class="customer-row"><div><strong>{escape(display_cloud_id(item.get('cloud_id')) or 'Unassigned')}</strong><br><small>{escape(item.get('serial_number') or 'Pending serial')}</small></div><div>{escape((item.get('online_status') or 'offline').title())}<br><small>{escape(item.get('software_version') or 'Unknown version')}</small></div><div><span class="pill">{escape((item.get('online_status') or 'offline').title())}</span></div><div><a class="download" href="/partner/appliance-dashboard">Manage</a></div></article>''' for item in appliances) or '<div class="empty">No appliance orders or assignments yet.</div>'
     content=f'''<header class="topbar"><div><p class="eyebrow">Protected partner workspace · {escape(role_label)}</p><h1>Partner portal</h1></div><div class="dialog-actions">{admin_link}<form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></div></header><nav class="portal-tabs" aria-label="Partner portal">{tab_buttons}</nav><section class="portal-workspace">
     <div class="portal-panel" data-portal-panel="getting-started" hidden><h2>Partner onboarding</h2><div class="feature-grid" style="margin-top:20px"><article class="feature-card"><div class="feature-icon">1</div><h2>Agreement status</h2><p>Approval and agreement records are managed by AnyAiCam administration.</p><span class="pill">Approved access</span></article><article class="feature-card"><div class="feature-icon">2</div><h2>Training</h2><p>Complete sales, installation, activation, privacy, and support training.</p><span class="coming">Training checklist</span></article><article class="feature-card"><div class="feature-icon">3</div><h2>Support contacts</h2><p>Technical support, sales operations, activation help, and escalation contacts.</p><a class="download" href="/help">Open support</a></article></div><section class="panel" style="margin-top:18px"><h2>Onboarding checklist</h2><ol><li>Partner agreement approved</li><li>Authorized users confirmed</li><li>Training completed</li><li>Territory and tax information reviewed</li><li>Payout details approved</li><li>First customer installation scheduled</li></ol></section></div>
@@ -1984,7 +2012,7 @@ def render_partner_workspace(request: Request, shell: Callable):
     <div class="portal-panel" data-portal-panel="customers"><div class="portal-actions"><h2><span id="customer-count">{len(customers)}</span> customers</h2><button class="action-button" id="add-customer">Add New Customer</button></div><div class="portal-search-row"><input class="portal-search" id="customer-search" placeholder="Search by name, company, email, or customer ID…"><div class="status-filters">{filters}</div></div><div class="customer-list" id="customer-list">{customer_body}</div><div class="empty" id="customer-no-results" hidden>No customers match the selected filter.</div></div>
     <div class="portal-panel" data-portal-panel="materials" hidden><h2>Partner materials</h2><div class="feature-grid" style="margin-top:20px">{''.join(f'<article class="feature-card"><div class="feature-icon">▧</div><h2>{item}</h2><p>Protected partner document library.</p><span class="coming">Coming soon</span></article>' for item in ['Brochures','Price sheets','Installation guides','Proposal templates','Logos','Training documents'])}</div></div>
     <div class="portal-panel" data-portal-panel="pricing" hidden><h2>Partner pricing and profitability</h2><div class="feature-grid" style="margin-top:20px"><a class="feature-card" href="/partner-prices" style="color:inherit;text-decoration:none"><h2>Wholesale price sheet</h2><p>Retail, partner prices, volume tiers, and margins.</p></a><a class="feature-card" href="/partner-quotes" style="color:inherit;text-decoration:none"><h2>Quote builder</h2><p>Customer price, partner cost, and first-year profit.</p></a><a class="feature-card" href="/partner-revenue" style="color:inherit;text-decoration:none"><h2>Recurring revenue</h2><p>Monthly recurring profit and commissions.</p></a></div></div>
-    <div class="portal-panel" data-portal-panel="adapters" hidden><h2>Cloud adapters and appliances</h2><div class="health-detail">Orders, serial numbers, assignments, shipping, activation, connectivity, version, and health.</div><div class="customer-list">{adapter_rows}</div></div></section>
+    <div class="portal-panel" data-portal-panel="adapters" hidden><h2>Cloud adapters and appliances</h2><div class="health-detail">Orders, serial numbers, assignments, shipping, activation, connectivity, version, and health.</div><div class="customer-list">{adapter_rows}</div>{gateway_verification}</div></section>
     <dialog class="partner-dialog" id="customer-dialog" style="width:min(900px,calc(100% - 28px))"><div class="dialog-body"><div class="panel-head"><h2>New customer onboarding</h2><button class="ghost-button" type="button" id="close-customer-dialog">Close</button></div><form class="dialog-form" id="customer-form"><div class="account-grid"><label>Customer name<input id="new-name" required></label><label>Company<input id="new-company"></label><label>Email<input id="new-email" type="email" required></label><label>Phone<input id="new-phone"></label><label>Sites, one per line<textarea id="new-sites" rows="3" required>Primary site</textarea></label><label>Appliance<select id="new-appliance"><option>AnyAiCam mini PC</option><option>Customer-owned computer</option></select></label><label>Camera quantity<input id="new-quantity" type="number" min="1" max="128" value="4"></label><label>Resolution<select id="new-resolution"><option value="2mp">2MP / 1080p</option><option value="4mp">4MP</option><option value="8mp">8MP / 4K</option></select></label><label>Recording mode<select id="new-recording"><option value="motion">Motion</option></select></label><label>Retention<select id="new-retention"><option value="2">2 days</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select></label><label>Status<select id="new-status"><option value="pending_installation">Pending installation</option><option value="trial">Trial</option><option value="active">Active</option><option value="suspended">Suspended</option><option value="cancelled">Cancelled</option></select></label><label>Customer selling price per camera<input id="new-selling" type="number" min="0" step="0.01" placeholder="Defaults to retail"></label></div><fieldset><legend>Analytics per camera</legend><label><input class="new-addon" type="checkbox" value="smart_motion"> Smart Motion</label><label><input class="new-addon" type="checkbox" value="people_counting"> People Counting</label><label><input class="new-addon" type="checkbox" value="lpr"> License Plate Recognition</label><label><input class="new-addon" type="checkbox" value="ppe"> Construction PPE Monitoring</label></fieldset><button class="action-button">Calculate, quote, and create customer</button></form><section class="panel" id="onboarding-result" hidden></section></div></dialog>'''
     scripts='''<script>const portalTabs=document.querySelectorAll('[data-portal-tab]'),portalPanels=document.querySelectorAll('[data-portal-panel]');portalTabs.forEach(tab=>tab.addEventListener('click',()=>{portalTabs.forEach(x=>x.classList.remove('active'));portalPanels.forEach(p=>p.hidden=p.dataset.portalPanel!==tab.dataset.portalTab);tab.classList.add('active')}));document.getElementById('add-customer').onclick=()=>location.href='/partner/onboarding';const search=document.getElementById('customer-search'),rows=[...document.querySelectorAll('[data-customer-status]')],noResults=document.getElementById('customer-no-results');function filterCustomers(){if(!rows.length){noResults.hidden=true;return}const status=document.querySelector('[name=customer-status]:checked').value,q=search.value.trim().toLowerCase();let visible=0;rows.forEach(row=>{const show=(status==='all'||row.dataset.customerStatus===status)&&(!q||row.dataset.search.includes(q));row.hidden=!show;if(show)visible++});noResults.hidden=visible>0;document.getElementById('customer-count').textContent=visible}search.addEventListener('input',filterCustomers);document.querySelectorAll('[name=customer-status]').forEach(x=>x.addEventListener('change',filterCustomers));filterCustomers();const inviteForm=document.getElementById('team-invite-form');if(inviteForm)inviteForm.addEventListener('submit',async event=>{event.preventDefault();const box=document.getElementById('team-invite-result');box.textContent='Sending…';const response=await fetch('/api/partner/users/invite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('team-invite-email').value,name:document.getElementById('team-invite-name').value,role:document.getElementById('team-invite-role').value})});const data=await response.json().catch(()=>({}));if(!response.ok){box.textContent=data.detail||'Invitation failed.';return}box.textContent=data.message+(data.email_status==='sent'?'':' Temporary password: '+data.temporary_password);event.target.reset()});</script>'''
     return shell('Partner portal','partner',content,scripts)

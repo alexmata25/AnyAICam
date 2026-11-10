@@ -434,6 +434,19 @@ CREATE TABLE IF NOT EXISTS appliance_claims(
 CREATE INDEX IF NOT EXISTS idx_appliance_claims_device_id ON appliance_claims(device_id);
 CREATE INDEX IF NOT EXISTS idx_appliance_claims_status ON appliance_claims(status);
 '''),
+    # Source only: reject simultaneous current completed claims for one appliance.
+    # Existing duplicates require review before this migration can be applied.
+    ('20261106_one_current_completed_claim_per_appliance', '''
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appliance_claim_one_current_completed
+ ON appliance_claims(appliance_id)
+ WHERE appliance_id IS NOT NULL AND status='completed' AND revoked_at IS NULL;
+'''),
+    # Existing live duplicate device sessions must be reviewed before rollout.
+    ('20261107_one_current_claim_session_per_device', '''
+CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_one_live_session_per_device
+ ON appliance_claims(LOWER(device_id))
+ WHERE status IN ('pending','claimed') AND revoked_at IS NULL;
+'''),
     # Cloud->edge camera-configuration sync (2026-09-12): closes the gap
     # where a camera successfully provisioned through the cloud (RTSP
     # DESCRIBE already verified by the appliance-agent) never reached the
@@ -1278,6 +1291,189 @@ CREATE TABLE IF NOT EXISTS camera_plan_change_attempts_v2(
  status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  UNIQUE(stripe_subscription_id,open_slot)
 );
+'''),
+    # Nullable server-owned edition; no backfill or customer migration.
+    ('20261103_appliance_gateway_edition', '''
+ALTER TABLE appliances ADD COLUMN gateway_edition TEXT;
+'''),
+    # Provisioning decisions are evidence references, not software licenses.
+    # No writer is enabled until a trusted evidence verifier is integrated.
+    ('20261104_appliance_edition_provisioning_decisions', '''
+CREATE TABLE IF NOT EXISTS appliance_edition_provisioning_decisions(
+ id TEXT PRIMARY KEY,
+ customer_id TEXT NOT NULL,
+ appliance_id TEXT NOT NULL,
+ claim_id TEXT NOT NULL,
+ edition TEXT NOT NULL CHECK(edition IN ('local_gateway','cloud_gateway')),
+ evidence_source TEXT NOT NULL CHECK(length(trim(evidence_source)) > 0),
+ evidence_reference TEXT NOT NULL CHECK(length(trim(evidence_reference)) > 0),
+ evidence_version TEXT NOT NULL CHECK(length(trim(evidence_version)) > 0),
+ verified_by TEXT NOT NULL CHECK(length(trim(verified_by)) > 0),
+ verified_at TEXT NOT NULL,
+ revoked_at TEXT,
+ FOREIGN KEY(customer_id) REFERENCES customers(id),
+ FOREIGN KEY(appliance_id) REFERENCES appliances(id),
+ FOREIGN KEY(claim_id) REFERENCES appliance_claims(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appliance_edition_current_decision
+ ON appliance_edition_provisioning_decisions(appliance_id) WHERE revoked_at IS NULL;
+'''),
+    # Internal test authorization only; no customer purchase or license grant.
+    ('20261105_internal_gateway_provisioning_authorizations', '''
+CREATE TABLE IF NOT EXISTS internal_gateway_provisioning_authorizations(
+ id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, appliance_id TEXT NOT NULL,
+ claim_id TEXT NOT NULL, edition TEXT NOT NULL CHECK(edition IN ('local_gateway','cloud_gateway')),
+ basis TEXT NOT NULL CHECK(basis='internal_test_claimed_appliance'),
+ authorized_by TEXT NOT NULL, created_at TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('active','revoked')),
+ version INTEGER NOT NULL CHECK(version>0), audit_reference TEXT NOT NULL,
+ FOREIGN KEY(customer_id) REFERENCES customers(id),
+ FOREIGN KEY(appliance_id) REFERENCES appliances(id),
+ FOREIGN KEY(claim_id) REFERENCES appliance_claims(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_internal_gateway_active_authorization
+ ON internal_gateway_provisioning_authorizations(appliance_id) WHERE status='active';
+'''),
+    # Proposed camera-level Cloud Gateway binding; no paid producer is wired.
+    ('20261108_cloud_gateway_camera_entitlements', '''
+CREATE TABLE IF NOT EXISTS cloud_gateway_camera_entitlements(
+ id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, appliance_id TEXT NOT NULL,
+ camera_id TEXT NOT NULL, camera_number INTEGER NOT NULL, device_key TEXT NOT NULL,
+ edition TEXT NOT NULL CHECK(edition='cloud_gateway'),
+ billing_source TEXT NOT NULL, billing_reference TEXT NOT NULL, billing_version TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','active','suspended','revoked','cancelled')),
+ version INTEGER NOT NULL CHECK(version>0), audit_reference TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_reason TEXT,
+ FOREIGN KEY(customer_id) REFERENCES customers(id),
+ FOREIGN KEY(appliance_id) REFERENCES appliances(id), FOREIGN KEY(camera_id) REFERENCES cameras(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cloud_gateway_camera_current
+ ON cloud_gateway_camera_entitlements(camera_id) WHERE status IN ('pending','active','suspended');
+CREATE INDEX IF NOT EXISTS idx_cloud_gateway_camera_billing
+ ON cloud_gateway_camera_entitlements(customer_id,billing_reference,status);
+'''),
+    # Prepared Cloud Gateway subscription evidence; no checkout is enabled.
+    ('20261109_cloud_gateway_subscription_evidence', '''
+CREATE TABLE IF NOT EXISTS cloud_gateway_subscription_evidence(
+ stripe_subscription_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL,
+ stripe_customer_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL, checkout_session_id TEXT NOT NULL,
+ product TEXT NOT NULL CHECK(product='cloud_gateway'), quantity INTEGER NOT NULL,
+ amount_cents INTEGER NOT NULL, currency TEXT NOT NULL, billing_interval TEXT NOT NULL, interval_count INTEGER NOT NULL,
+ status TEXT NOT NULL, stripe_status TEXT NOT NULL, current_period_end INTEGER,
+ invoice_id TEXT, charge_id TEXT, payment_intent_id TEXT, payment_verified INTEGER NOT NULL, reversal TEXT,
+ source_version TEXT NOT NULL, event_created INTEGER NOT NULL, event_id TEXT NOT NULL,
+ updated_at TEXT NOT NULL, FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_gateway_subscription_customer
+ ON cloud_gateway_subscription_evidence(customer_id,status);
+CREATE TABLE IF NOT EXISTS cloud_gateway_evidence_holds(
+ stripe_subscription_id TEXT NOT NULL, customer_id TEXT NOT NULL,
+ event_id TEXT NOT NULL, event_created INTEGER NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(stripe_subscription_id,event_id)
+);
+CREATE TABLE IF NOT EXISTS cloud_gateway_webhook_correlation(
+ event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, object_id TEXT NOT NULL,
+ stripe_customer_id TEXT, event_created INTEGER NOT NULL, status TEXT NOT NULL,
+ subscription_id TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cloud_gateway_refresh_leases(
+ stripe_subscription_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL,
+ token TEXT NOT NULL, lease_until INTEGER NOT NULL
+);
+'''),
+    # Prepared authorization-bound checkout attempts; no route is enabled.
+    ('20261110_gateway_checkout_attempts', '''
+CREATE TABLE IF NOT EXISTS gateway_checkout_attempts(
+ id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, appliance_id TEXT NOT NULL,
+ claim_id TEXT NOT NULL, edition TEXT NOT NULL CHECK(edition IN ('local_gateway','cloud_gateway')),
+ decision_id TEXT NOT NULL, authorization_reference TEXT NOT NULL, authorization_version TEXT NOT NULL,
+ stripe_customer_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL,
+ quantity INTEGER NOT NULL CHECK(quantity>0), camera_ids_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('reserved','creating','open','review','paid_review','late_paid_review','expired')),
+ authorization_invalidated INTEGER NOT NULL DEFAULT 0 CHECK(authorization_invalidated IN (0,1)),
+ session_id TEXT UNIQUE, stripe_subscription_id TEXT, stripe_invoice_id TEXT UNIQUE, payment_event_id TEXT UNIQUE,
+ reversal_state TEXT NOT NULL DEFAULT 'none' CHECK(reversal_state IN ('none','refunded')),
+ refund_charge_id TEXT, refund_event_id TEXT UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_checkout_one_unresolved
+ ON gateway_checkout_attempts(appliance_id) WHERE status IN ('reserved','creating','open','review','paid_review');
+CREATE TABLE IF NOT EXISTS gateway_checkout_review_actions(
+ request_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, actor_email TEXT NOT NULL,
+ action TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gateway_stripe_payment_links(
+ kind TEXT NOT NULL CHECK(kind IN ('invoice','charge','payment_intent')),
+ provider_id TEXT NOT NULL, customer_id TEXT NOT NULL, stripe_customer_id TEXT NOT NULL,
+ stripe_subscription_id TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(kind,provider_id)
+);
+'''),
+    ('20261111_gateway_stable_installation_claim_ids', '''
+CREATE TABLE IF NOT EXISTS gateway_stable_installation_claim_ids(
+ claim_id TEXT PRIMARY KEY, appliance_id TEXT NOT NULL UNIQUE,
+ original_claim_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gateway_claim_recovery_requests(
+ request_id TEXT PRIMARY KEY, appliance_id TEXT NOT NULL, customer_id TEXT NOT NULL,
+ requested_by TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_claim_one_pending_recovery
+ ON gateway_claim_recovery_requests(appliance_id) WHERE status='pending_manual_verification';
+'''),
+    # Cloud Gateway event-clip retention (owner approval 2026-11-05): 14-day
+    # default, 7/30 options, separate from every Full VMS retention source.
+    # Additive; no rows are written here (cloud_gateway_retention.py).
+    ('20261112_cloud_gateway_retention_settings', '''
+CREATE TABLE IF NOT EXISTS cloud_gateway_retention_settings(
+ customer_id TEXT PRIMARY KEY,
+ retention_days INTEGER NOT NULL CHECK(retention_days IN (7,14,30)),
+ source TEXT NOT NULL CHECK(source IN ('default','customer_owner','administrator')),
+ version INTEGER NOT NULL CHECK(version>0),
+ updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
+ FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+'''),
+    # Capture-time retention attribution (Codex review of 9ba528b): each
+    # event-media row records, when it is cataloged, which retention policy
+    # governs it -- 'full_vms_plan' (the existing Full VMS chain) or
+    # 'cloud_gateway' with the 7/14/30 days frozen at capture and the paid
+    # binding that authorized it. Later binding, subscription or camera
+    # changes never rewrite it. NULL = a historical row cataloged before
+    # this migration; the sweep classifies those conservatively and never
+    # deletes one it cannot attribute. Plus the retention worker's own
+    # operational health (a real deletion probe and tick, not a flag).
+    # Additive; no rows are written here.
+    ('20261113_event_media_retention_attribution', '''
+ALTER TABLE detection_event_media ADD COLUMN retention_policy TEXT CHECK(retention_policy IN ('full_vms_plan','cloud_gateway'));
+ALTER TABLE detection_event_media ADD COLUMN retention_days INTEGER CHECK(retention_days IN (7,14,30));
+ALTER TABLE detection_event_media ADD COLUMN retention_basis_ref TEXT;
+ALTER TABLE detection_event_media ADD COLUMN retention_recorded_at TEXT;
+CREATE TABLE IF NOT EXISTS recording_retention_sweep_health(
+ worker_id TEXT PRIMARY KEY,
+ started_at TEXT NOT NULL,
+ last_probe_ok_at TEXT, last_tick_ok_at TEXT,
+ last_error TEXT, last_error_at TEXT,
+ diagnostics_json TEXT,
+ updated_at TEXT NOT NULL
+);
+'''),
+    # Additive only: no backfill or automatic remote-service entitlement.
+    # One current binding per appliance; replaced subscriptions are fenced by
+    # their ID and every mutation must compare that ID within its transaction.
+    ('20261103_local_gateway_remote_subscriptions','''
+CREATE TABLE IF NOT EXISTS local_gateway_remote_subscriptions(
+ appliance_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL,
+ stripe_customer_id TEXT NOT NULL, stripe_subscription_id TEXT NOT NULL UNIQUE,
+ stripe_subscription_item_id TEXT NOT NULL, stripe_price_id TEXT NOT NULL,
+ status TEXT NOT NULL, stripe_status TEXT NOT NULL,
+ current_period_end INTEGER, cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+ payment_failed_at TEXT, suspended_reason TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ FOREIGN KEY(appliance_id) REFERENCES appliances(id),
+ FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_local_gateway_remote_customer
+ ON local_gateway_remote_subscriptions(customer_id, status);
 '''),
     # Build Your System purchase progress (2026-10-05, per_camera_billing.
     # build_progress): the validated plan/camera/hardware selection a

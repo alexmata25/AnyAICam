@@ -59,6 +59,25 @@ EVENT_MEDIA_CAPTURE_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_CAPTURE_ENABL
 # mode -- it never contacts the cloud at all (see its own comment).
 EVENT_MEDIA_UPLOAD_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED")
 
+
+def _edition_upload_allowed() -> bool:
+    from gateway_edition import video_transport_allowed
+    return video_transport_allowed("event")
+
+
+def _event_camera_authorized(camera_number: int, identity: dict) -> bool:
+    from gateway_edition import current_edition, event_camera_authorized
+    if current_edition() == "full_vms":
+        return True
+    return event_camera_authorized(camera_number, identity, recording_upload._known_camera_numbers())
+
+
+def _event_upload_session(camera_number: int, camera_id: str) -> dict | None:
+    from gateway_edition import current_edition
+    if current_edition() == "cloud_gateway":
+        return recording_upload._ensure_session(camera_number, camera_id, force_refresh=True)
+    return recording_upload._ensure_session(camera_number, camera_id)
+
 # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
 # every event clip/thumbnail object was written with no CacheControl
 # metadata at all, so nothing ever told a browser (or a future CDN sitting
@@ -312,7 +331,7 @@ def upload_motion_event_media(
 
     # This is the hard local-only boundary.  Nothing below it may run unless
     # the explicit transport flag is true.
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         logger.info(
             "event_media.captured_local event_id=%s camera=%s thumbnail=%s",
             event_id,
@@ -321,6 +340,10 @@ def upload_motion_event_media(
         )
         return True
 
+    from gateway_edition import event_clip_reference_allowed
+    if not event_clip_reference_allowed(event_id, safe_clip_url):
+        logger.warning("event_media.invalid_event_clip event_id=%s camera=%s", event_id, camera_number)
+        return False
     recording_upload._refresh_camera_map()
     identity = recording_upload._camera_identity(camera_number)
 
@@ -399,8 +422,29 @@ def upload_motion_event_media(
             return True
         event_media_outbox.replace(event_id, {**job, "classified": True})
 
+    if not _event_camera_authorized(camera_number, identity):
+        logger.warning("event_media.camera_unlicensed event_id=%s camera=%s", event_id, camera_number)
+        return False
+    from gateway_edition import current_edition, event_clip_duration_allowed, event_thumbnail_allowed
+    gateway_duration = None
+    gateway_window = None
+    if current_edition() == "cloud_gateway":
+        gateway_duration = _duration_seconds(clip_path)
+        if not event_clip_duration_allowed(gateway_duration):
+            logger.warning("event_media.invalid_clip_duration event_id=%s camera=%s", event_id, camera_number)
+            return False
+        try:
+            gateway_window = compute_clip_window(event_start, event_end)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("event_media.invalid_event_window event_id=%s camera=%s", event_id, camera_number)
+            return False
+        # A caller must not smuggle another video through the optional image
+        # argument. The existing producer emits JPEG event thumbnails.
+        if not event_thumbnail_allowed(thumbnail_path):
+            logger.warning("event_media.invalid_thumbnail event_id=%s camera=%s", event_id, camera_number)
+            return False
     camera_id = identity["camera_id"]
-    session = recording_upload._ensure_session(camera_number, camera_id)
+    session = _event_upload_session(camera_number, camera_id)
 
     if not session:
         logger.warning(
@@ -408,6 +452,23 @@ def upload_motion_event_media(
             event_id,
             camera_number,
         )
+        return False
+
+    def gateway_handoff_authorized():
+        if current_edition() != "cloud_gateway":
+            return True
+        try:
+            if not _edition_upload_allowed():
+                return False
+            recording_upload._refresh_camera_map()
+            latest = recording_upload._camera_identity(camera_number)
+            return (isinstance(latest, dict) and latest.get("camera_id") == camera_id
+                    and _event_camera_authorized(camera_number, latest))
+        except Exception:
+            return False
+
+    if not gateway_handoff_authorized():
+        logger.warning("event_media.authorization_changed event_id=%s camera=%s", event_id, camera_number)
         return False
 
     if recording_upload.boto3 is None:
@@ -442,6 +503,10 @@ def upload_motion_event_media(
 
     clip_key = base_key + ".mp4"
 
+    if not gateway_handoff_authorized():
+        logger.warning("event_media.authorization_changed event_id=%s camera=%s", event_id, camera_number)
+        return False
+
     client.upload_file(
         str(clip_path),
         session["bucket"],
@@ -452,6 +517,9 @@ def upload_motion_event_media(
     thumbnail_key = None
 
     if thumbnail_path is not None:
+        if not gateway_handoff_authorized():
+            logger.warning("event_media.authorization_changed event_id=%s camera=%s", event_id, camera_number)
+            return False
         thumbnail_key = base_key + ".jpg"
 
         try:
@@ -471,9 +539,9 @@ def upload_motion_event_media(
             )
             thumbnail_key = None
 
-    window = compute_clip_window(event_start, event_end)
+    window = gateway_window if gateway_window is not None else compute_clip_window(event_start, event_end)
 
-    actual_duration = _duration_seconds(clip_path)
+    actual_duration = gateway_duration if gateway_duration is not None else _duration_seconds(clip_path)
     duration_seconds = (
         actual_duration
         if actual_duration is not None
@@ -581,7 +649,7 @@ def register_shared_event_media(
     always be recovered later WITHOUT this call, or its retry, ever
     encoding or uploading anything. Removed from the outbox only on a
     confirmed accepted/duplicate response."""
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         logger.info(
             "event_media.shared_registration_skipped_disabled "
             "event_id=%s camera=%s",
@@ -602,6 +670,8 @@ def register_shared_event_media(
         )
         return False
 
+    if not _event_camera_authorized(camera_number, identity):
+        return False
     camera_id = identity["camera_id"]
 
     event_media_outbox.put({
@@ -671,7 +741,7 @@ def report_media_failed(*, event_id: str, camera_number: int, reason: str) -> bo
     is truly gone -- a clip still in the outbox is pending, not failed, and
     keeps being retried. Best effort: if this cannot be delivered the
     event simply stays 'pending'."""
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         return False
     if any(str(job.get("event_id")) == str(event_id) for job in event_media_outbox.load()):
         return False  # still queued for retry
@@ -734,7 +804,7 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     # diagnostics, and future supervisors may call this synchronous entry
     # point directly.  An upload-disabled local-capture run must never turn
     # into transport because of such a call.
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         return {"attempted": 0, "completed": 0, "pending": len(event_media_outbox.load())}
     attempted = completed = 0
     for job in event_media_outbox.due()[:max(1, max_jobs)]:
@@ -802,7 +872,7 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
 
 
 async def event_media_retry_worker() -> None:
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    if not EVENT_MEDIA_UPLOAD_ENABLED or not _edition_upload_allowed():
         event_media_retry_state["worker_status"] = "disabled"
         while True: await asyncio.sleep(3600)
     event_media_retry_state["worker_status"] = "running"

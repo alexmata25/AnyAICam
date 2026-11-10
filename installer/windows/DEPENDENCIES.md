@@ -2,6 +2,18 @@
 
 All customer installation inputs are embedded in the installer. Downloads occur only while preparing the ignored `vendor` build cache.
 
+The shared Full VMS / Local Gateway / Cloud Gateway installer requires all eight
+pinned vendor inputs and the complete 108-wheel lock. Optional runtime analytics
+do not make their packaged dependencies optional build inputs. Gateway editions
+must not silently strip Vosk, Tesseract or the Full VMS dependency set.
+Blue's sealed 1.3.4 handoff records Inno Setup **7.1.0**; build.ps1 checks the
+compiler's numeric PE version metadata before staging or compiler execution.
+This check does not establish authenticity; approved provenance/hashes and
+normal publisher verification are still required. Prefer recovery
+of the sealed toolchain; any replacement version/install needs owner approval.
+See `../../docs/windows-gateway-prerequisite-remediation.md` for provenance,
+local-cache findings, interpreter roles and unresolved approval gates.
+
 | Component | Version | Source | SHA-256 | License | Installed location | Role |
 |---|---:|---|---|---|---|---|
 | CPython embeddable x64 | 3.12.10 | `python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip` | `4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3` | PSF-2.0 | `runtime/python` | Core |
@@ -13,7 +25,6 @@ All customer installation inputs are embedded in the installer. Downloads occur 
 | Microsoft Visual C++ 2015-2022 Redistributable x64 | 14.44.35211 (captured 2026-10-07; Authenticode: Microsoft Corporation, checked by `build.ps1`) | `aka.ms/vs/17/release/vc_redist.x64.exe`, stored as `vc_redist.x64-14.44.35211.exe` | `cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b` | Microsoft Visual C++ Redistributable license | Windows system (`/install /quiet /norestart`; kept on uninstall, shared component) | Core: torch/cv2 DLLs need it; a clean Windows lacks it |
 | Vosk small US English speech model | vosk-model-small-en-us-0.15 (the same pin as the Linux Dockerfiles) | `alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip` | `30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498`; every extracted file in `vosk-model-small-en-us-0.15.sha256` | Apache-2.0 (Copyright 2020 Alpha Cephei Inc); notice `notices/vosk-model-small-en-us-0.15-NOTICE.txt`, installed in `licenses/` | `%ProgramData%\AnyAiCam\models\stt\vosk-model-small-en-us-0.15` (SYSTEM/Administrators only; verified, kept or replaced on every install by `install-stt-model.ps1`) | Voice Call listening (offline speech-to-text) |
 | Tesseract OCR engine bundle | Tesseract 5.5.2 + its 27-DLL import closure (leptonica 1.87.0, libarchive, libcurl, ICU, libtiff, ...) and the English model (byte-identical to tessdata_fast 4.1.0 `eng.traineddata`, as on Linux) | 23 pinned conda-forge win-64 packages (`tesseract-bundle.lock.json`, each checked against conda-forge's published SHA-256), assembled deterministically by `prepare-tesseract-bundle.py` into `tesseract-5.5.2-win64-anyaicam.zip`; the DLL list is re-derived from the PE import tables on every run | `221b4599a9310737d8f3a2d8a93477eb3c495d41b5eca8af6ed7b79e0781fbf7`; every file in the zip's `BUNDLE-MANIFEST.json` | Apache-2.0 (Tesseract) and permissive licences for every library, EXCEPT libiconv 1.18 (`iconv.dll`, `charset.dll`): LGPL-2.1-only, imported by archive.dll/libxml2.dll. **Legal gate before customer distribution** (notice, source offer, replaceability; same class as psycopg-binary). Each package's own licence files ship in `licenses/tesseract/` | `runtime/tools/tesseract` (replaced as a whole and verified file by file by `install-runtime.ps1`; on the VMS's PATH, `TESSDATA_PREFIX` set by `service-launcher.ps1`) | Licence plate reading (OCR) |
-| Tesseract OCR engine | Not bundled | N/A | N/A | Apache-2.0 upstream | N/A | Optional license-plate recognition only |
 
 Setup order: Visual C++ runtime (exit 0, 1638 already installed, or 3010 restart needed; anything else stops setup), then the Python runtime, then `runtime-preflight.py` with the bundled Python (imports fastapi, uvicorn, numpy, cv2, torch, torchvision, ultralytics and runs one torch operation), and only then the service. A failed preflight stops setup before any service is installed.
 

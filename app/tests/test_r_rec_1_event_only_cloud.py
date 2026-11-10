@@ -50,7 +50,7 @@ def _seed(db, camera_rows=(("cam-1", 1),), *, local_mode=None, cloud_mode=None):
     db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-1','P','approved','real',?)", (NOW,))
     db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-1','partner-1','C','c@example.test','active','real',?)", (NOW,))
     db.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES('site-1','cust-1','S',?)", (NOW,))
-    db.execute("INSERT OR IGNORE INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-1','cust-1','site-1','AIC-RREC0001',?)", (NOW,))
+    db.execute("INSERT OR IGNORE INTO appliances(id,customer_id,site_id,cloud_id,created_at,gateway_edition) VALUES('appl-1','cust-1','site-1','AIC-RREC0001',?,'full_vms')", (NOW,))
     db.execute("INSERT OR IGNORE INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES('cred-1','appl-1',?,?)", (password_hash("cred"), NOW))
     for camera_id, number in camera_rows:
         db.execute(

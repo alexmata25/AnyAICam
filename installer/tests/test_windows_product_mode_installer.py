@@ -81,11 +81,11 @@ def test_anything_but_exactly_local_or_hybrid_is_refused(env, mode, needle):
 
 def test_setup_offers_the_choice_only_on_a_new_interactive_install_and_passes_it():
     iss = (WIN / "AnyAiCam-VMS.iss").read_text(encoding="utf-8-sig")
-    assert "CreateInputOptionPage(wpSelectDir, 'How will you use AnyAiCam?'" in iss
+    assert "CreateInputOptionPage(GatewayEditionPage.ID, 'How will you use AnyAiCam?'" in iss
     assert "ProductModePage.Add('Local:" in iss and "ProductModePage.Add('Hybrid:" in iss
     assert "(ExistingInstall() or (ExpandConstant('{param:ProductMode|}') <> ''))" in iss       # skipped on upgrade / silent param
     assert "not ExistingInstall() and not WizardSilent()" in iss                                # silent new install: no default
-    assert "-ProductMode \"' + ProductModeChoice() + '\"'" in iss
+    assert "-ProductMode \"' + ProductModeChoice() + '\" -GatewayEdition" in iss
     script = (WIN / "install-runtime.ps1").read_text(encoding="utf-8-sig")
     assert "[string]$ProductMode = ''" in script
 
@@ -110,7 +110,8 @@ def _function(name):
 def test_setup_checks_the_mode_before_stopping_or_removing_any_service():
     prepare = _function("PrepareToInstall(var NeedsRestart: Boolean): String;")
     check = prepare.index("Result := ProductModeProblem();")
-    assert check < prepare.index("if Result <> '' then begin")
+    assert check < prepare.index("if Result <> '' then begin", check)
+    assert prepare.index("Result := GatewayEditionProblem();") < check
     assert check < prepare.index("'stopwait'") and check < prepare.index("'uninstall'")
     assert "Log('Install refused before any change: ' + Result);" in prepare
     assert prepare.index("exit;") < prepare.index("'stopwait'")                       # refused -> returns before any change
